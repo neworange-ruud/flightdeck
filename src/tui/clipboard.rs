@@ -7,7 +7,9 @@
 //! clipboard command is available, so it rarely perturbs the alternate screen.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Copy `text` to the system clipboard (best effort; failures are silent).
 pub fn copy(text: &str) {
@@ -18,6 +20,135 @@ pub fn copy(text: &str) {
         return;
     }
     let _ = write_osc52(text);
+}
+
+/// If the system clipboard holds an image, write it to a temp file and return
+/// its path; otherwise return `None`.
+///
+/// This is how FlightDeck delivers a pasted image to a hosted agent: the agent
+/// runs in a PTY and cannot see the host clipboard's image flavour, but it does
+/// understand a file-path reference (the same thing a terminal inserts when you
+/// drag an image in). The caller sends the returned path to the PTY.
+///
+/// Best effort: any failure (no image, missing tool) yields `None` so the caller
+/// can fall back to a normal paste.
+pub fn save_clipboard_image() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        save_clipboard_image_macos()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        save_clipboard_image_linux()
+    }
+}
+
+/// A unique path under the system temp dir for a pasted image, namespaced by pid
+/// and a per-process counter so concurrent pastes never collide.
+fn unique_image_path(ext: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("flightdeck-paste-{pid}-{n}.{ext}"))
+}
+
+/// `true` if `path` now refers to a non-empty file.
+fn wrote_non_empty(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// macOS: read the clipboard image via `osascript`. Screenshots and most copied
+/// images expose a `PNGf` flavour; we prefer it and fall back to `TIFF`.
+#[cfg(target_os = "macos")]
+fn save_clipboard_image_macos() -> Option<PathBuf> {
+    // Inspect the available flavours first so we only spend the write attempt
+    // when an image is actually present.
+    let info = Command::new("osascript")
+        .args(["-e", "clipboard info"])
+        .output()
+        .ok()?;
+    let info = String::from_utf8_lossy(&info.stdout);
+    let has_png = info.contains("PNGf");
+    let has_tiff = info.contains("TIFF");
+    if !has_png && !has_tiff {
+        return None;
+    }
+
+    // Prefer PNG; coercion to PNGf succeeds for most image flavours on macOS.
+    if has_png || has_tiff {
+        let path = unique_image_path("png");
+        if osascript_write_clipboard(&path, "«class PNGf»") && wrote_non_empty(&path) {
+            return Some(path);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    // Fall back to a raw TIFF dump when PNG coercion failed.
+    if has_tiff {
+        let path = unique_image_path("tiff");
+        if osascript_write_clipboard(&path, "«class TIFF»") && wrote_non_empty(&path) {
+            return Some(path);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    None
+}
+
+/// Run an AppleScript that writes the clipboard, coerced to `class`, to `path`.
+/// Returns whether the script exited successfully.
+#[cfg(target_os = "macos")]
+fn osascript_write_clipboard(path: &Path, class: &str) -> bool {
+    // AppleScript string literals escape `\` and `"`; temp paths contain neither
+    // in practice, but guard anyway.
+    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "set p to POSIX file \"{p}\"\n\
+         set fh to open for access p with write permission\n\
+         try\n\
+         \tset eof fh to 0\n\
+         \twrite (the clipboard as {class}) to fh\n\
+         \tclose access fh\n\
+         on error errMsg number errNum\n\
+         \tclose access fh\n\
+         \terror errMsg number errNum\n\
+         end try"
+    );
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Linux: try Wayland (`wl-paste`) then X11 (`xclip`) to pull a PNG off the
+/// clipboard.
+#[cfg(not(target_os = "macos"))]
+fn save_clipboard_image_linux() -> Option<PathBuf> {
+    use std::fs::File;
+
+    // (command, args producing PNG bytes on stdout)
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-paste", &["--type", "image/png"]),
+        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
+    ];
+    for (cmd, args) in candidates {
+        let path = unique_image_path("png");
+        let Ok(file) = File::create(&path) else {
+            continue;
+        };
+        let spawned = Command::new(cmd)
+            .args(*args)
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::null())
+            .status();
+        if matches!(spawned, Ok(s) if s.success()) && wrote_non_empty(&path) {
+            return Some(path);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    None
 }
 
 /// Pipe `text` into the first available platform clipboard command. Returns

@@ -26,6 +26,10 @@ pub enum KeyAction {
     Dispatch(Command),
     /// Forward these raw bytes to the active PTY (Terminal mode passthrough).
     Passthrough(Vec<u8>),
+    /// Paste from the system clipboard into the active terminal. The wiring
+    /// layer (T9) reads the clipboard: an image is written to a temp file and
+    /// its path sent to the agent; otherwise a literal Ctrl-V passes through.
+    Paste,
     /// Open the command palette.
     OpenPalette,
     /// Open the help / keybindings overlay.
@@ -65,6 +69,16 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     // Esc: leave terminal focus (SPECS §23 "Leave terminal input focus").
     if key.code == KeyCode::Esc && key.modifiers.is_empty() {
         return KeyAction::FocusApp;
+    }
+    // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
+    // but cannot see the host clipboard's image flavour through the PTY, so the
+    // wiring layer reads it and sends a temp-file path instead. With no image on
+    // the clipboard it falls back to a literal Ctrl-V (0x16) passthrough.
+    if key.code == KeyCode::Char('v')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        return KeyAction::Paste;
     }
     // Everything else passes through to the PTY.
     KeyAction::Passthrough(encode_key(key))
@@ -575,6 +589,25 @@ mod tests {
     fn terminal_mode_ctrl_a_passes_0x01() {
         let action = map_key(InputMode::Terminal, ctrl(KeyCode::Char('a')));
         assert_eq!(action, KeyAction::Passthrough(vec![0x01]));
+    }
+
+    #[test]
+    fn terminal_mode_ctrl_v_maps_to_paste() {
+        // Ctrl-V is intercepted as a paste so the wiring layer can turn a
+        // clipboard image into a file-path reference for the agent.
+        assert_eq!(
+            map_key(InputMode::Terminal, ctrl(KeyCode::Char('v'))),
+            KeyAction::Paste
+        );
+    }
+
+    #[test]
+    fn app_mode_ctrl_v_is_unbound() {
+        // Paste only applies while a terminal is focused (the agent chat).
+        assert_eq!(
+            map_key(InputMode::App, ctrl(KeyCode::Char('v'))),
+            KeyAction::None
+        );
     }
 
     #[test]
