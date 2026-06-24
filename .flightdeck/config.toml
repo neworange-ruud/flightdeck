@@ -15,7 +15,7 @@ agent_tab_position = "left"
 default_agent = "opencode"
 
 [notifications]
-enabled = true
+enabled = false
 on_finish = true
 on_waiting = true
 on_failed = true
