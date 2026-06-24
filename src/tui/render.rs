@@ -32,6 +32,7 @@ use crate::app::state::AppState;
 use crate::git::status::WorktreeStatus;
 use crate::tui::layout;
 use crate::tui::palette::CommandPalette;
+use crate::tui::selection::Selection;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -503,21 +504,34 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let focused = state.mode() == InputMode::Terminal;
-    render_screen(frame, area, term.screen(), focused);
+    render_screen(frame, area, term.screen(), focused, term.selection());
 }
 
+/// Background colour used to highlight selected terminal cells (SPECS §20).
+const SELECTION_BG: Color = Color::Rgb(58, 90, 138);
+
 /// Render a VT100 [`vt100::Screen`] into `area`, cell-by-cell. When `focused`,
-/// the terminal cursor is positioned to match the screen's cursor.
-fn render_screen(frame: &mut Frame, area: Rect, screen: &vt100::Screen, focused: bool) {
+/// the terminal cursor is positioned to match the screen's cursor. Cells inside
+/// `selection` are drawn with the selection highlight.
+fn render_screen(
+    frame: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    focused: bool,
+    selection: Option<&Selection>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let (rows, cols) = screen.size();
+    let offset = screen.scrollback();
     {
         let buf = frame.buffer_mut();
         let max_r = area.height.min(rows);
         let max_c = area.width.min(cols);
         for r in 0..max_r {
+            // Columns selected on this visible row, if any.
+            let sel_cols = selection.and_then(|s| s.row_selection(r, rows, cols, offset));
             for c in 0..max_c {
                 let Some(cell) = screen.cell(r, c) else {
                     continue;
@@ -543,6 +557,14 @@ fn render_screen(frame: &mut Frame, area: Rect, screen: &vt100::Screen, focused:
                 }
                 if cell.inverse() {
                     style = style.add_modifier(Modifier::REVERSED);
+                }
+                // Selection highlight overrides the cell background and drops any
+                // inverse so the highlight reads consistently.
+                if sel_cols.map(|(a, b)| c >= a && c <= b).unwrap_or(false) {
+                    style = style
+                        .bg(SELECTION_BG)
+                        .fg(Color::White)
+                        .remove_modifier(Modifier::REVERSED);
                 }
                 target.set_style(style);
             }
@@ -917,7 +939,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 
 /// Draw the help / keybindings overlay (SPECS §23).
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
-    let overlay_area = layout::centered_overlay(area, 64, 26);
+    let overlay_area = layout::centered_overlay(area, 64, 40);
     frame.render_widget(Clear, overlay_area);
 
     let help_text = vec![
@@ -956,6 +978,14 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "Cycle terminal tabs (agent + shells)",
         ),
         shortcut_line("  Mouse click", "Select terminal tab"),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Selection / Clipboard",
+            Style::default().fg(Color::Yellow),
+        )),
+        shortcut_line("  Drag", "Select terminal text (copies on release)"),
+        shortcut_line("  Drag past edge", "Auto-scrolls to reach offscreen text"),
+        shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
         shortcut_line("  Esc", "Leave terminal focus / focus app"),

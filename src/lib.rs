@@ -285,6 +285,17 @@ enum Prompt {
     AbandonConfirm,
 }
 
+/// An in-progress mouse text selection drag over the terminal viewport (SPECS
+/// §20). The selection itself lives on the active [`crate::terminal::session::Terminal`];
+/// this only tracks the latest pointer position so the event loop can auto-scroll
+/// while the pointer sits at (or beyond) a viewport edge.
+struct DragState {
+    /// Latest absolute pointer column (terminal coordinates).
+    col: u16,
+    /// Latest absolute pointer row (terminal coordinates).
+    row: u16,
+}
+
 /// The full interactive UI state layered over [`AppState`]: which overlay is
 /// drawn, plus any in-progress prompt.
 #[derive(Default)]
@@ -295,6 +306,9 @@ struct Ui {
     /// Set when a dispatched [`Effect::Quit`] asks the app to exit (e.g. the
     /// "Quit" command palette action). The event loop checks this each turn.
     should_quit: bool,
+    /// Active mouse text-selection drag, if the left button is held over the
+    /// terminal viewport (SPECS §20).
+    drag: Option<DragState>,
 }
 
 /// A prompt plus the rendered hint shown to the user (drawn as a message line).
@@ -365,6 +379,13 @@ fn event_loop(
         }
         tick = tick.wrapping_add(1);
 
+        // --- Auto-scroll the terminal while a selection drag rests at an edge. ---
+        if ui.drag.is_some() {
+            if let Ok(size) = terminal.size() {
+                autoscroll_drag(state, &ui, Rect::new(0, 0, size.width, size.height));
+            }
+        }
+
         // --- Render. ---
         let overlay = ui.render_overlay();
         terminal
@@ -389,7 +410,7 @@ fn event_loop(
                     Ok(s) => Rect::new(0, 0, s.width, s.height),
                     Err(_) => continue,
                 };
-                handle_mouse(me, area, state, services, &ui);
+                handle_mouse(me, area, state, services, &mut ui);
             }
             Event::Resize(cols, rows) => {
                 let size = viewport_pty_size(PtySize { rows, cols });
@@ -427,30 +448,121 @@ const MOUSE_WHEEL_UP: u8 = 64;
 const MOUSE_WHEEL_DOWN: u8 = 65;
 
 /// Handle a mouse event (SPECS §20, §22 — keyboard-first, but mouse-assisted):
-/// a left click selects the clicked Agent Tab or child-terminal tab, and the
-/// wheel scrolls the active terminal.
-fn handle_mouse(me: MouseEvent, area: Rect, state: &mut AppState, services: &Services, ui: &Ui) {
+/// a left click selects the clicked Agent Tab or child-terminal tab, the wheel
+/// scrolls the active terminal, and a left-button drag over the terminal
+/// viewport selects text for copy/paste (auto-copying on release).
+///
+/// When the hosted application has its own mouse reporting enabled (a full-screen
+/// TUI), plain button/drag events are forwarded to it so it still works; holding
+/// Shift forces local text selection instead.
+fn handle_mouse(
+    me: MouseEvent,
+    area: Rect,
+    state: &mut AppState,
+    services: &Services,
+    ui: &mut Ui,
+) {
     // Ignore mouse while a modal/prompt/overlay is capturing input.
     if ui.modal_active() {
         return;
     }
+    let term_area = crate::tui::layout::compute(area).terminal;
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let Some(hit) = hit_test(area, state, me.column, me.row) else {
-                return;
-            };
-            match hit {
-                HitTarget::AgentTab(i) => {
-                    let _ = state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
-                }
-                HitTarget::Child(ChildTarget::Primary) => {
-                    if let Some(tab) = state.selected_mut() {
-                        tab.session.focus_primary();
+            // A click on a tab switches to it (and never starts a selection).
+            if let Some(hit) = hit_test(area, state, me.column, me.row) {
+                ui.drag = None;
+                match hit {
+                    HitTarget::AgentTab(i) => {
+                        let _ =
+                            state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
+                    }
+                    HitTarget::Child(ChildTarget::Primary) => {
+                        if let Some(tab) = state.selected_mut() {
+                            tab.session.focus_primary();
+                        }
+                    }
+                    HitTarget::Child(ChildTarget::Child(i)) => {
+                        let _ = state
+                            .dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
                     }
                 }
-                HitTarget::Child(ChildTarget::Child(i)) => {
-                    let _ =
-                        state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+                return;
+            }
+            // A press inside the terminal viewport begins a selection (or is
+            // forwarded to a mouse-aware hosted app unless Shift is held).
+            if rect_contains(term_area, me.column, me.row) {
+                let shift = me.modifiers.contains(KeyModifiers::SHIFT);
+                let col = me.column.saturating_sub(term_area.x);
+                let row = me.row.saturating_sub(term_area.y);
+                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                    if term.wants_mouse() && !shift {
+                        let bytes = encode_mouse_button(term.mouse_encoding(), 0, col, row, true);
+                        let _ = term.session_mut().write_input(&bytes);
+                        ui.drag = None;
+                    } else {
+                        term.begin_selection(row, col);
+                        ui.drag = Some(DragState {
+                            col: me.column,
+                            row: me.row,
+                        });
+                    }
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if ui.drag.is_some() {
+                if let Some(d) = ui.drag.as_mut() {
+                    d.col = me.column;
+                    d.row = me.row;
+                }
+                // Clamp the pointer into the viewport so a drag past an edge keeps
+                // extending along that edge (auto-scroll reveals more each tick).
+                let col = me
+                    .column
+                    .saturating_sub(term_area.x)
+                    .min(term_area.width.saturating_sub(1));
+                let row = me
+                    .row
+                    .saturating_sub(term_area.y)
+                    .min(term_area.height.saturating_sub(1));
+                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                    term.update_selection(row, col);
+                }
+            } else if rect_contains(term_area, me.column, me.row) {
+                // Forwarded drag for a mouse-aware hosted app.
+                let col = me.column.saturating_sub(term_area.x);
+                let row = me.row.saturating_sub(term_area.y);
+                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                    if term.wants_mouse() {
+                        let bytes = encode_mouse_button(term.mouse_encoding(), 32, col, row, true);
+                        let _ = term.session_mut().write_input(&bytes);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if ui.drag.take().is_some() {
+                // End of a local selection: copy it (and keep it highlighted as
+                // confirmation), or clear a zero-length click.
+                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                    if term.has_selection() {
+                        if let Some(text) = term.selected_text() {
+                            crate::tui::clipboard::copy(&text);
+                        }
+                    } else {
+                        term.clear_selection();
+                    }
+                }
+            } else if rect_contains(term_area, me.column, me.row) {
+                // Forwarded release for a mouse-aware hosted app.
+                let col = me.column.saturating_sub(term_area.x);
+                let row = me.row.saturating_sub(term_area.y);
+                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                    if term.wants_mouse() {
+                        let bytes = encode_mouse_button(term.mouse_encoding(), 0, col, row, false);
+                        let _ = term.session_mut().write_input(&bytes);
+                    }
                 }
             }
         }
@@ -458,6 +570,56 @@ fn handle_mouse(me: MouseEvent, area: Rect, state: &mut AppState, services: &Ser
         MouseEventKind::ScrollDown => handle_scroll(state, area, me, false),
         _ => {}
     }
+}
+
+/// Number of scrollback lines moved per auto-scroll tick during a drag.
+const AUTOSCROLL_LINES: usize = 1;
+
+/// While a selection drag rests at (or beyond) a vertical edge of the terminal
+/// viewport, scroll the view a step and extend the selection into the newly
+/// revealed region. Called once per event-loop tick so scrolling continues even
+/// when the pointer is held still (crossterm emits no events without movement).
+fn autoscroll_drag(state: &mut AppState, ui: &Ui, area: Rect) {
+    let Some(drag) = ui.drag.as_ref() else {
+        return;
+    };
+    let term_area = crate::tui::layout::compute(area).terminal;
+    if term_area.height == 0 {
+        return;
+    }
+    // Top edge (pointer at or above the first row) scrolls up into history;
+    // bottom edge (at or below the last row) scrolls back down.
+    let up = if drag.row <= term_area.y {
+        true
+    } else if drag.row >= term_area.bottom().saturating_sub(1) {
+        false
+    } else {
+        return;
+    };
+
+    let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) else {
+        return;
+    };
+    if term.selection().is_none() {
+        return;
+    }
+    if up {
+        term.scroll_up(AUTOSCROLL_LINES);
+    } else {
+        term.scroll_down(AUTOSCROLL_LINES);
+    }
+    // Pin the head to the edge row at the new offset so the selection grows to
+    // cover the revealed line.
+    let edge_row = if up {
+        0
+    } else {
+        term_area.height.saturating_sub(1)
+    };
+    let col = drag
+        .col
+        .saturating_sub(term_area.x)
+        .min(term_area.width.saturating_sub(1));
+    term.update_selection(edge_row, col);
 }
 
 /// Handle a mouse-wheel event over the terminal viewport. When the hosted agent
@@ -517,6 +679,35 @@ fn encode_mouse_report(
             let bx = cx.saturating_add(32).min(255) as u8;
             let by = cy.saturating_add(32).min(255) as u8;
             vec![0x1b, b'[', b'M', cb.saturating_add(32), bx, by]
+        }
+    }
+}
+
+/// Encode a mouse button press/drag/release report for a mouse-aware hosted
+/// application. `cb` is the xterm button code (0 = left, +32 = motion/drag);
+/// `pressed` distinguishes press/drag (`true`) from release (`false`). `col`/
+/// `row` are 0-based viewport cells (protocol coordinates are 1-based).
+fn encode_mouse_button(
+    encoding: vt100::MouseProtocolEncoding,
+    cb: u8,
+    col: u16,
+    row: u16,
+    pressed: bool,
+) -> Vec<u8> {
+    let cx = col.saturating_add(1);
+    let cy = row.saturating_add(1);
+    match encoding {
+        // SGR reports the same button code for release but terminate with 'm'.
+        vt100::MouseProtocolEncoding::Sgr => {
+            let end = if pressed { 'M' } else { 'm' };
+            format!("\x1b[<{cb};{cx};{cy}{end}").into_bytes()
+        }
+        // X10 has no release button code — release is reported as button 3.
+        _ => {
+            let code = if pressed { cb } else { 3 };
+            let bx = cx.saturating_add(32).min(255) as u8;
+            let by = cy.saturating_add(32).min(255) as u8;
+            vec![0x1b, b'[', b'M', code.saturating_add(32), bx, by]
         }
     }
 }
@@ -1075,8 +1266,10 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
         return;
     };
     if let Some(term) = tab.session.active_mut() {
-        // Typing/sending input snaps the view back to the live bottom, matching
-        // standard terminal behaviour when scrolled into local scrollback.
+        // Typing/sending input snaps the view back to the live bottom and drops
+        // any selection, matching standard terminal behaviour when scrolled into
+        // local scrollback.
+        term.clear_selection();
         term.scroll_to_bottom();
         let _ = term.session_mut().write_input(bytes);
     }

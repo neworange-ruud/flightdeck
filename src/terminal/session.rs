@@ -4,6 +4,7 @@
 //! Children may outlive the primary and are not persisted (SPECS §19).
 
 use crate::contracts::{FlightDeckError, ProcessState, PtyBackend, PtySession, PtySize, Result};
+use crate::tui::selection::{screen_row_to_rfb, Point, Selection};
 use std::path::Path;
 
 /// Scrollback lines kept by each terminal's VT parser.
@@ -23,6 +24,8 @@ pub struct Terminal {
     pub title: String,
     session: Box<dyn PtySession>,
     parser: vt100::Parser,
+    /// The active mouse text selection, if any (SPECS §20).
+    selection: Option<Selection>,
 }
 
 impl Terminal {
@@ -34,6 +37,7 @@ impl Terminal {
             title,
             session,
             parser: vt100::Parser::new(size.rows.max(1), size.cols.max(1), SCROLLBACK),
+            selection: None,
         }
     }
 
@@ -92,8 +96,108 @@ impl Terminal {
         self.parser.screen_mut().set_scrollback(0);
     }
 
-    /// Resize both the VT screen grid and the underlying PTY (SPECS §23).
+    // --- Mouse text selection (SPECS §20) ---------------------------------
+
+    /// The active selection, if any (for rendering the highlight).
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Whether a non-empty selection exists (something is actually highlighted).
+    pub fn has_selection(&self) -> bool {
+        self.selection.map(|s| !s.is_empty()).unwrap_or(false)
+    }
+
+    /// Clear any active selection.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Begin a selection at a visible screen cell (drag start).
+    pub fn begin_selection(&mut self, screen_row: u16, col: u16) {
+        let p = self.point_at(screen_row, col);
+        self.selection = Some(Selection::new(p));
+    }
+
+    /// Move the selection head to a visible screen cell (drag move). No-op if no
+    /// selection is in progress.
+    pub fn update_selection(&mut self, screen_row: u16, col: u16) {
+        let p = self.point_at(screen_row, col);
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = p;
+        }
+    }
+
+    /// Map a visible screen cell to a scroll-stable [`Point`], clamping to the
+    /// current screen bounds and offset.
+    fn point_at(&self, screen_row: u16, col: u16) -> Point {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let offset = screen.scrollback();
+        let row = screen_row.min(rows.saturating_sub(1));
+        let col = col.min(cols.saturating_sub(1));
+        Point {
+            rows_from_bottom: screen_row_to_rfb(row, rows, offset).max(0),
+            col,
+        }
+    }
+
+    /// Extract the currently-selected text, reading from scrollback as needed.
+    ///
+    /// Lines are joined with `\n` and trailing whitespace is trimmed per line.
+    /// Restores the viewport's scrollback offset before returning.
+    pub fn selected_text(&mut self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (rows, cols) = self.parser.screen().size();
+        let saved = self.parser.screen().scrollback();
+        let (first, last) = sel.first_last();
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut rfb = first.rows_from_bottom;
+        while rfb >= last.rows_from_bottom {
+            if let Some((c0, c1)) = sel.col_range_for_rfb(rfb, cols) {
+                // Bring this content line into view at the bottom-most row (the
+                // offset clamps internally for very old lines).
+                self.parser.screen_mut().set_scrollback(rfb.max(0) as usize);
+                let actual = self.parser.screen().scrollback();
+                let screen_row = (rows as i64 - 1) - rfb + actual as i64;
+                if (0..rows as i64).contains(&screen_row) {
+                    lines.push(self.read_row(screen_row as u16, c0, c1.min(cols.saturating_sub(1))));
+                }
+            }
+            rfb -= 1;
+        }
+
+        self.parser.screen_mut().set_scrollback(saved);
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    /// Read the cell contents of a visible `screen_row` from column `c0` to `c1`
+    /// inclusive, with trailing whitespace trimmed.
+    fn read_row(&self, screen_row: u16, c0: u16, c1: u16) -> String {
+        let screen = self.parser.screen();
+        let mut s = String::new();
+        for c in c0..=c1 {
+            let contents = screen.cell(screen_row, c).map(|cell| cell.contents());
+            match contents {
+                Some(text) if !text.is_empty() => s.push_str(text),
+                _ => s.push(' '),
+            }
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Resize both the VT screen grid and the underlying PTY (SPECS §23). The
+    /// active selection is dropped, as content reflows under a new width.
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
+        self.selection = None;
         self.parser
             .screen_mut()
             .set_size(size.rows.max(1), size.cols.max(1));
@@ -540,6 +644,80 @@ mod tests {
         term.process_output(b"\x1b[?1000h\x1b[?1006h");
         assert!(term.wants_mouse());
         assert_eq!(term.mouse_encoding(), vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    // §20: a drag selects text on the visible screen and extracts it.
+    #[test]
+    fn selects_and_extracts_visible_text() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "agent", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output(b"hello world\r\n");
+
+        // "hello world" is on the top screen row (row 0). Select cols 0..=4.
+        term.begin_selection(0, 0);
+        term.update_selection(0, 4);
+        assert!(term.has_selection());
+        assert_eq!(term.selected_text().as_deref(), Some("hello"));
+
+        // Extend across the whole word range; trailing blanks are trimmed.
+        term.update_selection(0, 40);
+        assert_eq!(term.selected_text().as_deref(), Some("hello world"));
+
+        term.clear_selection();
+        assert!(!term.has_selection());
+        assert_eq!(term.selected_text(), None);
+    }
+
+    // §20: a multi-line selection joins rows with newlines.
+    #[test]
+    fn selects_multiple_lines() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "agent", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output(b"line one\r\nline two\r\n");
+
+        // Rows 0 and 1 hold the two lines. Select from start of row 0 to end of
+        // row 1.
+        term.begin_selection(0, 0);
+        term.update_selection(1, 40);
+        assert_eq!(term.selected_text().as_deref(), Some("line one\nline two"));
+    }
+
+    // §20: a selection survives scrolling — it stays pinned to its content and
+    // can still be extracted after scrolling into history.
+    #[test]
+    fn selection_pinned_across_scroll() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "agent", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        for i in 0..40 {
+            term.process_output(format!("row {i:02}\r\n").as_bytes());
+        }
+        // Scroll up so older content is visible, select a line, then scroll
+        // further: the extracted text must be the same line.
+        term.scroll_up(5);
+        let row = 0u16; // top visible row at this offset
+        term.begin_selection(row, 0);
+        term.update_selection(row, 5);
+        let before = term.selected_text();
+        assert!(before.is_some());
+        term.scroll_up(3);
+        assert_eq!(term.selected_text(), before, "selection must stay pinned");
+        term.scroll_to_bottom();
+        assert_eq!(term.selected_text(), before, "even back at the bottom");
     }
 
     // §20: local scrollback scrolls up into history and snaps back to the bottom.
