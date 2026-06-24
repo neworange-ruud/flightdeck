@@ -13,6 +13,26 @@ agent status, and helps push branches for GitHub pull-request workflows.
 
 ## Quick start
 
+Install with Homebrew:
+
+```bash
+brew install neworange-ruud/tap/flightdeck
+```
+
+Or install directly from the latest GitHub Release:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
+```
+
+Update Homebrew installs with:
+
+```bash
+brew upgrade flightdeck
+```
+
+For direct installs, re-run the installer command above.
+
 ```bash
 cd /path/to/your/git/repo
 flightdeck
@@ -191,6 +211,34 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo run                                # run inside a git repo
 ```
+
+## Release
+
+Releases are built by `cargo-dist` in GitHub Actions when a version tag is
+pushed. To publish a release, install `dist` once if needed:
+
+```bash
+cargo install cargo-dist --version 0.32.0 --locked
+```
+
+Then run one command from a clean working tree:
+
+```bash
+./scripts/release 0.2.0
+```
+
+The script updates `Cargo.toml`, refreshes `Cargo.lock`, runs formatting,
+Clippy, tests, validates the cargo-dist plan, commits `Release v0.2.0`, tags it,
+and pushes the branch and tag. GitHub Actions then creates the GitHub Release,
+uploads the installer/artifacts/checksums, and publishes the Homebrew formula to
+`neworange-ruud/homebrew-tap`.
+
+Repository setup required for Homebrew publishing:
+
+- Create the `neworange-ruud/homebrew-tap` repo if it does not exist.
+- Add a `HOMEBREW_TAP_TOKEN` repository secret with permission to push to that
+  tap.
+- Ensure Actions has read/write workflow permissions for release creation.
 
 ## Manual smoke test (human, requires a real terminal)
 

@@ -218,11 +218,8 @@ mod tests {
         let area = full_terminal();
         let layout = compute(area);
         // top band (2) + child_tabs (1) + terminal (?) + info_bar (1) + status (1).
-        let expected_h = area.height
-            - TOP_BAND
-            - CHILD_TAB_BAR_HEIGHT
-            - INFO_BAR_HEIGHT
-            - STATUS_BAR_HEIGHT;
+        let expected_h =
+            area.height - TOP_BAND - CHILD_TAB_BAR_HEIGHT - INFO_BAR_HEIGHT - STATUS_BAR_HEIGHT;
         assert_eq!(layout.terminal.height, expected_h);
         assert_eq!(layout.terminal.y, TOP_BAND + CHILD_TAB_BAR_HEIGHT);
     }

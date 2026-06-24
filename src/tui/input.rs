@@ -166,17 +166,19 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
         // Alt-Down: next Agent Tab.
         KeyCode::Down if alt => Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))),
         // Alt-Left: previous terminal tab (cycles agent + shells).
-        KeyCode::Left if alt => {
-            Some(KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev)))
-        }
+        KeyCode::Left if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
+            Selector::Prev,
+        ))),
         // Alt-Right: next terminal tab (cycles agent + shells).
-        KeyCode::Right if alt => {
-            Some(KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)))
-        }
+        KeyCode::Right if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
+            Selector::Next,
+        ))),
         // Alt-1..Alt-9: jump to Agent Tab by index.
         KeyCode::Char(c @ '1'..='9') if alt => {
             let idx = (c as usize) - ('1' as usize);
-            Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(idx))))
+            Some(KeyAction::Dispatch(Command::SwitchAgentTab(
+                Selector::Index(idx),
+            )))
         }
         _ => None,
     }

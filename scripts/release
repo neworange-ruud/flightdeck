@@ -1,0 +1,81 @@
+#!/usr/bin/env sh
+set -eu
+
+usage() {
+  printf 'Usage: %s <version>\n' "$0" >&2
+  printf 'Example: %s 0.2.0\n' "$0" >&2
+}
+
+if [ "${1:-}" = "" ]; then
+  usage
+  exit 2
+fi
+
+version="${1#v}"
+tag="v${version}"
+
+case "$version" in
+  *[!0-9A-Za-z.+-]*|""|*.*.*.*)
+    printf 'Invalid SemVer-ish version: %s\n' "$version" >&2
+    exit 2
+    ;;
+  *.*.*) ;;
+  *)
+    printf 'Version must include major.minor.patch, got: %s\n' "$version" >&2
+    exit 2
+    ;;
+esac
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_cmd cargo
+require_cmd dist
+require_cmd git
+require_cmd perl
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  printf 'Working tree must be clean before starting a release.\n' >&2
+  exit 1
+fi
+
+if git rev-parse "$tag" >/dev/null 2>&1; then
+  printf 'Tag already exists locally: %s\n' "$tag" >&2
+  exit 1
+fi
+
+if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+  printf 'Tag already exists on origin: %s\n' "$tag" >&2
+  exit 1
+fi
+
+current_version=$(cargo metadata --no-deps --format-version 1 | perl -0ne 'print $1 if /"name":"flightdeck","version":"([^"]+)"/')
+if [ "$current_version" = "$version" ]; then
+  printf 'Cargo.toml already has version %s; continuing.\n' "$version"
+else
+  VERSION="$version" perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m' Cargo.toml
+fi
+
+cargo metadata --format-version 1 >/dev/null
+
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+dist generate --check
+dist plan --tag "$tag" --allow-dirty
+
+git add Cargo.toml Cargo.lock
+if git diff --cached --quiet; then
+  printf 'No version-file changes to commit; tagging current HEAD.\n'
+else
+  git commit -m "Release ${tag}"
+fi
+git tag -a "$tag" -m "Release ${tag}"
+git push origin HEAD
+git push origin "$tag"
+
+printf '\nRelease %s pushed. GitHub Actions will build artifacts and publish the GitHub Release.\n' "$tag"

@@ -53,10 +53,7 @@ pub fn rfb_to_screen_row(rfb: i64, rows: u16, offset: usize) -> i64 {
 impl Selection {
     /// Begin a selection collapsed onto a single point.
     pub fn new(p: Point) -> Self {
-        Selection {
-            anchor: p,
-            head: p,
-        }
+        Selection { anchor: p, head: p }
     }
 
     /// Whether the selection covers nothing (anchor and head coincide).

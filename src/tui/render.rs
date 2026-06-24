@@ -1171,7 +1171,10 @@ mod tests {
     #[test]
     fn header_uses_wide_logo_when_space_allows() {
         let flat = flatten(&header_line(200));
-        assert!(flat.contains("F · L · I · G · H · T"), "wide brand: {flat:?}");
+        assert!(
+            flat.contains("F · L · I · G · H · T"),
+            "wide brand: {flat:?}"
+        );
         assert!(flat.contains("██████"), "block flourish: {flat:?}");
     }
 
@@ -1183,7 +1186,10 @@ mod tests {
             flat.contains("F·L·I·G·H·T·D·E·C·K"),
             "narrow brand: {flat:?}"
         );
-        assert!(!flat.contains("F · L"), "must not be the wide brand: {flat:?}");
+        assert!(
+            !flat.contains("F · L"),
+            "must not be the wide brand: {flat:?}"
+        );
         assert!(flat.contains("██████"), "block flourish: {flat:?}");
     }
 
@@ -1200,8 +1206,12 @@ mod tests {
         term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
-        let row0: String = (0..120).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
-        let row1: String = (0..120).map(|x| buffer[(x, 1)].symbol().to_string()).collect();
+        let row0: String = (0..120)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        let row1: String = (0..120)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
         // The logo (block flourish + brand) sits on the very first row.
         assert!(row0.contains("██████"), "logo row: {row0:?}");
         assert!(row0.contains("F · L · I"), "brand on logo row: {row0:?}");
@@ -1311,7 +1321,9 @@ mod tests {
             .unwrap();
         let buffer = term.backend().buffer().clone();
         // Info bar is one row above the status bar (y = 22); status bar is y = 23.
-        let info_row: String = (0..80).map(|x| buffer[(x, 22)].symbol().to_string()).collect();
+        let info_row: String = (0..80)
+            .map(|x| buffer[(x, 22)].symbol().to_string())
+            .collect();
         assert!(
             info_row.contains("flightdeck/tab0"),
             "info bar row should show the branch, got: {info_row:?}"

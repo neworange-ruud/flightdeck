@@ -165,7 +165,11 @@ impl Terminal {
                 let actual = self.parser.screen().scrollback();
                 let screen_row = (rows as i64 - 1) - rfb + actual as i64;
                 if (0..rows as i64).contains(&screen_row) {
-                    lines.push(self.read_row(screen_row as u16, c0, c1.min(cols.saturating_sub(1))));
+                    lines.push(self.read_row(
+                        screen_row as u16,
+                        c0,
+                        c1.min(cols.saturating_sub(1)),
+                    ));
                 }
             }
             rfb -= 1;

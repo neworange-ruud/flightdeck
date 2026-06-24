@@ -62,6 +62,11 @@ const GIT_REFRESH_EVERY: u64 = 40;
 /// real terminal. Teardown is guaranteed in all paths (SPECS §25): the terminal
 /// is restored and every tab's sessions are terminated before returning.
 pub fn run() -> Result<()> {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("flightdeck {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Subcommand dispatch. `setup-status` installs the opt-in precise status
     // hooks/plugin and exits without launching the TUI (SPECS §24, Layer 2).
     if std::env::args().nth(1).as_deref() == Some("setup-status") {
@@ -1452,8 +1457,7 @@ mod tests {
             },
         );
 
-        let mut state =
-            AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
+        let mut state = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
         let mut ui = Ui::default();
 
         // Starting the flow shows the agent picker (more than one agent).

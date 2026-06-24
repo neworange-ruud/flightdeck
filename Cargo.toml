@@ -2,6 +2,13 @@
 name = "flightdeck"
 version = "0.1.0"
 edition = "2021"
+description = "A macOS-first terminal UI for orchestrating multiple local AI coding agents in isolated Git worktrees."
+repository = "https://github.com/neworange-ruud/flightdeck"
+homepage = "https://github.com/neworange-ruud/flightdeck"
+readme = "README.md"
+license = "MIT"
+keywords = ["ai", "agents", "git", "tui", "worktree"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "flightdeck"
@@ -24,3 +31,8 @@ vt100 = "0.16.2"
 [dev-dependencies]
 insta = "1.48.0"
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

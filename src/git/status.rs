@@ -272,10 +272,7 @@ mod tests {
     fn collect_status_reports_change_counts() {
         let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
         let wt = Path::new("/repo/.flightdeck/worktrees/feat");
-        git.set_porcelain_at(
-            wt,
-            ["?? a.rs", " M b.rs", "M  c.rs", " D d.rs"],
-        );
+        git.set_porcelain_at(wt, ["?? a.rs", " M b.rs", "M  c.rs", " D d.rs"]);
         let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
         assert!(status.dirty);
         assert_eq!(status.changes.added, 1);
