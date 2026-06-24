@@ -618,14 +618,17 @@ impl AppState {
     /// persistent warning; otherwise check preconditions and merge only when
     /// allowed; never auto-resolve conflicts.
     fn cmd_finish_merge(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
-        let Some(tab) = self.selected() else {
+        let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
+        let tab = &self.tabs[idx];
         let agent_branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
         let agent_worktree =
             to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
         let base_worktree = self.repo_root.clone();
+        // A running primary agent does NOT block the merge — "Finish" stops it and
+        // removes the worktree afterwards. We only track it to inform the prompt.
         let primary_running = tab.session.primary_state() == ProcessState::Running;
 
         // SPECS §13: if base is dirty, local merge is disabled — record the
@@ -642,25 +645,52 @@ impl AppState {
             agent_branch: &agent_branch,
             base_worktree: &base_worktree,
             agent_worktree: &agent_worktree,
-            primary_running,
-            user_confirmed: confirm,
         };
 
+        // Technical preconditions (both worktrees clean, both branches exist).
         match check_merge_preconditions(services.git, &req)? {
             MergeDecision::Refused(reason) => return Ok(Effect::Refused(reason)),
             MergeDecision::Allowed => {}
+        }
+
+        // SPECS §15: the user must explicitly confirm. The first dispatch asks;
+        // the UI re-dispatches with `confirm: true`.
+        if !confirm {
+            return Ok(Effect::MergeConfirm {
+                agent_branch,
+                base_branch,
+                primary_running,
+            });
         }
 
         let outcome = merge_back(services.git, &req)?;
         if outcome.conflicted {
             return Ok(Effect::Refused(outcome.message));
         }
-        if outcome.merged {
-            Ok(Effect::Message(format!(
-                "Merged {agent_branch} into {base_branch}."
-            )))
-        } else {
-            Ok(Effect::Refused(outcome.message))
+        if !outcome.merged {
+            return Ok(Effect::Refused(outcome.message));
+        }
+
+        // Merge succeeded: stop the agent's session and remove its worktree, then
+        // drop the tab (the work now lives on the base branch). Force removal — the
+        // merge is already committed onto base, so nothing is lost.
+        let _ = self.tabs[idx].session.terminate_all();
+        match remove_worktree_if_safe(services.git, services.fs, &agent_worktree, true) {
+            Ok(()) => {
+                self.tabs.remove(idx);
+                self.fix_selection_after_removal(idx);
+                self.persist(services)?;
+                Ok(Effect::Message(format!(
+                    "Merged {agent_branch} into {base_branch} and removed the worktree."
+                )))
+            }
+            Err(e) => {
+                // The merge landed; only cleanup failed. Surface it but keep the tab.
+                self.persist(services)?;
+                Ok(Effect::Warning(format!(
+                    "Merged {agent_branch} into {base_branch}, but removing the worktree failed: {e}"
+                )))
+            }
         }
     }
 
@@ -1529,14 +1559,89 @@ mod tests {
             &svc,
         )
         .unwrap();
-        // Stop the primary so it is not "running" (precondition).
+        // Stop the primary so it is not "running".
         handle.set_state(ProcessState::Stopped);
-        // Both worktrees clean (default).
+        // Both worktrees clean (default). Confirm performs the merge and cleanup.
         let effect = app
             .dispatch(Command::FinishLocalMerge { confirm: true }, &svc)
             .unwrap();
         assert!(matches!(effect, Effect::Message(_)));
         assert_eq!(git.merges().len(), 1);
+        // On success the worktree is removed and the tab dropped.
+        assert_eq!(git.removed_worktrees().len(), 1);
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn local_merge_works_while_primary_running() {
+        // A running primary agent no longer blocks the merge — "Finish" stops it
+        // and removes the worktree.
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        // Primary is running — must NOT block the merge.
+        handle.set_state(ProcessState::Running);
+        let effect = app
+            .dispatch(Command::FinishLocalMerge { confirm: true }, &svc)
+            .unwrap();
+        assert!(matches!(effect, Effect::Message(_)));
+        assert_eq!(git.merges().len(), 1);
+        assert_eq!(git.removed_worktrees().len(), 1);
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn finish_merge_without_confirm_asks_for_confirmation() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        handle.set_state(ProcessState::Running);
+        // First dispatch (confirm: false) asks rather than merging.
+        let effect = app
+            .dispatch(Command::FinishLocalMerge { confirm: false }, &svc)
+            .unwrap();
+        match effect {
+            Effect::MergeConfirm {
+                primary_running, ..
+            } => assert!(primary_running),
+            other => panic!("expected MergeConfirm, got {other:?}"),
+        }
+        // Nothing was merged or removed yet.
+        assert!(git.merges().is_empty());
+        assert!(git.removed_worktrees().is_empty());
+        assert_eq!(app.tabs.len(), 1);
     }
 
     // --- §26: push warning + confirm ------------------------------------

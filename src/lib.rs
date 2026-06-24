@@ -288,6 +288,13 @@ enum Prompt {
     PushConfirm,
     /// Confirm abandoning a worktree that has uncommitted changes (SPECS §5/§15).
     AbandonConfirm,
+    /// Confirm a local merge-back; on success the worktree is removed and the
+    /// tab closed, stopping the agent if it is still running (SPECS §15).
+    MergeConfirm {
+        agent_branch: String,
+        base_branch: String,
+        primary_running: bool,
+    },
 }
 
 /// An in-progress mouse text selection drag over the terminal viewport (SPECS
@@ -843,6 +850,20 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         Effect::AbandonWarning => {
             start_prompt(ui, Prompt::AbandonConfirm);
         }
+        Effect::MergeConfirm {
+            agent_branch,
+            base_branch,
+            primary_running,
+        } => {
+            start_prompt(
+                ui,
+                Prompt::MergeConfirm {
+                    agent_branch,
+                    base_branch,
+                    primary_running,
+                },
+            );
+        }
         Effect::CloseTabOptions(opts) => {
             start_prompt(
                 ui,
@@ -927,6 +948,20 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
         Prompt::AbandonConfirm => {
             "Worktree has uncommitted changes — discard them? [y] abandon (force)  [n] cancel  (Esc cancel)"
                 .to_string()
+        }
+        Prompt::MergeConfirm {
+            agent_branch,
+            base_branch,
+            primary_running,
+        } => {
+            let running = if *primary_running {
+                " (stops the running agent)"
+            } else {
+                ""
+            };
+            format!(
+                "Merge {agent_branch} into {base_branch} then remove the worktree{running}? [y] merge  [n] cancel  (Esc cancel)"
+            )
         }
     }
 }
@@ -1097,6 +1132,14 @@ fn handle_prompt_key(
             KeyCode::Char('n') => ui.clear(),
             _ => ui.prompt = Some(pstate),
         },
+        Prompt::MergeConfirm { .. } => match key.code {
+            KeyCode::Char('y') => {
+                let result = state.dispatch(Command::FinishLocalMerge { confirm: true }, services);
+                finish_prompt(result, ui);
+            }
+            KeyCode::Char('n') => ui.clear(),
+            _ => ui.prompt = Some(pstate),
+        },
     }
 
     Ok(())
@@ -1127,6 +1170,18 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
         }
         Effect::PushWarning(_) => start_prompt(ui, Prompt::PushConfirm),
         Effect::AbandonWarning => start_prompt(ui, Prompt::AbandonConfirm),
+        Effect::MergeConfirm {
+            agent_branch,
+            base_branch,
+            primary_running,
+        } => start_prompt(
+            ui,
+            Prompt::MergeConfirm {
+                agent_branch,
+                base_branch,
+                primary_running,
+            },
+        ),
         Effect::CloseTabOptions(opts) => start_prompt(
             ui,
             Prompt::CloseTab {
@@ -1544,6 +1599,25 @@ mod tests {
             ui.prompt.as_ref().unwrap().prompt,
             Prompt::AbandonConfirm
         ));
+    }
+
+    #[test]
+    fn effect_merge_confirm_opens_merge_prompt() {
+        let mut ui = Ui::default();
+        apply_effect_no_state(
+            Effect::MergeConfirm {
+                agent_branch: "flightdeck/feat".to_string(),
+                base_branch: "main".to_string(),
+                primary_running: true,
+            },
+            &mut ui,
+        );
+        let pstate = ui.prompt.as_ref().expect("merge prompt set");
+        assert!(matches!(pstate.prompt, Prompt::MergeConfirm { .. }));
+        // The hint names both branches and warns about stopping the agent.
+        assert!(pstate.hint.contains("flightdeck/feat"));
+        assert!(pstate.hint.contains("main"));
+        assert!(pstate.hint.contains("stops the running agent"));
     }
 
     #[test]

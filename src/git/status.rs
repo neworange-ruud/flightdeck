@@ -127,18 +127,17 @@ pub struct MergeRequest<'a> {
     pub agent_branch: &'a str,
     pub base_worktree: &'a Path,
     pub agent_worktree: &'a Path,
-    pub primary_running: bool,
-    pub user_confirmed: bool,
 }
 
 /// The §13 message shown when the base worktree is dirty and local merge is
 /// therefore disabled.
 const BASE_DIRTY_MESSAGE: &str = "Base worktree has uncommitted changes. Local merge is disabled.\nRecommended action: push this branch and create a PR instead.";
 
-/// Check all local merge-back preconditions (SPECS §15): both worktrees clean,
-/// both branches exist, no running primary agent unless explicitly stopped,
-/// user confirmed. Refuses with a clear reason otherwise; base-dirty disables
-/// merge entirely (SPECS §13).
+/// Check the technical local merge-back preconditions (SPECS §15): both
+/// worktrees clean and both branches exist. Refuses with a clear reason
+/// otherwise; base-dirty disables merge entirely (SPECS §13). A running primary
+/// agent does NOT block the merge — "Finish" stops the agent and removes the
+/// worktree after merging. User confirmation is handled at the command layer.
 pub fn check_merge_preconditions(
     git: &dyn GitExecutor,
     req: &MergeRequest<'_>,
@@ -167,18 +166,6 @@ pub fn check_merge_preconditions(
             "Agent branch '{}' does not exist.",
             req.agent_branch
         )));
-    }
-    // No running primary agent unless explicitly stopped.
-    if req.primary_running {
-        return Ok(MergeDecision::Refused(
-            "Primary agent is still running; stop it before merging.".to_string(),
-        ));
-    }
-    // User explicitly confirmed.
-    if !req.user_confirmed {
-        return Ok(MergeDecision::Refused(
-            "Merge not confirmed by the user.".to_string(),
-        ));
     }
     Ok(MergeDecision::Allowed)
 }
@@ -232,8 +219,6 @@ mod tests {
             agent_branch,
             base_worktree: base_wt,
             agent_worktree: agent_wt,
-            primary_running: false,
-            user_confirmed: true,
         }
     }
 
@@ -362,31 +347,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_refused_when_primary_running() {
+    fn merge_allowed_when_primary_running() {
+        // A running primary agent no longer blocks the technical preconditions;
+        // "Finish" stops the agent and removes the worktree after merging.
         let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
         let base_wt = Path::new("/repo");
         let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
-        let mut r = req("main", "flightdeck/feat", base_wt, agent_wt);
-        r.primary_running = true;
-        let decision = check_merge_preconditions(&git, &r).unwrap();
-        match decision {
-            MergeDecision::Refused(msg) => assert!(msg.contains("Primary agent")),
-            MergeDecision::Allowed => panic!("expected refusal"),
-        }
-    }
-
-    #[test]
-    fn merge_refused_when_not_confirmed() {
-        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
-        let base_wt = Path::new("/repo");
-        let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
-        let mut r = req("main", "flightdeck/feat", base_wt, agent_wt);
-        r.user_confirmed = false;
-        let decision = check_merge_preconditions(&git, &r).unwrap();
-        match decision {
-            MergeDecision::Refused(msg) => assert!(msg.contains("confirm")),
-            MergeDecision::Allowed => panic!("expected refusal"),
-        }
+        let decision =
+            check_merge_preconditions(&git, &req("main", "flightdeck/feat", base_wt, agent_wt))
+                .unwrap();
+        assert_eq!(decision, MergeDecision::Allowed);
     }
 
     #[test]

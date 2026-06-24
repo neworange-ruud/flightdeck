@@ -90,8 +90,6 @@ fn merge_refused_when_base_worktree_dirty() {
         agent_branch: branch,
         base_worktree: &root,
         agent_worktree: &agent_wt,
-        primary_running: false,
-        user_confirmed: true,
     };
     let decision = check_merge_preconditions(&git_cli, &req).expect("check");
     match decision {
@@ -124,8 +122,6 @@ fn merge_allowed_and_succeeds_when_all_preconditions_pass() {
         agent_branch: branch,
         base_worktree: &root,
         agent_worktree: &agent_wt,
-        primary_running: false,
-        user_confirmed: true,
     };
     assert_eq!(
         check_merge_preconditions(&git_cli, &req).expect("check"),
@@ -242,8 +238,6 @@ fn conflicting_merge_is_reported_and_not_auto_resolved() {
         agent_branch: branch,
         base_worktree: &root,
         agent_worktree: &agent_wt,
-        primary_running: false,
-        user_confirmed: true,
     };
     // Preconditions pass (both clean, both branches exist, confirmed).
     assert_eq!(

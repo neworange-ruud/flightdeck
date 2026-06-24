@@ -175,6 +175,18 @@ pub enum Effect {
     /// The selected tab's worktree has uncommitted changes; the UI must confirm
     /// before re-dispatching `AbandonWorktree { confirm: true }` (SPECS §5/§15).
     AbandonWarning,
+    /// The merge is ready and awaits explicit confirmation; the UI confirms then
+    /// re-dispatches `FinishLocalMerge { confirm: true }` (SPECS §15). On success
+    /// the worktree is removed and the tab closed, so a running agent is stopped.
+    MergeConfirm {
+        /// The agent branch being merged.
+        agent_branch: String,
+        /// The base branch it merges into.
+        base_branch: String,
+        /// Whether the selected tab's primary agent is still running (it will be
+        /// stopped as part of the post-merge cleanup).
+        primary_running: bool,
+    },
     /// The branch already existed and was attached to (surfaced, never silent, §11).
     AttachedExisting {
         /// The attached branch name.
