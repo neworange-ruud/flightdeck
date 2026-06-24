@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::app::modes::InputMode;
-use crate::app::state::AppState;
+use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
 use crate::tui::layout;
 use crate::tui::palette::CommandPalette;
@@ -189,7 +189,7 @@ pub fn draw(
     frame.render_widget(divider, ml.divider);
     draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
     draw_child_tab_bar(frame, state, ml.child_tabs);
-    draw_terminal_viewport(frame, state, ml.terminal);
+    draw_terminal_viewport(frame, state, ml.terminal, now_ms);
     let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
     frame.render_widget(info_divider, ml.info_divider);
     draw_info_bar(frame, state, cache, ml.info_bar);
@@ -318,6 +318,25 @@ pub fn draw_sidebar(
             Style::default().fg(Color::White)
         };
         let marker = if selected { "▸ " } else { "  " };
+
+        // A tab whose worktree is still being materialized on a background
+        // worker shows an animated spinner instead of a process/status line, so
+        // the user always sees that something is happening (SPECS §16/§17).
+        if tab.phase == TabPhase::Creating {
+            let spin = Style::default().fg(Color::Cyan);
+            lines.push(Line::from(vec![
+                Span::styled(marker, name_style),
+                Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
+                Span::styled(tab.meta.name.clone(), name_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("creating worktree…", spin),
+            ]));
+            // Keep the block height uniform (divider/name/status/git rows).
+            lines.push(Line::from(Span::raw("")));
+            continue;
+        }
         // A colour-coded status dot on the name line so idle (green) vs in
         // progress (blue) vs error (red) is glanceable per tab (SPECS §24).
         // Manual override takes visual priority but never hides the dot.
@@ -361,6 +380,13 @@ pub fn draw_sidebar(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A braille spinner frame chosen from the wall clock (≈12.5 fps), used to
+/// animate in-progress work (e.g. a tab whose worktree is being created).
+pub fn spinner_frame(now_ms: u64) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[((now_ms / 80) % FRAMES.len() as u64) as usize]
 }
 
 /// Collapse an interpreted status to a glanceable sidebar label + colour
@@ -482,7 +508,7 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Draw the active terminal viewport (SPECS §20): the VT100 screen of the
 /// selected tab's active terminal (primary agent, or the selected child shell),
 /// rendered cell-by-cell from its parser.
-pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect) {
+pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
     let Some(tab) = state.selected() else {
         let p = Paragraph::new(
             "\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.",
@@ -491,6 +517,30 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect) {
         frame.render_widget(p, area);
         return;
     };
+
+    // While the worktree is being created on a background worker there is no
+    // session yet: show an animated progress message so the UI never looks
+    // frozen (SPECS §16/§17).
+    if tab.phase == TabPhase::Creating {
+        let msg = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(now_ms)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("Creating worktree for {}…", tab.meta.branch),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]))
+        .alignment(Alignment::Center);
+        let inner = Rect {
+            y: area.y + area.height / 2,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(msg, inner);
+        return;
+    }
 
     let Some(term) = tab.session.active() else {
         let p =
