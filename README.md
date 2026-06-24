@@ -7,6 +7,8 @@ launches a selected AI coding agent inside each one, lets you switch between
 parallel agent sessions, open extra child shells in each worktree, tracks Git and
 agent status, and helps push branches for GitHub pull-request workflows.
 
+![FlightDeck screenshot](specs/screenshot.png)
+
 ```text
 1 Agent Tab = 1 Worktree = 1 Branch = 1 Primary Agent Process
 ```
