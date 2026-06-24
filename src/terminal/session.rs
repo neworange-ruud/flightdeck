@@ -57,6 +57,41 @@ impl Terminal {
         self.parser.screen()
     }
 
+    /// Whether the hosted application has enabled xterm mouse reporting. When
+    /// true, mouse events (e.g. wheel scroll) should be forwarded to the PTY so
+    /// the app's own scroll region / scrollbar responds, exactly as in a real
+    /// terminal emulator (SPECS §20).
+    pub fn wants_mouse(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    /// The mouse-report encoding the hosted application expects.
+    pub fn mouse_encoding(&self) -> vt100::MouseProtocolEncoding {
+        self.parser.screen().mouse_protocol_encoding()
+    }
+
+    /// Scroll the viewport `lines` rows up into the VT100 scrollback. Used for
+    /// plain (non-mouse-aware) output; clamped to the available scrollback.
+    pub fn scroll_up(&mut self, lines: usize) {
+        let cur = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(cur.saturating_add(lines));
+    }
+
+    /// Scroll the viewport `lines` rows back down toward the live bottom.
+    pub fn scroll_down(&mut self, lines: usize) {
+        let cur = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(cur.saturating_sub(lines));
+    }
+
+    /// Snap the viewport back to the live bottom (scrollback offset 0).
+    pub fn scroll_to_bottom(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
     /// Resize both the VT screen grid and the underlying PTY (SPECS §23).
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
         self.parser
@@ -164,6 +199,23 @@ impl Session {
     /// Focus the primary agent terminal (clear any child selection, SPECS §19).
     pub fn focus_primary(&mut self) {
         self.selected_child = None;
+    }
+
+    /// The currently active terminal: the selected child shell, or the primary
+    /// agent when no child is selected (SPECS §19, §20).
+    pub fn active(&self) -> Option<&Terminal> {
+        match self.selected_child {
+            Some(c) => self.children.get(c),
+            None => self.primary.as_ref(),
+        }
+    }
+
+    /// Mutable access to the currently active terminal (see [`Session::active`]).
+    pub fn active_mut(&mut self) -> Option<&mut Terminal> {
+        match self.selected_child {
+            Some(c) => self.children.get_mut(c),
+            None => self.primary.as_mut(),
+        }
     }
 
     /// Number of child terminals.
@@ -448,6 +500,75 @@ mod tests {
         session.ctrl_c_primary().unwrap();
         session.ctrl_c_all().unwrap();
         session.terminate_all().unwrap();
+    }
+
+    // §20: `active` follows the child selection (primary when none selected).
+    #[test]
+    fn active_terminal_follows_selection() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "opencode", &[], Path::new(CWD), sz())
+            .unwrap();
+        session
+            .spawn_child(&pty, "zsh", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        // A child is selected after spawning it.
+        assert_eq!(session.active().unwrap().kind, TerminalKind::Child);
+        session.focus_primary();
+        assert_eq!(session.active().unwrap().kind, TerminalKind::Primary);
+        assert!(session.active_mut().is_some());
+    }
+
+    // §20: a TUI that enables xterm mouse reporting is detected, with encoding.
+    #[test]
+    fn detects_mouse_mode_and_encoding() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "opencode", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        let term = session.active_mut().unwrap();
+        assert!(!term.wants_mouse());
+        // Enable mouse tracking (1000) with SGR encoding (1006), as a full-screen
+        // TUI like opencode does.
+        term.process_output(b"\x1b[?1000h\x1b[?1006h");
+        assert!(term.wants_mouse());
+        assert_eq!(term.mouse_encoding(), vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    // §20: local scrollback scrolls up into history and snaps back to the bottom.
+    #[test]
+    fn scrolls_local_scrollback() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "opencode", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        let term = session.active_mut().unwrap();
+        // Feed more lines than the 24-row viewport so scrollback accumulates.
+        for i in 0..40 {
+            term.process_output(format!("line {i}\r\n").as_bytes());
+        }
+        assert_eq!(term.screen().scrollback(), 0);
+
+        term.scroll_up(3);
+        assert_eq!(term.screen().scrollback(), 3);
+        term.scroll_down(1);
+        assert_eq!(term.screen().scrollback(), 2);
+        term.scroll_to_bottom();
+        assert_eq!(term.screen().scrollback(), 0);
+
+        // Scrolling down at the bottom is a no-op (saturating).
+        term.scroll_down(5);
+        assert_eq!(term.screen().scrollback(), 0);
     }
 
     // §26: handles failed process start (spawn_primary surfaces Err).

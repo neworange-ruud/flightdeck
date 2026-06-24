@@ -633,16 +633,18 @@ impl PtySession for FakePtySession {
 // FakeClock — fixed time
 // ===========================================================================
 
-/// [`Clock`] returning a fixed timestamp.
+/// [`Clock`] returning a fixed timestamp and a settable millisecond counter.
 #[derive(Debug, Clone)]
 pub struct FakeClock {
     now: String,
+    millis: Arc<Mutex<u64>>,
 }
 
 impl Default for FakeClock {
     fn default() -> Self {
         FakeClock {
             now: "2026-01-01T00:00:00Z".to_string(),
+            millis: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -650,13 +652,30 @@ impl Default for FakeClock {
 impl FakeClock {
     /// New clock with a custom fixed timestamp.
     pub fn new(now: impl Into<String>) -> Self {
-        FakeClock { now: now.into() }
+        FakeClock {
+            now: now.into(),
+            millis: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Set the value returned by [`Clock::now_millis`].
+    pub fn set_millis(&self, millis: u64) {
+        *self.millis.lock().unwrap() = millis;
+    }
+
+    /// Advance the millisecond counter by `delta`.
+    pub fn advance_millis(&self, delta: u64) {
+        *self.millis.lock().unwrap() += delta;
     }
 }
 
 impl Clock for FakeClock {
     fn now_iso8601(&self) -> String {
         self.now.clone()
+    }
+
+    fn now_millis(&self) -> u64 {
+        *self.millis.lock().unwrap()
     }
 }
 

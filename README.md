@@ -112,6 +112,47 @@ tab (`agent | shell 1 | …`) to switch terminals.
   drift, and the base branch. It reflects the tab's worktree regardless of
   whether the agent or a shell is focused.
 
+## Agent status indicators
+
+Every Agent Tab shows its agent's live status — a colour-coded **dot** next to
+the tab name plus a `proc: <process> | <status>` line in the sidebar. The
+minimum signal is **idle vs in progress**, and it works for **all** agents
+(OpenCode, Claude Code, Codex CLI) with **zero setup**:
+
+- 🟢 **working** — the agent is actively producing output (in progress).
+- ⚪ **idle** — the process is up but quiet (finished its turn / waiting on you).
+- 🔵 manual override (`Ctrl-s`) — shown in cyan, never hides the process state.
+
+This baseline is purely **output-activity based**: FlightDeck watches each
+agent's terminal and flips a tab to `idle` once output has been silent past a
+short threshold, back to `working` the moment it resumes. Nothing is installed
+into the agents.
+
+### Optional: precise status (waiting / needs-attention / completed)
+
+For exact `waiting` / `completed` signals (e.g. light up the moment an agent
+asks for confirmation, rather than after the silence timeout), run:
+
+```bash
+flightdeck setup-status
+```
+
+This writes ready-to-use, self-contained hook/plugin artifacts to
+`.flightdeck/integrations/` and adds `.flightdeck/agent-status` to `.gitignore`.
+Each agent's hook writes a keyword (`working`/`idle`/`waiting`) to
+`<worktree>/.flightdeck/agent-status`, which FlightDeck polls; a fresh hook
+signal is shown immediately yet is still superseded by later output activity, so
+agents that only signal turn-completion (Codex) still behave correctly. The
+hooks are gated on `.flightdeck/` existing, so they're a no-op outside FlightDeck
+worktrees. Wire them per the generated `README.md`:
+
+- **Claude Code** — merge `claude-code.settings.json` into `~/.claude/settings.json`
+  (`UserPromptSubmit`→working, `Stop`/`StopFailure`→idle, `Notification`→waiting).
+- **Codex CLI** — append `codex-config.toml` to `~/.codex/config.toml`
+  (`UserPromptSubmit`→working, `Stop`→idle; `notify` fallback for older builds).
+- **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
+  (`session.idle`→idle, message activity→working, permission prompt→waiting).
+
 ## Architecture
 
 Business logic is separated from the TUI and fully testable. Git, the

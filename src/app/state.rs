@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agents::adapter::{build_launch, validate_agent};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::status::{classify_output, combine_status, DisplayStatus};
+use crate::agents::status::{classify_output, combine_status, running_status, DisplayStatus};
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
@@ -54,9 +54,22 @@ pub struct RuntimeTab {
     pub meta: TabState,
     /// The live terminal session (one primary + N children). Not persisted.
     pub session: Session,
-    /// Cached interpreted status from the latest output classification, if any.
-    /// Combined with process state + manual override for display (SPECS §24).
+    /// Cached interpreted status from the latest output classification or hook
+    /// signal, if any. Combined with process state + activity + manual override
+    /// for display (SPECS §24).
     pub interpreted: Option<InterpretedStatus>,
+    /// Clock-millis when `interpreted` was last set (for sticky-signal logic).
+    pub interpreted_at_ms: Option<u64>,
+    /// Clock-millis of the most recent PTY output from the primary agent. Drives
+    /// the universal idle/working heuristic (SPECS §24).
+    pub last_activity_ms: Option<u64>,
+    /// Absolute path to this tab's agent status file, written by the agent's
+    /// status hook/plugin (Layer 2, opt-in) and polled by FlightDeck. `None`
+    /// until the agent is spawned.
+    pub status_file: Option<PathBuf>,
+    /// Last raw status-file content applied, used to ignore unchanged re-reads so
+    /// each hook event registers as a single fresh signal.
+    pub status_file_seen: Option<String>,
 }
 
 impl RuntimeTab {
@@ -67,6 +80,10 @@ impl RuntimeTab {
             meta,
             session: Session::new(),
             interpreted: None,
+            interpreted_at_ms: None,
+            last_activity_ms: None,
+            status_file: None,
+            status_file_seen: None,
         }
     }
 
@@ -76,15 +93,60 @@ impl RuntimeTab {
     }
 
     /// The combined, display-ready status (SPECS §24): live process state +
-    /// cached interpreted status + manual override. Manual takes visual priority
-    /// but never hides process state.
-    pub fn display_status(&self) -> DisplayStatus {
+    /// activity-derived idle/working + cached signal + manual override. Manual
+    /// takes visual priority but never hides process state.
+    ///
+    /// `now_ms` is the current clock-millis ([`Clock::now_millis`]); only running
+    /// agents consult it (to decide idle vs working).
+    pub fn display_status(&self, now_ms: u64) -> DisplayStatus {
         let manual = self
             .meta
             .manual_status
             .as_deref()
             .and_then(ManualStatus::from_str_lossy);
-        combine_status(self.session.primary_state(), self.interpreted, manual)
+        let process = self.session.primary_state();
+        let interpreted = if process == ProcessState::Running {
+            Some(running_status(
+                self.interpreted,
+                self.interpreted_at_ms,
+                self.last_activity_ms,
+                now_ms,
+            ))
+        } else {
+            // Not running: let the process state drive (exited → completed/failed,
+            // lost → session lost, …) rather than a stale activity reading.
+            None
+        };
+        combine_status(process, interpreted, manual)
+    }
+}
+
+/// Path to a tab's agent status file inside its worktree (Layer 2, SPECS §24).
+///
+/// The agent's status hook/plugin writes one of the keywords understood by
+/// [`status_keyword_to_interpreted`] here; FlightDeck polls it. The path is
+/// derived purely from the worktree so the hook can compute the same path from
+/// its own working directory without any injected configuration. It is covered
+/// by the `.flightdeck/agent-status` `.gitignore` entry added at init.
+pub fn agent_status_file(worktree_abs: &Path) -> PathBuf {
+    worktree_abs.join(".flightdeck").join("agent-status")
+}
+
+/// Map a status-file keyword (written by an agent hook/plugin) to an
+/// [`InterpretedStatus`] (SPECS §24). Unknown keywords yield `None`.
+pub fn status_keyword_to_interpreted(keyword: &str) -> Option<InterpretedStatus> {
+    match keyword.trim().to_ascii_lowercase().as_str() {
+        "working" | "busy" | "in_progress" | "in-progress" | "thinking" => {
+            Some(InterpretedStatus::Working)
+        }
+        "idle" => Some(InterpretedStatus::Idle),
+        "waiting" | "waiting_for_input" | "input" => Some(InterpretedStatus::WaitingForInput),
+        "attention" | "needs_attention" | "needs-attention" | "notification" => {
+            Some(InterpretedStatus::NeedsAttention)
+        }
+        "done" | "completed" | "complete" | "finished" => Some(InterpretedStatus::Completed),
+        "error" | "failed" | "failure" => Some(InterpretedStatus::Failed),
+        _ => None,
     }
 }
 
@@ -211,13 +273,17 @@ impl AppState {
     // Status ingestion (SPECS §24)
     // -----------------------------------------------------------------------
 
-    /// Ingest PTY output for a tab and update its cached interpreted status by
-    /// running the agent's patterns through [`classify_output`] (SPECS §24).
-    /// Output that matches no pattern leaves the cached status unchanged.
-    pub fn ingest_output(&mut self, tab: &TabId, bytes: &[u8]) {
+    /// Ingest PTY output for a tab: record output activity (for the idle/working
+    /// heuristic) and update the cached interpreted status by running the agent's
+    /// patterns through [`classify_output`] (SPECS §24). `now_ms` is the current
+    /// [`Clock::now_millis`]. Output that matches no pattern leaves the cached
+    /// signal unchanged but still counts as activity.
+    pub fn ingest_output(&mut self, tab: &TabId, bytes: &[u8], now_ms: u64) {
         let Some(idx) = self.tab_index(tab) else {
             return;
         };
+        // Any output is activity → the agent is doing something right now.
+        self.tabs[idx].last_activity_ms = Some(now_ms);
         let text = String::from_utf8_lossy(bytes);
         let agent_key = self.tabs[idx].meta.agent.clone();
         let patterns = self
@@ -227,7 +293,36 @@ impl AppState {
         if let Some(patterns) = patterns {
             if let Some(status) = classify_output(&patterns, &text) {
                 self.tabs[idx].interpreted = Some(status);
+                self.tabs[idx].interpreted_at_ms = Some(now_ms);
             }
+        }
+    }
+
+    /// Poll each tab's agent status file (Layer 2, opt-in precise signals).
+    ///
+    /// A configured agent hook/plugin writes a keyword (see
+    /// [`status_keyword_to_interpreted`]) to the tab's [`agent_status_file`].
+    /// Each *new* content registers as a fresh signal stamped `now_ms`, so it is
+    /// shown immediately yet can still be superseded by later output activity
+    /// (important for agents like Codex that only signal turn completion).
+    /// Missing/unreadable files are ignored, so this is safe before any hook is
+    /// installed. Call on each tick (SPECS §24).
+    pub fn poll_status_files(&mut self, services: &Services, now_ms: u64) {
+        for tab in self.tabs.iter_mut() {
+            let Some(path) = tab.status_file.as_ref() else {
+                continue;
+            };
+            let Ok(content) = services.fs.read_to_string(path) else {
+                continue;
+            };
+            if tab.status_file_seen.as_deref() == Some(content.as_str()) {
+                continue; // unchanged since last poll
+            }
+            if let Some(status) = status_keyword_to_interpreted(&content) {
+                tab.interpreted = Some(status);
+                tab.interpreted_at_ms = Some(now_ms);
+            }
+            tab.status_file_seen = Some(content);
         }
     }
 
@@ -242,7 +337,8 @@ impl AppState {
 
     /// Build a [`ProjectState`] from the runtime tabs for persistence (SPECS §9).
     /// Snapshots the last-known status from each tab's combined display status.
-    pub fn to_project_state(&self) -> ProjectState {
+    /// `now_ms` is the current [`Clock::now_millis`], used to resolve idle/working.
+    pub fn to_project_state(&self, now_ms: u64) -> ProjectState {
         let project_root_relative = match to_relative(&self.repo_root, &self.repo_root) {
             Ok(p) if !p.as_os_str().is_empty() => p.to_string_lossy().to_string(),
             _ => ".".to_string(),
@@ -252,7 +348,7 @@ impl AppState {
             .iter()
             .map(|t| {
                 let mut meta = t.meta.clone();
-                meta.last_known_status = t.display_status().interpreted.as_str().to_string();
+                meta.last_known_status = t.display_status(now_ms).interpreted.as_str().to_string();
                 meta
             })
             .collect();
@@ -267,7 +363,7 @@ impl AppState {
     /// Persist `state.json` via the filesystem service (SPECS §9). Called after
     /// mutations that change tab metadata.
     fn persist(&self, services: &Services) -> Result<()> {
-        let state = self.to_project_state();
+        let state = self.to_project_state(services.clock.now_millis());
         save_state(services.fs, &self.state_path, &state)
     }
 
@@ -374,6 +470,7 @@ impl AppState {
 
         // (g) spawn the primary terminal (NO initial prompt, SPECS §17).
         let launch = build_launch(&agent, &worktree_abs);
+        let status_file = agent_status_file(&worktree_abs);
         let mut session = Session::new();
         session.spawn_primary(
             services.pty,
@@ -410,6 +507,10 @@ impl AppState {
             meta,
             session,
             interpreted: Some(InterpretedStatus::Starting),
+            interpreted_at_ms: None,
+            last_activity_ms: None,
+            status_file: Some(status_file),
+            status_file_seen: None,
         });
         // Focus the new tab.
         self.selected_tab = Some(self.tabs.len() - 1);
@@ -711,6 +812,7 @@ impl AppState {
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
         );
         let launch = build_launch(&agent, &cwd);
+        let status_file = agent_status_file(&cwd);
         let tab = &mut self.tabs[idx];
         tab.session.spawn_primary(
             services.pty,
@@ -720,6 +822,10 @@ impl AppState {
             size,
         )?;
         tab.interpreted = Some(InterpretedStatus::Starting);
+        tab.interpreted_at_ms = None;
+        tab.last_activity_ms = None;
+        tab.status_file = Some(status_file);
+        tab.status_file_seen = None;
         tab.meta.recovered = false;
         Ok(())
     }
@@ -1205,7 +1311,7 @@ mod tests {
         app.dispatch(Command::SetManualStatus(Some(ManualStatus::Blocked)), &svc)
             .unwrap();
 
-        let ds = app.tabs[0].display_status();
+        let ds = app.tabs[0].display_status(0);
         assert_eq!(ds.manual, Some(ManualStatus::Blocked));
         // Process state still represented (the primary is running).
         assert_eq!(ds.process, ProcessState::Running);
@@ -1213,7 +1319,7 @@ mod tests {
 
         // Clear it; process state remains.
         app.dispatch(Command::SetManualStatus(None), &svc).unwrap();
-        let ds = app.tabs[0].display_status();
+        let ds = app.tabs[0].display_status(0);
         assert_eq!(ds.manual, None);
         assert_eq!(ds.process, ProcessState::Running);
     }
@@ -1243,17 +1349,101 @@ mod tests {
         .unwrap();
         let id = app.tabs[0].id();
 
-        app.ingest_output(&id, b"the agent is waiting for input now");
+        app.ingest_output(&id, b"the agent is waiting for input now", 0);
         assert_eq!(
-            app.tabs[0].display_status().interpreted,
+            app.tabs[0].display_status(0).interpreted,
             InterpretedStatus::WaitingForInput
         );
 
         // Non-matching output leaves it unchanged.
-        app.ingest_output(&id, b"some normal log line");
+        app.ingest_output(&id, b"some normal log line", 0);
         assert_eq!(
-            app.tabs[0].display_status().interpreted,
+            app.tabs[0].display_status(0).interpreted,
             InterpretedStatus::WaitingForInput
+        );
+    }
+
+    // --- §24: activity-based idle/working detection ---------------------
+
+    #[test]
+    fn activity_drives_working_then_idle() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        let id = app.tabs[0].id();
+
+        // Output at t=1000 → working when observed shortly after.
+        app.ingest_output(&id, b"...streaming tokens...", 1_000);
+        assert_eq!(
+            app.tabs[0].display_status(1_100).interpreted,
+            InterpretedStatus::Working
+        );
+
+        // No further output; once past the idle threshold → idle.
+        let later = 1_000 + crate::agents::status::IDLE_AFTER_MS + 1;
+        assert_eq!(
+            app.tabs[0].display_status(later).interpreted,
+            InterpretedStatus::Idle
+        );
+    }
+
+    // --- §24: opt-in precise status via status file ---------------------
+
+    #[test]
+    fn poll_status_file_applies_hook_signal() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // The agent's hook writes "waiting" to the tab's status file.
+        let path = app.tabs[0].status_file.clone().expect("status file path");
+        fs.write(&path, "waiting\n").unwrap();
+
+        app.poll_status_files(&svc, 5_000);
+        // A waiting hook signal is sticky while the agent stays quiet.
+        assert_eq!(
+            app.tabs[0].display_status(9_999).interpreted,
+            InterpretedStatus::WaitingForInput
+        );
+
+        // New output after the signal supersedes it → back to working.
+        let id = app.tabs[0].id();
+        app.ingest_output(&id, b"resuming", 6_000);
+        assert_eq!(
+            app.tabs[0].display_status(6_050).interpreted,
+            InterpretedStatus::Working
         );
     }
 
@@ -1473,7 +1663,7 @@ mod tests {
         .unwrap();
 
         // Round-trip through to_project_state → persistence load.
-        let saved = app.to_project_state();
+        let saved = app.to_project_state(0);
         assert_eq!(saved.tabs.len(), 1);
         assert_eq!(saved.base_branch, "main");
 

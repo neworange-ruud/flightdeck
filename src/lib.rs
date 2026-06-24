@@ -62,6 +62,12 @@ const GIT_REFRESH_EVERY: u64 = 40;
 /// real terminal. Teardown is guaranteed in all paths (SPECS §25): the terminal
 /// is restored and every tab's sessions are terminated before returning.
 pub fn run() -> Result<()> {
+    // Subcommand dispatch. `setup-status` installs the opt-in precise status
+    // hooks/plugin and exits without launching the TUI (SPECS §24, Layer 2).
+    if std::env::args().nth(1).as_deref() == Some("setup-status") {
+        return run_setup_status();
+    }
+
     // 1–4. Construct services + run startup (init, gitignore, recover, build state).
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
@@ -119,6 +125,45 @@ pub fn run() -> Result<()> {
     terminate_all_sessions(&mut state);
 
     loop_result.and(persist_result)
+}
+
+/// `flightdeck setup-status`: install the opt-in precise agent status
+/// integrations (hooks/plugin) into `<repo>/.flightdeck/integrations/` and add
+/// the `.flightdeck/agent-status` `.gitignore` entry, then print wiring
+/// instructions. Does not launch the TUI (SPECS §24, Layer 2).
+fn run_setup_status() -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
+    let git = GitCli::discover(&cwd).map_err(|_| {
+        FlightDeckError::Git(
+            "not inside a Git repository (run `flightdeck setup-status` from a git project)"
+                .to_string(),
+        )
+    })?;
+    let repo_root = git.root().to_path_buf();
+
+    let fs = RealFs;
+    let report = crate::agents::setup::write_status_integrations(&fs, &repo_root)?;
+
+    let dir = repo_root.join(crate::agents::setup::INTEGRATIONS_DIR);
+    println!("FlightDeck: wrote status integrations to {}", dir.display());
+    for p in &report.written {
+        if let Some(name) = p.file_name() {
+            println!("  - {}", name.to_string_lossy());
+        }
+    }
+    if report.gitignore_added {
+        println!("FlightDeck: added .flightdeck/agent-status to .gitignore (commit this).");
+    }
+    println!();
+    println!("Status detection works out of the box (output-activity based).");
+    println!("To enable PRECISE status, wire one or more agents — see:");
+    println!("  {}/README.md", dir.display());
+    println!();
+    println!("  Claude Code → merge claude-code.settings.json into ~/.claude/settings.json");
+    println!("  Codex CLI   → append codex-config.toml to ~/.codex/config.toml");
+    println!("  OpenCode    → copy opencode-flightdeck.js to ~/.config/opencode/plugin/");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +351,13 @@ fn event_loop(
     let mut tick: u64 = 0;
 
     loop {
+        let now_ms = services.clock.now_millis();
+
         // --- Drain PTY output and feed each terminal's VT parser + status. ---
-        drain_pty_output(state);
+        drain_pty_output(state, now_ms);
+
+        // --- Poll opt-in agent status files (precise idle/working signals). ---
+        state.poll_status_files(services, now_ms);
 
         // --- Periodically refresh the git-status cache (non-blocking-ish). ---
         if tick.is_multiple_of(GIT_REFRESH_EVERY) {
@@ -318,7 +368,7 @@ fn event_loop(
         // --- Render. ---
         let overlay = ui.render_overlay();
         terminal
-            .draw(|frame| draw(frame, state, &cache, &overlay))
+            .draw(|frame| draw(frame, state, &cache, &overlay, now_ms))
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
         // --- Poll for input (short timeout so PTY output keeps flowing). ---
@@ -369,30 +419,104 @@ fn viewport_pty_size(full: PtySize) -> PtySize {
     }
 }
 
-/// Handle a mouse event: a left click selects the clicked Agent Tab or
-/// child-terminal tab (SPECS §22 — keyboard-first, but mouse-assisted).
+/// Number of scrollback lines moved per mouse-wheel notch.
+const SCROLL_LINES: usize = 3;
+/// xterm protocol button code for a wheel-up event.
+const MOUSE_WHEEL_UP: u8 = 64;
+/// xterm protocol button code for a wheel-down event.
+const MOUSE_WHEEL_DOWN: u8 = 65;
+
+/// Handle a mouse event (SPECS §20, §22 — keyboard-first, but mouse-assisted):
+/// a left click selects the clicked Agent Tab or child-terminal tab, and the
+/// wheel scrolls the active terminal.
 fn handle_mouse(me: MouseEvent, area: Rect, state: &mut AppState, services: &Services, ui: &Ui) {
     // Ignore mouse while a modal/prompt/overlay is capturing input.
     if ui.modal_active() {
         return;
     }
-    if me.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
-    let Some(hit) = hit_test(area, state, me.column, me.row) else {
-        return;
-    };
-    match hit {
-        HitTarget::AgentTab(i) => {
-            let _ = state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
-        }
-        HitTarget::Child(ChildTarget::Primary) => {
-            if let Some(tab) = state.selected_mut() {
-                tab.session.focus_primary();
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(hit) = hit_test(area, state, me.column, me.row) else {
+                return;
+            };
+            match hit {
+                HitTarget::AgentTab(i) => {
+                    let _ = state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
+                }
+                HitTarget::Child(ChildTarget::Primary) => {
+                    if let Some(tab) = state.selected_mut() {
+                        tab.session.focus_primary();
+                    }
+                }
+                HitTarget::Child(ChildTarget::Child(i)) => {
+                    let _ =
+                        state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+                }
             }
         }
-        HitTarget::Child(ChildTarget::Child(i)) => {
-            let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+        MouseEventKind::ScrollUp => handle_scroll(state, area, me, true),
+        MouseEventKind::ScrollDown => handle_scroll(state, area, me, false),
+        _ => {}
+    }
+}
+
+/// Handle a mouse-wheel event over the terminal viewport. When the hosted agent
+/// app has mouse reporting enabled (a full-screen TUI with its own scroll
+/// region, e.g. opencode), the wheel event is forwarded to its PTY so the app
+/// scrolls itself — exactly as in a real terminal emulator. Otherwise we scroll
+/// the terminal's own VT100 scrollback so plain output stays reviewable.
+fn handle_scroll(state: &mut AppState, area: Rect, me: MouseEvent, up: bool) {
+    let term_area = crate::tui::layout::compute(area).terminal;
+    if !rect_contains(term_area, me.column, me.row) {
+        return;
+    }
+    let Some(tab) = state.selected_mut() else {
+        return;
+    };
+    let Some(term) = tab.session.active_mut() else {
+        return;
+    };
+    if term.wants_mouse() {
+        let cb = if up { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_DOWN };
+        let col = me.column.saturating_sub(term_area.x);
+        let row = me.row.saturating_sub(term_area.y);
+        let bytes = encode_mouse_report(term.mouse_encoding(), cb, col, row);
+        let _ = term.session_mut().write_input(&bytes);
+    } else if up {
+        term.scroll_up(SCROLL_LINES);
+    } else {
+        term.scroll_down(SCROLL_LINES);
+    }
+}
+
+/// Whether `(col, row)` lies within `r`.
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
+}
+
+/// Encode a mouse report for the hosted application, matching its active mouse
+/// encoding. `cb` is the xterm protocol button code; `col`/`row` are 0-based
+/// cell coordinates within the terminal viewport (protocol coordinates are
+/// 1-based).
+fn encode_mouse_report(
+    encoding: vt100::MouseProtocolEncoding,
+    cb: u8,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let cx = col.saturating_add(1);
+    let cy = row.saturating_add(1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{cb};{cx};{cy}M").into_bytes(),
+        // Default (X10) and, approximately, the legacy UTF-8 encoding: one
+        // printable byte per field, offset by 32 and clamped to a single byte.
+        _ => {
+            let bx = cx.saturating_add(32).min(255) as u8;
+            let by = cy.saturating_add(32).min(255) as u8;
+            vec![0x1b, b'[', b'M', cb.saturating_add(32), bx, by]
         }
     }
 }
@@ -909,7 +1033,7 @@ fn run_palette_action(
 /// Drain output from every terminal of every tab, feeding each terminal's VT
 /// parser (so it can be rendered) and feeding each primary's output to status
 /// classification (SPECS §24).
-fn drain_pty_output(state: &mut AppState) {
+fn drain_pty_output(state: &mut AppState, now_ms: u64) {
     // Collect (tab id, primary bytes) first so we can call `ingest_output`
     // (which borrows `state` mutably) without overlapping the session borrow.
     let mut ingest: Vec<(TabId, Vec<u8>)> = Vec::new();
@@ -941,7 +1065,7 @@ fn drain_pty_output(state: &mut AppState) {
     }
 
     for (id, bytes) in ingest {
-        state.ingest_output(&id, &bytes);
+        state.ingest_output(&id, &bytes, now_ms);
     }
 }
 
@@ -950,17 +1074,11 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     let Some(tab) = state.selected_mut() else {
         return;
     };
-    match tab.session.selected_child() {
-        Some(c) => {
-            if let Some(child) = tab.session.child_mut(c) {
-                let _ = child.session_mut().write_input(bytes);
-            }
-        }
-        None => {
-            if let Some(primary) = tab.session.primary_mut() {
-                let _ = primary.session_mut().write_input(bytes);
-            }
-        }
+    if let Some(term) = tab.session.active_mut() {
+        // Typing/sending input snaps the view back to the live bottom, matching
+        // standard terminal behaviour when scrolled into local scrollback.
+        term.scroll_to_bottom();
+        let _ = term.session_mut().write_input(bytes);
     }
 }
 
@@ -1010,7 +1128,7 @@ fn refresh_git_cache(state: &AppState, services: &Services, cache: &mut GitStatu
 /// Persist state on quit, swallowing (but reporting) any error so teardown can
 /// proceed (SPECS §9).
 fn persist_quietly(state: &AppState, services: &Services) -> Result<()> {
-    let project_state = state.to_project_state();
+    let project_state = state.to_project_state(services.clock.now_millis());
     save_state(services.fs, &state.state_path, &project_state)
 }
 
@@ -1043,6 +1161,30 @@ mod tests {
             args: vec![],
             status_patterns: StatusPatterns::default(),
         }
+    }
+
+    // §20: SGR mouse reports use 1-based viewport coordinates and a trailing 'M'.
+    #[test]
+    fn encodes_sgr_wheel_report() {
+        // Wheel-up at viewport cell (0,0) → column/row 1.
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, MOUSE_WHEEL_UP, 0, 0),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+        // Wheel-down at cell (4,2) → column 5, row 3.
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, MOUSE_WHEEL_DOWN, 4, 2),
+            b"\x1b[<65;5;3M".to_vec()
+        );
+    }
+
+    // §20: the default (X10) encoding offsets each field by 32.
+    #[test]
+    fn encodes_default_wheel_report() {
+        assert_eq!(
+            encode_mouse_report(vt100::MouseProtocolEncoding::Default, MOUSE_WHEEL_UP, 0, 0),
+            vec![0x1b, b'[', b'M', 32 + 64, 32 + 1, 32 + 1]
+        );
     }
 
     fn config_with_agent(agent: AgentDef) -> Config {

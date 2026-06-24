@@ -29,6 +29,52 @@ pub fn classify_output(patterns: &StatusPatterns, output: &str) -> Option<Interp
     None
 }
 
+/// Quiet period after which a *running* agent that produced no output is
+/// considered idle rather than working (SPECS §24). Agents (OpenCode, Claude
+/// Code, Codex) stream output continuously while working and fall silent at
+/// their prompt, so a short silence is a reliable "turn finished" signal.
+pub const IDLE_AFTER_MS: u64 = 1500;
+
+/// Compute the effective interpreted status of a **running** agent from output
+/// activity timing plus the latest classified/hook signal (SPECS §24).
+///
+/// Precedence:
+/// 1. A *sticky* signal (waiting / needs-attention / completed / failed /
+///    recovered) holds until fresh output arrives **after** it — i.e. the agent
+///    resumed working — at which point it is superseded.
+/// 2. Otherwise activity decides: output within [`IDLE_AFTER_MS`] → `Working`,
+///    older → `Idle`.
+/// 3. Before any output has been seen, the raw signal (e.g. `Starting`) shows.
+pub fn running_status(
+    signal: Option<InterpretedStatus>,
+    signal_at_ms: Option<u64>,
+    last_activity_ms: Option<u64>,
+    now_ms: u64,
+) -> InterpretedStatus {
+    if let Some(sig) = signal {
+        let sticky = matches!(
+            sig,
+            InterpretedStatus::WaitingForInput
+                | InterpretedStatus::NeedsAttention
+                | InterpretedStatus::Completed
+                | InterpretedStatus::Failed
+                | InterpretedStatus::Recovered
+        );
+        if sticky {
+            let superseded =
+                matches!((last_activity_ms, signal_at_ms), (Some(a), Some(s)) if a > s);
+            if !superseded {
+                return sig;
+            }
+        }
+    }
+    match last_activity_ms {
+        None => signal.unwrap_or(InterpretedStatus::Running),
+        Some(t) if now_ms.saturating_sub(t) < IDLE_AFTER_MS => InterpretedStatus::Working,
+        Some(_) => InterpretedStatus::Idle,
+    }
+}
+
 /// The combined, display-ready status (SPECS §24). Manual override takes visual
 /// priority but does not hide the process state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +290,54 @@ mod tests {
         assert_eq!(ds.process, ProcessState::Running);
         assert_eq!(ds.interpreted, InterpretedStatus::WaitingForInput);
         assert_eq!(ds.manual, Some(ManualStatus::Blocked));
+    }
+
+    // -------------------------------------------------------------------------
+    // running_status (activity-based idle/working) tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn running_status_recent_output_is_working() {
+        // last activity 100ms ago, well within the idle threshold.
+        let s = running_status(None, None, Some(1_000), 1_100);
+        assert_eq!(s, InterpretedStatus::Working);
+    }
+
+    #[test]
+    fn running_status_quiet_past_threshold_is_idle() {
+        let s = running_status(None, None, Some(1_000), 1_000 + IDLE_AFTER_MS + 1);
+        assert_eq!(s, InterpretedStatus::Idle);
+    }
+
+    #[test]
+    fn running_status_no_output_yet_shows_signal() {
+        let s = running_status(Some(InterpretedStatus::Starting), None, None, 5_000);
+        assert_eq!(s, InterpretedStatus::Starting);
+    }
+
+    #[test]
+    fn running_status_sticky_waiting_holds_while_quiet() {
+        // Signal arrived at t=1000 (activity also at 1000); now far later but no
+        // new activity → still waiting, even though it is "quiet".
+        let s = running_status(
+            Some(InterpretedStatus::WaitingForInput),
+            Some(1_000),
+            Some(1_000),
+            9_999,
+        );
+        assert_eq!(s, InterpretedStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn running_status_signal_superseded_by_later_activity() {
+        // Waiting signal at t=1000, but new output at t=2000 → agent resumed.
+        let s = running_status(
+            Some(InterpretedStatus::WaitingForInput),
+            Some(1_000),
+            Some(2_000),
+            2_050,
+        );
+        assert_eq!(s, InterpretedStatus::Working);
     }
 
     #[test]

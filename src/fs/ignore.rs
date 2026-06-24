@@ -10,6 +10,27 @@ use std::path::Path;
 pub const STATE_IGNORE_ENTRY: &str = ".flightdeck/state.json";
 /// Required entry: the ignored managed worktrees directory.
 pub const WORKTREES_IGNORE_ENTRY: &str = ".flightdeck/worktrees/";
+/// Opt-in entry added by `flightdeck setup-status`: the per-worktree agent
+/// status file written by status hooks/plugins (SPECS §24, Layer 2). Not part of
+/// the core §6 required set — only added when the user opts into status hooks.
+pub const STATUS_IGNORE_ENTRY: &str = ".flightdeck/agent-status";
+
+/// Ensure a single entry is present in `<repo_root>/.gitignore`, appending it
+/// only if missing (same append-only contract as
+/// [`ensure_flightdeck_gitignore`]). Returns whether the file changed.
+pub fn ensure_gitignore_entry(fs: &dyn FileSystem, repo_root: &Path, entry: &str) -> Result<bool> {
+    let gitignore_path = repo_root.join(".gitignore");
+    let existing = if fs.exists(&gitignore_path) {
+        fs.read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+    if existing.lines().map(str::trim).any(|l| l == entry) {
+        return Ok(false);
+    }
+    fs.append_line(&gitignore_path, entry)?;
+    Ok(true)
+}
 
 /// Result of an attempted `.gitignore` update.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

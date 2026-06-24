@@ -102,4 +102,9 @@ pub trait PtySession: Send {
 pub trait Clock {
     /// Current time as an ISO-8601 string.
     fn now_iso8601(&self) -> String;
+
+    /// Monotonic-ish milliseconds, used for activity timing (idle/working
+    /// detection, SPECS §24). Only *differences* are meaningful; the absolute
+    /// origin is unspecified. Tests can advance this deterministically.
+    fn now_millis(&self) -> u64;
 }

@@ -55,6 +55,10 @@ impl ProcessState {
 pub enum InterpretedStatus {
     Starting,
     Running,
+    /// Actively producing output — the agent is working on something.
+    Working,
+    /// Process is up but quiet — finished a turn / waiting on the user.
+    Idle,
     WaitingForInput,
     NeedsAttention,
     Completed,
@@ -71,6 +75,8 @@ impl InterpretedStatus {
         match self {
             InterpretedStatus::Starting => "starting",
             InterpretedStatus::Running => "running",
+            InterpretedStatus::Working => "working",
+            InterpretedStatus::Idle => "idle",
             InterpretedStatus::WaitingForInput => "waiting",
             InterpretedStatus::NeedsAttention => "needs attention",
             InterpretedStatus::Completed => "completed",
@@ -88,6 +94,8 @@ impl InterpretedStatus {
         match s {
             "starting" => InterpretedStatus::Starting,
             "running" => InterpretedStatus::Running,
+            "working" => InterpretedStatus::Working,
+            "idle" => InterpretedStatus::Idle,
             "waiting" => InterpretedStatus::WaitingForInput,
             "needs attention" => InterpretedStatus::NeedsAttention,
             "completed" => InterpretedStatus::Completed,

@@ -173,14 +173,20 @@ fn divider_line(width: usize) -> Line<'static> {
 /// Draw the complete FlightDeck UI into `frame`.
 ///
 /// Called once per tick by T9 inside `Terminal::draw(|frame| draw(frame, ...))`.
-pub fn draw(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, overlay: &UiOverlay) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &AppState,
+    cache: &GitStatusCache,
+    overlay: &UiOverlay,
+    now_ms: u64,
+) {
     let area = frame.area();
     let ml = layout::compute(area);
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
-    draw_sidebar(frame, state, cache, ml.sidebar);
+    draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
     draw_child_tab_bar(frame, state, ml.child_tabs);
     draw_terminal_viewport(frame, state, ml.terminal);
     draw_info_bar(frame, state, cache, ml.info_bar);
@@ -253,7 +259,13 @@ pub fn header_line(width: usize) -> Line<'static> {
 // ---------------------------------------------------------------------------
 
 /// Draw the left Agent Tabs sidebar.
-pub fn draw_sidebar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, area: Rect) {
+pub fn draw_sidebar(
+    frame: &mut Frame,
+    state: &AppState,
+    cache: &GitStatusCache,
+    area: Rect,
+    now_ms: u64,
+) {
     let block = Block::default().borders(Borders::RIGHT);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -286,7 +298,7 @@ pub fn draw_sidebar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache,
     // a divider above every tab including the first (SPECS §20).
     for (i, tab) in state.tabs.iter().enumerate() {
         let selected = state.selected_tab == Some(i);
-        let ds = tab.display_status();
+        let ds = tab.display_status(now_ms);
         let git = cache.get(&tab.meta.id);
 
         // Divider (top of the tab block).
@@ -301,8 +313,16 @@ pub fn draw_sidebar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache,
             Style::default().fg(Color::White)
         };
         let marker = if selected { "▸ " } else { "  " };
+        // A colour-coded status dot on the name line so idle vs working (vs
+        // waiting/failed/…) is glanceable per tab (SPECS §24). Manual override
+        // takes visual priority but never hides the dot.
+        let dot_color = ds
+            .manual
+            .map(|_| Color::Cyan)
+            .unwrap_or_else(|| interpreted_color(ds.interpreted));
         lines.push(Line::from(vec![
             Span::styled(marker, name_style),
+            Span::styled("● ", Style::default().fg(dot_color)),
             Span::styled(tab.meta.name.clone(), name_style),
         ]));
 
@@ -347,6 +367,8 @@ fn interpreted_color(status: crate::contracts::InterpretedStatus) -> Color {
     match status {
         Starting => Color::Blue,
         Running => Color::Green,
+        Working => Color::Green,
+        Idle => Color::DarkGray,
         WaitingForInput => Color::Yellow,
         NeedsAttention => Color::Magenta,
         Completed => Color::Cyan,
@@ -473,11 +495,7 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect) {
         return;
     };
 
-    let term = match tab.session.selected_child() {
-        Some(c) => tab.session.child(c),
-        None => tab.session.primary(),
-    };
-    let Some(term) = term else {
+    let Some(term) = tab.session.active() else {
         let p =
             Paragraph::new("  (terminal starting…)").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
@@ -1086,7 +1104,7 @@ mod tests {
             .process_output(b"HELLO_FLIGHTDECK");
 
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -1149,7 +1167,7 @@ mod tests {
     fn header_and_divider_render_on_top_two_rows() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(120, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let row0: String = (0..120).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
@@ -1259,7 +1277,7 @@ mod tests {
             },
         );
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None))
+        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         // Info bar is one row above the status bar (y = 22); status bar is y = 23.
@@ -1304,7 +1322,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None);
+            draw(frame, &state, &cache, &UiOverlay::None, 0);
         })
         .unwrap();
     }
@@ -1320,6 +1338,7 @@ mod tests {
                 &state,
                 &cache,
                 &UiOverlay::Message("Test message".to_string()),
+                0,
             );
         })
         .unwrap();
@@ -1331,7 +1350,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Help);
+            draw(frame, &state, &cache, &UiOverlay::Help, 0);
         })
         .unwrap();
     }
@@ -1343,7 +1362,7 @@ mod tests {
         let cache = empty_cache();
         let palette = CommandPalette::new();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Palette(palette));
+            draw(frame, &state, &cache, &UiOverlay::Palette(palette), 0);
         })
         .unwrap();
     }
@@ -1377,6 +1396,7 @@ mod tests {
                     status: ws,
                     pr_url: Some("https://github.com/owner/repo/compare/main...test".to_string()),
                 },
+                0,
             );
         })
         .unwrap();
@@ -1388,7 +1408,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None);
+            draw(frame, &state, &cache, &UiOverlay::None, 0);
         })
         .unwrap();
 
@@ -1430,6 +1450,7 @@ mod tests {
                     status: ws,
                     pr_url: None,
                 },
+                0,
             );
         })
         .unwrap();
@@ -1453,7 +1474,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None);
+            draw(frame, &state, &cache, &UiOverlay::None, 0);
         })
         .unwrap();
 
