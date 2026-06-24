@@ -470,9 +470,17 @@ Before local merge-back, FlightDeck must require:
 - Agent worktree is clean
 - Base branch exists
 - Agent branch exists
-- No running primary agent unless explicitly stopped
 - User explicitly confirms merge
 - FlightDeck knows the tab’s base branch and base commit SHA
+
+Each agent must be able to finish and merge back to its base branch independently,
+regardless of whether other agents — or its own primary agent — are still running.
+A running primary agent does **not** block the merge: merging operates on the
+agent branch's committed refs, not the live process.
+
+On a successful merge, FlightDeck cleans up: it stops the tab's session
+(including a still-running primary agent), removes the agent worktree, and closes
+the tab. The work now lives on the base branch, so removal is safe.
 
 If base repo is dirty:
 
@@ -481,7 +489,7 @@ Base worktree has uncommitted changes. Local merge is disabled.
 Recommended action: push this branch and create a PR instead.
 ```
 
-MVP should not attempt conflict resolution. If merge conflicts occur, FlightDeck should stop and explain that manual Git intervention is required.
+MVP should not attempt conflict resolution. If merge conflicts occur, FlightDeck should stop and explain that manual Git intervention is required (the worktree is left intact for manual resolution).
 
 ---
 
