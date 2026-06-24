@@ -1596,9 +1596,9 @@ mod tests {
         use crate::contracts::InterpretedStatus::*;
         use ratatui::style::Color;
 
-        // In progress (blue).
+        // In progress (light blue).
         for s in [Starting, Running, Working] {
-            assert_eq!(status_label_color(s), ("in progress", Color::Blue));
+            assert_eq!(status_label_color(s), ("in progress", Color::LightBlue));
         }
         // Error (red).
         for s in [Failed, SessionLost] {
