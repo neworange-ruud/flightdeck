@@ -218,8 +218,16 @@ fn derive_project_name(repo_root: &Path) -> String {
 /// §25). These are the multi-step flows the palette/keys require: text entry for
 /// New/Rename, single-key choice menus for Set Status / Close / Push.
 enum Prompt {
-    /// Free-text entry for a new Agent Tab name; dispatches `NewAgentTab`.
-    NewTabName { buffer: String },
+    /// Pick which agent a new tab should run, before naming it. Holds the
+    /// `(key, display_name)` of each registered agent; a number key selects one
+    /// and advances to [`Prompt::NewTabName`] (SPECS §4, §22).
+    SelectAgent { agents: Vec<(String, String)> },
+    /// Free-text entry for a new Agent Tab name; dispatches `NewAgentTab` with
+    /// the agent chosen in [`Prompt::SelectAgent`] (`None` = configured default).
+    NewTabName {
+        buffer: String,
+        agent_key: Option<String>,
+    },
     /// Free-text entry for renaming the selected tab; dispatches `RenameAgentTab`.
     RenameTab { buffer: String },
     /// Pick a manual status (or clear); dispatches `SetManualStatus`.
@@ -228,6 +236,8 @@ enum Prompt {
     CloseTab { actions: Vec<CloseAction> },
     /// Confirm a push despite uncommitted changes (SPECS §14).
     PushConfirm,
+    /// Confirm abandoning a worktree that has uncommitted changes (SPECS §5/§15).
+    AbandonConfirm,
 }
 
 /// The full interactive UI state layered over [`AppState`]: which overlay is
@@ -459,12 +469,7 @@ fn dispatch_command(
     // Intercept commands that need interactive input before dispatch.
     match &cmd {
         Command::NewAgentTab { name, .. } if name.is_empty() => {
-            start_prompt(
-                ui,
-                Prompt::NewTabName {
-                    buffer: String::new(),
-                },
-            );
+            start_new_tab_flow(state, ui);
             return Ok(());
         }
         Command::RenameAgentTab { new_name } if new_name.is_empty() => {
@@ -515,6 +520,9 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         Effect::PushWarning(_plan) => {
             start_prompt(ui, Prompt::PushConfirm);
         }
+        Effect::AbandonWarning => {
+            start_prompt(ui, Prompt::AbandonConfirm);
+        }
         Effect::CloseTabOptions(opts) => {
             start_prompt(
                 ui,
@@ -541,9 +549,40 @@ fn start_prompt(ui: &mut Ui, prompt: Prompt) {
     ui.prompt = Some(PromptState { prompt, hint });
 }
 
+/// Begin the New Agent Tab flow (SPECS §4, §22): if more than one agent is
+/// registered, show the agent picker first; otherwise skip straight to the name
+/// prompt using the configured default agent.
+fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
+    let agents: Vec<(String, String)> = state
+        .registry
+        .all()
+        .iter()
+        .map(|a| (a.key.clone(), a.display_name.clone()))
+        .collect();
+    if agents.len() > 1 {
+        start_prompt(ui, Prompt::SelectAgent { agents });
+    } else {
+        // Zero or one agent: no meaningful choice — use the default.
+        start_prompt(
+            ui,
+            Prompt::NewTabName {
+                buffer: String::new(),
+                agent_key: None,
+            },
+        );
+    }
+}
+
 /// Build the message-line hint for a prompt given the current text buffer.
 fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
     match prompt {
+        Prompt::SelectAgent { agents } => {
+            let mut parts = Vec::new();
+            for (i, (_key, display)) in agents.iter().enumerate() {
+                parts.push(format!("[{}] {}", i + 1, display));
+            }
+            format!("New Agent Tab — pick agent: {}  (Esc cancel)", parts.join("  "))
+        }
         Prompt::NewTabName { .. } => {
             format!("New Agent Tab name: {buffer}_   (Enter to create, Esc to cancel)")
         }
@@ -563,6 +602,10 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
         }
         Prompt::PushConfirm => {
             "Worktree has uncommitted changes. [p] push committed only  [c] cancel  (Esc cancel)"
+                .to_string()
+        }
+        Prompt::AbandonConfirm => {
+            "Worktree has uncommitted changes — discard them? [y] abandon (force)  [n] cancel  (Esc cancel)"
                 .to_string()
         }
     }
@@ -607,12 +650,33 @@ fn handle_prompt_key(
     };
 
     match &mut pstate.prompt {
+        Prompt::SelectAgent { agents } => {
+            // A number key picks an agent and advances to the name prompt.
+            if let KeyCode::Char(c @ '1'..='9') = key.code {
+                let idx = (c as usize) - ('1' as usize);
+                if let Some((agent_key, _display)) = agents.get(idx) {
+                    let prompt = Prompt::NewTabName {
+                        buffer: String::new(),
+                        agent_key: Some(agent_key.clone()),
+                    };
+                    let hint = prompt_hint(&prompt, "");
+                    ui.prompt = Some(PromptState { prompt, hint });
+                    return Ok(());
+                }
+            }
+            // Any other key: keep showing the picker.
+            ui.prompt = Some(pstate);
+        }
         Prompt::NewTabName { .. } | Prompt::RenameTab { .. } => {
-            // Capture which kind of text prompt this is without holding a borrow
-            // of `pstate.prompt` across the buffer mutation below.
+            // Capture which kind of text prompt this is, plus the chosen agent,
+            // without holding a borrow of `pstate.prompt` across the mutation.
             let is_new = matches!(pstate.prompt, Prompt::NewTabName { .. });
+            let new_agent_key = match &pstate.prompt {
+                Prompt::NewTabName { agent_key, .. } => agent_key.clone(),
+                _ => None,
+            };
             let buffer = match &mut pstate.prompt {
-                Prompt::NewTabName { buffer } | Prompt::RenameTab { buffer } => buffer,
+                Prompt::NewTabName { buffer, .. } | Prompt::RenameTab { buffer } => buffer,
                 _ => unreachable!(),
             };
             match key.code {
@@ -627,7 +691,7 @@ fn handle_prompt_key(
                     let cmd = if is_new {
                         Command::NewAgentTab {
                             name,
-                            agent_key: None, // default agent for MVP
+                            agent_key: new_agent_key,
                         }
                     } else {
                         Command::RenameAgentTab { new_name: name }
@@ -705,6 +769,14 @@ fn handle_prompt_key(
                 None => ui.prompt = Some(pstate),
             }
         }
+        Prompt::AbandonConfirm => match key.code {
+            KeyCode::Char('y') => {
+                let result = state.dispatch(Command::AbandonWorktree { confirm: true }, services);
+                finish_prompt(result, ui);
+            }
+            KeyCode::Char('n') => ui.clear(),
+            _ => ui.prompt = Some(pstate),
+        },
     }
 
     Ok(())
@@ -734,6 +806,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
             ui.message(format!("Attached to existing branch {branch}"))
         }
         Effect::PushWarning(_) => start_prompt(ui, Prompt::PushConfirm),
+        Effect::AbandonWarning => start_prompt(ui, Prompt::AbandonConfirm),
         Effect::CloseTabOptions(opts) => start_prompt(
             ui,
             Prompt::CloseTab {
@@ -798,12 +871,7 @@ fn run_palette_action(
     match action {
         PaletteAction::Dispatch(cmd) => dispatch_command(cmd, state, services, ui),
         PaletteAction::NewAgentTab => {
-            start_prompt(
-                ui,
-                Prompt::NewTabName {
-                    buffer: String::new(),
-                },
-            );
+            start_new_tab_flow(state, ui);
             Ok(())
         }
         PaletteAction::RenameAgentTab => {
@@ -998,10 +1066,97 @@ mod tests {
     fn new_tab_prompt_hint_includes_buffer() {
         let p = Prompt::NewTabName {
             buffer: String::new(),
+            agent_key: None,
         };
         let hint = prompt_hint(&p, "fix bug");
         assert!(hint.contains("fix bug"));
         assert!(hint.to_lowercase().contains("name"));
+    }
+
+    #[test]
+    fn select_agent_prompt_hint_lists_numbered_agents() {
+        let p = Prompt::SelectAgent {
+            agents: vec![
+                ("claude".to_string(), "Claude Code".to_string()),
+                ("opencode".to_string(), "OpenCode".to_string()),
+            ],
+        };
+        let hint = prompt_hint(&p, "");
+        assert!(hint.contains("[1] Claude Code"), "got: {hint}");
+        assert!(hint.contains("[2] OpenCode"), "got: {hint}");
+        assert!(hint.to_lowercase().contains("pick agent"), "got: {hint}");
+    }
+
+    #[test]
+    fn new_tab_flow_picks_agent_then_advances_to_named_prompt() {
+        use crate::app::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Config with two agents so the picker is shown.
+        let mut config = Config {
+            ui: UiConfig {
+                default_agent: "opencode".to_string(),
+                agent_tab_position: "left".to_string(),
+            },
+            ..Config::default()
+        };
+        config.agents.insert(
+            "opencode".to_string(),
+            AgentDef {
+                display_name: "OpenCode".to_string(),
+                command: "opencode".to_string(),
+                ..AgentDef::default()
+            },
+        );
+        config.agents.insert(
+            "claude".to_string(),
+            AgentDef {
+                display_name: "Claude Code".to_string(),
+                command: "claude".to_string(),
+                ..AgentDef::default()
+            },
+        );
+
+        let mut state =
+            AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
+        let mut ui = Ui::default();
+
+        // Starting the flow shows the agent picker (more than one agent).
+        start_new_tab_flow(&state, &mut ui);
+        let agents = match &ui.prompt.as_ref().expect("prompt active").prompt {
+            Prompt::SelectAgent { agents } => agents.clone(),
+            _ => panic!("expected SelectAgent prompt"),
+        };
+        // BTreeMap key order: "claude" before "opencode".
+        assert_eq!(agents[0].0, "claude");
+        assert_eq!(agents[1].0, "opencode");
+
+        // Services are required by the signature but unused by the picker branch.
+        let git = FakeGit::new();
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+        };
+
+        // Pressing '1' picks Claude Code and advances to the name prompt.
+        handle_prompt_key(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &mut state,
+            &services,
+            &mut ui,
+        )
+        .unwrap();
+        match &ui.prompt.as_ref().expect("name prompt active").prompt {
+            Prompt::NewTabName { agent_key, .. } => {
+                assert_eq!(agent_key.as_deref(), Some("claude"));
+            }
+            _ => panic!("expected NewTabName prompt carrying the chosen agent"),
+        }
     }
 
     #[test]
@@ -1038,6 +1193,17 @@ mod tests {
         assert!(matches!(
             ui.prompt.as_ref().unwrap().prompt,
             Prompt::PushConfirm
+        ));
+    }
+
+    #[test]
+    fn effect_abandon_warning_opens_abandon_prompt() {
+        let mut ui = Ui::default();
+        apply_effect_no_state(Effect::AbandonWarning, &mut ui);
+        assert!(ui.prompt.is_some());
+        assert!(matches!(
+            ui.prompt.as_ref().unwrap().prompt,
+            Prompt::AbandonConfirm
         ));
     }
 

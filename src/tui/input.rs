@@ -81,7 +81,6 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let no_mod = key.modifiers.is_empty();
 
     match key.code {
@@ -107,33 +106,27 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('?') if no_mod => KeyAction::OpenHelp,
 
         // --- Agent Tab Navigation (SPECS §23) ----------------------------
-        // Up / Alt-Up: previous Agent Tab. Plain arrows are accepted because
-        // some terminals (e.g. Warp) capture Option/Alt+Up/Down themselves; in
-        // App mode the bare arrows are otherwise unused.
-        KeyCode::Up if alt || no_mod => {
-            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))
-        }
-        // Down / Alt-Down: next Agent Tab.
-        KeyCode::Down if alt || no_mod => {
-            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
-        }
-        // Alt-1..Alt-9: jump to Agent Tab by index.
-        KeyCode::Char(c @ '1'..='9') if alt => {
-            let idx = (c as usize) - ('1' as usize);
-            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(idx)))
-        }
+        // Bare Up/Down: previous / next Agent Tab. The Alt-modified variants are
+        // handled in `map_global` so they also work in Terminal mode; the bare
+        // arrows are an App-mode-only fallback because some terminals (e.g. Warp)
+        // capture Option/Alt+Up/Down themselves, and in App mode the bare arrows
+        // are otherwise unused.
+        KeyCode::Up if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
+        // Down: next Agent Tab.
+        KeyCode::Down if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
 
         // --- Child Terminal Navigation (SPECS §23) -----------------------
         // Ctrl-t: New child terminal.
         KeyCode::Char('t') if ctrl => KeyAction::Dispatch(Command::NewChildTerminal),
         // Ctrl-w: Close active child terminal.
         KeyCode::Char('w') if ctrl => KeyAction::Dispatch(Command::CloseChildTerminal),
-        // Left / Alt-Left: previous terminal tab (cycles agent + shells).
-        KeyCode::Left if alt || no_mod => {
+        // Bare Left/Right: previous / next terminal tab (cycles agent + shells).
+        // Alt-Left/Right are handled in `map_global` for Terminal mode.
+        KeyCode::Left if no_mod => {
             KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
         }
-        // Right / Alt-Right: next terminal tab (cycles agent + shells).
-        KeyCode::Right if alt || no_mod => {
+        // Right: next terminal tab (cycles agent + shells).
+        KeyCode::Right if no_mod => {
             KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
         }
 
@@ -156,12 +149,35 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
 
 fn map_global(key: KeyEvent) -> Option<KeyAction> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
         // Ctrl-g: Command palette (both modes).
         KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
         // Ctrl-q: Quit.
         KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
+
+        // --- Agent + child-terminal navigation (SPECS §23) ---------------
+        // Alt-based navigation is global so it works while a terminal is
+        // focused (Terminal mode) as well as in App mode; otherwise these keys
+        // would be swallowed by the PTY passthrough and tabs would never switch.
+        // Alt-Up: previous Agent Tab.
+        KeyCode::Up if alt => Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))),
+        // Alt-Down: next Agent Tab.
+        KeyCode::Down if alt => Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))),
+        // Alt-Left: previous terminal tab (cycles agent + shells).
+        KeyCode::Left if alt => {
+            Some(KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev)))
+        }
+        // Alt-Right: next terminal tab (cycles agent + shells).
+        KeyCode::Right if alt => {
+            Some(KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)))
+        }
+        // Alt-1..Alt-9: jump to Agent Tab by index.
+        KeyCode::Char(c @ '1'..='9') if alt => {
+            let idx = (c as usize) - ('1' as usize);
+            Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(idx))))
+        }
         _ => None,
     }
 }
@@ -309,6 +325,53 @@ mod tests {
         assert_eq!(
             map_key(InputMode::Terminal, ctrl(KeyCode::Char('q'))),
             KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn terminal_mode_alt_up_switches_agent_tab() {
+        // Agent-tab navigation must work while a terminal is focused, not just
+        // in App mode — otherwise Alt+Up is swallowed by the PTY passthrough.
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Up)),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))
+        );
+    }
+
+    #[test]
+    fn terminal_mode_alt_down_switches_agent_tab() {
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Down)),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+        );
+    }
+
+    #[test]
+    fn terminal_mode_alt_left_right_switch_child_terminal() {
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Left)),
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
+        );
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Right)),
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
+        );
+    }
+
+    #[test]
+    fn terminal_mode_alt_index_jumps_agent_tab() {
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Char('2'))),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(1)))
+        );
+    }
+
+    #[test]
+    fn terminal_mode_bare_up_passes_through() {
+        // Without Alt, arrows still belong to the PTY in Terminal mode.
+        assert_eq!(
+            map_key(InputMode::Terminal, KeyEvent::from(KeyCode::Up)),
+            KeyAction::Passthrough(vec![0x1b, b'[', b'A'])
         );
     }
 

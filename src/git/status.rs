@@ -12,12 +12,67 @@ pub fn base_drift(git: &dyn GitExecutor, base_branch: &str, base_commit_sha: &st
     Ok(git.ahead_behind(base_commit_sha, base_branch)?.0)
 }
 
+/// A count of working-tree changes by category, parsed from
+/// `git status --porcelain` (SPECS §21). Each changed path is counted once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorktreeChanges {
+    /// New files: untracked (`??`) plus staged additions (`A`).
+    pub added: u32,
+    /// Modified, renamed, copied, or type-changed tracked files.
+    pub modified: u32,
+    /// Deleted tracked files.
+    pub deleted: u32,
+}
+
+impl WorktreeChanges {
+    /// Total number of changed paths.
+    pub fn total(&self) -> u32 {
+        self.added + self.modified + self.deleted
+    }
+
+    /// Whether the worktree is clean (no changes of any kind).
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Classify the lines of `git status --porcelain` (v1) into [`WorktreeChanges`].
+///
+/// Each line is `XY <path>` where `X` is the staged status and `Y` the
+/// worktree status. A path is counted once, by its most significant status:
+/// deletion > addition > modification (rename/copy/type-change count as
+/// modifications). Untracked `??` entries count as additions.
+pub fn parse_porcelain_changes(lines: &[String]) -> WorktreeChanges {
+    let mut changes = WorktreeChanges::default();
+    for line in lines {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        if x == '?' && y == '?' {
+            changes.added += 1;
+        } else if x == 'D' || y == 'D' {
+            changes.deleted += 1;
+        } else if x == 'A' {
+            changes.added += 1;
+        } else {
+            // M, R, C, T, and worktree-only modifications.
+            changes.modified += 1;
+        }
+    }
+    changes
+}
+
 /// Lightweight git status for an Agent Tab's worktree (SPECS §21).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeStatus {
     pub branch: String,
     pub base_branch: String,
     pub dirty: bool,
+    pub changes: WorktreeChanges,
     pub ahead: u32,
     pub behind: u32,
     pub upstream: Option<String>,
@@ -33,7 +88,10 @@ pub fn collect_status(
     base_commit_sha: &str,
     worktree_path: &Path,
 ) -> Result<WorktreeStatus> {
-    let dirty = git.is_dirty(worktree_path)?;
+    // One porcelain call yields both the dirty flag and the per-category counts.
+    let porcelain = git.status_porcelain(worktree_path)?;
+    let changes = parse_porcelain_changes(&porcelain);
+    let dirty = !changes.is_empty();
     let upstream = git.upstream_of(branch)?;
     // Ahead/behind vs the upstream, only meaningful when an upstream is known.
     let (ahead, behind) = match &upstream {
@@ -45,6 +103,7 @@ pub fn collect_status(
         branch: branch.to_string(),
         base_branch: base_branch.to_string(),
         dirty,
+        changes,
         ahead,
         behind,
         upstream,
@@ -176,6 +235,62 @@ mod tests {
             primary_running: false,
             user_confirmed: true,
         }
+    }
+
+    fn lines(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_changes_classifies_each_category() {
+        // Untracked + staged-add → added; modified/renamed → modified; del → deleted.
+        let porcelain = lines(&[
+            "?? new_untracked.rs",
+            "A  staged_new.rs",
+            " M worktree_modified.rs",
+            "M  staged_modified.rs",
+            "R  old.rs -> renamed.rs",
+            " D deleted.rs",
+            "D  staged_deleted.rs",
+        ]);
+        let ch = parse_porcelain_changes(&porcelain);
+        assert_eq!(ch.added, 2, "untracked + staged add");
+        assert_eq!(ch.modified, 3, "worktree-mod + staged-mod + rename");
+        assert_eq!(ch.deleted, 2, "worktree-del + staged-del");
+        assert_eq!(ch.total(), 7);
+        assert!(!ch.is_empty());
+    }
+
+    #[test]
+    fn parse_changes_empty_is_clean() {
+        let ch = parse_porcelain_changes(&[]);
+        assert!(ch.is_empty());
+        assert_eq!(ch.total(), 0);
+    }
+
+    #[test]
+    fn collect_status_reports_change_counts() {
+        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let wt = Path::new("/repo/.flightdeck/worktrees/feat");
+        git.set_porcelain_at(
+            wt,
+            ["?? a.rs", " M b.rs", "M  c.rs", " D d.rs"],
+        );
+        let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert!(status.dirty);
+        assert_eq!(status.changes.added, 1);
+        assert_eq!(status.changes.modified, 2);
+        assert_eq!(status.changes.deleted, 1);
+        assert_eq!(status.changes.total(), 4);
+    }
+
+    #[test]
+    fn collect_status_clean_worktree_has_no_changes() {
+        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let wt = Path::new("/repo/.flightdeck/worktrees/feat");
+        let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert!(!status.dirty);
+        assert!(status.changes.is_empty());
     }
 
     #[test]

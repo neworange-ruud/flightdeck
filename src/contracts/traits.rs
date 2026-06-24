@@ -22,6 +22,9 @@ pub trait GitExecutor {
     fn current_branch(&self, cwd: &Path) -> Result<String>;
     /// Whether the working tree at `cwd` has uncommitted changes.
     fn is_dirty(&self, cwd: &Path) -> Result<bool>;
+    /// The lines of `git status --porcelain` for `cwd` (one per changed path).
+    /// An empty vector means the worktree is clean.
+    fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>>;
     /// Whether a local branch exists.
     fn branch_exists(&self, name: &str) -> Result<bool>;
     /// Create a new branch `name` starting at `from` (does not check it out).
@@ -32,8 +35,10 @@ pub trait GitExecutor {
     fn add_worktree(&self, path: &Path, branch: &str) -> Result<()>;
     /// List all worktrees of the repository.
     fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>>;
-    /// Remove a worktree at `path`.
-    fn remove_worktree(&self, path: &Path) -> Result<()>;
+    /// Remove a worktree at `path`. When `force` is set, remove it even with
+    /// uncommitted/untracked changes (`git worktree remove --force`); otherwise
+    /// git refuses on a dirty worktree (SPECS §5/§15).
+    fn remove_worktree(&self, path: &Path, force: bool) -> Result<()>;
     /// `(ahead, behind)` counts of `branch` relative to `base`.
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)>;
     /// Configured upstream of `branch`, if any (e.g. `origin/foo`).

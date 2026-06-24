@@ -162,6 +162,9 @@ struct FakeGitState {
     /// Per-cwd dirty flag; `None` key holds the default.
     dirty: HashMap<PathBuf, bool>,
     default_dirty: bool,
+    /// Per-cwd `git status --porcelain` line overrides. When absent, the
+    /// porcelain output is synthesized from the dirty flag.
+    porcelain: HashMap<PathBuf, Vec<String>>,
     worktrees: Vec<WorktreeInfo>,
     revs: HashMap<String, String>,
     ahead_behind: HashMap<(String, String), (u32, u32)>,
@@ -185,6 +188,7 @@ impl Default for FakeGit {
                 branches: ["main".to_string()].into_iter().collect(),
                 dirty: HashMap::new(),
                 default_dirty: false,
+                porcelain: HashMap::new(),
                 worktrees: Vec::new(),
                 revs: HashMap::new(),
                 ahead_behind: HashMap::new(),
@@ -239,6 +243,20 @@ impl FakeGit {
     /// Set a dirty override for a specific path.
     pub fn set_dirty_at(&self, path: impl Into<PathBuf>, dirty: bool) {
         self.inner.lock().unwrap().dirty.insert(path.into(), dirty);
+    }
+
+    /// Set explicit `git status --porcelain` lines for a specific path. This
+    /// also implies the worktree is dirty when the lines are non-empty.
+    pub fn set_porcelain_at<I, S>(&self, path: impl Into<PathBuf>, lines: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inner
+            .lock()
+            .unwrap()
+            .porcelain
+            .insert(path.into(), lines.into_iter().map(Into::into).collect());
     }
 
     /// Map a refname to a SHA.
@@ -335,6 +353,21 @@ impl GitExecutor for FakeGit {
         Ok(*st.dirty.get(cwd).unwrap_or(&st.default_dirty))
     }
 
+    fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>> {
+        let st = self.inner.lock().unwrap();
+        // Explicit override wins; otherwise synthesize from the dirty flag so
+        // callers that only set dirtiness still see a non-empty status.
+        if let Some(lines) = st.porcelain.get(cwd) {
+            return Ok(lines.clone());
+        }
+        let dirty = *st.dirty.get(cwd).unwrap_or(&st.default_dirty);
+        Ok(if dirty {
+            vec![" M synthetic-change".to_string()]
+        } else {
+            Vec::new()
+        })
+    }
+
     fn branch_exists(&self, name: &str) -> Result<bool> {
         Ok(self.inner.lock().unwrap().branches.contains(name))
     }
@@ -372,7 +405,7 @@ impl GitExecutor for FakeGit {
         Ok(self.inner.lock().unwrap().worktrees.clone())
     }
 
-    fn remove_worktree(&self, path: &Path) -> Result<()> {
+    fn remove_worktree(&self, path: &Path, _force: bool) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         st.worktrees.retain(|w| w.path != path);
         st.removed_worktrees.push(path.to_path_buf());

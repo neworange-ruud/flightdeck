@@ -18,27 +18,48 @@ pub const CHILD_TAB_BAR_HEIGHT: u16 = 1;
 /// Height of the status/action bar in rows (SPECS §23).
 pub const STATUS_BAR_HEIGHT: u16 = 1;
 
+/// Height of the git info bar in rows (branch + change counts, SPECS §21).
+pub const INFO_BAR_HEIGHT: u16 = 1;
+
+/// Height of the full-width branded header (logo) row.
+pub const HEADER_HEIGHT: u16 = 1;
+
+/// Height of the divider row between the header and the rest of the app.
+pub const DIVIDER_HEIGHT: u16 = 1;
+
 /// The computed sub-rects for the main FlightDeck layout (SPECS §20).
 ///
 /// ```text
-/// ┌──────────────────────┬──────────────────────────────────────────┐
+/// ┌─────────────────────────────────────────────────────────────────┐
+/// │ header (full-width logo)                                         │
+/// ├─────────────────────────────────────────────────────────────────┤
+/// │ divider                                                         │
+/// ├──────────────────────┬──────────────────────────────────────────┤
 /// │ sidebar              │ child_tabs                               │
 /// │                      ├──────────────────────────────────────────┤
 /// │                      │                                          │
 /// │                      │          terminal                        │
 /// │                      │                                          │
 /// │                      ├──────────────────────────────────────────┤
+/// │                      │ info_bar                                 │
+/// │                      ├──────────────────────────────────────────┤
 /// │                      │ status_bar                               │
 /// └──────────────────────┴──────────────────────────────────────────┘
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainLayout {
+    /// Full-width branded header (logo) row at the very top.
+    pub header: Rect,
+    /// Full-width divider row between the header and the rest of the app.
+    pub divider: Rect,
     /// Left Agent Tabs sidebar.
     pub sidebar: Rect,
     /// Horizontal child-terminal tab bar (top of the main pane).
     pub child_tabs: Rect,
     /// Active terminal viewport.
     pub terminal: Rect,
+    /// Git info bar (branch + change counts), just above the status bar.
+    pub info_bar: Rect,
     /// Status/action bar (bottom of the main pane).
     pub status_bar: Rect,
 }
@@ -53,22 +74,34 @@ pub struct MainLayout {
 /// If the area is too small (e.g. less than the minimum heights/widths),
 /// sub-rects may be zero-sized — callers must handle this gracefully.
 pub fn compute(area: Rect) -> MainLayout {
-    // Split horizontally: sidebar | main pane.
-    let [sidebar, main] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)]).areas(area);
+    // Full-width top band: header (logo) | divider | body.
+    let [header, divider, body] = Layout::vertical([
+        Constraint::Length(HEADER_HEIGHT),
+        Constraint::Length(DIVIDER_HEIGHT),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
 
-    // Split main pane vertically: child_tabs | terminal | status_bar.
-    let [child_tabs, terminal, status_bar] = Layout::vertical([
+    // Split the body horizontally: sidebar | main pane.
+    let [sidebar, main] =
+        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)]).areas(body);
+
+    // Split main pane vertically: child_tabs | terminal | info_bar | status_bar.
+    let [child_tabs, terminal, info_bar, status_bar] = Layout::vertical([
         Constraint::Length(CHILD_TAB_BAR_HEIGHT),
         Constraint::Fill(1),
+        Constraint::Length(INFO_BAR_HEIGHT),
         Constraint::Length(STATUS_BAR_HEIGHT),
     ])
     .areas(main);
 
     MainLayout {
+        header,
+        divider,
         sidebar,
         child_tabs,
         terminal,
+        info_bar,
         status_bar,
     }
 }
@@ -93,19 +126,41 @@ mod tests {
         Rect::new(0, 0, 120, 40)
     }
 
+    /// Total height consumed by the full-width top band (header + divider).
+    const TOP_BAND: u16 = HEADER_HEIGHT + DIVIDER_HEIGHT;
+
+    #[test]
+    fn header_and_divider_span_full_width_at_top() {
+        let area = full_terminal();
+        let layout = compute(area);
+        // Header is the very first row, full width.
+        assert_eq!(layout.header.y, 0);
+        assert_eq!(layout.header.x, 0);
+        assert_eq!(layout.header.width, area.width);
+        assert_eq!(layout.header.height, HEADER_HEIGHT);
+        // Divider sits directly below the header, also full width.
+        assert_eq!(layout.divider.y, HEADER_HEIGHT);
+        assert_eq!(layout.divider.x, 0);
+        assert_eq!(layout.divider.width, area.width);
+        assert_eq!(layout.divider.height, DIVIDER_HEIGHT);
+        // The rest of the app begins below the divider.
+        assert_eq!(layout.divider.bottom(), layout.sidebar.top());
+        assert_eq!(layout.divider.bottom(), layout.child_tabs.top());
+    }
+
     #[test]
     fn sidebar_has_correct_width() {
         let layout = compute(full_terminal());
         assert_eq!(layout.sidebar.width, SIDEBAR_WIDTH);
         assert_eq!(layout.sidebar.x, 0);
-        assert_eq!(layout.sidebar.y, 0);
+        assert_eq!(layout.sidebar.y, TOP_BAND);
     }
 
     #[test]
-    fn sidebar_fills_full_height() {
+    fn sidebar_fills_remaining_height_below_top_band() {
         let area = full_terminal();
         let layout = compute(area);
-        assert_eq!(layout.sidebar.height, area.height);
+        assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
     }
 
     #[test]
@@ -124,14 +179,26 @@ mod tests {
         let layout = compute(area);
         assert_eq!(layout.child_tabs.width, expected_main_w);
         assert_eq!(layout.terminal.width, expected_main_w);
+        assert_eq!(layout.info_bar.width, expected_main_w);
         assert_eq!(layout.status_bar.width, expected_main_w);
+    }
+
+    #[test]
+    fn info_bar_sits_directly_above_status_bar() {
+        let area = full_terminal();
+        let layout = compute(area);
+        assert_eq!(layout.info_bar.height, INFO_BAR_HEIGHT);
+        assert_eq!(layout.info_bar.x, SIDEBAR_WIDTH);
+        assert_eq!(layout.info_bar.bottom(), layout.status_bar.top());
+        assert_eq!(layout.terminal.bottom(), layout.info_bar.top());
     }
 
     #[test]
     fn child_tabs_bar_height() {
         let layout = compute(full_terminal());
         assert_eq!(layout.child_tabs.height, CHILD_TAB_BAR_HEIGHT);
-        assert_eq!(layout.child_tabs.y, 0);
+        // The child tab bar is the first row of the body, below the top band.
+        assert_eq!(layout.child_tabs.y, TOP_BAND);
     }
 
     #[test]
@@ -150,10 +217,14 @@ mod tests {
     fn terminal_viewport_fills_remaining() {
         let area = full_terminal();
         let layout = compute(area);
-        // child_tabs (1) + terminal (?) + status_bar (1) == area.height
-        let expected_h = area.height - CHILD_TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT;
+        // top band (2) + child_tabs (1) + terminal (?) + info_bar (1) + status (1).
+        let expected_h = area.height
+            - TOP_BAND
+            - CHILD_TAB_BAR_HEIGHT
+            - INFO_BAR_HEIGHT
+            - STATUS_BAR_HEIGHT;
         assert_eq!(layout.terminal.height, expected_h);
-        assert_eq!(layout.terminal.y, CHILD_TAB_BAR_HEIGHT);
+        assert_eq!(layout.terminal.y, TOP_BAND + CHILD_TAB_BAR_HEIGHT);
     }
 
     #[test]
@@ -163,20 +234,25 @@ mod tests {
         assert!(layout.sidebar.right() <= layout.terminal.left());
         // Vertical panes must not overlap within main pane.
         assert!(layout.child_tabs.bottom() <= layout.terminal.top());
-        assert!(layout.terminal.bottom() <= layout.status_bar.top());
+        assert!(layout.terminal.bottom() <= layout.info_bar.top());
+        assert!(layout.info_bar.bottom() <= layout.status_bar.top());
     }
 
     #[test]
     fn total_area_accounted_for() {
         let area = full_terminal();
         let layout = compute(area);
-        // Sidebar spans full height.
-        assert_eq!(layout.sidebar.height, area.height);
+        // Sidebar spans the full height below the top band.
+        assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
         // Width sum: sidebar + main pane columns.
         assert_eq!(layout.sidebar.width + layout.child_tabs.width, area.width);
-        // Height sum within main pane.
+        // Height sum: top band + main pane rows == full height.
         assert_eq!(
-            layout.child_tabs.height + layout.terminal.height + layout.status_bar.height,
+            TOP_BAND
+                + layout.child_tabs.height
+                + layout.terminal.height
+                + layout.info_bar.height
+                + layout.status_bar.height,
             area.height
         );
     }

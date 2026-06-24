@@ -60,7 +60,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         label: "Abandon Worktree",
-        action: PaletteAction::Dispatch(Command::AbandonWorktree),
+        action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
     },
     PaletteEntry {
         label: "New Child Terminal",

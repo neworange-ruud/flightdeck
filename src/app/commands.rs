@@ -120,8 +120,14 @@ pub enum Command {
         /// Whether the user explicitly confirmed the merge (SPECS §15).
         confirm: bool,
     },
-    /// Abandon (remove) the selected tab's worktree if safe (SPECS §5/§15).
-    AbandonWorktree,
+    /// Abandon (remove) the selected tab's worktree (SPECS §5/§15). With
+    /// `confirm` false, a dirty worktree returns [`Effect::AbandonWarning`]
+    /// instead of removing; with `confirm` true the worktree is force-removed
+    /// even with uncommitted changes.
+    AbandonWorktree {
+        /// Whether the user confirmed discarding uncommitted changes.
+        confirm: bool,
+    },
     /// Open a new child shell terminal in the selected tab (SPECS §19).
     NewChildTerminal,
     /// Close the selected tab's currently-selected child terminal (SPECS §19).
@@ -166,6 +172,9 @@ pub enum Effect {
     /// The push warning + the plan that triggered it; the UI offers the options
     /// and re-dispatches `PushBranch { confirm: Some(..) }` (SPECS §14).
     PushWarning(PushPlan),
+    /// The selected tab's worktree has uncommitted changes; the UI must confirm
+    /// before re-dispatching `AbandonWorktree { confirm: true }` (SPECS §5/§15).
+    AbandonWarning,
     /// The branch already existed and was attached to (surfaced, never silent, §11).
     AttachedExisting {
         /// The attached branch name.

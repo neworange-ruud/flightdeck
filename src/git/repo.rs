@@ -100,6 +100,16 @@ impl GitExecutor for GitCli {
         Ok(!out.stdout.is_empty() && !stdout_trimmed(&out).is_empty())
     }
 
+    fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>> {
+        let out = self.run_in(cwd, &["status", "--porcelain"])?;
+        require_success(&out, "status --porcelain")?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
+    }
+
     fn branch_exists(&self, name: &str) -> Result<bool> {
         // `git branch --list <name>` prints the branch if it exists locally.
         let out = self.run(&["branch", "--list", name])?;
@@ -132,9 +142,14 @@ impl GitExecutor for GitCli {
         Ok(parse_worktree_list(&String::from_utf8_lossy(&out.stdout)))
     }
 
-    fn remove_worktree(&self, path: &Path) -> Result<()> {
+    fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
         let path_str = path.to_string_lossy();
-        let out = self.run(&["worktree", "remove", &path_str])?;
+        let args: &[&str] = if force {
+            &["worktree", "remove", "--force", &path_str]
+        } else {
+            &["worktree", "remove", &path_str]
+        };
+        let out = self.run(args)?;
         require_success(&out, &format!("worktree remove {path_str}"))
     }
 

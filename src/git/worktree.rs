@@ -57,20 +57,24 @@ pub fn create_worktree(
     git.add_worktree(target, branch)
 }
 
-/// Remove a managed worktree only when it is safe to do so (SPECS §5, §15).
+/// Remove a managed worktree (SPECS §5, §15). When `force` is false the removal
+/// is refused if the worktree has uncommitted changes; when `force` is true the
+/// worktree is removed regardless (the caller is responsible for having obtained
+/// the user's confirmation first).
 pub fn remove_worktree_if_safe(
     git: &dyn GitExecutor,
     fs: &dyn FileSystem,
     path: &Path,
+    force: bool,
 ) -> Result<()> {
     let _ = fs;
-    if git.is_dirty(path)? {
+    if !force && git.is_dirty(path)? {
         return Err(FlightDeckError::Refused(format!(
             "worktree '{}' has uncommitted changes; refusing to remove",
             path.display()
         )));
     }
-    git.remove_worktree(path)
+    git.remove_worktree(path, force)
 }
 
 #[cfg(test)]
@@ -169,14 +173,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_refuses_when_dirty() {
+    fn remove_refuses_when_dirty_without_force() {
         let git = FakeGit::new();
         let fs = FakeFs::new();
         let path = Path::new("/repo/.flightdeck/worktrees/feat");
         git.set_dirty_at(path, true);
-        let err = remove_worktree_if_safe(&git, &fs, path).unwrap_err();
+        let err = remove_worktree_if_safe(&git, &fs, path, false).unwrap_err();
         assert!(matches!(err, FlightDeckError::Refused(_)));
         assert!(git.removed_worktrees().is_empty());
+    }
+
+    #[test]
+    fn remove_forced_when_dirty() {
+        let git = FakeGit::new();
+        let fs = FakeFs::new();
+        let path = Path::new("/repo/.flightdeck/worktrees/feat");
+        git.set_dirty_at(path, true);
+        remove_worktree_if_safe(&git, &fs, path, true).unwrap();
+        assert_eq!(git.removed_worktrees(), vec![path.to_path_buf()]);
     }
 
     #[test]
@@ -185,7 +199,7 @@ mod tests {
         let fs = FakeFs::new();
         let path = Path::new("/repo/.flightdeck/worktrees/feat");
         git.set_dirty_at(path, false);
-        remove_worktree_if_safe(&git, &fs, path).unwrap();
+        remove_worktree_if_safe(&git, &fs, path, false).unwrap();
         assert_eq!(git.removed_worktrees(), vec![path.to_path_buf()]);
     }
 }

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
@@ -67,7 +67,7 @@ pub enum UiOverlay {
 // Mouse hit-testing (clickable tabs)
 // ---------------------------------------------------------------------------
 
-/// Rows the sidebar header ("Agent Tabs") occupies before the first tab.
+/// Rows the sidebar header ("Agents") occupies before the first tab.
 const SIDEBAR_HEADER_ROWS: u16 = 1;
 /// Rows each agent tab occupies in the sidebar: divider + name + agent + git.
 const SIDEBAR_ROWS_PER_TAB: u16 = 4;
@@ -177,9 +177,13 @@ pub fn draw(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, overlay
     let area = frame.area();
     let ml = layout::compute(area);
 
+    draw_header(frame, ml.header);
+    let divider = Paragraph::new(divider_line(ml.divider.width as usize));
+    frame.render_widget(divider, ml.divider);
     draw_sidebar(frame, state, cache, ml.sidebar);
     draw_child_tab_bar(frame, state, ml.child_tabs);
     draw_terminal_viewport(frame, state, ml.terminal);
+    draw_info_bar(frame, state, cache, ml.info_bar);
     draw_status_bar(frame, state, ml.status_bar);
 
     // Draw overlay on top if active.
@@ -191,6 +195,56 @@ pub fn draw(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, overlay
         UiOverlay::GitStatus { status, pr_url } => {
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Branded header (logo)
+// ---------------------------------------------------------------------------
+
+/// Left/right block-shade flourishes of the logo (a ░▒▓█ gradient).
+const LOGO_LEFT: &str = "░░░▒▒▒▓▓▓██████";
+const LOGO_RIGHT: &str = "██████▓▓▓▒▒▒░░░";
+/// The brand wordmark, spaced (wide) and tight (narrow) variants.
+const BRAND_WIDE: &str = "   F · L · I · G · H · T · D · E · C · K   ";
+const BRAND_NARROW: &str = "  F·L·I·G·H·T·D·E·C·K  ";
+
+/// Draw the full-width branded header, logo centered (best fit for the width).
+pub fn draw_header(frame: &mut Frame, area: Rect) {
+    let line = header_line(area.width as usize);
+    let para = Paragraph::new(line).alignment(Alignment::Center);
+    frame.render_widget(para, area);
+}
+
+/// Build the centered logo [`Line`] for a given width: the wide wordmark when it
+/// fits, the tighter variant when it does not, and a plain truncated brand when
+/// even that is too wide. Exported for testing.
+pub fn header_line(width: usize) -> Line<'static> {
+    let block_style = Style::default().fg(Color::Cyan);
+    let brand_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let flanks = LOGO_LEFT.chars().count() + LOGO_RIGHT.chars().count();
+    let wide_w = flanks + BRAND_WIDE.chars().count();
+    let narrow_w = flanks + BRAND_NARROW.chars().count();
+
+    if width >= wide_w {
+        Line::from(vec![
+            Span::styled(LOGO_LEFT, block_style),
+            Span::styled(BRAND_WIDE, brand_style),
+            Span::styled(LOGO_RIGHT, block_style),
+        ])
+    } else if width >= narrow_w {
+        Line::from(vec![
+            Span::styled(LOGO_LEFT, block_style),
+            Span::styled(BRAND_NARROW, brand_style),
+            Span::styled(LOGO_RIGHT, block_style),
+        ])
+    } else {
+        // Too narrow for the framed logo: show the brand alone, truncated to fit.
+        let brand: String = "FLIGHTDECK".chars().take(width).collect();
+        Line::from(Span::styled(brand, brand_style))
     }
 }
 
@@ -207,13 +261,16 @@ pub fn draw_sidebar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache,
     let width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header row (SIDEBAR_HEADER_ROWS).
-    lines.push(Line::from(Span::styled(
-        "Agent Tabs",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )));
+    // Header row (SIDEBAR_HEADER_ROWS): centered "Agents" title.
+    lines.push(
+        Line::from(Span::styled(
+            "Agents",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+    );
 
     if state.tabs.is_empty() {
         lines.push(divider_line(width));
@@ -488,6 +545,120 @@ fn vt_color(c: vt100::Color) -> Color {
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Git info bar (SPECS §21)
+// ---------------------------------------------------------------------------
+
+/// Draw the one-line git info bar for the selected tab (SPECS §21).
+///
+/// Shown for whichever child terminal is active (agent or shell) — it reflects
+/// the tab's worktree, not the focused process. Content: branch name, the
+/// add/modify/delete file counts, ahead/behind vs upstream, base drift, and the
+/// base branch. Data comes from the [`GitStatusCache`]; a missing entry renders
+/// as `git: ?` and never panics.
+pub fn draw_info_bar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, area: Rect) {
+    let line = info_bar_line(state, cache);
+    let para = Paragraph::new(line).style(Style::default().bg(Color::Reset));
+    frame.render_widget(para, area);
+}
+
+/// A dim ` │ ` segment separator for the info bar.
+fn info_sep() -> Span<'static> {
+    Span::styled(" │ ", Style::default().fg(Color::DarkGray))
+}
+
+/// Build the git info bar [`Line`] for the selected tab. Exported for testing.
+pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> {
+    let Some(tab) = state.selected() else {
+        return Line::from(Span::styled(
+            " No Agent Tab selected",
+            Style::default().fg(Color::DarkGray),
+        ));
+    };
+    let git = cache.get(&tab.meta.id);
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Branch (prefer the freshly-collected name; fall back to stored meta).
+    let branch = git
+        .map(|w| w.branch.clone())
+        .unwrap_or_else(|| tab.meta.branch.clone());
+    spans.push(Span::styled(" ⎇ ", Style::default().fg(Color::Blue)));
+    spans.push(Span::styled(
+        branch,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    match git {
+        None => {
+            spans.push(info_sep());
+            spans.push(Span::styled("git: ?", Style::default().fg(Color::DarkGray)));
+        }
+        Some(ws) => {
+            // Change counts: +added ~modified -deleted (N files), or "clean".
+            spans.push(info_sep());
+            let ch = ws.changes;
+            if ch.is_empty() {
+                spans.push(Span::styled("clean", Style::default().fg(Color::Green)));
+            } else {
+                spans.push(Span::styled(
+                    format!("+{}", ch.added),
+                    Style::default().fg(Color::Green),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("~{}", ch.modified),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("-{}", ch.deleted),
+                    Style::default().fg(Color::Red),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("({} files)", ch.total()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // Ahead/behind vs upstream.
+            spans.push(info_sep());
+            if ws.upstream.is_some() {
+                spans.push(Span::styled(
+                    format!("↑{} ↓{}", ws.ahead, ws.behind),
+                    Style::default().fg(Color::Cyan),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "no upstream",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // Base drift (only when the base has moved).
+            if ws.base_drift > 0 {
+                spans.push(info_sep());
+                spans.push(Span::styled(
+                    format!("base +{}", ws.base_drift),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+
+            // Base branch for context.
+            spans.push(info_sep());
+            spans.push(Span::styled(
+                format!("base: {}", ws.base_branch),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    Line::from(spans)
 }
 
 // ---------------------------------------------------------------------------
@@ -882,12 +1053,14 @@ mod tests {
     fn hit_test_maps_sidebar_rows_to_agent_tabs() {
         let state = state_with_tabs(2);
         let area = Rect::new(0, 0, 80, 24);
-        // Header is row 0; tab 0 occupies rows 1..=4, tab 1 rows 5..=8.
-        assert_eq!(hit_test(area, &state, 2, 1), Some(HitTarget::AgentTab(0)));
-        assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
-        assert_eq!(hit_test(area, &state, 2, 5), Some(HitTarget::AgentTab(1)));
-        // Header row selects nothing.
+        // Rows 0-1 are the logo header + divider; row 2 is the sidebar's "Agent
+        // Tabs" heading. Tab 0 occupies rows 3..=6, tab 1 rows 7..=10.
+        assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 7), Some(HitTarget::AgentTab(1)));
+        // The header band and the sidebar heading select nothing.
         assert_eq!(hit_test(area, &state, 2, 0), None);
+        assert_eq!(hit_test(area, &state, 2, 2), None);
     }
 
     #[test]
@@ -931,11 +1104,169 @@ mod tests {
     fn hit_test_maps_child_tab_bar_to_primary() {
         let state = state_with_tabs(1);
         let area = Rect::new(0, 0, 80, 24);
-        // Child tab bar is row 0 of the main pane; the "agent" segment starts at
-        // the sidebar width (28) and spans " agent " (7 cols).
+        // Child tab bar is the first body row (row 2, below the logo + divider);
+        // the "agent" segment starts at the sidebar width (28), spanning " agent ".
         assert_eq!(
-            hit_test(area, &state, 30, 0),
+            hit_test(area, &state, 30, 2),
             Some(HitTarget::Child(ChildTarget::Primary))
+        );
+    }
+
+    // --- Git info bar (SPECS §21) ----------------------------------------
+
+    fn flatten(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    // --- Branded header (logo) -------------------------------------------
+
+    #[test]
+    fn header_uses_wide_logo_when_space_allows() {
+        let flat = flatten(&header_line(200));
+        assert!(flat.contains("F · L · I · G · H · T"), "wide brand: {flat:?}");
+        assert!(flat.contains("██████"), "block flourish: {flat:?}");
+    }
+
+    #[test]
+    fn header_shrinks_to_narrow_logo_when_tight() {
+        // 60 cols fits the narrow logo but not the wide one.
+        let flat = flatten(&header_line(60));
+        assert!(
+            flat.contains("F·L·I·G·H·T·D·E·C·K"),
+            "narrow brand: {flat:?}"
+        );
+        assert!(!flat.contains("F · L"), "must not be the wide brand: {flat:?}");
+        assert!(flat.contains("██████"), "block flourish: {flat:?}");
+    }
+
+    #[test]
+    fn header_falls_back_to_truncated_brand_when_very_narrow() {
+        let flat = flatten(&header_line(8));
+        assert_eq!(flat, "FLIGHTDE", "8-col fallback: {flat:?}");
+    }
+
+    #[test]
+    fn header_and_divider_render_on_top_two_rows() {
+        let state = state_with_tabs(1);
+        let mut term = test_terminal(120, 24);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let row0: String = (0..120).map(|x| buffer[(x, 0)].symbol().to_string()).collect();
+        let row1: String = (0..120).map(|x| buffer[(x, 1)].symbol().to_string()).collect();
+        // The logo (block flourish + brand) sits on the very first row.
+        assert!(row0.contains("██████"), "logo row: {row0:?}");
+        assert!(row0.contains("F · L · I"), "brand on logo row: {row0:?}");
+        // The divider fills the second row.
+        assert!(
+            row1.chars().filter(|&c| c == '─').count() > 100,
+            "divider row should be a full-width rule: {row1:?}"
+        );
+    }
+
+    #[test]
+    fn info_bar_without_selection_says_no_tab() {
+        let state = empty_state();
+        let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(flat.contains("No Agent Tab selected"), "got: {flat:?}");
+    }
+
+    #[test]
+    fn info_bar_without_cache_shows_branch_and_unknown_git() {
+        let state = state_with_tabs(1);
+        let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(flat.contains("flightdeck/tab0"), "branch missing: {flat:?}");
+        assert!(flat.contains("git: ?"), "unknown marker missing: {flat:?}");
+    }
+
+    #[test]
+    fn info_bar_shows_branch_and_change_counts() {
+        let state = state_with_tabs(1);
+        let mut cache = empty_cache();
+        cache.insert(
+            "t0".to_string(),
+            WorktreeStatus {
+                branch: "flightdeck/tab0".to_string(),
+                base_branch: "main".to_string(),
+                dirty: true,
+                changes: crate::git::status::WorktreeChanges {
+                    added: 1,
+                    modified: 2,
+                    deleted: 3,
+                },
+                ahead: 4,
+                behind: 5,
+                upstream: Some("origin/flightdeck/tab0".to_string()),
+                base_drift: 6,
+                worktree_path: PathBuf::from("/repo/.flightdeck/worktrees/tab0"),
+            },
+        );
+        let flat = flatten(&info_bar_line(&state, &cache));
+        assert!(flat.contains("flightdeck/tab0"), "branch: {flat:?}");
+        assert!(flat.contains("+1"), "added: {flat:?}");
+        assert!(flat.contains("~2"), "modified: {flat:?}");
+        assert!(flat.contains("-3"), "deleted: {flat:?}");
+        assert!(flat.contains("(6 files)"), "total: {flat:?}");
+        assert!(flat.contains("↑4 ↓5"), "ahead/behind: {flat:?}");
+        assert!(flat.contains("base +6"), "drift: {flat:?}");
+        assert!(flat.contains("base: main"), "base branch: {flat:?}");
+    }
+
+    #[test]
+    fn info_bar_clean_worktree_says_clean() {
+        let state = state_with_tabs(1);
+        let mut cache = empty_cache();
+        cache.insert(
+            "t0".to_string(),
+            WorktreeStatus {
+                branch: "flightdeck/tab0".to_string(),
+                base_branch: "main".to_string(),
+                dirty: false,
+                changes: crate::git::status::WorktreeChanges::default(),
+                ahead: 0,
+                behind: 0,
+                upstream: None,
+                base_drift: 0,
+                worktree_path: PathBuf::from("/repo/.flightdeck/worktrees/tab0"),
+            },
+        );
+        let flat = flatten(&info_bar_line(&state, &cache));
+        assert!(flat.contains("clean"), "clean marker: {flat:?}");
+        assert!(flat.contains("no upstream"), "upstream marker: {flat:?}");
+    }
+
+    #[test]
+    fn info_bar_renders_above_status_bar_in_buffer() {
+        // The info bar occupies the row just above the bottom status bar.
+        let state = state_with_tabs(1);
+        let mut cache = empty_cache();
+        cache.insert(
+            "t0".to_string(),
+            WorktreeStatus {
+                branch: "flightdeck/tab0".to_string(),
+                base_branch: "main".to_string(),
+                dirty: true,
+                changes: crate::git::status::WorktreeChanges {
+                    added: 2,
+                    modified: 0,
+                    deleted: 0,
+                },
+                ahead: 0,
+                behind: 0,
+                upstream: None,
+                base_drift: 0,
+                worktree_path: PathBuf::from("/repo/.flightdeck/worktrees/tab0"),
+            },
+        );
+        let mut term = test_terminal(80, 24);
+        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        // Info bar is one row above the status bar (y = 22); status bar is y = 23.
+        let info_row: String = (0..80).map(|x| buffer[(x, 22)].symbol().to_string()).collect();
+        assert!(
+            info_row.contains("flightdeck/tab0"),
+            "info bar row should show the branch, got: {info_row:?}"
         );
     }
 
@@ -1026,6 +1357,11 @@ mod tests {
             branch: "flightdeck/test".to_string(),
             base_branch: "main".to_string(),
             dirty: true,
+            changes: crate::git::status::WorktreeChanges {
+                added: 1,
+                modified: 2,
+                deleted: 0,
+            },
             ahead: 3,
             behind: 1,
             upstream: Some("origin/flightdeck/test".to_string()),
@@ -1078,6 +1414,7 @@ mod tests {
             branch: "flightdeck/mybranch".to_string(),
             base_branch: "main".to_string(),
             dirty: false,
+            changes: crate::git::status::WorktreeChanges::default(),
             ahead: 0,
             behind: 0,
             upstream: None,

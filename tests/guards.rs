@@ -67,7 +67,6 @@ fn git_layer_has_no_history_rewriting_subcommands() {
         "\"reset\"",
         "\"filter-branch\"",
         "\"filter-repo\"",
-        "\"--force\"",
         "\"-f\"",
         "\"gh\"", // no GitHub PR creation via the gh CLI
     ];
@@ -79,6 +78,21 @@ fn git_layer_has_no_history_rewriting_subcommands() {
                 "SPECS §5 violation: forbidden git argument {token} found in {}",
                 file.display()
             );
+        }
+        // `--force` is forbidden EXCEPT for `git worktree remove --force`, which
+        // discards a dirty *working tree* (the user-confirmed Abandon action,
+        // SPECS §5 "remove managed worktrees") and never touches commit history.
+        // Every line bearing the `--force` literal must therefore be a worktree
+        // removal — this still catches force-push and any other force op.
+        for line in contents.lines() {
+            if line.contains("\"--force\"") {
+                assert!(
+                    line.contains("\"worktree\"") && line.contains("\"remove\""),
+                    "SPECS §5 violation: \"--force\" outside `worktree remove` found in {}: {}",
+                    file.display(),
+                    line.trim()
+                );
+            }
         }
     }
 }
