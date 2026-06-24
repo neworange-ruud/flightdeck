@@ -103,6 +103,11 @@ pub fn run() -> Result<()> {
         }));
     }
 
+    // Resume: start the primary agent for every recovered/loaded tab whose
+    // worktree still exists (best effort). Done here, after the viewport size is
+    // known, rather than in `recover`/`AppState::new` which never spawn.
+    let _ = state.resume_agents(&services);
+
     let loop_result = event_loop(&mut terminal, &mut state, &services);
 
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate

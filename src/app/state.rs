@@ -627,18 +627,42 @@ impl AppState {
         }
     }
 
-    /// Switch the selected tab's child terminal (SPECS §22).
+    /// Switch the selected tab's active terminal (SPECS §22). `Next`/`Prev`
+    /// cycle the full horizontal tab ring — the primary "agent" terminal plus
+    /// every child shell — wrapping around. `Index(i)` selects child shell `i`.
     fn cmd_switch_child(&mut self, sel: Selector) -> Result<Effect> {
         let Some(tab) = self.selected_mut() else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let len = tab.session.child_count();
-        match Self::resolve_selector(sel, tab.session.selected_child(), len) {
-            Some(idx) => {
-                tab.session.switch_child(idx)?;
+        let child_count = tab.session.child_count();
+        match sel {
+            Selector::Index(i) => {
+                if i < child_count {
+                    tab.session.switch_child(i)?;
+                    Ok(Effect::None)
+                } else {
+                    Ok(Effect::Refused("No such child terminal.".to_string()))
+                }
+            }
+            Selector::Next | Selector::Prev => {
+                // Ring positions: 0 = primary (agent), 1..=child_count = children.
+                let ring = child_count + 1;
+                let cur = match tab.session.selected_child() {
+                    None => 0,
+                    Some(i) => i + 1,
+                };
+                let next = match sel {
+                    Selector::Next => (cur + 1) % ring,
+                    Selector::Prev => (cur + ring - 1) % ring,
+                    Selector::Index(_) => unreachable!(),
+                };
+                if next == 0 {
+                    tab.session.focus_primary();
+                } else {
+                    tab.session.switch_child(next - 1)?;
+                }
                 Ok(Effect::None)
             }
-            None => Ok(Effect::Refused("No such child terminal.".to_string())),
         }
     }
 
@@ -660,14 +684,11 @@ impl AppState {
         }
     }
 
-    /// Restart the primary agent of the selected (recovered/stopped) tab
-    /// (SPECS §10, §23). Re-validates the agent before spawning.
-    fn cmd_restart_agent(&mut self, services: &Services) -> Result<Effect> {
+    /// Spawn (or re-spawn) the primary agent for tab `idx`. Re-validates the
+    /// agent's command first (SPECS §16) and marks the tab no longer recovered.
+    fn start_primary_for(&mut self, idx: usize, services: &Services) -> Result<()> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
-        let Some(idx) = self.selected_tab else {
-            return Err(FlightDeckError::Other("no tab selected".to_string()));
-        };
         let agent_key = self.tabs[idx].meta.agent.clone();
         let agent = self
             .registry
@@ -691,8 +712,48 @@ impl AppState {
         )?;
         tab.interpreted = Some(InterpretedStatus::Starting);
         tab.meta.recovered = false;
+        Ok(())
+    }
+
+    /// Restart the primary agent of the selected (recovered/stopped) tab
+    /// (SPECS §10, §23). Re-validates the agent before spawning.
+    fn cmd_restart_agent(&mut self, services: &Services) -> Result<Effect> {
+        let Some(idx) = self.selected_tab else {
+            return Err(FlightDeckError::Other("no tab selected".to_string()));
+        };
+        self.start_primary_for(idx, services)?;
         self.persist(services)?;
         Ok(Effect::Message("Restarted primary agent.".to_string()))
+    }
+
+    /// Start the primary agent for every resumed tab that has no running primary
+    /// and whose worktree still exists on disk (used when resuming a session).
+    ///
+    /// Best-effort: a tab whose agent command is missing or whose worktree is
+    /// gone is skipped rather than aborting the whole resume. Returns the number
+    /// of agents started. This is an explicit step the wiring layer invokes —
+    /// `AppState::new` and `recover` themselves never spawn (SPECS §10).
+    pub fn resume_agents(&mut self, services: &Services) -> usize {
+        let mut started = 0usize;
+        for idx in 0..self.tabs.len() {
+            if self.tabs[idx].session.primary_state() != ProcessState::NotStarted {
+                continue;
+            }
+            let cwd = to_absolute(
+                &self.repo_root,
+                Path::new(&self.tabs[idx].meta.worktree_path_relative),
+            );
+            if !services.fs.exists(&cwd) {
+                continue;
+            }
+            if self.start_primary_for(idx, services).is_ok() {
+                started += 1;
+            }
+        }
+        if started > 0 {
+            let _ = self.persist(services);
+        }
+        started
     }
 
     /// Show the git status panel for the selected tab (SPECS §21).
@@ -1436,5 +1497,124 @@ mod tests {
             ProcessState::NotStarted
         );
         assert_eq!(app.selected_tab, Some(0));
+    }
+
+    // --- Alt-Left/Right cycles the agent + shells ring (SPECS §19, §22) ---
+
+    #[test]
+    fn switch_child_cycles_through_agent_and_shells() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session(); // primary
+        pty.queue_session(); // shell 1
+        pty.queue_session(); // shell 2
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "t".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        app.dispatch(Command::NewChildTerminal, &svc).unwrap();
+        app.dispatch(Command::NewChildTerminal, &svc).unwrap();
+        // After creating two children, the second (index 1) is selected.
+        assert_eq!(app.tabs[0].session.selected_child(), Some(1));
+
+        // Next from last child wraps to the primary ("agent") tab.
+        app.dispatch(Command::SwitchChildTerminal(Selector::Next), &svc)
+            .unwrap();
+        assert_eq!(app.tabs[0].session.selected_child(), None);
+        // Next again → first child shell.
+        app.dispatch(Command::SwitchChildTerminal(Selector::Next), &svc)
+            .unwrap();
+        assert_eq!(app.tabs[0].session.selected_child(), Some(0));
+        // Prev → back to the primary ("agent") tab.
+        app.dispatch(Command::SwitchChildTerminal(Selector::Prev), &svc)
+            .unwrap();
+        assert_eq!(app.tabs[0].session.selected_child(), None);
+        // Prev from the primary wraps to the last child shell.
+        app.dispatch(Command::SwitchChildTerminal(Selector::Prev), &svc)
+            .unwrap();
+        assert_eq!(app.tabs[0].session.selected_child(), Some(1));
+    }
+
+    // --- Resuming a session starts the agents (user-requested behaviour) --
+
+    fn recovered_tab(slug: &str) -> TabState {
+        TabState {
+            id: slug.to_string(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            agent: "opencode".to_string(),
+            branch: format!("flightdeck/{slug}"),
+            worktree_path_relative: format!(".flightdeck/worktrees/{slug}"),
+            base_branch: "main".to_string(),
+            base_commit_sha: "abc".to_string(),
+            created_at: String::new(),
+            attached_existing_branch: false,
+            recovered: true,
+            last_known_status: "session lost".to_string(),
+            manual_status: None,
+        }
+    }
+
+    #[test]
+    fn resume_agents_starts_primary_when_worktree_exists() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("r"));
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        assert_eq!(pty.spawns().len(), 1);
+        assert_eq!(app.tabs[0].session.primary_state(), ProcessState::Running);
+        assert!(!app.tabs[0].meta.recovered);
+    }
+
+    #[test]
+    fn resume_agents_skips_tab_with_missing_worktree() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("gone"));
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new(); // worktree dir does NOT exist
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 0);
+        assert_eq!(pty.spawns().len(), 0);
+        assert_eq!(
+            app.tabs[0].session.primary_state(),
+            ProcessState::NotStarted
+        );
     }
 }

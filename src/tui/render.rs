@@ -762,7 +762,10 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         )),
         shortcut_line("  Ctrl-t", "New child terminal"),
         shortcut_line("  Ctrl-w", "Close active child terminal"),
-        shortcut_line("  Alt-Left / Alt-Right", "Previous / Next child terminal"),
+        shortcut_line(
+            "  Alt-Left / Alt-Right",
+            "Cycle terminal tabs (agent + shells)",
+        ),
         shortcut_line("  Mouse click", "Select terminal tab"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
