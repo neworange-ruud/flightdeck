@@ -108,6 +108,24 @@ impl InterpretedStatus {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OS notifications (SPECS §24) — alert the user when an agent finishes a task.
+// ---------------------------------------------------------------------------
+
+/// A pending OS notification produced when an agent finishes a running task.
+///
+/// Built by [`crate::app::state::AppState::take_finish_notifications`] and posted
+/// by a [`crate::contracts::Notifier`] (the macOS implementation lives in
+/// [`crate::notify`]). Decoupling production from delivery keeps the
+/// transition-detection logic pure and unit-testable (SPECS §27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    /// Short title (the Agent Tab name).
+    pub title: String,
+    /// Body line (e.g. `"Claude Code finished"`).
+    pub body: String,
+}
+
 /// Manual status override set by the user (SPECS §24). `None` = cleared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualStatus {
@@ -235,6 +253,46 @@ impl Default for UiConfig {
     }
 }
 
+/// Default for a boolean config field that should be `true` when omitted.
+fn default_true() -> bool {
+    true
+}
+
+/// `[notifications]` config section (SPECS §24): OS notifications fired when an
+/// agent transitions out of an active state (working/starting) into a settled
+/// one. Each category can be toggled independently; `enabled` is the master
+/// switch and is **off by default** (opt-in) — enable it with `flightdeck
+/// setup-notifications` or by editing the config. The per-category toggles
+/// default to `true`, so once enabled all three categories fire unless one is
+/// turned off; a partial `[notifications]` table fills the rest in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Master switch for all OS notifications. Off by default (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Notify when an agent finishes its turn (idle / completed).
+    #[serde(default = "default_true")]
+    pub on_finish: bool,
+    /// Notify when an agent is waiting for input / needs attention.
+    #[serde(default = "default_true")]
+    pub on_waiting: bool,
+    /// Notify when an agent errors out (failed).
+    #[serde(default = "default_true")]
+    pub on_failed: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        NotificationsConfig {
+            // Opt-in: off until the user enables it (config or setup command).
+            enabled: false,
+            on_finish: true,
+            on_waiting: true,
+            on_failed: true,
+        }
+    }
+}
+
 /// The full parsed `config.toml` (SPECS §8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -246,6 +304,8 @@ pub struct Config {
     pub git: GitConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentDef>,
 }
