@@ -27,6 +27,12 @@ pub const HEADER_HEIGHT: u16 = 1;
 /// Height of the divider row between the header and the rest of the app.
 pub const DIVIDER_HEIGHT: u16 = 1;
 
+/// Height of the divider row directly above the status bar.
+pub const STATUS_DIVIDER_HEIGHT: u16 = 1;
+
+/// Height of the divider row directly above the git info bar.
+pub const INFO_DIVIDER_HEIGHT: u16 = 1;
+
 /// The computed sub-rects for the main FlightDeck layout (SPECS §20).
 ///
 /// ```text
@@ -41,7 +47,11 @@ pub const DIVIDER_HEIGHT: u16 = 1;
 /// │                      │          terminal                        │
 /// │                      │                                          │
 /// │                      ├──────────────────────────────────────────┤
+/// │                      │ info_divider                             │
+/// │                      ├──────────────────────────────────────────┤
 /// │                      │ info_bar                                 │
+/// │                      ├──────────────────────────────────────────┤
+/// │                      │ status_divider                           │
 /// │                      ├──────────────────────────────────────────┤
 /// │                      │ status_bar                               │
 /// └──────────────────────┴──────────────────────────────────────────┘
@@ -58,8 +68,12 @@ pub struct MainLayout {
     pub child_tabs: Rect,
     /// Active terminal viewport.
     pub terminal: Rect,
+    /// Full-width divider row directly above the git info bar.
+    pub info_divider: Rect,
     /// Git info bar (branch + change counts), just above the status bar.
     pub info_bar: Rect,
+    /// Full-width divider row directly above the status bar.
+    pub status_divider: Rect,
     /// Status/action bar (bottom of the main pane).
     pub status_bar: Rect,
 }
@@ -86,14 +100,18 @@ pub fn compute(area: Rect) -> MainLayout {
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)]).areas(body);
 
-    // Split main pane vertically: child_tabs | terminal | info_bar | status_bar.
-    let [child_tabs, terminal, info_bar, status_bar] = Layout::vertical([
-        Constraint::Length(CHILD_TAB_BAR_HEIGHT),
-        Constraint::Fill(1),
-        Constraint::Length(INFO_BAR_HEIGHT),
-        Constraint::Length(STATUS_BAR_HEIGHT),
-    ])
-    .areas(main);
+    // Split main pane vertically: child_tabs | terminal | info_divider
+    // | info_bar | status_divider | status_bar.
+    let [child_tabs, terminal, info_divider, info_bar, status_divider, status_bar] =
+        Layout::vertical([
+            Constraint::Length(CHILD_TAB_BAR_HEIGHT),
+            Constraint::Fill(1),
+            Constraint::Length(INFO_DIVIDER_HEIGHT),
+            Constraint::Length(INFO_BAR_HEIGHT),
+            Constraint::Length(STATUS_DIVIDER_HEIGHT),
+            Constraint::Length(STATUS_BAR_HEIGHT),
+        ])
+        .areas(main);
 
     MainLayout {
         header,
@@ -101,7 +119,9 @@ pub fn compute(area: Rect) -> MainLayout {
         sidebar,
         child_tabs,
         terminal,
+        info_divider,
         info_bar,
+        status_divider,
         status_bar,
     }
 }
@@ -189,8 +209,14 @@ mod tests {
         let layout = compute(area);
         assert_eq!(layout.info_bar.height, INFO_BAR_HEIGHT);
         assert_eq!(layout.info_bar.x, SIDEBAR_WIDTH);
-        assert_eq!(layout.info_bar.bottom(), layout.status_bar.top());
-        assert_eq!(layout.terminal.bottom(), layout.info_bar.top());
+        // A divider row now sits between the info bar and the status bar.
+        assert_eq!(layout.info_bar.bottom(), layout.status_divider.top());
+        assert_eq!(layout.status_divider.bottom(), layout.status_bar.top());
+        assert_eq!(layout.status_divider.height, STATUS_DIVIDER_HEIGHT);
+        // A divider row also sits between the terminal and the info bar.
+        assert_eq!(layout.terminal.bottom(), layout.info_divider.top());
+        assert_eq!(layout.info_divider.bottom(), layout.info_bar.top());
+        assert_eq!(layout.info_divider.height, INFO_DIVIDER_HEIGHT);
     }
 
     #[test]
@@ -217,9 +243,15 @@ mod tests {
     fn terminal_viewport_fills_remaining() {
         let area = full_terminal();
         let layout = compute(area);
-        // top band (2) + child_tabs (1) + terminal (?) + info_bar (1) + status (1).
-        let expected_h =
-            area.height - TOP_BAND - CHILD_TAB_BAR_HEIGHT - INFO_BAR_HEIGHT - STATUS_BAR_HEIGHT;
+        // top band (2) + child_tabs (1) + terminal (?) + info_divider (1)
+        // + info_bar (1) + status_divider (1) + status (1).
+        let expected_h = area.height
+            - TOP_BAND
+            - CHILD_TAB_BAR_HEIGHT
+            - INFO_DIVIDER_HEIGHT
+            - INFO_BAR_HEIGHT
+            - STATUS_DIVIDER_HEIGHT
+            - STATUS_BAR_HEIGHT;
         assert_eq!(layout.terminal.height, expected_h);
         assert_eq!(layout.terminal.y, TOP_BAND + CHILD_TAB_BAR_HEIGHT);
     }
@@ -231,8 +263,10 @@ mod tests {
         assert!(layout.sidebar.right() <= layout.terminal.left());
         // Vertical panes must not overlap within main pane.
         assert!(layout.child_tabs.bottom() <= layout.terminal.top());
-        assert!(layout.terminal.bottom() <= layout.info_bar.top());
-        assert!(layout.info_bar.bottom() <= layout.status_bar.top());
+        assert!(layout.terminal.bottom() <= layout.info_divider.top());
+        assert!(layout.info_divider.bottom() <= layout.info_bar.top());
+        assert!(layout.info_bar.bottom() <= layout.status_divider.top());
+        assert!(layout.status_divider.bottom() <= layout.status_bar.top());
     }
 
     #[test]
@@ -248,7 +282,9 @@ mod tests {
             TOP_BAND
                 + layout.child_tabs.height
                 + layout.terminal.height
+                + layout.info_divider.height
                 + layout.info_bar.height
+                + layout.status_divider.height
                 + layout.status_bar.height,
             area.height
         );
