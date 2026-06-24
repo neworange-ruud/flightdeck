@@ -6,7 +6,7 @@
 //! amend, squash, rebase, cherry-pick, or PR creation) — the SPECS §5 safety
 //! boundary is enforced by construction.
 
-use crate::contracts::domain::{MergeOutcome, ProcessState, PtySize, WorktreeInfo};
+use crate::contracts::domain::{MergeOutcome, Notification, ProcessState, PtySize, WorktreeInfo};
 use crate::contracts::error::Result;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +96,18 @@ pub trait PtySession: Send {
     fn process_state(&self) -> ProcessState;
     /// Force-terminate the whole process tree (SPECS §25 force path).
     fn terminate_tree(&mut self) -> Result<()>;
+}
+
+/// Posts OS notifications when an agent finishes a running task (SPECS §24).
+///
+/// A seam so the event loop can fire notifications without depending on any
+/// platform API, and tests can record them. Delivery is **best-effort and
+/// non-blocking**: implementations must never block the caller (the render
+/// loop) and must swallow their own errors — a failed notification is never
+/// worth interrupting the UI.
+pub trait Notifier {
+    /// Post a single OS notification.
+    fn notify(&self, notification: &Notification);
 }
 
 /// A clock, abstracted so timestamps are deterministic in tests (SPECS §26).

@@ -318,45 +318,42 @@ pub fn draw_sidebar(
             Style::default().fg(Color::White)
         };
         let marker = if selected { "▸ " } else { "  " };
-        // A colour-coded status dot on the name line so idle vs working (vs
-        // waiting/failed/…) is glanceable per tab (SPECS §24). Manual override
-        // takes visual priority but never hides the dot.
+        // A colour-coded status dot on the name line so idle (green) vs in
+        // progress (blue) vs error (red) is glanceable per tab (SPECS §24).
+        // Manual override takes visual priority but never hides the dot.
         let dot_color = ds
             .manual
             .map(|_| Color::Cyan)
-            .unwrap_or_else(|| interpreted_color(ds.interpreted));
+            .unwrap_or_else(|| status_label_color(ds.interpreted).1);
         lines.push(Line::from(vec![
             Span::styled(marker, name_style),
             Span::styled("● ", Style::default().fg(dot_color)),
             Span::styled(tab.meta.name.clone(), name_style),
         ]));
 
-        // Agent | process | status.
+        // Agent name + simplified status, e.g. "Claude Code [in progress]".
+        // A manual override (cyan) takes visual priority; otherwise the
+        // interpreted status collapses to idle / in progress / error.
         let agent_name = state
             .registry
             .get(&tab.meta.agent)
             .map(|a| a.display_name.clone())
             .unwrap_or_else(|| tab.meta.agent.clone());
-        let (status_str, status_color) = if let Some(manual) = ds.manual {
-            (
-                format!("{} | proc: {}", manual.as_str(), ds.process.as_str()),
-                Color::Cyan,
-            )
-        } else {
-            (
-                format!(
-                    "proc: {} | {}",
-                    ds.process.as_str(),
-                    ds.interpreted.as_str()
-                ),
-                interpreted_color(ds.interpreted),
-            )
+        let (status_label, status_color) = match ds.manual {
+            Some(manual) => (manual.as_str().to_string(), Color::Cyan),
+            None => {
+                let (label, color) = status_label_color(ds.interpreted);
+                (label.to_string(), color)
+            }
         };
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(agent_name, Style::default().fg(Color::Gray)),
             Span::raw(" "),
-            Span::styled(status_str, Style::default().fg(status_color)),
+            Span::styled(
+                format!("[{status_label}]"),
+                Style::default().fg(status_color),
+            ),
         ]));
 
         // Git indicators (dirty, ahead/behind, base drift, recovered/existing).
@@ -366,21 +363,16 @@ pub fn draw_sidebar(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Colour for an interpreted status label (SPECS §24).
-fn interpreted_color(status: crate::contracts::InterpretedStatus) -> Color {
+/// Collapse an interpreted status to a glanceable sidebar label + colour
+/// (SPECS §24): in progress (blue), error (red), otherwise idle (green).
+fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
     use crate::contracts::InterpretedStatus::*;
     match status {
-        Starting => Color::Blue,
-        Running => Color::Green,
-        Working => Color::Green,
-        Idle => Color::DarkGray,
-        WaitingForInput => Color::Yellow,
-        NeedsAttention => Color::Magenta,
-        Completed => Color::Cyan,
-        Failed => Color::Red,
-        Stopped => Color::DarkGray,
-        SessionLost | Recovered => Color::Magenta,
-        Unknown => Color::DarkGray,
+        Starting | Running | Working => ("in progress", Color::Blue),
+        Failed | SessionLost => ("error", Color::Red),
+        Idle | WaitingForInput | NeedsAttention | Completed | Stopped | Recovered | Unknown => {
+            ("idle", Color::Green)
+        }
     }
 }
 
@@ -1544,6 +1536,60 @@ mod tests {
         assert!(
             all_text.contains("No tabs"),
             "sidebar should show 'No tabs' hint when empty, got: {all_text:?}"
+        );
+    }
+
+    // --- §24: simplified sidebar status (idle / in progress / error) ------
+
+    #[test]
+    fn status_label_color_collapses_to_three_buckets() {
+        use crate::contracts::InterpretedStatus::*;
+        use ratatui::style::Color;
+
+        // In progress (blue).
+        for s in [Starting, Running, Working] {
+            assert_eq!(status_label_color(s), ("in progress", Color::Blue));
+        }
+        // Error (red).
+        for s in [Failed, SessionLost] {
+            assert_eq!(status_label_color(s), ("error", Color::Red));
+        }
+        // Everything else reads as idle (green).
+        for s in [
+            Idle,
+            WaitingForInput,
+            NeedsAttention,
+            Completed,
+            Stopped,
+            Recovered,
+            Unknown,
+        ] {
+            assert_eq!(status_label_color(s), ("idle", Color::Green));
+        }
+    }
+
+    #[test]
+    fn sidebar_shows_bracketed_status_without_proc_prefix() {
+        let state = state_with_tabs(1);
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+
+        let buffer = term.backend().buffer().clone();
+        let all_text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        // New format: "<agent> [<status>]"; a fresh (not-started) tab reads idle.
+        assert!(
+            all_text.contains("[idle]"),
+            "sidebar should show bracketed status, got: {all_text:?}"
+        );
+        // The "proc:" prefix is gone.
+        assert!(
+            !all_text.contains("proc:"),
+            "sidebar must not show the 'proc:' prefix, got: {all_text:?}"
         );
     }
 }

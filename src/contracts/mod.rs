@@ -9,4 +9,4 @@ pub mod traits;
 pub use domain::*;
 pub use error::{FlightDeckError, Result};
 pub use real::{RealClock, RealFs};
-pub use traits::{Clock, FileSystem, GitExecutor, PtyBackend, PtySession};
+pub use traits::{Clock, FileSystem, GitExecutor, Notifier, PtyBackend, PtySession};

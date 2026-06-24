@@ -175,6 +175,51 @@ worktrees. Wire them per the generated `README.md`:
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
   (`session.idle`→idle, message activity→working, permission prompt→waiting).
 
+### OS notifications (macOS)
+
+FlightDeck posts a native OS notification when an agent finishes a running task,
+so you get pinged the moment a background tab is done while your attention is
+elsewhere. A notification fires on the **edge** from an active state
+(working/starting) to a settled one:
+
+- **finished** — the agent went idle / completed its turn,
+- **waiting** — the agent is waiting for input / needs attention,
+- **failed** — the agent errored out.
+
+It fires once per transition (a quiet agent never re-notifies until it resumes
+work) and is suppressed briefly at startup so resumed agents settling to idle
+don't produce a burst. Accuracy follows the status model above: precise with the
+optional hooks, best-effort with the zero-setup activity heuristic.
+
+Notifications are **off by default** (opt-in). Turn them on with:
+
+```bash
+flightdeck setup-notifications
+```
+
+This flips `notifications.enabled = true` in `.flightdeck/config.toml` (creating
+it on first run) and prints the macOS delivery tips below. You can also edit the
+config by hand — the master switch is `enabled`; the three per-category toggles
+default to `true`, so enabling is a single flip:
+
+```toml
+[notifications]
+enabled = true     # master switch (off by default)
+on_finish = true   # agent went idle / completed
+on_waiting = true  # agent is waiting for input / needs attention
+on_failed = true   # agent errored out
+```
+
+Set `enabled = false` (or re-edit the config) to turn them off again.
+
+Delivery on macOS: if [`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
+is installed (`brew install terminal-notifier`) FlightDeck uses it — the most
+reliable option, since it registers as a real app and prompts for permission on
+first use. Otherwise it falls back to `osascript`, whose notifications are
+attributed to **Script Editor**: enable **System Settings → Notifications →
+Script Editor** (and make sure no Focus / Do Not Disturb is active) or banners
+are silently dropped. Other platforms are a no-op for now (macOS first).
+
 ## Architecture
 
 Business logic is separated from the TUI and fully testable. Git, the

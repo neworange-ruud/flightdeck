@@ -14,6 +14,7 @@ pub mod app;
 pub mod config;
 pub mod fs;
 pub mod git;
+pub mod notify;
 pub mod persistence;
 pub mod terminal;
 pub mod tui;
@@ -24,15 +25,16 @@ use std::time::Duration;
 use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
 use crate::app::state::{AppState, Services};
 use crate::config::init::initialize;
-use crate::config::load::load_config;
+use crate::config::load::{load_config, serialize_config};
 use crate::config::schema::default_config;
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs};
-use crate::contracts::{FileSystem, ManualStatus, PtySize, TabId};
+use crate::contracts::{FileSystem, ManualStatus, Notifier, PtySize, TabId};
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
 use crate::git::repo::{detect_base_branch, GitCli};
 use crate::git::status::collect_status;
+use crate::notify::SystemNotifier;
 use crate::persistence::project_state::{default_state, load_state, save_state};
 use crate::persistence::recovery::recover;
 use crate::terminal::pty::PortablePtyBackend;
@@ -67,10 +69,14 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Subcommand dispatch. `setup-status` installs the opt-in precise status
-    // hooks/plugin and exits without launching the TUI (SPECS §24, Layer 2).
-    if std::env::args().nth(1).as_deref() == Some("setup-status") {
-        return run_setup_status();
+    // Subcommand dispatch. These configure the opt-in status/notification
+    // features and exit without launching the TUI (SPECS §24).
+    match std::env::args().nth(1).as_deref() {
+        // Install the precise status hooks/plugin (Layer 2).
+        Some("setup-status") => return run_setup_status(),
+        // Enable OS notifications in config (off by default).
+        Some("setup-notifications") => return run_setup_notifications(),
+        _ => {}
     }
 
     // 1–4. Construct services + run startup (init, gitignore, recover, build state).
@@ -119,7 +125,8 @@ pub fn run() -> Result<()> {
     // known, rather than in `recover`/`AppState::new` which never spawn.
     let _ = state.resume_agents(&services);
 
-    let loop_result = event_loop(&mut terminal, &mut state, &services);
+    let notifier = SystemNotifier;
+    let loop_result = event_loop(&mut terminal, &mut state, &services, &notifier);
 
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
     // every session so no orphaned child processes remain. Persist on the way
@@ -168,6 +175,58 @@ fn run_setup_status() -> Result<()> {
     println!("  Claude Code → merge claude-code.settings.json into ~/.claude/settings.json");
     println!("  Codex CLI   → append codex-config.toml to ~/.codex/config.toml");
     println!("  OpenCode    → copy opencode-flightdeck.js to ~/.config/opencode/plugin/");
+    Ok(())
+}
+
+/// `flightdeck setup-notifications`: turn on OS notifications by setting
+/// `notifications.enabled = true` in `<repo>/.flightdeck/config.toml` (creating
+/// the config on first run), then print how to tune or disable them. Does not
+/// launch the TUI (SPECS §24). Notifications are off by default; this is the
+/// quick way to opt in without hand-editing the config.
+fn run_setup_notifications() -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
+    let git = GitCli::discover(&cwd).map_err(|_| {
+        FlightDeckError::Git(
+            "not inside a Git repository (run `flightdeck setup-notifications` from a git project)"
+                .to_string(),
+        )
+    })?;
+    let repo_root = git.root().to_path_buf();
+    let fs = RealFs;
+    let config_path = repo_root.join(".flightdeck").join("config.toml");
+
+    // Ensure a config exists (first run writes the default), then load it.
+    if !fs.exists(&config_path) {
+        let project_name = derive_project_name(&repo_root);
+        let base_branch = detect_base_branch(&git, &cwd, None)?;
+        initialize(&fs, &repo_root, &project_name, &base_branch)?;
+    }
+    let mut config = load_config(&fs, &config_path)?;
+
+    if config.notifications.enabled {
+        println!(
+            "FlightDeck: OS notifications are already enabled in {}.",
+            config_path.display()
+        );
+    } else {
+        config.notifications.enabled = true;
+        fs.write(&config_path, &serialize_config(&config)?)?;
+        println!(
+            "FlightDeck: enabled OS notifications in {}.",
+            config_path.display()
+        );
+    }
+    println!();
+    println!("You'll be notified when an agent finishes a task, waits for input, or fails.");
+    println!("Tune per-category under [notifications] (set enabled = false to turn off):");
+    println!("  enabled    = true   # master switch");
+    println!("  on_finish  = true   # agent went idle / completed");
+    println!("  on_waiting = true   # agent is waiting for input / needs attention");
+    println!("  on_failed  = true   # agent errored out");
+    println!();
+    println!("macOS delivery: `brew install terminal-notifier` for best reliability,");
+    println!("or allow Script Editor under System Settings → Notifications.");
     Ok(())
 }
 
@@ -364,10 +423,15 @@ fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     state: &mut AppState,
     services: &Services,
+    notifier: &dyn Notifier,
 ) -> Result<()> {
     let mut ui = Ui::default();
     let mut cache: GitStatusCache = GitStatusCache::new();
     let mut tick: u64 = 0;
+
+    // Suppress notifications briefly at startup so resumed/just-launched agents
+    // settling to idle don't produce a burst of "finished" alerts (SPECS §24).
+    state.begin_notification_grace(services.clock.now_millis());
 
     loop {
         let now_ms = services.clock.now_millis();
@@ -377,6 +441,11 @@ fn event_loop(
 
         // --- Poll opt-in agent status files (precise idle/working signals). ---
         state.poll_status_files(services, now_ms);
+
+        // --- Fire OS notifications for agents that just finished a task. ---
+        for n in state.take_finish_notifications(now_ms) {
+            notifier.notify(&n);
+        }
 
         // --- Periodically refresh the git-status cache (non-blocking-ish). ---
         if tick.is_multiple_of(GIT_REFRESH_EVERY) {

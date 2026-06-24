@@ -1,8 +1,8 @@
 //! Default config construction and validation (SPECS §8).
 
 use crate::contracts::{
-    AgentDef, Config, FlightDeckError, GitConfig, ProjectConfig, Result, StatusPatterns, UiConfig,
-    WorktreesConfig,
+    AgentDef, Config, FlightDeckError, GitConfig, NotificationsConfig, ProjectConfig, Result,
+    StatusPatterns, UiConfig, WorktreesConfig,
 };
 use std::collections::BTreeMap;
 
@@ -71,6 +71,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
         },
+        notifications: NotificationsConfig::default(),
         agents,
     }
 }

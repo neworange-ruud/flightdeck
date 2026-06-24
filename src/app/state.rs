@@ -17,7 +17,8 @@ use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushCo
 use crate::app::modes::InputMode;
 use crate::contracts::{
     Clock, Config, FileSystem, FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus,
-    ProcessState, ProjectState, PtyBackend, PtySize, Result, TabId, TabState, STATE_VERSION,
+    Notification, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result,
+    TabId, TabState, STATE_VERSION,
 };
 use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
@@ -70,6 +71,11 @@ pub struct RuntimeTab {
     /// Last raw status-file content applied, used to ignore unchanged re-reads so
     /// each hook event registers as a single fresh signal.
     pub status_file_seen: Option<String>,
+    /// Whether this tab was last observed in an *active* state (working /
+    /// starting). When it next settles (idle / waiting / completed / failed) a
+    /// single OS notification fires and this is cleared, so a quiet agent never
+    /// re-notifies until it resumes working (SPECS §24).
+    pub notify_armed: bool,
 }
 
 impl RuntimeTab {
@@ -84,6 +90,7 @@ impl RuntimeTab {
             last_activity_ms: None,
             status_file: None,
             status_file_seen: None,
+            notify_armed: false,
         }
     }
 
@@ -150,6 +157,72 @@ pub fn status_keyword_to_interpreted(keyword: &str) -> Option<InterpretedStatus>
     }
 }
 
+/// How long after the event loop starts finish-notifications are suppressed
+/// (SPECS §24). Long enough for resumed/just-launched agents to settle to idle
+/// without firing a "finished" alert.
+pub const NOTIFY_STARTUP_GRACE_MS: u64 = 4000;
+
+/// Which OS-notification category a settled status belongs to (SPECS §24), used
+/// to gate it against the per-category config toggles and to phrase the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyKind {
+    /// Agent finished its turn (idle / completed).
+    Finish,
+    /// Agent is waiting for input / needs attention.
+    Waiting,
+    /// Agent errored out.
+    Failed,
+}
+
+impl NotifyKind {
+    /// Whether this category is enabled in the config.
+    fn enabled(self, cfg: &NotificationsConfig) -> bool {
+        match self {
+            NotifyKind::Finish => cfg.on_finish,
+            NotifyKind::Waiting => cfg.on_waiting,
+            NotifyKind::Failed => cfg.on_failed,
+        }
+    }
+
+    /// The verb used in the notification body, e.g. `"finished"`.
+    fn verb(self) -> &'static str {
+        match self {
+            NotifyKind::Finish => "finished",
+            NotifyKind::Waiting => "is waiting for input",
+            NotifyKind::Failed => "failed",
+        }
+    }
+}
+
+/// Classification of an [`InterpretedStatus`] for notification edge-detection
+/// (SPECS §24): an agent is *active*, has just *finished* (a notifiable
+/// category), or is in a *neutral* state that neither arms nor notifies.
+enum NotifyPhase {
+    Active,
+    Finished(NotifyKind),
+    Neutral,
+}
+
+/// Map an interpreted status to its notification phase (SPECS §24).
+fn notify_phase(status: InterpretedStatus) -> NotifyPhase {
+    match status {
+        InterpretedStatus::Starting | InterpretedStatus::Running | InterpretedStatus::Working => {
+            NotifyPhase::Active
+        }
+        InterpretedStatus::Idle | InterpretedStatus::Completed => {
+            NotifyPhase::Finished(NotifyKind::Finish)
+        }
+        InterpretedStatus::WaitingForInput | InterpretedStatus::NeedsAttention => {
+            NotifyPhase::Finished(NotifyKind::Waiting)
+        }
+        InterpretedStatus::Failed => NotifyPhase::Finished(NotifyKind::Failed),
+        InterpretedStatus::Stopped
+        | InterpretedStatus::SessionLost
+        | InterpretedStatus::Recovered
+        | InterpretedStatus::Unknown => NotifyPhase::Neutral,
+    }
+}
+
 /// The headless application state (SPECS §3).
 pub struct AppState {
     /// The parsed, committed configuration (SPECS §8).
@@ -173,6 +246,10 @@ pub struct AppState {
     pub state_path: PathBuf,
     /// PTY size used when spawning terminals; updated on resize.
     pub pty_size: PtySize,
+    /// Clock-millis before which finish-notifications are suppressed. Set at
+    /// event-loop start to a short window after launch so resumed/just-spawned
+    /// agents settling to idle don't fire a burst of alerts (SPECS §24).
+    pub notify_grace_until_ms: u64,
 }
 
 impl AppState {
@@ -199,6 +276,7 @@ impl AppState {
             repo_root: repo_root.into(),
             state_path: state_path.into(),
             pty_size: PtySize::default(),
+            notify_grace_until_ms: 0,
         }
     }
 
@@ -324,6 +402,54 @@ impl AppState {
             }
             tab.status_file_seen = Some(content);
         }
+    }
+
+    /// Open the startup grace window: suppress finish-notifications until
+    /// `now_ms + NOTIFY_STARTUP_GRACE_MS` (SPECS §24). Called once when the event
+    /// loop starts so agents resumed/spawned at launch can settle to idle without
+    /// each firing a "finished" alert.
+    pub fn begin_notification_grace(&mut self, now_ms: u64) {
+        self.notify_grace_until_ms = now_ms + NOTIFY_STARTUP_GRACE_MS;
+    }
+
+    /// Detect agents that just finished a running task and return the OS
+    /// notifications to post, updating each tab's per-tab arming so a quiet agent
+    /// never re-notifies (SPECS §24).
+    ///
+    /// A notification fires on the **edge** from an active state (working /
+    /// starting / running) to a settled one (idle/completed → "finished",
+    /// waiting/needs-attention → "waiting", failed → "failed"). Pure of I/O: the
+    /// caller (event loop) hands the results to a [`crate::contracts::Notifier`].
+    /// Returns nothing while notifications are disabled or during the startup
+    /// grace window — but arming is still tracked, so only *new* finishes after
+    /// the window alert.
+    pub fn take_finish_notifications(&mut self, now_ms: u64) -> Vec<Notification> {
+        let cfg = self.config.notifications;
+        let suppressed = !cfg.enabled || now_ms < self.notify_grace_until_ms;
+        let registry = &self.registry;
+        let mut out = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            let interpreted = tab.display_status(now_ms).interpreted;
+            match notify_phase(interpreted) {
+                NotifyPhase::Active => tab.notify_armed = true,
+                NotifyPhase::Neutral => tab.notify_armed = false,
+                NotifyPhase::Finished(kind) => {
+                    let was_armed = tab.notify_armed;
+                    tab.notify_armed = false;
+                    if was_armed && !suppressed && kind.enabled(&cfg) {
+                        let agent = registry
+                            .get(&tab.meta.agent)
+                            .map(|a| a.display_name.clone())
+                            .unwrap_or_else(|| tab.meta.agent.clone());
+                        out.push(Notification {
+                            title: tab.meta.name.clone(),
+                            body: format!("{agent} {}", kind.verb()),
+                        });
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Update the persisted PTY size used for future spawns (SPECS §23 resize).
@@ -511,6 +637,7 @@ impl AppState {
             last_activity_ms: None,
             status_file: Some(status_file),
             status_file_seen: None,
+            notify_armed: false,
         });
         // Focus the new tab.
         self.selected_tab = Some(self.tabs.len() - 1);
@@ -1401,6 +1528,158 @@ mod tests {
             app.tabs[0].display_status(later).interpreted,
             InterpretedStatus::Idle
         );
+    }
+
+    // --- §24: OS notifications on task-finish edge ----------------------
+
+    /// Build an app with one running tab and return it plus the tab id.
+    fn app_with_running_tab(
+        config: Config,
+    ) -> (AppState, FakeGit, FakeFs, FakePty, FakeClock, TabId) {
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &services(&git, &fs, &pty, &clock),
+        )
+        .unwrap();
+        let id = app.tabs[0].id();
+        (app, git, fs, pty, clock, id)
+    }
+
+    const IDLE: u64 = crate::agents::status::IDLE_AFTER_MS;
+
+    /// A config with one real agent and OS notifications enabled (off by
+    /// default, so tests that expect alerts must opt in).
+    fn config_notify_on(dir: &TempDir) -> Config {
+        let (agent, _cmd) = make_real_agent(dir, "opencode");
+        let mut config = config_with_agent(agent);
+        config.notifications.enabled = true;
+        config
+    }
+
+    #[test]
+    fn notifies_when_agent_finishes_turn() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config_notify_on(&dir));
+
+        // Agent streams output (working) → a tick arms the tab, no alert yet.
+        app.ingest_output(&id, b"...working...", 1_000);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+
+        // Falls silent past the idle threshold → one "finished" notification.
+        let idle_at = 1_000 + IDLE + 1;
+        let notes = app.take_finish_notifications(idle_at);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Task");
+        // Body names the agent (the test agent's display name is "opencode").
+        assert!(notes[0].body.contains("opencode"), "got: {}", notes[0].body);
+        assert!(notes[0].body.contains("finished"), "got: {}", notes[0].body);
+
+        // Staying idle must not re-notify.
+        assert!(app.take_finish_notifications(idle_at + 1).is_empty());
+
+        // Resuming work re-arms; finishing again fires a fresh notification.
+        app.ingest_output(&id, b"more work", idle_at + 100);
+        assert!(app.take_finish_notifications(idle_at + 150).is_empty());
+        let idle_again = idle_at + 100 + IDLE + 1;
+        assert_eq!(app.take_finish_notifications(idle_again).len(), 1);
+    }
+
+    #[test]
+    fn notifies_when_agent_waits_for_input() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config_notify_on(&dir));
+
+        app.ingest_output(&id, b"...working...", 1_000);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+
+        // A waiting pattern (the opencode test agent matches "waiting for input").
+        app.ingest_output(&id, b"the agent is waiting for input now", 1_200);
+        let notes = app.take_finish_notifications(1_250);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].body.contains("waiting"), "got: {}", notes[0].body);
+    }
+
+    #[test]
+    fn notifies_when_agent_fails() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config_notify_on(&dir));
+
+        app.ingest_output(&id, b"...working...", 1_000);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+
+        // The opencode test agent matches "ERROR" as an error pattern.
+        app.ingest_output(&id, b"ERROR: boom", 1_200);
+        let notes = app.take_finish_notifications(1_250);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].body.contains("failed"), "got: {}", notes[0].body);
+    }
+
+    #[test]
+    fn startup_grace_suppresses_finish_notifications() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config_notify_on(&dir));
+
+        app.begin_notification_grace(1_000); // suppress until 1_000 + grace
+        app.ingest_output(&id, b"...working...", 1_100);
+        assert!(app.take_finish_notifications(1_200).is_empty()); // arms the tab
+
+        // Settles to idle while still inside the grace window → suppressed.
+        let idle_at = 1_100 + IDLE + 1;
+        assert!(idle_at < 1_000 + NOTIFY_STARTUP_GRACE_MS, "test setup");
+        assert!(app.take_finish_notifications(idle_at).is_empty());
+    }
+
+    #[test]
+    fn disabled_config_emits_no_notifications() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let mut config = config_with_agent(agent);
+        config.notifications.enabled = false;
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config);
+
+        app.ingest_output(&id, b"...working...", 1_000);
+        let _ = app.take_finish_notifications(1_100);
+        let idle_at = 1_000 + IDLE + 1;
+        assert!(app.take_finish_notifications(idle_at).is_empty());
+    }
+
+    #[test]
+    fn notifications_are_off_by_default() {
+        // Opt-in: the master switch is off until the user enables it, but the
+        // per-category toggles stay on so enabling is a single flip.
+        let cfg = NotificationsConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.on_finish && cfg.on_waiting && cfg.on_failed);
+        assert!(!Config::default().notifications.enabled);
+    }
+
+    #[test]
+    fn per_category_toggle_suppresses_only_that_category() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_notify_on(&dir);
+        config.notifications.on_finish = false; // mute turn-finished only
+        let (mut app, _git, _fs, _pty, _clock, id) = app_with_running_tab(config);
+
+        app.ingest_output(&id, b"...working...", 1_000);
+        let _ = app.take_finish_notifications(1_100);
+        let idle_at = 1_000 + IDLE + 1;
+        // on_finish disabled → no "finished" alert.
+        assert!(app.take_finish_notifications(idle_at).is_empty());
+
+        // But a waiting signal (on_waiting still enabled) still fires.
+        app.ingest_output(&id, b"...working again...", idle_at + 100);
+        let _ = app.take_finish_notifications(idle_at + 150);
+        app.ingest_output(&id, b"waiting for input", idle_at + 200);
+        assert_eq!(app.take_finish_notifications(idle_at + 250).len(), 1);
     }
 
     // --- §24: opt-in precise status via status file ---------------------
