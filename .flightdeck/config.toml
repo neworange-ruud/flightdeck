@@ -1,0 +1,57 @@
+[project]
+name = "flightdeck"
+default_base_branch = "main"
+
+[worktrees]
+root = ".flightdeck/worktrees"
+
+[git]
+default_remote = "origin"
+primary_host = "github"
+branch_prefix = "flightdeck/"
+
+[ui]
+agent_tab_position = "left"
+default_agent = "opencode"
+
+[agents.claude]
+display_name = "Claude Code"
+command = "claude"
+args = []
+
+[agents.claude.status_patterns]
+waiting = []
+completed = []
+error = []
+
+[agents.codex]
+display_name = "Codex CLI"
+command = "codex"
+args = []
+
+[agents.codex.status_patterns]
+waiting = []
+completed = []
+error = []
+
+[agents.opencode]
+display_name = "OpenCode"
+command = "opencode"
+args = []
+
+[agents.opencode.status_patterns]
+waiting = [
+    "Proceed?",
+    "Confirm",
+    "Approve",
+    "Do you want to",
+]
+completed = [
+    "Done",
+    "Complete",
+    "Task complete",
+]
+error = [
+    "Error",
+    "Failed",
+]

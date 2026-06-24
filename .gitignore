@@ -1,1 +1,3 @@
 /target
+.flightdeck/state.json
+.flightdeck/worktrees/
