@@ -107,10 +107,16 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('?') if no_mod => KeyAction::OpenHelp,
 
         // --- Agent Tab Navigation (SPECS §23) ----------------------------
-        // Alt-Up: previous Agent Tab.
-        KeyCode::Up if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
-        // Alt-Down: next Agent Tab.
-        KeyCode::Down if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
+        // Up / Alt-Up: previous Agent Tab. Plain arrows are accepted because
+        // some terminals (e.g. Warp) capture Option/Alt+Up/Down themselves; in
+        // App mode the bare arrows are otherwise unused.
+        KeyCode::Up if alt || no_mod => {
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))
+        }
+        // Down / Alt-Down: next Agent Tab.
+        KeyCode::Down if alt || no_mod => {
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+        }
         // Alt-1..Alt-9: jump to Agent Tab by index.
         KeyCode::Char(c @ '1'..='9') if alt => {
             let idx = (c as usize) - ('1' as usize);
@@ -122,10 +128,14 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('t') if ctrl => KeyAction::Dispatch(Command::NewChildTerminal),
         // Ctrl-w: Close active child terminal.
         KeyCode::Char('w') if ctrl => KeyAction::Dispatch(Command::CloseChildTerminal),
-        // Alt-Left: previous child terminal.
-        KeyCode::Left if alt => KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev)),
-        // Alt-Right: next child terminal.
-        KeyCode::Right if alt => KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)),
+        // Left / Alt-Left: previous terminal tab (cycles agent + shells).
+        KeyCode::Left if alt || no_mod => {
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
+        }
+        // Right / Alt-Right: next terminal tab (cycles agent + shells).
+        KeyCode::Right if alt || no_mod => {
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
+        }
 
         // --- Status (SPECS §23) ------------------------------------------
         // Ctrl-s: Set manual status.
@@ -358,6 +368,31 @@ mod tests {
         assert_eq!(
             map_key(InputMode::App, alt(KeyCode::Down)),
             KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+        );
+    }
+
+    #[test]
+    fn app_mode_plain_up_down_switch_agent_tab() {
+        // Bare arrows work in App mode (terminals may swallow Alt+Up/Down).
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::Up)),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))
+        );
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::Down)),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+        );
+    }
+
+    #[test]
+    fn app_mode_plain_left_right_switch_terminal() {
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::Left)),
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
+        );
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::Right)),
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
         );
     }
 

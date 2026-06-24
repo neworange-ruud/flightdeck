@@ -70,10 +70,11 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
 
 Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
 `Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-f` finish/local-merge · `Ctrl-k` close
-tab · `Alt-↑/↓` previous/next **agent tab** · `Alt-1..9` jump to agent tab ·
-`Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` cycle the
-**terminal tabs** (agent + shells) · `Ctrl-s` set manual status · `Ctrl-r`
-restart agent. The full table is in the in-app help (`?`).
+tab · `↑/↓` (or `Alt-↑/↓`) previous/next **agent tab** · `Alt-1..9` jump to agent
+tab · `Ctrl-t` new child terminal · `Ctrl-w` close child · `←/→` (or `Alt-←/→`)
+cycle the **terminal tabs** (agent + shells) · `Ctrl-s` set manual status ·
+`Ctrl-r` restart agent. In App mode the bare arrow keys work too (some terminals
+intercept `Alt`+arrows). The full table is in the in-app help (`?`).
 
 **Mouse**: click an Agent Tab in the sidebar to select it, or a child-terminal
 tab (`agent | shell 1 | …`) to switch terminals.

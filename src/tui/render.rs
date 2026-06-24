@@ -752,7 +752,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "Agent Tab Navigation",
             Style::default().fg(Color::Yellow),
         )),
-        shortcut_line("  Alt-Up / Alt-Down", "Previous / Next Agent Tab"),
+        shortcut_line("  Up / Down (or Alt)", "Previous / Next Agent Tab"),
         shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Tab by index"),
         shortcut_line("  Mouse click", "Select Agent Tab"),
         Line::raw(""),
@@ -763,7 +763,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Ctrl-t", "New child terminal"),
         shortcut_line("  Ctrl-w", "Close active child terminal"),
         shortcut_line(
-            "  Alt-Left / Alt-Right",
+            "  Left / Right (or Alt)",
             "Cycle terminal tabs (agent + shells)",
         ),
         shortcut_line("  Mouse click", "Select terminal tab"),
