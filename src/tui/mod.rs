@@ -1,0 +1,10 @@
+//! TUI layer (T8): Ratatui layout, rendering, input mapping, and command
+//! palette (SPECS §19–§24).
+//!
+//! The TUI renders `AppState` and emits `Command`s; it never executes git/fs/pty
+//! directly (SPECS §27).
+
+pub mod input;
+pub mod layout;
+pub mod palette;
+pub mod render;
