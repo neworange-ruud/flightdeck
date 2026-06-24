@@ -190,7 +190,11 @@ pub fn draw(
     draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
     draw_child_tab_bar(frame, state, ml.child_tabs);
     draw_terminal_viewport(frame, state, ml.terminal);
+    let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
+    frame.render_widget(info_divider, ml.info_divider);
     draw_info_bar(frame, state, cache, ml.info_bar);
+    let status_divider = Paragraph::new(divider_line(ml.status_divider.width as usize));
+    frame.render_widget(status_divider, ml.status_divider);
     draw_status_bar(frame, state, ml.status_bar);
 
     // Draw overlay on top if active.
@@ -721,6 +725,7 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 pub fn status_bar_text(mode: InputMode) -> Line<'static> {
     match mode {
         InputMode::Terminal => Line::from(vec![
+            Span::raw(" "),
             Span::styled(
                 "MODE: TERMINAL",
                 Style::default()
@@ -735,6 +740,7 @@ pub fn status_bar_text(mode: InputMode) -> Line<'static> {
             Span::raw(": command palette"),
         ]),
         InputMode::App => Line::from(vec![
+            Span::raw(" "),
             Span::styled(
                 "MODE: APP",
                 Style::default()
@@ -1320,13 +1326,22 @@ mod tests {
         term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
-        // Info bar is one row above the status bar (y = 22); status bar is y = 23.
+        // Layout bottom rows: info_bar (y = 21), status_divider (y = 22),
+        // status_bar (y = 23).
         let info_row: String = (0..80)
-            .map(|x| buffer[(x, 22)].symbol().to_string())
+            .map(|x| buffer[(x, 21)].symbol().to_string())
             .collect();
         assert!(
             info_row.contains("flightdeck/tab0"),
             "info bar row should show the branch, got: {info_row:?}"
+        );
+        // The divider row sits directly above the status bar.
+        let divider_row: String = (0..80)
+            .map(|x| buffer[(x, 22)].symbol().to_string())
+            .collect();
+        assert!(
+            divider_row.contains('─'),
+            "divider row should be drawn above status bar, got: {divider_row:?}"
         );
     }
 
