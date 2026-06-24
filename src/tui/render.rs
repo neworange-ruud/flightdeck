@@ -390,11 +390,11 @@ pub fn spinner_frame(now_ms: u64) -> char {
 }
 
 /// Collapse an interpreted status to a glanceable sidebar label + colour
-/// (SPECS §24): in progress (blue), error (red), otherwise idle (green).
+/// (SPECS §24): in progress (light blue), error (red), otherwise idle (green).
 fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
     use crate::contracts::InterpretedStatus::*;
     match status {
-        Starting | Running | Working => ("in progress", Color::Blue),
+        Starting | Running | Working => ("in progress", Color::LightBlue),
         Failed | SessionLost => ("error", Color::Red),
         Idle | WaitingForInput | NeedsAttention | Completed | Stopped | Recovered | Unknown => {
             ("idle", Color::Green)
