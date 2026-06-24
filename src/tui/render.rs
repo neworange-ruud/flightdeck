@@ -98,6 +98,20 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
     if rect_contains(ml.sidebar, col, row) {
         return sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row).map(HitTarget::AgentTab);
     }
+    if state.split_view {
+        // In split view a click anywhere inside a terminal's column selects it.
+        let region = layout::split_region(&ml);
+        if rect_contains(region, col, row) {
+            let entries = child_tab_entries(state);
+            let cols = layout::split_columns(region, entries.len());
+            for ((target, _label), c) in entries.iter().zip(cols.iter()) {
+                if rect_contains(c.col, col, row) {
+                    return Some(HitTarget::Child(*target));
+                }
+            }
+        }
+        return None;
+    }
     if rect_contains(ml.child_tabs, col, row) {
         for (target, start, w) in child_tab_positions(ml.child_tabs, state) {
             if col >= start && col < start.saturating_add(w) {
@@ -188,8 +202,14 @@ pub fn draw(
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
     draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
-    draw_child_tab_bar(frame, state, ml.child_tabs);
-    draw_terminal_viewport(frame, state, ml.terminal, now_ms);
+    if state.split_view {
+        // Split view reclaims the tab-bar row and lays the selected tab's
+        // terminals out side by side in equal-width columns.
+        draw_split_view(frame, state, layout::split_region(&ml), now_ms);
+    } else {
+        draw_child_tab_bar(frame, state, ml.child_tabs);
+        draw_terminal_viewport(frame, state, ml.terminal, now_ms);
+    }
     let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
     frame.render_widget(info_divider, ml.info_divider);
     draw_info_bar(frame, state, cache, ml.info_bar);
@@ -390,11 +410,11 @@ pub fn spinner_frame(now_ms: u64) -> char {
 }
 
 /// Collapse an interpreted status to a glanceable sidebar label + colour
-/// (SPECS §24): in progress (light blue), error (red), otherwise idle (green).
+/// (SPECS §24): in progress (cyan), error (red), otherwise idle (green).
 fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
     use crate::contracts::InterpretedStatus::*;
     match status {
-        Starting | Running | Working => ("in progress", Color::LightBlue),
+        Starting | Running | Working => ("in progress", Color::Cyan),
         Failed | SessionLost => ("error", Color::Red),
         Idle | WaitingForInput | NeedsAttention | Completed | Stopped | Recovered | Unknown => {
             ("idle", Color::Green)
@@ -630,6 +650,116 @@ fn vt_color(c: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split view (terminals side by side)
+// ---------------------------------------------------------------------------
+
+/// Draw the selected tab's terminals (primary agent + child shells) side by side
+/// in equal-width columns, each topped by its label, with a vertical separator
+/// between columns. Replaces the horizontal tab bar + single viewport when split
+/// view is enabled. Column geometry comes from [`layout::split_columns`] so it
+/// matches the per-terminal PTY sizing the wiring layer applies.
+pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms: u64) {
+    let Some(tab) = state.selected() else {
+        let p = Paragraph::new(
+            "\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.",
+        )
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, region);
+        return;
+    };
+
+    // While the worktree is materializing there is no session yet (SPECS §16/§17).
+    if tab.phase == TabPhase::Creating {
+        let msg = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(now_ms)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("Creating worktree for {}…", tab.meta.branch),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]))
+        .alignment(Alignment::Center);
+        let inner = Rect {
+            y: region.y + region.height / 2,
+            height: 1,
+            ..region
+        };
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let entries = child_tab_entries(state);
+    let cols = layout::split_columns(region, entries.len());
+    let active = tab.session.selected_child(); // None = primary
+    let focused = state.mode() == InputMode::Terminal;
+
+    for (i, ((target, label), col)) in entries.iter().zip(cols.iter()).enumerate() {
+        let is_active = match target {
+            ChildTarget::Primary => active.is_none(),
+            ChildTarget::Child(c) => active == Some(*c),
+        };
+
+        // Column header: the terminal label, highlighted when active (matching
+        // the tab-bar colours: agent = yellow, shell = cyan).
+        let header_style = if is_active {
+            let bg = if matches!(target, ChildTarget::Primary) {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            };
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let header = Paragraph::new(Line::from(Span::styled(format!(" {label} "), header_style)))
+            .alignment(Alignment::Center);
+        frame.render_widget(header, col.header);
+
+        // Column body: the terminal's VT100 screen. Only the active column shows
+        // the cursor, and only while a terminal is focused.
+        let term = match target {
+            ChildTarget::Primary => tab.session.primary(),
+            ChildTarget::Child(c) => tab.session.child(*c),
+        };
+        match term {
+            Some(term) => render_screen(
+                frame,
+                col.viewport,
+                term.screen(),
+                focused && is_active,
+                term.selection(),
+            ),
+            None => {
+                let p = Paragraph::new("  (starting…)").style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(p, col.viewport);
+            }
+        }
+
+        // Vertical separator in the gutter to the right of every column but the
+        // last, spanning the full region height.
+        if i + 1 < cols.len() {
+            let sep_x = col.col.right();
+            let sep = Paragraph::new(vec![Line::from("│"); region.height as usize])
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(
+                sep,
+                Rect {
+                    x: sep_x,
+                    y: region.y,
+                    width: 1,
+                    height: region.height,
+                },
+            );
+        }
     }
 }
 
@@ -1025,6 +1155,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "  Left / Right (or Alt)",
             "Cycle terminal tabs (agent + shells)",
         ),
+        shortcut_line("  Ctrl-b", "Toggle split view (terminals side by side)"),
         shortcut_line("  Mouse click", "Select terminal tab"),
         Line::raw(""),
         Line::from(Span::styled(
@@ -1205,6 +1336,80 @@ mod tests {
         assert_eq!(
             hit_test(area, &state, 30, 2),
             Some(HitTarget::Child(ChildTarget::Primary))
+        );
+    }
+
+    #[test]
+    fn split_view_renders_both_terminals_side_by_side() {
+        // In split view the primary agent and a child shell render at the same
+        // time, each in its own column.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.split_view = true;
+        let session = &mut state.tabs[0].session;
+        session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        session
+            .spawn_child(&pty, "zsh", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        session.primary_mut().unwrap().process_output(b"AGENT_PANE");
+        session.child_mut(0).unwrap().process_output(b"SHELL_PANE");
+
+        let mut term = test_terminal(120, 30);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+
+        let buffer = term.backend().buffer().clone();
+        let all_text: String = (0..30_u16)
+            .flat_map(|y| (0..120_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(all_text.contains("AGENT_PANE"), "agent column must render");
+        assert!(all_text.contains("SHELL_PANE"), "shell column must render");
+    }
+
+    #[test]
+    fn hit_test_in_split_view_selects_column() {
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.split_view = true;
+        let session = &mut state.tabs[0].session;
+        session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        session
+            .spawn_child(&pty, "zsh", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+
+        let area = Rect::new(0, 0, 120, 30);
+        // Two columns over the main pane (x ≥ sidebar width 28). A click just
+        // right of the sidebar lands in the agent (primary) column; a click far
+        // right lands in the shell column.
+        let region = layout::split_region(&layout::compute(area));
+        let cols = layout::split_columns(region, 2);
+        let left = cols[0].col.x + cols[0].col.width / 2;
+        let right = cols[1].col.x + cols[1].col.width / 2;
+        let row = region.y + 2;
+        assert_eq!(
+            hit_test(area, &state, left, row),
+            Some(HitTarget::Child(ChildTarget::Primary))
+        );
+        assert_eq!(
+            hit_test(area, &state, right, row),
+            Some(HitTarget::Child(ChildTarget::Child(0)))
         );
     }
 
@@ -1596,9 +1801,9 @@ mod tests {
         use crate::contracts::InterpretedStatus::*;
         use ratatui::style::Color;
 
-        // In progress (light blue).
+        // In progress (cyan).
         for s in [Starting, Running, Working] {
-            assert_eq!(status_label_color(s), ("in progress", Color::LightBlue));
+            assert_eq!(status_label_color(s), ("in progress", Color::Cyan));
         }
         // Error (red).
         for s in [Failed, SessionLost] {

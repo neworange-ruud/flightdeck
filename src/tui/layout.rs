@@ -126,6 +126,82 @@ pub fn compute(area: Rect) -> MainLayout {
     }
 }
 
+/// Height of each split-view column's header row (the terminal's label).
+pub const SPLIT_HEADER_HEIGHT: u16 = 1;
+
+/// One column of the split view: a header row (the terminal label) above its
+/// terminal `viewport`. `col` is the full column span (header + viewport) and is
+/// used to place the inter-column separators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitColumn {
+    /// The whole column rect (header + viewport).
+    pub col: Rect,
+    /// The header row (terminal label).
+    pub header: Rect,
+    /// The terminal viewport below the header.
+    pub viewport: Rect,
+}
+
+/// The full main-pane region used by split view: the child-tab-bar row (which
+/// split view does not draw) merged with the terminal viewport, so the columns
+/// reclaim that row. Falls back gracefully on degenerate layouts.
+pub fn split_region(ml: &MainLayout) -> Rect {
+    Rect {
+        x: ml.child_tabs.x,
+        y: ml.child_tabs.y,
+        width: ml.terminal.width,
+        height: ml.child_tabs.height.saturating_add(ml.terminal.height),
+    }
+}
+
+/// Divide `region` into `n` equal-width columns separated by a one-column gutter,
+/// each with a [`SPLIT_HEADER_HEIGHT`]-row header reserved at the top (SPECS:
+/// split view). Remainder columns are widened by one so the whole width is used.
+/// Returns an empty vec for `n == 0` or a zero-sized region.
+pub fn split_columns(region: Rect, n: usize) -> Vec<SplitColumn> {
+    let mut out = Vec::new();
+    if n == 0 || region.width == 0 || region.height == 0 {
+        return out;
+    }
+    let n_u16 = n as u16;
+    // One-column gutters between adjacent columns (n - 1 of them).
+    let gutters = n_u16 - 1;
+    let avail = region.width.saturating_sub(gutters);
+    let base = avail / n_u16;
+    let extra = avail % n_u16; // first `extra` columns get one more column
+
+    let header_h = SPLIT_HEADER_HEIGHT.min(region.height);
+    let mut x = region.x;
+    for i in 0..n {
+        let w = base + if (i as u16) < extra { 1 } else { 0 };
+        let col = Rect {
+            x,
+            y: region.y,
+            width: w,
+            height: region.height,
+        };
+        let header = Rect {
+            x,
+            y: region.y,
+            width: w,
+            height: header_h,
+        };
+        let viewport = Rect {
+            x,
+            y: region.y.saturating_add(header_h),
+            width: w,
+            height: region.height.saturating_sub(header_h),
+        };
+        out.push(SplitColumn {
+            col,
+            header,
+            viewport,
+        });
+        x = x.saturating_add(w).saturating_add(1); // skip the gutter column
+    }
+    out
+}
+
 /// Compute the centered overlay area for modals/palette (e.g. help, command
 /// palette). Returns a [`Rect`] that is at most `max_w` × `max_h` and centered
 /// in `area`.
@@ -316,5 +392,69 @@ mod tests {
         let overlay = centered_overlay(area, 200, 200);
         assert_eq!(overlay.width, 40);
         assert_eq!(overlay.height, 10);
+    }
+
+    #[test]
+    fn split_region_reclaims_the_tab_bar_row() {
+        let ml = compute(full_terminal());
+        let region = split_region(&ml);
+        // Starts at the tab bar row and spans both it and the terminal viewport.
+        assert_eq!(region.x, ml.child_tabs.x);
+        assert_eq!(region.y, ml.child_tabs.y);
+        assert_eq!(region.width, ml.terminal.width);
+        assert_eq!(region.height, ml.child_tabs.height + ml.terminal.height);
+    }
+
+    #[test]
+    fn split_columns_divide_width_equally_with_gutters() {
+        // Width 31, 3 columns → 2 gutters → 29 usable → 9,10,10? No: base=9,
+        // extra=2 so first two columns get 10, last gets 9. Sum + gutters = 31.
+        let region = Rect::new(0, 0, 31, 10);
+        let cols = split_columns(region, 3);
+        assert_eq!(cols.len(), 3);
+        let total: u16 = cols.iter().map(|c| c.col.width).sum::<u16>() + 2; // + gutters
+        assert_eq!(total, region.width);
+        // Columns are ordered left to right with a one-column gutter between.
+        assert_eq!(cols[0].col.x, 0);
+        assert_eq!(cols[1].col.x, cols[0].col.right() + 1);
+        assert_eq!(cols[2].col.x, cols[1].col.right() + 1);
+        // Equal-ish: widths differ by at most one.
+        let max = cols.iter().map(|c| c.col.width).max().unwrap();
+        let min = cols.iter().map(|c| c.col.width).min().unwrap();
+        assert!(max - min <= 1);
+    }
+
+    #[test]
+    fn split_columns_reserve_a_header_row() {
+        let region = Rect::new(2, 5, 40, 12);
+        let cols = split_columns(region, 2);
+        for c in &cols {
+            assert_eq!(c.header.height, SPLIT_HEADER_HEIGHT);
+            assert_eq!(c.header.y, region.y);
+            assert_eq!(c.viewport.y, region.y + SPLIT_HEADER_HEIGHT);
+            assert_eq!(c.viewport.height, region.height - SPLIT_HEADER_HEIGHT);
+            // Header and viewport share the column's x and width.
+            assert_eq!(c.header.x, c.col.x);
+            assert_eq!(c.viewport.x, c.col.x);
+            assert_eq!(c.header.width, c.col.width);
+            assert_eq!(c.viewport.width, c.col.width);
+        }
+    }
+
+    #[test]
+    fn split_columns_single_column_has_no_gutter() {
+        let region = Rect::new(0, 0, 20, 8);
+        let cols = split_columns(region, 1);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].col.width, region.width);
+        assert_eq!(cols[0].col.x, region.x);
+    }
+
+    #[test]
+    fn split_columns_degenerate_inputs_do_not_panic() {
+        assert!(split_columns(Rect::new(0, 0, 0, 0), 3).is_empty());
+        assert!(split_columns(Rect::new(0, 0, 40, 10), 0).is_empty());
+        // Very narrow region with many columns: no panic, widths may be zero.
+        let _ = split_columns(Rect::new(0, 0, 2, 4), 5);
     }
 }

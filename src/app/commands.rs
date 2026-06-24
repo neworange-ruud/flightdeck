@@ -147,6 +147,9 @@ pub enum Command {
     ShowGitStatus,
     /// Show help / keybindings (SPECS §23).
     ShowHelp,
+    /// Toggle split view: lay the selected tab's terminals (agent + shells) out
+    /// side by side in equal-width columns instead of as horizontal tabs.
+    ToggleSplitView,
     /// Quit FlightDeck (signals clean teardown to the wiring layer, SPECS §23).
     Quit,
 }

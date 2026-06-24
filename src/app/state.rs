@@ -329,6 +329,10 @@ pub struct AppState {
     /// event-loop start to a short window after launch so resumed/just-spawned
     /// agents settling to idle don't fire a burst of alerts (SPECS §24).
     pub notify_grace_until_ms: u64,
+    /// When `true`, the selected tab's terminals (primary agent + child shells)
+    /// are laid out side by side in equal-width columns instead of as a single
+    /// active terminal behind a horizontal tab bar. Runtime-only (not persisted).
+    pub split_view: bool,
 }
 
 impl AppState {
@@ -356,6 +360,7 @@ impl AppState {
             state_path: state_path.into(),
             pty_size: PtySize::default(),
             notify_grace_until_ms: 0,
+            split_view: false,
         }
     }
 
@@ -384,6 +389,11 @@ impl AppState {
             InputMode::Terminal => InputMode::App,
             InputMode::App => InputMode::Terminal,
         };
+    }
+
+    /// Toggle split view (side-by-side terminals vs. horizontal tabs).
+    pub fn toggle_split_view(&mut self) {
+        self.split_view = !self.split_view;
     }
 
     // -----------------------------------------------------------------------
@@ -620,6 +630,11 @@ impl AppState {
             Command::RestartAgent => self.cmd_restart_agent(services),
             Command::ShowGitStatus => self.cmd_show_git_status(services),
             Command::ShowHelp => Ok(Effect::ShowHelp),
+            Command::ToggleSplitView => {
+                self.toggle_split_view();
+                let label = if self.split_view { "on" } else { "off" };
+                Ok(Effect::Message(format!("Split view {label}.")))
+            }
             Command::Quit => Ok(Effect::Quit),
         }
     }
@@ -2028,6 +2043,30 @@ mod tests {
         assert_eq!(app.mode(), InputMode::Terminal);
         app.toggle_mode();
         assert_eq!(app.mode(), InputMode::App);
+    }
+
+    #[test]
+    fn toggle_split_view_command_flips_flag() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let mut app = fresh_state(config);
+
+        assert!(!app.split_view, "split view defaults off");
+        let effect = app
+            .dispatch(Command::ToggleSplitView, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert!(app.split_view);
+        assert!(matches!(effect, Effect::Message(_)));
+        // Toggling again turns it back off — no tab required (it is a global view
+        // command, not a tab action).
+        app.dispatch(Command::ToggleSplitView, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert!(!app.split_view);
     }
 
     // --- §26 / §13: dirty base → local merge disabled -------------------
