@@ -1,6 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
+if [ -d "${HOME:-}/.cargo/bin" ]; then
+  PATH="${HOME}/.cargo/bin:${PATH}"
+  export PATH
+fi
+
 usage() {
   printf 'Usage: %s <version>\n' "$0" >&2
   printf 'Example: %s 0.2.0\n' "$0" >&2
