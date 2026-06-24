@@ -54,7 +54,9 @@ fn unique_image_path(ext: &str) -> PathBuf {
 
 /// `true` if `path` now refers to a non-empty file.
 fn wrote_non_empty(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// macOS: read the clipboard image via `osascript`. Screenshots and most copied
@@ -99,7 +101,10 @@ fn save_clipboard_image_macos() -> Option<PathBuf> {
 fn osascript_write_clipboard(path: &Path, class: &str) -> bool {
     // AppleScript string literals escape `\` and `"`; temp paths contain neither
     // in practice, but guard anyway.
-    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let p = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "set p to POSIX file \"{p}\"\n\
          set fh to open for access p with write permission\n\
@@ -131,7 +136,10 @@ fn save_clipboard_image_linux() -> Option<PathBuf> {
     // (command, args producing PNG bytes on stdout)
     let candidates: &[(&str, &[&str])] = &[
         ("wl-paste", &["--type", "image/png"]),
-        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
+        (
+            "xclip",
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        ),
     ];
     for (cmd, args) in candidates {
         let path = unique_image_path("png");

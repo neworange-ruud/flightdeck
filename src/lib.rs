@@ -125,10 +125,8 @@ pub fn run() -> Result<()> {
     // flickering with) whatever title the parent tooling keeps rewriting. The
     // previous title is pushed onto the terminal's title stack so it can be
     // restored on exit. Best effort — terminals without XTWINOPS just ignore it.
-    let _ = save_and_set_terminal_title(&format!(
-        "flightdeck — {}",
-        derive_project_name(&repo_root)
-    ));
+    let _ =
+        save_and_set_terminal_title(&format!("flightdeck — {}", derive_project_name(&repo_root)));
 
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width.
@@ -681,7 +679,11 @@ fn drain_create_outcomes(
 /// was at least one tab to refresh). Keeps git status off the UI thread so a
 /// busy repo — e.g. another instance running `git worktree add` — never freezes
 /// the UI (SPECS §21).
-fn spawn_status_refresh(state: &AppState, worker_git: &GitCli, status_tx: &Sender<StatusMsg>) -> bool {
+fn spawn_status_refresh(
+    state: &AppState,
+    worker_git: &GitCli,
+    status_tx: &Sender<StatusMsg>,
+) -> bool {
     struct StatusReq {
         tab_id: String,
         branch: String,
