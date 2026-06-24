@@ -3,14 +3,9 @@
 /// The two FlightDeck input modes (SPECS §23). In [`InputMode::Terminal`] most
 /// keystrokes go to the active terminal; in [`InputMode::App`] keystrokes control
 /// FlightDeck.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
     Terminal,
+    #[default]
     App,
-}
-
-impl Default for InputMode {
-    fn default() -> Self {
-        InputMode::App
-    }
 }
