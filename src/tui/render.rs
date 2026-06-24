@@ -64,6 +64,109 @@ pub enum UiOverlay {
 }
 
 // ---------------------------------------------------------------------------
+// Mouse hit-testing (clickable tabs)
+// ---------------------------------------------------------------------------
+
+/// Rows the sidebar header ("Agent Tabs") occupies before the first tab.
+const SIDEBAR_HEADER_ROWS: u16 = 1;
+/// Rows each agent tab occupies in the sidebar: divider + name + agent + git.
+const SIDEBAR_ROWS_PER_TAB: u16 = 4;
+
+/// Which child-terminal tab a click landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildTarget {
+    /// The primary agent terminal.
+    Primary,
+    /// The child shell terminal at this index.
+    Child(usize),
+}
+
+/// What a mouse click resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitTarget {
+    /// An Agent Tab in the sidebar (by index).
+    AgentTab(usize),
+    /// A child-terminal tab in the main pane.
+    Child(ChildTarget),
+}
+
+/// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
+/// `area`, returning the agent tab or child-terminal tab it lands on, if any.
+pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
+    let ml = layout::compute(area);
+    if rect_contains(ml.sidebar, col, row) {
+        return sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row).map(HitTarget::AgentTab);
+    }
+    if rect_contains(ml.child_tabs, col, row) {
+        for (target, start, w) in child_tab_positions(ml.child_tabs, state) {
+            if col >= start && col < start.saturating_add(w) {
+                return Some(HitTarget::Child(target));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `(col, row)` is inside `r`.
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
+}
+
+/// Map a click in the sidebar `area` to an agent tab index (or `None`).
+fn sidebar_tab_at(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<usize> {
+    let inner = Block::default().borders(Borders::RIGHT).inner(area);
+    if col < inner.x || col >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    let first = inner.y.saturating_add(SIDEBAR_HEADER_ROWS);
+    if row < first {
+        return None;
+    }
+    let idx = ((row - first) / SIDEBAR_ROWS_PER_TAB) as usize;
+    (idx < tab_count).then_some(idx)
+}
+
+/// The child-terminal tab entries for the selected tab: the primary "agent" tab
+/// plus one per child shell. Shared by rendering and hit-testing so positions
+/// always agree.
+fn child_tab_entries(state: &AppState) -> Vec<(ChildTarget, String)> {
+    let mut v = vec![(ChildTarget::Primary, "agent".to_string())];
+    if let Some(tab) = state.selected() {
+        for i in 0..tab.session.child_count() {
+            v.push((ChildTarget::Child(i), format!("shell {}", i + 1)));
+        }
+    }
+    v
+}
+
+/// Compute `(target, start_col, width)` for each child-terminal tab segment,
+/// matching exactly how [`draw_child_tab_bar`] lays them out.
+fn child_tab_positions(area: Rect, state: &AppState) -> Vec<(ChildTarget, u16, u16)> {
+    let mut out = Vec::new();
+    let mut x = area.x;
+    for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(3); // " | " separator
+        }
+        let w = label.chars().count() as u16 + 2; // " label "
+        out.push((target, x, w));
+        x = x.saturating_add(w);
+    }
+    out
+}
+
+/// A full-width horizontal divider line (used between sidebar tabs).
+fn divider_line(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Top-level entry point
 // ---------------------------------------------------------------------------
 
@@ -97,88 +200,88 @@ pub fn draw(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, overlay
 
 /// Draw the left Agent Tabs sidebar.
 pub fn draw_sidebar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, area: Rect) {
-    let block = Block::default()
-        .title(" Agent Tabs ")
-        .borders(Borders::RIGHT);
-
+    let block = Block::default().borders(Borders::RIGHT);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header row (SIDEBAR_HEADER_ROWS).
+    lines.push(Line::from(Span::styled(
+        "Agent Tabs",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
     if state.tabs.is_empty() {
-        let hint = Paragraph::new("No tabs. Ctrl-n to create.")
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(hint, inner);
+        lines.push(divider_line(width));
+        lines.push(Line::from(Span::styled(
+            "No tabs. Ctrl-n to create.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
-    let items: Vec<ListItem> = state
-        .tabs
-        .iter()
-        .enumerate()
-        .map(|(i, tab)| {
-            let selected = state.selected_tab == Some(i);
-            let ds = tab.display_status();
-            let git = cache.get(&tab.meta.id);
+    // Each tab block is SIDEBAR_ROWS_PER_TAB rows: divider, name, agent, git —
+    // a divider above every tab including the first (SPECS §20).
+    for (i, tab) in state.tabs.iter().enumerate() {
+        let selected = state.selected_tab == Some(i);
+        let ds = tab.display_status();
+        let git = cache.get(&tab.meta.id);
 
-            // Line 1: tab name (with selection marker).
-            let name_style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let marker = if selected { "▸ " } else { "  " };
-            let name_line = Line::from(vec![
-                Span::styled(marker, name_style),
-                Span::styled(tab.meta.name.clone(), name_style),
-            ]);
+        // Divider (top of the tab block).
+        lines.push(divider_line(width));
 
-            // Line 2: agent | process: <state> | status: <interp>
-            let agent_name = state
-                .registry
-                .get(&tab.meta.agent)
-                .map(|a| a.display_name.as_str())
-                .unwrap_or(&tab.meta.agent);
+        // Name (with selection marker).
+        let name_style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let marker = if selected { "▸ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(marker, name_style),
+            Span::styled(tab.meta.name.clone(), name_style),
+        ]));
 
-            let (status_str, status_color) = if let Some(manual) = ds.manual {
-                (
-                    format!("{} | proc: {}", manual.as_str(), ds.process.as_str()),
-                    Color::Cyan,
-                )
-            } else {
-                let color = interpreted_color(ds.interpreted);
-                (
-                    format!(
-                        "proc: {} | {}",
-                        ds.process.as_str(),
-                        ds.interpreted.as_str()
-                    ),
-                    color,
-                )
-            };
+        // Agent | process | status.
+        let agent_name = state
+            .registry
+            .get(&tab.meta.agent)
+            .map(|a| a.display_name.clone())
+            .unwrap_or_else(|| tab.meta.agent.clone());
+        let (status_str, status_color) = if let Some(manual) = ds.manual {
+            (
+                format!("{} | proc: {}", manual.as_str(), ds.process.as_str()),
+                Color::Cyan,
+            )
+        } else {
+            (
+                format!(
+                    "proc: {} | {}",
+                    ds.process.as_str(),
+                    ds.interpreted.as_str()
+                ),
+                interpreted_color(ds.interpreted),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(agent_name, Style::default().fg(Color::Gray)),
+            Span::raw(" "),
+            Span::styled(status_str, Style::default().fg(status_color)),
+        ]));
 
-            let agent_line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(agent_name, Style::default().fg(Color::Gray)),
-                Span::raw(" "),
-                Span::styled(status_str, Style::default().fg(status_color)),
-            ]);
+        // Git indicators (dirty, ahead/behind, base drift, recovered/existing).
+        lines.push(build_git_indicator_line(tab, git));
+    }
 
-            // Line 3: git indicators (dirty, ahead/behind, base drift, markers).
-            let git_line = build_git_indicator_line(tab, git);
-
-            let mut lines = vec![name_line, agent_line, git_line];
-
-            // Blank line separator between tabs.
-            lines.push(Line::raw(""));
-
-            ListItem::new(lines)
-        })
-        .collect();
-
-    let list = List::new(items);
-    frame.render_widget(list, inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Colour for an interpreted status label (SPECS §24).
@@ -264,36 +367,35 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         return;
     };
 
-    // Build "agent | shell 1 | shell 2 …" style tab bar.
+    // Build "agent | shell 1 | shell 2 …" from the shared segmentation so the
+    // rendered positions line up with mouse hit-testing (SPECS §19).
+    let active = tab.session.selected_child(); // None = primary
     let mut spans: Vec<Span> = Vec::new();
-
-    let primary_selected = tab.session.selected_child().is_none();
-    let primary_style = if primary_selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    spans.push(Span::styled(" agent ", primary_style));
-
-    for i in 0..tab.session.child_count() {
-        let child_selected = tab.session.selected_child() == Some(i);
-        let style = if child_selected {
+    for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        }
+        let is_active = match target {
+            ChildTarget::Primary => active.is_none(),
+            ChildTarget::Child(c) => active == Some(c),
+        };
+        let style = if is_active {
+            let bg = if matches!(target, ChildTarget::Primary) {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            };
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
-        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(format!(" shell {} ", i + 1), style));
+        spans.push(Span::styled(format!(" {label} "), style));
     }
 
-    let line = Line::from(spans);
-    let para = Paragraph::new(line).style(Style::default().bg(Color::Reset));
+    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
 }
 
@@ -301,32 +403,91 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 // Terminal viewport (SPECS §20)
 // ---------------------------------------------------------------------------
 
-/// Draw the active terminal viewport (SPECS §20).
-///
-/// The actual byte-level PTY rendering (scrollback buffer, ANSI escape
-/// processing) is handled by T9's PTY integration. This function renders a
-/// placeholder/scrollback string. T9 should replace this with a proper
-/// terminal widget or render the scrollback bytes directly into the buffer.
+/// Draw the active terminal viewport (SPECS §20): the VT100 screen of the
+/// selected tab's active terminal (primary agent, or the selected child shell),
+/// rendered cell-by-cell from its parser.
 pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect) {
-    let block = Block::default().borders(Borders::NONE);
-
-    let content = if state.selected().is_none() {
-        Paragraph::new("\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(block)
-    } else {
-        // T9 should render the actual terminal content here. For now we show a
-        // placeholder that T9 replaces with a real terminal widget.
-        Paragraph::new(
-            "  [terminal output — rendered by T9 wiring layer]\n\
-             \n\
-             \x1b[2m  (Replace this with the PTY scrollback render)\x1b[0m",
+    let Some(tab) = state.selected() else {
+        let p = Paragraph::new(
+            "\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.",
         )
-        .style(Style::default().fg(Color::Gray))
-        .block(block)
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, area);
+        return;
     };
 
-    frame.render_widget(content, area);
+    let term = match tab.session.selected_child() {
+        Some(c) => tab.session.child(c),
+        None => tab.session.primary(),
+    };
+    let Some(term) = term else {
+        let p =
+            Paragraph::new("  (terminal starting…)").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, area);
+        return;
+    };
+
+    let focused = state.mode() == InputMode::Terminal;
+    render_screen(frame, area, term.screen(), focused);
+}
+
+/// Render a VT100 [`vt100::Screen`] into `area`, cell-by-cell. When `focused`,
+/// the terminal cursor is positioned to match the screen's cursor.
+fn render_screen(frame: &mut Frame, area: Rect, screen: &vt100::Screen, focused: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (rows, cols) = screen.size();
+    {
+        let buf = frame.buffer_mut();
+        let max_r = area.height.min(rows);
+        let max_c = area.width.min(cols);
+        for r in 0..max_r {
+            for c in 0..max_c {
+                let Some(cell) = screen.cell(r, c) else {
+                    continue;
+                };
+                let target = &mut buf[(area.x + c, area.y + r)];
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    target.set_symbol(" ");
+                } else {
+                    target.set_symbol(contents);
+                }
+                let mut style = Style::default()
+                    .fg(vt_color(cell.fgcolor()))
+                    .bg(vt_color(cell.bgcolor()));
+                if cell.bold() {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.italic() {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if cell.underline() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if cell.inverse() {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                target.set_style(style);
+            }
+        }
+    }
+    if focused && !screen.hide_cursor() {
+        let (cr, cc) = screen.cursor_position();
+        if cr < area.height && cc < area.width {
+            frame.set_cursor_position((area.x + cc, area.y + cr));
+        }
+    }
+}
+
+/// Convert a [`vt100::Color`] to a ratatui [`Color`].
+fn vt_color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,8 +752,9 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "Agent Tab Navigation",
             Style::default().fg(Color::Yellow),
         )),
-        shortcut_line("  Alt-Left / Alt-Right", "Previous / Next Agent Tab"),
+        shortcut_line("  Alt-Up / Alt-Down", "Previous / Next Agent Tab"),
         shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Tab by index"),
+        shortcut_line("  Mouse click", "Select Agent Tab"),
         Line::raw(""),
         Line::from(Span::styled(
             "Child Terminal Navigation",
@@ -600,8 +762,8 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         )),
         shortcut_line("  Ctrl-t", "New child terminal"),
         shortcut_line("  Ctrl-w", "Close active child terminal"),
-        shortcut_line("  Ctrl-Tab", "Next child terminal"),
-        shortcut_line("  Ctrl-Shift-Tab", "Previous child terminal"),
+        shortcut_line("  Alt-Left / Alt-Right", "Previous / Next child terminal"),
+        shortcut_line("  Mouse click", "Select terminal tab"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
         shortcut_line("  Esc", "Leave terminal focus / focus app"),
@@ -687,6 +849,91 @@ mod tests {
 
     fn empty_cache() -> GitStatusCache {
         GitStatusCache::new()
+    }
+
+    fn state_with_tabs(n: usize) -> AppState {
+        let mut ps = default_state("main");
+        for i in 0..n {
+            ps.tabs.push(crate::contracts::TabState {
+                id: format!("t{i}"),
+                name: format!("tab{i}"),
+                slug: format!("tab{i}"),
+                agent: "opencode".to_string(),
+                branch: format!("flightdeck/tab{i}"),
+                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "sha".to_string(),
+                created_at: "t".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+            });
+        }
+        AppState::new(Config::default(), ps, "/repo", "/repo/state.json")
+    }
+
+    // --- Mouse hit-testing (clickable tabs) ------------------------------
+
+    #[test]
+    fn hit_test_maps_sidebar_rows_to_agent_tabs() {
+        let state = state_with_tabs(2);
+        let area = Rect::new(0, 0, 80, 24);
+        // Header is row 0; tab 0 occupies rows 1..=4, tab 1 rows 5..=8.
+        assert_eq!(hit_test(area, &state, 2, 1), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 5), Some(HitTarget::AgentTab(1)));
+        // Header row selects nothing.
+        assert_eq!(hit_test(area, &state, 2, 0), None);
+    }
+
+    #[test]
+    fn terminal_viewport_renders_parsed_pty_output() {
+        // Regression: the active terminal's PTY output must actually render
+        // (previously a placeholder was shown). Spawn a primary, feed it bytes,
+        // and assert the text lands in the viewport region of the buffer.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.tabs[0]
+            .session
+            .primary_mut()
+            .unwrap()
+            .process_output(b"HELLO_FLIGHTDECK");
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None))
+            .unwrap();
+
+        let buffer = term.backend().buffer().clone();
+        let all_text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            all_text.contains("HELLO_FLIGHTDECK"),
+            "terminal viewport must render parsed PTY output"
+        );
+    }
+
+    #[test]
+    fn hit_test_maps_child_tab_bar_to_primary() {
+        let state = state_with_tabs(1);
+        let area = Rect::new(0, 0, 80, 24);
+        // Child tab bar is row 0 of the main pane; the "agent" segment starts at
+        // the sidebar width (28) and spans " agent " (7 cols).
+        assert_eq!(
+            hit_test(area, &state, 30, 0),
+            Some(HitTarget::Child(ChildTarget::Primary))
+        );
     }
 
     // --- Status bar text (SPECS §23) -------------------------------------

@@ -6,6 +6,9 @@
 use crate::contracts::{FlightDeckError, ProcessState, PtyBackend, PtySession, PtySize, Result};
 use std::path::Path;
 
+/// Scrollback lines kept by each terminal's VT parser.
+const SCROLLBACK: usize = 2000;
+
 /// Whether a terminal hosts the primary agent or a child shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalKind {
@@ -13,14 +16,27 @@ pub enum TerminalKind {
     Child,
 }
 
-/// A single terminal (primary or child) and its live PTY session.
+/// A single terminal (primary or child): its live PTY session plus a VT100
+/// parser that turns the raw PTY byte stream into a renderable screen grid.
 pub struct Terminal {
     pub kind: TerminalKind,
     pub title: String,
     session: Box<dyn PtySession>,
+    parser: vt100::Parser,
 }
 
 impl Terminal {
+    /// Construct a terminal wrapping a spawned session, with a VT parser sized
+    /// to the terminal's viewport.
+    fn new(kind: TerminalKind, title: String, session: Box<dyn PtySession>, size: PtySize) -> Self {
+        Terminal {
+            kind,
+            title,
+            session,
+            parser: vt100::Parser::new(size.rows.max(1), size.cols.max(1), SCROLLBACK),
+        }
+    }
+
     /// The terminal's process state.
     pub fn process_state(&self) -> ProcessState {
         self.session.process_state()
@@ -29,6 +45,24 @@ impl Terminal {
     /// Mutable access to the underlying session.
     pub fn session_mut(&mut self) -> &mut dyn PtySession {
         self.session.as_mut()
+    }
+
+    /// Feed raw PTY output bytes into the VT parser (updates the screen grid).
+    pub fn process_output(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    /// The current parsed screen, for rendering.
+    pub fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
+
+    /// Resize both the VT screen grid and the underlying PTY (SPECS §23).
+    pub fn resize(&mut self, size: PtySize) -> Result<()> {
+        self.parser
+            .screen_mut()
+            .set_size(size.rows.max(1), size.cols.max(1));
+        self.session.resize(size)
     }
 }
 
@@ -57,11 +91,12 @@ impl Session {
         size: PtySize,
     ) -> Result<()> {
         let session = backend.spawn(cmd, args, cwd, size)?;
-        self.primary = Some(Terminal {
-            kind: TerminalKind::Primary,
-            title: cmd.to_string(),
+        self.primary = Some(Terminal::new(
+            TerminalKind::Primary,
+            cmd.to_string(),
             session,
-        });
+            size,
+        ));
         Ok(())
     }
 
@@ -76,11 +111,12 @@ impl Session {
         size: PtySize,
     ) -> Result<usize> {
         let session = backend.spawn(cmd, args, cwd, size)?;
-        self.children.push(Terminal {
-            kind: TerminalKind::Child,
-            title: cmd.to_string(),
+        self.children.push(Terminal::new(
+            TerminalKind::Child,
+            cmd.to_string(),
             session,
-        });
+            size,
+        ));
         let index = self.children.len() - 1;
         self.selected_child = Some(index);
         Ok(index)
@@ -123,6 +159,11 @@ impl Session {
     /// The currently selected child index, if any.
     pub fn selected_child(&self) -> Option<usize> {
         self.selected_child
+    }
+
+    /// Focus the primary agent terminal (clear any child selection, SPECS §19).
+    pub fn focus_primary(&mut self) {
+        self.selected_child = None;
     }
 
     /// Number of child terminals.

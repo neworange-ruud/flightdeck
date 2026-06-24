@@ -82,7 +82,6 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let no_mod = key.modifiers.is_empty();
 
     match key.code {
@@ -108,10 +107,10 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('?') if no_mod => KeyAction::OpenHelp,
 
         // --- Agent Tab Navigation (SPECS §23) ----------------------------
-        // Alt-Left: previous Agent Tab.
-        KeyCode::Left if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
-        // Alt-Right: next Agent Tab.
-        KeyCode::Right if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
+        // Alt-Up: previous Agent Tab.
+        KeyCode::Up if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
+        // Alt-Down: next Agent Tab.
+        KeyCode::Down if alt => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
         // Alt-1..Alt-9: jump to Agent Tab by index.
         KeyCode::Char(c @ '1'..='9') if alt => {
             let idx = (c as usize) - ('1' as usize);
@@ -123,14 +122,10 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('t') if ctrl => KeyAction::Dispatch(Command::NewChildTerminal),
         // Ctrl-w: Close active child terminal.
         KeyCode::Char('w') if ctrl => KeyAction::Dispatch(Command::CloseChildTerminal),
-        // Ctrl-Tab: Next child terminal.
-        KeyCode::Tab if ctrl && !shift => {
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
-        }
-        // Ctrl-Shift-Tab (BackTab with Ctrl): Previous child terminal.
-        KeyCode::BackTab if ctrl => {
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
-        }
+        // Alt-Left: previous child terminal.
+        KeyCode::Left if alt => KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev)),
+        // Alt-Right: next child terminal.
+        KeyCode::Right if alt => KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)),
 
         // --- Status (SPECS §23) ------------------------------------------
         // Ctrl-s: Set manual status.
@@ -273,16 +268,6 @@ mod tests {
         }
     }
 
-    /// Construct a KeyEvent with Ctrl+Shift held.
-    fn ctrl_shift(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }
-    }
-
     // --- Global shortcuts (both modes) ------------------------------------
 
     #[test]
@@ -361,18 +346,34 @@ mod tests {
     }
 
     #[test]
-    fn app_mode_alt_left_prev_tab() {
+    fn app_mode_alt_up_prev_tab() {
         assert_eq!(
-            map_key(InputMode::App, alt(KeyCode::Left)),
+            map_key(InputMode::App, alt(KeyCode::Up)),
             KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))
         );
     }
 
     #[test]
-    fn app_mode_alt_right_next_tab() {
+    fn app_mode_alt_down_next_tab() {
+        assert_eq!(
+            map_key(InputMode::App, alt(KeyCode::Down)),
+            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+        );
+    }
+
+    #[test]
+    fn app_mode_alt_left_prev_child() {
+        assert_eq!(
+            map_key(InputMode::App, alt(KeyCode::Left)),
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
+        );
+    }
+
+    #[test]
+    fn app_mode_alt_right_next_child() {
         assert_eq!(
             map_key(InputMode::App, alt(KeyCode::Right)),
-            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))
+            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
         );
     }
 
@@ -409,19 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn app_mode_ctrl_tab_next_child() {
-        assert_eq!(
-            map_key(InputMode::App, ctrl(KeyCode::Tab)),
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
-        );
-    }
-
-    #[test]
-    fn app_mode_ctrl_shift_backtab_prev_child() {
-        assert_eq!(
-            map_key(InputMode::App, ctrl_shift(KeyCode::BackTab)),
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
-        );
+    fn app_mode_ctrl_tab_is_unbound() {
+        // Child-terminal switching moved to Alt-Left/Right; Ctrl-Tab is unbound.
+        assert_eq!(map_key(InputMode::App, ctrl(KeyCode::Tab)), KeyAction::None);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub mod tui;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::app::commands::{CloseAction, Command, Effect, PushConfirm};
+use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
 use crate::app::state::{AppState, Services};
 use crate::config::init::initialize;
 use crate::config::load::load_config;
@@ -38,9 +38,13 @@ use crate::persistence::recovery::recover;
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::input::{map_key, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
-use crate::tui::render::{draw, GitStatusCache, UiOverlay};
+use crate::tui::render::{draw, hit_test, ChildTarget, GitStatusCache, HitTarget, UiOverlay};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 /// How long to block waiting for an input event before looping again so PTY
 /// output keeps flowing and statuses keep refreshing.
@@ -87,12 +91,16 @@ pub fn run() -> Result<()> {
     let mut terminal = ratatui::try_init()
         .map_err(|e| FlightDeckError::Io(format!("failed to initialise terminal: {e}")))?;
 
-    // Seed the PTY size from the real terminal so spawns match the viewport.
+    // Enable mouse capture so tabs are clickable (best effort).
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+
+    // Seed the PTY size from the terminal viewport (not the whole screen) so
+    // agents wrap at the right width.
     if let Ok(size) = terminal.size() {
-        state.set_pty_size(PtySize {
+        state.set_pty_size(viewport_pty_size(PtySize {
             rows: size.height,
             cols: size.width,
-        });
+        }));
     }
 
     let loop_result = event_loop(&mut terminal, &mut state, &services);
@@ -100,6 +108,7 @@ pub fn run() -> Result<()> {
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
     // every session so no orphaned child processes remain. Persist on the way
     // out (best effort) regardless of how the loop ended.
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     let persist_result = persist_quietly(&state, &services);
     terminate_all_sessions(&mut state);
@@ -223,6 +232,9 @@ struct Ui {
     overlay: UiOverlay,
     palette: Option<CommandPalette>,
     prompt: Option<PromptState>,
+    /// Set when a dispatched [`Effect::Quit`] asks the app to exit (e.g. the
+    /// "Quit" command palette action). The event loop checks this each turn.
+    should_quit: bool,
 }
 
 /// A prompt plus the rendered hint shown to the user (drawn as a message line).
@@ -276,12 +288,11 @@ fn event_loop(
 ) -> Result<()> {
     let mut ui = Ui::default();
     let mut cache: GitStatusCache = GitStatusCache::new();
-    let mut viewport: Vec<u8> = Vec::new();
     let mut tick: u64 = 0;
 
     loop {
-        // --- Drain PTY output, classify it, and feed the active viewport. ---
-        drain_pty_output(state, &mut viewport);
+        // --- Drain PTY output and feed each terminal's VT parser + status. ---
+        drain_pty_output(state);
 
         // --- Periodically refresh the git-status cache (non-blocking-ish). ---
         if tick.is_multiple_of(GIT_REFRESH_EVERY) {
@@ -304,22 +315,71 @@ fn event_loop(
 
         match event::read().map_err(|e| FlightDeckError::Io(format!("event read failed: {e}")))? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // Drop the synthetic viewport buffer reference on focus changes
-                // implicitly by always re-reading; just route the key.
                 if handle_key(key, state, services, &mut ui)? {
-                    break; // Quit requested.
+                    break; // Quit requested via the Ctrl-q key action.
                 }
             }
+            Event::Mouse(me) => {
+                let area = match terminal.size() {
+                    Ok(s) => Rect::new(0, 0, s.width, s.height),
+                    Err(_) => continue,
+                };
+                handle_mouse(me, area, state, services, &ui);
+            }
             Event::Resize(cols, rows) => {
-                let size = PtySize { rows, cols };
+                let size = viewport_pty_size(PtySize { rows, cols });
                 state.set_pty_size(size);
                 resize_sessions(state, size);
             }
             _ => {}
         }
+
+        // A dispatched Effect::Quit (e.g. the "Quit" palette action) also exits.
+        if ui.should_quit {
+            break;
+        }
     }
 
     Ok(())
+}
+
+/// Compute the PTY/terminal-viewport size from the full terminal size. Agents
+/// must wrap at the viewport width (total minus the sidebar/borders), not the
+/// whole screen.
+fn viewport_pty_size(full: PtySize) -> PtySize {
+    let ml = crate::tui::layout::compute(Rect::new(0, 0, full.cols, full.rows));
+    PtySize {
+        rows: ml.terminal.height.max(1),
+        cols: ml.terminal.width.max(1),
+    }
+}
+
+/// Handle a mouse event: a left click selects the clicked Agent Tab or
+/// child-terminal tab (SPECS §22 — keyboard-first, but mouse-assisted).
+fn handle_mouse(me: MouseEvent, area: Rect, state: &mut AppState, services: &Services, ui: &Ui) {
+    // Ignore mouse while a modal/prompt/overlay is capturing input.
+    if ui.modal_active() {
+        return;
+    }
+    if me.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    let Some(hit) = hit_test(area, state, me.column, me.row) else {
+        return;
+    };
+    match hit {
+        HitTarget::AgentTab(i) => {
+            let _ = state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
+        }
+        HitTarget::Child(ChildTarget::Primary) => {
+            if let Some(tab) = state.selected_mut() {
+                tab.session.focus_primary();
+            }
+        }
+        HitTarget::Child(ChildTarget::Child(i)) => {
+            let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+        }
+    }
 }
 
 /// Route a key press. Returns `Ok(true)` when the loop should quit.
@@ -439,7 +499,7 @@ fn dispatch_command(
 fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
     match effect {
         Effect::None => ui.clear(),
-        Effect::Quit => {} // Handled by the Quit key action, not via Effect here.
+        Effect::Quit => ui.should_quit = true,
         Effect::Message(m) => ui.message(m),
         Effect::Warning(m) => ui.message(format!("WARNING: {m}")),
         Effect::Refused(m) => ui.message(format!("Refused: {m}")),
@@ -660,7 +720,7 @@ fn finish_prompt(result: Result<Effect>, ui: &mut Ui) {
 fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
     match effect {
         Effect::None => ui.clear(),
-        Effect::Quit => {}
+        Effect::Quit => ui.should_quit = true,
         Effect::Message(m) => ui.message(m),
         Effect::Warning(m) => ui.message(format!("WARNING: {m}")),
         Effect::Refused(m) => ui.message(format!("Refused: {m}")),
@@ -773,38 +833,34 @@ fn run_palette_action(
 // PTY plumbing
 // ---------------------------------------------------------------------------
 
-/// Drain output from every terminal of every tab. Output from each tab's
-/// primary feeds status classification (SPECS §24); the active terminal's
-/// output is also appended to the rendered viewport buffer.
-fn drain_pty_output(state: &mut AppState, viewport: &mut Vec<u8>) {
+/// Drain output from every terminal of every tab, feeding each terminal's VT
+/// parser (so it can be rendered) and feeding each primary's output to status
+/// classification (SPECS §24).
+fn drain_pty_output(state: &mut AppState) {
     // Collect (tab id, primary bytes) first so we can call `ingest_output`
     // (which borrows `state` mutably) without overlapping the session borrow.
     let mut ingest: Vec<(TabId, Vec<u8>)> = Vec::new();
-    let active_idx = state.selected_tab;
 
-    for (i, tab) in state.tabs.iter_mut().enumerate() {
+    for tab in state.tabs.iter_mut() {
         let id = TabId(tab.meta.id.clone());
 
-        // Primary output → classification + (if active terminal) viewport.
+        // Primary: drain → VT parser + status classification.
         if let Some(primary) = tab.session.primary_mut() {
             if let Ok(bytes) = primary.session_mut().try_read_output() {
                 if !bytes.is_empty() {
-                    if active_idx == Some(i) && tab.session_selected_child_is_none() {
-                        viewport.extend_from_slice(&bytes);
-                    }
+                    primary.process_output(&bytes);
                     ingest.push((id.clone(), bytes));
                 }
             }
         }
 
-        // Child terminals: drain so their PTYs don't stall; forward the active
-        // child's output to the viewport.
-        let selected_child = tab.session.selected_child();
+        // Child terminals: drain → VT parser (so they don't stall and so their
+        // screen renders when selected).
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
                 if let Ok(bytes) = child.session_mut().try_read_output() {
-                    if !bytes.is_empty() && active_idx == Some(i) && selected_child == Some(c) {
-                        viewport.extend_from_slice(&bytes);
+                    if !bytes.is_empty() {
+                        child.process_output(&bytes);
                     }
                 }
             }
@@ -813,13 +869,6 @@ fn drain_pty_output(state: &mut AppState, viewport: &mut Vec<u8>) {
 
     for (id, bytes) in ingest {
         state.ingest_output(&id, &bytes);
-    }
-
-    // Keep the viewport buffer bounded so it cannot grow without limit.
-    const MAX_VIEWPORT: usize = 256 * 1024;
-    if viewport.len() > MAX_VIEWPORT {
-        let drop = viewport.len() - MAX_VIEWPORT;
-        viewport.drain(0..drop);
     }
 }
 
@@ -842,15 +891,16 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     }
 }
 
-/// Resize every live PTY session to the new terminal size (SPECS §23 resize).
+/// Resize every live PTY session and its VT parser to the new viewport size
+/// (SPECS §23 resize).
 fn resize_sessions(state: &mut AppState, size: PtySize) {
     for tab in state.tabs.iter_mut() {
         if let Some(primary) = tab.session.primary_mut() {
-            let _ = primary.session_mut().resize(size);
+            let _ = primary.resize(size);
         }
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
-                let _ = child.session_mut().resize(size);
+                let _ = child.resize(size);
             }
         }
     }
@@ -896,17 +946,6 @@ fn persist_quietly(state: &AppState, services: &Services) -> Result<()> {
 fn terminate_all_sessions(state: &mut AppState) {
     for tab in state.tabs.iter_mut() {
         let _ = tab.session.terminate_all();
-    }
-}
-
-// Small helper on RuntimeTab via an extension trait kept local to wiring.
-trait SessionViewportExt {
-    fn session_selected_child_is_none(&self) -> bool;
-}
-
-impl SessionViewportExt for crate::app::state::RuntimeTab {
-    fn session_selected_child_is_none(&self) -> bool {
-        self.session.selected_child().is_none()
     }
 }
 
@@ -1009,6 +1048,30 @@ mod tests {
     }
 
     // --- modal capture ----------------------------------------------------
+
+    #[test]
+    fn effect_quit_sets_should_quit() {
+        // Regression: dispatching Quit (e.g. the palette "Quit" action) must
+        // actually request exit, not be a silent no-op.
+        let mut ui = Ui::default();
+        assert!(!ui.should_quit);
+        apply_effect_no_state(Effect::Quit, &mut ui);
+        assert!(ui.should_quit);
+    }
+
+    #[test]
+    fn viewport_size_is_smaller_than_full_terminal() {
+        // The agent PTY must wrap at the viewport width (full minus sidebar),
+        // not the whole screen width.
+        let full = PtySize {
+            rows: 40,
+            cols: 120,
+        };
+        let vp = viewport_pty_size(full);
+        assert!(vp.cols < full.cols, "viewport narrower than full screen");
+        assert!(vp.rows < full.rows, "viewport shorter than full screen");
+        assert!(vp.cols >= 1 && vp.rows >= 1);
+    }
 
     #[test]
     fn modal_active_when_prompt_present() {

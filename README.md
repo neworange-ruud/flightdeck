@@ -68,11 +68,15 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
 - **App mode** — keystrokes control FlightDeck. `Enter` focuses the terminal;
   `?` shows help.
 
-Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit · `Ctrl-n` new tab · `Ctrl-p`
-push · `Ctrl-f` finish/local-merge · `Ctrl-k` close tab · `Alt-←/→` prev/next tab
-· `Alt-1..9` jump to tab · `Ctrl-t` new child terminal · `Ctrl-w` close child ·
-`Ctrl-s` set manual status · `Ctrl-r` restart agent. The full table is in the
-in-app help (`?`) and SPECS §23.
+Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
+`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-f` finish/local-merge · `Ctrl-k` close
+tab · `Alt-↑/↓` previous/next **agent tab** · `Alt-1..9` jump to agent tab ·
+`Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` previous/next
+**child terminal** · `Ctrl-s` set manual status · `Ctrl-r` restart agent. The
+full table is in the in-app help (`?`).
+
+**Mouse**: click an Agent Tab in the sidebar to select it, or a child-terminal
+tab (`agent | shell 1 | …`) to switch terminals.
 
 ## Architecture
 
@@ -125,7 +129,8 @@ changes, run this checklist by hand from inside a scratch Git repo:
 3. **Missing agent**: edit `config.toml` to a bogus `command`, create a tab →
    creation fails with a clear message and **no** branch/worktree is created.
 4. **Child terminal** (`Ctrl-t`) → a shell opens in the same worktree; switch
-   with `Ctrl-Tab`; close with `Ctrl-w`.
+   with `Alt-←/→` (or click its tab); close with `Ctrl-w`. The agent's and each
+   shell's live output renders in the main pane.
 5. **Git status** (palette → *Show Git Status*) → branch, base, drift, dirty,
    ahead/behind, worktree path.
 6. **Push** (`Ctrl-p`) → with uncommitted changes you are warned; after a commit,
@@ -133,6 +138,8 @@ changes, run this checklist by hand from inside a scratch Git repo:
 7. **Manual status** (`Ctrl-s`) → set/clear; the process state stays visible.
 8. **Close tab** (`Ctrl-k`) → the option menu defaults to *Send Ctrl-C to
    primary*; it never auto-escalates to force-kill.
+8b. **Quit**: `Ctrl-q`, or open the palette (`Ctrl-g`) and choose *Quit* — both
+    exit cleanly.
 9. **Recovery**: quit (`Ctrl-q`), relaunch → tabs are reconstructed from disk and
    marked *recovered*; agents are **not** auto-restarted (use `Ctrl-r`).
 10. **No orphans**: after quitting, confirm no agent/shell child processes are
