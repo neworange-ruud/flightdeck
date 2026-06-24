@@ -10,6 +10,8 @@
 //! - `KeyAction::OpenPalette` → open the [`crate::tui::palette::CommandPalette`].
 //! - `KeyAction::Quit` → clean teardown (terminate sessions, restore terminal).
 //! - `KeyAction::OpenHelp` → show the help overlay.
+//! - `KeyAction::FocusApp` → call `AppState::focus_app()` (leave terminal focus).
+//! - `KeyAction::FocusTerminal` → call `AppState::focus_terminal()`.
 //! - `KeyAction::None` → no-op.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,6 +30,10 @@ pub enum KeyAction {
     OpenPalette,
     /// Open the help / keybindings overlay.
     OpenHelp,
+    /// Leave terminal-input focus → app-command mode (`AppState::focus_app`).
+    FocusApp,
+    /// Focus the active terminal → terminal mode (`AppState::focus_terminal`).
+    FocusTerminal,
     /// Quit FlightDeck (wiring layer cleans up).
     Quit,
     /// No action.
@@ -58,17 +64,7 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     }
     // Esc: leave terminal focus (SPECS §23 "Leave terminal input focus").
     if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-        return KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(
-            // Signal "leave terminal" – wiring calls AppState::focus_app().
-            // We encode this as a sentinel command understood by T9.
-            // Rather than invent a new Command variant, we represent mode
-            // transition via a dedicated KeyAction.
-            0, // placeholder; T9 sees LeaveTerminal via the Esc binding below.
-        )));
-    }
-    // Esc: leave terminal focus.
-    if key.code == KeyCode::Esc {
-        return KeyAction::None; // handled above (modifiers non-empty)
+        return KeyAction::FocusApp;
     }
     // Everything else passes through to the PTY.
     KeyAction::Passthrough(encode_key(key))
@@ -92,13 +88,7 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
     match key.code {
         // --- Focus -------------------------------------------------------
         // Enter: focus terminal (SPECS §23).
-        KeyCode::Enter if no_mod => {
-            KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Index(
-                // T9 calls AppState::focus_terminal() on this.
-                // We model it as "focus active terminal" — T9 must detect it.
-                usize::MAX, // sentinel: T9 maps this to focus_terminal()
-            )))
-        }
+        KeyCode::Enter if no_mod => KeyAction::FocusTerminal,
 
         // --- Global shortcuts (App mode, non-global) ---------------------
         // Ctrl-n: New Agent Tab.
@@ -459,6 +449,24 @@ mod tests {
     }
 
     // --- Terminal mode passthrough ----------------------------------------
+
+    #[test]
+    fn terminal_mode_esc_focuses_app() {
+        // Esc leaves terminal focus → app-command mode (SPECS §23).
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::Esc)),
+            KeyAction::FocusApp
+        );
+    }
+
+    #[test]
+    fn app_mode_enter_focuses_terminal() {
+        // Enter focuses the active terminal (SPECS §23).
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::Enter)),
+            KeyAction::FocusTerminal
+        );
+    }
 
     #[test]
     fn terminal_mode_regular_char_passes_through() {
