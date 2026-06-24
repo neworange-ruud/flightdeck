@@ -754,6 +754,10 @@ fn handle_key(
             write_active_pty(state, &bytes);
             Ok(false)
         }
+        KeyAction::Paste => {
+            paste_into_active_pty(state);
+            Ok(false)
+        }
         KeyAction::OpenPalette => {
             ui.palette = Some(CommandPalette::new());
             Ok(false)
@@ -1277,6 +1281,30 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
         term.clear_selection();
         term.scroll_to_bottom();
         let _ = term.session_mut().write_input(bytes);
+    }
+}
+
+/// Paste from the system clipboard into the active terminal (Ctrl-V).
+///
+/// When the clipboard holds an image, it is written to a temp file and the
+/// file path is sent to the agent — matching how a terminal inserts a path when
+/// you drag an image in, which agents like Claude Code recognise and attach. A
+/// trailing space is appended so the user can keep typing. With no image on the
+/// clipboard, a literal Ctrl-V (0x16) is forwarded, preserving prior behaviour.
+fn paste_into_active_pty(state: &mut AppState) {
+    match crate::tui::clipboard::save_clipboard_image() {
+        Some(path) => {
+            let raw = path.to_string_lossy();
+            // Quote the path if it could be word-split by the agent's input.
+            let mut text = if raw.contains(char::is_whitespace) {
+                format!("'{}'", raw.replace('\'', "'\\''"))
+            } else {
+                raw.into_owned()
+            };
+            text.push(' ');
+            write_active_pty(state, text.as_bytes());
+        }
+        None => write_active_pty(state, &[0x16]),
     }
 }
 
