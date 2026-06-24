@@ -95,6 +95,10 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::Dispatch(Command::ShowGitStatus),
     },
     PaletteEntry {
+        label: "Toggle Split View",
+        action: PaletteAction::Dispatch(Command::ToggleSplitView),
+    },
+    PaletteEntry {
         label: "Show Help",
         action: PaletteAction::Dispatch(Command::ShowHelp),
     },
@@ -104,8 +108,9 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
 ];
 
-/// The number of required §22 command-palette actions.
-pub const REQUIRED_ACTION_COUNT: usize = 16;
+/// The number of required §22 command-palette actions, plus the "Toggle Split
+/// View" view command.
+pub const REQUIRED_ACTION_COUNT: usize = 17;
 
 /// The command palette model (SPECS §22).
 ///
@@ -203,7 +208,8 @@ mod tests {
 
     #[test]
     fn lists_all_required_actions() {
-        // SPECS §22 mandates exactly 16 palette actions.
+        // SPECS §22 mandates 16 palette actions, plus the "Toggle Split View"
+        // view command added on top.
         assert_eq!(
             CommandPalette::total_actions(),
             REQUIRED_ACTION_COUNT,
@@ -228,6 +234,7 @@ mod tests {
             "Restart Agent",
             "Open Shell",
             "Show Git Status",
+            "Toggle Split View",
             "Show Help",
             "Quit",
         ];

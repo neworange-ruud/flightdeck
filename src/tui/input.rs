@@ -152,6 +152,10 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         // Ctrl-r: Restart primary agent.
         KeyCode::Char('r') if ctrl => KeyAction::Dispatch(Command::RestartAgent),
 
+        // --- View (split layout) -----------------------------------------
+        // Ctrl-b: Toggle split view (terminals side by side vs. tabs).
+        KeyCode::Char('b') if ctrl => KeyAction::Dispatch(Command::ToggleSplitView),
+
         // Unrecognised key in App mode: no-op.
         _ => KeyAction::None,
     }
@@ -542,6 +546,14 @@ mod tests {
         assert_eq!(
             map_key(InputMode::App, ctrl(KeyCode::Char('r'))),
             KeyAction::Dispatch(Command::RestartAgent)
+        );
+    }
+
+    #[test]
+    fn app_mode_ctrl_b_toggles_split_view() {
+        assert_eq!(
+            map_key(InputMode::App, ctrl(KeyCode::Char('b'))),
+            KeyAction::Dispatch(Command::ToggleSplitView)
         );
     }
 

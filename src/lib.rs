@@ -556,6 +556,18 @@ fn event_loop(
             }
         }
 
+        // --- Keep the selected tab's terminals sized to the current layout
+        //     (per-column in split view, full viewport otherwise). ---
+        if let Ok(size) = terminal.size() {
+            sync_terminal_sizes(
+                state,
+                PtySize {
+                    rows: size.height,
+                    cols: size.width,
+                },
+            );
+        }
+
         // --- Render. ---
         let overlay = ui.render_overlay();
         terminal
@@ -1669,6 +1681,70 @@ fn resize_sessions(state: &mut AppState, size: PtySize) {
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
                 let _ = child.resize(size);
+            }
+        }
+    }
+}
+
+/// Resize a terminal only when its VT grid size actually differs, so this is
+/// cheap to call every frame and never drops a live mouse selection spuriously.
+fn resize_if_changed(term: &mut crate::terminal::session::Terminal, size: PtySize) {
+    let (rows, cols) = term.screen().size();
+    if rows != size.rows || cols != size.cols {
+        let _ = term.resize(size);
+    }
+}
+
+/// Size the *selected* tab's terminals to match the current layout: each
+/// terminal gets its split-view column viewport when split view is on, or the
+/// full terminal viewport otherwise. Only the selected tab is visible, so only
+/// it needs syncing; other tabs self-heal the next time they are selected.
+///
+/// Idempotent via [`resize_if_changed`], so calling it every frame is cheap and
+/// transparently handles every transition (toggle, tab switch, child add/close,
+/// terminal resize) without threading resize calls through each command.
+fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
+    let Some(idx) = state.selected_tab else {
+        return;
+    };
+
+    if state.split_view {
+        let area = Rect::new(0, 0, full.cols, full.rows);
+        let ml = crate::tui::layout::compute(area);
+        let region = crate::tui::layout::split_region(&ml);
+        let n = state.tabs[idx].session.child_count() + 1;
+        let cols = crate::tui::layout::split_columns(region, n);
+        if cols.is_empty() {
+            return;
+        }
+        let col_size = |i: usize| PtySize {
+            rows: cols[i].viewport.height.max(1),
+            cols: cols[i].viewport.width.max(1),
+        };
+        // cols[0] → primary, cols[i + 1] → child i.
+        if let Some(primary) = state.tabs[idx].session.primary_mut() {
+            resize_if_changed(primary, col_size(0));
+        }
+        let child_count = state.tabs[idx].session.child_count();
+        for c in 0..child_count {
+            if c + 1 >= cols.len() {
+                break;
+            }
+            let size = col_size(c + 1);
+            if let Some(child) = state.tabs[idx].session.child_mut(c) {
+                resize_if_changed(child, size);
+            }
+        }
+    } else {
+        // Normal view: every terminal of the selected tab fills the viewport.
+        let size = state.pty_size;
+        if let Some(primary) = state.tabs[idx].session.primary_mut() {
+            resize_if_changed(primary, size);
+        }
+        let child_count = state.tabs[idx].session.child_count();
+        for c in 0..child_count {
+            if let Some(child) = state.tabs[idx].session.child_mut(c) {
+                resize_if_changed(child, size);
             }
         }
     }
