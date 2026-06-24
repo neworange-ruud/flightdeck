@@ -20,10 +20,12 @@ pub mod terminal;
 pub mod tui;
 
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
-use crate::app::state::{AppState, Services};
+use crate::app::state::{materialize_worktree, AppState, Services, TabPhase, WorktreeJob};
 use crate::config::init::initialize;
 use crate::config::load::{load_config, serialize_config};
 use crate::config::schema::default_config;
@@ -33,7 +35,7 @@ use crate::contracts::{FileSystem, ManualStatus, Notifier, PtySize, TabId};
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
 use crate::git::repo::{detect_base_branch, GitCli};
-use crate::git::status::collect_status;
+use crate::git::status::{collect_status, WorktreeStatus};
 use crate::notify::SystemNotifier;
 use crate::persistence::project_state::{default_state, load_state, save_state};
 use crate::persistence::recovery::recover;
@@ -66,6 +68,13 @@ const GIT_REFRESH_EVERY: u64 = 40;
 pub fn run() -> Result<()> {
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
         println!("flightdeck {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // `--help`/`-h` must be handled explicitly: otherwise it falls through and
+    // launches the full TUI instead of printing usage.
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        print_help();
         return Ok(());
     }
 
@@ -111,6 +120,16 @@ pub fn run() -> Result<()> {
     // Enable mouse capture so tabs are clickable (best effort).
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
+    // Take ownership of the terminal title so it stays a stable
+    // "flightdeck — <project>" while we run, instead of inheriting (and
+    // flickering with) whatever title the parent tooling keeps rewriting. The
+    // previous title is pushed onto the terminal's title stack so it can be
+    // restored on exit. Best effort — terminals without XTWINOPS just ignore it.
+    let _ = save_and_set_terminal_title(&format!(
+        "flightdeck — {}",
+        derive_project_name(&repo_root)
+    ));
+
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width.
     if let Ok(size) = terminal.size() {
@@ -126,12 +145,15 @@ pub fn run() -> Result<()> {
     let _ = state.resume_agents(&services);
 
     let notifier = SystemNotifier;
-    let loop_result = event_loop(&mut terminal, &mut state, &services, &notifier);
+    // Background workers (worktree creation, git-status refresh) run git off
+    // the UI thread; they need an owned, cloneable git handle.
+    let loop_result = event_loop(&mut terminal, &mut state, &services, &notifier, git.clone());
 
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
     // every session so no orphaned child processes remain. Persist on the way
     // out (best effort) regardless of how the loop ended.
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = restore_terminal_title();
     ratatui::restore();
     let persist_result = persist_quietly(&state, &services);
     terminate_all_sessions(&mut state);
@@ -319,6 +341,45 @@ fn derive_project_name(repo_root: &Path) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
+/// Print usage for `flightdeck --help`/`-h`.
+fn print_help() {
+    println!("flightdeck {}", env!("CARGO_PKG_VERSION"));
+    println!("Terminal UI for orchestrating multiple local AI coding agents.");
+    println!();
+    println!("USAGE:");
+    println!("    flightdeck [SUBCOMMAND]");
+    println!();
+    println!("Run with no arguments inside a Git repository to launch the TUI.");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    setup-status           Install the opt-in precise agent-status integrations");
+    println!("    setup-notifications    Enable OS notifications when agents finish");
+    println!();
+    println!("OPTIONS:");
+    println!("    -h, --help       Print this help");
+    println!("    -V, --version    Print version");
+}
+
+/// Push the current window/icon title onto the terminal's title stack
+/// (XTWINOPS `CSI 22;0t`) and set our own stable title (OSC 0). Best effort:
+/// terminals without XTWINOPS ignore the push, and the title is restored on
+/// exit by [`restore_terminal_title`].
+fn save_and_set_terminal_title(title: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    write!(out, "\x1b[22;0t\x1b]0;{title}\x07")?;
+    out.flush()
+}
+
+/// Pop the title saved by [`save_and_set_terminal_title`] back off the
+/// terminal's title stack (XTWINOPS `CSI 23;0t`).
+fn restore_terminal_title() -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    write!(out, "\x1b[23;0t")?;
+    out.flush()
+}
+
 // ---------------------------------------------------------------------------
 // Overlay / prompt state machine
 // ---------------------------------------------------------------------------
@@ -380,6 +441,10 @@ struct Ui {
     /// Active mouse text-selection drag, if the left button is held over the
     /// terminal viewport (SPECS §20).
     drag: Option<DragState>,
+    /// Worktree-creation jobs queued by [`AppState::begin_new_agent_tab`] this
+    /// turn, awaiting hand-off to a background worker by the event loop. Keeps
+    /// the slow `git worktree add` off the UI thread.
+    pending_jobs: Vec<WorktreeJob>,
 }
 
 /// A prompt plus the rendered hint shown to the user (drawn as a message line).
@@ -431,6 +496,7 @@ fn event_loop(
     state: &mut AppState,
     services: &Services,
     notifier: &dyn Notifier,
+    worker_git: GitCli,
 ) -> Result<()> {
     let mut ui = Ui::default();
     let mut cache: GitStatusCache = GitStatusCache::new();
@@ -440,11 +506,33 @@ fn event_loop(
     // settling to idle don't produce a burst of "finished" alerts (SPECS §24).
     state.begin_notification_grace(services.clock.now_millis());
 
+    // Background-work channels (SPECS §16/§17/§21): slow git runs off the UI
+    // thread so the loop keeps drawing, draining PTYs, and handling input.
+    let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
+    let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
+    let mut status_in_flight = false;
+    // Serializes THIS instance's `git worktree add`s so two quick new-tab
+    // requests don't race on the repo's index/worktree locks.
+    let git_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
     loop {
         let now_ms = services.clock.now_millis();
 
         // --- Drain PTY output and feed each terminal's VT parser + status. ---
         drain_pty_output(state, now_ms);
+
+        // --- Apply completed background worktree-creation jobs. ---
+        drain_create_outcomes(&create_rx, state, services, &mut ui);
+
+        // --- Apply background git-status results into the cache. ---
+        while let Ok(msg) = status_rx.try_recv() {
+            match msg {
+                StatusMsg::Update(id, status) => {
+                    cache.insert(id, status);
+                }
+                StatusMsg::Done => status_in_flight = false,
+            }
+        }
 
         // --- Poll opt-in agent status files (precise idle/working signals). ---
         state.poll_status_files(services, now_ms);
@@ -454,9 +542,12 @@ fn event_loop(
             notifier.notify(&n);
         }
 
-        // --- Periodically refresh the git-status cache (non-blocking-ish). ---
-        if tick.is_multiple_of(GIT_REFRESH_EVERY) {
-            refresh_git_cache(state, services, &mut cache);
+        // --- Periodically refresh the git-status cache off the UI thread. ---
+        if tick.is_multiple_of(GIT_REFRESH_EVERY)
+            && !status_in_flight
+            && spawn_status_refresh(state, &worker_git, &status_tx)
+        {
+            status_in_flight = true;
         }
         tick = tick.wrapping_add(1);
 
@@ -501,6 +592,12 @@ fn event_loop(
             _ => {}
         }
 
+        // --- Hand off any queued worktree-creation jobs to background workers
+        //     so `git worktree add` never blocks the loop (SPECS §16/§17). ---
+        for job in ui.pending_jobs.drain(..) {
+            spawn_worktree_job(job, &worker_git, &git_lock, &create_tx);
+        }
+
         // A dispatched Effect::Quit (e.g. the "Quit" palette action) also exits.
         if ui.should_quit {
             break;
@@ -508,6 +605,125 @@ fn event_loop(
     }
 
     Ok(())
+}
+
+/// One completed background worktree-creation job: which placeholder tab to
+/// finalize, and whether materialization succeeded (SPECS §16/§17).
+struct CreateOutcome {
+    tab_id: String,
+    result: Result<()>,
+}
+
+/// A message from the background git-status worker (SPECS §21).
+enum StatusMsg {
+    /// A tab's freshly collected worktree status, keyed by tab id.
+    Update(String, WorktreeStatus),
+    /// The refresh batch finished (clears the in-flight guard).
+    Done,
+}
+
+/// Spawn a background worker that materializes `job`'s worktree (the slow
+/// `git worktree add`) and reports the outcome back over `create_tx`. The
+/// `git_lock` serializes this instance's worktree adds so concurrent new-tab
+/// requests don't race on the repo's index/worktree locks.
+fn spawn_worktree_job(
+    job: WorktreeJob,
+    worker_git: &GitCli,
+    git_lock: &Arc<Mutex<()>>,
+    create_tx: &Sender<CreateOutcome>,
+) {
+    let git = worker_git.clone();
+    let lock = Arc::clone(git_lock);
+    let tx = create_tx.clone();
+    std::thread::spawn(move || {
+        let result = {
+            // Recover from a poisoned lock (a previous worker panicked) rather
+            // than cascading the panic into every future creation.
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            materialize_worktree(&git, &job)
+        };
+        let _ = tx.send(CreateOutcome {
+            tab_id: job.tab_id,
+            result,
+        });
+    });
+}
+
+/// Drain finished worktree-creation jobs and reflect them in [`AppState`]:
+/// finalize (spawn the agent, flip to Ready) on success, or remove the
+/// placeholder tab and surface the error on failure.
+fn drain_create_outcomes(
+    create_rx: &Receiver<CreateOutcome>,
+    state: &mut AppState,
+    services: &Services,
+    ui: &mut Ui,
+) {
+    while let Ok(outcome) = create_rx.try_recv() {
+        match outcome.result {
+            Ok(()) => match state.finalize_new_tab(&outcome.tab_id, services) {
+                Ok(effect) => apply_effect(effect, state, ui),
+                Err(e) => {
+                    state.fail_new_tab(&outcome.tab_id);
+                    ui.message(format!("Failed to start agent: {e}"));
+                }
+            },
+            Err(e) => {
+                state.fail_new_tab(&outcome.tab_id);
+                ui.message(format!("Failed to create worktree: {e}"));
+            }
+        }
+    }
+}
+
+/// Snapshot every [`TabPhase::Ready`] tab's parameters and spawn a single
+/// background worker that runs `collect_status` for each, publishing results
+/// over `status_tx`. Returns whether a worker was actually spawned (i.e. there
+/// was at least one tab to refresh). Keeps git status off the UI thread so a
+/// busy repo — e.g. another instance running `git worktree add` — never freezes
+/// the UI (SPECS §21).
+fn spawn_status_refresh(state: &AppState, worker_git: &GitCli, status_tx: &Sender<StatusMsg>) -> bool {
+    struct StatusReq {
+        tab_id: String,
+        branch: String,
+        base_branch: String,
+        base_commit_sha: String,
+        worktree_abs: std::path::PathBuf,
+    }
+
+    let reqs: Vec<StatusReq> = state
+        .tabs
+        .iter()
+        .filter(|t| t.phase == TabPhase::Ready)
+        .map(|t| StatusReq {
+            tab_id: t.meta.id.clone(),
+            branch: t.meta.branch.clone(),
+            base_branch: t.meta.base_branch.clone(),
+            base_commit_sha: t.meta.base_commit_sha.clone(),
+            worktree_abs: to_absolute(&state.repo_root, Path::new(&t.meta.worktree_path_relative)),
+        })
+        .collect();
+
+    if reqs.is_empty() {
+        return false;
+    }
+
+    let git = worker_git.clone();
+    let tx = status_tx.clone();
+    std::thread::spawn(move || {
+        for r in reqs {
+            if let Ok(status) = collect_status(
+                &git,
+                &r.branch,
+                &r.base_branch,
+                &r.base_commit_sha,
+                &r.worktree_abs,
+            ) {
+                let _ = tx.send(StatusMsg::Update(r.tab_id, status));
+            }
+        }
+        let _ = tx.send(StatusMsg::Done);
+    });
+    true
 }
 
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents
@@ -1116,16 +1332,25 @@ fn handle_prompt_key(
                         ui.prompt = Some(pstate);
                         return Ok(());
                     }
-                    let cmd = if is_new {
-                        Command::NewAgentTab {
-                            name,
-                            agent_key: new_agent_key,
+                    if is_new {
+                        // Async new-tab flow: reserve a placeholder tab now
+                        // (cheap, validation-first), then queue the slow worktree
+                        // creation for a background worker so the UI never blocks
+                        // on `git worktree add` (SPECS §16/§17).
+                        ui.prompt = None;
+                        match state.begin_new_agent_tab(&name, new_agent_key.as_deref(), services) {
+                            Ok(job) => {
+                                let branch = job.branch.clone();
+                                ui.pending_jobs.push(job);
+                                ui.message(format!("Creating worktree for {branch}…"));
+                            }
+                            Err(e) => ui.message(format!("Error: {e}")),
                         }
                     } else {
-                        Command::RenameAgentTab { new_name: name }
-                    };
-                    let result = state.dispatch(cmd, services);
-                    finish_prompt(result, ui);
+                        let result =
+                            state.dispatch(Command::RenameAgentTab { new_name: name }, services);
+                        finish_prompt(result, ui);
+                    }
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -1443,30 +1668,6 @@ fn resize_sessions(state: &mut AppState, size: PtySize) {
             if let Some(child) = tab.session.child_mut(c) {
                 let _ = child.resize(size);
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Git status refresh
-// ---------------------------------------------------------------------------
-
-/// Refresh the git-status cache for every tab (SPECS §20, §21). Best-effort:
-/// failures for a single tab leave its previous entry untouched.
-fn refresh_git_cache(state: &AppState, services: &Services, cache: &mut GitStatusCache) {
-    for tab in &state.tabs {
-        let worktree = to_absolute(
-            &state.repo_root,
-            Path::new(&tab.meta.worktree_path_relative),
-        );
-        if let Ok(status) = collect_status(
-            services.git,
-            &tab.meta.branch,
-            &tab.meta.base_branch,
-            &tab.meta.base_commit_sha,
-            &worktree,
-        ) {
-            cache.insert(tab.meta.id.clone(), status);
         }
     }
 }

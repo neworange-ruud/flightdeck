@@ -45,6 +45,80 @@ pub struct Services<'a> {
     pub clock: &'a dyn Clock,
 }
 
+/// Lifecycle phase of an Agent Tab (SPECS §16/§17).
+///
+/// A tab is `Creating` while its worktree is materialized on a background
+/// worker (so the UI never blocks on `git worktree add`); it flips to `Ready`
+/// once the primary agent is spawned. Creation failures remove the placeholder
+/// tab entirely rather than leaving a dead state, so there is no `Failed`
+/// variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPhase {
+    /// Worktree is being materialized on a background worker; no session yet.
+    Creating,
+    /// Worktree exists and the primary agent has been spawned.
+    Ready,
+}
+
+/// A unit of slow worktree-materialization work handed to a background worker
+/// after [`AppState::begin_new_agent_tab`] has reserved a placeholder tab.
+///
+/// Carries only owned, `Send` data so it can cross the thread boundary; the
+/// worker runs [`materialize_worktree`] and the main thread then calls
+/// [`AppState::finalize_new_tab`] (or [`AppState::fail_new_tab`]).
+#[derive(Debug, Clone)]
+pub struct WorktreeJob {
+    /// Id of the placeholder ([`TabPhase::Creating`]) tab to finalize.
+    pub tab_id: String,
+    /// Branch the worktree is for.
+    pub branch: String,
+    /// Base branch to create from (when `create_branch`).
+    pub base_branch: String,
+    /// Absolute path where the worktree lives (to create, or to reuse).
+    pub worktree_abs: PathBuf,
+    /// Whether the worker must run `git worktree add` (false = reuse existing).
+    pub needs_create: bool,
+    /// Whether to create the branch before adding the worktree.
+    pub create_branch: bool,
+}
+
+/// Run the slow part of new-tab creation off the UI thread: materialize the
+/// worktree described by `job`. A no-op when the worktree is being reused.
+///
+/// Free function (no `&self`) so a background worker can call it with a cloned
+/// [`GitExecutor`] without borrowing [`AppState`].
+pub fn materialize_worktree(git: &dyn GitExecutor, job: &WorktreeJob) -> Result<()> {
+    if job.needs_create {
+        create_worktree(
+            git,
+            &job.branch,
+            &job.base_branch,
+            &job.worktree_abs,
+            job.create_branch,
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `cmd` acts on the selected tab's live worktree/session and therefore
+/// must be refused while that tab is still in [`TabPhase::Creating`]. Creating a
+/// new tab, switching/closing tabs, and global commands stay allowed.
+fn requires_ready_tab(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::PushBranch { .. }
+            | Command::FinishLocalMerge { .. }
+            | Command::AbandonWorktree { .. }
+            | Command::NewChildTerminal
+            | Command::OpenShell
+            | Command::CloseChildTerminal
+            | Command::SwitchChildTerminal(_)
+            | Command::RestartAgent
+            | Command::RenameAgentTab { .. }
+            | Command::ShowGitStatus
+    )
+}
+
 /// A live Agent Tab: persisted metadata + a live terminal session + the cached
 /// interpreted status from output pattern matching (SPECS §3, §24).
 ///
@@ -53,6 +127,9 @@ pub struct Services<'a> {
 pub struct RuntimeTab {
     /// The persisted tab metadata (serialized verbatim to `state.json`).
     pub meta: TabState,
+    /// Lifecycle phase: `Creating` until the background worker materializes the
+    /// worktree and the agent is spawned, then `Ready`.
+    pub phase: TabPhase,
     /// The live terminal session (one primary + N children). Not persisted.
     pub session: Session,
     /// Cached interpreted status from the latest output classification or hook
@@ -84,6 +161,8 @@ impl RuntimeTab {
     fn from_meta(meta: TabState) -> Self {
         RuntimeTab {
             meta,
+            // Recovered tabs already have a worktree on disk (SPECS §10).
+            phase: TabPhase::Ready,
             session: Session::new(),
             interpreted: None,
             interpreted_at_ms: None,
@@ -316,6 +395,13 @@ impl AppState {
         self.selected_tab.and_then(|i| self.tabs.get(i))
     }
 
+    /// Whether the selected tab's worktree is still being created.
+    fn selected_is_creating(&self) -> bool {
+        self.selected()
+            .map(|t| t.phase == TabPhase::Creating)
+            .unwrap_or(false)
+    }
+
     /// Mutable access to the selected runtime tab, if any.
     pub fn selected_mut(&mut self) -> Option<&mut RuntimeTab> {
         match self.selected_tab {
@@ -508,6 +594,15 @@ impl AppState {
     /// The command reducer (SPECS §22). Calls the services through the trait
     /// objects and returns an [`Effect`] describing what the UI should surface.
     pub fn dispatch(&mut self, cmd: Command, services: &Services) -> Result<Effect> {
+        // Commands that act on the selected tab's live worktree/session are
+        // refused while that tab's worktree is still being created on a
+        // background worker (SPECS §16/§17). Closing/switching stays allowed so
+        // the user can always cancel — important if creation itself hangs.
+        if self.selected_is_creating() && requires_ready_tab(&cmd) {
+            return Ok(Effect::Refused(
+                "This tab is still being created — please wait.".to_string(),
+            ));
+        }
         match cmd {
             Command::NewAgentTab { name, agent_key } => {
                 self.cmd_new_agent_tab(&name, agent_key.as_deref(), services)
@@ -529,15 +624,40 @@ impl AppState {
         }
     }
 
-    /// NEW-TAB FLOW (SPECS §4, §16, §17). Validation precedes ALL git mutation
-    /// (SPECS §16): if the agent command is missing we fail before creating any
-    /// branch/worktree/process.
+    /// NEW-TAB FLOW (SPECS §4, §16, §17), synchronous all-in-one used by the
+    /// command dispatcher and tests. Validation precedes ALL git mutation
+    /// (SPECS §16). The interactive event loop instead drives the async pair
+    /// [`AppState::begin_new_agent_tab`] + [`AppState::finalize_new_tab`] (with
+    /// [`materialize_worktree`] on a background worker) so the UI never blocks
+    /// on `git worktree add`.
     fn cmd_new_agent_tab(
         &mut self,
         name: &str,
         agent_key: Option<&str>,
         services: &Services,
     ) -> Result<Effect> {
+        let job = self.begin_new_agent_tab(name, agent_key, services)?;
+        match materialize_worktree(services.git, &job) {
+            Ok(()) => self.finalize_new_tab(&job.tab_id, services),
+            Err(e) => {
+                self.fail_new_tab(&job.tab_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Begin the new-tab flow: validate, plan, and reserve a placeholder
+    /// ([`TabPhase::Creating`]) tab, returning the [`WorktreeJob`] the caller
+    /// must run. Performs only cheap, lock-free git reads — never the slow
+    /// `git worktree add` — so it is safe to call on the UI thread (SPECS §16:
+    /// validation precedes mutation; the placeholder is pushed only after the
+    /// agent command validates).
+    pub fn begin_new_agent_tab(
+        &mut self,
+        name: &str,
+        agent_key: Option<&str>,
+        services: &Services,
+    ) -> Result<WorktreeJob> {
         // (a) look up the agent in the registry.
         let key = agent_key
             .map(|k| k.to_string())
@@ -571,21 +691,12 @@ impl AppState {
         let worktrees_root_abs = to_absolute(&self.repo_root, Path::new(&worktrees_root_rel));
         let plan = plan_worktree(services.git, &branch, &target, &worktrees_root_abs)?;
 
-        // (f) materialize the worktree as planned.
-        let worktree_abs = match plan {
-            WorktreePlan::Create => {
-                // Create the branch from base only when it does not already exist.
-                let create_branch = matches!(decision, BranchDecision::Create);
-                create_worktree(
-                    services.git,
-                    &branch,
-                    &self.base_branch,
-                    &target,
-                    create_branch,
-                )?;
-                target.clone()
-            }
-            WorktreePlan::ReuseManaged { path } => path,
+        // (f) resolve the worktree location + whether the worker must create it.
+        //     The slow `git worktree add` is deferred to `materialize_worktree`.
+        let (worktree_abs, needs_create, create_branch) = match plan {
+            // Create the branch from base only when it does not already exist.
+            WorktreePlan::Create => (target, true, matches!(decision, BranchDecision::Create)),
+            WorktreePlan::ReuseManaged { path } => (path, false, false),
             WorktreePlan::RefuseCheckedOutElsewhere { path } => {
                 return Err(FlightDeckError::Refused(format!(
                     "branch '{branch}' is already checked out at {}",
@@ -594,19 +705,8 @@ impl AppState {
             }
         };
 
-        // (g) spawn the primary terminal (NO initial prompt, SPECS §17).
-        let launch = build_launch(&agent, &worktree_abs);
-        let status_file = agent_status_file(&worktree_abs);
-        let mut session = Session::new();
-        session.spawn_primary(
-            services.pty,
-            &launch.command,
-            &launch.args,
-            &launch.cwd,
-            self.pty_size,
-        )?;
-
-        // (h) record the new TabState.
+        // (g) record the placeholder TabState. The base SHA is a cheap, lock-free
+        //     read so we resolve it now; the session is spawned in `finalize`.
         let base_commit_sha = services.git.rev_parse(&self.base_branch)?;
         let worktree_rel = to_relative(&self.repo_root, &worktree_abs)
             .unwrap_or_else(|_| worktree_abs.clone())
@@ -615,7 +715,7 @@ impl AppState {
         let created_at = services.clock.now_iso8601();
         let id = format!("{slug}-{created_at}");
         let meta = TabState {
-            id,
+            id: id.clone(),
             name: name.to_string(),
             slug,
             agent: key,
@@ -631,24 +731,83 @@ impl AppState {
         };
         self.tabs.push(RuntimeTab {
             meta,
-            session,
-            interpreted: Some(InterpretedStatus::Starting),
+            phase: TabPhase::Creating,
+            session: Session::new(),
+            interpreted: None,
             interpreted_at_ms: None,
             last_activity_ms: None,
-            status_file: Some(status_file),
+            status_file: None,
             status_file_seen: None,
             notify_armed: false,
         });
-        // Focus the new tab.
+        // Focus the new (placeholder) tab so the user sees the progress.
         self.selected_tab = Some(self.tabs.len() - 1);
 
-        // (i) persist.
+        Ok(WorktreeJob {
+            tab_id: id,
+            branch,
+            base_branch: self.base_branch.clone(),
+            worktree_abs,
+            needs_create,
+            create_branch,
+        })
+    }
+
+    /// Finalize a placeholder tab once its worktree has been materialized: spawn
+    /// the primary agent (NO initial prompt, SPECS §17), flip the tab to
+    /// [`TabPhase::Ready`], and persist. Returns [`Effect::None`] if the
+    /// placeholder is gone (e.g. the user closed it while it was creating).
+    pub fn finalize_new_tab(&mut self, tab_id: &str, services: &Services) -> Result<Effect> {
+        let Some(idx) = self.tabs.iter().position(|t| t.meta.id == tab_id) else {
+            return Ok(Effect::None);
+        };
+
+        // Re-resolve everything the spawn needs from the recorded metadata.
+        let agent_key = self.tabs[idx].meta.agent.clone();
+        let agent = self
+            .registry
+            .get(&agent_key)
+            .cloned()
+            .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
+        let worktree_abs = to_absolute(
+            &self.repo_root,
+            Path::new(&self.tabs[idx].meta.worktree_path_relative),
+        );
+        let branch = self.tabs[idx].meta.branch.clone();
+        let attached = self.tabs[idx].meta.attached_existing_branch;
+
+        // Spawn the primary terminal (fast fork+exec; stays on the UI thread).
+        let launch = build_launch(&agent, &worktree_abs);
+        let mut session = Session::new();
+        session.spawn_primary(
+            services.pty,
+            &launch.command,
+            &launch.args,
+            &launch.cwd,
+            self.pty_size,
+        )?;
+
+        let tab = &mut self.tabs[idx];
+        tab.session = session;
+        tab.phase = TabPhase::Ready;
+        tab.interpreted = Some(InterpretedStatus::Starting);
+        tab.status_file = Some(agent_status_file(&worktree_abs));
+
         self.persist(services)?;
 
         if attached {
             Ok(Effect::AttachedExisting { branch })
         } else {
             Ok(Effect::Message(format!("Created Agent Tab on {branch}")))
+        }
+    }
+
+    /// Remove a placeholder tab whose worktree creation failed, restoring a
+    /// sensible selection. The error itself is surfaced by the caller.
+    pub fn fail_new_tab(&mut self, tab_id: &str) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.meta.id == tab_id) {
+            self.tabs.remove(idx);
+            self.fix_selection_after_removal(idx);
         }
     }
 
@@ -1219,6 +1378,103 @@ mod tests {
         assert!(git.added_worktrees().is_empty());
         assert!(pty.spawns().is_empty());
         assert!(app.tabs.is_empty());
+    }
+
+    // --- §16/§17: async new-tab flow (begin → materialize → finalize) -----
+
+    #[test]
+    fn begin_new_agent_tab_reserves_placeholder_without_spawning() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab("Fix Login Bug", None, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        // A placeholder tab exists and is focused, in the Creating phase.
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.selected_tab, Some(0));
+        assert_eq!(app.tabs[0].phase, TabPhase::Creating);
+        assert_eq!(job.tab_id, app.tabs[0].meta.id);
+        assert!(job.needs_create);
+        // Nothing slow happened yet: no worktree add, no spawn, no persist.
+        assert!(git.added_worktrees().is_empty());
+        assert!(pty.spawns().is_empty());
+        assert!(fs.file_contents(Path::new(STATE)).is_none());
+
+        // The worker runs the slow step, then finalize spawns + flips to Ready.
+        materialize_worktree(&git, &job).unwrap();
+        let effect = app
+            .finalize_new_tab(&job.tab_id, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert!(matches!(effect, Effect::Message(_)));
+        assert_eq!(app.tabs[0].phase, TabPhase::Ready);
+        assert_eq!(git.added_worktrees().len(), 1);
+        assert_eq!(pty.spawns().len(), 1);
+        assert!(app.tabs[0].status_file.is_some());
+        // Persisted only on finalize.
+        assert!(fs
+            .file_contents(Path::new(STATE))
+            .expect("state.json written")
+            .contains("flightdeck/fix-login-bug"));
+    }
+
+    #[test]
+    fn fail_new_tab_removes_the_placeholder() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab("Some Task", None, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert_eq!(app.tabs.len(), 1);
+
+        app.fail_new_tab(&job.tab_id);
+        assert!(app.tabs.is_empty());
+        assert_eq!(app.selected_tab, None);
+    }
+
+    #[test]
+    fn destructive_commands_refused_while_tab_is_creating() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab("WIP", None, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert_eq!(app.tabs[0].phase, TabPhase::Creating);
+
+        let effect = app
+            .dispatch(
+                Command::PushBranch { confirm: None },
+                &services(&git, &fs, &pty, &clock),
+            )
+            .unwrap();
+        assert!(matches!(effect, Effect::Refused(_)));
+        // The refusal short-circuits before any push attempt.
+        assert!(git.pushes().is_empty());
     }
 
     // --- §26 / §11: attach to existing branch, surfaced ------------------
