@@ -883,7 +883,7 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 
 /// Draw the mode status bar (SPECS §23).
 ///
-/// Terminal mode: `MODE: TERMINAL | Esc: app commands | Ctrl-g: command palette`
+/// Terminal mode: `MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: command palette`
 /// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(state.mode());
@@ -906,7 +906,7 @@ pub fn status_bar_text(mode: InputMode) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Alt+Esc", Style::default().fg(Color::Yellow)),
             Span::raw(": app commands | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
             Span::raw(": command palette"),
@@ -1167,7 +1167,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Esc", "Leave terminal focus / focus app"),
+        shortcut_line("  Alt+Esc", "Leave terminal focus / focus app"),
         shortcut_line("  Enter", "Focus active terminal"),
         Line::raw(""),
         Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
