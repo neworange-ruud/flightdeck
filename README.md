@@ -292,10 +292,10 @@ Repository setup required for Homebrew publishing:
 Release binaries are signed in CI with an Apple Developer ID Application
 certificate (`macos-sign = true` in `dist-workspace.toml`) and built with the
 **hardened runtime** enabled. The hardened runtime is turned on via
-`.github/workflows/build-setup.yml`, which exports `CODESIGN_OPTIONS=runtime`
+`.github/workflows/build-setup.steps`, which exports `CODESIGN_OPTIONS=runtime`
 before `dist build` (cargo-dist has no dedicated config key for it). That file
 is injected into the build job through the `github-build-setup` key, so
-`dist generate --check` stays green — edit `build-setup.yml` rather than
+`dist generate --check` stays green — edit `build-setup.steps` rather than
 `release.yml` directly, then re-run `dist generate`.
 
 Required repository secrets (a missing one silently disables signing):

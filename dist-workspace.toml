@@ -26,6 +26,6 @@ install-updater = false
 # Requires CODESIGN_CERTIFICATE, CODESIGN_CERTIFICATE_PASSWORD, and
 # CODESIGN_IDENTITY secrets in CI. (Signing only; cargo-dist does not notarize.)
 macos-sign = true
-# Custom build-job steps (relative to .github/workflows/). build-setup.yml sets
+# Custom build-job steps (relative to .github/workflows/). build-setup.steps sets
 # CODESIGN_OPTIONS=runtime so the macOS signer enables the hardened runtime.
-github-build-setup = "build-setup.yml"
+github-build-setup = "build-setup.steps"

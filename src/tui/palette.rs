@@ -14,6 +14,8 @@ use crate::app::commands::{Command, Selector};
 /// A single entry in the command palette (SPECS §22).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteEntry {
+    /// High-level command group shown in the palette.
+    pub group: &'static str,
     /// Short human-readable label (the exact string the user sees and filters on).
     pub label: &'static str,
     /// The action this entry maps to.
@@ -39,82 +41,105 @@ pub enum PaletteAction {
 /// All §22 command-palette entries, in display order.
 const ALL_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
+        group: "Agent Tabs",
         label: "New Agent Tab",
         action: PaletteAction::NewAgentTab,
     },
     PaletteEntry {
+        group: "Agent Tabs",
         label: "Rename Agent Tab",
         action: PaletteAction::RenameAgentTab,
     },
     PaletteEntry {
+        group: "Agent Tabs",
         label: "Close Agent Tab",
         action: PaletteAction::CloseAgentTab,
     },
     PaletteEntry {
-        label: "Push Branch",
-        action: PaletteAction::Dispatch(Command::PushBranch { confirm: None }),
-    },
-    PaletteEntry {
-        label: "Finish / Local Merge",
-        action: PaletteAction::Dispatch(Command::FinishLocalMerge { confirm: false }),
-    },
-    PaletteEntry {
-        label: "Rebase Worktree",
-        action: PaletteAction::Dispatch(Command::RebaseWorktree { confirm: false }),
-    },
-    PaletteEntry {
-        label: "Abandon Worktree",
-        action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
-    },
-    PaletteEntry {
-        label: "New Child Terminal",
-        action: PaletteAction::Dispatch(Command::NewChildTerminal),
-    },
-    PaletteEntry {
-        label: "Close Child Terminal",
-        action: PaletteAction::Dispatch(Command::CloseChildTerminal),
-    },
-    PaletteEntry {
+        group: "Agent Tabs",
         label: "Switch Agent Tab",
         action: PaletteAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
     },
     PaletteEntry {
-        label: "Switch Child Terminal",
-        action: PaletteAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)),
-    },
-    PaletteEntry {
-        label: "Set Manual Status",
-        action: PaletteAction::SetManualStatus,
-    },
-    PaletteEntry {
+        group: "Agent Tabs",
         label: "Restart Agent",
         action: PaletteAction::Dispatch(Command::RestartAgent),
     },
     PaletteEntry {
-        label: "Open Shell",
-        action: PaletteAction::Dispatch(Command::OpenShell),
+        group: "Worktree",
+        label: "Copy .env(.local)",
+        action: PaletteAction::Dispatch(Command::CopyEnvFile),
     },
     PaletteEntry {
+        group: "Worktree",
+        label: "Rebase Worktree",
+        action: PaletteAction::Dispatch(Command::RebaseWorktree { confirm: false }),
+    },
+    PaletteEntry {
+        group: "Worktree",
+        label: "Abandon Worktree",
+        action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
+    },
+    PaletteEntry {
+        group: "Git",
+        label: "Push Branch",
+        action: PaletteAction::Dispatch(Command::PushBranch { confirm: None }),
+    },
+    PaletteEntry {
+        group: "Git",
+        label: "Finish / Local Merge",
+        action: PaletteAction::Dispatch(Command::FinishLocalMerge { confirm: false }),
+    },
+    PaletteEntry {
+        group: "Git",
         label: "Show Git Status",
         action: PaletteAction::Dispatch(Command::ShowGitStatus),
     },
     PaletteEntry {
+        group: "Terminals",
+        label: "New Child Terminal",
+        action: PaletteAction::Dispatch(Command::NewChildTerminal),
+    },
+    PaletteEntry {
+        group: "Terminals",
+        label: "Close Child Terminal",
+        action: PaletteAction::Dispatch(Command::CloseChildTerminal),
+    },
+    PaletteEntry {
+        group: "Terminals",
+        label: "Switch Child Terminal",
+        action: PaletteAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)),
+    },
+    PaletteEntry {
+        group: "Terminals",
+        label: "Open Shell",
+        action: PaletteAction::Dispatch(Command::OpenShell),
+    },
+    PaletteEntry {
+        group: "Status",
+        label: "Set Manual Status",
+        action: PaletteAction::SetManualStatus,
+    },
+    PaletteEntry {
+        group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
     },
     PaletteEntry {
+        group: "View",
         label: "Show Help",
         action: PaletteAction::Dispatch(Command::ShowHelp),
     },
     PaletteEntry {
+        group: "Global",
         label: "Quit",
         action: PaletteAction::Dispatch(Command::Quit),
     },
 ];
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
-/// View" view command.
-pub const REQUIRED_ACTION_COUNT: usize = 18;
+/// View", "Rebase Worktree", and "Copy .env(.local)" commands.
+pub const REQUIRED_ACTION_COUNT: usize = 19;
 
 /// The command palette model (SPECS §22).
 ///
@@ -227,6 +252,7 @@ mod tests {
             "New Agent Tab",
             "Rename Agent Tab",
             "Close Agent Tab",
+            "Copy .env(.local)",
             "Push Branch",
             "Finish / Local Merge",
             "Rebase Worktree",
@@ -250,6 +276,16 @@ mod tests {
                 "missing required palette action: '{req}'"
             );
         }
+    }
+
+    #[test]
+    fn entries_have_groups() {
+        let copy = ALL_ENTRIES
+            .iter()
+            .find(|e| e.label == "Copy .env(.local)")
+            .expect("copy env action present");
+        assert_eq!(copy.group, "Worktree");
+        assert!(ALL_ENTRIES.iter().all(|e| !e.group.is_empty()));
     }
 
     #[test]
