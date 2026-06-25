@@ -1,3 +1,4 @@
 /target
 .flightdeck/state.json
 .flightdeck/worktrees/
+.reference-developer-agent-container/
