@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
+use crate::app::modes::InputMode;
 use crate::app::state::{materialize_worktree, AppState, Services, TabPhase, WorktreeJob};
 use crate::config::init::initialize;
 use crate::config::load::{load_config, serialize_config};
@@ -45,9 +46,9 @@ use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{draw, hit_test, ChildTarget, GitStatusCache, HitTarget, UiOverlay};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
 
@@ -121,6 +122,13 @@ pub fn run() -> Result<()> {
     // Enable mouse capture so tabs are clickable (best effort).
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
+    // Enable bracketed paste so the host terminal delivers a multi-line paste as
+    // a single `Event::Paste` instead of a stream of key events. Without it, a
+    // paste arrives as line₁ + Enter + line₂ + Enter + …, and the hosted agent
+    // executes the first line and queues the rest as separate prompts. Best
+    // effort; disabled again on teardown.
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+
     // Enable the kitty keyboard protocol's "disambiguate escape codes" mode when
     // the terminal supports it. Without it, terminals report Alt/Option+Esc as a
     // bare Esc — indistinguishable from the agent's own Esc — so Alt+Esc can't be
@@ -171,6 +179,7 @@ pub fn run() -> Result<()> {
     if keyboard_enhanced {
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     let _ = restore_terminal_title();
     ratatui::restore();
@@ -614,6 +623,9 @@ fn event_loop(
                     Err(_) => continue,
                 };
                 handle_mouse(me, area, state, services, &mut ui);
+            }
+            Event::Paste(data) => {
+                handle_paste(data, state, services, &mut ui)?;
             }
             Event::Resize(cols, rows) => {
                 let size = viewport_pty_size(PtySize { rows, cols });
@@ -1104,6 +1116,52 @@ fn handle_key(
         KeyAction::Quit => Ok(true),
         KeyAction::None => Ok(false),
     }
+}
+
+/// Handle an `Event::Paste` — a single atomic paste from the host terminal
+/// (delivered as one event because we enable bracketed paste mode at startup).
+///
+/// A text-editing modal (name prompt, command palette) consumes the paste as
+/// literal characters, replayed as discrete key presses so the existing editing
+/// logic applies — this is exactly what these modals saw before bracketed paste
+/// mode coalesced a paste into one event. Otherwise, only a focused terminal
+/// receives it, forwarded to the PTY via [`paste_text_into_active_pty`].
+fn handle_paste(
+    data: String,
+    state: &mut AppState,
+    services: &Services,
+    ui: &mut Ui,
+) -> Result<()> {
+    if ui.prompt.is_some() || ui.palette.is_some() {
+        for ch in data.chars() {
+            let code = match ch {
+                '\n' | '\r' => KeyCode::Enter,
+                c => KeyCode::Char(c),
+            };
+            handle_key(
+                KeyEvent::new(code, KeyModifiers::empty()),
+                state,
+                services,
+                ui,
+            )?;
+            // Stop if the modal closed mid-paste (e.g. a newline submitted it).
+            if ui.prompt.is_none() && ui.palette.is_none() {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    // Any other overlay swallows input the way a key press would; ignore it.
+    if !matches!(ui.overlay, UiOverlay::None) || ui.modal_active() {
+        return Ok(());
+    }
+
+    // Only a focused terminal receives pasted text; in App mode it is a no-op.
+    if state.mode() == InputMode::Terminal {
+        paste_text_into_active_pty(state, &data);
+    }
+    Ok(())
 }
 
 /// Dispatch a [`Command`], translating the returned [`Effect`] into UI state.
@@ -1692,6 +1750,42 @@ fn paste_into_active_pty(state: &mut AppState) {
     }
 }
 
+/// Forward externally-pasted text (one bracketed paste from the host terminal)
+/// to the active PTY.
+///
+/// When the hosted application has enabled bracketed paste mode (DECSET 2004) —
+/// as Claude Code, OpenCode, and modern shells do — the text is wrapped in the
+/// `ESC [200~` / `ESC [201~` guards so the app treats it as one atomic paste
+/// instead of executing each line. Apps that have *not* enabled the mode receive
+/// the raw text, matching how a real terminal emulator forwards a paste. Either
+/// way, newlines are normalised to carriage returns, the line break a terminal
+/// delivers for Enter.
+fn paste_text_into_active_pty(state: &mut AppState, text: &str) {
+    let wants_bracket = state
+        .selected()
+        .and_then(|tab| tab.session.active())
+        .is_some_and(|term| term.bracketed_paste());
+    let bytes = encode_paste(text, wants_bracket);
+    write_active_pty(state, &bytes);
+}
+
+/// Encode pasted text for the PTY: normalise newlines to carriage returns (the
+/// line break a terminal sends for Enter) and, when `bracketed` is set, wrap the
+/// payload in the `ESC [200~` / `ESC [201~` guards so a bracketed-paste-aware
+/// app treats it as one atomic insert rather than executing line by line.
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let mut bytes = Vec::with_capacity(normalized.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        normalized.into_bytes()
+    }
+}
+
 /// Resize every live PTY session and its VT parser to the new viewport size
 /// (SPECS §23 resize).
 fn resize_sessions(state: &mut AppState, size: PtySize) {
@@ -2038,6 +2132,31 @@ mod tests {
         assert!(!ui.should_quit);
         apply_effect_no_state(Effect::Quit, &mut ui);
         assert!(ui.should_quit);
+    }
+
+    // --- bracketed paste encoding -----------------------------------------
+
+    #[test]
+    fn encode_paste_wraps_when_app_enabled_bracketed_mode() {
+        // A multi-line paste must reach a bracketed-paste-aware agent as one
+        // atomic insert (guarded by ESC[200~/ESC[201~), not line-by-line, so it
+        // does not execute the first line and queue the rest as prompts.
+        let bytes = encode_paste("line one\nline two", true);
+        assert_eq!(bytes, b"\x1b[200~line one\rline two\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn encode_paste_passes_raw_when_app_disabled_bracketed_mode() {
+        // Without bracketed paste mode the app gets the raw text, exactly as a
+        // real terminal forwards a paste — no guards inserted.
+        let bytes = encode_paste("line one\nline two", false);
+        assert_eq!(bytes, b"line one\rline two".to_vec());
+    }
+
+    #[test]
+    fn encode_paste_normalises_crlf_and_lf_to_cr() {
+        // Both CRLF (Windows clipboard) and bare LF collapse to a single CR.
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
     }
 
     #[test]

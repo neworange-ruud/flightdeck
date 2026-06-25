@@ -74,6 +74,15 @@ impl Terminal {
         self.parser.screen().mouse_protocol_encoding()
     }
 
+    /// Whether the hosted application has enabled bracketed paste mode (DECSET
+    /// 2004). When true, pasted text should be wrapped in the `ESC [200~` /
+    /// `ESC [201~` guards so the app (e.g. Claude Code, OpenCode, a shell)
+    /// treats a multi-line paste as one atomic insert instead of executing each
+    /// line as it arrives.
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
     /// Scroll the viewport `lines` rows up into the VT100 scrollback. Used for
     /// plain (non-mouse-aware) output; clamped to the available scrollback.
     pub fn scroll_up(&mut self, lines: usize) {
