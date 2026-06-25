@@ -1,0 +1,8 @@
+# Custom build-job steps injected by cargo-dist via `github-build-setup`.
+# Runs in build-local-artifacts before `dist build`, so the exported env var is
+# visible to the signing step.
+- name: Enable macOS hardened runtime for codesign
+  if: runner.os == 'macOS'
+  # cargo-dist passes CODESIGN_OPTIONS verbatim to `codesign --options`, so
+  # `runtime` enables the hardened runtime on the Developer ID signature.
+  run: echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
