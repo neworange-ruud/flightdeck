@@ -22,3 +22,7 @@ tap = "neworange-ruud/homebrew-tap"
 formula = "flightdeck"
 # Whether to install an updater program
 install-updater = false
+# Code-sign macOS binaries with an Apple Developer ID certificate.
+# Requires CODESIGN_CERTIFICATE, CODESIGN_CERTIFICATE_PASSWORD, and
+# CODESIGN_IDENTITY secrets in CI. (Signing only; cargo-dist does not notarize.)
+macos-sign = true
