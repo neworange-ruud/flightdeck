@@ -47,7 +47,8 @@ pub enum KeyAction {
 /// Map a key event to a [`KeyAction`] based on the current input mode (SPECS §23).
 ///
 /// In [`InputMode::Terminal`] most keys produce `Passthrough`; the global
-/// shortcuts (`Ctrl-g`, `Esc`, `Ctrl-q`) are intercepted first.
+/// shortcuts (`Ctrl-g`, `Ctrl-q`) and `Alt+Esc` (leave terminal focus) are
+/// intercepted first. Bare `Esc` passes through to the PTY.
 ///
 /// In [`InputMode::App`] all keys are interpreted as FlightDeck commands.
 pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
@@ -66,8 +67,12 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     if let Some(global) = map_global(key) {
         return global;
     }
-    // Esc: leave terminal focus (SPECS §23 "Leave terminal input focus").
-    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+    // Alt+Esc: leave terminal focus (SPECS §23 "Leave terminal input focus").
+    // Bare Esc (and double-Esc) must pass through to the PTY so hosted agents
+    // like Claude Code / OpenCode can use it — e.g. their 2×Esc "abort prompt"
+    // gesture, vim/readline cancel, fzf dismiss, etc. We therefore require Alt
+    // to leave terminal focus rather than swallowing every Esc.
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::ALT {
         return KeyAction::FocusApp;
     }
     // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
@@ -568,11 +573,21 @@ mod tests {
     // --- Terminal mode passthrough ----------------------------------------
 
     #[test]
-    fn terminal_mode_esc_focuses_app() {
-        // Esc leaves terminal focus → app-command mode (SPECS §23).
+    fn terminal_mode_alt_esc_focuses_app() {
+        // Alt+Esc leaves terminal focus → app-command mode (SPECS §23).
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Esc)),
+            KeyAction::FocusApp
+        );
+    }
+
+    #[test]
+    fn terminal_mode_bare_esc_passes_through() {
+        // Bare Esc must reach the PTY so hosted agents can use it (e.g. Claude
+        // Code / OpenCode 2×Esc abort). Only Alt+Esc leaves terminal focus.
         assert_eq!(
             map_key(InputMode::Terminal, key(KeyCode::Esc)),
-            KeyAction::FocusApp
+            KeyAction::Passthrough(vec![0x1b])
         );
     }
 

@@ -46,7 +46,8 @@ use crate::tui::render::{draw, hit_test, ChildTarget, GitStatusCache, HitTarget,
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
 
@@ -120,6 +121,23 @@ pub fn run() -> Result<()> {
     // Enable mouse capture so tabs are clickable (best effort).
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
+    // Enable the kitty keyboard protocol's "disambiguate escape codes" mode when
+    // the terminal supports it. Without it, terminals report Alt/Option+Esc as a
+    // bare Esc — indistinguishable from the agent's own Esc — so Alt+Esc can't be
+    // used to leave terminal focus, and Alt-navigation shortcuts are unreliable.
+    // With it, modified keys carry their real modifiers. Best effort; popped on
+    // teardown only if we pushed it.
+    let keyboard_enhanced = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+
     // Take ownership of the terminal title so it stays a stable
     // "flightdeck — <project>" while we run, instead of inheriting (and
     // flickering with) whatever title the parent tooling keeps rewriting. The
@@ -150,6 +168,9 @@ pub fn run() -> Result<()> {
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
     // every session so no orphaned child processes remain. Persist on the way
     // out (best effort) regardless of how the loop ended.
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     let _ = restore_terminal_title();
     ratatui::restore();
