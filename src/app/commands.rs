@@ -128,6 +128,8 @@ pub enum Command {
         /// Whether the user explicitly confirmed the rebase.
         confirm: bool,
     },
+    /// Copy `.env.local` or `.env` from the base folder into the selected worktree.
+    CopyEnvFile,
     /// Abandon (remove) the selected tab's worktree (SPECS §5/§15). With
     /// `confirm` false, a dirty worktree returns [`Effect::AbandonWarning`]
     /// instead of removing; with `confirm` true the worktree is force-removed

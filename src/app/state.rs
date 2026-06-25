@@ -110,6 +110,7 @@ fn requires_ready_tab(cmd: &Command) -> bool {
         Command::PushBranch { .. }
             | Command::FinishLocalMerge { .. }
             | Command::RebaseWorktree { .. }
+            | Command::CopyEnvFile
             | Command::AbandonWorktree { .. }
             | Command::NewChildTerminal
             | Command::OpenShell
@@ -624,6 +625,7 @@ impl AppState {
             Command::PushBranch { confirm } => self.cmd_push(confirm, services),
             Command::FinishLocalMerge { confirm } => self.cmd_finish_merge(confirm, services),
             Command::RebaseWorktree { confirm } => self.cmd_rebase(confirm, services),
+            Command::CopyEnvFile => self.cmd_copy_env_file(services),
             Command::AbandonWorktree { confirm } => self.cmd_abandon(confirm, services),
             Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(services),
             Command::CloseChildTerminal => self.cmd_close_child(),
@@ -1090,6 +1092,28 @@ impl AppState {
         }
     }
 
+    /// Copy the first available base env file into the selected worktree.
+    fn cmd_copy_env_file(&mut self, services: &Services) -> Result<Effect> {
+        let Some(tab) = self.selected() else {
+            return Err(FlightDeckError::Other("no tab selected".to_string()));
+        };
+        let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let Some(name) = [".env.local", ".env"]
+            .into_iter()
+            .find(|name| services.fs.exists(&self.repo_root.join(name)))
+        else {
+            return Ok(Effect::Refused(
+                "No .env.local or .env found in base folder.".to_string(),
+            ));
+        };
+
+        let source = self.repo_root.join(name);
+        let destination = worktree.join(name);
+        let contents = services.fs.read_to_string(&source)?;
+        services.fs.write(&destination, &contents)?;
+        Ok(Effect::Message(format!("Copied {name} to worktree.")))
+    }
+
     /// New child shell terminal in the selected tab's worktree (SPECS §19).
     fn cmd_new_child(&mut self, services: &Services) -> Result<Effect> {
         let size = self.pty_size;
@@ -1552,6 +1576,108 @@ mod tests {
         assert!(matches!(effect, Effect::Refused(_)));
         // The refusal short-circuits before any push attempt.
         assert!(git.pushes().is_empty());
+    }
+
+    #[test]
+    fn copy_env_file_prefers_env_local() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new()
+            .with_file("/repo/.env", "BASE=1\n")
+            .with_file("/repo/.env.local", "LOCAL=1\n");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Fix Login Bug".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        let effect = app.dispatch(Command::CopyEnvFile, &svc).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::Message("Copied .env.local to worktree.".to_string())
+        );
+        assert_eq!(
+            fs.file_contents(Path::new(
+                "/repo/.flightdeck/worktrees/fix-login-bug/.env.local"
+            )),
+            Some("LOCAL=1\n".to_string())
+        );
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_env_file_falls_back_to_env_and_refuses_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new().with_file("/repo/.env", "BASE=1\n");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config.clone());
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Fix Login Bug".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        let effect = app.dispatch(Command::CopyEnvFile, &svc).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::Message("Copied .env to worktree.".to_string())
+        );
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            Some("BASE=1\n".to_string())
+        );
+
+        let empty_fs = FakeFs::new();
+        let empty_pty = FakePty::new();
+        empty_pty.queue_session();
+        let empty_svc = services(&git, &empty_fs, &empty_pty, &clock);
+        let mut empty_app = fresh_state(config);
+        empty_app
+            .dispatch(
+                Command::NewAgentTab {
+                    name: "No Env".to_string(),
+                    agent_key: None,
+                },
+                &empty_svc,
+            )
+            .unwrap();
+
+        let effect = empty_app
+            .dispatch(Command::CopyEnvFile, &empty_svc)
+            .unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::Refused("No .env.local or .env found in base folder.".to_string())
+        );
     }
 
     // --- §26 / §11: attach to existing branch, surfaced ------------------

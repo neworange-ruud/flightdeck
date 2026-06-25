@@ -1051,7 +1051,7 @@ pub fn draw_git_status_overlay(
 
 /// Draw the command palette as a centered overlay (SPECS §22).
 pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: Rect) {
-    let overlay_area = layout::centered_overlay(area, 60, 20);
+    let overlay_area = layout::centered_overlay(area, 60, 32);
     frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
@@ -1080,26 +1080,34 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     // Filtered list.
     let filtered = palette.filtered();
     let selected_idx = palette.selected_index();
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            if i == selected_idx {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )))
-            } else {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default().fg(Color::White),
-                )))
-            }
-        })
-        .collect();
+    let mut last_group: Option<&str> = None;
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, entry) in filtered.iter().enumerate() {
+        if last_group != Some(entry.group) {
+            last_group = Some(entry.group);
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  {}", entry.group),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))));
+        }
+
+        items.push(if i == selected_idx {
+            ListItem::new(Line::from(Span::styled(
+                format!("  {} ", entry.label),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )))
+        } else {
+            ListItem::new(Line::from(Span::styled(
+                format!("  {} ", entry.label),
+                Style::default().fg(Color::White),
+            )))
+        });
+    }
 
     if items.is_empty() {
         frame.render_widget(
