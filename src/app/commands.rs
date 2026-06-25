@@ -120,6 +120,14 @@ pub enum Command {
         /// Whether the user explicitly confirmed the merge (SPECS §15).
         confirm: bool,
     },
+    /// Rebase the selected tab's worktree onto its base branch (SPECS §5
+    /// carve-out). With `confirm` false the first dispatch checks preconditions
+    /// and returns [`Effect::RebaseConfirm`]; the UI confirms and re-dispatches
+    /// with `confirm: true`. Aborts (leaving the worktree untouched) on conflict.
+    RebaseWorktree {
+        /// Whether the user explicitly confirmed the rebase.
+        confirm: bool,
+    },
     /// Abandon (remove) the selected tab's worktree (SPECS §5/§15). With
     /// `confirm` false, a dirty worktree returns [`Effect::AbandonWarning`]
     /// instead of removing; with `confirm` true the worktree is force-removed
@@ -188,6 +196,21 @@ pub enum Effect {
         base_branch: String,
         /// Whether the selected tab's primary agent is still running (it will be
         /// stopped as part of the post-merge cleanup).
+        primary_running: bool,
+    },
+    /// A rebase is ready and awaits explicit confirmation; the UI confirms then
+    /// re-dispatches `RebaseWorktree { confirm: true }` (SPECS §5 carve-out).
+    /// Rewrites the worktree branch's history, so it is always confirmed first.
+    RebaseConfirm {
+        /// The agent branch being rebased.
+        agent_branch: String,
+        /// The base branch it is rebased onto.
+        base_branch: String,
+        /// How many commits the base has moved since this tab was created
+        /// (SPECS §12 drift) — shown so the user knows what they are pulling in.
+        drift: u32,
+        /// Whether the primary agent is still running in the worktree. A rebase
+        /// rewrites its HEAD underneath it, so the user is warned.
         primary_running: bool,
     },
     /// The branch already existed and was attached to (surfaced, never silent, §11).

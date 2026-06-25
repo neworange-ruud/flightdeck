@@ -24,7 +24,8 @@ use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
 use crate::git::remote::{github_pr_url, plan_push, push_branch, PushPlan};
 use crate::git::status::{
-    check_merge_preconditions, collect_status, merge_back, MergeDecision, MergeRequest,
+    base_drift, check_merge_preconditions, check_rebase_preconditions, collect_status, merge_back,
+    rebase_onto_base, MergeDecision, MergeRequest, RebaseDecision, RebaseRequest,
 };
 use crate::git::worktree::{create_worktree, plan_worktree, remove_worktree_if_safe, WorktreePlan};
 use crate::persistence::project_state::save_state;
@@ -108,6 +109,7 @@ fn requires_ready_tab(cmd: &Command) -> bool {
         cmd,
         Command::PushBranch { .. }
             | Command::FinishLocalMerge { .. }
+            | Command::RebaseWorktree { .. }
             | Command::AbandonWorktree { .. }
             | Command::NewChildTerminal
             | Command::OpenShell
@@ -621,6 +623,7 @@ impl AppState {
             Command::CloseAgentTab { action } => self.cmd_close_tab(action, services),
             Command::PushBranch { confirm } => self.cmd_push(confirm, services),
             Command::FinishLocalMerge { confirm } => self.cmd_finish_merge(confirm, services),
+            Command::RebaseWorktree { confirm } => self.cmd_rebase(confirm, services),
             Command::AbandonWorktree { confirm } => self.cmd_abandon(confirm, services),
             Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(services),
             Command::CloseChildTerminal => self.cmd_close_child(),
@@ -993,6 +996,65 @@ impl AppState {
                 )))
             }
         }
+    }
+
+    /// Rebase Worktree onto the base branch (SPECS §5 carve-out). Checks
+    /// preconditions, requires explicit confirmation, then rebases; aborts and
+    /// reports on conflict, never resolving them. On success the worktree branch
+    /// sits on top of the current base, so the stored base SHA is advanced to the
+    /// base tip — drift (SPECS §12) then reflects that the base has been
+    /// incorporated. The worktree branch's history is rewritten, so a previously
+    /// pushed branch will need a force-push to update the remote / PR.
+    fn cmd_rebase(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
+        let Some(idx) = self.selected_tab else {
+            return Err(FlightDeckError::Other("no tab selected".to_string()));
+        };
+        let tab = &self.tabs[idx];
+        let agent_branch = tab.meta.branch.clone();
+        let base_branch = tab.meta.base_branch.clone();
+        let base_commit_sha = tab.meta.base_commit_sha.clone();
+        let agent_worktree =
+            to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let primary_running = tab.session.primary_state() == ProcessState::Running;
+
+        let req = RebaseRequest {
+            base_branch: &base_branch,
+            agent_branch: &agent_branch,
+            agent_worktree: &agent_worktree,
+        };
+
+        // Technical preconditions (agent worktree clean, both branches exist).
+        match check_rebase_preconditions(services.git, &req)? {
+            RebaseDecision::Refused(reason) => return Ok(Effect::Refused(reason)),
+            RebaseDecision::Allowed => {}
+        }
+
+        // History rewrite — always confirm first. The UI re-dispatches with
+        // `confirm: true`.
+        if !confirm {
+            let drift = base_drift(services.git, &base_branch, &base_commit_sha).unwrap_or(0);
+            return Ok(Effect::RebaseConfirm {
+                agent_branch,
+                base_branch,
+                drift,
+                primary_running,
+            });
+        }
+
+        let outcome = rebase_onto_base(services.git, &req)?;
+        if outcome.conflicted || !outcome.rebased {
+            return Ok(Effect::Refused(outcome.message));
+        }
+
+        // Rebase landed: the branch now sits on the current base, so advance the
+        // stored base SHA (best effort) and persist so §12 drift reflects it.
+        if let Ok(sha) = services.git.rev_parse(&base_branch) {
+            self.tabs[idx].meta.base_commit_sha = sha;
+        }
+        self.persist(services)?;
+        Ok(Effect::Message(format!(
+            "Rebased {agent_branch} onto {base_branch}. If the branch was pushed, force-push to update the remote / PR."
+        )))
     }
 
     /// Abandon Worktree (SPECS §5/§15). A clean worktree is removed immediately.
@@ -2216,6 +2278,164 @@ mod tests {
         assert!(git.merges().is_empty());
         assert!(git.removed_worktrees().is_empty());
         assert_eq!(app.tabs.len(), 1);
+    }
+
+    // --- §5 carve-out: Rebase Worktree ----------------------------------
+
+    #[test]
+    fn rebase_without_confirm_asks_for_confirmation() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        handle.set_state(ProcessState::Running);
+
+        // First dispatch (confirm: false) asks rather than rebasing.
+        let effect = app
+            .dispatch(Command::RebaseWorktree { confirm: false }, &svc)
+            .unwrap();
+        match effect {
+            Effect::RebaseConfirm {
+                base_branch,
+                primary_running,
+                ..
+            } => {
+                assert_eq!(base_branch, "main");
+                assert!(primary_running, "running agent reported in the prompt");
+            }
+            other => panic!("expected RebaseConfirm, got {other:?}"),
+        }
+        // Nothing was rebased yet.
+        assert!(git.rebases().is_empty());
+    }
+
+    #[test]
+    fn rebase_on_confirm_rebases_onto_base_and_advances_stored_sha() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        // The base branch has advanced since tab creation.
+        git.set_rev("main", "sha-main-new");
+
+        let effect = app
+            .dispatch(Command::RebaseWorktree { confirm: true }, &svc)
+            .unwrap();
+        match effect {
+            Effect::Message(m) => assert!(m.contains("Rebased"), "got: {m}"),
+            other => panic!("expected Message, got {other:?}"),
+        }
+        // Rebased the agent worktree onto the base branch.
+        let wt = to_absolute(
+            Path::new(REPO),
+            Path::new(&app.tabs[0].meta.worktree_path_relative),
+        );
+        assert_eq!(git.rebases(), vec![("main".to_string(), wt)]);
+        // Stored base SHA advanced to the current base tip so §12 drift resets.
+        assert_eq!(app.tabs[0].meta.base_commit_sha, "sha-main-new");
+    }
+
+    #[test]
+    fn rebase_aborts_and_refuses_on_conflict_without_advancing_sha() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        let sha_before = app.tabs[0].meta.base_commit_sha.clone();
+        git.set_rebase_outcome(crate::contracts::RebaseOutcome {
+            rebased: false,
+            conflicted: true,
+            message: "CONFLICT in file.rs".to_string(),
+        });
+
+        let effect = app
+            .dispatch(Command::RebaseWorktree { confirm: true }, &svc)
+            .unwrap();
+        match effect {
+            Effect::Refused(m) => assert!(m.contains("aborted"), "got: {m}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // The stored base SHA must NOT advance on a conflict.
+        assert_eq!(app.tabs[0].meta.base_commit_sha, sha_before);
+    }
+
+    #[test]
+    fn rebase_refused_when_worktree_dirty() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        let wt = to_absolute(
+            Path::new(REPO),
+            Path::new(&app.tabs[0].meta.worktree_path_relative),
+        );
+        git.set_dirty_at(&wt, true);
+
+        let effect = app
+            .dispatch(Command::RebaseWorktree { confirm: false }, &svc)
+            .unwrap();
+        assert!(matches!(effect, Effect::Refused(_)));
+        assert!(git.rebases().is_empty());
     }
 
     // --- §26: push warning + confirm ------------------------------------

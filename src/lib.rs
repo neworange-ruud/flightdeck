@@ -443,6 +443,14 @@ enum Prompt {
         base_branch: String,
         primary_running: bool,
     },
+    /// Confirm rebasing the worktree onto its base branch; rewrites the branch's
+    /// history and aborts on conflict (SPECS §5 carve-out).
+    RebaseConfirm {
+        agent_branch: String,
+        base_branch: String,
+        drift: u32,
+        primary_running: bool,
+    },
 }
 
 /// An in-progress mouse text selection drag over the terminal viewport (SPECS
@@ -1246,6 +1254,22 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
                 },
             );
         }
+        Effect::RebaseConfirm {
+            agent_branch,
+            base_branch,
+            drift,
+            primary_running,
+        } => {
+            start_prompt(
+                ui,
+                Prompt::RebaseConfirm {
+                    agent_branch,
+                    base_branch,
+                    drift,
+                    primary_running,
+                },
+            );
+        }
         Effect::CloseTabOptions(opts) => {
             start_prompt(
                 ui,
@@ -1343,6 +1367,26 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             };
             format!(
                 "Merge {agent_branch} into {base_branch} then remove the worktree{running}? [y] merge  [n] cancel  (Esc cancel)"
+            )
+        }
+        Prompt::RebaseConfirm {
+            agent_branch,
+            base_branch,
+            drift,
+            primary_running,
+        } => {
+            let moved = match drift {
+                0 => String::new(),
+                1 => " (base moved 1 commit)".to_string(),
+                n => format!(" (base moved {n} commits)"),
+            };
+            let running = if *primary_running {
+                "; agent is running — its HEAD will be rewritten"
+            } else {
+                ""
+            };
+            format!(
+                "Rebase {agent_branch} onto {base_branch}{moved}{running}? Rewrites history; aborts on conflict. [y] rebase  [n] cancel  (Esc cancel)"
             )
         }
     }
@@ -1531,6 +1575,14 @@ fn handle_prompt_key(
             KeyCode::Char('n') => ui.clear(),
             _ => ui.prompt = Some(pstate),
         },
+        Prompt::RebaseConfirm { .. } => match key.code {
+            KeyCode::Char('y') => {
+                let result = state.dispatch(Command::RebaseWorktree { confirm: true }, services);
+                finish_prompt(result, ui);
+            }
+            KeyCode::Char('n') => ui.clear(),
+            _ => ui.prompt = Some(pstate),
+        },
     }
 
     Ok(())
@@ -1570,6 +1622,20 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
             Prompt::MergeConfirm {
                 agent_branch,
                 base_branch,
+                primary_running,
+            },
+        ),
+        Effect::RebaseConfirm {
+            agent_branch,
+            base_branch,
+            drift,
+            primary_running,
+        } => start_prompt(
+            ui,
+            Prompt::RebaseConfirm {
+                agent_branch,
+                base_branch,
+                drift,
                 primary_running,
             },
         ),

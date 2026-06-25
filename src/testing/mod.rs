@@ -5,7 +5,7 @@
 //! Phase 1+ logic module is unit-tested against these fakes — no real git, no
 //! real filesystem mutation outside tempdirs, no real PTY.
 
-use crate::contracts::domain::{MergeOutcome, ProcessState, PtySize, WorktreeInfo};
+use crate::contracts::domain::{MergeOutcome, ProcessState, PtySize, RebaseOutcome, WorktreeInfo};
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::traits::{Clock, FileSystem, GitExecutor, PtyBackend, PtySession};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -171,12 +171,14 @@ struct FakeGitState {
     upstreams: HashMap<String, Option<String>>,
     remotes: HashMap<String, String>,
     merge_outcome: Option<MergeOutcome>,
+    rebase_outcome: Option<RebaseOutcome>,
     // recordings
     created_branches: Vec<(String, String)>,
     added_worktrees: Vec<(PathBuf, String)>,
     removed_worktrees: Vec<PathBuf>,
     pushes: Vec<(String, String, PathBuf)>,
     merges: Vec<(String, PathBuf)>,
+    rebases: Vec<(String, PathBuf)>,
 }
 
 impl Default for FakeGit {
@@ -195,11 +197,13 @@ impl Default for FakeGit {
                 upstreams: HashMap::new(),
                 remotes: HashMap::new(),
                 merge_outcome: None,
+                rebase_outcome: None,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
                 removed_worktrees: Vec::new(),
                 pushes: Vec::new(),
                 merges: Vec::new(),
+                rebases: Vec::new(),
             }),
         }
     }
@@ -311,6 +315,11 @@ impl FakeGit {
         self.inner.lock().unwrap().merge_outcome = Some(outcome);
     }
 
+    /// Set the outcome returned by [`GitExecutor::rebase_onto`].
+    pub fn set_rebase_outcome(&self, outcome: RebaseOutcome) {
+        self.inner.lock().unwrap().rebase_outcome = Some(outcome);
+    }
+
     // --- recordings ---
 
     /// Branches created via [`GitExecutor::create_branch`], as `(name, from)`.
@@ -336,6 +345,11 @@ impl FakeGit {
     /// Merges performed, as `(branch, cwd)`.
     pub fn merges(&self) -> Vec<(String, PathBuf)> {
         self.inner.lock().unwrap().merges.clone()
+    }
+
+    /// Rebases performed, as `(onto, cwd)`.
+    pub fn rebases(&self) -> Vec<(String, PathBuf)> {
+        self.inner.lock().unwrap().rebases.clone()
     }
 }
 
@@ -454,6 +468,16 @@ impl GitExecutor for FakeGit {
             merged: true,
             conflicted: false,
             message: "merged".to_string(),
+        }))
+    }
+
+    fn rebase_onto(&self, onto: &str, cwd: &Path) -> Result<RebaseOutcome> {
+        let mut st = self.inner.lock().unwrap();
+        st.rebases.push((onto.to_string(), cwd.to_path_buf()));
+        Ok(st.rebase_outcome.clone().unwrap_or(RebaseOutcome {
+            rebased: true,
+            conflicted: false,
+            message: "rebased".to_string(),
         }))
     }
 }

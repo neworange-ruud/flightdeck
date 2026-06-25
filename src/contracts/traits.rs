@@ -6,7 +6,9 @@
 //! amend, squash, rebase, cherry-pick, or PR creation) — the SPECS §5 safety
 //! boundary is enforced by construction.
 
-use crate::contracts::domain::{MergeOutcome, Notification, ProcessState, PtySize, WorktreeInfo};
+use crate::contracts::domain::{
+    MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+};
 use crate::contracts::error::Result;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +16,14 @@ use std::path::{Path, PathBuf};
 ///
 /// Implementations shell out to `git` via `std::process::Command`. Methods that
 /// do not take a `cwd` operate against the repository the implementation was
-/// constructed for. **Never** add a history-rewriting method here (SPECS §5).
+/// constructed for.
+///
+/// History-rewriting is forbidden here by default (SPECS §5). The single
+/// sanctioned exception is [`rebase_onto`](GitExecutor::rebase_onto), a
+/// user-initiated, conflict-aborting rebase reachable only behind explicit
+/// confirmation and the precondition checks in the git workflow layer (SPECS §5
+/// carve-out). Do **not** add any other history-rewriting method (commit,
+/// amend, squash, cherry-pick, automatic rebase).
 pub trait GitExecutor {
     /// Top-level directory of the repository containing `cwd`.
     fn repo_root(&self, cwd: &Path) -> Result<PathBuf>;
@@ -51,6 +60,14 @@ pub trait GitExecutor {
     /// precondition checks in the git workflow layer — never call directly
     /// without those checks).
     fn merge_no_ff(&self, branch: &str, cwd: &Path) -> Result<MergeOutcome>;
+    /// Rebase the branch checked out in `cwd` onto `onto` (SPECS §5 carve-out).
+    /// This rewrites the worktree branch's commits, so it is the one sanctioned
+    /// history-rewriting op and must only be reached after the precondition
+    /// checks and explicit user confirmation in the git workflow layer. On
+    /// conflict the implementation aborts the rebase (`git rebase --abort`) and
+    /// returns `conflicted: true` so the worktree is left untouched — FlightDeck
+    /// never resolves conflicts or leaves a half-finished rebase.
+    fn rebase_onto(&self, onto: &str, cwd: &Path) -> Result<RebaseOutcome>;
 }
 
 /// Abstraction over filesystem operations (SPECS §26).

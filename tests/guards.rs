@@ -52,7 +52,12 @@ fn no_agent_orchestrator_name_in_source() {
 
 /// SPECS §5: the git layer must not invoke any history-rewriting,
 /// commit-creating, or PR-creating git subcommand. We look for these as quoted
-/// argument literals (e.g. `"commit"`, `"rebase"`) anywhere under `src/`.
+/// argument literals (e.g. `"commit"`, `"amend"`) anywhere under `src/`.
+///
+/// The single sanctioned exception is the `"rebase"` subcommand, which is
+/// permitted ONLY in `src/git/repo.rs` — the guarded, user-confirmed,
+/// conflict-aborting worktree rebase (SPECS §5.1 carve-out). It must appear
+/// nowhere else.
 #[test]
 fn git_layer_has_no_history_rewriting_subcommands() {
     let src = manifest_dir().join("src");
@@ -61,7 +66,6 @@ fn git_layer_has_no_history_rewriting_subcommands() {
         "\"commit\"",
         "\"amend\"",
         "\"--amend\"",
-        "\"rebase\"",
         "\"cherry-pick\"",
         "\"cherry\"",
         "\"reset\"",
@@ -70,12 +74,23 @@ fn git_layer_has_no_history_rewriting_subcommands() {
         "\"-f\"",
         "\"gh\"", // no GitHub PR creation via the gh CLI
     ];
+    // The one file allowed to name the `"rebase"` subcommand (SPECS §5.1).
+    let rebase_carve_out = src.join("git").join("repo.rs");
     for file in rust_files(&src) {
         let contents = fs::read_to_string(&file).unwrap_or_default();
         for token in forbidden {
             assert!(
                 !contents.contains(token),
                 "SPECS §5 violation: forbidden git argument {token} found in {}",
+                file.display()
+            );
+        }
+        // `"rebase"` is the sole sanctioned history-rewriting op and may only be
+        // invoked from the git executor implementation (SPECS §5.1 carve-out).
+        if file != rebase_carve_out {
+            assert!(
+                !contents.contains("\"rebase\""),
+                "SPECS §5 violation: \"rebase\" outside the §5.1 carve-out (src/git/repo.rs) found in {}",
                 file.display()
             );
         }

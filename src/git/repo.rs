@@ -1,7 +1,9 @@
 //! Real [`GitExecutor`] over the `git` binary, plus repo-root / base-branch
 //! detection (SPECS §5, §27).
 
-use crate::contracts::{FlightDeckError, GitExecutor, MergeOutcome, Result, WorktreeInfo};
+use crate::contracts::{
+    FlightDeckError, GitExecutor, MergeOutcome, RebaseOutcome, Result, WorktreeInfo,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -225,6 +227,31 @@ impl GitExecutor for GitCli {
                 message: combined.trim().to_string(),
             })
         }
+    }
+
+    fn rebase_onto(&self, onto: &str, cwd: &Path) -> Result<RebaseOutcome> {
+        // Guarded rebase (SPECS §5 carve-out): only reached after preconditions
+        // and explicit confirmation in the workflow layer. On any failure we
+        // abort so the worktree is left exactly as it was — never resolve
+        // conflicts, never leave a half-finished rebase.
+        let out = self.run_in(cwd, &["rebase", onto])?;
+        if out.status.success() {
+            return Ok(RebaseOutcome {
+                rebased: true,
+                conflicted: false,
+                message: format!("rebased onto {onto}"),
+            });
+        }
+        let combined = format!("{}\n{}", stdout_trimmed(&out), stderr_trimmed(&out));
+        let conflicted = combined.to_lowercase().contains("conflict");
+        // Abort any rebase left in progress (no-op/harmless if none is). We
+        // ignore its result: the worktree state is reported via the outcome.
+        let _ = self.run_in(cwd, &["rebase", "--abort"]);
+        Ok(RebaseOutcome {
+            rebased: false,
+            conflicted,
+            message: combined.trim().to_string(),
+        })
     }
 }
 

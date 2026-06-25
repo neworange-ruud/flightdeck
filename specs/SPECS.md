@@ -122,6 +122,7 @@ FlightDeck may:
 - Remove managed worktrees when safe
 - Delete managed local branches when safe and explicitly confirmed
 - Perform local merge-back only under strict conditions
+- Rebase an agent worktree onto its base branch, only under strict conditions (see carve-out below)
 
 FlightDeck must not:
 
@@ -130,11 +131,35 @@ FlightDeck must not:
 - Amend commits
 - Squash commits
 - Rebase automatically
-- Rewrite history
+- Rewrite history (except the explicitly-confirmed worktree rebase below)
 - Create GitHub PRs
 - Resolve merge conflicts automatically
 
 This boundary matters. The fastest way to make this tool untrustworthy is to let it mutate commit history.
+
+### 5.1 Worktree rebase carve-out
+
+The one sanctioned history-rewriting operation is **Rebase Worktree**: rebasing an
+Agent Tab's worktree branch onto its base branch so a long-running branch can be
+brought current (see §12 drift). It is never automatic and is constrained by:
+
+- **User-initiated and explicitly confirmed.** Reachable only via the command
+  palette (*Rebase Worktree*), and the first dispatch always returns a
+  confirmation prompt before anything is rewritten.
+- **Preconditions.** The agent worktree must be clean (FlightDeck never stashes
+  or discards) and both the agent and base branches must exist.
+- **Conflict policy.** On any conflict the rebase is aborted (`git rebase
+  --abort`), leaving the worktree exactly as it was. FlightDeck never resolves
+  conflicts and never leaves a half-finished rebase — consistent with §15.
+- **Local only.** The rebase targets the *local* base branch (no fetch),
+  matching how §12 drift and §15 merge-back are computed. On success the tab's
+  stored base SHA is advanced so drift reflects the incorporated base.
+- **Remote consequence is surfaced.** Because the branch history is rewritten, a
+  previously pushed branch needs a force-push; FlightDeck states this and never
+  force-pushes on the user's behalf (push remains §14, non-force, confirmed).
+
+The `GitExecutor::rebase_onto` method is the only history-rewriting op on the
+trait and must only be reached through this guarded workflow.
 
 ---
 

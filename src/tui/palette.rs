@@ -59,6 +59,10 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::Dispatch(Command::FinishLocalMerge { confirm: false }),
     },
     PaletteEntry {
+        label: "Rebase Worktree",
+        action: PaletteAction::Dispatch(Command::RebaseWorktree { confirm: false }),
+    },
+    PaletteEntry {
         label: "Abandon Worktree",
         action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
     },
@@ -110,7 +114,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
 /// View" view command.
-pub const REQUIRED_ACTION_COUNT: usize = 17;
+pub const REQUIRED_ACTION_COUNT: usize = 18;
 
 /// The command palette model (SPECS §22).
 ///
@@ -225,6 +229,7 @@ mod tests {
             "Close Agent Tab",
             "Push Branch",
             "Finish / Local Merge",
+            "Rebase Worktree",
             "Abandon Worktree",
             "New Child Terminal",
             "Close Child Terminal",
