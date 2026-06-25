@@ -7,8 +7,8 @@
 use std::io::{self, Write};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, PushKeyboardEnhancementFlags,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
@@ -22,7 +22,10 @@ fn main() -> io::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
 
-    queue!(out, crossterm::style::Print("Press keys (Ctrl-C / Ctrl-Q to quit)\r\n"))?;
+    queue!(
+        out,
+        crossterm::style::Print("Press keys (Ctrl-C / Ctrl-Q to quit)\r\n")
+    )?;
     out.flush()?;
 
     loop {
