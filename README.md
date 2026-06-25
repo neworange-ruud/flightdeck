@@ -287,6 +287,34 @@ Repository setup required for Homebrew publishing:
   tap.
 - Ensure Actions has read/write workflow permissions for release creation.
 
+### macOS code signing
+
+Release binaries are signed in CI with an Apple Developer ID Application
+certificate (`macos-sign = true` in `dist-workspace.toml`) and built with the
+**hardened runtime** enabled. The hardened runtime is turned on via
+`.github/workflows/build-setup.yml`, which exports `CODESIGN_OPTIONS=runtime`
+before `dist build` (cargo-dist has no dedicated config key for it). That file
+is injected into the build job through the `github-build-setup` key, so
+`dist generate --check` stays green — edit `build-setup.yml` rather than
+`release.yml` directly, then re-run `dist generate`.
+
+Required repository secrets (a missing one silently disables signing):
+
+- `CODESIGN_CERTIFICATE` — base64-encoded `.p12` (Developer ID Application cert
+  plus private key).
+- `CODESIGN_CERTIFICATE_PASSWORD` — passphrase for that `.p12`.
+- `CODESIGN_IDENTITY` — the identity string, e.g.
+  `Developer ID Application: <name> (<TEAMID>)`.
+
+Releases are **signed but not notarized** (cargo-dist 0.32 does not notarize).
+This is fine for the Homebrew and `curl | sh` install paths, which do not apply
+a Gatekeeper quarantine. Artifacts downloaded through a web browser would be
+quarantined and rejected by Gatekeeper until notarized — add a
+`notarytool` + `stapler` step if browser distribution is ever needed.
+
+To verify a built binary: `codesign -dv --verbose=4 <path>` should show the
+Developer ID authority and `flags=0x10000(runtime)`.
+
 ## Manual smoke test (human, requires a real terminal)
 
 Automated tests cannot drive a real attached terminal/PTY end-to-end. After
