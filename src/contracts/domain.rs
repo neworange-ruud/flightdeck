@@ -379,6 +379,20 @@ pub struct MergeOutcome {
     pub message: String,
 }
 
+/// Outcome of a guarded worktree rebase onto the base branch (SPECS §5
+/// carve-out). On conflict the rebase is aborted so the worktree is left
+/// exactly as it was — FlightDeck never resolves conflicts or leaves a
+/// half-finished rebase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseOutcome {
+    /// True if the rebase completed successfully (HEAD now sits on the base).
+    pub rebased: bool,
+    /// True if the rebase hit conflicts and was aborted (no changes applied).
+    pub conflicted: bool,
+    /// Human-readable detail.
+    pub message: String,
+}
+
 /// Terminal dimensions for a PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
