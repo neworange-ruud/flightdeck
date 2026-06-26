@@ -1065,10 +1065,11 @@ impl AppState {
         )))
     }
 
-    /// Abandon Worktree (SPECS §5/§15). A clean worktree is removed immediately.
-    /// A dirty worktree returns [`Effect::AbandonWarning`] so the UI can confirm;
-    /// once the user confirms (`confirm` true) it is force-removed regardless of
-    /// uncommitted changes. The tab is dropped after a successful removal.
+    /// Abandon Worktree (SPECS §5/§15). Always returns [`Effect::AbandonWarning`]
+    /// first so the UI confirms, even for a clean worktree (`dirty` tells the
+    /// prompt whether uncommitted changes would be lost); once the user confirms
+    /// (`confirm` true) it is force-removed regardless of uncommitted changes.
+    /// The tab is dropped after a successful removal.
     fn cmd_abandon(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
         let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
@@ -1078,10 +1079,11 @@ impl AppState {
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
         );
 
-        // Without confirmation, a dirty worktree must be confirmed before we
-        // discard its uncommitted changes.
-        if !confirm && services.git.is_dirty(&worktree)? {
-            return Ok(Effect::AbandonWarning);
+        // Abandoning always asks first (SPECS §5/§15); a clean worktree is also
+        // confirmed, just without the dirty-changes warning.
+        if !confirm {
+            let dirty = services.git.is_dirty(&worktree)?;
+            return Ok(Effect::AbandonWarning { dirty });
         }
 
         match remove_worktree_if_safe(services.git, services.fs, &worktree, confirm) {
@@ -2657,7 +2659,7 @@ mod tests {
         let effect = app
             .dispatch(Command::AbandonWorktree { confirm: false }, &svc)
             .unwrap();
-        assert!(matches!(effect, Effect::AbandonWarning));
+        assert!(matches!(effect, Effect::AbandonWarning { dirty: true }));
         assert_eq!(app.tabs.len(), 1); // not removed
 
         // Confirming force-removes the dirty worktree and drops the tab.
@@ -2667,6 +2669,45 @@ mod tests {
         assert!(matches!(effect, Effect::Message(_)));
         assert_eq!(app.tabs.len(), 0);
         assert!(git.removed_worktrees().iter().any(|p| p == &wt));
+    }
+
+    #[test]
+    fn abandon_confirms_even_a_clean_worktree() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // A clean worktree is NOT removed on the first (unconfirmed) abandon: it
+        // still asks first, just without the dirty-changes warning.
+        let effect = app
+            .dispatch(Command::AbandonWorktree { confirm: false }, &svc)
+            .unwrap();
+        assert!(matches!(effect, Effect::AbandonWarning { dirty: false }));
+        assert_eq!(app.tabs.len(), 1); // not removed
+        assert!(git.removed_worktrees().is_empty());
+
+        // Confirming removes it and drops the tab.
+        let effect = app
+            .dispatch(Command::AbandonWorktree { confirm: true }, &svc)
+            .unwrap();
+        assert!(matches!(effect, Effect::Message(_)));
+        assert_eq!(app.tabs.len(), 0);
     }
 
     // --- §26: save/load round trip --------------------------------------
