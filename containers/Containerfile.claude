@@ -8,7 +8,7 @@
 # `execution.base_image` at it (e.g. to pin/customize the toolchain):
 #
 #   podman build -t flightdeck-claude-base:latest -f containers/Containerfile.claude containers
-#   # then in .flightdeck/config.toml:  [execution] base_image = "localhost/flightdeck-claude-base:latest"
+#   # then in .flightdeck/config.toml:  [containers] base_image = "localhost/flightdeck-claude-base:latest"
 #
 # Base-image contract (when used as base_image):
 #   - Debian-family (so the customization layer can `apt-get install`).

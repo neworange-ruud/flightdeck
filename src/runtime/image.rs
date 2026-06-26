@@ -4,7 +4,7 @@
 //! The tag/hash/template helpers are pure; [`ensure_image`] drives the control
 //! plane through [`ContainerRuntime`] and is unit-tested with the fake.
 
-use crate::contracts::{ContainerRuntime, ExecutionConfig, FileSystem, FlightDeckError, Result};
+use crate::contracts::{ContainerRuntime, ContainersConfig, FileSystem, FlightDeckError, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -21,8 +21,8 @@ pub const DEFAULT_BASE_IMAGE: &str = "docker.io/library/node:22-bookworm-slim";
 
 /// The command that installs an agent's CLI on top of [`DEFAULT_BASE_IMAGE`].
 /// Returns `None` for an agent FlightDeck has no built-in recipe for — such an
-/// agent must set `execution.image`, `execution.base_image`, or
-/// `execution.containerfile` itself.
+/// agent must set `containers.image`, `containers.base_image`, or
+/// `containers.containerfile` itself.
 pub fn agent_install_command(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" => Some("npm install -g @anthropic-ai/claude-code"),
@@ -33,7 +33,7 @@ pub fn agent_install_command(agent: &str) -> Option<&'static str> {
 }
 
 /// A FlightDeck-owned base image tag (for users who prefer to pre-build a base
-/// and point `execution.base_image` at it; not used by the default flow).
+/// and point `containers.base_image` at it; not used by the default flow).
 pub fn base_image_tag(agent: &str) -> String {
     format!("localhost/flightdeck-{agent}-base:latest")
 }
@@ -43,9 +43,9 @@ pub fn project_image_tag(repo_hash: &str, agent: &str) -> String {
     format!("localhost/flightdeck-{repo_hash}-{agent}:local")
 }
 
-/// The image tag a launch will use: an explicit `execution.image`, else the
+/// The image tag a launch will use: an explicit `containers.image`, else the
 /// computed per-project tag.
-pub fn resolve_image_tag(repo_hash: &str, agent: &str, exec: &ExecutionConfig) -> String {
+pub fn resolve_image_tag(repo_hash: &str, agent: &str, exec: &ContainersConfig) -> String {
     exec.image
         .clone()
         .unwrap_or_else(|| project_image_tag(repo_hash, agent))
@@ -101,7 +101,7 @@ pub fn generate_containerfile(
             let install = agent_install_command(agent).ok_or_else(|| {
                 FlightDeckError::Config(format!(
                     "no built-in container recipe for agent '{agent}'; set \
-                     execution.image, execution.base_image, or execution.containerfile \
+                     containers.image, containers.base_image, or containers.containerfile \
                      in .flightdeck/config.toml"
                 ))
             })?;
@@ -158,7 +158,7 @@ pub fn generated_containerfile_path(repo_root: &Path, agent: &str) -> PathBuf {
 /// Ensure the image for `agent` exists and is current, building it if needed,
 /// and return the tag to run.
 ///
-/// - An explicit `execution.image` is returned as-is (BYO; existence is checked
+/// - An explicit `containers.image` is returned as-is (BYO; existence is checked
 ///   at launch, not here).
 /// - Otherwise the per-project tag is (re)built from base + customization when
 ///   the baked `flightdeck.build` label does not match the current hash.
@@ -168,7 +168,7 @@ pub fn ensure_image(
     repo_root: &Path,
     repo_hash: &str,
     agent: &str,
-    exec: &ExecutionConfig,
+    exec: &ContainersConfig,
 ) -> Result<String> {
     if let Some(tag) = &exec.image {
         return Ok(tag.clone());
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn resolve_prefers_explicit_image() {
-        let mut exec = ExecutionConfig::default();
+        let mut exec = ContainersConfig::default();
         assert_eq!(
             resolve_image_tag("h", "claude", &exec),
             "localhost/flightdeck-h-claude:local"
@@ -370,7 +370,7 @@ mod tests {
     fn ensure_image_builds_when_absent() {
         let rt = ImgFake::default(); // exists=false
         let fs = FakeFs::new();
-        let exec = ExecutionConfig {
+        let exec = ContainersConfig {
             enabled: true,
             packages: vec!["jq".to_string()],
             ..Default::default()
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn ensure_image_skips_build_when_label_matches() {
         let fs = FakeFs::new();
-        let exec = ExecutionConfig {
+        let exec = ContainersConfig {
             enabled: true,
             packages: vec!["jq".to_string()],
             ..Default::default()
@@ -412,7 +412,7 @@ mod tests {
     fn ensure_image_returns_explicit_image_without_building() {
         let rt = ImgFake::default();
         let fs = FakeFs::new();
-        let exec = ExecutionConfig {
+        let exec = ContainersConfig {
             enabled: true,
             image: Some("localhost/custom:1".to_string()),
             ..Default::default()

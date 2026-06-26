@@ -308,7 +308,7 @@ pub struct UpdateConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Container execution model (SPECS §31) — the optional `[execution]` section.
+// Container execution model (SPECS §31) — the optional `[containers]` section.
 // ---------------------------------------------------------------------------
 
 fn default_runtime() -> String {
@@ -368,12 +368,12 @@ pub struct AuthConfig {
     pub env_allow: Vec<String>,
 }
 
-/// `[execution]` config section (SPECS §31). When the table is absent or
+/// `[containers]` config section (SPECS §31). When the table is absent or
 /// `enabled = false`, FlightDeck's behaviour is bit-for-bit the local model;
 /// every field is `#[serde(default)]` so existing `config.toml` files keep
 /// working untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionConfig {
+pub struct ContainersConfig {
     /// Master switch. **Off by default** — all agents run locally until enabled.
     #[serde(default)]
     pub enabled: bool,
@@ -409,9 +409,9 @@ pub struct ExecutionConfig {
     pub auth: AuthConfig,
 }
 
-impl Default for ExecutionConfig {
+impl Default for ContainersConfig {
     fn default() -> Self {
-        ExecutionConfig {
+        ContainersConfig {
             enabled: false,
             runtime: default_runtime(),
             image: None,
@@ -442,8 +442,9 @@ pub struct Config {
     #[serde(default)]
     pub update: UpdateConfig,
     /// Container execution (SPECS §31). Absent table → disabled → local model.
-    #[serde(default)]
-    pub execution: ExecutionConfig,
+    /// Accepts the legacy `[execution]` section name as a deprecated alias.
+    #[serde(default, alias = "execution")]
+    pub containers: ContainersConfig,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentDef>,
 }
@@ -473,7 +474,7 @@ pub struct TabState {
     #[serde(default)]
     pub manual_status: Option<String>,
     /// Whether this tab's agent was launched inside a container (SPECS §31).
-    /// Recorded per-tab so that toggling `[execution] enabled` off later does
+    /// Recorded per-tab so that toggling `[containers] enabled` off later does
     /// not mislead reattach/teardown of tabs that *were* containerized.
     #[serde(default)]
     pub containerized: bool,

@@ -15,7 +15,7 @@ toggle. It is written to slot into FlightDeck's existing architecture (SPECS
 | Area | Decision |
 | --- | --- |
 | Workspace | **Bind-mount** the host git worktree into the container at `/workspace` with `--userns keep-id`. Host keeps owning the worktree + all git ops. No diff/apply/sync layer. |
-| Opt-in | **Single project-wide toggle** (`[execution] enabled`). All agents containerized or none. |
+| Opt-in | **Single project-wide toggle** (`[containers] enabled`). All agents containerized or none. |
 | Runtime | **Podman only**, behind a trait so Docker can be added later. |
 | Child shells (Ctrl-t) | Run **inside the same container** via `podman exec`. |
 | Sidecars / MCP | **None in v1.** Single container per tab. Pod model deferred. |
@@ -98,12 +98,12 @@ src/runtime/                      NEW — all container logic
 src/contracts/
   traits.rs      + trait ContainerRuntime
   real.rs        + PodmanCli : ContainerRuntime (shells out)
-  domain.rs      + ExecutionConfig; + TabState container fields
+  domain.rs      + ContainersConfig; + TabState container fields
   error.rs       + container error variants
 
 src/config/
-  schema.rs      validate [execution]
-  init.rs        wizard/default writes [execution] (disabled by default)
+  schema.rs      validate [containers]
+  init.rs        wizard/default writes [containers] (disabled by default)
 
 src/app/state.rs SPAWN-SITE BRANCHING + container teardown + reattach
 src/testing/     + FakeContainerRuntime
@@ -122,7 +122,7 @@ PLAN.md delegates against SPECS).
 
 ```rust
 /// Everything needed to launch/attach/exec, resolved on the UI thread from
-/// (AgentDef, ExecutionConfig, TabState, repo_root). Owned + Send.
+/// (AgentDef, ContainersConfig, TabState, repo_root). Owned + Send.
 pub struct ContainerSpec {
     pub name: String,            // flightdeck-<id>
     pub labels: Vec<(String, String)>,
@@ -207,10 +207,10 @@ assembled in `src/runtime/`, so no other module can hand-roll an unguarded
 ## 5. Config additions (`domain.rs` + `config/schema.rs`)
 
 ```rust
-/// `[execution]` config section. Absent table → Default (disabled) → today's
+/// `[containers]` config section. Absent table → Default (disabled) → today's
 /// behaviour is preserved bit-for-bit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionConfig {
+pub struct ContainersConfig {
     #[serde(default)]                 pub enabled: bool,           // master toggle, OFF by default
     #[serde(default = "default_runtime")] pub runtime: String,    // "podman"
     #[serde(default)]                 pub image: Option<String>,  // resolved image, or None → built
@@ -227,7 +227,7 @@ pub struct ExecutionConfig {
 `Limits { cpu: f32=4, memory: String="8g", pids: u32=512 }`,
 `AuthConfig { mounts: Vec<AuthMount>, env_allow: Vec<String> }`.
 
-Add `#[serde(default)] pub execution: ExecutionConfig` to `Config`. Every field
+Add `#[serde(default)] pub execution: ContainersConfig` to `Config`. Every field
 is `#[serde(default)]` ⇒ existing `config.toml` files keep working untouched.
 
 `config/schema.rs::validate` adds: runtime ∈ {podman}; ports unique & non-zero;
@@ -247,7 +247,7 @@ and `#[serde(default)]` for backward compatibility:
 ```
 
 The container **name** is derived from `id` (no need to store it). `containerized`
-is recorded per-tab so that toggling `[execution] enabled` off later does not
+is recorded per-tab so that toggling `[containers] enabled` off later does not
 mislead reattach/teardown of tabs that *were* containerized.
 
 ---
@@ -282,7 +282,7 @@ A small resolver decides the launch form. Replace the direct `build_launch`
 calls at the three sites with a branch:
 
 - `finalize_new_tab` & `start_primary_for` (primary spawn):
-  - if `!execution.enabled` → today's `build_launch` (unchanged).
+  - if `!containers.enabled` → today's `build_launch` (unchanged).
   - else → build `ContainerSpec`, `enforce_guardrails`, then
     `session.spawn_primary(pty, "podman", build_run_args(&spec), host_cwd, size)`.
     Set `tab.meta.containerized = true`, record image.
@@ -325,7 +325,7 @@ dependencies):
    installing the agent CLI + git + a non-root `agent` user wired for UID
    mapping. Tag `flightdeck/<agent>-base:<flightdeck-version>`.
 2. **Project customization layer**, two tiers:
-   - *Declarative (default):* `packages` + `setup_script` in `[execution]`.
+   - *Declarative (default):* `packages` + `setup_script` in `[containers]`.
      FlightDeck generates a final Containerfile (`FROM flightdeck/<agent>-base` +
      `apt/apk install <packages>` + `RUN <setup_script>`) and builds it as
      `flightdeck/<repo-hash>-<agent>:local`.
@@ -375,7 +375,7 @@ pub trait ContainerRuntime {
 
 ## 10. Auth
 
-Resolved at spec-build time from `[execution.auth]`:
+Resolved at spec-build time from `[containers.auth]`:
 
 - **Mount mode:** `--volume <host_cred_path>:<container_path>:ro` (e.g.
   `~/.claude` → `/home/agent/.claude`). Guardrails forbid mounting `$HOME` root,
@@ -428,14 +428,14 @@ rest.*
 **Phase 1 — Pure core (no runtime needed).** `runtime/spec.rs`,
 `runtime/container.rs`, `runtime/guards.rs`, `runtime/name.rs`,
 `runtime/image.rs` tag/hash logic. Full unit tests on argv + guardrails +
-staleness hash. `ExecutionConfig` + validation + `TabState` fields. Nothing
+staleness hash. `ContainersConfig` + validation + `TabState` fields. Nothing
 wired into spawn yet. (Mirrors DAC's builder/guards/config test suites.)
 
 **Phase 2 — `ContainerRuntime` + reattach plumbing.** Trait + `PodmanCli` +
 `FakeContainerRuntime`; add to `Services`. Branch the three spawn sites; add
 container teardown + startup reconcile. App-layer unit tests with the fake cover
 primary-run, child-exec, reattach-vs-session-lost, and teardown. Behind
-`[execution] enabled=false` so default behaviour is unchanged.
+`[containers] enabled=false` so default behaviour is unchanged.
 
 **Phase 3 — Image subsystem.** Shipped `containers/Containerfile.*`; generated
 Containerfile templating; `flightdeck image build [--force]` on the background
@@ -444,7 +444,7 @@ worker; auto-build + preflight before first launch; `flightdeck doctor`.
 **Phase 4 — End-to-end + polish.** Ignored-by-default Podman-backed e2e
 (`#[ignore]`, like the real-PTY smoke test): build → run claude in a worktree →
 edit a file → see it on host → child shell exec → restart-reattach → close +
-cleanup. Wizard writes `[execution]`. Docs.
+cleanup. Wizard writes `[containers]`. Docs.
 
 **Fast-follow (post-v1):** ad-hoc `flightdeck port <tab> <port>`; egress proxy
 (reintroduces a minimal pod); Docker backend behind the same trait.
@@ -479,6 +479,6 @@ cleanup. Wizard writes `[execution]`. Docs.
   merge / rebase are unaffected (SPECS §5/§5.1 boundary intact).
 - The recovery invariant: recovery never *relaunches*; reattach only reconnects
   to an already-*running* container (SPECS §10).
-- Default behaviour with `[execution]` absent or `enabled=false` is bit-for-bit
+- Default behaviour with `[containers]` absent or `enabled=false` is bit-for-bit
   today's FlightDeck.
 ```

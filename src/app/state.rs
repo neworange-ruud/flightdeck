@@ -16,7 +16,7 @@ use crate::agents::status::{classify_output, combine_status, running_status, Dis
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
-    AgentDef, Clock, Config, ContainerRuntime, ContainerState, ExecutionConfig, FileSystem,
+    AgentDef, Clock, Config, ContainerRuntime, ContainerState, ContainersConfig, FileSystem,
     FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
     NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result, TabId, TabState,
     STATE_VERSION,
@@ -141,7 +141,7 @@ fn platform_mount_flags() -> Option<String> {
 /// (SPECS §31). Default credential mounts target subpaths of this.
 const AGENT_HOME: &str = "/home/agent";
 
-/// Host→container credential mounts applied by default (no `[execution.auth]`
+/// Host→container credential mounts applied by default (no `[containers.auth]`
 /// configured, default base image) so the host agent's login carries into the
 /// container (SPECS §31). Host paths may use `~`; absent ones are skipped.
 fn default_auth_mounts(agent: &str) -> Vec<(&'static str, &'static str)> {
@@ -162,7 +162,7 @@ fn default_auth_mounts(agent: &str) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-/// Host env vars injected by default (no `[execution.auth]` configured) when
+/// Host env vars injected by default (no `[containers.auth]` configured) when
 /// present, so API-key auth works without configuration (SPECS §31).
 fn default_env_allow(agent: &str) -> Vec<&'static str> {
     match agent {
@@ -189,7 +189,7 @@ fn expand_tilde(p: &str) -> PathBuf {
 /// ([`ContainerRuntime::available`]).
 fn validate_launchable(
     agent: &AgentDef,
-    exec: &ExecutionConfig,
+    exec: &ContainersConfig,
     container: &dyn ContainerRuntime,
 ) -> Result<()> {
     if exec.enabled {
@@ -798,7 +798,7 @@ impl AppState {
 
         // (b) validate the command (or container runtime) BEFORE any git
         //     mutation (SPECS §16/§31).
-        validate_launchable(&agent, &self.config.execution, services.container)?;
+        validate_launchable(&agent, &self.config.containers, services.container)?;
 
         // (c) slug + branch name with the configured prefix.
         let slug = slugify(name);
@@ -1349,7 +1349,7 @@ impl AppState {
 
     /// Resolve how to launch (or reattach) a primary terminal (SPECS §31).
     ///
-    /// - Local mode (`execution.enabled == false`): the agent command directly.
+    /// - Local mode (`containers.enabled == false`): the agent command directly.
     /// - Container mode, `allow_attach` + a running container: `podman attach`.
     /// - Container mode otherwise: a fresh `podman run` (guardrail-checked). The
     ///   image must already exist; a missing image is refused with guidance
@@ -1362,7 +1362,7 @@ impl AppState {
         services: &Services,
         allow_attach: bool,
     ) -> Result<PrimarySpawn> {
-        if !self.config.execution.enabled {
+        if !self.config.containers.enabled {
             let launch = build_launch(agent, worktree_abs);
             return Ok(PrimarySpawn {
                 start_args: None,
@@ -1389,7 +1389,7 @@ impl AppState {
         // Fresh run: verify the image (no building here), then start the
         // container detached and attach to it. The caller runs `start_args`.
         let rhash = repo_hash(&self.repo_root);
-        let image = image::resolve_image_tag(&rhash, &agent.key, &self.config.execution);
+        let image = image::resolve_image_tag(&rhash, &agent.key, &self.config.containers);
         if !services.container.image_exists(&image)? {
             return Err(image::missing_image_error(&image));
         }
@@ -1422,7 +1422,7 @@ impl AppState {
         worktree_abs: &Path,
         services: &Services,
     ) -> ContainerSpec {
-        let exec = &self.config.execution;
+        let exec = &self.config.containers;
         let user_auth = !exec.auth.mounts.is_empty() || !exec.auth.env_allow.is_empty();
         let (auth_mounts, env) = if user_auth || exec.base_image.is_some() {
             // Explicit auth config (or a custom base image, whose paths we can't
@@ -1509,7 +1509,7 @@ impl AppState {
 
     /// Spawn (or re-spawn) the primary agent for tab `idx`. Re-validates the
     /// agent first (SPECS §16), launches locally or in a container per
-    /// `execution.enabled` (SPECS §31), and marks the tab no longer recovered.
+    /// `containers.enabled` (SPECS §31), and marks the tab no longer recovered.
     /// `allow_attach` reconnects to a still-running container instead of running
     /// a fresh one (used on resume, not on an explicit restart).
     fn start_primary_for(
@@ -1526,7 +1526,7 @@ impl AppState {
             .get(&agent_key)
             .cloned()
             .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
-        validate_launchable(&agent, &self.config.execution, services.container)?;
+        validate_launchable(&agent, &self.config.containers, services.container)?;
 
         let cwd = to_absolute(
             &repo_root,
@@ -3232,7 +3232,7 @@ mod tests {
 
     fn exec_config() -> Config {
         let mut c = config_with_agent(plain_agent("opencode"));
-        c.execution.enabled = true;
+        c.containers.enabled = true;
         c
     }
 

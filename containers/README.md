@@ -11,7 +11,7 @@ This is a **project-wide toggle** — when enabled, all agents run in containers
 In `.flightdeck/config.toml`:
 
 ```toml
-[execution]
+[containers]
 enabled = true
 runtime = "podman"
 
@@ -28,15 +28,15 @@ runtime = "podman"
 # Optional: publish dev-server ports to 127.0.0.1
 # forward_ports = [3000]
 
-[execution.limits]
+[containers.limits]
 cpu = "4"
 memory = "8g"
 pids = 512
 
 # Credentials: mount host creds read-only, and/or inject an allowlisted env var.
-[execution.auth]
+[containers.auth]
 env_allow = ["ANTHROPIC_API_KEY"]
-# [[execution.auth.mounts]]
+# [[containers.auth.mounts]]
 # host_path = "~/.claude"
 # container_path = "/home/agent/.claude"
 # writable = false
@@ -50,7 +50,7 @@ flightdeck doctor               # verifies podman + images are ready
 ```
 
 The reference `Containerfile.*` in this directory are **optional** — only needed
-if you want to pre-build and pin a base via `execution.base_image`.
+if you want to pre-build and pin a base via `containers.base_image`.
 
 ## 3. Run
 

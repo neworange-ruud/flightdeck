@@ -349,7 +349,7 @@ fn run_image() -> Result<()> {
         println!("usage: flightdeck image build [agent]");
         println!();
         println!("Builds the container image for an agent (default: the configured");
-        println!("default agent) from its FlightDeck base image plus any [execution]");
+        println!("default agent) from its FlightDeck base image plus any [containers]");
         println!("customization (packages / setup_script / containerfile).");
         return Ok(());
     }
@@ -385,7 +385,7 @@ fn run_image() -> Result<()> {
     podman.available()?;
 
     let rhash = crate::runtime::name::repo_hash(&repo_root);
-    let tag = crate::runtime::image::resolve_image_tag(&rhash, &agent, &config.execution);
+    let tag = crate::runtime::image::resolve_image_tag(&rhash, &agent, &config.containers);
     println!(
         "FlightDeck: building image '{tag}' for agent '{agent}' (this may take a few minutes)…"
     );
@@ -395,7 +395,7 @@ fn run_image() -> Result<()> {
         &repo_root,
         &rhash,
         &agent,
-        &config.execution,
+        &config.containers,
     )?;
     println!("FlightDeck: image ready → {built}");
     Ok(())
@@ -423,14 +423,14 @@ fn run_doctor() -> Result<()> {
     };
 
     println!("FlightDeck doctor");
-    if !config.execution.enabled {
-        println!("  • container execution: disabled ([execution] enabled = false)");
+    if !config.containers.enabled {
+        println!("  • container execution: disabled ([containers] enabled = false)");
         println!("    Agents run locally; nothing else to check.");
         return Ok(());
     }
     println!(
         "  • container execution: enabled (runtime = {})",
-        config.execution.runtime
+        config.containers.runtime
     );
 
     let podman = crate::runtime::PodmanCli;
@@ -452,7 +452,7 @@ fn run_doctor() -> Result<()> {
 
     let rhash = crate::runtime::name::repo_hash(&repo_root);
     for agent in config.agents.keys() {
-        let tag = crate::runtime::image::resolve_image_tag(&rhash, agent, &config.execution);
+        let tag = crate::runtime::image::resolve_image_tag(&rhash, agent, &config.containers);
         let present = podman.image_exists(&tag).unwrap_or(false);
         let mark = if present { "present" } else { "MISSING" };
         println!("  • image for '{agent}': {tag} — {mark}");
@@ -572,7 +572,7 @@ fn print_help() {
     println!("    image build [agent]    Build an agent's container image (default agent");
     println!("                           if none given)");
     println!();
-    println!("    Enable with `enabled = true` under [execution] in");
+    println!("    Enable with `enabled = true` under [containers] in");
     println!("    .flightdeck/config.toml, then run `flightdeck doctor`.");
     println!();
     println!("MAINTENANCE:");

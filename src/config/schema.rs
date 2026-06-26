@@ -1,7 +1,7 @@
 //! Default config construction and validation (SPECS §8).
 
 use crate::contracts::{
-    AgentDef, Config, ExecutionConfig, FlightDeckError, GitConfig, NotificationsConfig,
+    AgentDef, Config, ContainersConfig, FlightDeckError, GitConfig, NotificationsConfig,
     ProjectConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WorktreesConfig,
 };
 use std::collections::BTreeMap;
@@ -73,7 +73,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         },
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
-        execution: ExecutionConfig::default(),
+        containers: ContainersConfig::default(),
         agents,
     }
 }
@@ -103,20 +103,20 @@ pub fn validate(config: &Config) -> Result<()> {
         }
     }
 
-    validate_execution(&config.execution)?;
+    validate_containers(&config.containers)?;
 
     Ok(())
 }
 
-/// Validate the `[execution]` section (SPECS §31). Only enforced when the
+/// Validate the `[containers]` section (SPECS §31). Only enforced when the
 /// section is `enabled`, so a disabled-but-malformed table never blocks startup.
-pub fn validate_execution(exec: &crate::contracts::ExecutionConfig) -> Result<()> {
+pub fn validate_containers(exec: &crate::contracts::ContainersConfig) -> Result<()> {
     if !exec.enabled {
         return Ok(());
     }
     if exec.runtime != "podman" {
         return Err(FlightDeckError::Config(format!(
-            "execution.runtime '{}' is not supported (only 'podman')",
+            "containers.runtime '{}' is not supported (only 'podman')",
             exec.runtime
         )));
     }
@@ -124,7 +124,7 @@ pub fn validate_execution(exec: &crate::contracts::ExecutionConfig) -> Result<()
     // customization.
     if exec.containerfile.is_some() && (!exec.packages.is_empty() || exec.setup_script.is_some()) {
         return Err(FlightDeckError::Config(
-            "execution.containerfile cannot be combined with packages/setup_script".to_string(),
+            "containers.containerfile cannot be combined with packages/setup_script".to_string(),
         ));
     }
     // Ports must be non-zero and unique.
@@ -132,12 +132,12 @@ pub fn validate_execution(exec: &crate::contracts::ExecutionConfig) -> Result<()
     for &port in &exec.forward_ports {
         if port == 0 {
             return Err(FlightDeckError::Config(
-                "execution.forward_ports must not contain 0".to_string(),
+                "containers.forward_ports must not contain 0".to_string(),
             ));
         }
         if !seen.insert(port) {
             return Err(FlightDeckError::Config(format!(
-                "execution.forward_ports contains duplicate port {port}"
+                "containers.forward_ports contains duplicate port {port}"
             )));
         }
     }
@@ -229,21 +229,21 @@ mod tests {
         assert!(err.to_string().contains("claude"));
     }
 
-    // --- [execution] validation (SPECS §31) ---
+    // --- [containers] validation (SPECS §31) ---
 
     #[test]
-    fn validate_ignores_disabled_execution() {
+    fn validate_ignores_disabled_containers() {
         let mut cfg = default_config("proj", "main");
         // Garbage runtime is tolerated while disabled.
-        cfg.execution.runtime = "docker".to_string();
+        cfg.containers.runtime = "docker".to_string();
         assert!(validate(&cfg).is_ok());
     }
 
     #[test]
     fn validate_rejects_unsupported_runtime_when_enabled() {
         let mut cfg = default_config("proj", "main");
-        cfg.execution.enabled = true;
-        cfg.execution.runtime = "docker".to_string();
+        cfg.containers.enabled = true;
+        cfg.containers.runtime = "docker".to_string();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("podman"));
     }
@@ -251,28 +251,28 @@ mod tests {
     #[test]
     fn validate_rejects_containerfile_with_packages() {
         let mut cfg = default_config("proj", "main");
-        cfg.execution.enabled = true;
-        cfg.execution.containerfile = Some("c/Containerfile".to_string());
-        cfg.execution.packages = vec!["jq".to_string()];
+        cfg.containers.enabled = true;
+        cfg.containers.containerfile = Some("c/Containerfile".to_string());
+        cfg.containers.packages = vec!["jq".to_string()];
         assert!(validate(&cfg).is_err());
     }
 
     #[test]
     fn validate_rejects_duplicate_and_zero_ports() {
         let mut cfg = default_config("proj", "main");
-        cfg.execution.enabled = true;
-        cfg.execution.forward_ports = vec![3000, 3000];
+        cfg.containers.enabled = true;
+        cfg.containers.forward_ports = vec![3000, 3000];
         assert!(validate(&cfg).is_err());
-        cfg.execution.forward_ports = vec![0];
+        cfg.containers.forward_ports = vec![0];
         assert!(validate(&cfg).is_err());
     }
 
     #[test]
-    fn validate_accepts_valid_execution() {
+    fn validate_accepts_valid_containers() {
         let mut cfg = default_config("proj", "main");
-        cfg.execution.enabled = true;
-        cfg.execution.packages = vec!["jq".to_string(), "curl".to_string()];
-        cfg.execution.forward_ports = vec![3000, 8080];
+        cfg.containers.enabled = true;
+        cfg.containers.packages = vec!["jq".to_string(), "curl".to_string()];
+        cfg.containers.forward_ports = vec![3000, 8080];
         assert!(validate(&cfg).is_ok());
     }
 }

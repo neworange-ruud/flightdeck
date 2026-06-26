@@ -1136,8 +1136,8 @@ An **opt-in** model for running agents inside isolated, rootless **Podman**
 containers instead of directly on the host. Off by default; when enabled it is
 **project-wide** (all agents run in containers, or none do).
 
-- **Single toggle.** `[execution] enabled` in `config.toml`. Absent table or
-  `false` ⇒ today's local model, bit-for-bit. Every `[execution]` field is
+- **Single toggle.** `[containers] enabled` in `config.toml`. Absent table or
+  `false` ⇒ today's local model, bit-for-bit. Every `[containers]` field is
   optional. Runtime is `podman` only in v1 (behind a trait so Docker can follow).
 - **Workspace = bind-mounted host worktree.** The agent's git worktree stays on
   the host and is bind-mounted at `/workspace` with `--userns keep-id --user
@@ -1167,13 +1167,13 @@ containers instead of directly on the host. Off by default; when enabled it is
   relaxed by config.
 - **Network.** Full outbound in v1 (an egress allowlist is a planned follow-up;
   the builder leaves a seam for a proxy sidecar).
-- **Auth.** With no `[execution.auth]` configured (and the default base image),
+- **Auth.** With no `[containers.auth]` configured (and the default base image),
   FlightDeck passes the host agent's credentials through automatically — the
   agent's config dir is bind-mounted writable into the container home (so an
   existing login carries over and a fresh one persists) and known API-key env
   vars are injected when present. Absent host paths are skipped. Projects can
   override with explicit `auth.mounts` / `auth.env_allow`.
-- **Ports.** `execution.forward_ports` publishes `127.0.0.1:<port>:<port>`.
+- **Ports.** `containers.forward_ports` publishes `127.0.0.1:<port>:<port>`.
 - **Images.** By default `flightdeck image build [agent]` generates a
   **self-contained** image from a trusted, fully-qualified public base
   (`docker.io/library/node`), installing the agent CLI and creating the
