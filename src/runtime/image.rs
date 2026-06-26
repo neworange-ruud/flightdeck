@@ -112,8 +112,16 @@ pub fn generate_containerfile(
                  && rm -rf /var/lib/apt/lists/*\n",
             );
             s.push_str(&format!("RUN {install}\n"));
-            // Non-root user; UID-mapped at run time via `--userns keep-id`.
-            s.push_str("RUN useradd --create-home --shell /usr/bin/zsh agent\n");
+            // Non-root user; UID-mapped at run time via `--userns keep-id --user
+            // <host-uid>`. The process runs as the host UID (not `agent`'s UID),
+            // so make the home tree world-writable and pre-create the XDG dirs —
+            // otherwise the agent cannot create e.g. ~/.local/state (EACCES).
+            s.push_str(
+                "RUN useradd --create-home --shell /usr/bin/zsh agent \\\n    \
+                 && mkdir -p /home/agent/.local/state /home/agent/.local/share \
+                 /home/agent/.config /home/agent/.cache \\\n    \
+                 && chmod -R 0777 /home/agent\n",
+            );
             push_packages(&mut s, packages);
             push_setup(&mut s, setup_script);
             s.push_str("USER agent\n");
@@ -279,6 +287,8 @@ mod tests {
         assert!(cf.starts_with("FROM docker.io/library/node:22-bookworm-slim\n"));
         assert!(cf.contains("npm install -g @anthropic-ai/claude-code"));
         assert!(cf.contains("useradd --create-home --shell /usr/bin/zsh agent"));
+        // Home is made writable by the UID-mapped (host) user.
+        assert!(cf.contains("chmod -R 0777 /home/agent"));
         assert!(cf.contains("apt-get install -y --no-install-recommends postgresql-client jq"));
         assert!(cf.contains("COPY .flightdeck/setup.sh /tmp/flightdeck-setup"));
         assert!(cf.contains("USER agent"));

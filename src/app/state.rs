@@ -1462,11 +1462,6 @@ impl AppState {
                 .collect();
             mounts.shrink_to_fit();
             let mut env = Vec::new();
-            // Pin HOME so the agent finds the mounted creds regardless of how the
-            // UID-mapped user resolves inside the container.
-            if !mounts.is_empty() {
-                env.push(("HOME".to_string(), AGENT_HOME.to_string()));
-            }
             for key in default_env_allow(&agent.key) {
                 if let Ok(val) = std::env::var(key) {
                     env.push((key.to_string(), val));
@@ -1474,6 +1469,15 @@ impl AppState {
             }
             (mounts, env)
         };
+
+        // On the default base image, pin HOME to the `agent` user's home: the
+        // process runs as the host UID (no passwd entry for it), so without this
+        // HOME would be unset/`/` and the agent could not write its config.
+        let mut env = env;
+        if exec.base_image.is_none() && !env.iter().any(|(k, _)| k == "HOME") {
+            env.push(("HOME".to_string(), AGENT_HOME.to_string()));
+        }
+
         ContainerSpec {
             name: name.to_string(),
             labels: standard_labels(tab_id, rhash),

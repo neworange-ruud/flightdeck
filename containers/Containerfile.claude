@@ -27,6 +27,8 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code
 
 # Non-root user (UID-mapped at run time via --userns keep-id).
-RUN useradd --create-home --shell /usr/bin/zsh agent
+RUN useradd --create-home --shell /usr/bin/zsh agent \
+    && mkdir -p /home/agent/.local/state /home/agent/.local/share /home/agent/.config /home/agent/.cache \
+    && chmod -R 0777 /home/agent
 USER agent
 WORKDIR /workspace
