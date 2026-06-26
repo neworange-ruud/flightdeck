@@ -27,13 +27,19 @@ Or install directly from the latest GitHub Release:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
 ```
 
-Update Homebrew installs with:
+Update direct (installer) installs in place with:
+
+```bash
+flightdeck update
+```
+
+This checks the latest GitHub Release and replaces the binary if a newer version
+exists. It only self-updates installs done via the installer above; for Homebrew
+installs it defers to the package manager — update those with:
 
 ```bash
 brew upgrade flightdeck
 ```
-
-For direct installs, re-run the installer command above.
 
 ```bash
 cd /path/to/your/git/repo
