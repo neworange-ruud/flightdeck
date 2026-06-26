@@ -48,6 +48,26 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
+current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+if [ "$current_branch" = "" ]; then
+  printf 'Release must be run from a local branch, not a detached HEAD.\n' >&2
+  exit 1
+fi
+
+upstream_ref=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+if [ "$upstream_ref" = "" ]; then
+  printf 'Current branch has no upstream tracking branch: %s\n' "$current_branch" >&2
+  exit 1
+fi
+
+upstream_remote=${upstream_ref%%/*}
+git fetch "$upstream_remote" --quiet
+
+if ! git merge-base --is-ancestor "$upstream_ref" HEAD; then
+  printf 'Local branch is behind %s; update it before cutting a release.\n' "$upstream_ref" >&2
+  exit 1
+fi
+
 if git rev-parse "$tag" >/dev/null 2>&1; then
   printf 'Tag already exists locally: %s\n' "$tag" >&2
   exit 1
