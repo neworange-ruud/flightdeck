@@ -110,6 +110,22 @@ mod tests {
     }
 
     #[test]
+    fn init_writes_containers_section_off_by_default() {
+        let fs = FakeFs::new();
+        let repo = Path::new("/repo");
+        initialize(&fs, repo, "proj", "main").unwrap();
+        let contents = fs
+            .file_contents(Path::new("/repo/.flightdeck/config.toml"))
+            .unwrap();
+        // The section is present so the feature is discoverable...
+        assert!(contents.contains("[containers]"), "config: {contents}");
+        // ...and disabled by default (parse it back to be unambiguous).
+        let cfg = crate::config::load::parse_config(&contents).unwrap();
+        assert!(!cfg.containers.enabled, "containers must default to off");
+        assert_eq!(cfg.containers.runtime, "podman");
+    }
+
+    #[test]
     fn init_creates_state_json() {
         let fs = FakeFs::new();
         let repo = Path::new("/repo");
