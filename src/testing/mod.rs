@@ -5,9 +5,13 @@
 //! Phase 1+ logic module is unit-tested against these fakes — no real git, no
 //! real filesystem mutation outside tempdirs, no real PTY.
 
-use crate::contracts::domain::{MergeOutcome, ProcessState, PtySize, RebaseOutcome, WorktreeInfo};
+use crate::contracts::domain::{
+    ContainerState, MergeOutcome, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+};
 use crate::contracts::error::{FlightDeckError, Result};
-use crate::contracts::traits::{Clock, FileSystem, GitExecutor, PtyBackend, PtySession};
+use crate::contracts::traits::{
+    Clock, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -650,6 +654,161 @@ impl PtySession for FakePtySession {
         st.terminated = true;
         st.state = ProcessState::Stopped;
         Ok(())
+    }
+}
+
+// ===========================================================================
+// FakeContainerRuntime — scriptable container control plane (SPECS §31)
+// ===========================================================================
+
+/// Scriptable in-memory [`ContainerRuntime`] for tests.
+#[derive(Debug)]
+pub struct FakeContainerRuntime {
+    inner: Mutex<FakeCrState>,
+}
+
+#[derive(Debug)]
+struct FakeCrState {
+    unavailable: Option<String>,
+    images: HashSet<String>,
+    image_labels: HashMap<(String, String), String>,
+    states: HashMap<String, ContainerState>,
+    by_label: HashMap<String, Vec<String>>,
+    host_uid: u32,
+    // recordings
+    builds: Vec<String>,
+    removed: Vec<(String, bool)>,
+}
+
+impl Default for FakeContainerRuntime {
+    fn default() -> Self {
+        FakeContainerRuntime {
+            inner: Mutex::new(FakeCrState {
+                unavailable: None,
+                images: HashSet::new(),
+                image_labels: HashMap::new(),
+                states: HashMap::new(),
+                by_label: HashMap::new(),
+                host_uid: 501,
+                builds: Vec::new(),
+                removed: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl FakeContainerRuntime {
+    /// New runtime: podman available, no images, all containers absent.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark the runtime unavailable with a message.
+    pub fn set_unavailable(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().unavailable = Some(msg.into());
+    }
+
+    /// Register an existing local image.
+    pub fn with_image(self, tag: impl Into<String>) -> Self {
+        self.inner.lock().unwrap().images.insert(tag.into());
+        self
+    }
+
+    /// Set the liveness of a named container.
+    pub fn set_container_state(&self, name: impl Into<String>, state: ContainerState) {
+        self.inner.lock().unwrap().states.insert(name.into(), state);
+    }
+
+    /// Names returned for a given label query.
+    pub fn set_label_members(&self, label: impl Into<String>, names: Vec<String>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .by_label
+            .insert(label.into(), names);
+    }
+
+    /// Containers removed via [`ContainerRuntime::remove_container`].
+    pub fn removed_containers(&self) -> Vec<(String, bool)> {
+        self.inner.lock().unwrap().removed.clone()
+    }
+
+    /// Image tags built via [`ContainerRuntime::build_image`].
+    pub fn builds(&self) -> Vec<String> {
+        self.inner.lock().unwrap().builds.clone()
+    }
+}
+
+impl ContainerRuntime for FakeContainerRuntime {
+    fn available(&self) -> Result<()> {
+        match &self.inner.lock().unwrap().unavailable {
+            Some(msg) => Err(FlightDeckError::Refused(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn image_exists(&self, tag: &str) -> Result<bool> {
+        Ok(self.inner.lock().unwrap().images.contains(tag))
+    }
+
+    fn image_label(&self, tag: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .image_labels
+            .get(&(tag.to_string(), key.to_string()))
+            .cloned())
+    }
+
+    fn build_image(
+        &self,
+        tag: &str,
+        _containerfile: &Path,
+        _context: &Path,
+        labels: &[(String, String)],
+    ) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.images.insert(tag.to_string());
+        for (k, v) in labels {
+            st.image_labels
+                .insert((tag.to_string(), k.clone()), v.clone());
+        }
+        st.builds.push(tag.to_string());
+        Ok(())
+    }
+
+    fn container_state(&self, name: &str) -> Result<ContainerState> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .states
+            .get(name)
+            .copied()
+            .unwrap_or(ContainerState::Absent))
+    }
+
+    fn remove_container(&self, name: &str, force: bool) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.removed.push((name.to_string(), force));
+        st.states.insert(name.to_string(), ContainerState::Absent);
+        Ok(())
+    }
+
+    fn list_by_label(&self, label: &str) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .by_label
+            .get(label)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn host_uid(&self) -> u32 {
+        self.inner.lock().unwrap().host_uid
     }
 }
 

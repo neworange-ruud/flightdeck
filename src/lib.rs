@@ -16,6 +16,7 @@ pub mod fs;
 pub mod git;
 pub mod notify;
 pub mod persistence;
+pub mod runtime;
 pub mod terminal;
 pub mod tui;
 pub mod update;
@@ -92,6 +93,10 @@ pub fn run() -> Result<()> {
         Some("setup-update") => return run_setup_update(),
         // Self-update installer-based installs from GitHub Releases (SPECS §29).
         Some("update") => return update::run(),
+        // Build/inspect agent container images (SPECS §31).
+        Some("image") => return run_image(),
+        // Verify the container runtime + images are ready (SPECS §31).
+        Some("doctor") => return run_doctor(),
         _ => {}
     }
 
@@ -109,12 +114,14 @@ pub fn run() -> Result<()> {
     let fs = RealFs;
     let pty = PortablePtyBackend;
     let clock = RealClock;
+    let container = crate::runtime::PodmanCli;
 
     let services = Services {
         git: &git,
         fs: &fs,
         pty: &pty,
         clock: &clock,
+        container: &container,
     };
 
     let mut state = startup(&services, &repo_root, &cwd)?;
@@ -332,6 +339,123 @@ fn run_setup_update() -> Result<()> {
     Ok(())
 }
 
+/// `flightdeck image build [agent]` — build (or rebuild) an agent's container
+/// image from the FlightDeck base + project customization (SPECS §31).
+fn run_image() -> Result<()> {
+    use crate::contracts::ContainerRuntime;
+
+    let action = std::env::args().nth(2);
+    if action.as_deref() != Some("build") {
+        println!("usage: flightdeck image build [agent]");
+        println!();
+        println!("Builds the container image for an agent (default: the configured");
+        println!("default agent) from its FlightDeck base image plus any [execution]");
+        println!("customization (packages / setup_script / containerfile).");
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
+    let git = GitCli::discover(&cwd).map_err(|_| {
+        FlightDeckError::Git(
+            "not inside a Git repository (run `flightdeck image build` from a git project)"
+                .to_string(),
+        )
+    })?;
+    let repo_root = git.root().to_path_buf();
+    let fs = RealFs;
+    let config_path = repo_root.join(".flightdeck").join("config.toml");
+    if !fs.exists(&config_path) {
+        let project_name = derive_project_name(&repo_root);
+        let base_branch = detect_base_branch(&git, &cwd, None)?;
+        initialize(&fs, &repo_root, &project_name, &base_branch)?;
+    }
+    let config = load_config(&fs, &config_path)?;
+
+    let agent = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| config.ui.default_agent.clone());
+    if !config.agents.contains_key(&agent) {
+        return Err(FlightDeckError::Config(format!(
+            "unknown agent '{agent}' (not in config.toml)"
+        )));
+    }
+
+    let podman = crate::runtime::PodmanCli;
+    podman.available()?;
+
+    let rhash = crate::runtime::name::repo_hash(&repo_root);
+    let tag = crate::runtime::image::resolve_image_tag(&rhash, &agent, &config.execution);
+    println!(
+        "FlightDeck: building image '{tag}' for agent '{agent}' (this may take a few minutes)…"
+    );
+    let built = crate::runtime::image::ensure_image(
+        &podman,
+        &fs,
+        &repo_root,
+        &rhash,
+        &agent,
+        &config.execution,
+    )?;
+    println!("FlightDeck: image ready → {built}");
+    Ok(())
+}
+
+/// `flightdeck doctor` — verify the container runtime + images are ready
+/// (SPECS §31). Reports rather than mutating anything.
+fn run_doctor() -> Result<()> {
+    use crate::contracts::ContainerRuntime;
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
+    let git = GitCli::discover(&cwd).map_err(|_| {
+        FlightDeckError::Git(
+            "not inside a Git repository (run `flightdeck doctor` from a git project)".to_string(),
+        )
+    })?;
+    let repo_root = git.root().to_path_buf();
+    let fs = RealFs;
+    let config_path = repo_root.join(".flightdeck").join("config.toml");
+    let config = if fs.exists(&config_path) {
+        load_config(&fs, &config_path)?
+    } else {
+        crate::contracts::Config::default()
+    };
+
+    println!("FlightDeck doctor");
+    if !config.execution.enabled {
+        println!("  • container execution: disabled ([execution] enabled = false)");
+        println!("    Agents run locally; nothing else to check.");
+        return Ok(());
+    }
+    println!(
+        "  • container execution: enabled (runtime = {})",
+        config.execution.runtime
+    );
+
+    let podman = crate::runtime::PodmanCli;
+    match podman.available() {
+        Ok(()) => println!("  • podman: ready"),
+        Err(e) => {
+            println!("  • podman: NOT ready — {e}");
+            println!("    Install podman and start the machine, then re-run `flightdeck doctor`.");
+            return Ok(());
+        }
+    }
+
+    let rhash = crate::runtime::name::repo_hash(&repo_root);
+    for agent in config.agents.keys() {
+        let tag = crate::runtime::image::resolve_image_tag(&rhash, agent, &config.execution);
+        let present = podman.image_exists(&tag).unwrap_or(false);
+        let mark = if present { "present" } else { "MISSING" };
+        println!("  • image for '{agent}': {tag} — {mark}");
+        if !present {
+            println!("    Build it with `flightdeck image build {agent}`.");
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Startup (SPECS §4, §7, §10, §13) — terminal-free, returns the built AppState.
 // ---------------------------------------------------------------------------
@@ -436,6 +560,8 @@ fn print_help() {
     println!("    setup-notifications    Enable OS notifications when agents finish");
     println!("    setup-update           Enable the opt-in once-a-day update notice");
     println!("    update                 Update FlightDeck to the latest release");
+    println!("    image build [agent]    Build an agent's container image (SPECS §31)");
+    println!("    doctor                 Check the container runtime + images are ready");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");
@@ -2168,11 +2294,13 @@ mod tests {
         let fs = FakeFs::new();
         let pty = FakePty::new();
         let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
+            container: &container,
         };
 
         // Pressing '1' picks Claude Code and advances to the name prompt.
@@ -2347,11 +2475,13 @@ mod tests {
         git.set_dirty_at(repo, true);
         let pty = FakePty::new();
         let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
+            container: &container,
         };
 
         let state = startup(&services, repo, repo).expect("startup should succeed");
@@ -2376,11 +2506,13 @@ mod tests {
         let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
         let pty = FakePty::new();
         let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
+            container: &container,
         };
 
         let state = startup(&services, repo, repo).expect("startup should succeed");

@@ -307,6 +307,125 @@ pub struct UpdateConfig {
     pub check: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Container execution model (SPECS §31) — the optional `[execution]` section.
+// ---------------------------------------------------------------------------
+
+fn default_runtime() -> String {
+    "podman".to_string()
+}
+fn default_cpu() -> String {
+    "4".to_string()
+}
+fn default_memory() -> String {
+    "8g".to_string()
+}
+fn default_pids() -> u32 {
+    512
+}
+
+/// Container resource limits (SPECS §31). Stored as strings/ints (never `f32`)
+/// so the whole [`Config`] can keep `Eq`. `cpu` maps to `--cpus` (e.g. `"4"` or
+/// `"1.5"`), `memory` to `--memory` (e.g. `"8g"`), `pids` to `--pids-limit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    #[serde(default = "default_cpu")]
+    pub cpu: String,
+    #[serde(default = "default_memory")]
+    pub memory: String,
+    #[serde(default = "default_pids")]
+    pub pids: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            cpu: default_cpu(),
+            memory: default_memory(),
+            pids: default_pids(),
+        }
+    }
+}
+
+/// A host credential bind-mounted read-only (or writable) into the agent
+/// container (SPECS §31). `host_path` may start with `~`. Mounting `$HOME`
+/// itself is rejected by the runtime guardrails regardless of config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthMount {
+    pub host_path: String,
+    pub container_path: String,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// How agent credentials reach the container (SPECS §31): bind-mounted files
+/// and/or a host-env allowlist injected as `--env KEY=value`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub mounts: Vec<AuthMount>,
+    #[serde(default)]
+    pub env_allow: Vec<String>,
+}
+
+/// `[execution]` config section (SPECS §31). When the table is absent or
+/// `enabled = false`, FlightDeck's behaviour is bit-for-bit the local model;
+/// every field is `#[serde(default)]` so existing `config.toml` files keep
+/// working untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionConfig {
+    /// Master switch. **Off by default** — all agents run locally until enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Container runtime. Only `"podman"` is supported in v1.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+    /// Fully-resolved image to run. When `None`, FlightDeck builds one from the
+    /// base + customization (SPECS §31 image strategy).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Override the FlightDeck base image the generated Containerfile builds on.
+    #[serde(default)]
+    pub base_image: Option<String>,
+    /// Declarative customization: OS packages to install on top of the base.
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Declarative customization: a repo-relative script run during the build.
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    /// Advanced escape hatch: a repo-relative Containerfile to build verbatim
+    /// (expected to `FROM` a FlightDeck base). Mutually exclusive with
+    /// `packages`/`setup_script`.
+    #[serde(default)]
+    pub containerfile: Option<String>,
+    /// Ports published to `127.0.0.1` at container start.
+    #[serde(default)]
+    pub forward_ports: Vec<u16>,
+    /// Resource limits.
+    #[serde(default)]
+    pub limits: Limits,
+    /// Credential delivery.
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        ExecutionConfig {
+            enabled: false,
+            runtime: default_runtime(),
+            image: None,
+            base_image: None,
+            packages: Vec::new(),
+            setup_script: None,
+            containerfile: None,
+            forward_ports: Vec::new(),
+            limits: Limits::default(),
+            auth: AuthConfig::default(),
+        }
+    }
+}
+
 /// The full parsed `config.toml` (SPECS §8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -322,6 +441,9 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Container execution (SPECS §31). Absent table → disabled → local model.
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentDef>,
 }
@@ -350,6 +472,14 @@ pub struct TabState {
     pub last_known_status: String,
     #[serde(default)]
     pub manual_status: Option<String>,
+    /// Whether this tab's agent was launched inside a container (SPECS §31).
+    /// Recorded per-tab so that toggling `[execution] enabled` off later does
+    /// not mislead reattach/teardown of tabs that *were* containerized.
+    #[serde(default)]
+    pub containerized: bool,
+    /// The image the container was launched from, for provenance (SPECS §31).
+    #[serde(default)]
+    pub container_image: Option<String>,
 }
 
 fn default_last_known_status() -> String {
@@ -420,4 +550,19 @@ impl Default for PtySize {
     fn default() -> Self {
         PtySize { rows: 24, cols: 80 }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Container runtime value types (SPECS §31), used by the `ContainerRuntime` trait.
+// ---------------------------------------------------------------------------
+
+/// Liveness of a named container as reported by the runtime (SPECS §31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    /// The container exists and its main process is running.
+    Running,
+    /// The container existed and has exited (not yet removed).
+    Exited,
+    /// No container with that name exists (never created, or already removed).
+    Absent,
 }

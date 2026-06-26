@@ -131,6 +131,8 @@ pub fn recover(
             recovered: true,
             last_known_status: "session lost".to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         };
 
         state.tabs.push(new_tab);
@@ -163,6 +165,8 @@ mod tests {
             recovered: false,
             last_known_status: "running".to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         }
     }
 

@@ -1,0 +1,29 @@
+# FlightDeck base image for the Claude Code agent (SPECS §31).
+#
+# Build the base once (FlightDeck's per-project image FROMs this one):
+#
+#   podman build -t flightdeck-claude-base:latest -f containers/Containerfile.claude containers
+#
+# Then enable containers in .flightdeck/config.toml ([execution] enabled = true)
+# and build the project image with `flightdeck image build claude`.
+#
+# Contract for FlightDeck base images:
+#   - Debian-family (so the generated customization layer can `apt-get install`).
+#   - A non-root user named `agent` (FlightDeck maps the host UID onto it via
+#     `--userns keep-id --user <uid>`, so /workspace is writable).
+#   - The agent CLI on PATH.
+FROM node:22-bookworm-slim
+
+# Tooling the agent and child shells commonly need.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl ripgrep less zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the Claude Code CLI.
+RUN npm install -g @anthropic-ai/claude-code
+
+# Non-root user (UID-mapped at run time via --userns keep-id).
+RUN useradd --create-home --shell /usr/bin/zsh agent
+USER agent
+WORKDIR /workspace

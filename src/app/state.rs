@@ -16,9 +16,10 @@ use crate::agents::status::{classify_output, combine_status, running_status, Dis
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
-    Clock, Config, FileSystem, FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus,
-    Notification, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result,
-    TabId, TabState, STATE_VERSION,
+    AgentDef, Clock, Config, ContainerRuntime, ContainerState, ExecutionConfig, FileSystem,
+    FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
+    NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result, TabId, TabState,
+    STATE_VERSION,
 };
 use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
@@ -29,6 +30,13 @@ use crate::git::status::{
 };
 use crate::git::worktree::{create_worktree, plan_worktree, remove_worktree_if_safe, WorktreePlan};
 use crate::persistence::project_state::save_state;
+use crate::runtime::container::{
+    build_attach_args, build_exec_args, build_run_args, standard_labels,
+};
+use crate::runtime::guards::enforce_guardrails;
+use crate::runtime::image;
+use crate::runtime::name::{container_name, repo_hash};
+use crate::runtime::spec::{ContainerSpec, ResolvedAuthMount};
 use crate::terminal::session::Session;
 use crate::terminal::shell::shell_launch;
 
@@ -44,6 +52,8 @@ pub struct Services<'a> {
     pub pty: &'a dyn PtyBackend,
     /// Clock for deterministic timestamps.
     pub clock: &'a dyn Clock,
+    /// Container runtime control plane (SPECS §31).
+    pub container: &'a dyn ContainerRuntime,
 }
 
 /// Lifecycle phase of an Agent Tab (SPECS §16/§17).
@@ -99,6 +109,52 @@ pub fn materialize_worktree(git: &dyn GitExecutor, job: &WorktreeJob) -> Result<
         )?;
     }
     Ok(())
+}
+
+/// How to launch (or reattach) a tab's primary terminal (SPECS §31): the
+/// command + argv handed to the [`PtyBackend`], plus whether it is
+/// containerized and the image used (for persistence).
+struct PrimarySpawn {
+    command: String,
+    args: Vec<String>,
+    containerized: bool,
+    image: Option<String>,
+}
+
+/// SELinux relabel suffix for bind mounts: `Some("z")` on Linux, `None` on
+/// macOS (the Podman-machine virtiofs share takes no relabel). SPECS §31/§11.
+fn platform_mount_flags() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        Some("z".to_string())
+    } else {
+        None
+    }
+}
+
+/// Expand a leading `~/` in a config path against `$HOME`.
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Validate an agent is launchable before any git mutation (SPECS §16/§31).
+/// In container mode the agent binary lives *inside* the image, so instead of
+/// the agent command we require the container runtime to be ready
+/// ([`ContainerRuntime::available`]).
+fn validate_launchable(
+    agent: &AgentDef,
+    exec: &ExecutionConfig,
+    container: &dyn ContainerRuntime,
+) -> Result<()> {
+    if exec.enabled {
+        container.available()
+    } else {
+        validate_agent(agent)
+    }
 }
 
 /// Whether `cmd` acts on the selected tab's live worktree/session and therefore
@@ -663,13 +719,17 @@ impl AppState {
         services: &Services,
     ) -> Result<Effect> {
         let job = self.begin_new_agent_tab(name, agent_key, services)?;
-        match materialize_worktree(services.git, &job) {
+        let outcome = match materialize_worktree(services.git, &job) {
             Ok(()) => self.finalize_new_tab(&job.tab_id, services),
-            Err(e) => {
-                self.fail_new_tab(&job.tab_id);
-                Err(e)
-            }
+            Err(e) => Err(e),
+        };
+        // Either step failing must leave no dead placeholder (the TabPhase
+        // contract: creation failures remove the tab entirely). A spawn failure
+        // in `finalize` (e.g. a missing container image) is no exception.
+        if outcome.is_err() {
+            self.fail_new_tab(&job.tab_id);
         }
+        outcome
     }
 
     /// Begin the new-tab flow: validate, plan, and reserve a placeholder
@@ -694,8 +754,9 @@ impl AppState {
             .cloned()
             .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{key}'")))?;
 
-        // (b) validate the command BEFORE any git mutation (SPECS §16).
-        validate_agent(&agent)?;
+        // (b) validate the command (or container runtime) BEFORE any git
+        //     mutation (SPECS §16/§31).
+        validate_launchable(&agent, &self.config.execution, services.container)?;
 
         // (c) slug + branch name with the configured prefix.
         let slug = slugify(name);
@@ -754,6 +815,8 @@ impl AppState {
             recovered: false,
             last_known_status: InterpretedStatus::Starting.as_str().to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -801,15 +864,18 @@ impl AppState {
         );
         let branch = self.tabs[idx].meta.branch.clone();
         let attached = self.tabs[idx].meta.attached_existing_branch;
+        let tab_id = self.tabs[idx].meta.id.clone();
 
-        // Spawn the primary terminal (fast fork+exec; stays on the UI thread).
-        let launch = build_launch(&agent, &worktree_abs);
+        // Resolve the launch (local command, or a fresh `podman run`) then spawn
+        // the primary terminal (fast; stays on the UI thread — SPECS §31 keeps
+        // the spawn path synchronous and never builds an image here).
+        let spawn = self.build_primary_spawn(&tab_id, &agent, &worktree_abs, services, false)?;
         let mut session = Session::new();
         session.spawn_primary(
             services.pty,
-            &launch.command,
-            &launch.args,
-            &launch.cwd,
+            &spawn.command,
+            &spawn.args,
+            &worktree_abs,
             self.pty_size,
         )?;
 
@@ -818,6 +884,8 @@ impl AppState {
         tab.phase = TabPhase::Ready;
         tab.interpreted = Some(InterpretedStatus::Starting);
         tab.status_file = Some(agent_status_file(&worktree_abs));
+        tab.meta.containerized = spawn.containerized;
+        tab.meta.container_image = spawn.image;
 
         self.persist(services)?;
 
@@ -890,7 +958,8 @@ impl AppState {
             }
         }
 
-        // Remove the tab from runtime state.
+        // Remove the backing container (if any), then the tab from runtime state.
+        self.destroy_container_if_any(idx, services);
         self.tabs.remove(idx);
         self.fix_selection_after_removal(idx);
         self.persist(services)?;
@@ -987,6 +1056,7 @@ impl AppState {
         // drop the tab (the work now lives on the base branch). Force removal — the
         // merge is already committed onto base, so nothing is lost.
         let _ = self.tabs[idx].session.terminate_all();
+        self.destroy_container_if_any(idx, services);
         match remove_worktree_if_safe(services.git, services.fs, &agent_worktree, true) {
             Ok(()) => {
                 self.tabs.remove(idx);
@@ -1086,8 +1156,9 @@ impl AppState {
 
         match remove_worktree_if_safe(services.git, services.fs, &worktree, confirm) {
             Ok(()) => {
-                // Tear down any live session, then drop the tab.
+                // Tear down any live session + container, then drop the tab.
                 let _ = self.tabs[idx].session.terminate_all();
+                self.destroy_container_if_any(idx, services);
                 self.tabs.remove(idx);
                 self.fix_selection_after_removal(idx);
                 self.persist(services)?;
@@ -1120,7 +1191,9 @@ impl AppState {
         Ok(Effect::Message(format!("Copied {name} to worktree.")))
     }
 
-    /// New child shell terminal in the selected tab's worktree (SPECS §19).
+    /// New child shell terminal in the selected tab's worktree (SPECS §19). When
+    /// the tab's agent runs in a container, the shell runs *inside* it via
+    /// `podman exec` so it shares `/workspace` and the toolchain (SPECS §31).
     fn cmd_new_child(&mut self, services: &Services) -> Result<Effect> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
@@ -1128,7 +1201,16 @@ impl AppState {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let cwd = to_absolute(&repo_root, Path::new(&tab.meta.worktree_path_relative));
-        let (cmd, args) = shell_launch();
+        let (shell_cmd, shell_args) = shell_launch();
+        let (cmd, args) = if tab.meta.containerized {
+            let name = container_name(&tab.meta.id);
+            (
+                "podman".to_string(),
+                build_exec_args(&name, &shell_cmd, &shell_args),
+            )
+        } else {
+            (shell_cmd, shell_args)
+        };
         let idx = tab
             .session
             .spawn_child(services.pty, &cmd, &args, &cwd, size)?;
@@ -1217,9 +1299,132 @@ impl AppState {
         }
     }
 
+    /// Resolve how to launch (or reattach) a primary terminal (SPECS §31).
+    ///
+    /// - Local mode (`execution.enabled == false`): the agent command directly.
+    /// - Container mode, `allow_attach` + a running container: `podman attach`.
+    /// - Container mode otherwise: a fresh `podman run` (guardrail-checked). The
+    ///   image must already exist; a missing image is refused with guidance
+    ///   (the fast launch path never builds — SPECS §31 keeps spawn synchronous).
+    fn build_primary_spawn(
+        &self,
+        tab_id: &str,
+        agent: &AgentDef,
+        worktree_abs: &Path,
+        services: &Services,
+        allow_attach: bool,
+    ) -> Result<PrimarySpawn> {
+        if !self.config.execution.enabled {
+            let launch = build_launch(agent, worktree_abs);
+            return Ok(PrimarySpawn {
+                command: launch.command,
+                args: launch.args,
+                containerized: false,
+                image: None,
+            });
+        }
+
+        let name = container_name(tab_id);
+        if allow_attach && services.container.container_state(&name)? == ContainerState::Running {
+            return Ok(PrimarySpawn {
+                command: "podman".to_string(),
+                args: build_attach_args(&name),
+                containerized: true,
+                image: None,
+            });
+        }
+
+        // Fresh run. Resolve and verify the image (no building on this path).
+        let rhash = repo_hash(&self.repo_root);
+        let image = image::resolve_image_tag(&rhash, &agent.key, &self.config.execution);
+        if !services.container.image_exists(&image)? {
+            return Err(image::missing_image_error(&image));
+        }
+        // Clear any stale exited container so `--name` does not clash.
+        let _ = services.container.remove_container(&name, true);
+
+        let spec =
+            self.container_spec(tab_id, &name, &rhash, &image, agent, worktree_abs, services);
+        let args = build_run_args(&spec);
+        enforce_guardrails(&args)?;
+        Ok(PrimarySpawn {
+            command: "podman".to_string(),
+            args,
+            containerized: true,
+            image: Some(image),
+        })
+    }
+
+    /// Assemble the [`ContainerSpec`] for a fresh run, resolving auth mounts,
+    /// env-allowlist secrets, host UID, and platform mount flags (SPECS §31).
+    #[allow(clippy::too_many_arguments)]
+    fn container_spec(
+        &self,
+        tab_id: &str,
+        name: &str,
+        rhash: &str,
+        image: &str,
+        agent: &AgentDef,
+        worktree_abs: &Path,
+        services: &Services,
+    ) -> ContainerSpec {
+        let exec = &self.config.execution;
+        let auth_mounts = exec
+            .auth
+            .mounts
+            .iter()
+            .map(|m| ResolvedAuthMount {
+                host_path: expand_tilde(&m.host_path),
+                container_path: m.container_path.clone(),
+                writable: m.writable,
+            })
+            .collect();
+        let mut env = Vec::new();
+        for key in &exec.auth.env_allow {
+            if let Ok(val) = std::env::var(key) {
+                env.push((key.clone(), val));
+            }
+        }
+        ContainerSpec {
+            name: name.to_string(),
+            labels: standard_labels(tab_id, rhash),
+            image: image.to_string(),
+            workspace_host: worktree_abs.to_path_buf(),
+            agent_cmd: agent.command.clone(),
+            agent_args: agent.args.clone(),
+            cpu: exec.limits.cpu.clone(),
+            memory: exec.limits.memory.clone(),
+            pids: exec.limits.pids,
+            forward_ports: exec.forward_ports.clone(),
+            auth_mounts,
+            env,
+            host_uid: services.container.host_uid(),
+            mount_flags: platform_mount_flags(),
+        }
+    }
+
+    /// Remove the container backing tab `idx`, if it is containerized. Called on
+    /// the teardown paths (force-close, abandon, merge) so a stopped session
+    /// leaves no container behind (SPECS §31).
+    fn destroy_container_if_any(&self, idx: usize, services: &Services) {
+        if !self.tabs[idx].meta.containerized {
+            return;
+        }
+        let name = container_name(&self.tabs[idx].meta.id);
+        let _ = services.container.remove_container(&name, true);
+    }
+
     /// Spawn (or re-spawn) the primary agent for tab `idx`. Re-validates the
-    /// agent's command first (SPECS §16) and marks the tab no longer recovered.
-    fn start_primary_for(&mut self, idx: usize, services: &Services) -> Result<()> {
+    /// agent first (SPECS §16), launches locally or in a container per
+    /// `execution.enabled` (SPECS §31), and marks the tab no longer recovered.
+    /// `allow_attach` reconnects to a still-running container instead of running
+    /// a fresh one (used on resume, not on an explicit restart).
+    fn start_primary_for(
+        &mut self,
+        idx: usize,
+        services: &Services,
+        allow_attach: bool,
+    ) -> Result<()> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
         let agent_key = self.tabs[idx].meta.agent.clone();
@@ -1228,27 +1433,28 @@ impl AppState {
             .get(&agent_key)
             .cloned()
             .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
-        validate_agent(&agent)?;
+        validate_launchable(&agent, &self.config.execution, services.container)?;
 
         let cwd = to_absolute(
             &repo_root,
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
         );
-        let launch = build_launch(&agent, &cwd);
         let status_file = agent_status_file(&cwd);
+        let tab_id = self.tabs[idx].meta.id.clone();
+        let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
+
         let tab = &mut self.tabs[idx];
-        tab.session.spawn_primary(
-            services.pty,
-            &launch.command,
-            &launch.args,
-            &launch.cwd,
-            size,
-        )?;
+        tab.session
+            .spawn_primary(services.pty, &spawn.command, &spawn.args, &cwd, size)?;
         tab.interpreted = Some(InterpretedStatus::Starting);
         tab.interpreted_at_ms = None;
         tab.last_activity_ms = None;
         tab.status_file = Some(status_file);
         tab.status_file_seen = None;
+        tab.meta.containerized = spawn.containerized;
+        if let Some(image) = spawn.image {
+            tab.meta.container_image = Some(image);
+        }
         tab.meta.recovered = false;
         Ok(())
     }
@@ -1259,7 +1465,8 @@ impl AppState {
         let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        self.start_primary_for(idx, services)?;
+        // An explicit restart always starts fresh (never silently reattaches).
+        self.start_primary_for(idx, services, false)?;
         self.persist(services)?;
         Ok(Effect::Message("Restarted primary agent.".to_string()))
     }
@@ -1284,7 +1491,20 @@ impl AppState {
             if !services.fs.exists(&cwd) {
                 continue;
             }
-            if self.start_primary_for(idx, services).is_ok() {
+            // In container mode, resume only *reattaches* to a still-running
+            // container — an exited one stays "session lost" for a manual
+            // restart, preserving the never-auto-relaunch invariant (SPECS §10).
+            if self.config.execution.enabled {
+                let name = container_name(&self.tabs[idx].meta.id);
+                let running = matches!(
+                    services.container.container_state(&name),
+                    Ok(ContainerState::Running)
+                );
+                if !running {
+                    continue;
+                }
+            }
+            if self.start_primary_for(idx, services, true).is_ok() {
                 started += 1;
             }
         }
@@ -1331,9 +1551,9 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{AgentDef, StatusPatterns, UiConfig, WorktreesConfig};
+    use crate::contracts::{AgentDef, ContainerState, StatusPatterns, UiConfig, WorktreesConfig};
     use crate::persistence::project_state::default_state;
-    use crate::testing::{FakeClock, FakeFs, FakeGit, FakePty};
+    use crate::testing::{FakeClock, FakeContainerRuntime, FakeFs, FakeGit, FakePty};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -1392,11 +1612,18 @@ mod tests {
         pty: &'a FakePty,
         clock: &'a FakeClock,
     ) -> Services<'a> {
+        // Local-mode tests don't exercise the container runtime; leak a default
+        // fake so the (overwhelming) majority of call sites need no container
+        // argument. Container-specific tests build `Services` explicitly with a
+        // configured `FakeContainerRuntime`.
+        let container: &'static FakeContainerRuntime =
+            Box::leak(Box::new(FakeContainerRuntime::new()));
         Services {
             git,
             fs,
             pty,
             clock,
+            container,
         }
     }
 
@@ -2731,6 +2958,8 @@ mod tests {
             recovered: true,
             last_known_status: "session lost".to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
         assert_eq!(app.tabs.len(), 1);
@@ -2807,6 +3036,8 @@ mod tests {
             recovered: true,
             last_known_status: "session lost".to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         }
     }
 
@@ -2858,5 +3089,234 @@ mod tests {
             app.tabs[0].session.primary_state(),
             ProcessState::NotStarted
         );
+    }
+
+    // --- Container execution (SPECS §31) ---------------------------------
+
+    fn plain_agent(key: &str) -> AgentDef {
+        AgentDef {
+            key: key.to_string(),
+            display_name: key.to_string(),
+            command: key.to_string(),
+            args: vec![],
+            status_patterns: StatusPatterns::default(),
+        }
+    }
+
+    fn exec_config() -> Config {
+        let mut c = config_with_agent(plain_agent("opencode"));
+        c.execution.enabled = true;
+        c
+    }
+
+    fn project_image() -> String {
+        image::project_image_tag(&repo_hash(std::path::Path::new(REPO)), "opencode")
+    }
+
+    fn new_tab_cmd() -> Command {
+        Command::NewAgentTab {
+            name: "add auth".to_string(),
+            agent_key: Some("opencode".to_string()),
+        }
+    }
+
+    #[test]
+    fn create_tab_launches_podman_run_when_containerized() {
+        let image = project_image();
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(image.clone());
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+
+        app.dispatch(new_tab_cmd(), &svc).unwrap();
+
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1, "primary spawned once");
+        assert_eq!(spawns[0].0, "podman", "launches via podman");
+        let args = &spawns[0].1;
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--cap-drop".to_string()));
+        assert!(args.contains(&image), "image present in run args");
+        // The tab records that it is containerized + the image used.
+        assert!(app.tabs[0].meta.containerized);
+        assert_eq!(app.tabs[0].meta.container_image, Some(image));
+    }
+
+    #[test]
+    fn create_tab_refused_when_image_missing() {
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new(); // no image registered
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+
+        let err = app.dispatch(new_tab_cmd(), &svc).unwrap_err();
+        assert!(err.to_string().contains("image"), "got: {err}");
+        // Placeholder tab is removed on failure (no dead state).
+        assert!(app.tabs.is_empty());
+        assert_eq!(pty.spawns().len(), 0, "nothing spawned");
+    }
+
+    #[test]
+    fn refused_when_runtime_unavailable() {
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new();
+        container.set_unavailable("podman machine not running");
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+
+        // Validation fails before any git mutation (no worktree added).
+        assert!(app.dispatch(new_tab_cmd(), &svc).is_err());
+        assert!(git.added_worktrees().is_empty());
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn child_shell_execs_into_container() {
+        let image = project_image();
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(image);
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+        app.dispatch(new_tab_cmd(), &svc).unwrap();
+        let name = container_name(&app.tabs[0].meta.id);
+
+        app.dispatch(Command::NewChildTerminal, &svc).unwrap();
+        let last = pty.spawns().pop().unwrap();
+        assert_eq!(last.0, "podman");
+        assert_eq!(last.1[0], "exec");
+        assert_eq!(last.1[1], "-it");
+        assert_eq!(last.1[2], name, "execs into the agent's container");
+    }
+
+    #[test]
+    fn force_close_removes_the_container() {
+        let image = project_image();
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(image);
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+        app.dispatch(new_tab_cmd(), &svc).unwrap();
+        let name = container_name(&app.tabs[0].meta.id);
+
+        app.dispatch(
+            Command::CloseAgentTab {
+                action: Some(CloseAction::ForceTerminate),
+            },
+            &svc,
+        )
+        .unwrap();
+        assert!(app.tabs.is_empty());
+        assert!(
+            container
+                .removed_containers()
+                .iter()
+                .any(|(n, f)| n == &name && *f),
+            "container force-removed on close"
+        );
+    }
+
+    #[test]
+    fn resume_reattaches_to_running_container() {
+        let mut config = exec_config();
+        config.ui.default_agent = "opencode".to_string();
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.containerized = true;
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let name = container_name("r");
+        let container = FakeContainerRuntime::new();
+        container.set_container_state(&name, ContainerState::Running);
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+
+        let started = app.resume_agents(&svc);
+        assert_eq!(started, 1, "reattaches to the running container");
+        let spawns = pty.spawns();
+        assert_eq!(spawns[0].0, "podman");
+        assert_eq!(spawns[0].1, vec!["attach".to_string(), name]);
+    }
+
+    #[test]
+    fn resume_skips_exited_container_as_session_lost() {
+        let config = exec_config();
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.containerized = true;
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        // Container is absent/exited (default) → never auto-relaunched.
+        let container = FakeContainerRuntime::new();
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+
+        let started = app.resume_agents(&svc);
+        assert_eq!(started, 0, "exited container stays session-lost");
+        assert_eq!(pty.spawns().len(), 0);
     }
 }
