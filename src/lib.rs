@@ -88,6 +88,8 @@ pub fn run() -> Result<()> {
         Some("setup-status") => return run_setup_status(),
         // Enable OS notifications in config (off by default).
         Some("setup-notifications") => return run_setup_notifications(),
+        // Enable the opt-in once-a-day update notice in config (SPECS §30).
+        Some("setup-update") => return run_setup_update(),
         // Self-update installer-based installs from GitHub Releases (SPECS §29).
         Some("update") => return update::run(),
         _ => {}
@@ -283,6 +285,53 @@ fn run_setup_notifications() -> Result<()> {
     Ok(())
 }
 
+/// `flightdeck setup-update`: turn on the opt-in update notice by setting
+/// `update.check = true` in `<repo>/.flightdeck/config.toml` (creating the
+/// config on first run), then explain the behavior. Does not launch the TUI
+/// (SPECS §24, §30). The check is off by default because it makes a network
+/// request on launch; this is the quick way to opt in without hand-editing.
+fn run_setup_update() -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
+    let git = GitCli::discover(&cwd).map_err(|_| {
+        FlightDeckError::Git(
+            "not inside a Git repository (run `flightdeck setup-update` from a git project)"
+                .to_string(),
+        )
+    })?;
+    let repo_root = git.root().to_path_buf();
+    let fs = RealFs;
+    let config_path = repo_root.join(".flightdeck").join("config.toml");
+
+    // Ensure a config exists (first run writes the default), then load it.
+    if !fs.exists(&config_path) {
+        let project_name = derive_project_name(&repo_root);
+        let base_branch = detect_base_branch(&git, &cwd, None)?;
+        initialize(&fs, &repo_root, &project_name, &base_branch)?;
+    }
+    let mut config = load_config(&fs, &config_path)?;
+
+    if config.update.check {
+        println!(
+            "FlightDeck: the update notice is already enabled in {}.",
+            config_path.display()
+        );
+    } else {
+        config.update.check = true;
+        fs.write(&config_path, &serialize_config(&config)?)?;
+        println!(
+            "FlightDeck: enabled the update notice in {}.",
+            config_path.display()
+        );
+    }
+    println!();
+    println!("On startup FlightDeck will check GitHub Releases at most once a day (in the");
+    println!("background) and show a status-bar hint when a newer version is available.");
+    println!("It never auto-updates — run `flightdeck update` (or `brew upgrade flightdeck`).");
+    println!("Disable any time by setting `check = false` under [update].");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Startup (SPECS §4, §7, §10, §13) — terminal-free, returns the built AppState.
 // ---------------------------------------------------------------------------
@@ -385,6 +434,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    setup-status           Install the opt-in precise agent-status integrations");
     println!("    setup-notifications    Enable OS notifications when agents finish");
+    println!("    setup-update           Enable the opt-in once-a-day update notice");
     println!("    update                 Update FlightDeck to the latest release");
     println!();
     println!("OPTIONS:");
@@ -551,6 +601,18 @@ fn event_loop(
     let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
     let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
     let mut status_in_flight = false;
+
+    // Opt-in once-a-day update notice (SPECS §30): surface any cached "newer
+    // version" finding immediately and, when due, kick off a background check.
+    // Never blocks startup; disabled installs return `None` and never spawn.
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+    if let Some(latest) = crate::update::start_check(
+        state.config.update.check,
+        services.clock.now_unix_secs(),
+        update_tx,
+    ) {
+        state.update_available = Some(latest);
+    }
     // Serializes THIS instance's `git worktree add`s so two quick new-tab
     // requests don't race on the repo's index/worktree locks.
     let git_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -572,6 +634,11 @@ fn event_loop(
                 }
                 StatusMsg::Done => status_in_flight = false,
             }
+        }
+
+        // --- Apply a completed background update check (SPECS §30). ---
+        while let Ok(latest) = update_rx.try_recv() {
+            state.update_available = Some(latest);
         }
 
         // --- Poll opt-in agent status files (precise idle/working signals). ---

@@ -25,6 +25,10 @@ path = "src/main.rs"
 # updater at our GitHub Releases. See src/update.rs.
 axoupdater = { version = "0.10", features = ["blocking"] }
 crossterm = "0.29.0"
+# Drives axoupdater's async `query_new_version` from the background update-check
+# thread (the opt-in once-a-day notice). A current-thread runtime; tokio is
+# already in the graph via axoupdater's `blocking` feature.
+tokio = { version = "1", features = ["rt", "net", "time"] }
 portable-pty = "0.9.0"
 ratatui = "0.30.2"
 serde = { version = "1.0.228", features = ["derive"] }

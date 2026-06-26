@@ -14,9 +14,18 @@
 //! to the package manager and exit cleanly.
 
 use crate::contracts::error::{FlightDeckError, Result};
+use axoupdater::Version;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 
 /// App name as recorded in the install receipt and GitHub Release artifacts.
 const APP_NAME: &str = "flightdeck";
+/// GitHub coordinates of the published releases (mirrors `dist-workspace.toml`).
+const RELEASE_OWNER: &str = "neworange-ruud";
+const RELEASE_REPO: &str = "flightdeck";
+/// Minimum gap between background update checks: once a day (SPECS §30).
+const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// `flightdeck update`: check GitHub Releases and replace the running binary in
 /// place when a newer version exists. Does not launch the TUI and does not
@@ -74,6 +83,150 @@ fn no_receipt_guidance() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in update notice (SPECS §30)
+// ---------------------------------------------------------------------------
+//
+// When `[update] check = true`, FlightDeck makes a once-a-day background check
+// against GitHub Releases on startup and surfaces a status-bar hint when a newer
+// release than the running binary exists. It is strictly a *notice*: it never
+// downloads or replaces anything (that stays the explicit `flightdeck update`),
+// never blocks startup (it runs on a background thread), and swallows every
+// error (offline, rate-limited, unparsable cache) so it can't disrupt the app.
+//
+// The check uses `query_new_version`, which only needs the release source — it
+// does NOT rely on an install receipt, so the notice works for Homebrew installs
+// too (the common case), even though those defer to `brew upgrade` to actually
+// update.
+
+/// On-disk record of the last check, so a restart within the interval reuses the
+/// result instead of hitting the network again. Stored per-user (not per-repo).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CheckCache {
+    /// Wall-clock seconds of the last completed check.
+    last_check_unix: u64,
+    /// Latest version string seen at that check (may equal the running version).
+    latest_version: String,
+}
+
+/// The GitHub release source the check queries.
+fn release_source() -> axoupdater::ReleaseSource {
+    axoupdater::ReleaseSource {
+        release_type: axoupdater::ReleaseSourceType::GitHub,
+        owner: RELEASE_OWNER.to_string(),
+        name: RELEASE_REPO.to_string(),
+        app_name: APP_NAME.to_string(),
+    }
+}
+
+/// This binary's compiled version.
+fn current_version() -> Option<Version> {
+    Version::parse(env!("CARGO_PKG_VERSION")).ok()
+}
+
+/// Per-user cache file (global, not repo-scoped). macOS-first; honors
+/// `FLIGHTDECK_UPDATE_CACHE` (tests) and `XDG_CACHE_HOME` when set.
+fn cache_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("FLIGHTDECK_UPDATE_CACHE") {
+        return Some(PathBuf::from(explicit));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        return Some(
+            PathBuf::from(xdg)
+                .join("flightdeck")
+                .join("update-check.json"),
+        );
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/flightdeck/update-check.json"))
+}
+
+/// Pure: is a fresh check due, given the last check time and now?
+fn is_due(now_unix: u64, last_check_unix: u64) -> bool {
+    now_unix.saturating_sub(last_check_unix) >= CHECK_INTERVAL_SECS
+}
+
+/// Pure: given the cached check (if any), now, and the running version, decide
+/// whether a fresh network check is due and what notice the cache alone already
+/// justifies (a newer version seen on the last check that we still haven't
+/// caught up to). Keeping this pure makes the once-a-day logic unit-testable
+/// without touching the disk or network.
+fn evaluate(
+    cache: Option<&CheckCache>,
+    now_unix: u64,
+    current: &Version,
+) -> (bool, Option<String>) {
+    let due = cache.is_none_or(|c| is_due(now_unix, c.last_check_unix));
+    let cached_notice = cache
+        .and_then(|c| Version::parse(&c.latest_version).ok())
+        .filter(|latest| latest > current)
+        .map(|latest| latest.to_string());
+    (due, cached_notice)
+}
+
+/// Query GitHub Releases for the latest version. Works regardless of install
+/// method (no receipt required). Returns `None` on any error so the check is
+/// always best-effort. Blocking — call it on a background thread.
+fn fetch_latest_version() -> Option<Version> {
+    let mut updater = axoupdater::AxoUpdater::new_for(APP_NAME);
+    updater.set_release_source(release_source());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    match rt.block_on(updater.query_new_version()) {
+        Ok(Some(latest)) => Some(latest.clone()),
+        _ => None,
+    }
+}
+
+fn read_cache() -> Option<CheckCache> {
+    let raw = std::fs::read_to_string(cache_path()?).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_cache(cache: &CheckCache) {
+    let Some(path) = cache_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Start the opt-in update check (SPECS §30). Returns an immediate notice (the
+/// latest version string) when a *cached* result already shows a newer release,
+/// so a restart surfaces yesterday's finding instantly. When a fresh check is
+/// due (a day has elapsed, or no cache exists) it additionally spawns a
+/// background thread that queries GitHub, refreshes the cache, and sends any
+/// newer version over `tx`. A no-op returning `None` when `enabled` is false.
+///
+/// `now_unix` is the current wall-clock time ([`crate::contracts::Clock::now_unix_secs`]).
+pub fn start_check(enabled: bool, now_unix: u64, tx: Sender<String>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let current = current_version()?;
+    let (due, cached_notice) = evaluate(read_cache().as_ref(), now_unix, &current);
+
+    if due {
+        std::thread::spawn(move || {
+            let Some(latest) = fetch_latest_version() else {
+                return;
+            };
+            write_cache(&CheckCache {
+                last_check_unix: now_unix,
+                latest_version: latest.to_string(),
+            });
+            if latest > current {
+                let _ = tx.send(latest.to_string());
+            }
+        });
+    }
+    cached_notice
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +249,69 @@ mod tests {
             !msg.to_lowercase().contains("updated"),
             "guidance must not imply a self-update happened: {msg}"
         );
+    }
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn check_is_due_only_after_a_full_day() {
+        let last = 1_000_000;
+        assert!(!is_due(last, last), "same instant is not due");
+        assert!(
+            !is_due(last + CHECK_INTERVAL_SECS - 1, last),
+            "just under a day is not due"
+        );
+        assert!(
+            is_due(last + CHECK_INTERVAL_SECS, last),
+            "exactly a day is due"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_no_cache_is_due_and_silent() {
+        let (due, notice) = evaluate(None, 5_000_000, &v("1.0.2"));
+        assert!(due, "missing cache must trigger a fresh check");
+        assert_eq!(notice, None, "no cached version means no notice yet");
+    }
+
+    #[test]
+    fn evaluate_surfaces_cached_newer_version_without_rechecking() {
+        let cache = CheckCache {
+            last_check_unix: 5_000_000,
+            latest_version: "1.0.3".to_string(),
+        };
+        // 1 hour later: not due, but the cache already knows 1.0.3 > 1.0.2.
+        let (due, notice) = evaluate(Some(&cache), 5_000_000 + 3600, &v("1.0.2"));
+        assert!(!due, "within the interval, no fresh check");
+        assert_eq!(notice.as_deref(), Some("1.0.3"));
+    }
+
+    #[test]
+    fn evaluate_is_silent_when_cache_matches_current_version() {
+        let cache = CheckCache {
+            last_check_unix: 5_000_000,
+            latest_version: "1.0.3".to_string(),
+        };
+        // Already on the latest the cache knows about → no notice.
+        let (_due, notice) = evaluate(Some(&cache), 5_000_000 + 3600, &v("1.0.3"));
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn evaluate_rechecks_after_a_day_even_with_a_cache() {
+        let cache = CheckCache {
+            last_check_unix: 5_000_000,
+            latest_version: "1.0.2".to_string(),
+        };
+        let (due, _notice) = evaluate(Some(&cache), 5_000_000 + CHECK_INTERVAL_SECS, &v("1.0.2"));
+        assert!(due, "a day later the check is due again");
+    }
+
+    #[test]
+    fn start_check_disabled_is_a_noop() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert_eq!(start_check(false, 5_000_000, tx), None);
     }
 }

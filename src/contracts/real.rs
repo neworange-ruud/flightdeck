@@ -72,6 +72,13 @@ impl Clock for RealClock {
             .unwrap_or_default()
             .as_millis() as u64
     }
+
+    fn now_unix_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
 }
 
 /// Format a Unix timestamp (seconds) as a UTC ISO-8601 string.

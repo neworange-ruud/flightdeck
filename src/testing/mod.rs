@@ -662,6 +662,7 @@ impl PtySession for FakePtySession {
 pub struct FakeClock {
     now: String,
     millis: Arc<Mutex<u64>>,
+    unix_secs: Arc<Mutex<u64>>,
 }
 
 impl Default for FakeClock {
@@ -669,6 +670,7 @@ impl Default for FakeClock {
         FakeClock {
             now: "2026-01-01T00:00:00Z".to_string(),
             millis: Arc::new(Mutex::new(0)),
+            unix_secs: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -679,6 +681,7 @@ impl FakeClock {
         FakeClock {
             now: now.into(),
             millis: Arc::new(Mutex::new(0)),
+            unix_secs: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -691,6 +694,11 @@ impl FakeClock {
     pub fn advance_millis(&self, delta: u64) {
         *self.millis.lock().unwrap() += delta;
     }
+
+    /// Set the value returned by [`Clock::now_unix_secs`].
+    pub fn set_unix_secs(&self, secs: u64) {
+        *self.unix_secs.lock().unwrap() = secs;
+    }
 }
 
 impl Clock for FakeClock {
@@ -700,6 +708,10 @@ impl Clock for FakeClock {
 
     fn now_millis(&self) -> u64 {
         *self.millis.lock().unwrap()
+    }
+
+    fn now_unix_secs(&self) -> u64 {
+        *self.unix_secs.lock().unwrap()
     }
 }
 

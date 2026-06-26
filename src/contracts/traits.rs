@@ -136,4 +136,9 @@ pub trait Clock {
     /// detection, SPECS §24). Only *differences* are meaningful; the absolute
     /// origin is unspecified. Tests can advance this deterministically.
     fn now_millis(&self) -> u64;
+
+    /// Wall-clock seconds since the Unix epoch. Unlike [`Clock::now_millis`]
+    /// this is real calendar time, so it survives process restarts — used by the
+    /// once-a-day update check (SPECS §30) to decide whether a day has elapsed.
+    fn now_unix_secs(&self) -> u64;
 }
