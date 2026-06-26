@@ -1084,16 +1084,22 @@ updates work from anywhere.
 
 The boundary that makes this safe is the **install receipt**. FlightDeck ships
 through two channels: the shell installer (writes a receipt recording the
-binary location and release source) and a Homebrew tap (no receipt).
+binary location and release source) and a Homebrew tap (no receipt). FlightDeck
+self-updates **only** when a receipt exists *and* it was written for the running
+executable.
 
-- **Receipt present** (shell-installer install): query GitHub Releases, and if a
-  newer version exists, download and replace the running binary, then tell the
-  user to restart. If already current, say so.
-- **Receipt absent** (Homebrew, `cargo install`, hand-copied binary): FlightDeck
-  **must not** self-replace the binary — that would desync the managing package
-  manager. It prints guidance instead: Homebrew users run `brew upgrade
-  flightdeck`; others re-run the installer. A missing receipt is **not** an
-  error (exit 0).
+- **Receipt present and for this binary** (shell-installer install): query
+  GitHub Releases, and if a newer version exists, download and replace the
+  running binary, then tell the user to restart. If already current, say so.
+- **Receipt absent, or present but for a different binary** (Homebrew, `cargo
+  install`, hand-copied binary, or a stale/foreign receipt left by a
+  since-removed installer copy): FlightDeck **must not** self-replace the binary
+  — that would desync the managing package manager. It prints guidance instead:
+  Homebrew users run `brew upgrade flightdeck`; others re-run the installer. This
+  is **not** an error (exit 0). The match is verified by comparing the receipt's
+  install path against the running executable's path; a non-matching receipt is
+  treated exactly like a missing one, so a leftover receipt can never produce a
+  misleading "already up to date".
 
 FlightDeck never auto-updates silently: downloading and replacing the binary is
 always an explicit, user-invoked command. (The optional update *notice* in §30

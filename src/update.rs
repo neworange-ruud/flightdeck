@@ -7,11 +7,13 @@
 //! binary lives and where its releases are hosted. Homebrew, `cargo install`,
 //! and hand-copied binaries leave no receipt.
 //!
-//! That receipt is also our package-manager guard: if it is absent we must
-//! **not** self-replace the binary, because doing so would desync the managing
-//! package manager (Homebrew's formula would still believe the old version is
-//! installed). So a missing receipt is not an error — it is the signal to defer
-//! to the package manager and exit cleanly.
+//! That receipt is also our package-manager guard: we self-update **only** when
+//! a receipt exists *and* it was written for the running executable. If it is
+//! absent (Homebrew/manual), or present but for a binary at a different path (a
+//! stale/foreign receipt, or a moved binary), self-replacing would desync the
+//! managing package manager (its formula would still believe the old version is
+//! installed). Neither case is an error — both are the signal to defer to the
+//! package manager and exit cleanly.
 
 use crate::contracts::error::{FlightDeckError, Result};
 use axoupdater::Version;
@@ -32,15 +34,28 @@ const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 /// require being inside a Git repository — updates work from anywhere.
 ///
 /// Installer-based installs self-update; everything else (Homebrew, `cargo
-/// install`, manual copies) is detected via the absent receipt and deferred to
-/// the package manager (see [`no_receipt_guidance`]).
+/// install`, manual copies) is deferred to the package manager (see
+/// [`not_self_updatable_guidance`]).
 pub fn run() -> Result<()> {
     let mut updater = axoupdater::AxoUpdater::new_for(APP_NAME);
 
-    // The receipt doubles as the package-manager guard: no receipt => not an
-    // installer install => defer rather than clobber a managed binary.
-    if updater.load_receipt().is_err() {
-        println!("{}", no_receipt_guidance());
+    // The receipt is the package-manager guard, but only when it actually
+    // belongs to THIS executable. `load_receipt` searching the user's config
+    // dirs can turn up a receipt for a *different* install (e.g. a stale one
+    // from a since-removed installer copy) even when the running binary came
+    // from Homebrew — `check_receipt_is_for_this_executable` compares install
+    // paths to catch that. If we self-updated on a foreign receipt, axoupdater's
+    // own eligibility check makes `run_sync` a no-op, which would otherwise be
+    // reported as the misleading "already up to date". So we gate on both and
+    // defer when either fails. (The eligibility check requires a loaded
+    // receipt, hence the short-circuit.)
+    let receipt_loaded = updater.load_receipt().is_ok();
+    let receipt_matches_executable = receipt_loaded
+        && updater
+            .check_receipt_is_for_this_executable()
+            .unwrap_or(false);
+    if must_defer(receipt_loaded, receipt_matches_executable) {
+        println!("{}", not_self_updatable_guidance());
         return Ok(());
     }
 
@@ -66,13 +81,23 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Guidance printed when no install receipt is found. Kept pure (no I/O) so the
-/// deferral path is unit-testable: it must steer Homebrew users to `brew
-/// upgrade` and never imply a self-update happened.
-fn no_receipt_guidance() -> String {
+/// Whether `flightdeck update` must defer to the package manager instead of
+/// self-replacing the binary: either there is no install receipt, or the receipt
+/// is for a different executable than the one running (a stale/foreign receipt,
+/// or a moved binary). Self-updating in either case would desync the managing
+/// package manager, so we defer. Pure, so the decision is unit-testable.
+fn must_defer(receipt_loaded: bool, receipt_matches_executable: bool) -> bool {
+    !receipt_loaded || !receipt_matches_executable
+}
+
+/// Guidance printed when this install can't be self-updated — no receipt, or a
+/// receipt that isn't for this binary. Kept pure (no I/O) so the deferral path
+/// is unit-testable: it must steer Homebrew users to `brew upgrade` and never
+/// imply a self-update happened.
+fn not_self_updatable_guidance() -> String {
     format!(
-        "FlightDeck: no install receipt found, so `{APP_NAME} update` can't self-update this \
-         install.\n\
+        "FlightDeck: this install can't self-update via `{APP_NAME} update` (no install \
+         receipt for this binary).\n\
          \n\
          If you installed via Homebrew, update with:\n\
          \x20\x20brew upgrade {APP_NAME}\n\
@@ -232,8 +257,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_receipt_guidance_defers_to_homebrew() {
-        let msg = no_receipt_guidance();
+    fn not_self_updatable_guidance_defers_to_homebrew() {
+        let msg = not_self_updatable_guidance();
         // Must point Homebrew users at the package manager, not self-update.
         assert!(
             msg.contains("brew upgrade flightdeck"),
@@ -248,6 +273,22 @@ mod tests {
         assert!(
             !msg.to_lowercase().contains("updated"),
             "guidance must not imply a self-update happened: {msg}"
+        );
+    }
+
+    #[test]
+    fn must_defer_unless_receipt_is_for_this_executable() {
+        // The only case that self-updates: a receipt that exists AND matches the
+        // running binary.
+        assert!(!must_defer(true, true), "eligible install must self-update");
+        // No receipt at all (Homebrew, manual copy).
+        assert!(must_defer(false, false), "no receipt must defer");
+        // Receipt present but for a different binary (stale/foreign receipt, or a
+        // moved binary). This is the case that previously produced a misleading
+        // "already up to date" — it must defer instead.
+        assert!(
+            must_defer(true, false),
+            "a receipt for another executable must defer, not self-update"
         );
     }
 
