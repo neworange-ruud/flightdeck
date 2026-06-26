@@ -1310,6 +1310,8 @@ mod tests {
                 recovered: false,
                 last_known_status: "unknown".to_string(),
                 manual_status: None,
+                containerized: false,
+                container_image: None,
             });
         }
         AppState::new(Config::default(), ps, "/repo", "/repo/state.json")

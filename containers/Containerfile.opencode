@@ -1,0 +1,25 @@
+# OPTIONAL reference base image for the opencode (sst) agent (SPECS §31).
+#
+# Not needed for the default flow — `flightdeck image build opencode` builds a
+# self-contained image from docker.io/library/node. Use this only to pre-build a
+# base and point `execution.base_image` at it. Verify the opencode package name
+# for your distribution before building.
+#
+#   podman build -t flightdeck-opencode-base:latest -f containers/Containerfile.opencode containers
+#
+# See Containerfile.claude for the base-image contract.
+FROM docker.io/library/node:22-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl ripgrep less zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the opencode CLI.
+RUN npm install -g opencode-ai
+
+RUN useradd --create-home --shell /usr/bin/zsh agent \
+    && mkdir -p /home/agent/.local/state /home/agent/.local/share /home/agent/.config /home/agent/.cache \
+    && chmod -R 0777 /home/agent
+USER agent
+WORKDIR /workspace

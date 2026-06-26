@@ -123,6 +123,8 @@ fn flags_stale_state_entry_when_worktree_dir_removed() {
         recovered: false,
         last_known_status: "running".to_string(),
         manual_status: None,
+        containerized: false,
+        container_image: None,
     });
 
     let report = recover(&fs, &git_cli, &root, &worktrees_root, &mut state).expect("recover");

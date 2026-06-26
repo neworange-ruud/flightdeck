@@ -1129,3 +1129,57 @@ purely informational and is governed by these rules:
 - **Notice ≠ update.** It never downloads or replaces anything; acting on it is
   the user's explicit choice (`flightdeck update`, or `brew upgrade flightdeck`
   for Homebrew installs).
+
+## 31. Container Execution
+
+An **opt-in** model for running agents inside isolated, rootless **Podman**
+containers instead of directly on the host. Off by default; when enabled it is
+**project-wide** (all agents run in containers, or none do).
+
+- **Single toggle.** `[containers] enabled` in `config.toml`. Absent table or
+  `false` ⇒ today's local model, bit-for-bit. Every `[containers]` field is
+  optional. Runtime is `podman` only in v1 (behind a trait so Docker can follow).
+- **Workspace = bind-mounted host worktree.** The agent's git worktree stays on
+  the host and is bind-mounted at `/workspace` with `--userns keep-id --user
+  <host-uid>` so the agent owns it. The host keeps owning the worktree and **all**
+  git operations — there is no diff/apply/sync layer (SPECS §5 boundary intact).
+- **The `PtyBackend` is unchanged.** `run`/`attach`/`exec` are ordinary `podman`
+  argv handed to the existing backend. All argv is built by the pure functions in
+  `src/runtime/container.rs`; the non-interactive control plane (build, inspect,
+  remove, list) is the `ContainerRuntime` trait (`src/runtime/podman.rs` real,
+  fake in `src/testing`).
+- **Deterministic identity.** A container is named `flightdeck-<tab-id>` and
+  labelled `flightdeck.tab` / `flightdeck.repo`. The name derives purely from the
+  persisted tab id, so child-shell `exec`, reattach, and teardown reconstruct it
+  with no runtime id captured at spawn.
+- **Child shells run inside the container.** `Ctrl-t` does `podman exec -it
+  flightdeck-<id> <shell>`, sharing `/workspace` and the toolchain.
+- **Persist & reattach.** The primary is started **detached** (`podman run -d
+  -it --rm`) and driven via `podman attach`, so it survives FlightDeck (the
+  client) quitting. On resume a still-running container is reattached; if it is
+  gone, a fresh one is started (matching how local agents resume, so a tab is
+  never left agent-less). Teardown (force-close / abandon / merge) removes the
+  container.
+- **Hard guardrails (non-disableable).** Enforced by `src/runtime/guards.rs`
+  before every `run`: no `--privileged`, no docker/podman socket mount, no
+  `--env-host`, no `$HOME` mount, loopback-only port publishing. Plus
+  `--cap-drop all` and `--security-opt no-new-privileges`. These cannot be
+  relaxed by config.
+- **Network.** Full outbound in v1 (an egress allowlist is a planned follow-up;
+  the builder leaves a seam for a proxy sidecar).
+- **Auth.** With no `[containers.auth]` configured (and the default base image),
+  FlightDeck passes the host agent's credentials through automatically — the
+  agent's config dir is bind-mounted writable into the container home (so an
+  existing login carries over and a fresh one persists) and known API-key env
+  vars are injected when present. Absent host paths are skipped. Projects can
+  override with explicit `auth.mounts` / `auth.env_allow`.
+- **Ports.** `containers.forward_ports` publishes `127.0.0.1:<port>:<port>`.
+- **Images.** By default `flightdeck image build [agent]` generates a
+  **self-contained** image from a trusted, fully-qualified public base
+  (`docker.io/library/node`), installing the agent CLI and creating the
+  UID-mappable `agent` user — no pre-built local base required. Per-project
+  customization layers on top: declarative `packages` + `setup_script`, an
+  overridable `base_image` (pre-built/pinned base), or a bring-your-own
+  `containerfile`. A `flightdeck.build` label hash detects staleness. The fast
+  launch path never builds — a missing image is refused with guidance;
+  `flightdeck doctor` reports readiness.

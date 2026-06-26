@@ -1,0 +1,34 @@
+# OPTIONAL reference base image for the Claude Code agent (SPECS §31).
+#
+# You do NOT need this for the default flow: `flightdeck image build claude`
+# generates a self-contained image from a trusted public base
+# (docker.io/library/node) with no pre-built local base required.
+#
+# This file is for users who prefer to pre-build a base and point
+# `execution.base_image` at it (e.g. to pin/customize the toolchain):
+#
+#   podman build -t flightdeck-claude-base:latest -f containers/Containerfile.claude containers
+#   # then in .flightdeck/config.toml:  [containers] base_image = "localhost/flightdeck-claude-base:latest"
+#
+# Base-image contract (when used as base_image):
+#   - Debian-family (so the customization layer can `apt-get install`).
+#   - A non-root user named `agent` (FlightDeck maps the host UID onto it via
+#     `--userns keep-id --user <uid>`, so /workspace is writable).
+#   - The agent CLI on PATH.
+FROM docker.io/library/node:22-bookworm-slim
+
+# Tooling the agent and child shells commonly need.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl ripgrep less zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the Claude Code CLI.
+RUN npm install -g @anthropic-ai/claude-code
+
+# Non-root user (UID-mapped at run time via --userns keep-id).
+RUN useradd --create-home --shell /usr/bin/zsh agent \
+    && mkdir -p /home/agent/.local/state /home/agent/.local/share /home/agent/.config /home/agent/.cache \
+    && chmod -R 0777 /home/agent
+USER agent
+WORKDIR /workspace

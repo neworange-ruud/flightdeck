@@ -54,6 +54,8 @@ mod tests {
             recovered: false,
             last_known_status: "running".to_string(),
             manual_status: None,
+            containerized: false,
+            container_image: None,
         }
     }
 

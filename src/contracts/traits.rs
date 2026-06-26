@@ -7,7 +7,7 @@
 //! boundary is enforced by construction.
 
 use crate::contracts::domain::{
-    MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+    ContainerState, MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
 };
 use crate::contracts::error::Result;
 use std::path::{Path, PathBuf};
@@ -141,4 +141,43 @@ pub trait Clock {
     /// this is real calendar time, so it survives process restarts — used by the
     /// once-a-day update check (SPECS §30) to decide whether a day has elapsed.
     fn now_unix_secs(&self) -> u64;
+}
+
+/// The container runtime control plane (SPECS §31).
+///
+/// This trait covers only the **non-interactive** `podman` operations —
+/// building images, inspecting/removing containers, and discovery. The
+/// interactive operations (`run`/`attach`/`exec`) are expressed as ordinary
+/// argv handed to the existing [`PtyBackend`], so they are *not* here. A seam
+/// like [`GitExecutor`]: the real impl shells out, tests use a fake (SPECS §27).
+pub trait ContainerRuntime {
+    /// Whether the runtime is usable (binary on `PATH`, machine up). Returns a
+    /// descriptive [`crate::contracts::FlightDeckError::Refused`] otherwise.
+    fn available(&self) -> Result<()>;
+    /// Whether a local image with `tag` exists.
+    fn image_exists(&self, tag: &str) -> Result<bool>;
+    /// Read a label off a local image, if the image and label both exist.
+    fn image_label(&self, tag: &str, key: &str) -> Result<Option<String>>;
+    /// Build `tag` from `containerfile` with `context` as the build context,
+    /// baking `labels` into the image (e.g. the staleness `flightdeck.build`).
+    fn build_image(
+        &self,
+        tag: &str,
+        containerfile: &Path,
+        context: &Path,
+        labels: &[(String, String)],
+    ) -> Result<()>;
+    /// Start a container **detached** by running `podman <run_args>` (where
+    /// `run_args` begins with `run -d …`). Returns once the container is up. The
+    /// detached container outlives the FlightDeck process, so its PTY can be
+    /// (re)connected with `podman attach` (SPECS §31).
+    fn start_detached(&self, run_args: &[String]) -> Result<()>;
+    /// Liveness of the named container.
+    fn container_state(&self, name: &str) -> Result<ContainerState>;
+    /// Remove the named container. `force` removes a running one.
+    fn remove_container(&self, name: &str, force: bool) -> Result<()>;
+    /// Names of containers carrying `label` (e.g. `flightdeck.repo=<hash>`).
+    fn list_by_label(&self, label: &str) -> Result<Vec<String>>;
+    /// The host UID to map into the container (`--userns keep-id --user <uid>`).
+    fn host_uid(&self) -> u32;
 }
