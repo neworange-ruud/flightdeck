@@ -1410,7 +1410,10 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             for (i, (_key, display)) in agents.iter().enumerate() {
                 parts.push(format!("[{}] {}", i + 1, display));
             }
-            format!("New Agent Tab — pick agent: {}  (Esc cancel)", parts.join("  "))
+            format!(
+                "New Agent Tab — pick agent: {}  (Esc cancel)",
+                parts.join("  ")
+            )
         }
         Prompt::NewTabName { .. } => {
             format!("New Agent Tab name: {buffer}_   (Enter to create, Esc to cancel)")
