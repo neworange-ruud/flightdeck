@@ -131,9 +131,9 @@ pub enum Command {
     /// Copy `.env.local` or `.env` from the base folder into the selected worktree.
     CopyEnvFile,
     /// Abandon (remove) the selected tab's worktree (SPECS §5/§15). With
-    /// `confirm` false, a dirty worktree returns [`Effect::AbandonWarning`]
-    /// instead of removing; with `confirm` true the worktree is force-removed
-    /// even with uncommitted changes.
+    /// `confirm` false it always returns [`Effect::AbandonWarning`] so the UI
+    /// confirms first (even for a clean worktree); with `confirm` true the
+    /// worktree is removed, force-removing any uncommitted changes.
     AbandonWorktree {
         /// Whether the user confirmed discarding uncommitted changes.
         confirm: bool,
@@ -185,9 +185,13 @@ pub enum Effect {
     /// The push warning + the plan that triggered it; the UI offers the options
     /// and re-dispatches `PushBranch { confirm: Some(..) }` (SPECS §14).
     PushWarning(PushPlan),
-    /// The selected tab's worktree has uncommitted changes; the UI must confirm
-    /// before re-dispatching `AbandonWorktree { confirm: true }` (SPECS §5/§15).
-    AbandonWarning,
+    /// The UI must confirm before re-dispatching `AbandonWorktree { confirm: true }`
+    /// (SPECS §5/§15). Abandoning always asks first; `dirty` is true when the
+    /// worktree has uncommitted changes, so the prompt can warn they'll be lost.
+    AbandonWarning {
+        /// Whether the worktree has uncommitted changes that would be discarded.
+        dirty: bool,
+    },
     /// The merge is ready and awaits explicit confirmation; the UI confirms then
     /// re-dispatches `FinishLocalMerge { confirm: true }` (SPECS §15). On success
     /// the worktree is removed and the tab closed, so a running agent is stopped.
