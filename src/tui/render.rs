@@ -1113,6 +1113,10 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     let mut items: Vec<ListItem> = Vec::new();
     for (i, entry) in filtered.iter().enumerate() {
         if last_group != Some(entry.group) {
+            // Blank line above each group header (except the first) for breathing room.
+            if last_group.is_some() {
+                items.push(ListItem::new(Line::raw("")));
+            }
             last_group = Some(entry.group);
             items.push(ListItem::new(Line::from(Span::styled(
                 format!("  {}", entry.group),

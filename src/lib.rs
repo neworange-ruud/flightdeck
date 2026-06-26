@@ -629,8 +629,9 @@ enum Prompt {
     CloseTab { actions: Vec<CloseAction> },
     /// Confirm a push despite uncommitted changes (SPECS §14).
     PushConfirm,
-    /// Confirm abandoning a worktree that has uncommitted changes (SPECS §5/§15).
-    AbandonConfirm,
+    /// Confirm abandoning a worktree (SPECS §5/§15). `dirty` is true when it has
+    /// uncommitted changes that would be discarded, so the prompt can warn.
+    AbandonConfirm { dirty: bool },
     /// Confirm a local merge-back; on success the worktree is removed and the
     /// tab closed, stopping the agent if it is still running (SPECS §15).
     MergeConfirm {
@@ -1459,8 +1460,8 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         Effect::PushWarning(_plan) => {
             start_prompt(ui, Prompt::PushConfirm);
         }
-        Effect::AbandonWarning => {
-            start_prompt(ui, Prompt::AbandonConfirm);
+        Effect::AbandonWarning { dirty } => {
+            start_prompt(ui, Prompt::AbandonConfirm { dirty });
         }
         Effect::MergeConfirm {
             agent_branch,
@@ -1550,7 +1551,10 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             for (i, (_key, display)) in agents.iter().enumerate() {
                 parts.push(format!("[{}] {}", i + 1, display));
             }
-            format!("New Agent Tab — pick agent: {}  (Esc cancel)", parts.join("  "))
+            format!(
+                "New Agent Tab — pick agent: {}  (Esc cancel)",
+                parts.join("  ")
+            )
         }
         Prompt::NewTabName { .. } => {
             format!("New Agent Tab name: {buffer}_   (Enter to create, Esc to cancel)")
@@ -1573,9 +1577,13 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             "Worktree has uncommitted changes. [p] push committed only  [c] cancel  (Esc cancel)"
                 .to_string()
         }
-        Prompt::AbandonConfirm => {
-            "Worktree has uncommitted changes — discard them? [y] abandon (force)  [n] cancel  (Esc cancel)"
-                .to_string()
+        Prompt::AbandonConfirm { dirty } => {
+            if *dirty {
+                "Worktree has uncommitted changes — discard them? [y] abandon (force)  [n] cancel  (Esc cancel)"
+                    .to_string()
+            } else {
+                "Abandon this worktree? [y] abandon  [n] cancel  (Esc cancel)".to_string()
+            }
         }
         Prompt::MergeConfirm {
             agent_branch,
@@ -1781,7 +1789,7 @@ fn handle_prompt_key(
                 None => ui.prompt = Some(pstate),
             }
         }
-        Prompt::AbandonConfirm => match key.code {
+        Prompt::AbandonConfirm { .. } => match key.code {
             KeyCode::Char('y') => {
                 let result = state.dispatch(Command::AbandonWorktree { confirm: true }, services);
                 finish_prompt(result, ui);
@@ -1834,7 +1842,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
             ui.message(format!("Attached to existing branch {branch}"))
         }
         Effect::PushWarning(_) => start_prompt(ui, Prompt::PushConfirm),
-        Effect::AbandonWarning => start_prompt(ui, Prompt::AbandonConfirm),
+        Effect::AbandonWarning { dirty } => start_prompt(ui, Prompt::AbandonConfirm { dirty }),
         Effect::MergeConfirm {
             agent_branch,
             base_branch,
@@ -2374,11 +2382,11 @@ mod tests {
     #[test]
     fn effect_abandon_warning_opens_abandon_prompt() {
         let mut ui = Ui::default();
-        apply_effect_no_state(Effect::AbandonWarning, &mut ui);
+        apply_effect_no_state(Effect::AbandonWarning { dirty: true }, &mut ui);
         assert!(ui.prompt.is_some());
         assert!(matches!(
             ui.prompt.as_ref().unwrap().prompt,
-            Prompt::AbandonConfirm
+            Prompt::AbandonConfirm { dirty: true }
         ));
     }
 
