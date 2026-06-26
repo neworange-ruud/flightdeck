@@ -233,50 +233,62 @@ pub fn draw(
 // Branded header (logo)
 // ---------------------------------------------------------------------------
 
-/// Left/right block-shade flourishes of the logo (a ░▒▓█ gradient).
-const LOGO_LEFT: &str = "░░░▒▒▒▓▓▓██████";
-const LOGO_RIGHT: &str = "██████▓▓▓▒▒▒░░░";
+/// The ░▒▓ gradient ramps that flank the wordmark, read *toward* the centered
+/// brand: solid blocks on the outside fade down to clear next to the text. The
+/// remaining width on each side is filled with solid `█` so the title bar spans
+/// the whole window (e.g. `█████▓▓▓▒▒▒░░░ · F L I G H T D E C K · ░░░▒▒▒▓▓▓█████`).
+const RAMP_IN: &str = "▓▓▓▒▒▒░░░";
+const RAMP_OUT: &str = "░░░▒▒▒▓▓▓";
 /// The brand wordmark, spaced (wide) and tight (narrow) variants.
-const BRAND_WIDE: &str = "   F · L · I · G · H · T · D · E · C · K   ";
-const BRAND_NARROW: &str = "  F·L·I·G·H·T·D·E·C·K  ";
+const BRAND_WIDE: &str = " · F L I G H T D E C K · ";
+const BRAND_NARROW: &str = " F·L·I·G·H·T·D·E·C·K ";
 
-/// Draw the full-width branded header, logo centered (best fit for the width).
+/// Draw the full-width branded header: the wordmark centered with the block
+/// gradient filling the row edge to edge.
 pub fn draw_header(frame: &mut Frame, area: Rect) {
     let line = header_line(area.width as usize);
     let para = Paragraph::new(line).alignment(Alignment::Center);
     frame.render_widget(para, area);
 }
 
-/// Build the centered logo [`Line`] for a given width: the wide wordmark when it
-/// fits, the tighter variant when it does not, and a plain truncated brand when
-/// even that is too wide. Exported for testing.
+/// Build the full-width logo [`Line`] for a given width: the wordmark (wide when
+/// it fits, tight when it does not) framed by the ░▒▓ ramps and padded with solid
+/// `█` blocks out to both edges so the bar always fills the window. Falls back to
+/// a plain truncated brand when even the tight framed form is too wide for the
+/// row. Exported for testing.
 pub fn header_line(width: usize) -> Line<'static> {
     let block_style = Style::default().fg(Color::Cyan);
     let brand_style = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
 
-    let flanks = LOGO_LEFT.chars().count() + LOGO_RIGHT.chars().count();
-    let wide_w = flanks + BRAND_WIDE.chars().count();
-    let narrow_w = flanks + BRAND_NARROW.chars().count();
+    let ramp = RAMP_IN.chars().count() + RAMP_OUT.chars().count();
 
-    if width >= wide_w {
-        Line::from(vec![
-            Span::styled(LOGO_LEFT, block_style),
-            Span::styled(BRAND_WIDE, brand_style),
-            Span::styled(LOGO_RIGHT, block_style),
-        ])
-    } else if width >= narrow_w {
-        Line::from(vec![
-            Span::styled(LOGO_LEFT, block_style),
-            Span::styled(BRAND_NARROW, brand_style),
-            Span::styled(LOGO_RIGHT, block_style),
-        ])
+    // Pick the widest wordmark whose framed form (brand + both ramps) fits.
+    let brand = if width >= BRAND_WIDE.chars().count() + ramp {
+        BRAND_WIDE
+    } else if width >= BRAND_NARROW.chars().count() + ramp {
+        BRAND_NARROW
     } else {
         // Too narrow for the framed logo: show the brand alone, truncated to fit.
-        let brand: String = "FLIGHTDECK".chars().take(width).collect();
-        Line::from(Span::styled(brand, brand_style))
-    }
+        let truncated: String = "FLIGHTDECK".chars().take(width).collect();
+        return Line::from(Span::styled(truncated, brand_style));
+    };
+
+    // Fill the leftover columns with solid blocks, split across both sides so the
+    // wordmark stays centered (any odd column goes to the right side).
+    let fill = width - (brand.chars().count() + ramp);
+    let left_blocks = fill / 2;
+    let right_blocks = fill - left_blocks;
+
+    Line::from(vec![
+        Span::styled(format!("{}{RAMP_IN}", "█".repeat(left_blocks)), block_style),
+        Span::styled(brand, brand_style),
+        Span::styled(
+            format!("{RAMP_OUT}{}", "█".repeat(right_blocks)),
+            block_style,
+        ),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,26 +1444,41 @@ mod tests {
     #[test]
     fn header_uses_wide_logo_when_space_allows() {
         let flat = flatten(&header_line(200));
-        assert!(
-            flat.contains("F · L · I · G · H · T"),
-            "wide brand: {flat:?}"
-        );
+        assert!(flat.contains("F L I G H T D E C K"), "wide brand: {flat:?}");
         assert!(flat.contains("██████"), "block flourish: {flat:?}");
     }
 
     #[test]
+    fn header_fills_the_full_window_width() {
+        // The title bar must span the entire width edge to edge, with blocks
+        // running out to both ends and the ░▒▓ ramps framing the wordmark.
+        for width in [50usize, 80, 120, 201] {
+            let line = header_line(width);
+            let flat = flatten(&line);
+            assert_eq!(
+                flat.chars().count(),
+                width,
+                "title bar must be exactly {width} cols: {flat:?}"
+            );
+            assert!(flat.starts_with('█'), "fills to the left edge: {flat:?}");
+            assert!(flat.ends_with('█'), "fills to the right edge: {flat:?}");
+            assert!(flat.contains("▓▓▓▒▒▒░░░"), "left ramp present: {flat:?}");
+        }
+    }
+
+    #[test]
     fn header_shrinks_to_narrow_logo_when_tight() {
-        // 60 cols fits the narrow logo but not the wide one.
-        let flat = flatten(&header_line(60));
+        // 40 cols fits the narrow logo (brand + ramps) but not the wide one.
+        let flat = flatten(&header_line(40));
         assert!(
             flat.contains("F·L·I·G·H·T·D·E·C·K"),
             "narrow brand: {flat:?}"
         );
         assert!(
-            !flat.contains("F · L"),
+            !flat.contains("F L I G H T"),
             "must not be the wide brand: {flat:?}"
         );
-        assert!(flat.contains("██████"), "block flourish: {flat:?}");
+        assert!(flat.contains("▓▓▓▒▒▒░░░"), "block ramp: {flat:?}");
     }
 
     #[test]
@@ -1475,7 +1502,7 @@ mod tests {
             .collect();
         // The logo (block flourish + brand) sits on the very first row.
         assert!(row0.contains("██████"), "logo row: {row0:?}");
-        assert!(row0.contains("F · L · I"), "brand on logo row: {row0:?}");
+        assert!(row0.contains("F L I G H T"), "brand on logo row: {row0:?}");
         // The divider fills the second row.
         assert!(
             row1.chars().filter(|&c| c == '─').count() > 100,

@@ -19,6 +19,11 @@ name = "flightdeck"
 path = "src/main.rs"
 
 [dependencies]
+# Self-update for installer-based installs (`flightdeck update`). The `blocking`
+# feature exposes the `*_sync` methods so we avoid pulling an async runtime into
+# the otherwise-synchronous TUI; `github_releases` (a default feature) points the
+# updater at our GitHub Releases. See src/update.rs.
+axoupdater = { version = "0.10", features = ["blocking"] }
 crossterm = "0.29.0"
 portable-pty = "0.9.0"
 ratatui = "0.30.2"

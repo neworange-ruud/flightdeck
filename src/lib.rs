@@ -18,6 +18,7 @@ pub mod notify;
 pub mod persistence;
 pub mod terminal;
 pub mod tui;
+pub mod update;
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
@@ -87,6 +88,8 @@ pub fn run() -> Result<()> {
         Some("setup-status") => return run_setup_status(),
         // Enable OS notifications in config (off by default).
         Some("setup-notifications") => return run_setup_notifications(),
+        // Self-update installer-based installs from GitHub Releases (SPECS §29).
+        Some("update") => return update::run(),
         _ => {}
     }
 
@@ -382,6 +385,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    setup-status           Install the opt-in precise agent-status integrations");
     println!("    setup-notifications    Enable OS notifications when agents finish");
+    println!("    update                 Update FlightDeck to the latest release");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");
@@ -822,21 +826,28 @@ fn handle_mouse(
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // A click on a tab switches to it (and never starts a selection).
+            // Clicking the left sidebar focuses the app chrome (APP mode);
+            // clicking anything in the right-hand agent area focuses the
+            // terminal (TERMINAL mode), so the click sets the mode the user
+            // would intuitively expect (SPECS §23).
             if let Some(hit) = hit_test(area, state, me.column, me.row) {
                 ui.drag = None;
                 match hit {
                     HitTarget::AgentTab(i) => {
                         let _ =
                             state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
+                        state.focus_app();
                     }
                     HitTarget::Child(ChildTarget::Primary) => {
                         if let Some(tab) = state.selected_mut() {
                             tab.session.focus_primary();
                         }
+                        state.focus_terminal();
                     }
                     HitTarget::Child(ChildTarget::Child(i)) => {
                         let _ = state
                             .dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+                        state.focus_terminal();
                     }
                 }
                 return;
@@ -844,6 +855,9 @@ fn handle_mouse(
             // A press inside the terminal viewport begins a selection (or is
             // forwarded to a mouse-aware hosted app unless Shift is held).
             if rect_contains(term_area, me.column, me.row) {
+                // Clicking the agent's terminal focuses it (TERMINAL mode), so
+                // keystrokes go straight to the agent (SPECS §23).
+                state.focus_terminal();
                 let shift = me.modifiers.contains(KeyModifiers::SHIFT);
                 let col = me.column.saturating_sub(term_area.x);
                 let row = me.row.saturating_sub(term_area.y);

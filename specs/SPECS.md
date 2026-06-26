@@ -749,6 +749,18 @@ Status bar:
 MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help
 ```
 
+### Mode switching by mouse
+
+Clicking sets the mode the click implies, mirroring the two regions of the
+layout:
+
+- Clicking an **agent tab in the left sidebar** focuses the app chrome → **APP**
+  mode (and switches to that tab).
+- Clicking the **right-hand agent area** (the terminal viewport or a child
+  terminal label) focuses the terminal → **TERMINAL** mode.
+
+This is in addition to the keyboard focus controls (Esc / Enter) above.
+
 Required shortcuts:
 
 ```text
@@ -1062,3 +1074,26 @@ MVP does not include:
 - TUI settings editor
 - Automatic conflict resolution
 - Background daemon
+
+## 29. Self-Update
+
+`flightdeck update` updates the binary in place to the latest GitHub Release.
+It is a subcommand (§24-style): it exits without launching the TUI and, unlike
+the other subcommands, does **not** require being inside a Git repository —
+updates work from anywhere.
+
+The boundary that makes this safe is the **install receipt**. FlightDeck ships
+through two channels: the shell installer (writes a receipt recording the
+binary location and release source) and a Homebrew tap (no receipt).
+
+- **Receipt present** (shell-installer install): query GitHub Releases, and if a
+  newer version exists, download and replace the running binary, then tell the
+  user to restart. If already current, say so.
+- **Receipt absent** (Homebrew, `cargo install`, hand-copied binary): FlightDeck
+  **must not** self-replace the binary — that would desync the managing package
+  manager. It prints guidance instead: Homebrew users run `brew upgrade
+  flightdeck`; others re-run the installer. A missing receipt is **not** an
+  error (exit 0).
+
+FlightDeck never auto-updates silently and never checks for updates from inside
+the TUI event loop; updating is always an explicit, user-invoked command.
