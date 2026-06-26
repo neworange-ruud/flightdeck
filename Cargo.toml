@@ -1,6 +1,6 @@
 [package]
 name = "flightdeck"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "A macOS-first terminal UI for orchestrating multiple local AI coding agents in isolated Git worktrees."
 repository = "https://github.com/neworange-ruud/flightdeck"
