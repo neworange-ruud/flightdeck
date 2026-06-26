@@ -41,6 +41,21 @@ installs it defers to the package manager — update those with:
 brew upgrade flightdeck
 ```
 
+### Update notice (opt-in)
+
+FlightDeck can tell you when a newer release is out. It's **off by default**
+(it makes a network request on launch). Turn it on with:
+
+```bash
+flightdeck setup-update          # sets update.check = true in config.toml
+```
+
+When enabled, FlightDeck checks GitHub Releases at most **once a day** in the
+background (cached per-user, never blocking startup) and shows a status-bar hint
+when a newer version is available. It only informs — it never auto-updates; you
+still run `flightdeck update` (or `brew upgrade flightdeck`) yourself. Disable
+any time by setting `check = false` under `[update]`.
+
 ```bash
 cd /path/to/your/git/repo
 flightdeck

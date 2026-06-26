@@ -898,17 +898,18 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 /// Terminal mode: `MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: command palette`
 /// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let text = status_bar_text(state.mode());
+    let text = status_bar_text(state.mode(), state.update_available.as_deref());
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
 }
 
-/// Build the status bar [`Line`] for the given mode (SPECS §23).
+/// Build the status bar [`Line`] for the given mode (SPECS §23), with an
+/// optional trailing update hint when a newer release is available (SPECS §30).
 ///
 /// Exported for snapshot testing.
-pub fn status_bar_text(mode: InputMode) -> Line<'static> {
-    match mode {
-        InputMode::Terminal => Line::from(vec![
+pub fn status_bar_text(mode: InputMode, update_available: Option<&str>) -> Line<'static> {
+    let mut spans = match mode {
+        InputMode::Terminal => vec![
             Span::raw(" "),
             Span::styled(
                 "MODE: TERMINAL",
@@ -922,8 +923,8 @@ pub fn status_bar_text(mode: InputMode) -> Line<'static> {
             Span::raw(": app commands | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
             Span::raw(": command palette"),
-        ]),
-        InputMode::App => Line::from(vec![
+        ],
+        InputMode::App => vec![
             Span::raw(" "),
             Span::styled(
                 "MODE: APP",
@@ -939,8 +940,24 @@ pub fn status_bar_text(mode: InputMode) -> Line<'static> {
             Span::raw(": command palette | "),
             Span::styled("?", Style::default().fg(Color::Yellow)),
             Span::raw(": help"),
-        ]),
+        ],
+    };
+
+    // Update notice (SPECS §30): a non-intrusive hint, never a modal. It points
+    // at `flightdeck update`, which itself routes Homebrew installs to `brew
+    // upgrade`, so a single message is correct for every install method.
+    if let Some(version) = update_available {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("● v{version} available — run `flightdeck update`"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
+
+    Line::from(spans)
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,7 +1648,7 @@ mod tests {
 
     #[test]
     fn status_bar_terminal_mode_text() {
-        let line = status_bar_text(InputMode::Terminal);
+        let line = status_bar_text(InputMode::Terminal, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(flat.contains("Esc"), "must mention Esc");
@@ -1642,7 +1659,7 @@ mod tests {
 
     #[test]
     fn status_bar_app_mode_text() {
-        let line = status_bar_text(InputMode::App);
+        let line = status_bar_text(InputMode::App, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -1651,6 +1668,24 @@ mod tests {
         assert!(flat.contains("command palette"), "must mention palette");
         assert!(flat.contains('?'), "must mention '?'");
         assert!(flat.contains("help"), "must mention help");
+    }
+
+    #[test]
+    fn status_bar_shows_update_hint_when_available() {
+        let line = status_bar_text(InputMode::App, Some("1.0.3"));
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            flat.contains("v1.0.3 available"),
+            "must show the new version"
+        );
+        assert!(
+            flat.contains("flightdeck update"),
+            "must point at the update command"
+        );
+        // Absent the notice, the bar is unchanged.
+        let none = status_bar_text(InputMode::App, None);
+        let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!none_flat.contains("available"), "no hint when up to date");
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------

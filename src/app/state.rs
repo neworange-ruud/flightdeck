@@ -336,6 +336,11 @@ pub struct AppState {
     /// are laid out side by side in equal-width columns instead of as a single
     /// active terminal behind a horizontal tab bar. Runtime-only (not persisted).
     pub split_view: bool,
+    /// Latest published version when a newer release than this binary exists,
+    /// set by the opt-in once-a-day update check (SPECS §30). `None` until the
+    /// check completes (or when up to date / the check is disabled). Drives the
+    /// status-bar update hint. Runtime-only.
+    pub update_available: Option<String>,
 }
 
 impl AppState {
@@ -364,6 +369,7 @@ impl AppState {
             pty_size: PtySize::default(),
             notify_grace_until_ms: 0,
             split_view: false,
+            update_available: None,
         }
     }
 

@@ -1095,5 +1095,31 @@ binary location and release source) and a Homebrew tap (no receipt).
   flightdeck`; others re-run the installer. A missing receipt is **not** an
   error (exit 0).
 
-FlightDeck never auto-updates silently and never checks for updates from inside
-the TUI event loop; updating is always an explicit, user-invoked command.
+FlightDeck never auto-updates silently: downloading and replacing the binary is
+always an explicit, user-invoked command. (The optional update *notice* in §30
+may check for a newer version, but it only informs — it never updates.)
+
+## 30. Update Notice
+
+An **opt-in** convenience that tells the user when a newer release exists. It is
+purely informational and is governed by these rules:
+
+- **Off by default.** Enabled with `update.check = true` in `config.toml`
+  (or `flightdeck setup-update`). It makes a network request on launch, so it is
+  never on without consent.
+- **Once a day.** On startup, when enabled, FlightDeck checks GitHub Releases at
+  most once per 24h. The last check time and result are cached per-user (not in
+  the repo), so restarts within the day reuse the cached result with no network
+  call.
+- **Non-blocking, best-effort.** The check runs on a background thread; it never
+  delays startup. Any failure (offline, rate-limited, unparsable cache) silently
+  yields no notice.
+- **Install-method agnostic.** The check queries the release source directly and
+  does not need an install receipt, so the notice works for Homebrew installs
+  too (the common case).
+- **Surface = a status-bar hint only.** When a newer version is available, the
+  status bar shows an unobtrusive hint pointing at `flightdeck update`. Never a
+  modal, never an interruption.
+- **Notice ≠ update.** It never downloads or replaces anything; acting on it is
+  the user's explicit choice (`flightdeck update`, or `brew upgrade flightdeck`
+  for Homebrew installs).
