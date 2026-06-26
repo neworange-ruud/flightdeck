@@ -167,6 +167,11 @@ pub trait ContainerRuntime {
         context: &Path,
         labels: &[(String, String)],
     ) -> Result<()>;
+    /// Start a container **detached** by running `podman <run_args>` (where
+    /// `run_args` begins with `run -d …`). Returns once the container is up. The
+    /// detached container outlives the FlightDeck process, so its PTY can be
+    /// (re)connected with `podman attach` (SPECS §31).
+    fn start_detached(&self, run_args: &[String]) -> Result<()>;
     /// Liveness of the named container.
     fn container_state(&self, name: &str) -> Result<ContainerState>;
     /// Remove the named container. `force` removes a running one.

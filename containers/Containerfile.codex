@@ -1,10 +1,13 @@
-# FlightDeck base image for the OpenAI Codex CLI agent (SPECS §31).
+# OPTIONAL reference base image for the OpenAI Codex CLI agent (SPECS §31).
+#
+# Not needed for the default flow — `flightdeck image build codex` builds a
+# self-contained image from docker.io/library/node. Use this only to pre-build a
+# base and point `execution.base_image` at it.
 #
 #   podman build -t flightdeck-codex-base:latest -f containers/Containerfile.codex containers
 #
-# See Containerfile.claude for the base-image contract (Debian-family, non-root
-# `agent` user, agent CLI on PATH).
-FROM node:22-bookworm-slim
+# See Containerfile.claude for the base-image contract.
+FROM docker.io/library/node:22-bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

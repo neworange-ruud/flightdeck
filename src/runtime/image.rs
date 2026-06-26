@@ -13,7 +13,27 @@ use std::path::{Path, PathBuf};
 /// packages/setup-script/Containerfile triggers a rebuild.
 pub const BUILD_LABEL: &str = "flightdeck.build";
 
-/// The FlightDeck-owned base image for an agent.
+/// The default base image FlightDeck builds on when the project does not
+/// override it. A **trusted, fully-qualified Docker Official Image** (Docker
+/// Hub `library/node`) so `podman build` pulls from a real registry — the
+/// fully-qualified name also avoids relying on a `registries.conf` default.
+pub const DEFAULT_BASE_IMAGE: &str = "docker.io/library/node:22-bookworm-slim";
+
+/// The command that installs an agent's CLI on top of [`DEFAULT_BASE_IMAGE`].
+/// Returns `None` for an agent FlightDeck has no built-in recipe for — such an
+/// agent must set `execution.image`, `execution.base_image`, or
+/// `execution.containerfile` itself.
+pub fn agent_install_command(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude" => Some("npm install -g @anthropic-ai/claude-code"),
+        "codex" => Some("npm install -g @openai/codex"),
+        "opencode" => Some("npm install -g opencode-ai"),
+        _ => None,
+    }
+}
+
+/// A FlightDeck-owned base image tag (for users who prefer to pre-build a base
+/// and point `execution.base_image` at it; not used by the default flow).
 pub fn base_image_tag(agent: &str) -> String {
     format!("localhost/flightdeck-{agent}-base:latest")
 }
@@ -46,31 +66,77 @@ pub fn customization_hash(
     format!("{:016x}", h.finish())
 }
 
-/// Generate a Containerfile layering declarative customization on the base.
+/// Generate the Containerfile to build for an agent (Debian-family base, so
+/// packages install via `apt-get`).
 ///
-/// The base image is assumed Debian-family (the FlightDeck base contract), so
-/// packages install via `apt-get`. `setup_script` is the build-context-relative
-/// path the script is `COPY`'d from.
+/// Two modes:
+/// - **`base_override = None`** (the default): a **self-contained** file built
+///   from the trusted [`DEFAULT_BASE_IMAGE`] that installs git + the agent CLI
+///   and creates the non-root, UID-mappable `agent` user — so a plain
+///   `flightdeck image build` works with no pre-built local base. Requires a
+///   built-in recipe for `agent` ([`agent_install_command`]).
+/// - **`base_override = Some(base)`**: layer declarative customization onto a
+///   base that is assumed to already carry the agent CLI + `agent` user.
+///
+/// `setup_script` is the build-context-relative path the script is `COPY`'d from.
 pub fn generate_containerfile(
-    base: &str,
+    agent: &str,
+    base_override: Option<&str>,
     packages: &[String],
     setup_script: Option<&str>,
-) -> String {
+) -> Result<String> {
     let mut s = String::new();
-    s.push_str(&format!("FROM {base}\n"));
-    s.push_str("USER root\n");
+
+    match base_override {
+        Some(base) => {
+            // Layer-on-base: the base already provides the agent + `agent` user.
+            s.push_str(&format!("FROM {base}\n"));
+            s.push_str("USER root\n");
+            push_packages(&mut s, packages);
+            push_setup(&mut s, setup_script);
+            s.push_str("USER agent\n");
+        }
+        None => {
+            // Self-contained from the trusted default base.
+            let install = agent_install_command(agent).ok_or_else(|| {
+                FlightDeckError::Config(format!(
+                    "no built-in container recipe for agent '{agent}'; set \
+                     execution.image, execution.base_image, or execution.containerfile \
+                     in .flightdeck/config.toml"
+                ))
+            })?;
+            s.push_str(&format!("FROM {DEFAULT_BASE_IMAGE}\n"));
+            s.push_str(
+                "RUN apt-get update \\\n    \
+                 && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep less zsh \\\n    \
+                 && rm -rf /var/lib/apt/lists/*\n",
+            );
+            s.push_str(&format!("RUN {install}\n"));
+            // Non-root user; UID-mapped at run time via `--userns keep-id`.
+            s.push_str("RUN useradd --create-home --shell /usr/bin/zsh agent\n");
+            push_packages(&mut s, packages);
+            push_setup(&mut s, setup_script);
+            s.push_str("USER agent\n");
+            s.push_str("WORKDIR /workspace\n");
+        }
+    }
+    Ok(s)
+}
+
+fn push_packages(s: &mut String, packages: &[String]) {
     if !packages.is_empty() {
         s.push_str(&format!(
             "RUN apt-get update && apt-get install -y --no-install-recommends {} \\\n    && rm -rf /var/lib/apt/lists/*\n",
             packages.join(" ")
         ));
     }
+}
+
+fn push_setup(s: &mut String, setup_script: Option<&str>) {
     if let Some(script) = setup_script {
         s.push_str(&format!("COPY {script} /tmp/flightdeck-setup\n"));
         s.push_str("RUN chmod +x /tmp/flightdeck-setup && /tmp/flightdeck-setup\n");
     }
-    s.push_str("USER agent\n");
-    s
 }
 
 /// Where a generated Containerfile is written (under the repo's `.flightdeck`).
@@ -101,10 +167,12 @@ pub fn ensure_image(
     }
 
     let tag = project_image_tag(repo_hash, agent);
+    // The base used for the staleness hash: the override, else our trusted
+    // default (the generated content also encodes it).
     let base = exec
         .base_image
         .clone()
-        .unwrap_or_else(|| base_image_tag(agent));
+        .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string());
 
     // Resolve the Containerfile to build + the staleness inputs.
     let (containerfile_path, context, hash) = if let Some(rel) = &exec.containerfile {
@@ -117,7 +185,12 @@ pub fn ensure_image(
             Some(rel) => Some(fs.read_to_string(&repo_root.join(rel))?),
             None => None,
         };
-        let content = generate_containerfile(&base, &exec.packages, exec.setup_script.as_deref());
+        let content = generate_containerfile(
+            agent,
+            exec.base_image.as_deref(),
+            &exec.packages,
+            exec.setup_script.as_deref(),
+        )?;
         let path = generated_containerfile_path(repo_root, agent);
         if let Some(parent) = path.parent() {
             fs.create_dir_all(parent)?;
@@ -193,16 +266,44 @@ mod tests {
     }
 
     #[test]
-    fn generated_containerfile_installs_packages_and_runs_setup() {
+    fn default_containerfile_is_self_contained_from_trusted_base() {
+        // No base override → build from the trusted public base, install the
+        // agent CLI, and create the non-root user — no pre-built local base.
         let cf = generate_containerfile(
-            "localhost/flightdeck-claude-base:latest",
+            "claude",
+            None,
             &["postgresql-client".to_string(), "jq".to_string()],
             Some(".flightdeck/setup.sh"),
-        );
-        assert!(cf.starts_with("FROM localhost/flightdeck-claude-base:latest\n"));
+        )
+        .unwrap();
+        assert!(cf.starts_with("FROM docker.io/library/node:22-bookworm-slim\n"));
+        assert!(cf.contains("npm install -g @anthropic-ai/claude-code"));
+        assert!(cf.contains("useradd --create-home --shell /usr/bin/zsh agent"));
         assert!(cf.contains("apt-get install -y --no-install-recommends postgresql-client jq"));
         assert!(cf.contains("COPY .flightdeck/setup.sh /tmp/flightdeck-setup"));
+        assert!(cf.contains("USER agent"));
+    }
+
+    #[test]
+    fn base_override_layers_without_installing_agent() {
+        let cf = generate_containerfile(
+            "claude",
+            Some("localhost/my-base:1"),
+            &["jq".to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(cf.starts_with("FROM localhost/my-base:1\n"));
+        // The override is assumed to already carry the agent CLI.
+        assert!(!cf.contains("npm install"));
+        assert!(cf.contains("apt-get install -y --no-install-recommends jq"));
         assert!(cf.trim_end().ends_with("USER agent"));
+    }
+
+    #[test]
+    fn unknown_agent_without_base_is_an_error() {
+        let err = generate_containerfile("mystery", None, &[], None).unwrap_err();
+        assert!(err.to_string().contains("no built-in container recipe"));
     }
 
     // A FakeContainerRuntime focused on image calls (the full fake lives in
@@ -236,6 +337,9 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
             self.builds.lock().unwrap().push((tag.to_string(), h));
+            Ok(())
+        }
+        fn start_detached(&self, _run_args: &[String]) -> Result<()> {
             Ok(())
         }
         fn container_state(&self, _n: &str) -> Result<ContainerState> {
@@ -279,9 +383,8 @@ mod tests {
             ..Default::default()
         };
         // Pre-compute the hash the same way ensure_image will.
-        let base = base_image_tag("claude");
-        let content = generate_containerfile(&base, &exec.packages, None);
-        let hash = customization_hash(&base, &exec.packages, None, Some(&content));
+        let content = generate_containerfile("claude", None, &exec.packages, None).unwrap();
+        let hash = customization_hash(DEFAULT_BASE_IMAGE, &exec.packages, None, Some(&content));
         let rt = ImgFake {
             exists: true,
             label: Some(hash),

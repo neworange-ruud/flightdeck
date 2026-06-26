@@ -6,17 +6,7 @@ instead of directly on the host. The agent's git worktree is bind-mounted at
 
 This is a **project-wide toggle** — when enabled, all agents run in containers.
 
-## 1. Build a base image
-
-FlightDeck's per-project image builds *on top of* a base image that carries the
-agent CLI and a non-root, UID-mappable `agent` user. Build the base once:
-
-```bash
-podman build -t flightdeck-claude-base:latest -f containers/Containerfile.claude containers
-# or codex / opencode
-```
-
-## 2. Enable containers
+## 1. Enable containers
 
 In `.flightdeck/config.toml`:
 
@@ -25,10 +15,14 @@ In `.flightdeck/config.toml`:
 enabled = true
 runtime = "podman"
 
-# Optional per-project customization layered on the base image:
+# By default FlightDeck builds a self-contained image from a trusted public
+# base (docker.io/library/node) and installs the agent CLI — no pre-built base
+# needed. Optional per-project customization layered on top:
 # packages = ["postgresql-client", "jq"]
 # setup_script = ".flightdeck/agent-setup.sh"
-# Or bring your own Containerfile (must FROM a flightdeck base):
+# Pin/replace the base image (must be Debian-family, carry the agent + `agent` user):
+# base_image = "localhost/flightdeck-claude-base:latest"
+# Or bring your own Containerfile entirely:
 # containerfile = "containers/agent.Containerfile"
 
 # Optional: publish dev-server ports to 127.0.0.1
@@ -48,14 +42,17 @@ env_allow = ["ANTHROPIC_API_KEY"]
 # writable = false
 ```
 
-## 3. Build the project image and check readiness
+## 2. Build the image and check readiness
 
 ```bash
-flightdeck image build claude   # builds base + customization → project image
+flightdeck image build claude   # pulls the trusted base, installs the agent CLI
 flightdeck doctor               # verifies podman + images are ready
 ```
 
-## 4. Run
+The reference `Containerfile.*` in this directory are **optional** — only needed
+if you want to pre-build and pin a base via `execution.base_image`.
+
+## 3. Run
 
 Launch FlightDeck as usual. New agent tabs run in a container named
 `flightdeck-<tab-id>`; child shells (`Ctrl-t`) `podman exec` into the same

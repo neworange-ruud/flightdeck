@@ -14,6 +14,11 @@ use std::path::Path;
 pub const WORKSPACE: &str = "/workspace";
 
 /// Build the `podman run …` argv (everything after the `podman` binary name).
+///
+/// The container is started **detached** (`-d`) with a TTY allocated (`-it`) so
+/// it survives FlightDeck (the client) quitting — FlightDeck connects to it
+/// separately via `podman attach` ([`build_attach_args`]), which can reconnect
+/// after a restart (SPECS §31 persist-&-reattach).
 pub fn build_run_args(spec: &ContainerSpec) -> Vec<String> {
     // Accumulate into `a`; the `flag!` macro pushes one or more `&str` literals.
     let mut a: Vec<String> = Vec::new();
@@ -21,7 +26,7 @@ pub fn build_run_args(spec: &ContainerSpec) -> Vec<String> {
         ($($s:expr),+ $(,)?) => {{ $( a.push($s.to_string()); )+ }};
     }
 
-    flag!("run", "-it", "--rm");
+    flag!("run", "-d", "-it", "--rm");
 
     flag!("--name");
     a.push(spec.name.clone());
@@ -192,6 +197,10 @@ mod tests {
     fn run_args_have_security_posture() {
         let a = build_run_args(&base_spec());
         assert_eq!(a[0], "run");
+        assert!(
+            a.contains(&"-d".to_string()),
+            "detached so it survives a restart"
+        );
         assert!(a.contains(&"--rm".to_string()));
         // cap-drop all + no-new-privileges present.
         assert_eq!(value_after(&a, "--cap-drop"), Some(&"all".to_string()));

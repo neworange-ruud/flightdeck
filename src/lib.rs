@@ -437,8 +437,15 @@ fn run_doctor() -> Result<()> {
     match podman.available() {
         Ok(()) => println!("  • podman: ready"),
         Err(e) => {
-            println!("  • podman: NOT ready — {e}");
-            println!("    Install podman and start the machine, then re-run `flightdeck doctor`.");
+            // `available()` already returns actionable, platform-specific
+            // install/start guidance (indented here under the bullet). Drop the
+            // generic "operation refused: " error prefix for a clean read.
+            println!("  • podman: NOT ready");
+            let msg = e.to_string();
+            let msg = msg.strip_prefix("operation refused: ").unwrap_or(&msg);
+            for line in msg.lines() {
+                println!("    {line}");
+            }
             return Ok(());
         }
     }
@@ -555,13 +562,21 @@ fn print_help() {
     println!();
     println!("Run with no arguments inside a Git repository to launch the TUI.");
     println!();
-    println!("SUBCOMMANDS:");
+    println!("SETUP:");
     println!("    setup-status           Install the opt-in precise agent-status integrations");
     println!("    setup-notifications    Enable OS notifications when agents finish");
     println!("    setup-update           Enable the opt-in once-a-day update notice");
+    println!();
+    println!("CONTAINERS (optional — run agents in isolated Podman containers):");
+    println!("    doctor                 Check the container runtime and images are ready");
+    println!("    image build [agent]    Build an agent's container image (default agent");
+    println!("                           if none given)");
+    println!();
+    println!("    Enable with `enabled = true` under [execution] in");
+    println!("    .flightdeck/config.toml, then run `flightdeck doctor`.");
+    println!();
+    println!("MAINTENANCE:");
     println!("    update                 Update FlightDeck to the latest release");
-    println!("    image build [agent]    Build an agent's container image (SPECS §31)");
-    println!("    doctor                 Check the container runtime + images are ready");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");

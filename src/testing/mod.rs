@@ -678,6 +678,7 @@ struct FakeCrState {
     // recordings
     builds: Vec<String>,
     removed: Vec<(String, bool)>,
+    started: Vec<Vec<String>>,
 }
 
 impl Default for FakeContainerRuntime {
@@ -692,6 +693,7 @@ impl Default for FakeContainerRuntime {
                 host_uid: 501,
                 builds: Vec::new(),
                 removed: Vec::new(),
+                started: Vec::new(),
             }),
         }
     }
@@ -737,6 +739,11 @@ impl FakeContainerRuntime {
     pub fn builds(&self) -> Vec<String> {
         self.inner.lock().unwrap().builds.clone()
     }
+
+    /// Detached run argv recorded via [`ContainerRuntime::start_detached`].
+    pub fn started(&self) -> Vec<Vec<String>> {
+        self.inner.lock().unwrap().started.clone()
+    }
 }
 
 impl ContainerRuntime for FakeContainerRuntime {
@@ -775,6 +782,18 @@ impl ContainerRuntime for FakeContainerRuntime {
                 .insert((tag.to_string(), k.clone()), v.clone());
         }
         st.builds.push(tag.to_string());
+        Ok(())
+    }
+
+    fn start_detached(&self, run_args: &[String]) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.started.push(run_args.to_vec());
+        // Mark the named container running so a follow-up state check sees it.
+        if let Some(i) = run_args.iter().position(|a| a == "--name") {
+            if let Some(name) = run_args.get(i + 1) {
+                st.states.insert(name.clone(), ContainerState::Running);
+            }
+        }
         Ok(())
     }
 

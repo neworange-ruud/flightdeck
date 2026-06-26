@@ -111,10 +111,16 @@ pub fn materialize_worktree(git: &dyn GitExecutor, job: &WorktreeJob) -> Result<
     Ok(())
 }
 
-/// How to launch (or reattach) a tab's primary terminal (SPECS §31): the
-/// command + argv handed to the [`PtyBackend`], plus whether it is
-/// containerized and the image used (for persistence).
+/// How to launch (or reattach) a tab's primary terminal (SPECS §31).
+///
+/// `command`/`args` are handed to the [`PtyBackend`] (for a container that is
+/// `podman attach <name>`). When `start_args` is `Some`, the caller must first
+/// start the detached container with those `podman run -d …` args — that is the
+/// fresh-launch case; reattach leaves it `None`.
 struct PrimarySpawn {
+    /// `podman run -d …` args to start the container before attaching (fresh
+    /// launch only); `None` when reattaching or running locally.
+    start_args: Option<Vec<String>>,
     command: String,
     args: Vec<String>,
     containerized: bool,
@@ -128,6 +134,42 @@ fn platform_mount_flags() -> Option<String> {
         Some("z".to_string())
     } else {
         None
+    }
+}
+
+/// Home directory of the non-root `agent` user in the default base image
+/// (SPECS §31). Default credential mounts target subpaths of this.
+const AGENT_HOME: &str = "/home/agent";
+
+/// Host→container credential mounts applied by default (no `[execution.auth]`
+/// configured, default base image) so the host agent's login carries into the
+/// container (SPECS §31). Host paths may use `~`; absent ones are skipped.
+fn default_auth_mounts(agent: &str) -> Vec<(&'static str, &'static str)> {
+    match agent {
+        "claude" => vec![
+            ("~/.claude", "/home/agent/.claude"),
+            ("~/.claude.json", "/home/agent/.claude.json"),
+        ],
+        "codex" => vec![("~/.codex", "/home/agent/.codex")],
+        "opencode" => vec![
+            (
+                "~/.local/share/opencode",
+                "/home/agent/.local/share/opencode",
+            ),
+            ("~/.config/opencode", "/home/agent/.config/opencode"),
+        ],
+        _ => vec![],
+    }
+}
+
+/// Host env vars injected by default (no `[execution.auth]` configured) when
+/// present, so API-key auth works without configuration (SPECS §31).
+fn default_env_allow(agent: &str) -> Vec<&'static str> {
+    match agent {
+        "claude" => vec!["ANTHROPIC_API_KEY"],
+        "codex" => vec!["OPENAI_API_KEY"],
+        "opencode" => vec!["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        _ => vec![],
     }
 }
 
@@ -870,6 +912,10 @@ impl AppState {
         // the primary terminal (fast; stays on the UI thread — SPECS §31 keeps
         // the spawn path synchronous and never builds an image here).
         let spawn = self.build_primary_spawn(&tab_id, &agent, &worktree_abs, services, false)?;
+        // Fresh container: start it detached before attaching its PTY.
+        if let Some(start_args) = &spawn.start_args {
+            services.container.start_detached(start_args)?;
+        }
         let mut session = Session::new();
         session.spawn_primary(
             services.pty,
@@ -1317,6 +1363,7 @@ impl AppState {
         if !self.config.execution.enabled {
             let launch = build_launch(agent, worktree_abs);
             return Ok(PrimarySpawn {
+                start_args: None,
                 command: launch.command,
                 args: launch.args,
                 containerized: false,
@@ -1325,8 +1372,11 @@ impl AppState {
         }
 
         let name = container_name(tab_id);
+        // Reattach to a still-running container (the detached run survives a
+        // FlightDeck restart) — no fresh start needed.
         if allow_attach && services.container.container_state(&name)? == ContainerState::Running {
             return Ok(PrimarySpawn {
+                start_args: None,
                 command: "podman".to_string(),
                 args: build_attach_args(&name),
                 containerized: true,
@@ -1334,7 +1384,8 @@ impl AppState {
             });
         }
 
-        // Fresh run. Resolve and verify the image (no building on this path).
+        // Fresh run: verify the image (no building here), then start the
+        // container detached and attach to it. The caller runs `start_args`.
         let rhash = repo_hash(&self.repo_root);
         let image = image::resolve_image_tag(&rhash, &agent.key, &self.config.execution);
         if !services.container.image_exists(&image)? {
@@ -1345,11 +1396,12 @@ impl AppState {
 
         let spec =
             self.container_spec(tab_id, &name, &rhash, &image, agent, worktree_abs, services);
-        let args = build_run_args(&spec);
-        enforce_guardrails(&args)?;
+        let run_args = build_run_args(&spec);
+        enforce_guardrails(&run_args)?;
         Ok(PrimarySpawn {
+            start_args: Some(run_args),
             command: "podman".to_string(),
-            args,
+            args: build_attach_args(&name),
             containerized: true,
             image: Some(image),
         })
@@ -1369,22 +1421,57 @@ impl AppState {
         services: &Services,
     ) -> ContainerSpec {
         let exec = &self.config.execution;
-        let auth_mounts = exec
-            .auth
-            .mounts
-            .iter()
-            .map(|m| ResolvedAuthMount {
-                host_path: expand_tilde(&m.host_path),
-                container_path: m.container_path.clone(),
-                writable: m.writable,
-            })
-            .collect();
-        let mut env = Vec::new();
-        for key in &exec.auth.env_allow {
-            if let Ok(val) = std::env::var(key) {
-                env.push((key.clone(), val));
+        let user_auth = !exec.auth.mounts.is_empty() || !exec.auth.env_allow.is_empty();
+        let (auth_mounts, env) = if user_auth || exec.base_image.is_some() {
+            // Explicit auth config (or a custom base image, whose paths we can't
+            // assume) — use exactly what the project declared.
+            let mounts = exec
+                .auth
+                .mounts
+                .iter()
+                .map(|m| ResolvedAuthMount {
+                    host_path: expand_tilde(&m.host_path),
+                    container_path: m.container_path.clone(),
+                    writable: m.writable,
+                })
+                .collect();
+            let mut env = Vec::new();
+            for key in &exec.auth.env_allow {
+                if let Ok(val) = std::env::var(key) {
+                    env.push((key.clone(), val));
+                }
             }
-        }
+            (mounts, env)
+        } else {
+            // No auth configured + the default base image: pass the host agent's
+            // credentials through automatically so the user need not re-login
+            // (SPECS §31). Mounts are writable so a fresh login persists, and
+            // skipped when the host path is absent (avoids creating empty dirs).
+            let mut mounts: Vec<ResolvedAuthMount> = default_auth_mounts(&agent.key)
+                .into_iter()
+                .filter_map(|(host, ctr)| {
+                    let host_path = expand_tilde(host);
+                    host_path.exists().then_some(ResolvedAuthMount {
+                        host_path,
+                        container_path: ctr.to_string(),
+                        writable: true,
+                    })
+                })
+                .collect();
+            mounts.shrink_to_fit();
+            let mut env = Vec::new();
+            // Pin HOME so the agent finds the mounted creds regardless of how the
+            // UID-mapped user resolves inside the container.
+            if !mounts.is_empty() {
+                env.push(("HOME".to_string(), AGENT_HOME.to_string()));
+            }
+            for key in default_env_allow(&agent.key) {
+                if let Ok(val) = std::env::var(key) {
+                    env.push((key.to_string(), val));
+                }
+            }
+            (mounts, env)
+        };
         ContainerSpec {
             name: name.to_string(),
             labels: standard_labels(tab_id, rhash),
@@ -1442,6 +1529,10 @@ impl AppState {
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
+        // Fresh container: start it detached before attaching its PTY.
+        if let Some(start_args) = &spawn.start_args {
+            services.container.start_detached(start_args)?;
+        }
 
         let tab = &mut self.tabs[idx];
         tab.session
@@ -1491,19 +1582,10 @@ impl AppState {
             if !services.fs.exists(&cwd) {
                 continue;
             }
-            // In container mode, resume only *reattaches* to a still-running
-            // container — an exited one stays "session lost" for a manual
-            // restart, preserving the never-auto-relaunch invariant (SPECS §10).
-            if self.config.execution.enabled {
-                let name = container_name(&self.tabs[idx].meta.id);
-                let running = matches!(
-                    services.container.container_state(&name),
-                    Ok(ContainerState::Running)
-                );
-                if !running {
-                    continue;
-                }
-            }
+            // `allow_attach` reconnects to a still-running container (the
+            // detached run survives a restart); if the container is gone it
+            // starts a fresh one — matching how local agents resume, so a tab is
+            // never left without an agent. Best-effort per tab.
             if self.start_primary_for(idx, services, true).is_ok() {
                 started += 1;
             }
@@ -3139,13 +3221,25 @@ mod tests {
 
         app.dispatch(new_tab_cmd(), &svc).unwrap();
 
+        // The container is started detached (run -d …), carrying the image +
+        // guardrails; the PTY then attaches to it.
+        let started = container.started();
+        assert_eq!(started.len(), 1, "container started detached once");
+        let run = &started[0];
+        assert_eq!(run[0], "run");
+        assert!(run.contains(&"-d".to_string()), "detached");
+        assert!(run.contains(&"--cap-drop".to_string()));
+        assert!(run.contains(&image), "image present in run args");
+
         let spawns = pty.spawns();
-        assert_eq!(spawns.len(), 1, "primary spawned once");
-        assert_eq!(spawns[0].0, "podman", "launches via podman");
-        let args = &spawns[0].1;
-        assert_eq!(args[0], "run");
-        assert!(args.contains(&"--cap-drop".to_string()));
-        assert!(args.contains(&image), "image present in run args");
+        assert_eq!(spawns.len(), 1, "primary PTY spawned once");
+        assert_eq!(spawns[0].0, "podman");
+        let name = container_name(&app.tabs[0].meta.id);
+        assert_eq!(
+            spawns[0].1,
+            vec!["attach".to_string(), name],
+            "PTY attaches"
+        );
         // The tab records that it is containerized + the image used.
         assert!(app.tabs[0].meta.containerized);
         assert_eq!(app.tabs[0].meta.container_image, Some(image));
@@ -3293,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_skips_exited_container_as_session_lost() {
+    fn resume_starts_fresh_when_container_gone() {
         let config = exec_config();
         let mut ps = default_state("main");
         let mut tab = recovered_tab("r");
@@ -3305,8 +3399,10 @@ mod tests {
         let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
         let pty = FakePty::new();
         let clock = FakeClock::default();
-        // Container is absent/exited (default) → never auto-relaunched.
-        let container = FakeContainerRuntime::new();
+        let image = image::project_image_tag(&repo_hash(std::path::Path::new(REPO)), "opencode");
+        // Container is gone (default Absent) but the image exists → resume starts
+        // a fresh detached container rather than leaving the tab agent-less.
+        let container = FakeContainerRuntime::new().with_image(image);
         let svc = Services {
             git: &git,
             fs: &fs,
@@ -3316,7 +3412,17 @@ mod tests {
         };
 
         let started = app.resume_agents(&svc);
-        assert_eq!(started, 0, "exited container stays session-lost");
-        assert_eq!(pty.spawns().len(), 0);
+        assert_eq!(started, 1, "starts a fresh container when none is running");
+        assert_eq!(
+            container.started().len(),
+            1,
+            "a detached container was started"
+        );
+        let name = container_name("r");
+        assert_eq!(
+            pty.spawns()[0].1,
+            vec!["attach".to_string(), name],
+            "PTY attaches"
+        );
     }
 }

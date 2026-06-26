@@ -1154,10 +1154,11 @@ containers instead of directly on the host. Off by default; when enabled it is
   with no runtime id captured at spawn.
 - **Child shells run inside the container.** `Ctrl-t` does `podman exec -it
   flightdeck-<id> <shell>`, sharing `/workspace` and the toolchain.
-- **Persist & reattach.** Containers (`--rm`) survive a FlightDeck restart under
-  conmon. On resume a still-running container is reattached (`podman attach`); an
-  exited one stays **session lost** for a manual restart — never auto-relaunched
-  (consistent with §10). Teardown (force-close / abandon / merge) removes the
+- **Persist & reattach.** The primary is started **detached** (`podman run -d
+  -it --rm`) and driven via `podman attach`, so it survives FlightDeck (the
+  client) quitting. On resume a still-running container is reattached; if it is
+  gone, a fresh one is started (matching how local agents resume, so a tab is
+  never left agent-less). Teardown (force-close / abandon / merge) removes the
   container.
 - **Hard guardrails (non-disableable).** Enforced by `src/runtime/guards.rs`
   before every `run`: no `--privileged`, no docker/podman socket mount, no
@@ -1166,12 +1167,19 @@ containers instead of directly on the host. Off by default; when enabled it is
   relaxed by config.
 - **Network.** Full outbound in v1 (an egress allowlist is a planned follow-up;
   the builder leaves a seam for a proxy sidecar).
-- **Auth.** Per project: mount host credentials read-only and/or inject an
-  allowlisted env var as `--env KEY=VALUE` (discrete argv, never interpolated).
+- **Auth.** With no `[execution.auth]` configured (and the default base image),
+  FlightDeck passes the host agent's credentials through automatically — the
+  agent's config dir is bind-mounted writable into the container home (so an
+  existing login carries over and a fresh one persists) and known API-key env
+  vars are injected when present. Absent host paths are skipped. Projects can
+  override with explicit `auth.mounts` / `auth.env_allow`.
 - **Ports.** `execution.forward_ports` publishes `127.0.0.1:<port>:<port>`.
-- **Images.** FlightDeck-owned base (`containers/Containerfile.<agent>`) plus
-  per-project customization: declarative `packages` + `setup_script` templated
-  onto the base, or an advanced bring-your-own `containerfile`. Built by
-  `flightdeck image build [agent]` (a `flightdeck.build` label hash detects
-  staleness). The fast launch path never builds — a missing image is refused with
-  guidance; `flightdeck doctor` reports readiness.
+- **Images.** By default `flightdeck image build [agent]` generates a
+  **self-contained** image from a trusted, fully-qualified public base
+  (`docker.io/library/node`), installing the agent CLI and creating the
+  UID-mappable `agent` user — no pre-built local base required. Per-project
+  customization layers on top: declarative `packages` + `setup_script`, an
+  overridable `base_image` (pre-built/pinned base), or a bring-your-own
+  `containerfile`. A `flightdeck.build` label hash detects staleness. The fast
+  launch path never builds — a missing image is refused with guidance;
+  `flightdeck doctor` reports readiness.
