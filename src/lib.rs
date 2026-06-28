@@ -19,7 +19,30 @@ pub mod persistence;
 pub mod runtime;
 pub mod terminal;
 pub mod tui;
+#[cfg(feature = "self-update")]
 pub mod update;
+
+// No-op stand-in when built without the `self-update` feature (e.g. a pure-Rust
+// build with no C toolchain). Keeps `update::run`/`update::start_check` callable
+// so the subcommand dispatch and the update-notice channel plumbing below need
+// no `cfg` of their own; `update` becomes a no-op and `start_check` never sends.
+#[cfg(not(feature = "self-update"))]
+pub mod update {
+    use crate::contracts::error::Result;
+    use std::sync::mpsc::Sender;
+
+    pub fn run() -> Result<()> {
+        println!(
+            "FlightDeck: this build was compiled without self-update support \
+             (`flightdeck update` is a no-op here)."
+        );
+        Ok(())
+    }
+
+    pub fn start_check(_enabled: bool, _now_unix: u64, _tx: Sender<String>) -> Option<String> {
+        None
+    }
+}
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};

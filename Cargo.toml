@@ -18,17 +18,26 @@ path = "src/lib.rs"
 name = "flightdeck"
 path = "src/main.rs"
 
+[features]
+# On by default: self-update (`flightdeck update`) and the opt-in update notice.
+# Gated because its dependency graph pulls in `aws-lc-sys` (a C crypto library),
+# which needs a C toolchain to build. Disable with `--no-default-features` to
+# build with a pure-Rust graph (e.g. the self-contained windows-gnu target with
+# no MSVC/CMake/NASM installed). See src/update.rs.
+default = ["self-update"]
+self-update = ["dep:axoupdater", "dep:tokio"]
+
 [dependencies]
 # Self-update for installer-based installs (`flightdeck update`). The `blocking`
 # feature exposes the `*_sync` methods so we avoid pulling an async runtime into
 # the otherwise-synchronous TUI; `github_releases` (a default feature) points the
 # updater at our GitHub Releases. See src/update.rs.
-axoupdater = { version = "0.10", features = ["blocking"] }
+axoupdater = { version = "0.10", features = ["blocking"], optional = true }
 crossterm = "0.29.0"
 # Drives axoupdater's async `query_new_version` from the background update-check
 # thread (the opt-in once-a-day notice). A current-thread runtime; tokio is
 # already in the graph via axoupdater's `blocking` feature.
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 portable-pty = "0.9.0"
 ratatui = "0.30.2"
 serde = { version = "1.0.228", features = ["derive"] }
