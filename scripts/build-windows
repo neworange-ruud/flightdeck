@@ -1,0 +1,51 @@
+#!/usr/bin/env sh
+set -eu
+
+# Cross-build the Windows binary from macOS/Linux using cargo-xwin in Docker.
+#
+# cargo-xwin downloads the MSVC CRT/SDK import libraries and links with LLVM's
+# lld, so no Windows machine (and no MSVC install) is required. The build is
+# CPU-architecture-independent: it works fine on Apple Silicon even though the
+# output targets x86_64 Windows.
+#
+# Output: target/x86_64-pc-windows-msvc/<profile>/flightdeck.exe
+#
+# Usage:
+#   scripts/build-windows            # release build (default)
+#   scripts/build-windows debug      # debug build
+#   PROFILE=release scripts/build-windows
+#
+# Note: this only *builds* the .exe. Running it requires Windows (real, a
+# Windows-on-ARM VM, or the windows-latest CI job) — see README "Cross-building
+# for Windows".
+
+TARGET="x86_64-pc-windows-msvc"
+IMAGE="ghcr.io/rust-cross/cargo-xwin:latest"
+
+profile="${1:-${PROFILE:-release}}"
+case "$profile" in
+  release) profile_flag="--release" ;;
+  debug)   profile_flag="" ;;
+  *)
+    printf 'Unknown profile: %s (use "release" or "debug")\n' "$profile" >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v docker >/dev/null 2>&1; then
+  printf 'Missing required command: docker\n' >&2
+  printf 'Install Docker Desktop, or build natively on Windows / in CI.\n' >&2
+  exit 1
+fi
+
+# A named volume caches the downloaded xwin SDK + cargo registry across runs so
+# repeat builds are fast.
+docker run --rm \
+  -v "$(pwd)":/io \
+  -w /io \
+  -v flightdeck-xwin-cache:/root/.cache \
+  -v flightdeck-cargo-registry:/usr/local/cargo/registry \
+  "$IMAGE" \
+  cargo xwin build ${profile_flag} --target "$TARGET"
+
+printf '\nBuilt target/%s/%s/flightdeck.exe\n' "$TARGET" "$profile"

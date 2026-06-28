@@ -4,27 +4,73 @@ use crate::contracts::{AgentDef, FlightDeckError, Result};
 use std::path::{Path, PathBuf};
 
 /// Whether `command` resolves on a given `PATH` string (pure, testable form).
-/// An absolute/relative path (contains '/') is checked directly for existence
-/// as a file; a bare name is searched in each ':'-separated `PATH` entry
-/// (SPECS §16).
+/// A path-like `command` (contains a path separator) is checked directly for
+/// existence as a file; a bare name is searched in each `PATH` entry, split on
+/// the platform separator (`:` on Unix, `;` on Windows) (SPECS §16).
+///
+/// On Windows a bare name without an extension also matches when one of the
+/// `PATHEXT` extensions (`.EXE`, `.CMD`, …) makes it a real file — so `claude`
+/// resolves to `claude.exe`/`claude.cmd`.
 pub fn command_in_path(command: &str, path_var: &str) -> bool {
-    if command.contains('/') {
+    if is_path_like(command) {
         // Treat as a direct filesystem path.
-        let p = Path::new(command);
-        p.exists() && p.is_file()
+        candidate_is_executable(Path::new(command))
     } else {
         // Search each entry in path_var.
-        for dir in path_var.split(':') {
+        for dir in path_var.split(PATH_SEPARATOR) {
             if dir.is_empty() {
                 continue;
             }
-            let candidate = Path::new(dir).join(command);
-            if candidate.exists() && candidate.is_file() {
+            if candidate_is_executable(&Path::new(dir).join(command)) {
                 return true;
             }
         }
         false
     }
+}
+
+/// The `PATH` entry separator for the current platform.
+#[cfg(windows)]
+const PATH_SEPARATOR: char = ';';
+#[cfg(not(windows))]
+const PATH_SEPARATOR: char = ':';
+
+/// Whether `command` looks like a filesystem path rather than a bare command
+/// name. `/` counts everywhere; `\` additionally counts on Windows.
+fn is_path_like(command: &str) -> bool {
+    command.contains('/') || (cfg!(windows) && command.contains('\\'))
+}
+
+/// Whether `path` names an existing file we could launch. On Windows, a path
+/// with no extension also matches when appending a `PATHEXT` extension yields a
+/// real file.
+fn candidate_is_executable(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() {
+            for ext in pathext() {
+                if path.with_extension(ext.trim_start_matches('.')).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The executable extensions from `PATHEXT` (without the leading dot stripped),
+/// falling back to the Windows defaults when the variable is unset.
+#[cfg(windows)]
+fn pathext() -> Vec<String> {
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Whether `command` exists on the process `PATH` (uses the real environment).
@@ -66,6 +112,7 @@ pub fn build_launch(agent: &AgentDef, cwd: &Path) -> LaunchSpec {
 mod tests {
     use super::*;
     use crate::contracts::{AgentDef, StatusPatterns};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -82,10 +129,14 @@ mod tests {
     fn create_executable(dir: &TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, "#!/bin/sh\n").expect("write fake binary");
-        // Make it a regular file (executable bit not required for our check — we only check exists+is_file)
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // Make it a regular file (executable bit not required for our check — we
+        // only check exists+is_file, and Windows has no POSIX mode bits).
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
         path
     }
 
@@ -115,7 +166,7 @@ mod tests {
         create_executable(&dir2, "myagent");
 
         let path_var = format!(
-            "{}:{}",
+            "{}{PATH_SEPARATOR}{}",
             dir1.path().to_str().unwrap(),
             dir2.path().to_str().unwrap()
         );

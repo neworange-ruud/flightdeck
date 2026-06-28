@@ -1642,6 +1642,7 @@ mod tests {
     use crate::contracts::{AgentDef, ContainerState, StatusPatterns, UiConfig, WorktreesConfig};
     use crate::persistence::project_state::default_state;
     use crate::testing::{FakeClock, FakeContainerRuntime, FakeFs, FakeGit, FakePty};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -1652,9 +1653,12 @@ mod tests {
     fn make_real_agent(dir: &TempDir, key: &str) -> (AgentDef, String) {
         let path = dir.path().join(key);
         std::fs::write(&path, "#!/bin/sh\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
         let command = path.to_str().unwrap().to_string();
         (
             AgentDef {
