@@ -74,7 +74,10 @@ impl Terminal {
     /// be missed.
     pub fn answer_cursor_position_query(&mut self, output: &[u8]) {
         const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
-        if !output.windows(DSR_CPR_QUERY.len()).any(|w| w == DSR_CPR_QUERY) {
+        if !output
+            .windows(DSR_CPR_QUERY.len())
+            .any(|w| w == DSR_CPR_QUERY)
+        {
             return;
         }
         let (row, col) = self.parser.screen().cursor_position();

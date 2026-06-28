@@ -308,6 +308,9 @@ mod tests {
 
         let err = remove_worktree_if_safe(&git, &fs, path, true).unwrap_err();
         assert!(matches!(err, FlightDeckError::Git(_)));
-        assert!(fs.exists(path), "directory must be left intact on unknown error");
+        assert!(
+            fs.exists(path),
+            "directory must be left intact on unknown error"
+        );
     }
 }
