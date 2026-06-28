@@ -1,17 +1,16 @@
 # FlightDeck
 
-**FlightDeck** is a macOS-first terminal UI for orchestrating multiple local AI
-coding agents working in parallel on the same Git project. You run it from inside
-a Git repository; it creates isolated Git **worktrees** under `.flightdeck/`,
-launches a selected AI coding agent inside each one, lets you switch between
-parallel agent sessions, open extra child shells in each worktree, tracks Git and
-agent status, and helps push branches for GitHub pull-request workflows.
+**FlightDeck** is a macOS and Windows terminal UI for orchestrating multiple
+local AI coding agents working in parallel on the same Git project. You run it
+from inside a Git repository; it creates isolated Git **worktrees** under
+`.flightdeck/`, launches a selected AI coding agent inside each one, lets you
+switch between parallel agent sessions, open extra child shells in each worktree,
+tracks Git and agent status, and helps push branches for GitHub pull-request
+workflows.
+
+> Each Agent Tab = 1 Worktree = 1 Branch = 1 Primary Agent Process + Optional Shell Processes
 
 ![FlightDeck screenshot](specs/screenshot.png)
-
-```text
-1 Agent Tab = 1 Worktree = 1 Branch = 1 Primary Agent Process
-```
 
 ## Quick start
 
@@ -95,6 +94,37 @@ config-driven — edit the `command`, `args`, and `status_patterns` there. When
 you create a tab you pick which agent it runs from a quick menu, so you can mix
 agents (e.g. Claude Code in one tab, OpenCode in another); the menu is skipped
 when only one agent is configured.
+
+## Running agents in containers (optional)
+
+FlightDeck can run each agent inside an isolated, rootless **Podman** container
+instead of directly on the host. The agent's git worktree is bind-mounted at
+`/workspace`, so the host keeps owning the worktree and all git operations while
+the agent process is sandboxed. It's a **project-wide toggle** — when enabled,
+all agents run in containers; new tabs `podman run`, child shells (`Ctrl-t`)
+`podman exec` into the same container, and a still-running container is
+reattached across FlightDeck restarts.
+
+Enable it in `.flightdeck/config.toml`, then build the image and check readiness:
+
+```toml
+[containers]
+enabled = true
+runtime = "podman"
+# forward_ports = [3000]        # publish dev-server ports to 127.0.0.1 only
+```
+
+```bash
+flightdeck image build claude   # builds a self-contained image, installs the agent CLI
+flightdeck doctor               # verifies podman + images are ready
+```
+
+Every launch is checked by non-disableable guardrails: no `--privileged`, no
+docker/podman socket mount, no `--env-host`, no home-directory mount, and ports
+publish to `127.0.0.1` only. Containers run with `--cap-drop all` and
+`--security-opt no-new-privileges`. Network egress is unrestricted in v1 (full
+outbound). See `containers/README.md` for the full configuration (resource
+limits, credential mounts, custom base images / Containerfiles).
 
 ## The Git ownership boundary (why FlightDeck is safe)
 
