@@ -75,6 +75,14 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::ALT {
         return KeyAction::FocusApp;
     }
+    // Windows: Alt+Esc is a reserved OS shortcut (cycles windows in z-order), so
+    // the shell grabs it before FlightDeck ever sees it. Offer Shift+Esc as the
+    // leave-terminal-focus key there instead. Bare Esc (and 2×Esc) still pass
+    // through to hosted agents.
+    #[cfg(windows)]
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::SHIFT {
+        return KeyAction::FocusApp;
+    }
     // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
     // but cannot see the host clipboard's image flavour through the PTY, so the
     // wiring layer reads it and sends a temp-file path instead. With no image on
@@ -578,6 +586,37 @@ mod tests {
         assert_eq!(
             map_key(InputMode::Terminal, alt(KeyCode::Esc)),
             KeyAction::FocusApp
+        );
+    }
+
+    /// Construct a KeyEvent with Shift held.
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_mode_shift_esc_focuses_app_on_windows() {
+        // Windows reserves Alt+Esc (cycles windows), so Shift+Esc is the
+        // leave-terminal-focus key there.
+        assert_eq!(
+            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
+            KeyAction::FocusApp
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn terminal_mode_shift_esc_passes_through_off_windows() {
+        // Off Windows, Shift+Esc is not a focus key — it stays a PTY passthrough.
+        assert_eq!(
+            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
+            KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
         );
     }
 
