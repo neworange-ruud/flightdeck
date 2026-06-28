@@ -56,6 +56,33 @@ impl Terminal {
         self.parser.process(bytes);
     }
 
+    /// Reply to a Device Status Report cursor-position query (`ESC[6n`) found in
+    /// freshly-read PTY output by writing a Cursor Position Report
+    /// (`ESC[<row>;<col>R`) back on the PTY input — exactly as a real terminal
+    /// emulator does.
+    ///
+    /// ConPTY (Windows) and many interactive programs that probe the cursor
+    /// (PowerShell's PSReadLine, Node-based TUIs such as Claude Code) **block
+    /// their initial render until they receive this reply**. Without it, a
+    /// Windows agent/shell pane stays blank with only a cursor in the top-left.
+    /// (Unix PTYs/programs don't gate their first paint on this handshake, so
+    /// the macOS-first build never needed it.)
+    ///
+    /// Call after [`Self::process_output`] so the reported position reflects the
+    /// parser's current cursor. Detection is per-chunk; a query split across two
+    /// reads (not observed from ConPTY, which emits `ESC[6n` atomically) would
+    /// be missed.
+    pub fn answer_cursor_position_query(&mut self, output: &[u8]) {
+        const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
+        if !output.windows(DSR_CPR_QUERY.len()).any(|w| w == DSR_CPR_QUERY) {
+            return;
+        }
+        let (row, col) = self.parser.screen().cursor_position();
+        // CPR is 1-based; vt100 reports a 0-based cursor position.
+        let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+        let _ = self.session.write_input(reply.as_bytes());
+    }
+
     /// The current parsed screen, for rendering.
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
@@ -423,6 +450,44 @@ mod tests {
 
     fn sz() -> PtySize {
         PtySize::default()
+    }
+
+    // Windows/ConPTY: a Device Status Report cursor-position query (`ESC[6n`)
+    // must be answered with a CPR on the PTY input, or the child stalls before
+    // rendering. A fresh screen has the cursor at home → 1;1 (1-based).
+    #[test]
+    fn answers_cursor_position_query_with_cpr() {
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "claude", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        let bytes = b"\x1b[6n";
+        let term = session.primary_mut().unwrap();
+        term.process_output(bytes);
+        term.answer_cursor_position_query(bytes);
+
+        assert_eq!(handle.input(), b"\x1b[1;1R");
+    }
+
+    // Output without a DSR query must not write anything back to the PTY.
+    #[test]
+    fn no_cursor_report_without_query() {
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "claude", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        let bytes = b"hello world\r\n";
+        let term = session.primary_mut().unwrap();
+        term.process_output(bytes);
+        term.answer_cursor_position_query(bytes);
+
+        assert!(handle.input().is_empty(), "no DSR query → no reply written");
     }
 
     // §26: creates primary terminal.

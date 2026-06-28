@@ -1984,6 +1984,9 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
             if let Ok(bytes) = primary.session_mut().try_read_output() {
                 if !bytes.is_empty() {
                     primary.process_output(&bytes);
+                    // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
+                    // any `ESC[6n` so the child renders instead of stalling.
+                    primary.answer_cursor_position_query(&bytes);
                     ingest.push((id.clone(), bytes));
                 }
             }
@@ -1996,6 +1999,7 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
                 if let Ok(bytes) = child.session_mut().try_read_output() {
                     if !bytes.is_empty() {
                         child.process_output(&bytes);
+                        child.answer_cursor_position_query(&bytes);
                     }
                 }
             }
