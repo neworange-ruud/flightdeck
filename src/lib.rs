@@ -19,7 +19,33 @@ pub mod persistence;
 pub mod runtime;
 pub mod terminal;
 pub mod tui;
+#[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
+
+// No-op stand-in when the real self-updater is not built: either the
+// `self-update` feature is off (a pure-Rust build with no C toolchain), or the
+// target is Windows (where the updater deps are gated out in Cargo.toml so the
+// released windows-msvc binary stays pure-Rust). Keeps
+// `update::run`/`update::start_check` callable so the subcommand dispatch and the
+// update-notice channel plumbing below need no `cfg` of their own; `update`
+// becomes a no-op and `start_check` never sends.
+#[cfg(not(all(feature = "self-update", not(windows))))]
+pub mod update {
+    use crate::contracts::error::Result;
+    use std::sync::mpsc::Sender;
+
+    pub fn run() -> Result<()> {
+        println!(
+            "FlightDeck: this build was compiled without self-update support \
+             (`flightdeck update` is a no-op here)."
+        );
+        Ok(())
+    }
+
+    pub fn start_check(_enabled: bool, _now_unix: u64, _tx: Sender<String>) -> Option<String> {
+        None
+    }
+}
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
@@ -1984,6 +2010,9 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
             if let Ok(bytes) = primary.session_mut().try_read_output() {
                 if !bytes.is_empty() {
                     primary.process_output(&bytes);
+                    // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
+                    // any `ESC[6n` so the child renders instead of stalling.
+                    primary.answer_cursor_position_query(&bytes);
                     ingest.push((id.clone(), bytes));
                 }
             }
@@ -1996,6 +2025,7 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
                 if let Ok(bytes) = child.session_mut().try_read_output() {
                     if !bytes.is_empty() {
                         child.process_output(&bytes);
+                        child.answer_cursor_position_query(&bytes);
                     }
                 }
             }
@@ -2185,15 +2215,19 @@ mod tests {
     use super::*;
     use crate::contracts::{AgentDef, Config, StatusPatterns, UiConfig, WorktreesConfig};
     use crate::testing::{FakeClock, FakeFs, FakeGit, FakePty};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn make_real_agent(dir: &TempDir, key: &str) -> AgentDef {
         let path = dir.path().join(key);
         std::fs::write(&path, "#!/bin/sh\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
         AgentDef {
             key: key.to_string(),
             display_name: key.to_string(),

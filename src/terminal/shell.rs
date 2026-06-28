@@ -1,10 +1,26 @@
 //! Default shell resolution for child terminals (SPECS §19).
 
-/// The user's default shell (`$SHELL`, falling back to a sensible default).
+/// The user's default shell.
+///
+/// On Unix this honours `$SHELL`, falling back to `/bin/zsh`. On Windows there
+/// is no `$SHELL`; we launch PowerShell — preferring PowerShell 7+ (`pwsh.exe`)
+/// when it is on `PATH`, otherwise the in-box Windows PowerShell
+/// (`powershell.exe`), which is always present.
 pub fn default_shell() -> String {
-    match std::env::var("SHELL") {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => "/bin/zsh".to_string(),
+    #[cfg(windows)]
+    {
+        if crate::agents::adapter::command_exists("pwsh.exe") {
+            "pwsh.exe".to_string()
+        } else {
+            "powershell.exe".to_string()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match std::env::var("SHELL") {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => "/bin/zsh".to_string(),
+        }
     }
 }
 

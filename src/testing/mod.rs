@@ -146,6 +146,13 @@ impl FileSystem for FakeFs {
         out.sort();
         Ok(out)
     }
+
+    fn remove_dir_all(&self, p: &Path) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.files.retain(|path, _| !path.starts_with(p));
+        st.dirs.retain(|dir| dir != p && !dir.starts_with(p));
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -176,10 +183,14 @@ struct FakeGitState {
     remotes: HashMap<String, String>,
     merge_outcome: Option<MergeOutcome>,
     rebase_outcome: Option<RebaseOutcome>,
+    /// When set, [`GitExecutor::remove_worktree`] fails with this `Git` message
+    /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
+    remove_worktree_error: Option<String>,
     // recordings
     created_branches: Vec<(String, String)>,
     added_worktrees: Vec<(PathBuf, String)>,
     removed_worktrees: Vec<PathBuf>,
+    pruned_count: u32,
     pushes: Vec<(String, String, PathBuf)>,
     merges: Vec<(String, PathBuf)>,
     rebases: Vec<(String, PathBuf)>,
@@ -202,9 +213,11 @@ impl Default for FakeGit {
                 remotes: HashMap::new(),
                 merge_outcome: None,
                 rebase_outcome: None,
+                remove_worktree_error: None,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
                 removed_worktrees: Vec::new(),
+                pruned_count: 0,
                 pushes: Vec::new(),
                 merges: Vec::new(),
                 rebases: Vec::new(),
@@ -324,6 +337,12 @@ impl FakeGit {
         self.inner.lock().unwrap().rebase_outcome = Some(outcome);
     }
 
+    /// Make [`GitExecutor::remove_worktree`] fail with the given `Git` message,
+    /// simulating git refusing a path it does not track as a worktree.
+    pub fn set_remove_worktree_error(&self, message: impl Into<String>) {
+        self.inner.lock().unwrap().remove_worktree_error = Some(message.into());
+    }
+
     // --- recordings ---
 
     /// Branches created via [`GitExecutor::create_branch`], as `(name, from)`.
@@ -339,6 +358,11 @@ impl FakeGit {
     /// Worktrees removed via [`GitExecutor::remove_worktree`].
     pub fn removed_worktrees(&self) -> Vec<PathBuf> {
         self.inner.lock().unwrap().removed_worktrees.clone()
+    }
+
+    /// Number of times [`GitExecutor::prune_worktrees`] was called.
+    pub fn prune_count(&self) -> u32 {
+        self.inner.lock().unwrap().pruned_count
     }
 
     /// Pushes performed, as `(remote, branch, cwd)`.
@@ -425,8 +449,16 @@ impl GitExecutor for FakeGit {
 
     fn remove_worktree(&self, path: &Path, _force: bool) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
+        if let Some(msg) = st.remove_worktree_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
         st.worktrees.retain(|w| w.path != path);
         st.removed_worktrees.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn prune_worktrees(&self) -> Result<()> {
+        self.inner.lock().unwrap().pruned_count += 1;
         Ok(())
     }
 

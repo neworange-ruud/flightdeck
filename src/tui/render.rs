@@ -903,6 +903,14 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// The key that leaves terminal focus, per platform. `Alt+Esc` everywhere
+/// except Windows, where the OS reserves `Alt+Esc` (cycles windows) so the
+/// terminal app never receives it — Windows uses `Shift+Esc` instead.
+#[cfg(windows)]
+pub const LEAVE_FOCUS_KEY: &str = "Shift+Esc";
+#[cfg(not(windows))]
+pub const LEAVE_FOCUS_KEY: &str = "Alt+Esc";
+
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
 /// optional trailing update hint when a newer release is available (SPECS §30).
 ///
@@ -919,7 +927,7 @@ pub fn status_bar_text(mode: InputMode, update_available: Option<&str>) -> Line<
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
-            Span::styled("Alt+Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(LEAVE_FOCUS_KEY, Style::default().fg(Color::Yellow)),
             Span::raw(": app commands | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
             Span::raw(": command palette"),
@@ -1208,6 +1216,9 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
+        #[cfg(windows)]
+        shortcut_line("  Shift+Esc", "Leave terminal focus / focus app"),
+        #[cfg(not(windows))]
         shortcut_line("  Alt+Esc", "Leave terminal focus / focus app"),
         shortcut_line("  Enter", "Focus active terminal"),
         Line::raw(""),

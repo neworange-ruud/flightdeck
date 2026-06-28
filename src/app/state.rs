@@ -1202,11 +1202,16 @@ impl AppState {
             return Ok(Effect::AbandonWarning { dirty });
         }
 
+        // Tear down any live session + container BEFORE removing the worktree.
+        // On Windows a directory cannot be deleted while a process still holds it
+        // open (the agent/shell keeps its cwd inside the worktree, and a container
+        // may bind-mount it), so `git worktree remove` would fail with a
+        // permission-denied error. Mirrors the merge path's ordering (SPECS §5/§15).
+        let _ = self.tabs[idx].session.terminate_all();
+        self.destroy_container_if_any(idx, services);
+
         match remove_worktree_if_safe(services.git, services.fs, &worktree, confirm) {
             Ok(()) => {
-                // Tear down any live session + container, then drop the tab.
-                let _ = self.tabs[idx].session.terminate_all();
-                self.destroy_container_if_any(idx, services);
                 self.tabs.remove(idx);
                 self.fix_selection_after_removal(idx);
                 self.persist(services)?;
@@ -1642,6 +1647,7 @@ mod tests {
     use crate::contracts::{AgentDef, ContainerState, StatusPatterns, UiConfig, WorktreesConfig};
     use crate::persistence::project_state::default_state;
     use crate::testing::{FakeClock, FakeContainerRuntime, FakeFs, FakeGit, FakePty};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -1652,9 +1658,12 @@ mod tests {
     fn make_real_agent(dir: &TempDir, key: &str) -> (AgentDef, String) {
         let path = dir.path().join(key);
         std::fs::write(&path, "#!/bin/sh\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
         let command = path.to_str().unwrap().to_string();
         (
             AgentDef {

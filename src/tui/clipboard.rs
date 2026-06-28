@@ -1,7 +1,7 @@
 //! Best-effort system-clipboard write for copied terminal selections.
 //!
-//! Tries the platform clipboard command first (`pbcopy` on macOS;
-//! `wl-copy`/`xclip`/`xsel` on Linux), falling back to an OSC 52 escape
+//! Tries the platform clipboard command first (`pbcopy` on macOS; `clip` on
+//! Windows; `wl-copy`/`xclip`/`xsel` on Linux), falling back to an OSC 52 escape
 //! sequence written to the controlling terminal. The fallback works over SSH
 //! and inside multiplexers that pass OSC 52 through, but is only reached when no
 //! clipboard command is available, so it rarely perturbs the alternate screen.
@@ -37,7 +37,11 @@ pub fn save_clipboard_image() -> Option<PathBuf> {
     {
         save_clipboard_image_macos()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        save_clipboard_image_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         save_clipboard_image_linux()
     }
@@ -127,9 +131,36 @@ fn osascript_write_clipboard(path: &Path, class: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows: ask PowerShell to read an image off the clipboard and save it as a
+/// PNG. `Clipboard::GetImage` returns null when no image is present, so the
+/// script exits non-zero and we report `None`.
+#[cfg(target_os = "windows")]
+fn save_clipboard_image_windows() -> Option<PathBuf> {
+    let path = unique_image_path("png");
+    // PowerShell single-quoted literals only need `'` doubled; temp paths never
+    // contain quotes in practice, but guard anyway.
+    let p = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($img -eq $null) {{ exit 1 }}; \
+         $img.Save('{p}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0"
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if matches!(status, Ok(s) if s.success()) && wrote_non_empty(&path) {
+        return Some(path);
+    }
+    let _ = std::fs::remove_file(&path);
+    None
+}
+
 /// Linux: try Wayland (`wl-paste`) then X11 (`xclip`) to pull a PNG off the
 /// clipboard.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn save_clipboard_image_linux() -> Option<PathBuf> {
     use std::fs::File;
 
@@ -165,6 +196,9 @@ fn save_clipboard_image_linux() -> Option<PathBuf> {
 fn try_command_clipboard(text: &str) -> bool {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        // `clip` reads stdin and sets the clipboard.
+        &[("clip", &[])]
     } else {
         &[
             ("wl-copy", &[]),

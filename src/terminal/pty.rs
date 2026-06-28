@@ -24,6 +24,112 @@ fn map_size(size: PtySize) -> PortPtySize {
     }
 }
 
+/// Build the `portable-pty` command for an agent/shell command + args.
+///
+/// On Unix the command is spawned as-is. On Windows it must go through
+/// [`resolve_windows_command`] first: `CreateProcess` can only launch PE
+/// executables, but npm/pnpm/yarn install many CLIs (e.g. OpenCode) as a `.cmd`
+/// batch wrapper on `PATH`. Spawning such a wrapper directly fails with
+/// "%1 is not a valid Win32 application", so batch wrappers are run through the
+/// command processor (`cmd.exe /d /c`).
+fn build_command_builder(cmd: &str, args: &[String]) -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        match resolve_windows_command(cmd) {
+            WindowsCommand::Batch(script) => {
+                let comspec = std::env::var_os("ComSpec")
+                    .unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+                let mut builder = CommandBuilder::new(comspec);
+                // /d skips any AutoRun registry command; /c runs then exits.
+                builder.arg("/d");
+                builder.arg("/c");
+                builder.arg(script);
+                builder.args(args);
+                builder
+            }
+            WindowsCommand::Direct(target) => {
+                let mut builder = CommandBuilder::new(target);
+                builder.args(args);
+                builder
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut builder = CommandBuilder::new(cmd);
+        builder.args(args);
+        builder
+    }
+}
+
+/// How a command should be launched on Windows.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsCommand {
+    /// A `.cmd`/`.bat` wrapper to run via `cmd.exe /c <script>`.
+    Batch(std::ffi::OsString),
+    /// A directly-spawnable target (a PE executable, or an unresolved name left
+    /// for `CreateProcess` to handle / fail on as before).
+    Direct(std::ffi::OsString),
+}
+
+/// Resolve a command to either a batch wrapper (run via the command processor)
+/// or a directly-spawnable target, mirroring how the OS would find it.
+///
+/// - A command that already carries an extension is classified by it
+///   (`.cmd`/`.bat` → batch, anything else → direct).
+/// - A bare name (or a path without an extension) is probed against the
+///   `PATHEXT`-style set `.com/.exe/.bat/.cmd`: for a bare name across every
+///   `PATH` entry, for a path-bearing name against that exact location. The
+///   first existing file wins, classified by its extension.
+/// - If nothing resolves, the original string is passed through as `Direct`.
+#[cfg(windows)]
+fn resolve_windows_command(cmd: &str) -> WindowsCommand {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    let as_path = Path::new(cmd);
+    if let Some(ext) = as_path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if ext == "cmd" || ext == "bat" {
+            return WindowsCommand::Batch(OsString::from(cmd));
+        }
+        return WindowsCommand::Direct(OsString::from(cmd));
+    }
+
+    // No extension: probe candidate executable extensions, batch last so a real
+    // .exe is preferred over a same-named wrapper.
+    const EXTS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+    let classify = |base: &Path| -> Option<WindowsCommand> {
+        for ext in EXTS {
+            let candidate = base.with_extension(ext);
+            if candidate.is_file() {
+                return Some(if ext == "bat" || ext == "cmd" {
+                    WindowsCommand::Batch(candidate.into_os_string())
+                } else {
+                    WindowsCommand::Direct(candidate.into_os_string())
+                });
+            }
+        }
+        None
+    };
+
+    let has_separator = cmd.contains('/') || cmd.contains('\\');
+    if has_separator {
+        if let Some(found) = classify(as_path) {
+            return found;
+        }
+    } else if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(found) = classify(&dir.join(cmd)) {
+                return found;
+            }
+        }
+    }
+
+    WindowsCommand::Direct(OsString::from(cmd))
+}
+
 impl PtyBackend for PortablePtyBackend {
     fn spawn(
         &self,
@@ -37,8 +143,7 @@ impl PtyBackend for PortablePtyBackend {
             .openpty(map_size(size))
             .map_err(|e| FlightDeckError::Io(format!("openpty failed: {e}")))?;
 
-        let mut builder = CommandBuilder::new(cmd);
-        builder.args(args);
+        let mut builder = build_command_builder(cmd, args);
         builder.cwd(cwd);
 
         let child = pair
@@ -163,16 +268,44 @@ impl PtySession for PortablePtySession {
     }
 
     fn terminate_tree(&mut self) -> Result<()> {
-        // Best-effort: kill the direct child of the PTY. On macOS/Linux this
-        // does NOT recursively reap an arbitrary grandchild tree; children that
-        // re-parent (daemonize / double-fork) may survive. For the MVP, killing
-        // the pty's direct child (the shell/agent) is acceptable, and dropping
-        // the pty master delivers SIGHUP to the foreground group.
-        self.killer
-            .kill()
-            .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
-        // Reap so we do not leave a zombie.
-        let _ = self.child.lock().expect("child poisoned").try_wait();
+        // On Windows the whole *tree* must die, not just the PTY's direct child.
+        // An npm-installed agent CLI runs as `cmd.exe /d /c <wrapper>` (see
+        // `build_command_builder`), which spawns the real agent (e.g. node.exe)
+        // as a grandchild. Killing only the direct child (`cmd.exe`) leaves that
+        // grandchild alive holding the worktree directory open (its cwd), so a
+        // later `git worktree remove` / directory delete fails with a
+        // permission-denied error. `taskkill /T /F` terminates the entire tree.
+        #[cfg(windows)]
+        {
+            let pid = self.child.lock().expect("child poisoned").process_id();
+            if let Some(pid) = pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .output();
+            }
+            // Backstop, best-effort: the tree kill above may already have reaped
+            // the direct child, in which case `kill()` would error.
+            let _ = self.killer.kill();
+        }
+        #[cfg(not(windows))]
+        {
+            // Best-effort: kill the direct child of the PTY. On macOS/Linux this
+            // does NOT recursively reap an arbitrary grandchild tree; children
+            // that re-parent (daemonize / double-fork) may survive. Killing the
+            // pty's direct child (the shell/agent) is acceptable, and dropping
+            // the pty master delivers SIGHUP to the foreground group.
+            self.killer
+                .kill()
+                .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
+        }
+        // Block until the direct child has actually exited so the OS releases the
+        // handles it held — most importantly its working directory. On Windows
+        // `TerminateProcess`/`taskkill` are asynchronous: they return before the
+        // process is torn down, and a worktree directory cannot be deleted while
+        // any process still has it open. Waiting here makes a subsequent
+        // `git worktree remove` (abandon / merge cleanup) reliable. The wait is
+        // bounded in practice because the tree has just been killed.
+        let _ = self.child.lock().expect("child poisoned").wait();
         *self.terminated.lock().expect("terminated flag poisoned") = true;
         Ok(())
     }
@@ -207,5 +340,49 @@ mod tests {
 
         // Terminate is a no-op once the process has exited, but must not error.
         session.terminate_tree().expect("terminate");
+    }
+
+    // Windows command resolution: npm-installed CLIs (e.g. OpenCode) land on
+    // PATH as a `.cmd` wrapper that CreateProcess can't launch directly; they
+    // must run via `cmd.exe /c`. PE executables spawn directly.
+    #[cfg(windows)]
+    #[test]
+    fn windows_classifies_batch_extensions() {
+        assert_eq!(
+            resolve_windows_command("opencode.cmd"),
+            WindowsCommand::Batch("opencode.cmd".into())
+        );
+        assert_eq!(
+            resolve_windows_command("setup.bat"),
+            WindowsCommand::Batch("setup.bat".into())
+        );
+        // Case-insensitive extension match.
+        assert_eq!(
+            resolve_windows_command(r"C:\tools\opencode.CMD"),
+            WindowsCommand::Batch(r"C:\tools\opencode.CMD".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_classifies_exe_as_direct() {
+        assert_eq!(
+            resolve_windows_command("claude.exe"),
+            WindowsCommand::Direct("claude.exe".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolves_extensionless_path_to_cmd_wrapper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("opencode.cmd");
+        std::fs::write(&script, "@echo off\n").expect("write wrapper");
+        // A path without an extension finds its `.cmd` sibling → batch.
+        let base = dir.path().join("opencode");
+        assert_eq!(
+            resolve_windows_command(base.to_str().unwrap()),
+            WindowsCommand::Batch(script.into_os_string())
+        );
     }
 }

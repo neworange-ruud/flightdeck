@@ -27,6 +27,12 @@ Or install directly from the latest GitHub Release:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
 ```
 
+On Windows, install from the same release with PowerShell:
+
+```powershell
+irm https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.ps1 | iex
+```
+
 Update direct (installer) installs in place with:
 
 ```bash
@@ -40,6 +46,10 @@ installs it defers to the package manager — update those with:
 ```bash
 brew upgrade flightdeck
 ```
+
+The Windows build is pure-Rust and ships **without** the self-updater
+(`flightdeck update` is a no-op there); upgrade by re-running the PowerShell
+installer above, which fetches the latest release.
 
 ### Update notice (opt-in)
 
@@ -280,6 +290,33 @@ cargo fmt --check
 cargo run                                # run inside a git repo
 ```
 
+### Cross-building for Windows
+
+The app compiles and runs on Windows. You can build a Windows `.exe` from
+macOS/Linux without a Windows machine — cross-compilation is
+CPU-architecture-independent, so it works on Apple Silicon too:
+
+```bash
+scripts/build-windows                    # release .exe via cargo-xwin in Docker
+scripts/build-windows debug              # debug build
+```
+
+This uses [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) in Docker to
+download the MSVC CRT/SDK import libraries and link with LLVM `lld` — no MSVC
+install required. The binary lands at
+`target/x86_64-pc-windows-msvc/release/flightdeck.exe`. The container ships the
+clang-based C cross-toolchain the dependency graph needs (the self-update path
+pulls in `aws-lc-sys`, a C crypto library), so a bare `cargo check --target
+x86_64-pc-windows-msvc` on the host is **not** sufficient — use the script (or
+CI) for any Windows compile check.
+
+Building is one thing; **running** a Windows binary needs Windows. The
+`windows-latest` CI job (see `.github/workflows/ci.yml`) compiles, lints, and
+runs the test suite on real Windows on every push — that is the canonical check.
+To exercise the TUI interactively on an Apple Silicon Mac, use a Windows 11 on
+ARM VM (its built-in x64 emulation runs the x86_64 binary); Wine's console
+emulation is not reliable for a full-screen PTY app.
+
 ## Release
 
 Releases are built by `cargo-dist` in GitHub Actions when a version tag is
@@ -375,7 +412,7 @@ changes, run this checklist by hand from inside a scratch Git repo:
 
 ## Status
 
-MVP. Out of scope for now: Windows, multiple repos per process, live terminal
+MVP. Out of scope for now: multiple repos per process, live terminal
 resurrection after restart, automatic commits/PRs, GitHub API integration, an
 agent plugin system, initial-prompt injection, a diff viewer, split panes, and
 multiple base branches (see SPECS §28).
