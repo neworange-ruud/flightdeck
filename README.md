@@ -27,6 +27,12 @@ Or install directly from the latest GitHub Release:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
 ```
 
+On Windows, install from the same release with PowerShell:
+
+```powershell
+irm https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.ps1 | iex
+```
+
 Update direct (installer) installs in place with:
 
 ```bash
@@ -40,6 +46,10 @@ installs it defers to the package manager — update those with:
 ```bash
 brew upgrade flightdeck
 ```
+
+The Windows build is pure-Rust and ships **without** the self-updater
+(`flightdeck update` is a no-op there); upgrade by re-running the PowerShell
+installer above, which fetches the latest release.
 
 ### Update notice (opt-in)
 

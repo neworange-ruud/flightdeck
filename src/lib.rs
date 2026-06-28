@@ -19,14 +19,17 @@ pub mod persistence;
 pub mod runtime;
 pub mod terminal;
 pub mod tui;
-#[cfg(feature = "self-update")]
+#[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
 
-// No-op stand-in when built without the `self-update` feature (e.g. a pure-Rust
-// build with no C toolchain). Keeps `update::run`/`update::start_check` callable
-// so the subcommand dispatch and the update-notice channel plumbing below need
-// no `cfg` of their own; `update` becomes a no-op and `start_check` never sends.
-#[cfg(not(feature = "self-update"))]
+// No-op stand-in when the real self-updater is not built: either the
+// `self-update` feature is off (a pure-Rust build with no C toolchain), or the
+// target is Windows (where the updater deps are gated out in Cargo.toml so the
+// released windows-msvc binary stays pure-Rust). Keeps
+// `update::run`/`update::start_check` callable so the subcommand dispatch and the
+// update-notice channel plumbing below need no `cfg` of their own; `update`
+// becomes a no-op and `start_check` never sends.
+#[cfg(not(all(feature = "self-update", not(windows))))]
 pub mod update {
     use crate::contracts::error::Result;
     use std::sync::mpsc::Sender;

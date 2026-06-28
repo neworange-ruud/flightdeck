@@ -7,12 +7,20 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "homebrew"]
+# The installers to generate for each app. "powershell" is the Windows
+# counterpart to the Unix "shell" installer (irm <url> | iex).
+installers = ["shell", "homebrew", "powershell"]
 # Package-manager publishing jobs to run after GitHub artifacts are hosted
 publish-jobs = ["homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# Target platforms to build apps for (Rust target-triple syntax). Windows ships
+# as x86_64-pc-windows-msvc (built on a GitHub windows runner). The released
+# windows binary is pure-Rust: the self-update deps are target-gated out in
+# Cargo.toml so the build needs no C toolchain (no CMake/NASM/aws-lc-sys).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
