@@ -4,6 +4,9 @@
 //! `tests/integration.rs` is a test-crate root, so submodules are pointed at the
 //! `tests/integration/` directory explicitly via `#[path]`.
 
+#[path = "integration/util.rs"]
+mod util;
+
 #[path = "integration/init.rs"]
 mod init;
 #[path = "integration/merge_preconditions.rs"]

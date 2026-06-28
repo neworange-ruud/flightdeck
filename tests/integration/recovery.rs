@@ -26,7 +26,7 @@ fn setup_repo() -> (tempfile::TempDir, PathBuf) {
     std::fs::write(root.join("README.md"), "hello\n").expect("write README");
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "initial commit"]);
-    let canonical = std::fs::canonicalize(root).expect("canonicalize root");
+    let canonical = crate::util::canonical_root(root);
     (dir, canonical)
 }
 
