@@ -268,16 +268,44 @@ impl PtySession for PortablePtySession {
     }
 
     fn terminate_tree(&mut self) -> Result<()> {
-        // Best-effort: kill the direct child of the PTY. On macOS/Linux this
-        // does NOT recursively reap an arbitrary grandchild tree; children that
-        // re-parent (daemonize / double-fork) may survive. For the MVP, killing
-        // the pty's direct child (the shell/agent) is acceptable, and dropping
-        // the pty master delivers SIGHUP to the foreground group.
-        self.killer
-            .kill()
-            .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
-        // Reap so we do not leave a zombie.
-        let _ = self.child.lock().expect("child poisoned").try_wait();
+        // On Windows the whole *tree* must die, not just the PTY's direct child.
+        // An npm-installed agent CLI runs as `cmd.exe /d /c <wrapper>` (see
+        // `build_command_builder`), which spawns the real agent (e.g. node.exe)
+        // as a grandchild. Killing only the direct child (`cmd.exe`) leaves that
+        // grandchild alive holding the worktree directory open (its cwd), so a
+        // later `git worktree remove` / directory delete fails with a
+        // permission-denied error. `taskkill /T /F` terminates the entire tree.
+        #[cfg(windows)]
+        {
+            let pid = self.child.lock().expect("child poisoned").process_id();
+            if let Some(pid) = pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .output();
+            }
+            // Backstop, best-effort: the tree kill above may already have reaped
+            // the direct child, in which case `kill()` would error.
+            let _ = self.killer.kill();
+        }
+        #[cfg(not(windows))]
+        {
+            // Best-effort: kill the direct child of the PTY. On macOS/Linux this
+            // does NOT recursively reap an arbitrary grandchild tree; children
+            // that re-parent (daemonize / double-fork) may survive. Killing the
+            // pty's direct child (the shell/agent) is acceptable, and dropping
+            // the pty master delivers SIGHUP to the foreground group.
+            self.killer
+                .kill()
+                .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
+        }
+        // Block until the direct child has actually exited so the OS releases the
+        // handles it held — most importantly its working directory. On Windows
+        // `TerminateProcess`/`taskkill` are asynchronous: they return before the
+        // process is torn down, and a worktree directory cannot be deleted while
+        // any process still has it open. Waiting here makes a subsequent
+        // `git worktree remove` (abandon / merge cleanup) reliable. The wait is
+        // bounded in practice because the tree has just been killed.
+        let _ = self.child.lock().expect("child poisoned").wait();
         *self.terminated.lock().expect("terminated flag poisoned") = true;
         Ok(())
     }

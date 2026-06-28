@@ -155,6 +155,15 @@ impl GitExecutor for GitCli {
         require_success(&out, &format!("worktree remove {path_str}"))
     }
 
+    fn prune_worktrees(&self) -> Result<()> {
+        // `--expire now` is required: a plain `git worktree prune` only removes
+        // entries whose directory has been missing longer than
+        // `gc.worktreePruneExpire` (default ~3 months), so it would leave a
+        // just-orphaned entry behind.
+        let out = self.run(&["worktree", "prune", "--expire", "now"])?;
+        require_success(&out, "worktree prune --expire now")
+    }
+
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)> {
         // `git rev-list --left-right --count base...branch` prints
         // "<left>\t<right>" where left = commits in base not in branch (behind)

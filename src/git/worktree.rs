@@ -61,20 +61,68 @@ pub fn create_worktree(
 /// is refused if the worktree has uncommitted changes; when `force` is true the
 /// worktree is removed regardless (the caller is responsible for having obtained
 /// the user's confirmation first).
+///
+/// If git reports the path is not a tracked worktree, the directory is treated
+/// as an orphan — left behind by an earlier removal that unregistered the
+/// worktree but failed to delete the directory (e.g. it was locked by a live
+/// process on Windows). In that case the directory is removed directly and any
+/// dangling worktree metadata is pruned, so the operation still succeeds and the
+/// tab can be dropped.
 pub fn remove_worktree_if_safe(
     git: &dyn GitExecutor,
     fs: &dyn FileSystem,
     path: &Path,
     force: bool,
 ) -> Result<()> {
-    let _ = fs;
     if !force && git.is_dirty(path)? {
         return Err(FlightDeckError::Refused(format!(
             "worktree '{}' has uncommitted changes; refusing to remove",
             path.display()
         )));
     }
-    git.remove_worktree(path, force)
+    match git.remove_worktree(path, force) {
+        Ok(()) => Ok(()),
+        // Two recoverable cases:
+        //  - the path is not a tracked worktree (an orphan directory left by an
+        //    earlier removal that unregistered the worktree but failed to delete
+        //    the directory), or
+        //  - on Windows, git could not delete the directory because a just-killed
+        //    process was still releasing its handles.
+        // In both cases delete the directory directly (the real filesystem retries
+        // through the brief Windows teardown window) and prune any dangling
+        // metadata so the operation still succeeds and the tab can be dropped.
+        Err(e) if is_unregistered_worktree(&e) || (cfg!(windows) && is_lock_error(&e)) => {
+            if fs.exists(path) {
+                fs.remove_dir_all(path)?;
+            }
+            let _ = git.prune_worktrees();
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a git error means the path is not a tracked worktree, so a directory
+/// at that path (if any) is an orphan we can remove directly. Matches git's
+/// "<path> is not a worktree" message from `git worktree remove`.
+fn is_unregistered_worktree(err: &FlightDeckError) -> bool {
+    matches!(err, FlightDeckError::Git(msg) if msg.contains("is not a worktree"))
+}
+
+/// Whether an error reflects a transient file lock — on Windows a directory
+/// cannot be deleted while a just-killed process is still releasing its handles,
+/// surfacing as a permission/access-denied or "in use" message.
+fn is_lock_error(err: &FlightDeckError) -> bool {
+    match err {
+        FlightDeckError::Git(msg) | FlightDeckError::Io(msg) => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("permission denied")
+                || msg.contains("access is denied")
+                || msg.contains("being used by another process")
+                || msg.contains("failed to delete")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +249,65 @@ mod tests {
         git.set_dirty_at(path, false);
         remove_worktree_if_safe(&git, &fs, path, false).unwrap();
         assert_eq!(git.removed_worktrees(), vec![path.to_path_buf()]);
+    }
+
+    #[test]
+    fn orphan_dir_removed_directly_when_not_a_worktree() {
+        // git no longer tracks the path as a worktree, but the directory still
+        // exists on disk: it must be deleted directly and metadata pruned.
+        let git = FakeGit::new();
+        let path = Path::new("/repo/.flightdeck/worktrees/orphan");
+        let fs = FakeFs::new().with_dir(path);
+        git.set_remove_worktree_error(format!("\"{}\" is not a worktree.", path.display()));
+
+        remove_worktree_if_safe(&git, &fs, path, true).unwrap();
+
+        assert!(!fs.exists(path), "orphan directory should be deleted");
+        assert_eq!(git.prune_count(), 1, "stale metadata should be pruned");
+    }
+
+    #[test]
+    fn unregistered_with_no_dir_is_a_noop_success() {
+        // Neither a tracked worktree nor a directory on disk: nothing to remove,
+        // but the abandon must still succeed so the tab can be dropped.
+        let git = FakeGit::new();
+        let fs = FakeFs::new();
+        let path = Path::new("/repo/.flightdeck/worktrees/gone");
+        git.set_remove_worktree_error(format!("\"{}\" is not a worktree.", path.display()));
+
+        remove_worktree_if_safe(&git, &fs, path, true).unwrap();
+        assert_eq!(git.prune_count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_error_falls_back_to_direct_removal() {
+        // git could not delete the directory because a just-killed process was
+        // still releasing its handles: fall back to a direct (retrying) delete.
+        let git = FakeGit::new();
+        let path = Path::new("/repo/.flightdeck/worktrees/feat");
+        let fs = FakeFs::new().with_dir(path);
+        git.set_remove_worktree_error(
+            "worktree remove feat failed: failed to delete 'feat': Permission denied".to_string(),
+        );
+
+        remove_worktree_if_safe(&git, &fs, path, true).unwrap();
+
+        assert!(!fs.exists(path), "locked directory should be force-removed");
+        assert_eq!(git.prune_count(), 1);
+    }
+
+    #[test]
+    fn other_git_errors_propagate() {
+        // A removal failure that is NOT an unregistered-worktree error must
+        // surface, not be silently swallowed by the orphan fallback.
+        let git = FakeGit::new();
+        let path = Path::new("/repo/.flightdeck/worktrees/feat");
+        let fs = FakeFs::new().with_dir(path);
+        git.set_remove_worktree_error("worktree remove feat failed: disk on fire".to_string());
+
+        let err = remove_worktree_if_safe(&git, &fs, path, true).unwrap_err();
+        assert!(matches!(err, FlightDeckError::Git(_)));
+        assert!(fs.exists(path), "directory must be left intact on unknown error");
     }
 }

@@ -52,6 +52,45 @@ impl FileSystem for RealFs {
         out.sort();
         Ok(out)
     }
+
+    fn remove_dir_all(&self, p: &Path) -> Result<()> {
+        remove_dir_all_resilient(p)
+    }
+}
+
+/// Remove a directory tree. On Windows a directory cannot be deleted while any
+/// file in it is still open, and a just-killed process releases its handles
+/// asynchronously — so retry briefly to absorb that teardown window instead of
+/// failing with a transient permission-denied error. On other platforms a
+/// single attempt is sufficient.
+#[cfg(windows)]
+fn remove_dir_all_resilient(p: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..10 {
+        match fs::remove_dir_all(p) {
+            Ok(()) => return Ok(()),
+            // Already gone (possibly removed by an earlier partial attempt).
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(FlightDeckError::Io(format!(
+        "{}: {}",
+        p.display(),
+        last.map(|e| e.to_string()).unwrap_or_default()
+    )))
+}
+
+#[cfg(not(windows))]
+fn remove_dir_all_resilient(p: &Path) -> Result<()> {
+    fs::remove_dir_all(p).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
 }
 
 /// System-clock-backed [`Clock`] producing UTC ISO-8601 timestamps.

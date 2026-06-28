@@ -48,6 +48,10 @@ pub trait GitExecutor {
     /// uncommitted/untracked changes (`git worktree remove --force`); otherwise
     /// git refuses on a dirty worktree (SPECS §5/§15).
     fn remove_worktree(&self, path: &Path, force: bool) -> Result<()>;
+    /// Prune administrative metadata for worktrees whose directories no longer
+    /// exist (`git worktree prune`). Used to reconcile after a worktree
+    /// directory has been removed out-of-band (SPECS §5/§15).
+    fn prune_worktrees(&self) -> Result<()>;
     /// `(ahead, behind)` counts of `branch` relative to `base`.
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)>;
     /// Configured upstream of `branch`, if any (e.g. `origin/foo`).
@@ -85,6 +89,9 @@ pub trait FileSystem {
     fn append_line(&self, p: &Path, line: &str) -> Result<()>;
     /// List the immediate entries of a directory.
     fn list_dir(&self, p: &Path) -> Result<Vec<PathBuf>>;
+    /// Recursively remove a directory and all its contents. Used to clean up an
+    /// orphaned worktree directory that git no longer tracks (SPECS §5/§15).
+    fn remove_dir_all(&self, p: &Path) -> Result<()>;
 }
 
 /// Spawns PTY-backed processes (SPECS §26).
