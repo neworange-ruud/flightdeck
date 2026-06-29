@@ -1107,10 +1107,7 @@ fn handle_mouse(
                         .column
                         .saturating_sub(vp.x)
                         .min(vp.width.saturating_sub(1));
-                    let row = me
-                        .row
-                        .saturating_sub(vp.y)
-                        .min(vp.height.saturating_sub(1));
+                    let row = me.row.saturating_sub(vp.y).min(vp.height.saturating_sub(1));
                     if let Some(term) = terminal_for_target(state, target) {
                         term.update_selection(row, col);
                     }
