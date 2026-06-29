@@ -127,6 +127,8 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('f') if ctrl => {
             KeyAction::Dispatch(Command::FinishLocalMerge { confirm: false })
         }
+        // Ctrl-u: Pull base (git pull --rebase on the base folder).
+        KeyCode::Char('u') if ctrl => KeyAction::Dispatch(Command::PullBase),
         // Ctrl-k: Close Agent Tab.
         KeyCode::Char('k') if ctrl => KeyAction::Dispatch(Command::CloseAgentTab { action: None }),
         // ?: Help / keybindings.

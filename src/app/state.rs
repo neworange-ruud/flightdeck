@@ -729,6 +729,7 @@ impl AppState {
             Command::PushBranch { confirm } => self.cmd_push(confirm, services),
             Command::FinishLocalMerge { confirm } => self.cmd_finish_merge(confirm, services),
             Command::RebaseWorktree { confirm } => self.cmd_rebase(confirm, services),
+            Command::PullBase => self.cmd_pull_base(services),
             Command::CopyEnvFile => self.cmd_copy_env_file(services),
             Command::AbandonWorktree { confirm } => self.cmd_abandon(confirm, services),
             Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(services),
@@ -1178,6 +1179,44 @@ impl AppState {
         self.persist(services)?;
         Ok(Effect::Message(format!(
             "Rebased {agent_branch} onto {base_branch}. If the branch was pushed, force-push to update the remote / PR."
+        )))
+    }
+
+    /// Pull base (SPECS §5.2). Runs `git pull --rebase` in the base folder (the
+    /// repo root) so merged PRs land on the local base branch without leaving
+    /// FlightDeck. A global action — it never touches an Agent Tab's worktree.
+    /// Refuses up front if the base folder is dirty (pull --rebase would refuse
+    /// anyway, but we surface a clear reason); aborts on conflict, leaving the
+    /// base folder exactly as it was. The base branch must be the one checked out
+    /// in the root.
+    fn cmd_pull_base(&mut self, services: &Services) -> Result<Effect> {
+        let base = self.base_branch.clone();
+        let root = self.repo_root.clone();
+
+        // The root folder must have the base branch checked out — Pull base is
+        // defined as updating the base, not whatever else might be checked out.
+        let current = services.git.current_branch(&root)?;
+        if current != base {
+            return Ok(Effect::Refused(format!(
+                "Base folder is on '{current}', not the base branch '{base}'."
+            )));
+        }
+
+        // `git pull --rebase` refuses on a dirty tree; FlightDeck never stashes
+        // or discards (SPECS §5), so surface a clear refusal instead.
+        if services.git.is_dirty(&root)? {
+            return Ok(Effect::Refused(format!(
+                "Base folder has uncommitted changes; commit or stash before pulling {base}."
+            )));
+        }
+
+        let outcome = services.git.pull_base(&root)?;
+        if outcome.conflicted || !outcome.rebased {
+            return Ok(Effect::Refused(outcome.message));
+        }
+
+        Ok(Effect::Message(format!(
+            "Pulled {base} (git pull --rebase)."
         )))
     }
 
@@ -2892,6 +2931,84 @@ mod tests {
             .unwrap();
         assert!(matches!(effect, Effect::Refused(_)));
         assert!(git.rebases().is_empty());
+    }
+
+    // --- §5.2: pull base -------------------------------------------------
+
+    #[test]
+    fn pull_base_pulls_base_folder() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        match effect {
+            Effect::Message(m) => assert!(m.contains("Pulled main"), "got: {m}"),
+            other => panic!("expected Message, got {other:?}"),
+        }
+        // The pull ran in the base folder (the repo root), never a worktree.
+        assert_eq!(git.pull_bases(), vec![PathBuf::from(REPO)]);
+    }
+
+    #[test]
+    fn pull_base_refused_when_base_folder_dirty() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        git.set_dirty_at(Path::new(REPO), true);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        assert!(matches!(effect, Effect::Refused(_)));
+        // A dirty base folder must not be pulled over.
+        assert!(git.pull_bases().is_empty());
+    }
+
+    #[test]
+    fn pull_base_refused_when_not_on_base_branch() {
+        let config = Config::default();
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("flightdeck/x");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        assert!(matches!(effect, Effect::Refused(_)));
+        assert!(git.pull_bases().is_empty());
+    }
+
+    #[test]
+    fn pull_base_aborts_and_refuses_on_conflict() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        git.set_pull_base_outcome(crate::contracts::RebaseOutcome {
+            rebased: false,
+            conflicted: true,
+            message: "CONFLICT in file.rs".to_string(),
+        });
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        match effect {
+            Effect::Refused(m) => assert!(m.contains("CONFLICT"), "got: {m}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
     }
 
     // --- §26: push warning + confirm ------------------------------------

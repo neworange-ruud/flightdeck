@@ -123,6 +123,7 @@ FlightDeck may:
 - Delete managed local branches when safe and explicitly confirmed
 - Perform local merge-back only under strict conditions
 - Rebase an agent worktree onto its base branch, only under strict conditions (see carve-out below)
+- Pull the base branch in the base folder with `git pull --rebase`, on explicit request (see §5.2)
 
 FlightDeck must not:
 
@@ -160,6 +161,25 @@ brought current (see §12 drift). It is never automatic and is constrained by:
 
 The `GitExecutor::rebase_onto` method is the only history-rewriting op on the
 trait and must only be reached through this guarded workflow.
+
+### 5.2 Pull base
+
+**Pull base** runs `git pull --rebase` in the *base folder* (the repository
+root) so that when an agent's pull request is merged on the remote, the user can
+bring the local base branch current without leaving FlightDeck. It is reachable
+from the command palette (*Pull Base*) and the `Ctrl-u` keybinding. Unlike the
+§5.1 worktree rebase, this is a global action that never touches an Agent Tab's
+worktree, so it is not confirmation-gated — but it is constrained by:
+
+- **Base branch only.** It operates on the repo root and requires the base
+  branch to be the one checked out there; otherwise it refuses.
+- **Clean tree required.** FlightDeck never stashes or discards (§5); a dirty
+  base folder is refused with a clear message rather than pulled over.
+- **Conflict policy.** On any conflict the rebase is aborted (`git rebase
+  --abort`), leaving the base folder exactly as it was — consistent with §5.1.
+
+The `GitExecutor::pull_base` method is the only fetch-and-rebase op on the trait
+and must only be reached through this guarded workflow.
 
 ---
 

@@ -92,6 +92,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         group: "Git",
+        label: "Pull Base",
+        action: PaletteAction::Dispatch(Command::PullBase),
+    },
+    PaletteEntry {
+        group: "Git",
         label: "Show Git Status",
         action: PaletteAction::Dispatch(Command::ShowGitStatus),
     },
@@ -138,8 +143,8 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 ];
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
-/// View", "Rebase Worktree", and "Copy .env(.local)" commands.
-pub const REQUIRED_ACTION_COUNT: usize = 19;
+/// View", "Rebase Worktree", "Copy .env(.local)", and "Pull Base" commands.
+pub const REQUIRED_ACTION_COUNT: usize = 20;
 
 /// The command palette model (SPECS §22).
 ///
@@ -255,6 +260,7 @@ mod tests {
             "Copy .env(.local)",
             "Push Branch",
             "Finish / Local Merge",
+            "Pull Base",
             "Rebase Worktree",
             "Abandon Worktree",
             "New Child Terminal",

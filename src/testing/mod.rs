@@ -183,6 +183,7 @@ struct FakeGitState {
     remotes: HashMap<String, String>,
     merge_outcome: Option<MergeOutcome>,
     rebase_outcome: Option<RebaseOutcome>,
+    pull_base_outcome: Option<RebaseOutcome>,
     /// When set, [`GitExecutor::remove_worktree`] fails with this `Git` message
     /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
     remove_worktree_error: Option<String>,
@@ -194,6 +195,7 @@ struct FakeGitState {
     pushes: Vec<(String, String, PathBuf)>,
     merges: Vec<(String, PathBuf)>,
     rebases: Vec<(String, PathBuf)>,
+    pull_bases: Vec<PathBuf>,
 }
 
 impl Default for FakeGit {
@@ -213,6 +215,7 @@ impl Default for FakeGit {
                 remotes: HashMap::new(),
                 merge_outcome: None,
                 rebase_outcome: None,
+                pull_base_outcome: None,
                 remove_worktree_error: None,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
@@ -221,6 +224,7 @@ impl Default for FakeGit {
                 pushes: Vec::new(),
                 merges: Vec::new(),
                 rebases: Vec::new(),
+                pull_bases: Vec::new(),
             }),
         }
     }
@@ -337,6 +341,11 @@ impl FakeGit {
         self.inner.lock().unwrap().rebase_outcome = Some(outcome);
     }
 
+    /// Set the outcome returned by [`GitExecutor::pull_base`].
+    pub fn set_pull_base_outcome(&self, outcome: RebaseOutcome) {
+        self.inner.lock().unwrap().pull_base_outcome = Some(outcome);
+    }
+
     /// Make [`GitExecutor::remove_worktree`] fail with the given `Git` message,
     /// simulating git refusing a path it does not track as a worktree.
     pub fn set_remove_worktree_error(&self, message: impl Into<String>) {
@@ -378,6 +387,11 @@ impl FakeGit {
     /// Rebases performed, as `(onto, cwd)`.
     pub fn rebases(&self) -> Vec<(String, PathBuf)> {
         self.inner.lock().unwrap().rebases.clone()
+    }
+
+    /// Base-folder pulls performed via [`GitExecutor::pull_base`], as `cwd`.
+    pub fn pull_bases(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().pull_bases.clone()
     }
 }
 
@@ -514,6 +528,16 @@ impl GitExecutor for FakeGit {
             rebased: true,
             conflicted: false,
             message: "rebased".to_string(),
+        }))
+    }
+
+    fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome> {
+        let mut st = self.inner.lock().unwrap();
+        st.pull_bases.push(cwd.to_path_buf());
+        Ok(st.pull_base_outcome.clone().unwrap_or(RebaseOutcome {
+            rebased: true,
+            conflicted: false,
+            message: "pulled base".to_string(),
         }))
     }
 }

@@ -137,12 +137,15 @@ FlightDeck **may**: detect the repo root / base branch / dirty state, create
 `.flightdeck/`, update `.gitignore` (append-only), create & attach branches,
 create & recover worktrees, push branches *after explicit confirmation*, remove
 managed worktrees (a clean worktree is removed immediately; a worktree with
-uncommitted changes is removed only after you confirm discarding them), and
-perform a guarded local merge-back only when strict preconditions hold.
+uncommitted changes is removed only after you confirm discarding them), perform
+a guarded local merge-back only when strict preconditions hold, rebase an agent
+worktree onto its base branch under explicit confirmation, and **pull base**
+(`git pull --rebase` on the base folder) to update the local base branch after a
+PR merges.
 
 FlightDeck **must not** (and cannot): stage files, create/amend/squash commits,
-rebase, rewrite history, force-push, create GitHub PRs, or auto-resolve merge
-conflicts. You (or your agent) make the commits; FlightDeck shows you a GitHub PR
+rebase automatically, rewrite history, force-push, create GitHub PRs, or
+auto-resolve merge conflicts. You (or your agent) make the commits; FlightDeck shows you a GitHub PR
 **compare URL** after a push so you create the PR yourself.
 
 ## Keyboard model
@@ -156,8 +159,9 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
   `?` shows help.
 
 Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
-`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-f` finish/local-merge · `Ctrl-k` close
-tab · `Alt-↑/↓` previous/next **agent tab** · `Alt-1..9` jump to agent tab ·
+`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-u` pull base · `Ctrl-f`
+finish/local-merge · `Ctrl-k` close tab · `Alt-↑/↓` previous/next **agent tab**
+· `Alt-1..9` jump to agent tab ·
 `Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` cycle the
 **terminal tabs** (agent + shells) · `Ctrl-s` set manual status · `Ctrl-r`
 restart agent. The `Alt`-modified navigation works in **both** modes, so you can
@@ -165,8 +169,9 @@ switch tabs without leaving terminal focus; in App mode the bare arrow keys also
 work (handy because some terminals intercept `Alt`+arrows). The full table is in
 the in-app help (`?`).
 
-**Mouse**: click an Agent Tab in the sidebar to select it, or a child-terminal
-tab (`agent | shell 1 | …`) to switch terminals.
+**Mouse**: click an Agent Tab in the sidebar to select it (or click anywhere
+else in the sidebar to switch to App mode without changing the selection), or a
+child-terminal tab (`agent | shell 1 | …`) to switch terminals.
 
 ## Screen layout
 
