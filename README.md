@@ -358,6 +358,10 @@ cargo install cargo-dist --version 0.32.0 --locked
 
 Then run one command from a clean working tree:
 
+Before cutting the release, move the relevant notes from `## [Unreleased]` into a
+new versioned entry in `CHANGELOG.md`. GitHub Release notes are generated from
+that changelog.
+
 ```bash
 ./scripts/release 0.2.0
 ```
