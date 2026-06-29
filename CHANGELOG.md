@@ -17,7 +17,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Restore mouse text selection in Split View and make wheel scrolling target
+  the column under the pointer.
 
 ## [1.2.0] - 2026-06-29
 
