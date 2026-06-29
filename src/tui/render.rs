@@ -99,13 +99,17 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         return sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row).map(HitTarget::AgentTab);
     }
     if state.split_view {
-        // In split view a click anywhere inside a terminal's column selects it.
+        // In split view a click on a column's header row switches to that
+        // terminal. Clicks in the column *body* are not switch targets here —
+        // they begin a text selection (handled by the mouse wiring, which still
+        // focuses the column). This mirrors normal mode, where the tab bar
+        // switches and the viewport selects.
         let region = layout::split_region(&ml);
         if rect_contains(region, col, row) {
             let entries = child_tab_entries(state);
             let cols = layout::split_columns(region, entries.len());
             for ((target, _label), c) in entries.iter().zip(cols.iter()) {
-                if rect_contains(c.col, col, row) {
+                if rect_contains(c.header, col, row) {
                     return Some(HitTarget::Child(*target));
                 }
             }
@@ -1449,22 +1453,27 @@ mod tests {
             .unwrap();
 
         let area = Rect::new(0, 0, 120, 30);
-        // Two columns over the main pane (x ≥ sidebar width 28). A click just
-        // right of the sidebar lands in the agent (primary) column; a click far
-        // right lands in the shell column.
+        // Two columns over the main pane (x ≥ sidebar width 28). A click on a
+        // column's header row switches to that terminal: the left header lands
+        // on the agent (primary) column, the right header on the shell column.
         let region = layout::split_region(&layout::compute(area));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
-        let row = region.y + 2;
+        let header_row = cols[0].header.y;
         assert_eq!(
-            hit_test(area, &state, left, row),
+            hit_test(area, &state, left, header_row),
             Some(HitTarget::Child(ChildTarget::Primary))
         );
         assert_eq!(
-            hit_test(area, &state, right, row),
+            hit_test(area, &state, right, header_row),
             Some(HitTarget::Child(ChildTarget::Child(0)))
         );
+        // A click in a column *body* is not a switch target — it begins a text
+        // selection instead (handled by the mouse wiring).
+        let body_row = cols[0].viewport.y + 1;
+        assert_eq!(hit_test(area, &state, left, body_row), None);
+        assert_eq!(hit_test(area, &state, right, body_row), None);
     }
 
     // --- Git info bar (SPECS §21) ----------------------------------------

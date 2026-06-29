@@ -684,6 +684,10 @@ struct DragState {
     col: u16,
     /// Latest absolute pointer row (terminal coordinates).
     row: u16,
+    /// Which terminal the selection is being made in. Fixed for the whole drag
+    /// so it keeps extending the same terminal even if the pointer leaves its
+    /// column (split view) or the active terminal changes.
+    target: ChildTarget,
 }
 
 /// The full interactive UI state layered over [`AppState`]: which overlay is
@@ -1057,13 +1061,12 @@ fn handle_mouse(
     if ui.modal_active() {
         return;
     }
-    let term_area = crate::tui::layout::compute(area).terminal;
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // A click on a tab switches to it (and never starts a selection).
-            // Clicking the left sidebar focuses the app chrome (APP mode);
-            // clicking anything in the right-hand agent area focuses the
-            // terminal (TERMINAL mode), so the click sets the mode the user
+            // A click on a tab/header switches to it (and never starts a
+            // selection). Clicking the left sidebar focuses the app chrome (APP
+            // mode); clicking a child-terminal tab (or, in split view, a column
+            // header) focuses that terminal — the click sets the mode the user
             // would intuitively expect (SPECS §23).
             if let Some(hit) = hit_test(area, state, me.column, me.row) {
                 ui.drag = None;
@@ -1073,68 +1076,50 @@ fn handle_mouse(
                             state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
                         state.focus_app();
                     }
-                    HitTarget::Child(ChildTarget::Primary) => {
-                        if let Some(tab) = state.selected_mut() {
-                            tab.session.focus_primary();
-                        }
-                        state.focus_terminal();
-                    }
-                    HitTarget::Child(ChildTarget::Child(i)) => {
-                        let _ = state
-                            .dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+                    HitTarget::Child(target) => {
+                        select_target(state, services, target);
                         state.focus_terminal();
                     }
                 }
                 return;
             }
-            // A press inside the terminal viewport begins a selection (or is
-            // forwarded to a mouse-aware hosted app unless Shift is held).
-            if rect_contains(term_area, me.column, me.row) {
-                // Clicking the agent's terminal focuses it (TERMINAL mode), so
-                // keystrokes go straight to the agent (SPECS §23).
+            // A press inside a terminal viewport begins a selection. In split
+            // view this is the column under the pointer (which also becomes the
+            // active terminal); otherwise the single terminal pane. Focusing it
+            // sends subsequent keystrokes there (TERMINAL mode, SPECS §23).
+            if let Some((target, viewport)) = terminal_at(area, state, me.column, me.row) {
+                select_target(state, services, target);
                 state.focus_terminal();
-                let shift = me.modifiers.contains(KeyModifiers::SHIFT);
-                let col = me.column.saturating_sub(term_area.x);
-                let row = me.row.saturating_sub(term_area.y);
-                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
-                    if term.wants_mouse() && !shift {
-                        let bytes = encode_mouse_button(term.mouse_encoding(), 0, col, row, true);
-                        let _ = term.session_mut().write_input(&bytes);
-                        ui.drag = None;
-                    } else {
-                        term.begin_selection(row, col);
-                        ui.drag = Some(DragState {
-                            col: me.column,
-                            row: me.row,
-                        });
-                    }
-                }
+                begin_terminal_selection(state, ui, target, viewport, me);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if ui.drag.is_some() {
+            if let Some(target) = ui.drag.as_ref().map(|d| d.target) {
                 if let Some(d) = ui.drag.as_mut() {
                     d.col = me.column;
                     d.row = me.row;
                 }
-                // Clamp the pointer into the viewport so a drag past an edge keeps
-                // extending along that edge (auto-scroll reveals more each tick).
-                let col = me
-                    .column
-                    .saturating_sub(term_area.x)
-                    .min(term_area.width.saturating_sub(1));
-                let row = me
-                    .row
-                    .saturating_sub(term_area.y)
-                    .min(term_area.height.saturating_sub(1));
-                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
-                    term.update_selection(row, col);
+                // Clamp the pointer into the target's viewport so a drag past an
+                // edge keeps extending along that edge (auto-scroll reveals more
+                // each tick).
+                if let Some(vp) = viewport_for_target(area, state, target) {
+                    let col = me
+                        .column
+                        .saturating_sub(vp.x)
+                        .min(vp.width.saturating_sub(1));
+                    let row = me
+                        .row
+                        .saturating_sub(vp.y)
+                        .min(vp.height.saturating_sub(1));
+                    if let Some(term) = terminal_for_target(state, target) {
+                        term.update_selection(row, col);
+                    }
                 }
-            } else if rect_contains(term_area, me.column, me.row) {
+            } else if let Some((target, vp)) = terminal_at(area, state, me.column, me.row) {
                 // Forwarded drag for a mouse-aware hosted app.
-                let col = me.column.saturating_sub(term_area.x);
-                let row = me.row.saturating_sub(term_area.y);
-                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                let col = me.column.saturating_sub(vp.x);
+                let row = me.row.saturating_sub(vp.y);
+                if let Some(term) = terminal_for_target(state, target) {
                     if term.wants_mouse() {
                         let bytes = encode_mouse_button(term.mouse_encoding(), 32, col, row, true);
                         let _ = term.session_mut().write_input(&bytes);
@@ -1143,10 +1128,10 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if ui.drag.take().is_some() {
+            if let Some(drag) = ui.drag.take() {
                 // End of a local selection: copy it (and keep it highlighted as
                 // confirmation), or clear a zero-length click.
-                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                if let Some(term) = terminal_for_target(state, drag.target) {
                     if term.has_selection() {
                         if let Some(text) = term.selected_text() {
                             crate::tui::clipboard::copy(&text);
@@ -1155,11 +1140,11 @@ fn handle_mouse(
                         term.clear_selection();
                     }
                 }
-            } else if rect_contains(term_area, me.column, me.row) {
+            } else if let Some((target, vp)) = terminal_at(area, state, me.column, me.row) {
                 // Forwarded release for a mouse-aware hosted app.
-                let col = me.column.saturating_sub(term_area.x);
-                let row = me.row.saturating_sub(term_area.y);
-                if let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) {
+                let col = me.column.saturating_sub(vp.x);
+                let row = me.row.saturating_sub(vp.y);
+                if let Some(term) = terminal_for_target(state, target) {
                     if term.wants_mouse() {
                         let bytes = encode_mouse_button(term.mouse_encoding(), 0, col, row, false);
                         let _ = term.session_mut().write_input(&bytes);
@@ -1170,6 +1155,122 @@ fn handle_mouse(
         MouseEventKind::ScrollUp => handle_scroll(state, area, me, true),
         MouseEventKind::ScrollDown => handle_scroll(state, area, me, false),
         _ => {}
+    }
+}
+
+/// Switch focus to a child-terminal `target` within the selected tab: the
+/// primary agent terminal or a child shell by index. A no-op switch (selecting
+/// the already-active terminal) is harmless. Mirrors the tab-bar click handling.
+fn select_target(state: &mut AppState, services: &Services, target: ChildTarget) {
+    match target {
+        ChildTarget::Primary => {
+            if let Some(tab) = state.selected_mut() {
+                tab.session.focus_primary();
+            }
+        }
+        ChildTarget::Child(i) => {
+            let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+        }
+    }
+}
+
+/// Mutable access to the terminal a [`ChildTarget`] names within the selected
+/// tab, or `None` if there is no selected tab / the terminal is not spawned.
+fn terminal_for_target(
+    state: &mut AppState,
+    target: ChildTarget,
+) -> Option<&mut crate::terminal::session::Terminal> {
+    let tab = state.selected_mut()?;
+    match target {
+        ChildTarget::Primary => tab.session.primary_mut(),
+        ChildTarget::Child(i) => tab.session.child_mut(i),
+    }
+}
+
+/// The child-terminal targets shown for the selected tab, in display order:
+/// the primary agent terminal followed by one entry per child shell. Matches
+/// the ordering used by the split-view layout and the child tab bar.
+fn target_order(state: &AppState) -> Vec<ChildTarget> {
+    let mut targets = vec![ChildTarget::Primary];
+    if let Some(tab) = state.selected() {
+        for i in 0..tab.session.child_count() {
+            targets.push(ChildTarget::Child(i));
+        }
+    }
+    targets
+}
+
+/// The currently active child-terminal target for the selected tab.
+fn active_target(state: &AppState) -> ChildTarget {
+    match state.selected().and_then(|t| t.session.selected_child()) {
+        Some(i) => ChildTarget::Child(i),
+        None => ChildTarget::Primary,
+    }
+}
+
+/// Resolve a pointer at `(col, row)` to the terminal viewport it lies over and
+/// the terminal that viewport hosts. In split view this is the body (below the
+/// header) of the column under the pointer; otherwise the single terminal pane,
+/// targeting whichever terminal is active. Returns `None` if the pointer is over
+/// no terminal viewport (sidebar, tab bar, gutter, status bar, …).
+fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(ChildTarget, Rect)> {
+    let ml = crate::tui::layout::compute(area);
+    if state.split_view {
+        let region = crate::tui::layout::split_region(&ml);
+        let targets = target_order(state);
+        let cols = crate::tui::layout::split_columns(region, targets.len());
+        targets
+            .into_iter()
+            .zip(cols)
+            .find_map(|(t, c)| rect_contains(c.viewport, col, row).then_some((t, c.viewport)))
+    } else if rect_contains(ml.terminal, col, row) {
+        Some((active_target(state), ml.terminal))
+    } else {
+        None
+    }
+}
+
+/// The viewport rect for a specific terminal `target` under the current layout:
+/// the matching split-view column body, or the single terminal pane. `None` if
+/// the target's column is not present (e.g. layout too small).
+fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Option<Rect> {
+    let ml = crate::tui::layout::compute(area);
+    if !state.split_view {
+        return Some(ml.terminal);
+    }
+    let region = crate::tui::layout::split_region(&ml);
+    let targets = target_order(state);
+    let idx = targets.iter().position(|t| *t == target)?;
+    let cols = crate::tui::layout::split_columns(region, targets.len());
+    cols.into_iter().nth(idx).map(|c| c.viewport)
+}
+
+/// Begin a text selection at the press position within `viewport` on the
+/// terminal named by `target`, or — when that terminal has its own mouse
+/// reporting enabled and Shift is not held — forward the press to it instead.
+fn begin_terminal_selection(
+    state: &mut AppState,
+    ui: &mut Ui,
+    target: ChildTarget,
+    viewport: Rect,
+    me: MouseEvent,
+) {
+    let shift = me.modifiers.contains(KeyModifiers::SHIFT);
+    let col = me.column.saturating_sub(viewport.x);
+    let row = me.row.saturating_sub(viewport.y);
+    if let Some(term) = terminal_for_target(state, target) {
+        if term.wants_mouse() && !shift {
+            let bytes = encode_mouse_button(term.mouse_encoding(), 0, col, row, true);
+            let _ = term.session_mut().write_input(&bytes);
+            ui.drag = None;
+        } else {
+            term.begin_selection(row, col);
+            ui.drag = Some(DragState {
+                col: me.column,
+                row: me.row,
+                target,
+            });
+        }
     }
 }
 
@@ -1184,21 +1285,25 @@ fn autoscroll_drag(state: &mut AppState, ui: &Ui, area: Rect) {
     let Some(drag) = ui.drag.as_ref() else {
         return;
     };
-    let term_area = crate::tui::layout::compute(area).terminal;
+    let target = drag.target;
+    let (drag_col, drag_row) = (drag.col, drag.row);
+    let Some(term_area) = viewport_for_target(area, state, target) else {
+        return;
+    };
     if term_area.height == 0 {
         return;
     }
     // Top edge (pointer at or above the first row) scrolls up into history;
     // bottom edge (at or below the last row) scrolls back down.
-    let up = if drag.row <= term_area.y {
+    let up = if drag_row <= term_area.y {
         true
-    } else if drag.row >= term_area.bottom().saturating_sub(1) {
+    } else if drag_row >= term_area.bottom().saturating_sub(1) {
         false
     } else {
         return;
     };
 
-    let Some(term) = state.selected_mut().and_then(|t| t.session.active_mut()) else {
+    let Some(term) = terminal_for_target(state, target) else {
         return;
     };
     if term.selection().is_none() {
@@ -1216,8 +1321,7 @@ fn autoscroll_drag(state: &mut AppState, ui: &Ui, area: Rect) {
     } else {
         term_area.height.saturating_sub(1)
     };
-    let col = drag
-        .col
+    let col = drag_col
         .saturating_sub(term_area.x)
         .min(term_area.width.saturating_sub(1));
     term.update_selection(edge_row, col);
@@ -1229,14 +1333,12 @@ fn autoscroll_drag(state: &mut AppState, ui: &Ui, area: Rect) {
 /// scrolls itself — exactly as in a real terminal emulator. Otherwise we scroll
 /// the terminal's own VT100 scrollback so plain output stays reviewable.
 fn handle_scroll(state: &mut AppState, area: Rect, me: MouseEvent, up: bool) {
-    let term_area = crate::tui::layout::compute(area).terminal;
-    if !rect_contains(term_area, me.column, me.row) {
-        return;
-    }
-    let Some(tab) = state.selected_mut() else {
+    // Scroll the terminal under the pointer: in split view the hovered column,
+    // otherwise the single terminal pane.
+    let Some((target, term_area)) = terminal_at(area, state, me.column, me.row) else {
         return;
     };
-    let Some(term) = tab.session.active_mut() else {
+    let Some(term) = terminal_for_target(state, target) else {
         return;
     };
     if term.wants_mouse() {
