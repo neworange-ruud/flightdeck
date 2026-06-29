@@ -12,7 +12,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Automate release-time changelog rollover so `./scripts/release <version>`
+  moves `Unreleased` notes into the new version entry and resets the template.
 
 ### Bug fixes
 
