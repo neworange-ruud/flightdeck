@@ -358,15 +358,13 @@ cargo install cargo-dist --version 0.32.0 --locked
 
 Then run one command from a clean working tree:
 
-Before cutting the release, move the relevant notes from `## [Unreleased]` into a
-new versioned entry in `CHANGELOG.md`. GitHub Release notes are generated from
-that changelog.
-
 ```bash
 ./scripts/release 0.2.0
 ```
 
-The script updates `Cargo.toml`, refreshes `Cargo.lock`, runs formatting,
+The script moves the current `## [Unreleased]` notes into a new versioned
+`CHANGELOG.md` entry dated for the release, resets `Unreleased` back to the
+empty template, updates `Cargo.toml`, refreshes `Cargo.lock`, runs formatting,
 Clippy, tests, validates the cargo-dist plan, commits `Release v0.2.0`, tags it,
 and pushes the branch and tag. GitHub Actions then creates the GitHub Release,
 uploads the installer/artifacts/checksums, and publishes the Homebrew formula to

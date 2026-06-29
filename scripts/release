@@ -43,6 +43,44 @@ require_cmd dist
 require_cmd git
 require_cmd perl
 
+update_changelog() {
+  release_date=$(date +%Y-%m-%d)
+  VERSION="$version" RELEASE_DATE="$release_date" perl -0pi -e '
+    my $template = <<"EOF";
+## [Unreleased]
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+EOF
+
+    if (/^## \[\Q$ENV{VERSION}\E\] - /m) {
+      print STDERR "CHANGELOG.md already has version $ENV{VERSION}; continuing.\n";
+      next;
+    }
+
+    my ($intro, $tail) = split /^## \[Unreleased\]\n\n/m, $_, 2;
+    die "CHANGELOG.md is missing the expected Unreleased section\n" unless defined $tail;
+
+    my ($body, $rest) = $tail =~ /\A(.*?)(?=^## \[|\z)(.*)\z/sm;
+    $body =~ s/\A\s+//;
+    $body =~ s/\s+\z//;
+
+    my $versioned = "## [$ENV{VERSION}] - $ENV{RELEASE_DATE}\n\n";
+    $versioned .= length($body) ? "$body\n\n" : "";
+
+    $_ = $intro . $template . "\n" . $versioned . $rest;
+  ' CHANGELOG.md
+}
+
 if ! git diff --quiet || ! git diff --cached --quiet; then
   printf 'Working tree must be clean before starting a release.\n' >&2
   exit 1
@@ -84,6 +122,8 @@ if [ "$current_version" = "$version" ]; then
 else
   VERSION="$version" perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m' Cargo.toml
 fi
+
+update_changelog
 
 cargo metadata --format-version 1 >/dev/null
 
