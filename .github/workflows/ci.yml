@@ -28,15 +28,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Clippy + tests on every supported platform. Running on windows-latest is the
-  # point: it compiles and exercises the #[cfg(windows)] paths (shell resolution,
-  # command discovery, clipboard) that the macOS host build never touches.
+  # Clippy + tests on every supported platform. Each OS is the point: windows-latest
+  # exercises the #[cfg(windows)] paths (shell resolution, command discovery,
+  # clipboard) and ubuntu-latest exercises the #[cfg(target_os = "linux")] paths
+  # (clipboard via xclip/wl-copy, podman runtime, notify-send) — neither of which
+  # the macOS host build touches.
   test:
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
