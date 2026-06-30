@@ -20,7 +20,7 @@ Install with Homebrew:
 brew install neworange-ruud/tap/flightdeck
 ```
 
-Or install directly from the latest GitHub Release:
+Or install on macOS or Linux directly from the latest GitHub Release:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
