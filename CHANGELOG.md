@@ -8,6 +8,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- Add **Pull base**: run `git pull --rebase` on the base folder to bring the
+  local base branch current after a PR is merged, without leaving FlightDeck.
+  Available from the command palette (*Pull Base*) and `Ctrl-u`; refuses on a
+  dirty base folder and aborts on conflict, leaving the base folder untouched.
 - First-class Linux support: ship an `x86_64-unknown-linux-gnu` release binary,
   run clippy and tests on `ubuntu-latest` in CI, and post desktop notifications
   via `notify-send` (libnotify).
@@ -16,6 +20,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 - Automate release-time changelog rollover so `./scripts/release <version>`
   moves `Unreleased` notes into the new version entry and resets the template.
+- Clicking anywhere in the agent sidebar — the heading or empty space, not just
+  an agent row — now switches to APP mode, so it works with zero or one agents.
 
 ### Bug fixes
 

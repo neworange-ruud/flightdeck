@@ -87,6 +87,11 @@ pub enum ChildTarget {
 pub enum HitTarget {
     /// An Agent Tab in the sidebar (by index).
     AgentTab(usize),
+    /// The sidebar chrome itself (header/heading/empty space below the tabs) —
+    /// anywhere in the left panel that is not an Agent Tab row. A click here
+    /// still focuses the app (APP mode) without changing the selected tab, so
+    /// clicking the sidebar works even with zero or one agents (SPECS §23).
+    Sidebar,
     /// A child-terminal tab in the main pane.
     Child(ChildTarget),
 }
@@ -96,7 +101,14 @@ pub enum HitTarget {
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
     let ml = layout::compute(area);
     if rect_contains(ml.sidebar, col, row) {
-        return sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row).map(HitTarget::AgentTab);
+        // A click on an actual Agent Tab row selects it; anywhere else in the
+        // sidebar (logo header, "Agents" heading, or the empty space below the
+        // last tab) resolves to the sidebar chrome so the click still focuses
+        // the app — even with no agents or just one (SPECS §23).
+        return Some(
+            sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row)
+                .map_or(HitTarget::Sidebar, HitTarget::AgentTab),
+        );
     }
     if state.split_view {
         // In split view a click on a column's header row switches to that
@@ -1186,6 +1198,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Ctrl-q", "Quit / close app"),
         shortcut_line("  Ctrl-n", "New Agent Tab"),
         shortcut_line("  Ctrl-p", "Push current branch"),
+        shortcut_line("  Ctrl-u", "Pull base (git pull --rebase)"),
         shortcut_line("  Ctrl-f", "Finish current Agent Tab"),
         shortcut_line("  Ctrl-k", "Close current Agent Tab"),
         shortcut_line("  ?", "Help / keybindings"),
@@ -1343,9 +1356,22 @@ mod tests {
         assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::AgentTab(0)));
         assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::AgentTab(0)));
         assert_eq!(hit_test(area, &state, 2, 7), Some(HitTarget::AgentTab(1)));
-        // The header band and the sidebar heading select nothing.
+        // The header band sits above the sidebar and selects nothing.
         assert_eq!(hit_test(area, &state, 2, 0), None);
-        assert_eq!(hit_test(area, &state, 2, 2), None);
+        // The sidebar heading (and any non-tab sidebar row) resolves to the
+        // sidebar chrome, so the click still focuses the app (SPECS §23).
+        assert_eq!(hit_test(area, &state, 2, 2), Some(HitTarget::Sidebar));
+    }
+
+    #[test]
+    fn hit_test_empty_sidebar_resolves_to_chrome() {
+        // With no agents, a click anywhere in the sidebar (heading or the empty
+        // space below it) still resolves to the sidebar chrome so APP mode is
+        // reachable by clicking the left panel (SPECS §23).
+        let state = state_with_tabs(0);
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(hit_test(area, &state, 2, 2), Some(HitTarget::Sidebar));
+        assert_eq!(hit_test(area, &state, 2, 5), Some(HitTarget::Sidebar));
     }
 
     #[test]
