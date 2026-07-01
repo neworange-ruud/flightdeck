@@ -12,6 +12,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   local base branch current after a PR is merged, without leaving FlightDeck.
   Available from the command palette (*Pull Base*) and `Ctrl-u`; refuses on a
   dirty base folder and aborts on conflict, leaving the base folder untouched.
+- First-class Linux support: ship an `x86_64-unknown-linux-gnu` release binary,
+  run clippy and tests on `ubuntu-latest` in CI, and post desktop notifications
+  via `notify-send` (libnotify).
 
 ### Improvements
 

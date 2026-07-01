@@ -2,7 +2,7 @@
 name = "flightdeck"
 version = "1.2.0"
 edition = "2021"
-description = "A macOS-first terminal UI for orchestrating multiple local AI coding agents in isolated Git worktrees."
+description = "A cross-platform terminal UI for orchestrating multiple local AI coding agents in isolated Git worktrees."
 repository = "https://github.com/neworange-ruud/flightdeck"
 homepage = "https://github.com/neworange-ruud/flightdeck"
 readme = "README.md"
