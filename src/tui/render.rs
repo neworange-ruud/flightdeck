@@ -31,7 +31,7 @@ use crate::app::modes::InputMode;
 use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
 use crate::tui::layout;
-use crate::tui::palette::CommandPalette;
+use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
 
 // ---------------------------------------------------------------------------
@@ -1104,7 +1104,7 @@ pub fn draw_git_status_overlay(
 
 /// Draw the command palette as a centered overlay (SPECS §22).
 pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: Rect) {
-    let overlay_area = layout::centered_overlay(area, 60, 32);
+    let overlay_area = layout::centered_overlay(area, 90, 32);
     frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
@@ -1133,47 +1133,70 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     // Filtered list.
     let filtered = palette.filtered();
     let selected_idx = palette.selected_index();
-    let mut last_group: Option<&str> = None;
-    let mut items: Vec<ListItem> = Vec::new();
-    for (i, entry) in filtered.iter().enumerate() {
-        if last_group != Some(entry.group) {
-            // Blank line above each group header (except the first) for breathing room.
-            if last_group.is_some() {
-                items.push(ListItem::new(Line::raw("")));
-            }
-            last_group = Some(entry.group);
-            items.push(ListItem::new(Line::from(Span::styled(
-                format!("  {}", entry.group),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ))));
-        }
 
-        items.push(if i == selected_idx {
-            ListItem::new(Line::from(Span::styled(
-                format!("  {} ", entry.label),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )))
-        } else {
-            ListItem::new(Line::from(Span::styled(
-                format!("  {} ", entry.label),
-                Style::default().fg(Color::White),
-            )))
-        });
-    }
-
-    if items.is_empty() {
+    if filtered.is_empty() {
         frame.render_widget(
             Paragraph::new("  (no matches)").style(Style::default().fg(Color::DarkGray)),
             list_area,
         );
-    } else {
-        frame.render_widget(List::new(items), list_area);
+        return;
     }
+
+    // Split the filtered entries across two columns. The left column takes the
+    // first half; the right column the remainder. Each column renders its own
+    // group headers so groups read correctly even when split at the boundary.
+    let split = filtered.len().div_ceil(2);
+    let [left_area, right_area] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(50),
+        ratatui::layout::Constraint::Percentage(50),
+    ])
+    .areas(list_area);
+
+    // Build the `ListItem`s for one column from a slice of the filtered
+    // entries. `base` is the flat index of the first entry so selection
+    // highlighting stays aligned with `selected_index`.
+    let build_column = |entries: &[&PaletteEntry], base: usize| -> Vec<ListItem<'static>> {
+        let mut last_group: Option<&str> = None;
+        let mut items: Vec<ListItem> = Vec::new();
+        for (offset, entry) in entries.iter().enumerate() {
+            let i = base + offset;
+            if last_group != Some(entry.group) {
+                // Blank line above each group header (except the first) for breathing room.
+                if last_group.is_some() {
+                    items.push(ListItem::new(Line::raw("")));
+                }
+                last_group = Some(entry.group);
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {}", entry.group),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))));
+            }
+
+            items.push(if i == selected_idx {
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {} ", entry.label),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )))
+            } else {
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {} ", entry.label),
+                    Style::default().fg(Color::White),
+                )))
+            });
+        }
+        items
+    };
+
+    frame.render_widget(List::new(build_column(&filtered[..split], 0)), left_area);
+    frame.render_widget(
+        List::new(build_column(&filtered[split..], split)),
+        right_area,
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   moves `Unreleased` notes into the new version entry and resets the template.
 - Clicking anywhere in the agent sidebar — the heading or empty space, not just
   an agent row — now switches to APP mode, so it works with zero or one agents.
+- Lay out the command palette across two columns so more entries are visible at
+  once without scrolling. Left/right arrow keys move the selection between the
+  two columns.
 
 ### Bug fixes
 

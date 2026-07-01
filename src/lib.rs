@@ -2038,6 +2038,8 @@ fn handle_palette_key(
         }
         KeyCode::Up => palette.select_prev(),
         KeyCode::Down => palette.select_next(),
+        KeyCode::Left => palette.select_left(),
+        KeyCode::Right => palette.select_right(),
         KeyCode::Backspace => palette.pop_char(),
         KeyCode::Enter => {
             let action = palette.selected_action().cloned();
