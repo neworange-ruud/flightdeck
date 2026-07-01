@@ -1,6 +1,6 @@
 # FlightDeck
 
-**FlightDeck** is a macOS and Windows terminal UI for orchestrating multiple
+**FlightDeck** is a macOS, Linux, and Windows terminal UI for orchestrating multiple
 local AI coding agents working in parallel on the same Git project. You run it
 from inside a Git repository; it creates isolated Git **worktrees** under
 `.flightdeck/`, launches a selected AI coding agent inside each one, lets you
@@ -20,7 +20,7 @@ Install with Homebrew:
 brew install neworange-ruud/tap/flightdeck
 ```
 
-Or install directly from the latest GitHub Release:
+Or install on macOS or Linux directly from the latest GitHub Release:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
@@ -236,7 +236,7 @@ worktrees. Wire them per the generated `README.md`:
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
   (`session.idle`→idle, message activity→working, permission prompt→waiting).
 
-### OS notifications (macOS)
+### OS notifications (macOS and Linux)
 
 FlightDeck posts a native OS notification when an agent finishes a running task,
 so you get pinged the moment a background tab is done while your attention is
@@ -279,7 +279,11 @@ reliable option, since it registers as a real app and prompts for permission on
 first use. Otherwise it falls back to `osascript`, whose notifications are
 attributed to **Script Editor**: enable **System Settings → Notifications →
 Script Editor** (and make sure no Focus / Do Not Disturb is active) or banners
-are silently dropped. Other platforms are a no-op for now (macOS first).
+are silently dropped.
+
+Delivery on Linux: FlightDeck posts via `notify-send` (libnotify). On
+Debian/Ubuntu install it with `sudo apt install libnotify-bin`. If `notify-send`
+is not on `PATH`, notifications are silently dropped. Windows is a no-op.
 
 ## Architecture
 

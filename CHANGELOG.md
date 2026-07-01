@@ -8,7 +8,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- First-class Linux support: ship an `x86_64-unknown-linux-gnu` release binary,
+  run clippy and tests on `ubuntu-latest` in CI, and post desktop notifications
+  via `notify-send` (libnotify).
 
 ### Improvements
 
