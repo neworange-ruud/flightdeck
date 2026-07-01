@@ -223,6 +223,28 @@ impl CommandPalette {
         }
     }
 
+    /// Move selection to the right column, preserving the row within the
+    /// column. No-op when already in the right column. The split point must
+    /// match the two-column layout in `render::draw_palette_overlay`.
+    pub fn select_right(&mut self) {
+        let len = self.filtered().len();
+        let split = len.div_ceil(2);
+        if self.selected < split {
+            self.selected = (self.selected + split).min(len.saturating_sub(1));
+        }
+    }
+
+    /// Move selection to the left column, preserving the row within the
+    /// column. No-op when already in the left column. The split point must
+    /// match the two-column layout in `render::draw_palette_overlay`.
+    pub fn select_left(&mut self) {
+        let len = self.filtered().len();
+        let split = len.div_ceil(2);
+        if self.selected >= split {
+            self.selected -= split;
+        }
+    }
+
     /// The currently selected [`PaletteAction`], if any filtered results exist.
     pub fn selected_action(&self) -> Option<&'static PaletteAction> {
         let items = self.filtered();
@@ -399,6 +421,49 @@ mod tests {
         assert_eq!(palette.selected_index(), 1);
         palette.select_prev();
         assert_eq!(palette.selected_index(), 0);
+    }
+
+    #[test]
+    fn column_navigation_moves_between_columns() {
+        let mut palette = CommandPalette::new();
+        let len = palette.filtered().len();
+        let split = len.div_ceil(2);
+
+        // From the top of the left column, Right jumps to the top of the right.
+        assert_eq!(palette.selected_index(), 0);
+        palette.select_right();
+        assert_eq!(palette.selected_index(), split);
+
+        // Left returns to the same row in the left column.
+        palette.select_left();
+        assert_eq!(palette.selected_index(), 0);
+
+        // Left is a no-op while already in the left column.
+        palette.select_left();
+        assert_eq!(palette.selected_index(), 0);
+
+        // Right preserves the row within the column.
+        palette.selected = 2;
+        palette.select_right();
+        assert_eq!(palette.selected_index(), split + 2);
+
+        // Right is a no-op while already in the right column.
+        palette.select_right();
+        assert_eq!(palette.selected_index(), split + 2);
+    }
+
+    #[test]
+    fn column_navigation_clamps_odd_last_row() {
+        let mut palette = CommandPalette::new();
+        let len = palette.filtered().len();
+        let split = len.div_ceil(2);
+        // With an odd count the left column has one extra row whose right-column
+        // counterpart does not exist; Right must clamp to the last entry.
+        if len % 2 == 1 {
+            palette.selected = split - 1;
+            palette.select_right();
+            assert_eq!(palette.selected_index(), len - 1);
+        }
     }
 
     #[test]
