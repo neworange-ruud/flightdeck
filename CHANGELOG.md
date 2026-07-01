@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.3.0] - 2026-07-01
+
+### New features
+
 - Add **Pull base**: run `git pull --rebase` on the base folder to bring the
   local base branch current after a PR is merged, without leaving FlightDeck.
   Available from the command palette (*Pull Base*) and `Ctrl-u`; refuses on a
