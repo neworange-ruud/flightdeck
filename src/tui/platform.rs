@@ -16,3 +16,11 @@ pub const IS_LINUX: bool = cfg!(target_os = "linux");
 
 /// Whether the target OS is macOS.
 pub const IS_MACOS: bool = cfg!(target_os = "macos");
+
+/// Whether `Shift+Esc` (rather than `Alt+Esc`) is the leave-terminal-focus key.
+///
+/// True on Windows and Linux, where the OS/window manager reserves `Alt+Esc`
+/// for cycling windows so FlightDeck never receives it. This is the single
+/// source of truth for the platform split: the input mapping, the
+/// `LEAVE_FOCUS_KEY` label, and the help overlay all derive from it.
+pub const LEAVE_FOCUS_USES_SHIFT: bool = IS_WINDOWS || IS_LINUX;

@@ -901,6 +901,7 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 /// Draw the mode status bar (SPECS §23).
 ///
 /// Terminal mode: `MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: command palette`
+///                 (the leave-focus key is `Shift+Esc` on Windows/Linux — see [`LEAVE_FOCUS_KEY`])
 /// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(state.mode(), state.update_available.as_deref());
@@ -911,7 +912,7 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// The key that leaves terminal focus, per platform. `Alt+Esc` on macOS; on
 /// Windows and Linux the OS/window manager reserves `Alt+Esc` (cycles windows)
 /// so the terminal app never receives it — those platforms use `Shift+Esc`.
-pub const LEAVE_FOCUS_KEY: &str = if platform::IS_WINDOWS || platform::IS_LINUX {
+pub const LEAVE_FOCUS_KEY: &str = if platform::LEAVE_FOCUS_USES_SHIFT {
     "Shift+Esc"
 } else {
     "Alt+Esc"
@@ -1223,7 +1224,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
         shortcut_line(
-            if platform::IS_WINDOWS || platform::IS_LINUX {
+            if platform::LEAVE_FOCUS_USES_SHIFT {
                 "  Shift+Esc"
             } else {
                 "  Alt+Esc"

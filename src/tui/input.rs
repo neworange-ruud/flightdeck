@@ -48,8 +48,9 @@ pub enum KeyAction {
 /// Map a key event to a [`KeyAction`] based on the current input mode (SPECS §23).
 ///
 /// In [`InputMode::Terminal`] most keys produce `Passthrough`; the global
-/// shortcuts (`Ctrl-g`, `Ctrl-q`) and `Alt+Esc` (leave terminal focus) are
-/// intercepted first. Bare `Esc` passes through to the PTY.
+/// shortcuts (`Ctrl-g`, `Ctrl-q`) and the leave-terminal-focus key (`Alt+Esc`,
+/// or `Shift+Esc` on Windows/Linux) are intercepted first. Bare `Esc` passes
+/// through to the PTY.
 ///
 /// In [`InputMode::App`] all keys are interpreted as FlightDeck commands.
 pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
@@ -80,7 +81,7 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     // the OS/window manager (e.g. GNOME) grabs it before FlightDeck ever sees
     // it. Offer Shift+Esc as the leave-terminal-focus key on those platforms
     // instead. Bare Esc (and 2×Esc) still pass through to hosted agents.
-    if (platform::IS_WINDOWS || platform::IS_LINUX)
+    if platform::LEAVE_FOCUS_USES_SHIFT
         && key.code == KeyCode::Esc
         && key.modifiers == KeyModifiers::SHIFT
     {
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn terminal_mode_shift_esc_focus_depends_on_platform() {
         let action = map_key(InputMode::Terminal, shift(KeyCode::Esc));
-        if platform::IS_WINDOWS || platform::IS_LINUX {
+        if platform::LEAVE_FOCUS_USES_SHIFT {
             // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc
             // is the leave-terminal-focus key there.
             assert_eq!(action, KeyAction::FocusApp);
