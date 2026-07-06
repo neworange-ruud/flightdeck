@@ -1076,6 +1076,13 @@ fn handle_mouse(
                             state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
                         state.focus_app();
                     }
+                    HitTarget::Sidebar => {
+                        // Clicking the sidebar chrome (header/heading/empty space)
+                        // focuses the app without changing the selected tab, so
+                        // APP mode is reachable by clicking the left panel even
+                        // with zero or one agents (SPECS §23).
+                        state.focus_app();
+                    }
                     HitTarget::Child(target) => {
                         select_target(state, services, target);
                         state.focus_terminal();
@@ -2031,6 +2038,8 @@ fn handle_palette_key(
         }
         KeyCode::Up => palette.select_prev(),
         KeyCode::Down => palette.select_next(),
+        KeyCode::Left => palette.select_left(),
+        KeyCode::Right => palette.select_right(),
         KeyCode::Backspace => palette.pop_char(),
         KeyCode::Enter => {
             let action = palette.selected_action().cloned();

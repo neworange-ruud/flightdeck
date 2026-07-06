@@ -1,6 +1,6 @@
 # FlightDeck
 
-**FlightDeck** is a macOS and Windows terminal UI for orchestrating multiple
+**FlightDeck** is a macOS, Linux, and Windows terminal UI for orchestrating multiple
 local AI coding agents working in parallel on the same Git project. You run it
 from inside a Git repository; it creates isolated Git **worktrees** under
 `.flightdeck/`, launches a selected AI coding agent inside each one, lets you
@@ -20,7 +20,7 @@ Install with Homebrew:
 brew install neworange-ruud/tap/flightdeck
 ```
 
-Or install directly from the latest GitHub Release:
+Or install on macOS or Linux directly from the latest GitHub Release:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
@@ -137,12 +137,15 @@ FlightDeck **may**: detect the repo root / base branch / dirty state, create
 `.flightdeck/`, update `.gitignore` (append-only), create & attach branches,
 create & recover worktrees, push branches *after explicit confirmation*, remove
 managed worktrees (a clean worktree is removed immediately; a worktree with
-uncommitted changes is removed only after you confirm discarding them), and
-perform a guarded local merge-back only when strict preconditions hold.
+uncommitted changes is removed only after you confirm discarding them), perform
+a guarded local merge-back only when strict preconditions hold, rebase an agent
+worktree onto its base branch under explicit confirmation, and **pull base**
+(`git pull --rebase` on the base folder) to update the local base branch after a
+PR merges.
 
 FlightDeck **must not** (and cannot): stage files, create/amend/squash commits,
-rebase, rewrite history, force-push, create GitHub PRs, or auto-resolve merge
-conflicts. You (or your agent) make the commits; FlightDeck shows you a GitHub PR
+rebase automatically, rewrite history, force-push, create GitHub PRs, or
+auto-resolve merge conflicts. You (or your agent) make the commits; FlightDeck shows you a GitHub PR
 **compare URL** after a push so you create the PR yourself.
 
 ## Keyboard model
@@ -156,8 +159,9 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
   `?` shows help.
 
 Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
-`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-f` finish/local-merge · `Ctrl-k` close
-tab · `Alt-↑/↓` previous/next **agent tab** · `Alt-1..9` jump to agent tab ·
+`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-u` pull base · `Ctrl-f`
+finish/local-merge · `Ctrl-k` close tab · `Alt-↑/↓` previous/next **agent tab**
+· `Alt-1..9` jump to agent tab ·
 `Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` cycle the
 **terminal tabs** (agent + shells) · `Ctrl-s` set manual status · `Ctrl-r`
 restart agent. The `Alt`-modified navigation works in **both** modes, so you can
@@ -165,8 +169,9 @@ switch tabs without leaving terminal focus; in App mode the bare arrow keys also
 work (handy because some terminals intercept `Alt`+arrows). The full table is in
 the in-app help (`?`).
 
-**Mouse**: click an Agent Tab in the sidebar to select it, or a child-terminal
-tab (`agent | shell 1 | …`) to switch terminals.
+**Mouse**: click an Agent Tab in the sidebar to select it (or click anywhere
+else in the sidebar to switch to App mode without changing the selection), or a
+child-terminal tab (`agent | shell 1 | …`) to switch terminals.
 
 ## Screen layout
 
@@ -236,7 +241,7 @@ worktrees. Wire them per the generated `README.md`:
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
   (`session.idle`→idle, message activity→working, permission prompt→waiting).
 
-### OS notifications (macOS)
+### OS notifications (macOS and Linux)
 
 FlightDeck posts a native OS notification when an agent finishes a running task,
 so you get pinged the moment a background tab is done while your attention is
@@ -279,7 +284,11 @@ reliable option, since it registers as a real app and prompts for permission on
 first use. Otherwise it falls back to `osascript`, whose notifications are
 attributed to **Script Editor**: enable **System Settings → Notifications →
 Script Editor** (and make sure no Focus / Do Not Disturb is active) or banners
-are silently dropped. Other platforms are a no-op for now (macOS first).
+are silently dropped.
+
+Delivery on Linux: FlightDeck posts via `notify-send` (libnotify). On
+Debian/Ubuntu install it with `sudo apt install libnotify-bin`. If `notify-send`
+is not on `PATH`, notifications are silently dropped. Windows is a no-op.
 
 ## Architecture
 

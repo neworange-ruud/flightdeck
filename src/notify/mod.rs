@@ -2,11 +2,12 @@
 //! task even while their attention is elsewhere.
 //!
 //! [`SystemNotifier`] is the production [`Notifier`]. On macOS it posts a native
-//! notification via `osascript`; on every other platform it is a no-op (so the
-//! crate builds and runs everywhere, with macOS support landing first).
+//! notification via `terminal-notifier`/`osascript`; on Linux it posts via
+//! `notify-send` (libnotify); on every other platform (e.g. Windows) it is a
+//! no-op, so the crate builds and runs everywhere.
 //!
-//! Delivery is best-effort and **never blocks the render loop**: the macOS path
-//! spawns `osascript` on a detached thread and ignores the result. A failed
+//! Delivery is best-effort and **never blocks the render loop**: each backend
+//! spawns its command on a detached thread and ignores the result. A failed
 //! notification must never disrupt the UI.
 
 use crate::contracts::{Notification, Notifier};
@@ -21,9 +22,13 @@ impl Notifier for SystemNotifier {
         {
             post_macos(&notification.title, &notification.body);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
-            // No-op on non-macOS platforms (macOS support lands first, SPECS §24).
+            post_linux(&notification.title, &notification.body);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // No-op on platforms without a notification backend (e.g. Windows).
             let _ = notification;
         }
     }
@@ -46,6 +51,28 @@ fn post_macos(title: &str, body: &str) {
             return;
         }
         post_via_osascript(&title, &body);
+    });
+}
+
+/// Post a desktop notification on Linux via `notify-send` (libnotify) on a
+/// detached thread so the render loop never blocks; output is discarded and any
+/// error is ignored. If `notify-send` is not installed the spawn fails and the
+/// notification is silently dropped — best-effort, exactly like the macOS path.
+///
+/// Arguments are passed as argv (no shell), so agent-controlled text cannot
+/// inject anything. `notify-send <SUMMARY> <BODY>` takes the title as the first
+/// positional argument and the body as the second.
+#[cfg(target_os = "linux")]
+fn post_linux(title: &str, body: &str) {
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("notify-send")
+            .arg(&title)
+            .arg(&body)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     });
 }
 

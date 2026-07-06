@@ -128,6 +128,11 @@ pub enum Command {
         /// Whether the user explicitly confirmed the rebase.
         confirm: bool,
     },
+    /// Pull base (SPECS §5.2): `git pull --rebase` on the base folder so merged
+    /// PRs land on the local base branch without leaving FlightDeck. A global
+    /// command (operates on the root, not the selected tab); refuses if the base
+    /// folder is dirty and aborts on conflict, leaving it untouched.
+    PullBase,
     /// Copy `.env.local` or `.env` from the base folder into the selected worktree.
     CopyEnvFile,
     /// Abandon (remove) the selected tab's worktree (SPECS §5/§15). With

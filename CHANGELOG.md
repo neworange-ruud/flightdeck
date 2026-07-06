@@ -12,16 +12,40 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- None yet.
+
+### Bug fixes
+
+- Use `Shift+Esc` to leave terminal focus on Linux, where the window manager
+  (e.g. GNOME) reserves `Alt+Esc` for cycling windows and FlightDeck never
+  receives it. Matches the existing Windows behaviour; macOS keeps `Alt+Esc`.
+
+## [1.3.0] - 2026-07-01
+
+### New features
+
+- Add **Pull base**: run `git pull --rebase` on the base folder to bring the
+  local base branch current after a PR is merged, without leaving FlightDeck.
+  Available from the command palette (*Pull Base*) and `Ctrl-u`; refuses on a
+  dirty base folder and aborts on conflict, leaving the base folder untouched.
+- First-class Linux support: ship an `x86_64-unknown-linux-gnu` release binary,
+  run clippy and tests on `ubuntu-latest` in CI, and post desktop notifications
+  via `notify-send` (libnotify).
+
+### Improvements
+
 - Automate release-time changelog rollover so `./scripts/release <version>`
   moves `Unreleased` notes into the new version entry and resets the template.
+- Clicking anywhere in the agent sidebar — the heading or empty space, not just
+  an agent row — now switches to APP mode, so it works with zero or one agents.
+- Lay out the command palette across two columns so more entries are visible at
+  once without scrolling. Left/right arrow keys move the selection between the
+  two columns.
 
 ### Bug fixes
 
 - Restore mouse text selection in Split View and make wheel scrolling target
   the column under the pointer.
-- Use `Shift+Esc` to leave terminal focus on Linux, where the window manager
-  (e.g. GNOME) reserves `Alt+Esc` for cycling windows and FlightDeck never
-  receives it. Matches the existing Windows behaviour; macOS keeps `Alt+Esc`.
 
 ## [1.2.0] - 2026-06-29
 

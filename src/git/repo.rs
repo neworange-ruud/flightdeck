@@ -262,6 +262,30 @@ impl GitExecutor for GitCli {
             message: combined.trim().to_string(),
         })
     }
+
+    fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome> {
+        // Pull base (SPECS §5.2): `git pull --rebase` on the base folder so
+        // merged PRs land on the local base branch. Only reached after the
+        // clean-tree precondition in the workflow layer. On any failure we abort
+        // any in-progress rebase so the base folder is left exactly as it was —
+        // never resolve conflicts, never leave a half-finished rebase (§5.1).
+        let out = self.run_in(cwd, &["pull", "--rebase"])?;
+        if out.status.success() {
+            return Ok(RebaseOutcome {
+                rebased: true,
+                conflicted: false,
+                message: "pulled base (--rebase)".to_string(),
+            });
+        }
+        let combined = format!("{}\n{}", stdout_trimmed(&out), stderr_trimmed(&out));
+        let conflicted = combined.to_lowercase().contains("conflict");
+        let _ = self.run_in(cwd, &["rebase", "--abort"]);
+        Ok(RebaseOutcome {
+            rebased: false,
+            conflicted,
+            message: combined.trim().to_string(),
+        })
+    }
 }
 
 /// Parse the output of `git worktree list --porcelain` into [`WorktreeInfo`]s.

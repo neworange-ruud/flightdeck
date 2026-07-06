@@ -72,6 +72,15 @@ pub trait GitExecutor {
     /// returns `conflicted: true` so the worktree is left untouched — FlightDeck
     /// never resolves conflicts or leaves a half-finished rebase.
     fn rebase_onto(&self, onto: &str, cwd: &Path) -> Result<RebaseOutcome>;
+    /// Fast-forward / rebase the base branch checked out in `cwd` onto its
+    /// upstream (`git pull --rebase`), used to pull merged PRs into the base
+    /// folder without leaving FlightDeck (SPECS §5.2 "Pull base"). This touches
+    /// only the base branch in the root folder — never an Agent Tab's worktree —
+    /// and, like [`rebase_onto`](GitExecutor::rebase_onto), aborts on conflict
+    /// (`git rebase --abort`) so the base folder is left exactly as it was.
+    /// Must only be reached after the clean-tree precondition check in the git
+    /// workflow layer.
+    fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome>;
 }
 
 /// Abstraction over filesystem operations (SPECS §26).
