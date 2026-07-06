@@ -614,7 +614,10 @@ mod tests {
             assert_eq!(action, KeyAction::FocusApp);
         } else {
             // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
-            assert_eq!(action, KeyAction::Passthrough(encode_key(shift(KeyCode::Esc))));
+            assert_eq!(
+                action,
+                KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
+            );
         }
     }
 
