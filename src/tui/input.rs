@@ -18,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::commands::{Command, Selector};
 use crate::app::modes::InputMode;
+use crate::tui::platform;
 
 /// The result of mapping a key event (SPECS §23).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +80,10 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     // the OS/window manager (e.g. GNOME) grabs it before FlightDeck ever sees
     // it. Offer Shift+Esc as the leave-terminal-focus key on those platforms
     // instead. Bare Esc (and 2×Esc) still pass through to hosted agents.
-    #[cfg(any(windows, target_os = "linux"))]
-    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::SHIFT {
+    if (platform::IS_WINDOWS || platform::IS_LINUX)
+        && key.code == KeyCode::Esc
+        && key.modifiers == KeyModifiers::SHIFT
+    {
         return KeyAction::FocusApp;
     }
     // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
@@ -599,25 +602,17 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn terminal_mode_shift_esc_focuses_app_on_windows_and_linux() {
-        // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc is
-        // the leave-terminal-focus key there.
-        assert_eq!(
-            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
-            KeyAction::FocusApp
-        );
-    }
-
-    #[cfg(not(any(windows, target_os = "linux")))]
-    #[test]
-    fn terminal_mode_shift_esc_passes_through_elsewhere() {
-        // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
-        assert_eq!(
-            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
-            KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
-        );
+    fn terminal_mode_shift_esc_focus_depends_on_platform() {
+        let action = map_key(InputMode::Terminal, shift(KeyCode::Esc));
+        if platform::IS_WINDOWS || platform::IS_LINUX {
+            // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc
+            // is the leave-terminal-focus key there.
+            assert_eq!(action, KeyAction::FocusApp);
+        } else {
+            // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
+            assert_eq!(action, KeyAction::Passthrough(encode_key(shift(KeyCode::Esc))));
+        }
     }
 
     #[test]

@@ -8,5 +8,6 @@ pub mod clipboard;
 pub mod input;
 pub mod layout;
 pub mod palette;
+pub mod platform;
 pub mod render;
 pub mod selection;
