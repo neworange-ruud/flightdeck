@@ -8,7 +8,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Resume agent sessions across restarts: FlightDeck captures the resume command
+  an agent prints on exit (`claude --resume <id>`, `codex resume <id>`) and
+  replays it when the tab is restarted or recovered, so the conversation
+  continues instead of starting fresh.
 
 ### Improvements
 
@@ -16,7 +19,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Continue a recovered worktree that has no stored agent by falling back to the
+  configured default agent, so restarting/resuming actually launches a terminal.
+- Refuse to start an agent when its worktree directory is missing instead of
+  silently launching it in the user's home directory (a case-sensitive-filesystem
+  path mismatch could otherwise drop the agent in `~/` on Linux).
+- Write `state.json` atomically (temp file + rename) so an abrupt shutdown
+  mid-write can no longer corrupt or truncate it.
+- Persist state and terminate agents on `SIGTERM`/`SIGINT`/`SIGHUP` (terminal
+  closed, `kill`, service stop) instead of dying without cleanup.
+- Terminate agents gracefully on shutdown: send `SIGTERM` to the whole process
+  group, allow a short grace period, then `SIGKILL` — so agents can exit cleanly
+  and child processes are no longer orphaned.
 
 ## [1.7.2] - 2026-07-14
 

@@ -256,6 +256,10 @@ pub struct RuntimeTab {
     /// single OS notification fires and this is cleared, so a quiet agent never
     /// re-notifies until it resumes working (SPECS §24).
     pub notify_armed: bool,
+    /// Rolling tail of recent primary output (ANSI-stripped, bounded) scanned for
+    /// the agent's on-exit resume hint. Runtime-only; the captured result lives
+    /// in `meta.resume_args`.
+    resume_scan: String,
 }
 
 impl RuntimeTab {
@@ -271,12 +275,45 @@ impl RuntimeTab {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            resume_scan: String::new(),
         }
     }
 
     /// Stable id of this tab.
     pub fn id(&self) -> TabId {
         TabId(self.meta.id.clone())
+    }
+
+    /// Scan primary output for the agent's on-exit resume hint (e.g.
+    /// `claude --resume <id>`) and, when found, record the replay args on the tab
+    /// so a later restart continues the same session. Keeps a bounded rolling
+    /// tail so a hint split across output chunks is still matched. Called from
+    /// `drain_pty_output`; the captured value persists via the normal paths.
+    pub fn capture_resume_hint(&mut self, bytes: &[u8]) {
+        /// Retained tail bound: big enough for a multi-line hint, cheap to rescan.
+        const RESUME_SCAN_CAP: usize = 8192;
+
+        if self.meta.agent.is_empty() {
+            return;
+        }
+        self.resume_scan.push_str(&String::from_utf8_lossy(bytes));
+        if self.resume_scan.len() > RESUME_SCAN_CAP {
+            let mut cut = self.resume_scan.len() - RESUME_SCAN_CAP;
+            while cut < self.resume_scan.len() && !self.resume_scan.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.resume_scan = self.resume_scan.split_off(cut);
+        }
+        // Cheap reject before the (rarely-needed) strip + parse.
+        if !self.resume_scan.contains("resume") {
+            return;
+        }
+        let clean = crate::agents::resume::strip_ansi(&self.resume_scan);
+        if let Some(args) = crate::agents::resume::parse_resume_args(&self.meta.agent, &clean) {
+            if self.meta.resume_args != args {
+                self.meta.resume_args = args;
+            }
+        }
     }
 
     /// The combined, display-ready status (SPECS §24): live process state +
@@ -903,6 +940,7 @@ impl AppState {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -912,6 +950,7 @@ impl AppState {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            resume_scan: String::new(),
         });
         // Focus the new (placeholder) tab so the user sees the progress.
         self.selected_tab = Some(self.tabs.len() - 1);
@@ -1769,17 +1808,16 @@ impl AppState {
         // stored agent (recovery cannot know which one ran), so fall back to the
         // configured default so it can still be continued.
         let agent_key = self.tabs[idx].meta.agent.clone();
-        let agent = if agent_key.is_empty() {
-            self.registry
-                .default_agent()
-                .cloned()
-                .ok_or_else(|| FlightDeckError::Config("no default agent configured".to_string()))?
-        } else {
-            self.registry
-                .get(&agent_key)
-                .cloned()
-                .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?
-        };
+        let agent =
+            if agent_key.is_empty() {
+                self.registry.default_agent().cloned().ok_or_else(|| {
+                    FlightDeckError::Config("no default agent configured".to_string())
+                })?
+            } else {
+                self.registry.get(&agent_key).cloned().ok_or_else(|| {
+                    FlightDeckError::Config(format!("unknown agent '{agent_key}'"))
+                })?
+            };
         validate_launchable(
             &agent,
             &self.config.containers,
@@ -1803,7 +1841,17 @@ impl AppState {
         }
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
-        let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
+        let mut spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
+        // Replay a captured resume command so the agent continues its previous
+        // session instead of starting fresh (e.g. `claude --resume <id>`). Local
+        // mode only — the resume args replace the configured base args. Container
+        // launches are left untouched (resume-in-container is out of scope).
+        if !spawn.containerized {
+            let resume = self.tabs[idx].meta.resume_args.clone();
+            if !resume.is_empty() {
+                spawn.args = resume;
+            }
+        }
         // Fresh container: start it detached before attaching its PTY.
         if let Some(start_args) = &spawn.start_args {
             services.container.start_detached(start_args)?;
@@ -3714,6 +3762,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
         assert_eq!(app.tabs.len(), 1);
@@ -3792,6 +3841,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         }
     }
 
@@ -3817,6 +3867,79 @@ mod tests {
         assert_eq!(pty.spawns().len(), 1);
         assert_eq!(app.tabs[0].session.primary_state(), ProcessState::Running);
         assert!(!app.tabs[0].meta.recovered);
+    }
+
+    #[test]
+    fn capture_resume_hint_records_resume_args_from_exit_line() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        app.tabs[0].capture_resume_hint(
+            b"Resume this session with:\n  claude --resume 3d74d44d-e9e7-407f-9938-c59ef4045e3f\n",
+        );
+        assert_eq!(
+            app.tabs[0].meta.resume_args,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "the agent's on-exit resume hint should be captured onto the tab"
+        );
+    }
+
+    #[test]
+    fn resume_replays_captured_resume_args_instead_of_base_args() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "claude"); // base args = []
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        tab.resume_args = vec![
+            "--resume".to_string(),
+            "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd, "launches the agent binary");
+        assert_eq!(
+            spawns[0].1,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "resume args must replace the configured base args"
+        );
     }
 
     #[test]

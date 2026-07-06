@@ -466,6 +466,7 @@ mod tests {
             .spawn(
                 "sh",
                 &["-c".to_string(), script],
+                &[],
                 dir.path(),
                 PtySize::default(),
             )

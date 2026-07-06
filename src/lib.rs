@@ -3405,15 +3405,22 @@ fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
         // Primary: drain into the VT parser. Lifecycle status comes only from
         // backend hooks/plugins; PTY output includes echoed user keystrokes and
         // is deliberately not treated as agent activity.
-        if let Some(primary) = tab.session.primary_mut() {
-            if let Ok(bytes) = primary.session_mut().try_read_output() {
-                if !bytes.is_empty() {
+        let primary_bytes = tab.session.primary_mut().and_then(|primary| {
+            match primary.session_mut().try_read_output() {
+                Ok(bytes) if !bytes.is_empty() => {
                     primary.process_output(&bytes);
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
+                    Some(bytes)
                 }
+                _ => None,
             }
+        });
+        // Capture the agent's on-exit resume hint from that output (borrow of
+        // `tab.session` has ended, so we can touch the rest of the tab).
+        if let Some(bytes) = primary_bytes {
+            tab.capture_resume_hint(&bytes);
         }
 
         // Child terminals: drain → VT parser (so they don't stall and so their
