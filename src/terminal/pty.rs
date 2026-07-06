@@ -130,6 +130,50 @@ fn resolve_windows_command(cmd: &str) -> WindowsCommand {
     WindowsCommand::Direct(OsString::from(cmd))
 }
 
+/// Grace budget between the graceful SIGTERM and the SIGKILL fallback: up to
+/// `STEPS * STEP` (~1s). Short enough to keep quit/teardown snappy, long enough
+/// for an agent to flush and exit on its own.
+#[cfg(unix)]
+const TERMINATE_GRACE_STEPS: usize = 20;
+#[cfg(unix)]
+const TERMINATE_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What graceful termination ended up doing (for tests / clarity).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TerminationOutcome {
+    /// The process was already gone; nothing was signalled.
+    AlreadyExited,
+    /// It exited after the graceful stop, within the grace window.
+    Graceful,
+    /// It outlasted the grace window and had to be force-killed.
+    Forced,
+}
+
+/// Escalation policy for terminating a process tree. If it is still alive, send
+/// a graceful stop, then poll up to `grace_steps` times (sleeping via `step`
+/// between checks) for it to exit, and force-kill if it never does. Pure control
+/// flow with injected effects, so it is unit-testable without a real process.
+pub(crate) fn escalate_terminate(
+    is_alive: impl Fn() -> bool,
+    graceful: impl FnOnce(),
+    grace_steps: usize,
+    step: impl Fn(),
+    force: impl FnOnce(),
+) -> TerminationOutcome {
+    if !is_alive() {
+        return TerminationOutcome::AlreadyExited;
+    }
+    graceful();
+    for _ in 0..grace_steps {
+        step();
+        if !is_alive() {
+            return TerminationOutcome::Graceful;
+        }
+    }
+    force();
+    TerminationOutcome::Forced
+}
+
 impl PtyBackend for PortablePtyBackend {
     fn spawn(
         &self,
@@ -291,14 +335,47 @@ impl PtySession for PortablePtySession {
             // the direct child, in which case `kill()` would error.
             let _ = self.killer.kill();
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            // Best-effort: kill the direct child of the PTY. On macOS/Linux this
-            // does NOT recursively reap an arbitrary grandchild tree; children
-            // that re-parent (daemonize / double-fork) may survive. Killing the
-            // pty's direct child (the shell/agent) is acceptable, and dropping
-            // the pty master delivers SIGHUP to the foreground group.
-            let _ = self.killer.kill();
+            // Graceful, whole-group shutdown. The pty child is a session/process
+            // -group leader (portable-pty calls `setsid`), so its PGID == PID and
+            // signalling the *negative* PID reaches the agent AND its descendants
+            // that stay in the group — not just the direct child. We send SIGTERM
+            // first (let the agent flush/exit cleanly), wait a short grace window,
+            // and only SIGKILL if it outlives it.
+            let pid = self.child.lock().expect("child poisoned").process_id();
+            if let Some(pid) = pid {
+                let pgid = pid as i32;
+                let signal_group = |sig: i32| {
+                    // Ignore ESRCH etc.: a already-dead group is fine.
+                    unsafe {
+                        libc::kill(-pgid, sig);
+                    }
+                };
+                let is_alive = || {
+                    matches!(
+                        self.child.lock().expect("child poisoned").try_wait(),
+                        Ok(None)
+                    )
+                };
+                escalate_terminate(
+                    is_alive,
+                    || signal_group(libc::SIGTERM),
+                    TERMINATE_GRACE_STEPS,
+                    || std::thread::sleep(TERMINATE_STEP),
+                    || signal_group(libc::SIGKILL),
+                );
+            } else {
+                // No pid to signal (already reaped): best-effort direct kill.
+                let _ = self.killer.kill();
+            }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            // Platforms without POSIX signals: best-effort direct child kill.
+            self.killer
+                .kill()
+                .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
         }
         // Block until the direct child has actually exited so the OS releases the
         // handles it held — most importantly its working directory. On Windows
@@ -316,6 +393,119 @@ impl PtySession for PortablePtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn escalate_skips_signals_when_already_exited() {
+        let graceful = Cell::new(false);
+        let forced = Cell::new(false);
+        let out = escalate_terminate(
+            || false,
+            || graceful.set(true),
+            5,
+            || {},
+            || forced.set(true),
+        );
+        assert_eq!(out, TerminationOutcome::AlreadyExited);
+        assert!(!graceful.get(), "no graceful signal for a dead process");
+        assert!(!forced.get(), "no force-kill for a dead process");
+    }
+
+    #[test]
+    fn escalate_is_graceful_when_it_exits_within_grace() {
+        let checks = Cell::new(0);
+        let forced = Cell::new(false);
+        // Alive for the first few liveness checks, then exits during the grace
+        // window (before grace_steps is exhausted).
+        let is_alive = || {
+            let n = checks.get();
+            checks.set(n + 1);
+            n < 3
+        };
+        let out = escalate_terminate(is_alive, || {}, 10, || {}, || forced.set(true));
+        assert_eq!(out, TerminationOutcome::Graceful);
+        assert!(
+            !forced.get(),
+            "must not force-kill if it exits during grace"
+        );
+    }
+
+    #[test]
+    fn escalate_force_kills_when_still_alive_after_grace() {
+        let graceful = Cell::new(false);
+        let forced = Cell::new(false);
+        let out = escalate_terminate(
+            || true, // never exits
+            || graceful.set(true),
+            3,
+            || {},
+            || forced.set(true),
+        );
+        assert_eq!(out, TerminationOutcome::Forced);
+        assert!(graceful.get(), "graceful stop is attempted first");
+        assert!(forced.get(), "force-kill after the grace window");
+    }
+
+    // Real-process test (ignored: needs a real PTY + spawns processes). Verifies
+    // that terminating a session reaps the WHOLE process group — including a
+    // grandchild — rather than leaving it orphaned. Run with `--ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn terminate_tree_reaps_process_group_including_grandchild() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        // A shell that backgrounds a long `sleep` (a grandchild of flightdeck),
+        // records its pid, and waits. Without group-killing, that sleep would
+        // survive after the shell dies.
+        let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
+        let backend = PortablePtyBackend;
+        let mut session = backend
+            .spawn(
+                "sh",
+                &["-c".to_string(), script],
+                dir.path(),
+                PtySize::default(),
+            )
+            .expect("spawn sh");
+
+        // Wait for the grandchild pid to be written.
+        let mut pid: Option<i32> = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                pid = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = pid.expect("grandchild pid recorded");
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "grandchild should be alive before terminate"
+        );
+
+        session.terminate_tree().expect("terminate");
+
+        // The grandchild must be gone — the group was signalled, not just the
+        // direct child.
+        let mut gone = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "grandchild {pid} must be reaped with the group");
+    }
 
     // Real-PTY smoke test. Ignored by default (SPECS: real PTY must not run in
     // the standard test run). Spawns a trivial command and verifies the session

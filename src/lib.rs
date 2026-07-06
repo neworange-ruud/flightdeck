@@ -17,6 +17,7 @@ pub mod git;
 pub mod notify;
 pub mod persistence;
 pub mod runtime;
+pub mod signals;
 pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
@@ -1158,7 +1159,16 @@ fn event_loop(
         }
     }
 
+    // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
+    // so the caller's clean teardown (persist `state.json` + terminate agents)
+    // runs, instead of the process dying without saving or cleaning up.
+    let shutdown = crate::signals::install_shutdown_flag();
+
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
         let n = workspace.projects.len();

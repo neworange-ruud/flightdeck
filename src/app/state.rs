@@ -1765,12 +1765,21 @@ impl AppState {
     ) -> Result<()> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
+        // A recovered tab reconstructed from an on-disk worktree carries no
+        // stored agent (recovery cannot know which one ran), so fall back to the
+        // configured default so it can still be continued.
         let agent_key = self.tabs[idx].meta.agent.clone();
-        let agent = self
-            .registry
-            .get(&agent_key)
-            .cloned()
-            .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
+        let agent = if agent_key.is_empty() {
+            self.registry
+                .default_agent()
+                .cloned()
+                .ok_or_else(|| FlightDeckError::Config("no default agent configured".to_string()))?
+        } else {
+            self.registry
+                .get(&agent_key)
+                .cloned()
+                .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?
+        };
         validate_launchable(
             &agent,
             &self.config.containers,
@@ -1782,6 +1791,16 @@ impl AppState {
             &repo_root,
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
         );
+        // Never spawn into a missing worktree: portable-pty silently falls back
+        // to the user's home directory for a cwd that is not an existing
+        // directory (this is how a restart could leave the agent running in
+        // `~/`). Refuse loudly instead so the tab can be recovered/removed.
+        if !services.fs.exists(&cwd) {
+            return Err(FlightDeckError::Refused(format!(
+                "worktree directory {} is missing; not starting the agent (it would launch in your home directory)",
+                cwd.display()
+            )));
+        }
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
@@ -1827,6 +1846,9 @@ impl AppState {
         if let Some(image) = spawn.image {
             tab.meta.container_image = Some(image);
         }
+        // Persist the resolved agent so a recovered tab (which had none) keeps
+        // the default on subsequent restarts/persists.
+        tab.meta.agent = agent.key.clone();
         tab.meta.recovered = false;
         Ok(())
     }
@@ -3817,6 +3839,77 @@ mod tests {
         let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
         assert_eq!(started, 0);
         assert_eq!(pty.spawns().len(), 0);
+        assert_eq!(
+            app.tabs[0].session.primary_state(),
+            ProcessState::NotStarted
+        );
+    }
+
+    // Fix #2: a recovered tab whose stored agent is empty (as real recovery
+    // leaves it) must resume on the configured default agent, and the resolved
+    // key must be persisted onto the tab.
+    #[test]
+    fn resume_starts_recovered_tab_with_empty_agent_using_default() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent); // ui.default_agent == "opencode"
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = String::new(); // real recovery stores no agent
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(
+            started, 1,
+            "recovered tab with empty agent should resume on the default agent"
+        );
+        assert_eq!(pty.spawns().len(), 1);
+        assert_eq!(
+            app.tabs[0].meta.agent, "opencode",
+            "resolved default agent must be persisted onto the tab"
+        );
+    }
+
+    // Fix #1: restarting a tab whose worktree directory is gone must refuse
+    // rather than spawn — otherwise the underlying PTY silently launches the
+    // agent in $HOME (portable-pty falls back to the home dir for a cwd that is
+    // not an existing directory).
+    #[test]
+    fn restart_refuses_when_worktree_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("gone")); // agent set, worktree .../gone
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new(); // worktree dir does NOT exist
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let result = app.dispatch(Command::RestartAgent, &services(&git, &fs, &pty, &clock));
+        assert!(
+            result.is_err(),
+            "restart must refuse when the worktree directory is missing"
+        );
+        assert_eq!(
+            pty.spawns().len(),
+            0,
+            "no agent may be spawned into a non-existent worktree"
+        );
         assert_eq!(
             app.tabs[0].session.primary_state(),
             ProcessState::NotStarted

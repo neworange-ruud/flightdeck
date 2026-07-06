@@ -56,6 +56,12 @@ axoupdater = { version = "0.10", features = ["blocking"], optional = true }
 # already in the graph via axoupdater's `blocking` feature.
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 
+# POSIX-only: shutdown-signal handling (run teardown on SIGTERM/SIGINT) and the
+# raw kill(2)/killpg used for graceful, process-group agent termination.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+libc = "0.2"
+
 [dev-dependencies]
 insta = "1.48.0"
 tempfile = "3.27.0"
