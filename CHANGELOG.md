@@ -19,6 +19,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 - Restore mouse text selection in Split View and make wheel scrolling target
   the column under the pointer.
+- Use `Shift+Esc` to leave terminal focus on Linux, where the window manager
+  (e.g. GNOME) reserves `Alt+Esc` for cycling windows and FlightDeck never
+  receives it. Matches the existing Windows behaviour; macOS keeps `Alt+Esc`.
 
 ## [1.2.0] - 2026-06-29
 

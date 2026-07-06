@@ -75,11 +75,11 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::ALT {
         return KeyAction::FocusApp;
     }
-    // Windows: Alt+Esc is a reserved OS shortcut (cycles windows in z-order), so
-    // the shell grabs it before FlightDeck ever sees it. Offer Shift+Esc as the
-    // leave-terminal-focus key there instead. Bare Esc (and 2×Esc) still pass
-    // through to hosted agents.
-    #[cfg(windows)]
+    // Windows and Linux: Alt+Esc is a reserved shortcut that cycles windows —
+    // the OS/window manager (e.g. GNOME) grabs it before FlightDeck ever sees
+    // it. Offer Shift+Esc as the leave-terminal-focus key on those platforms
+    // instead. Bare Esc (and 2×Esc) still pass through to hosted agents.
+    #[cfg(any(windows, target_os = "linux"))]
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::SHIFT {
         return KeyAction::FocusApp;
     }
@@ -599,21 +599,21 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn terminal_mode_shift_esc_focuses_app_on_windows() {
-        // Windows reserves Alt+Esc (cycles windows), so Shift+Esc is the
-        // leave-terminal-focus key there.
+    fn terminal_mode_shift_esc_focuses_app_on_windows_and_linux() {
+        // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc is
+        // the leave-terminal-focus key there.
         assert_eq!(
             map_key(InputMode::Terminal, shift(KeyCode::Esc)),
             KeyAction::FocusApp
         );
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
-    fn terminal_mode_shift_esc_passes_through_off_windows() {
-        // Off Windows, Shift+Esc is not a focus key — it stays a PTY passthrough.
+    fn terminal_mode_shift_esc_passes_through_elsewhere() {
+        // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
         assert_eq!(
             map_key(InputMode::Terminal, shift(KeyCode::Esc)),
             KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
