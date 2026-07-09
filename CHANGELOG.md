@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.4.0] - 2026-07-09
+
+### New features
+
 - **Mouse-driven tab management on the child tab bar.** The horizontal tab bar
   now carries **`+ agent`** and **`+ shell`** buttons, right-aligned and styled
   distinctly from the tabs. **`+ agent`** first asks which **backend** to use
