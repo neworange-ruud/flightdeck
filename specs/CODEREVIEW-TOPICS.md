@@ -1,188 +1,357 @@
 # FlightDeck Code Review Topics
 
-This document splits the codebase into small, connected review topics. The goal is not to review findings here, but to define review units that can be inspected independently without pulling in unrelated files.
+This document splits the current codebase into small, connected review topics. It is a review map, not a code review: no findings are recorded here.
 
-Prefer reviewing one topic at a time. If a reviewer finds a topic still too large, split it further along the line ranges listed here.
+The goal is independent, thorough review. Prefer too many small topics over fewer large ones.
 
 ## Review Rules
 
 - Review the listed primary scope first.
-- Use supporting tests only to understand expected behavior and coverage for that scope.
-- Do not expand into neighboring topics unless a direct bug path crosses that boundary.
-- For cross-cutting flows, review the named call path only, not the entire referenced file.
-- Treat `src/lib.rs`, `src/app/state.rs`, and `src/tui/render.rs` as split files; do not review them as single topics.
+- Use supporting scope only to understand expectations, call paths, or test coverage.
+- Do not expand into neighboring topics unless a concrete bug path crosses that boundary.
+- For large files, review only the named ranges and call paths.
+- Treat `src/lib.rs`, `src/app/state.rs`, `src/tui/render.rs`, `src/testing/mod.rs`, and `src/terminal/session.rs` as split files; do not review them as single topics.
 
-## Project Map
+## Current Project Map
 
 - Rust CLI/TUI crate: `Cargo.toml`, `src/main.rs`, `src/lib.rs`.
 - Headless app core: `src/app/*`.
 - TUI rendering/input: `src/tui/*`.
 - Git workflows: `src/git/*`.
 - PTY/session model: `src/terminal/*`.
-- Config, state, recovery, filesystem seams: `src/config/*`, `src/persistence/*`, `src/fs/*`, `src/contracts/*`.
+- Container execution: `src/runtime/*`, `containers/README.md`, `specs/CONTAINER_SUPPORT_PLAN.md`.
+- Self-update/update notices: `src/update.rs`, `Cargo.toml` feature gates.
+- Config, persistence, filesystem seams: `src/config/*`, `src/persistence/*`, `src/fs/*`, `src/contracts/*`.
 - Agent registry/status/integrations: `src/agents/*`, `src/notify/*`.
-- Test support and integration coverage: `src/testing/mod.rs`, `tests/*`.
+- Test support and integration coverage: `src/testing/mod.rs`, `tests/*`, `examples/keylog.rs`.
 
 ## Topics
 
-### T01 - Crate Entrypoint and CLI Dispatch
+### T01 - Crate Manifest, Features, and Dependencies
+
+Primary scope:
+- `Cargo.toml:1-66`
+
+Supporting scope:
+- `dist-workspace.toml:1-24`
+- `src/lib.rs:22-48`
+- `src/update.rs:1-18`
+
+Review focus:
+- Default `self-update` feature and Windows target-gating.
+- Optional `axoupdater`/`tokio` dependency graph.
+- Cross-platform package metadata and release profile.
+
+Keep out:
+- Runtime behavior of the updater.
+
+### T02 - Binary Entrypoint
 
 Primary scope:
 - `src/main.rs:1-9`
-- `src/lib.rs:68-160`
-- `src/lib.rs:342-379`
 
 Supporting scope:
-- `README.md:16-67`
+- `src/lib.rs:98-228`
 
 Review focus:
-- Thin binary boundary, `--help`, `--version`, and subcommand dispatch.
-- Error reporting and exit behavior.
-- Terminal title save/restore helpers only as used by startup and teardown.
+- Thin binary wrapper and process exit behavior.
+- Error display boundary.
 
 Keep out:
-- Interactive event loop internals.
-- Setup-status artifact templates.
+- CLI subcommand implementation.
 
-### T02 - Service Traits and Safety Boundary
+### T03 - Public Run Entry and CLI Dispatch
 
 Primary scope:
-- `src/contracts/traits.rs:1-122`
+- `src/lib.rs:98-228`
+- `src/lib.rs:581-610`
+
+Supporting scope:
+- `README.md:15-127`
+
+Review focus:
+- `--help`, `--version`, and subcommand routing.
+- Terminal setup/teardown around the main event loop.
+- Bracketed paste and keyboard enhancement setup.
+- Service construction including `PodmanCli`.
+
+Keep out:
+- Individual subcommand internals.
+- Event loop internals.
+
+### T04 - Setup Status and Notification Subcommands
+
+Primary scope:
+- `src/lib.rs:230-320`
+
+Supporting scope:
+- `src/agents/setup.rs:1-326`
+- `src/config/load.rs:1-131`
+- `src/config/init.rs:1-198`
+
+Review focus:
+- `setup-status` artifact write flow.
+- `setup-notifications` config mutation and first-run config creation.
+- Repo-root discovery and user-facing guidance.
+
+Keep out:
+- Runtime notification edge detection and delivery.
+
+### T05 - Setup Update Subcommand
+
+Primary scope:
+- `src/lib.rs:321-366`
+
+Supporting scope:
+- `src/update.rs:111-253`
+- `src/config/schema.rs:63-78`
+
+Review focus:
+- `update.check` config creation/mutation.
+- Opt-in semantics and user-facing text.
+- Repo-root discovery and missing-config behavior.
+
+Keep out:
+- Actual update check network/cache logic.
+
+### T06 - Image Build CLI Subcommand
+
+Primary scope:
+- `src/lib.rs:368-428`
+
+Supporting scope:
+- `src/runtime/image.rs:158-232`
+- `src/runtime/podman.rs:58-119`
+- `src/config/schema.rs:111-145`
+
+Review focus:
+- `flightdeck image build [agent]` parsing.
+- Config/agent validation.
+- Podman availability check.
+- Image tag resolution and build call.
+
+Keep out:
+- Containerfile generation details.
+
+### T07 - Doctor CLI Subcommand
+
+Primary scope:
+- `src/lib.rs:430-490`
+
+Supporting scope:
+- `src/runtime/podman.rs:18-72`
+- `src/runtime/image.rs:46-52`
+
+Review focus:
+- Reporting behavior for disabled/enabled containers.
+- Podman readiness guidance.
+- Per-agent image readiness checks.
+
+Keep out:
+- Image build implementation.
+
+### T08 - Startup Orchestration
+
+Primary scope:
+- `src/lib.rs:492-580`
+
+Supporting scope:
+- `src/config/init.rs:1-198`
+- `src/fs/ignore.rs:1-237`
+- `src/persistence/recovery.rs:42-144`
+- `src/git/repo.rs:338-351`
+
+Review focus:
+- First-run init sequence.
+- Config load/default fallback.
+- `.gitignore` notice.
+- State load/recovery without relaunch.
+- Dirty-base warning setup.
+
+Keep out:
+- Event loop and app command dispatch.
+
+### T09 - Service Traits and Safety Boundary
+
+Primary scope:
+- `src/contracts/traits.rs:1-199`
 - `src/contracts/error.rs:1-45`
-- `src/contracts/mod.rs`
 
 Supporting scope:
-- `tests/guards.rs:53-98`
-- `README.md:68-86`
-- `specs/SPECS.md:108-138`
+- `tests/guards.rs:53-122`
+- `README.md:129-149`
 
 Review focus:
-- Whether the trait surface preserves the git ownership boundary.
-- Whether user-reachable errors can be represented and surfaced safely.
-- Whether trait contracts are specific enough for fakes and production implementations.
+- Git ownership boundary and sanctioned rebase/pull-base carve-outs.
+- `FileSystem` removal API.
+- `Clock::now_unix_secs` for update checks.
+- `ContainerRuntime` control-plane seam.
+- User-reachable error representation.
 
 Keep out:
-- Concrete Git, FS, and PTY implementations.
+- Concrete implementations.
 
-### T03 - Domain Types: Status, Config, State, Git Values
+### T10 - Domain Types: Status, Config, State, Git, Container
 
 Primary scope:
-- `src/contracts/domain.rs:1-393`
+- `src/contracts/domain.rs:1-569`
 
 Supporting scope:
-- Serialization users in `src/config/load.rs`, `src/persistence/project_state.rs`, and `src/app/state.rs` only as needed.
+- `src/config/schema.rs:1-145`
+- `src/persistence/project_state.rs:1-129`
+- `src/app/state.rs:847-863`
 
 Review focus:
-- Persisted schema shape and serde defaults.
-- Status enum conversion helpers and manual-status labels.
-- Config defaults represented in domain structs.
-- `TabState` fields and relative-path assumptions.
+- Status and manual status models.
+- Update and container config defaults/serde aliases.
+- Persisted `TabState` container fields.
+- `RebaseOutcome` and `ContainerState` value types.
 
 Keep out:
-- Validation rules and business logic.
+- Validation and command behavior.
 
-### T04 - Real Filesystem and Clock Implementations
+### T11 - Real Filesystem and Clock
 
 Primary scope:
-- `src/contracts/real.rs:1-117`
+- `src/contracts/real.rs:1-163`
 
 Supporting scope:
-- `src/contracts/traits.rs:56-71`
-- Unit tests in `src/contracts/real.rs:101-117`
+- `src/contracts/traits.rs:86-160`
+- `src/git/worktree.rs:71-103`
 
 Review focus:
-- `RealFs` behavior against the `FileSystem` trait.
-- Append-only semantics for `append_line`.
-- UTC timestamp formatting and monotonic-ish millis expectation.
+- `RealFs` implementation including recursive removal.
+- Windows retry behavior for directory deletion.
+- ISO timestamp and Unix seconds clock behavior.
 
 Keep out:
 - Fake filesystem behavior.
-- Higher-level init/gitignore logic.
 
-### T05 - Test Fakes: FakeFs
+### T12 - Test Fake: FakeFs
 
 Primary scope:
-- `src/testing/mod.rs:15-145`
+- `src/testing/mod.rs:19-156`
 
 Supporting scope:
-- Unit tests in `src/testing/mod.rs:683-end` relevant to `FakeFs`.
+- Tests in `src/testing/mod.rs:952-1033` relevant to FakeFs.
 
 Review focus:
-- In-memory filesystem correctness for files, dirs, parent marking, reads/writes, appends, and sorted directory listing.
+- In-memory file/dir behavior.
+- Append and removal semantics.
+- Directory listing shape used by recovery.
 
 Keep out:
-- FakeGit and FakePty.
+- Git/container fakes.
 
-### T06 - Test Fakes: FakeGit
+### T13 - Test Fake: FakeGit
 
 Primary scope:
-- `src/testing/mod.rs:147-465`
+- `src/testing/mod.rs:158-549`
 
 Supporting scope:
-- Unit tests in `src/testing/mod.rs:683-end` relevant to `FakeGit`.
-- Git workflow unit tests that use recorded fake calls.
+- `src/git/status.rs:282-594`
+- `src/git/worktree.rs:128-316`
 
 Review focus:
-- Scriptable GitExecutor behavior and recordings.
-- Whether fake semantics are close enough to production for safety-sensitive unit tests.
+- Scripted branches, worktrees, dirty status, upstreams, remotes.
+- Rebase and pull-base recordings/outcomes.
+- Prune/remove error simulation.
 
 Keep out:
 - Production `GitCli`.
 
-### T07 - Test Fakes: FakePty and FakeClock
+### T14 - Test Fake: FakePty
 
 Primary scope:
-- `src/testing/mod.rs:466-682`
+- `src/testing/mod.rs:550-719`
 
 Supporting scope:
-- Unit tests in terminal/session and app/state that depend on queued sessions or clock advancement.
+- `src/terminal/session.rs:495-859`
+- `src/lib.rs:2577-2600`
 
 Review focus:
-- Fake PTY spawn queue, output/input recording, process state transitions, termination behavior.
-- Deterministic clock behavior for status and notification tests.
+- Spawn queue and failure behavior.
+- Output/input recording.
+- Process state, Ctrl-C, termination behavior.
 
 Keep out:
-- Production portable-pty implementation.
+- Production portable-pty.
 
-### T08 - Default Config Schema and Validation
+### T15 - Test Fake: FakeContainerRuntime
 
 Primary scope:
-- `src/config/schema.rs:1-191`
-- Config-related domain types in `src/contracts/domain.rs:161-311`
+- `src/testing/mod.rs:720-888`
 
 Supporting scope:
-- `specs/SPECS.md:209-260` if needed.
+- `src/app/state.rs:3347-3599`
+- `src/runtime/image.rs:319-367`
 
 Review focus:
-- Default agent definitions and status patterns.
-- Validation of required agents/default command fields.
-- Notification config defaults.
+- Image existence/labels/build recording.
+- Container state and start/remove recording.
+- Label discovery and host UID behavior.
+
+Keep out:
+- Production Podman implementation.
+
+### T16 - Test Fake: FakeClock
+
+Primary scope:
+- `src/testing/mod.rs:890-950`
+
+Supporting scope:
+- `src/update.rs:169-190`
+- Notification tests in `src/app/state.rs` that use `now_millis`.
+
+Review focus:
+- Fixed ISO time.
+- Millis and Unix seconds controls.
+- Suitability for idle/notification/update tests.
+
+Keep out:
+- Real clock formatting.
+
+### T17 - Default Config and Container Validation
+
+Primary scope:
+- `src/config/schema.rs:1-278`
+- Config domain types in `src/contracts/domain.rs:161-450`
+
+Supporting scope:
+- `containers/README.md`
+- `specs/CONTAINER_SUPPORT_PLAN.md`
+
+Review focus:
+- Default agents and status patterns.
+- `update` and `containers` defaults.
+- Container runtime, Containerfile/customization, and port validation.
+- Disabled-container tolerance.
 
 Keep out:
 - TOML parsing and file IO.
 
-### T09 - Config Load, Parse, Serialize
+### T18 - Config Load, Parse, Serialize
 
 Primary scope:
 - `src/config/load.rs:1-131`
 
 Supporting scope:
-- `src/config/schema.rs:79-105`
+- `src/config/schema.rs:81-145`
 
 Review focus:
 - TOML parse/serialize round trip.
-- Agent key population from map keys.
+- Agent key population.
 - Validation call after parse.
 - Error mapping.
 
 Keep out:
-- First-run file creation.
+- First-run init.
 
-### T10 - First-Run Initialization Artifacts
+### T19 - First-Run Initialization
 
 Primary scope:
-- `src/config/init.rs:1-182`
-- `src/persistence/project_state.rs:6-14`
+- `src/config/init.rs:1-198`
+- `src/persistence/project_state.rs:6-15`
 
 Supporting scope:
 - `tests/integration/init.rs:59-172`
@@ -190,831 +359,1211 @@ Supporting scope:
 Review focus:
 - Creation of `.flightdeck/`, `config.toml`, `state.json`, `worktrees/`.
 - Idempotence and non-overwrite behavior.
-- State-file shape on first run.
+- Default state/config shape.
 
 Keep out:
-- `.gitignore` mutation.
-- Startup orchestration in `src/lib.rs`.
+- Gitignore mutation.
 
-### T11 - Gitignore Updater
+### T20 - Gitignore Updater
 
 Primary scope:
 - `src/fs/ignore.rs:1-237`
 
 Supporting scope:
 - `tests/integration/init.rs:104-155`
-- `src/agents/setup.rs:48-67` only for the status-entry caller.
+- `src/agents/setup.rs:48-67`
 
 Review focus:
 - Append-only behavior.
 - Missing-file behavior.
-- Duplicate prevention with trimmed matching.
+- Duplicate prevention.
 - Core entries versus opt-in status entry.
 
 Keep out:
-- First-run init and setup-status template contents.
+- Init and setup-status template contents.
 
-### T12 - Path Helpers and State Path Assumptions
+### T21 - Path Helpers
 
 Primary scope:
-- `src/fs/paths.rs:1-136`
+- `src/fs/paths.rs:1-144`
 
 Supporting scope:
-- `src/app/state.rs` calls to `to_relative`, `to_absolute`, and `worktree_path` only.
+- `src/app/state.rs:819-844`
+- `src/persistence/recovery.rs:42-144`
 
 Review focus:
 - Relative path storage invariants.
-- Outside-root handling.
+- Absolute path resolution.
 - Worktree path construction.
 
 Keep out:
-- Recovery scan logic.
+- Recovery policy.
 
-### T13 - Startup Orchestration Before TUI Launch
-
-Primary scope:
-- `src/lib.rs:263-340`
-
-Supporting scope:
-- `src/config/init.rs`
-- `src/config/load.rs`
-- `src/fs/ignore.rs`
-- `src/persistence/recovery.rs:42-140`
-
-Review focus:
-- Base-branch detection flow.
-- First-run init order.
-- Config fallback behavior.
-- Gitignore notice.
-- Recovery invocation and dirty-base warning.
-
-Keep out:
-- Interactive event loop.
-- `AppState` command handling.
-
-### T14 - Production GitCli Command Wrapper
+### T22 - State File Load and Save
 
 Primary scope:
-- `src/git/repo.rs:1-230`
+- `src/persistence/project_state.rs:1-129`
 
 Supporting scope:
-- `src/contracts/traits.rs:13-54`
-- `tests/guards.rs:53-98`
-
-Review focus:
-- Concrete git commands and cwd/root selection.
-- Error handling for non-zero status.
-- Dirty/status/upstream/remote handling.
-- Merge command result mapping.
-- Absence of prohibited git operations.
-
-Keep out:
-- Pure branch/worktree/remote planning helpers.
-
-### T15 - Worktree List Parsing and Base Branch Detection
-
-Primary scope:
-- `src/git/repo.rs:231-354`
-
-Supporting scope:
-- `src/git/worktree.rs:19-35`
-
-Review focus:
-- `git worktree list --porcelain` parser.
-- Detached worktree handling.
-- Configured-base fallback rules.
-
-Keep out:
-- Worktree creation/removal commands.
-
-### T16 - Branch Naming and Create-vs-Attach Decision
-
-Primary scope:
-- `src/git/branch.rs:1-150`
-
-Supporting scope:
-- `src/app/state.rs:689-701`
-- `tests/integration/worktree.rs:58-134`
-
-Review focus:
-- Slug generation edge cases.
-- Prefix enforcement.
-- Branch existence decision and user-surfaced attach semantics.
-
-Keep out:
-- Worktree materialization.
-
-### T17 - Worktree Planning, Creation, and Safe Removal
-
-Primary scope:
-- `src/git/worktree.rs:1-205`
-
-Supporting scope:
-- `src/app/state.rs:703-721`, `src/app/state.rs:975-1028`
-- `tests/integration/worktree.rs:58-184`
-
-Review focus:
-- Managed-root detection.
-- Refusal when branch is checked out elsewhere.
-- Branch creation order versus worktree add.
-- Dirty worktree removal refusal and forced removal boundary.
-
-Keep out:
-- App-level prompt/confirmation UI.
-
-### T18 - Git Status Collection and Change Counting
-
-Primary scope:
-- `src/git/status.rs:1-113`
-
-Supporting scope:
-- `src/tui/render.rs:770-878`
-- Background refresh path in `src/lib.rs:688-741`
-
-Review focus:
-- Porcelain parsing and change categorization.
-- Ahead/behind and upstream behavior.
-- Base drift calculation.
-- Status object fields consumed by UI.
-
-Keep out:
-- Merge preconditions.
-
-### T19 - Merge Preconditions and Merge-Back Helper
-
-Primary scope:
-- `src/git/status.rs:115-203`
-
-Supporting scope:
-- `src/app/state.rs:918-996`
-- `tests/integration/merge_preconditions.rs:76-265`
-
-Review focus:
-- Dirty-base and dirty-agent refusal paths.
-- Branch existence checks.
-- Re-check-before-merge behavior.
-- Conflict reporting without auto-resolution.
-
-Keep out:
-- Prompt confirmation UI.
-
-### T20 - Remote Parsing, Push Planning, and PR URLs
-
-Primary scope:
-- `src/git/remote.rs:1-193`
-
-Supporting scope:
-- `src/app/state.rs:889-916`
-- `tests/integration/push.rs:69-185`
-
-Review focus:
-- GitHub remote URL parsing.
-- Dirty worktree push warnings.
-- Push delegation and PR compare URL generation.
-
-Keep out:
-- Network or GitHub API behavior; app only prints compare URLs.
-
-### T21 - Agent Registry
-
-Primary scope:
-- `src/agents/registry.rs:1-158`
-
-Supporting scope:
-- `src/config/schema.rs:11-77`
-- `src/lib.rs:1196-1218` for agent picker usage.
-
-Review focus:
-- Config-to-registry cloning/key population.
-- Default-agent lookup.
-- Stable ordering for UI selection.
-
-Keep out:
-- Agent command validation and status classification.
-
-### T22 - Agent Command Validation and LaunchSpec
-
-Primary scope:
-- `src/agents/adapter.rs:1-225`
-
-Supporting scope:
-- `src/app/state.rs:676-688`, `src/app/state.rs:794-803`, `src/app/state.rs:1128-1162`
-
-Review focus:
-- Command lookup rules for PATH and direct paths.
-- Validation before git mutation.
-- No initial prompt included in launched agent args.
-
-Keep out:
-- PTY spawn implementation.
-
-### T23 - Agent Output Status Classification
-
-Primary scope:
-- `src/agents/status.rs:1-350`
-
-Supporting scope:
-- `src/app/state.rs:450-548`
-- Status domain types in `src/contracts/domain.rs:15-159`
-
-Review focus:
-- Pattern precedence.
-- Activity-based working/idle heuristic.
-- Sticky signals and manual override combination.
-
-Keep out:
-- OS notification delivery.
-- Status integration templates.
-
-### T24 - Optional Status Integration Artifact Generation
-
-Primary scope:
-- `src/agents/setup.rs:1-326`
-
-Supporting scope:
-- CLI subcommand in `src/lib.rs:162-199`
-- `src/fs/ignore.rs:13-33`
-
-Review focus:
-- Files written by `setup-status`.
-- Idempotence.
-- Hook/plugin keyword compatibility with `status_keyword_to_interpreted`.
-- Safety of generated shell/JS snippets.
-
-Keep out:
-- Runtime polling of status files.
-
-### T25 - OS Notification Delivery
-
-Primary scope:
-- `src/notify/mod.rs:1-127`
-
-Supporting scope:
-- Notification domain/config in `src/contracts/domain.rs:111-127`, `src/contracts/domain.rs:261-294`
-- Setup-notifications CLI in `src/lib.rs:201-260`
-
-Review focus:
-- Non-blocking best-effort delivery.
-- macOS command construction and AppleScript escaping.
-- Non-macOS no-op behavior.
-
-Keep out:
-- Notification edge detection in `AppState`.
-
-### T26 - Notification Edge Detection and Status File Polling
-
-Primary scope:
-- `src/app/state.rs:210-303`
-- `src/app/state.rs:475-548`
-
-Supporting scope:
-- `src/agents/status.rs:38-76`
-- `src/notify/mod.rs` only as delivery target.
-
-Review focus:
-- Status-file keyword mapping and unchanged-content behavior.
-- Startup grace window.
-- Armed-edge notification logic and category toggles.
-
-Keep out:
-- Platform notifier implementation.
-
-### T27 - State File Load and Save
-
-Primary scope:
-- `src/persistence/project_state.rs:1-127`
-
-Supporting scope:
-- `src/app/state.rs:560-590`, `src/lib.rs:1757-1762`
+- `src/app/state.rs:667-697`
+- `src/lib.rs:2306-2311`
 
 Review focus:
 - JSON load/save error mapping.
 - Default state shape.
-- Persistence call expectations.
+- Container fields in persisted tab state.
 
 Keep out:
 - Recovery reconstruction.
 
-### T28 - Recovery Scan and Stale Entries
+### T23 - Recovery Scan and Stale Entries
 
 Primary scope:
-- `src/persistence/recovery.rs:1-374`
+- `src/persistence/recovery.rs:1-378`
 
 Supporting scope:
-- `tests/integration/recovery.rs:56-136`
-- Startup call in `src/lib.rs:298-310`
+- `tests/integration/recovery.rs:56-138`
+- Startup call in `src/lib.rs:537-549`
 
 Review focus:
-- Stored-tab validation against FS and git worktree list.
+- Stored-tab validation against FS and git worktrees.
 - On-disk worktree reconstruction.
 - Stale-entry reporting without deletion.
+- Container field defaults on recovered tabs.
 - No auto-relaunch behavior.
 
 Keep out:
 - `AppState::resume_agents`.
 
-### T29 - AppState Construction, Modes, Selection Helpers, Persistence
+### T24 - Production GitCli: Basic Commands
+
+Primary scope:
+- `src/git/repo.rs:1-218`
+
+Supporting scope:
+- `src/contracts/traits.rs:15-66`
+- `tests/guards.rs:53-122`
+
+Review focus:
+- Git command construction and cwd/root selection.
+- Dirty/status/branch/worktree/upstream/remote behavior.
+- Worktree prune.
+- Error mapping.
+
+Keep out:
+- Merge/rebase/pull-base behavior.
+
+### T25 - Production GitCli: Merge, Rebase, Pull Base
+
+Primary scope:
+- `src/git/repo.rs:219-289`
+
+Supporting scope:
+- `src/contracts/traits.rs:63-84`
+- `tests/guards.rs:53-122`
+- `src/git/status.rs:115-280`
+
+Review focus:
+- `merge --no-ff` result/conflict mapping.
+- `rebase` and `pull --rebase` sanctioned carve-outs.
+- Abort-on-failure behavior.
+- No auto conflict resolution.
+
+Keep out:
+- App confirmation prompts.
+
+### T26 - Worktree List Parsing and Base Branch Detection
+
+Primary scope:
+- `src/git/repo.rs:291-414`
+
+Supporting scope:
+- `src/git/worktree.rs:17-41`
+- `tests/integration/util.rs:1-31`
+
+Review focus:
+- `git worktree list --porcelain` parsing.
+- Detached worktree handling.
+- Configured-base fallback rules.
+- Canonical path considerations in tests.
+
+Keep out:
+- Worktree creation/removal commands.
+
+### T27 - Branch Naming and Attach Decision
+
+Primary scope:
+- `src/git/branch.rs:1-150`
+
+Supporting scope:
+- `src/app/state.rs:804-816`
+- `tests/integration/worktree.rs:58-134`
+
+Review focus:
+- Slug generation.
+- Prefix enforcement.
+- Create-vs-attach branch decision.
+- Rename must not rename branch.
+
+Keep out:
+- Worktree materialization.
+
+### T28 - Worktree Planning and Creation
+
+Primary scope:
+- `src/git/worktree.rs:1-58`
+
+Supporting scope:
+- `src/app/state.rs:818-886`
+- `tests/integration/worktree.rs:58-184`
+
+Review focus:
+- Managed-root detection.
+- Refusal when branch checked out elsewhere.
+- Branch creation before worktree add.
+
+Keep out:
+- Removal/orphan cleanup.
+
+### T29 - Worktree Removal and Orphan Cleanup
+
+Primary scope:
+- `src/git/worktree.rs:60-316`
+
+Supporting scope:
+- `src/contracts/real.rs:56-94`
+- `src/app/state.rs:1223-1262`
+
+Review focus:
+- Dirty refusal without force.
+- Forced removal boundary.
+- Unregistered/orphan worktree fallback.
+- Windows lock-error fallback and pruning.
+
+Keep out:
+- App prompt confirmation flow.
+
+### T30 - Git Status Collection and Change Counting
+
+Primary scope:
+- `src/git/status.rs:1-113`
+
+Supporting scope:
+- `src/tui/render.rs:795-907`
+- Background refresh in `src/lib.rs:972-1025`
+
+Review focus:
+- Porcelain parsing and change categorization.
+- Ahead/behind and upstream behavior.
+- Base drift calculation.
+- Status fields consumed by UI.
+
+Keep out:
+- Merge/rebase preconditions.
+
+### T31 - Merge Preconditions and Merge-Back Helper
+
+Primary scope:
+- `src/git/status.rs:115-203`
+
+Supporting scope:
+- `src/app/state.rs:1045-1124`
+- `tests/integration/merge_preconditions.rs:76-265`
+
+Review focus:
+- Dirty-base and dirty-agent refusal.
+- Branch existence checks.
+- Re-check-before-merge.
+- Conflict reporting without auto-resolution.
+
+Keep out:
+- UI confirmation prompt.
+
+### T32 - Worktree Rebase Preconditions and Helper
+
+Primary scope:
+- `src/git/status.rs:205-280`
+
+Supporting scope:
+- `src/app/state.rs:1126-1183`
+- `src/git/repo.rs:241-264`
+
+Review focus:
+- Clean-agent-worktree requirement.
+- Branch existence checks.
+- Re-check-before-rebase.
+- Aborted-conflict messaging.
+
+Keep out:
+- Pull-base behavior.
+
+### T33 - Remote Parsing, Push Planning, and PR URLs
+
+Primary scope:
+- `src/git/remote.rs:1-193`
+
+Supporting scope:
+- `src/app/state.rs:1016-1043`
+- `tests/integration/push.rs:69-185`
+
+Review focus:
+- GitHub remote URL parsing.
+- Dirty worktree push warning.
+- Push delegation.
+- Compare URL generation.
+
+Keep out:
+- GitHub API/PR creation.
+
+### T34 - Agent Registry
+
+Primary scope:
+- `src/agents/registry.rs:1-158`
+
+Supporting scope:
+- `src/config/schema.rs:9-79`
+- `src/lib.rs:1654-1676`
+
+Review focus:
+- Config-to-registry conversion.
+- Default-agent lookup.
+- Stable ordering for agent picker.
+
+Keep out:
+- Command validation and status classification.
+
+### T35 - Agent Command Validation and LaunchSpec
+
+Primary scope:
+- `src/agents/adapter.rs:1-276`
+
+Supporting scope:
+- `src/app/state.rs:186-200`
+- `src/app/state.rs:1394-1454`
+
+Review focus:
+- Command lookup rules for PATH/direct paths across platforms.
+- Validation before git mutation.
+- Local launch spec construction.
+- No initial prompt injection.
+
+Keep out:
+- Container launch argv.
+
+### T36 - Agent Output Status Classification
+
+Primary scope:
+- `src/agents/status.rs:1-350`
+
+Supporting scope:
+- `src/app/state.rs:282-308`
+- `src/app/state.rs:557-656`
+
+Review focus:
+- Pattern precedence.
+- Activity-based working/idle heuristic.
+- Sticky signals.
+- Manual status display combination.
+
+Keep out:
+- OS notification delivery.
+
+### T37 - Optional Status Integration Artifacts
+
+Primary scope:
+- `src/agents/setup.rs:1-326`
+
+Supporting scope:
+- `src/lib.rs:230-260`
+- `src/fs/ignore.rs:13-33`
+
+Review focus:
+- Generated Claude/Codex/OpenCode artifacts.
+- Idempotence and gitignore entry.
+- Keyword compatibility with runtime poller.
+- Safety of generated shell/JS snippets.
+
+Keep out:
+- Runtime polling logic.
+
+### T38 - OS Notification Delivery
+
+Primary scope:
+- `src/notify/mod.rs:1-154`
+
+Supporting scope:
+- `src/contracts/domain.rs:111-127`
+- `src/app/state.rs:340-404`, `src/app/state.rs:618-656`
+
+Review focus:
+- macOS terminal-notifier/osascript fallback.
+- Linux `notify-send` delivery.
+- Non-blocking best-effort behavior.
+- AppleScript escaping.
+
+Keep out:
+- Notification edge detection.
+
+### T39 - AppState Construction, Modes, Selection, Persistence
 
 Primary scope:
 - `src/app/modes.rs:1-11`
-- `src/app/state.rs:305-448`
-- `src/app/state.rs:551-599`
-- `src/app/state.rs:1221-1237`
+- `src/app/state.rs:406-552`
+- `src/app/state.rs:658-705`
+- `src/app/state.rs:1665-1680`
 
 Supporting scope:
-- AppState unit tests in `src/app/state.rs:1240-end` relevant to construction, mode, selection, persistence.
+- Unit tests in `src/app/state.rs:1683-end` relevant to construction, mode, persistence, and selection.
 
 Review focus:
-- Initial selection and recovered-tab runtime setup.
-- Mode transitions and split-view flag.
-- Selected-tab helper behavior.
+- Initial runtime state.
+- Mode and split-view flags.
+- Update notice field.
 - Runtime-to-persisted state conversion.
-- Selection clamping after tab removal.
+- Selection clamping after removal.
 
 Keep out:
-- Individual command handlers.
+- Individual commands.
 
-### T30 - Command and Effect Type Surface
+### T40 - Status File Polling and Notification Edge Detection
 
 Primary scope:
-- `src/app/commands.rs:1-230`
+- `src/app/state.rs:311-404`
+- `src/app/state.rs:557-656`
 
 Supporting scope:
-- `src/tui/palette.rs:23-109`
-- Dispatch match in `src/app/state.rs:604-640`
+- `src/agents/status.rs:48-76`
+- `src/notify/mod.rs`
 
 Review focus:
-- Whether command payloads and effects match product workflows.
-- Safety-related effect separation for warnings/refusals/confirmations.
+- Status file keyword mapping.
+- Unchanged-content handling.
+- Startup grace window.
+- Armed edge detection and category toggles.
+
+Keep out:
+- Platform notification backend.
+
+### T41 - Command and Effect Type Surface
+
+Primary scope:
+- `src/app/commands.rs:1-264`
+
+Supporting scope:
+- `src/tui/palette.rs:41-147`
+- Dispatch match in `src/app/state.rs:711-750`
+
+Review focus:
+- Command payloads for push, merge, rebase, pull base, copy env, abandon.
+- Confirmation effects and safety separation.
 - Close action defaults.
 
 Keep out:
-- Concrete command implementations.
+- Concrete command implementation.
 
-### T31 - New Agent Tab: App Core Flow
+### T42 - New Agent Tab: Planning and Placeholder
 
 Primary scope:
-- `src/app/state.rs:642-827`
+- `src/app/state.rs:752-886`
 
 Supporting scope:
-- `src/git/branch.rs`, `src/git/worktree.rs`, `src/agents/adapter.rs` only through direct calls.
-- Unit tests in `src/app/state.rs` related to new-tab creation.
+- `src/git/branch.rs`
+- `src/git/worktree.rs:1-58`
+- `src/agents/adapter.rs`
 
 Review focus:
-- Validation-before-git-mutation ordering.
-- Slug/branch/worktree path derivation.
+- Validation-before-git-mutation.
+- Slug/branch/worktree derivation.
 - Placeholder `Creating` tab behavior.
-- Finalize/fail cleanup and persistence.
+- Container-mode validation difference.
 
 Keep out:
-- Event-loop background worker mechanics.
+- Primary spawn/container launch finalization.
 
-### T32 - New Agent Tab: Event Loop Background Worker
+### T43 - New Agent Tab: Finalize and Failure Cleanup
 
 Primary scope:
-- `src/lib.rs:507-514`
-- `src/lib.rs:605-685`
-- `src/lib.rs:1196-1218`
-- `src/lib.rs:1349-1362`
+- `src/app/state.rs:888-953`
+- `src/app/state.rs:1394-1454`
 
 Supporting scope:
-- `src/app/state.rs:664-827`
+- Worker outcome path in `src/lib.rs:919-970`
 
 Review focus:
-- Async creation handoff from prompt to `pending_jobs`.
-- Worker thread, lock, outcome channel, finalize/fail behavior.
-- UI responsiveness while worktree creation runs.
+- Finalize primary spawn and transition to `Ready`.
+- Container start-before-attach behavior.
+- Persisted container metadata.
+- Placeholder cleanup on materialize/spawn failure.
 
 Keep out:
-- Branch/worktree planning helper correctness.
+- ContainerSpec assembly details.
 
-### T33 - App Core: Rename, Switch, Manual Status
+### T44 - App Core: Rename, Switch, Manual Status
 
 Primary scope:
-- `src/app/state.rs:829-838`
-- `src/app/state.rs:1058-1126`
+- `src/app/state.rs:955-964`
+- `src/app/state.rs:1324-1392`
 
 Supporting scope:
-- `src/app/commands.rs:100-104`, `src/app/commands.rs:135-140`
-- Input/palette mapping only for corresponding commands.
+- `src/app/commands.rs:100-111`, `src/app/commands.rs:150-155`
+- Relevant input/palette mappings.
 
 Review focus:
-- Rename should not mutate branch/slug/worktree metadata.
+- Rename only affects display name.
 - Agent tab and child terminal selector behavior.
-- Manual status persistence and display interaction.
+- Manual status persistence.
 
 Keep out:
-- Prompt UI for collecting rename/status input.
+- Prompt UI.
 
-### T34 - App Core: Close Tab and Process Handling
+### T45 - App Core: Close Tab and Container Teardown
 
 Primary scope:
-- `src/app/state.rs:840-887`
+- `src/app/state.rs:966-1014`
+- `src/app/state.rs:1543-1552`
 - `src/app/commands.rs:26-78`
-- `src/terminal/session.rs:362-405`
 
 Supporting scope:
-- Prompt handling in `src/lib.rs:1403-1419`
+- `src/terminal/session.rs:420-463`
+- Prompt handling in `src/lib.rs:1888-1904`
 
 Review focus:
 - No auto-escalation to force terminate.
-- Ctrl-C primary/all behavior.
-- If-all-stopped refusal.
+- Ctrl-C primary/all and if-stopped behavior.
+- Container removal on close.
 - Runtime tab removal and persistence.
 
 Keep out:
-- Abandon worktree removal semantics.
+- Abandon worktree removal.
 
-### T35 - App Core: Push Branch Command
+### T46 - App Core: Push Branch
 
 Primary scope:
-- `src/app/state.rs:889-916`
-- `src/app/commands.rs:80-87`, `src/app/commands.rs:112-117`, `src/app/commands.rs:175-177`
+- `src/app/state.rs:1016-1043`
+- `src/app/commands.rs:80-87`, `src/app/commands.rs:112-117`, `src/app/commands.rs:190-192`
 
 Supporting scope:
 - `src/git/remote.rs:39-83`
-- Prompt handling in `src/lib.rs:1420-1438`
+- Prompt handling in `src/lib.rs:1905-1923`
 
 Review focus:
-- Dirty worktree warning and confirm/cancel flow.
-- Remote selection from config.
-- Compare URL effect versus generic success message.
+- Dirty warning and confirm/cancel flow.
+- Remote selection.
+- PR URL versus success message.
 
 Keep out:
 - Remote parser internals beyond returned values.
 
-### T36 - App Core: Finish / Local Merge Command
+### T47 - App Core: Finish / Local Merge
 
 Primary scope:
-- `src/app/state.rs:918-996`
-- `src/app/commands.rs:118-122`, `src/app/commands.rs:181-192`
+- `src/app/state.rs:1045-1124`
+- `src/app/commands.rs:118-122`, `src/app/commands.rs:200-211`
 
 Supporting scope:
 - `src/git/status.rs:115-203`
-- Prompt handling in `src/lib.rs:1447-1454`
+- Prompt handling in `src/lib.rs:1932-1939`
 
 Review focus:
-- Dirty-base warning persistence.
-- Technical precondition check and explicit user confirmation.
-- Session termination and worktree removal after successful merge.
-- Cleanup failure behavior after merge already landed.
+- Dirty-base warning.
+- Explicit confirmation.
+- Session/container teardown and worktree removal after merge.
+- Cleanup failure after merge landed.
 
 Keep out:
-- Git merge helper internals except as direct dependency.
+- Git merge helper internals except direct dependency.
 
-### T37 - App Core: Abandon Worktree Command
+### T48 - App Core: Rebase Worktree
 
 Primary scope:
-- `src/app/state.rs:998-1029`
-- `src/app/commands.rs:123-130`, `src/app/commands.rs:178-180`
+- `src/app/state.rs:1126-1183`
+- `src/app/commands.rs:123-130`, `src/app/commands.rs:212-226`
 
 Supporting scope:
-- `src/git/worktree.rs:60-78`
-- Prompt handling in `src/lib.rs:1439-1446`
+- `src/git/status.rs:205-280`
+- Prompt handling in `src/lib.rs:1940-1947`
+- User prompt text in `src/lib.rs:1734-1753`
 
 Review focus:
-- Dirty worktree confirmation boundary.
+- Rebase preconditions and explicit history-rewrite confirmation.
+- Base-drift prompt context.
+- Stored base SHA advance on success.
+- Force-push warning message.
+
+Keep out:
+- Production Git rebase implementation.
+
+### T49 - App Core: Pull Base
+
+Primary scope:
+- `src/app/state.rs:1185-1221`
+- `src/app/commands.rs:131-135`
+
+Supporting scope:
+- `src/git/repo.rs:266-288`
+- `src/tui/input.rs:128-136`
+
+Review focus:
+- Base branch checked out in repo root.
+- Dirty-base refusal.
+- `git pull --rebase` outcome handling.
+- Global command behavior independent of selected tab.
+
+Keep out:
+- Agent worktree rebase.
+
+### T50 - App Core: Abandon Worktree
+
+Primary scope:
+- `src/app/state.rs:1223-1262`
+- `src/app/commands.rs:138-145`, `src/app/commands.rs:193-199`
+
+Supporting scope:
+- `src/git/worktree.rs:60-126`
+- Prompt handling in `src/lib.rs:1924-1931`
+
+Review focus:
+- Always-confirm behavior, dirty flag in prompt.
+- Session/container teardown before removal.
 - Forced removal only after confirmation.
-- Session teardown and state persistence.
+- State persistence and selection fixup.
 
 Keep out:
-- Close-tab process handling without worktree removal.
+- Worktree orphan cleanup internals.
 
-### T38 - App Core: Child Terminals, Restart, Resume, Status Command
+### T51 - App Core: Copy Env File
 
 Primary scope:
-- `src/app/state.rs:1031-1056`
-- `src/app/state.rs:1128-1219`
-- `src/terminal/shell.rs:1-32`
+- `src/app/state.rs:1264-1284`
+- `src/app/commands.rs:136-137`
 
 Supporting scope:
-- `src/terminal/session.rs:246-360`
+- `src/tui/palette.rs:68-72`
 
 Review focus:
-- Child shell spawn in selected worktree.
-- Child close selection behavior as used by app core.
-- Primary restart validation/spawn.
-- Resume-agents best-effort behavior.
-- Show git status effect.
+- `.env.local` preference over `.env`.
+- Base-to-worktree copy behavior.
+- Missing-file refusal.
 
 Keep out:
-- Session internals and PTY implementation.
+- General filesystem abstraction.
 
-### T39 - Production PTY Backend
+### T52 - App Core: Child Terminals, Restart, Resume, Status
 
 Primary scope:
-- `src/terminal/pty.rs:1-211`
+- `src/app/state.rs:1286-1322`
+- `src/app/state.rs:1554-1663`
 
 Supporting scope:
-- `src/contracts/traits.rs:73-99`
+- `src/terminal/session.rs:260-463`
+- `src/runtime/container.rs:97-114`
 
 Review focus:
-- `portable-pty` spawn setup, cwd, args, size mapping.
-- Reader thread and non-blocking output buffer.
-- Input write, resize, process_state, Ctrl-C, terminate behavior.
+- Child shell local versus `podman exec` behavior.
+- Child close selection behavior.
+- Restart fresh versus resume attach.
+- Resume best-effort behavior.
+- Git status effect.
 
 Keep out:
-- Higher-level session tab model.
+- ContainerSpec assembly.
 
-### T40 - Terminal Session Model: Primary and Children
+### T53 - Container Spawn Spec Assembly in AppState
 
 Primary scope:
-- `src/terminal/session.rs:212-406`
+- `src/app/state.rs:114-200`
+- `src/app/state.rs:1394-1552`
 
 Supporting scope:
-- Unit tests in `src/terminal/session.rs:408-612`
-- App core callers in `src/app/state.rs:1031-1056`, `src/app/state.rs:1128-1162`
+- `src/runtime/container.rs:16-152`
+- `src/runtime/name.rs:1-88`
+- `src/runtime/image.rs:46-52`, `src/runtime/image.rs:226-232`
 
 Review focus:
-- Primary versus child ownership.
-- Selection/focus of active terminal.
+- Local versus container launch decision.
+- Reattach to running containers.
+- Missing-image refusal.
+- Default auth mounts/env and `HOME` behavior.
+- Platform mount flags and host UID.
+- Container teardown.
+
+Keep out:
+- Pure argv builders and guardrails.
+
+### T54 - Runtime Value Types and Naming
+
+Primary scope:
+- `src/runtime/mod.rs:1-28`
+- `src/runtime/spec.rs:1-53`
+- `src/runtime/name.rs:1-88`
+
+Supporting scope:
+- `src/app/state.rs:1394-1552`
+
+Review focus:
+- ContainerSpec fields.
+- Auth mount representation.
+- Container name sanitization.
+- Repo hash and standard labels.
+
+Keep out:
+- Podman argv construction.
+
+### T55 - Podman Run/Attach/Exec Arg Builders
+
+Primary scope:
+- `src/runtime/container.rs:1-310`
+
+Supporting scope:
+- `src/runtime/spec.rs:21-53`
+- `src/app/state.rs:1394-1552`
+
+Review focus:
+- Detached run and attach model.
+- Workspace bind mount at `/workspace`.
+- Security posture args and resource limits.
+- Loopback-only ports.
+- Env and auth mounts as discrete argv elements.
+- Image then agent command tail.
+
+Keep out:
+- Guardrail enforcement logic.
+
+### T56 - Container Security Guardrails
+
+Primary scope:
+- `src/runtime/guards.rs:1-191`
+
+Supporting scope:
+- `src/runtime/container.rs:16-95`
+- `src/app/state.rs:1443-1447`
+
+Review focus:
+- Rejection of privileged/env-host/runtime socket/home mounts.
+- Loopback-only publish rule.
+- `--flag value` and `--flag=value` parsing.
+- Home mount canonicalization.
+
+Keep out:
+- Config validation.
+
+### T57 - Container Image Tagging and Containerfile Generation
+
+Primary scope:
+- `src/runtime/image.rs:1-157`
+
+Supporting scope:
+- `src/config/schema.rs:111-145`
+- `containers/README.md`
+
+Review focus:
+- Default trusted base image.
+- Built-in install recipes.
+- Project/base image tag shapes.
+- Customization hash inputs.
+- Generated Containerfile modes.
+
+Keep out:
+- Build-if-needed control flow.
+
+### T58 - Container Image Ensure/Build Flow
+
+Primary scope:
+- `src/runtime/image.rs:158-424`
+
+Supporting scope:
+- CLI caller in `src/lib.rs:368-428`
+- `src/contracts/traits.rs:162-199`
+
+Review focus:
+- Explicit image bypass.
+- Generated/explicit Containerfile handling.
+- Setup script body hashing.
+- Build label staleness check.
+- Missing image error text.
+
+Keep out:
+- Podman production shell-out.
+
+### T59 - Production Podman Runtime
+
+Primary scope:
+- `src/runtime/podman.rs:1-209`
+
+Supporting scope:
+- `src/contracts/traits.rs:162-199`
+- `src/lib.rs:430-490`
+
+Review focus:
+- `podman` availability and install guidance.
+- Image inspect/build behavior.
+- Detached start, state inspect, remove, label list.
+- Host UID lookup.
+- Error handling for missing binary versus not-ready runtime.
+
+Keep out:
+- Pure arg builders and guardrails.
+
+### T60 - Self-Update Command
+
+Primary scope:
+- `src/update.rs:1-109`
+
+Supporting scope:
+- `Cargo.toml:21-57`
+- Fallback module in `src/lib.rs:22-48`
+
+Review focus:
+- Install receipt eligibility check.
+- Package-manager deferral guidance.
+- `run_sync` result handling.
+- No-op behavior for unsupported builds.
+
+Keep out:
+- Background update notice.
+
+### T61 - Background Update Notice
+
+Primary scope:
+- `src/update.rs:111-358`
+
+Supporting scope:
+- `src/lib.rs:777-787`, `src/lib.rs:811-814`
+- `src/tui/render.rs:913-988`
+- `src/contracts/domain.rs:296-308`
+
+Review focus:
+- Once-a-day cache logic.
+- Cache path selection.
+- Background thread/network best effort.
+- Cached immediate notice.
+- Status bar hint behavior.
+
+Keep out:
+- Self-replacing update flow.
+
+### T62 - Production PTY: Command Resolution and Spawn
+
+Primary scope:
+- `src/terminal/pty.rs:1-202`
+
+Supporting scope:
+- `src/contracts/traits.rs:106-132`
+
+Review focus:
+- Windows `.cmd`/`.bat` resolution through `cmd.exe /d /c`.
+- Portable-pty open/spawn/cwd/args/size.
+- Reader thread and output buffer.
+
+Keep out:
+- Session-level terminal parser.
+
+### T63 - Production PTY: Process State and Termination
+
+Primary scope:
+- `src/terminal/pty.rs:204-388`
+
+Supporting scope:
+- `src/git/worktree.rs:112-126`
+- `src/contracts/real.rs:61-94`
+
+Review focus:
+- Input/write/resize/read behavior.
+- Process state polling.
+- Windows `taskkill /T /F` tree termination.
+- Wait-after-kill behavior for worktree removal reliability.
+
+Keep out:
+- Key mapping and app command close flow.
+
+### T64 - Terminal Parser, Mouse, Selection, Bracketed Paste, CPR Replies
+
+Primary scope:
+- `src/terminal/session.rs:1-249`
+
+Supporting scope:
+- `src/tui/selection.rs:1-215`
+- `src/lib.rs:2105-2221`
+- Render selection in `src/tui/render.rs:605-683`
+
+Review focus:
+- VT100 parser lifecycle.
+- Cursor-position report response (`ESC[6n`).
+- Mouse and bracketed paste mode detection.
+- Scrollback and selected text extraction.
+- Resize behavior.
+
+Keep out:
+- Primary/child terminal ownership.
+
+### T65 - Terminal Session Model: Primary and Children
+
+Primary scope:
+- `src/terminal/session.rs:251-859`
+
+Supporting scope:
+- App callers in `src/app/state.rs:1286-1322`, `src/app/state.rs:1554-1663`
+
+Review focus:
+- Primary and child spawn.
+- Active terminal selection.
 - Child close index fixup.
-- Ctrl-C and termination semantics.
+- Ctrl-C and terminate-all behavior.
 - `all_stopped` definition.
 
 Keep out:
-- VT100 rendering and text selection.
+- Production portable-pty implementation.
 
-### T41 - Terminal Selection and Scrollback Extraction
-
-Primary scope:
-- `src/tui/selection.rs:1-215`
-- `src/terminal/session.rs:20-210`
-
-Supporting scope:
-- Mouse handling in `src/lib.rs:803-879`, `src/lib.rs:889-934`
-- Render selection highlight in `src/tui/render.rs:576-645`
-
-Review focus:
-- Rows-from-bottom coordinate model.
-- Selection range math and clamping.
-- Selection extraction from visible and scrolled content.
-- Scroll behavior and selection clearing on resize.
-
-Keep out:
-- Clipboard command implementation.
-
-### T42 - Key Mapping and PTY Key Encoding
+### T66 - Shell Resolution
 
 Primary scope:
-- `src/tui/input.rs:1-670`
-- `src/app/modes.rs:1-11`
+- `src/terminal/shell.rs:1-48`
 
 Supporting scope:
-- `src/lib.rs:1026-1086` for how `KeyAction` is consumed.
+- `src/app/state.rs:1286-1310`
+- `src/runtime/container.rs:103-114`
 
 Review focus:
-- Terminal versus App mode behavior.
-- Global shortcuts in both modes.
-- Ctrl-V paste interception.
-- ANSI/VT key byte encoding.
+- Default shell selection by platform/env.
+- Child shell launch args.
 
 Keep out:
-- Prompt and palette key handling.
+- PTY spawn mechanics.
 
-### T43 - Command Palette Model
+### T67 - TUI Platform Constants and Key Mapping
 
 Primary scope:
-- `src/tui/palette.rs:1-366`
+- `src/tui/platform.rs:1-26`
+- `src/tui/input.rs:1-725`
 
 Supporting scope:
-- `src/lib.rs:1513-1590` for confirmed action handling.
+- `src/tui/render.rs:924-988`
+- `src/lib.rs:1422-1482`
 
 Review focus:
-- Completeness of command entries.
-- Filtering and selection wrap behavior.
-- Which entries dispatch directly versus require prompts.
+- Terminal/App mode distinction.
+- Alt+Esc versus Shift+Esc focus behavior.
+- Global shortcuts and Ctrl+U Pull Base.
+- Ctrl-V image paste interception.
+- VT key encoding.
 
 Keep out:
-- Palette overlay rendering.
+- Prompt/palette key handling in `src/lib.rs`.
 
-### T44 - Interactive Prompt State Machine
+### T68 - Command Palette Model and Column Navigation
 
 Primary scope:
-- `src/lib.rs:381-484`
-- `src/lib.rs:1088-1511`
-- `src/lib.rs:1513-1590`
+- `src/tui/palette.rs:1-478`
 
 Supporting scope:
-- `src/app/commands.rs`
-- Unit tests in `src/lib.rs:1834-end` related to prompts and effects.
+- `src/tui/render.rs:1104-1203`
+- `src/lib.rs:2020-2099`
 
 Review focus:
-- Prompt capture priority and cancellation.
-- New/rename text entry.
-- Agent picker behavior.
-- Manual status, close, push, abandon, and merge confirmation prompts.
-- Effect-to-overlay mapping consistency.
+- 20-entry action list and groups.
+- Filtering and selection wrap.
+- Left/right column navigation consistency with render split.
+- Direct dispatch versus prompts.
 
 Keep out:
-- App command implementation details.
+- Overlay rendering details.
 
-### T45 - Main Event Loop Tick and Background Status Refresh
-
-Primary scope:
-- `src/lib.rs:486-618`
-- `src/lib.rs:688-741`
-
-Supporting scope:
-- `src/tui/render.rs:41-44`
-- `src/git/status.rs:83-113`
-
-Review focus:
-- Per-tick ordering: PTY drain, create outcomes, status results, status-file polling, notifications, render, input.
-- Background git status refresh and in-flight guard.
-- Render loop non-blocking expectations.
-
-Keep out:
-- Individual input handlers.
-- Worktree creation worker details covered in T32.
-
-### T46 - PTY Drain, Input Write, Paste, Resize, Teardown
-
-Primary scope:
-- `src/lib.rs:1592-1770`
-
-Supporting scope:
-- `src/tui/clipboard.rs:25-44`
-- `src/terminal/session.rs`
-
-Review focus:
-- PTY output drain into VT parser and status ingestion.
-- Active terminal input write behavior.
-- Clipboard image path paste fallback.
-- Session resizing and split-view size sync.
-- Persist-on-quit and terminate-all-sessions teardown.
-
-Keep out:
-- Platform clipboard internals.
-
-### T47 - Mouse Hit Testing and Local/Forwarded Mouse Handling
-
-Primary scope:
-- `src/tui/render.rs:67-174`
-- `src/lib.rs:754-1024`
-
-Supporting scope:
-- `src/tui/selection.rs`
-- `src/terminal/session.rs:64-75`
-
-Review focus:
-- Click target calculation for sidebar and child tabs.
-- Split-view hit testing.
-- Local selection versus forwarded mouse-aware TUI events.
-- Wheel scroll forwarding versus local scrollback.
-- Mouse report encoding.
-
-Keep out:
-- Rendering of selected cells.
-
-### T48 - Layout Math
+### T69 - Layout Math
 
 Primary scope:
 - `src/tui/layout.rs:1-460`
 
 Supporting scope:
-- `src/tui/render.rs:188-230`
-- `src/lib.rs:743-751`, `src/lib.rs:1698-1751`
+- `src/tui/render.rs:205-247`
+- `src/lib.rs:1027-1036`, `src/lib.rs:2247-2300`
 
 Review focus:
-- Main layout rect computation.
+- Main layout rects.
 - Header/sidebar/main/status geometry.
-- Split-view region and column calculations.
+- Split-view region and columns.
 - Overlay centering.
 
 Keep out:
-- Actual drawing styles.
+- Actual rendering style.
 
-### T49 - Rendering: Header, Sidebar, and Status Indicators
+### T70 - Mouse Selection Geometry
 
 Primary scope:
-- `src/tui/render.rs:188-478`
+- `src/tui/selection.rs:1-215`
 
 Supporting scope:
-- `src/app/state.rs:181-207`
+- `src/terminal/session.rs:138-248`
+- `src/lib.rs:1045-1420`
+
+Review focus:
+- Rows-from-bottom coordinate model.
+- Selection range and screen-row conversion.
+- Scroll-stable selection behavior.
+
+Keep out:
+- Clipboard command implementation.
+
+### T71 - Clipboard Helpers
+
+Primary scope:
+- `src/tui/clipboard.rs:1-276`
+
+Supporting scope:
+- `src/lib.rs:2163-2221`
+- Selection copy caller in `src/lib.rs:1134-1146`
+
+Review focus:
+- Text copy via native commands and OSC 52 fallback.
+- Image paste extraction and temp file path generation.
+- Platform-specific clipboard behavior.
+- Silent failure/fallback expectations.
+
+Keep out:
+- PTY paste encoding.
+
+### T72 - Top-Level Rendering and Hit Testing
+
+Primary scope:
+- `src/tui/render.rs:1-247`
+
+Supporting scope:
+- Mouse wiring in `src/lib.rs:1045-1420`
+
+Review focus:
+- `UiOverlay` model.
+- Sidebar/child/split-view hit testing.
+- Top-level draw ordering.
+- Sidebar chrome focus target.
+
+Keep out:
+- Individual render widgets below.
+
+### T73 - Rendering: Header and Sidebar
+
+Primary scope:
+- `src/tui/render.rs:249-507`
+
+Supporting scope:
+- `src/app/state.rs:282-308`
 - `src/git/status.rs:69-113`
 
 Review focus:
-- Header fallback by width.
-- Sidebar tab block structure.
-- Creating-tab spinner.
-- Status label/color collapse.
-- Git indicator line behavior with missing cache.
+- Full-width branded header.
+- Sidebar tab structure.
+- Creating spinner.
+- Status colors and git indicators.
 
 Keep out:
-- Terminal screen rendering and overlays.
+- Terminal viewport rendering.
 
-### T50 - Rendering: Child Tabs, Terminal Viewport, VT Cells
+### T74 - Rendering: Child Tabs, Terminal Viewport, VT Cells
 
 Primary scope:
-- `src/tui/render.rs:480-655`
+- `src/tui/render.rs:509-683`
 
 Supporting scope:
-- `src/terminal/session.rs:54-75`, `src/terminal/session.rs:101-209`
-- `src/tui/selection.rs`
+- `src/terminal/session.rs:54-114`, `src/terminal/session.rs:138-248`
 
 Review focus:
-- Active terminal tab rendering.
+- Child tab rendering.
 - Empty/no-tab/creating states.
-- VT100 cell-to-ratatui style conversion.
-- Cursor positioning and selection highlight.
+- VT100 cell rendering, cursor positioning, selection highlight.
 
 Keep out:
 - Split view.
 
-### T51 - Rendering: Split View
+### T75 - Rendering: Split View
 
 Primary scope:
-- `src/tui/render.rs:656-764`
+- `src/tui/render.rs:685-793`
 - `src/tui/layout.rs:129-203`
-- `src/lib.rs:1698-1751`
+- `src/lib.rs:2247-2300`
 
 Supporting scope:
-- Click handling in `src/tui/render.rs:101-114`
+- `src/tui/render.rs:114-130`
 
 Review focus:
 - Column/header rendering.
-- Active cursor behavior in split view.
+- Active cursor behavior.
 - Separator placement.
-- Agreement between layout, rendering, hit testing, and PTY sizing.
+- Agreement between rendering, hit testing, and PTY sizing.
 
 Keep out:
 - Normal child-tab view.
 
-### T52 - Rendering: Git Info Bar and Git Status Overlay
+### T76 - Rendering: Git Info, Status Bar, Update Hint
 
 Primary scope:
-- `src/tui/render.rs:766-1046`
+- `src/tui/render.rs:795-988`
 
 Supporting scope:
 - `src/git/status.rs:69-113`
-- App command in `src/app/state.rs:1205-1219`
+- `src/update.rs:223-253`
+- `src/app/state.rs:437-441`
 
 Review focus:
-- Info bar fallback behavior when cache is missing.
-- Change counts, upstream, base drift, and base branch display.
-- Git status overlay content and no-diff boundary.
+- Info bar fallback and status formatting.
+- Platform-specific leave-focus key label.
+- Update-available status bar hint.
 
 Keep out:
-- Git status collection logic.
+- Git status overlay and update network/cache logic.
 
-### T53 - Rendering: Help, Palette, Message, Snapshots
+### T77 - Rendering: Git Status Overlay
 
 Primary scope:
-- `src/tui/render.rs:1048-1220`
-- Overlay-related tests in `src/tui/render.rs:1227-end`.
+- `src/tui/render.rs:990-1102`
+
+Supporting scope:
+- App command in `src/app/state.rs:1649-1663`
+
+Review focus:
+- Overlay content.
+- Dirty/upstream/ahead/behind/base drift rendering.
+- PR URL optional display.
+- No-diff boundary.
+
+Keep out:
+- Git status collection.
+
+### T78 - Rendering: Palette, Help, Message Overlays
+
+Primary scope:
+- `src/tui/render.rs:1104-1320`
+- Overlay-related tests in `src/tui/render.rs:1325-2002`
 
 Supporting scope:
 - `src/tui/palette.rs`
-- `src/lib.rs:1138-1186`
+- `src/lib.rs:1580-1644`, `src/lib.rs:1963-2018`
 
 Review focus:
-- Overlay layering and clearing expectations.
-- Help/keybinding text consistency with input mapping.
-- Palette render behavior.
-- Snapshot helper stability.
+- Two-column palette rendering and group headers.
+- Help text consistency with key mapping.
+- Message toast behavior.
 
 Keep out:
-- Palette data model.
+- Palette data model internals.
 
-### T54 - Clipboard Text Copy and Image Paste Helpers
+### T79 - Event Loop Tick, Background Workers, and Update Notices
 
 Primary scope:
-- `src/tui/clipboard.rs:1-242`
+- `src/lib.rs:750-902`
+- `src/lib.rs:904-1036`
 
 Supporting scope:
-- Paste caller in `src/lib.rs:1650-1672`
-- Selection copy caller in `src/lib.rs:855-867`
+- `src/update.rs:223-253`
+- `src/git/status.rs:83-113`
 
 Review focus:
-- Platform command fallback behavior.
-- OSC 52 encoding.
-- Clipboard image extraction and temp path generation.
-- Silent failure and fallback expectations.
+- Per-tick ordering.
+- Worktree creation channel.
+- Git status refresh worker.
+- Background update notice channel.
+- Render/input polling behavior.
 
 Keep out:
-- PTY write behavior after path generation.
+- Mouse/key/paste handlers.
 
-### T55 - Integration Test Harness: Init, Worktree, Recovery
+### T80 - Mouse Handling and Mouse Report Encoding
 
 Primary scope:
-- `tests/integration.rs:1-16`
+- `src/lib.rs:1038-1420`
+
+Supporting scope:
+- `src/tui/render.rs:77-190`
+- `src/terminal/session.rs:94-114`
+- `src/tui/selection.rs`
+
+Review focus:
+- Sidebar/child/split-view click behavior.
+- Selection target tracking across split panes.
+- Local selection versus forwarded mouse-aware app events.
+- Wheel forwarding versus local scrollback.
+- Mouse report encoding.
+
+Keep out:
+- Rendering selection highlight.
+
+### T81 - Key, Paste, Prompt, and Palette Wiring
+
+Primary scope:
+- `src/lib.rs:1422-2099`
+
+Supporting scope:
+- `src/tui/input.rs`
+- `src/tui/palette.rs`
+- `src/app/commands.rs`
+
+Review focus:
+- Modal priority and overlay dismissal.
+- Bracketed paste routing into prompts/palette/terminal.
+- Prompt state machine for new/rename/status/close/push/abandon/merge/rebase.
+- Effect-to-overlay mapping.
+- Palette key handling and action dispatch.
+
+Keep out:
+- App command implementations.
+
+### T82 - PTY Drain, Paste Encoding, Resize, Teardown
+
+Primary scope:
+- `src/lib.rs:2101-2319`
+
+Supporting scope:
+- `src/terminal/session.rs:59-114`
+- `src/tui/clipboard.rs:25-44`
+
+Review focus:
+- PTY output drain and status ingestion.
+- Cursor-position query replies.
+- Ctrl-V image paste path versus bracketed text paste.
+- Newline normalization.
+- Split-view resize sync.
+- Persist-on-quit and terminate-all-sessions.
+
+Keep out:
+- Production PTY internals.
+
+### T83 - Release and Distribution Automation
+
+Primary scope:
+- `scripts/release:1-86`
+- `dist-workspace.toml:1-24`
+
+Supporting scope:
+- `Cargo.toml:1-66`
+- `CHANGELOG.md:1-103`
+
+Review focus:
+- Version validation and clean-tree checks.
+- Quality gates and dist checks.
+- Release tag/push flow.
+- Target platforms and Homebrew publishing.
+
+Keep out:
+- Runtime update code.
+
+### T84 - Integration Test Harness: Init, Worktree, Recovery
+
+Primary scope:
+- `tests/integration.rs:1-19`
+- `tests/integration/util.rs:1-31`
 - `tests/integration/init.rs:1-172`
 - `tests/integration/worktree.rs:1-184`
-- `tests/integration/recovery.rs:1-136`
+- `tests/integration/recovery.rs:1-138`
 
 Supporting scope:
-- Modules under test as referenced by imports.
+- Modules under test by imports.
 
 Review focus:
-- Hermetic temp git setup.
-- Real FS/Git coverage for first-run init, worktree operations, and recovery.
-- macOS path canonicalization handling.
+- Shared temp git utilities.
+- Cross-platform canonical path handling.
+- Real FS/Git coverage for init, worktrees, and recovery.
 
 Keep out:
 - Push and merge integration tests.
 
-### T56 - Integration Test Harness: Push and Merge Safety
+### T85 - Integration Test Harness: Push and Merge Safety
 
 Primary scope:
 - `tests/integration/push.rs:1-185`
@@ -1026,109 +1575,131 @@ Supporting scope:
 - `src/git/worktree.rs`
 
 Review focus:
-- Local bare remote setup with no network.
-- Push planning and PR URL tests.
+- Local bare remote setup.
+- Push planning and PR URLs.
 - Merge success/conflict tests.
 - No-FlightDeck-created-commits guarantee.
 
 Keep out:
 - Unit tests for pure helpers.
 
-### T57 - Guard Tests for Product Invariants
+### T86 - Guard Tests for Product Invariants
 
 Primary scope:
-- `tests/guards.rs:1-98`
+- `tests/guards.rs:1-122`
 
 Supporting scope:
-- `README.md:68-86`
-- `specs/SPECS.md:23-58`, `specs/SPECS.md:108-138`
+- `README.md:129-149`
+- `src/contracts/traits.rs:15-84`
 
 Review focus:
 - Placeholder-name guard.
 - Forbidden git subcommand scan.
-- Whether exceptions such as `worktree remove --force` are tightly scoped.
+- Rebase carve-out confinement to `src/git/repo.rs`.
+- Runtime directory exclusion from git-subcommand scan.
 
 Keep out:
-- Runtime GitExecutor implementation.
+- Runtime GitExecutor implementation details beyond tokens scanned.
 
-### T58 - Release and Distribution Automation
+### T87 - Example Key Logger
 
 Primary scope:
-- `scripts/release:1-86`
-- `dist-workspace.toml:1-24`
-- `.github/workflows/release.yml:1-343`
+- `examples/keylog.rs:1-56`
 
 Supporting scope:
-- `Cargo.toml:1-38`
-- `README.md:16-36`
+- `src/tui/input.rs:48-102`
 
 Review focus:
-- Release version validation and clean-worktree checks.
-- Quality gates run before tagging.
-- cargo-dist config and generated CI permissions/artifact flow.
-- Homebrew publishing target.
+- Debugging utility behavior.
+- Raw mode/event capture safety.
+- Platform key-inspection usefulness.
 
 Keep out:
-- Product runtime code.
+- Product runtime behavior.
 
-### T59 - Documentation Consistency with Product Behavior
+### T88 - Documentation Consistency
 
 Primary scope:
-- `README.md:1-332`
+- `README.md:1-459`
+- `containers/README.md`
 - `specs/SPECS.md:1-1039`
 - `specs/PLAN.md:1-548`
+- `specs/CONTAINER_SUPPORT_PLAN.md`
 
 Supporting scope:
-- `Cargo.toml:1-20`
-- User-facing help in `src/lib.rs:342-359`
+- User-facing help in `src/lib.rs:581-610`
+- Container CLI in `src/lib.rs:368-490`
+- Update CLI in `src/lib.rs:321-366`, `src/update.rs`
 
 Review focus:
-- Public feature claims versus implemented commands and UI.
-- Safety boundary wording.
-- Keyboard model and screen layout consistency.
-- Setup-status/setup-notifications docs versus implementation.
+- Public feature claims versus implemented behavior.
+- Safety boundary wording, including rebase/pull-base carve-outs.
+- Keyboard model and help text consistency.
+- Container setup and guardrail docs.
+- Update/install guidance.
 
 Keep out:
-- Code correctness beyond checking documented behavior exists.
+- Code correctness beyond documented behavior existence.
 
 ## Suggested Review Order
 
-1. T02, T03, T57: establish contracts and non-negotiable safety invariants.
-2. T14-T20: review the Git layer before app commands that call it.
-3. T08-T13, T27-T28: review config, init, persistence, and recovery.
-4. T21-T26: review agent/status/notification behavior.
-5. T29-T38: review headless app command behavior.
-6. T39-T47: review PTY, event loop, input, prompts, mouse, and clipboard plumbing.
-7. T48-T53: review TUI layout and rendering.
-8. T55-T56: review integration coverage after the behavior topics.
-9. T58-T59: review release automation and docs.
+1. T09, T10, T86: review contracts and safety invariants first.
+2. T17-T23: review config, init, state, and recovery.
+3. T24-T33: review Git behavior before app workflows that depend on it.
+4. T54-T59: review container runtime primitives before AppState container launch flows.
+5. T39-T53: review headless app behavior.
+6. T60-T61: review update and update-notice behavior.
+7. T62-T68: review PTY, session, key mapping, and palette primitives.
+8. T69-T78: review rendering and layout.
+9. T79-T82: review wiring/event loop/mouse/paste/teardown.
+10. T83-T88: review tests, release automation, examples, and docs.
 
 ## Large File Split Index
 
 `src/lib.rs`:
-- T01: public run entry, CLI dispatch, title helpers.
-- T13: startup orchestration.
-- T32: new-tab background worker handoff.
-- T44: prompt and palette state machine.
-- T45: event loop tick and status refresh.
-- T46: PTY drain, paste, resize, teardown.
-- T47: mouse handling.
+- T03: run entry and terminal setup/teardown.
+- T04: setup-status/setup-notifications.
+- T05: setup-update.
+- T06: image build CLI.
+- T07: doctor CLI.
+- T08: startup.
+- T79: event loop and background workers.
+- T80: mouse handling.
+- T81: key/paste/prompt/palette wiring.
+- T82: PTY drain, paste encoding, resize, teardown.
 
 `src/app/state.rs`:
-- T26: status file polling and notification edge detection.
-- T29: construction, modes, selection, persistence.
-- T31: new agent tab app-core flow.
-- T33: rename, switch, manual status.
-- T34: close tab.
-- T35: push.
-- T36: finish/local merge.
-- T37: abandon.
-- T38: child terminals, restart, resume, git status command.
+- T39: construction, modes, selection, persistence.
+- T40: status file polling and notification edge detection.
+- T42: new-tab planning and placeholder.
+- T43: finalize and spawn/failure cleanup.
+- T44: rename, switch, manual status.
+- T45: close tab and container teardown.
+- T46: push branch.
+- T47: finish/local merge.
+- T48: rebase worktree.
+- T49: pull base.
+- T50: abandon worktree.
+- T51: copy env file.
+- T52: child terminals, restart, resume, status.
+- T53: container launch/spec assembly.
 
 `src/tui/render.rs`:
-- T47: hit testing.
-- T49: header/sidebar/status indicators.
-- T50: child tabs and VT terminal viewport.
-- T51: split view.
-- T52: git info/status overlay.
-- T53: help, palette, message overlays, snapshots.
+- T72: top-level draw and hit testing.
+- T73: header and sidebar.
+- T74: child tabs and VT terminal viewport.
+- T75: split view.
+- T76: git info, status bar, update hint.
+- T77: git status overlay.
+- T78: palette, help, and message overlays.
+
+`src/testing/mod.rs`:
+- T12: FakeFs.
+- T13: FakeGit.
+- T14: FakePty.
+- T15: FakeContainerRuntime.
+- T16: FakeClock.
+
+`src/terminal/session.rs`:
+- T64: terminal parser, mouse/bracketed modes, selection.
+- T65: session ownership of primary/children and process controls.
