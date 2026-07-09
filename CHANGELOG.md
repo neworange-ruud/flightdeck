@@ -8,7 +8,22 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Mouse-driven tab management on the child tab bar.** The horizontal tab bar
+  now carries **`+ agent`** and **`+ shell`** buttons, right-aligned and styled
+  distinctly from the tabs. **`+ agent`** first asks which **backend** to use
+  (Claude, OpenCode, …) then spawns an *additional agent* in the **same
+  worktree** as another `agent` tab on the row (agents number `agent`, `agent 2`,
+  `agent 3`, …); **`+ shell`** opens a child shell. Each tab shows a `✕` close
+  control you can click to close it. (With no session yet, `+ agent` creates a
+  fresh Agent Session Tab/worktree.) New palette commands **New Agent** and
+  **Close Agent** cover the same in-session agents from the keyboard.
+- **Sidebar close control.** Each Agent Session Tab in the sidebar shows a
+  right-aligned `✕` on its name row. Clicking it asks whether to **Abandon** the
+  worktree, just **Close** the agent, or **Cancel**.
+- **Clearer terminology.** The worktree-level tabs (and their palette commands)
+  are now called **"Agent Session Tab"** — *New/Rename/Close/Switch Agent Session
+  Tab* — to distinguish them from the individual agent tabs on the horizontal
+  row within a session.
 
 ### Improvements
 
@@ -26,6 +41,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   ready" (and drop the macOS/Windows-only `podman machine start` hint on Linux),
   surface the underlying cause when a repository can't be discovered, and
   include the agent name in the "build the image first" guidance.
+- **Confirmations and notifications now appear as a centered modal dialog** that
+  overlays the UI, instead of a single line at the bottom of the screen. Every
+  dialog shows a clickable button for each available action (Abandon, Close,
+  Cancel, …) while keeping the existing keyboard shortcuts, and long messages
+  wrap across lines inside the box instead of being truncated.
+- **Closing always confirms first.** Clicking a shell/agent tab's `✕` (or
+  pressing `Ctrl-w`) asks for confirmation before closing the terminal, matching
+  the existing confirmation flow for closing an Agent Tab. Routine actions no
+  longer pop a follow-up notification — opening a shell/agent or closing a tab is
+  its own confirmation, so those toasts are gone.
+- New agent sessions now **symlink** the base folder's `.env` and `.env.local`
+  into the worktree automatically, instead of requiring a manual copy. The link
+  keeps secrets in sync with the base and is best-effort — sessions where the
+  base has no `.env`/`.env.local` are created silently, with nothing to do. The
+  now-redundant *Copy .env(.local)* command is hidden from the palette.
 
 ### Bug fixes
 

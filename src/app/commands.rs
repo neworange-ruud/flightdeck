@@ -145,6 +145,14 @@ pub enum Command {
     },
     /// Open a new child shell terminal in the selected tab (SPECS §19).
     NewChildTerminal,
+    /// Spawn an additional agent terminal in the selected tab's worktree,
+    /// appearing as another "agent" tab on the horizontal row. Runs in the same
+    /// worktree/session. `agent_key` chooses the backend (claude, opencode, …);
+    /// `None` falls back to the session tab's own agent.
+    NewAgentTerminal { agent_key: Option<String> },
+    /// Close the selected child *agent* terminal (the horizontal-row agent tab).
+    /// Refuses if the selected terminal is not an additional agent (SPECS §19).
+    CloseAgentTerminal,
     /// Close the selected tab's currently-selected child terminal (SPECS §19).
     CloseChildTerminal,
     /// Switch the selected Agent Tab (SPECS §22).

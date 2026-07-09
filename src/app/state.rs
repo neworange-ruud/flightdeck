@@ -212,6 +212,8 @@ fn requires_ready_tab(cmd: &Command) -> bool {
             | Command::CopyEnvFile
             | Command::AbandonWorktree { .. }
             | Command::NewChildTerminal
+            | Command::NewAgentTerminal { .. }
+            | Command::CloseAgentTerminal
             | Command::OpenShell
             | Command::CloseChildTerminal
             | Command::SwitchChildTerminal(_)
@@ -734,7 +736,11 @@ impl AppState {
             Command::CopyEnvFile => self.cmd_copy_env_file(services),
             Command::AbandonWorktree { confirm } => self.cmd_abandon(confirm, services),
             Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(services),
+            Command::NewAgentTerminal { agent_key } => {
+                self.cmd_new_agent_child(agent_key.as_deref(), services)
+            }
             Command::CloseChildTerminal => self.cmd_close_child(),
+            Command::CloseAgentTerminal => self.cmd_close_agent_child(),
             Command::SwitchAgentTab(sel) => self.cmd_switch_tab(sel),
             Command::SwitchChildTerminal(sel) => self.cmd_switch_child(sel),
             Command::SetManualStatus(status) => self.cmd_set_manual_status(status, services),
@@ -925,6 +931,11 @@ impl AppState {
         let attached = self.tabs[idx].meta.attached_existing_branch;
         let tab_id = self.tabs[idx].meta.id.clone();
 
+        // Share the base folder's `.env`/`.env.local` into the worktree before
+        // the agent starts, so it inherits the developer's secrets. Best-effort:
+        // never fails the session (SPECS §17 keeps creation robust).
+        self.link_env_files(&worktree_abs, services);
+
         // Resolve the launch (local command, or a fresh `podman run`) then spawn
         // the primary terminal (fast; stays on the UI thread — SPECS §31 keeps
         // the spawn path synchronous and never builds an image here).
@@ -966,6 +977,21 @@ impl AppState {
             Ok(Effect::AttachedExisting { branch })
         } else {
             Ok(Effect::Message(format!("Created Agent Tab on {branch}")))
+        }
+    }
+
+    /// Symlink the base folder's `.env` / `.env.local` into a new worktree so
+    /// the agent shares the developer's secrets without a copy that could drift.
+    /// Best-effort: any file that is absent in the base, already present in the
+    /// worktree, or fails to link is silently skipped — a missing `.env` must
+    /// never bother the user or fail session creation.
+    fn link_env_files(&self, worktree: &Path, services: &Services) {
+        for name in [".env", ".env.local"] {
+            let source = self.repo_root.join(name);
+            let destination = worktree.join(name);
+            if services.fs.exists(&source) && !services.fs.exists(&destination) {
+                let _ = services.fs.symlink(&source, &destination);
+            }
         }
     }
 
@@ -1351,10 +1377,62 @@ impl AppState {
         } else {
             shell_launch()
         };
-        let idx = tab
+        let _idx = tab
             .session
             .spawn_child(services.pty, &cmd, &args, &cwd, size)?;
-        Ok(Effect::Message(format!("Opened child terminal #{idx}.")))
+        // The new shell tab appearing is its own confirmation; no toast needed.
+        Ok(Effect::None)
+    }
+
+    /// Spawn an additional agent terminal in the selected tab's worktree/session,
+    /// shown as another "agent" tab on the horizontal row. `agent_key` picks the
+    /// backend (falling back to the session tab's own agent when `None`). Runs in
+    /// the same worktree — a `podman exec` into the tab's container when
+    /// containerized, otherwise a local launch.
+    fn cmd_new_agent_child(
+        &mut self,
+        agent_key: Option<&str>,
+        services: &Services,
+    ) -> Result<Effect> {
+        let size = self.pty_size;
+        let repo_root = self.repo_root.clone();
+        let Some(idx) = self.selected_tab else {
+            return Err(FlightDeckError::Other("no tab selected".to_string()));
+        };
+        let agent_key = agent_key
+            .map(str::to_string)
+            .unwrap_or_else(|| self.tabs[idx].meta.agent.clone());
+        let agent = self
+            .registry
+            .get(&agent_key)
+            .cloned()
+            .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
+        validate_launchable(
+            &agent,
+            &self.config.containers,
+            services.container,
+            &repo_root,
+        )?;
+
+        let cwd = to_absolute(
+            &repo_root,
+            Path::new(&self.tabs[idx].meta.worktree_path_relative),
+        );
+        let (cmd, args) = if self.tabs[idx].meta.containerized {
+            let name = container_name(&self.tabs[idx].meta.id);
+            (
+                "podman".to_string(),
+                build_exec_args(&name, &agent.command, &agent.args),
+            )
+        } else {
+            let launch = build_launch(&agent, &cwd);
+            (launch.command, launch.args)
+        };
+        let tab = &mut self.tabs[idx];
+        tab.session
+            .spawn_agent_child(services.pty, &cmd, &args, &cwd, size)?;
+        // The new agent tab appearing is its own confirmation; no toast needed.
+        Ok(Effect::None)
     }
 
     /// Close the selected tab's currently-selected child terminal (SPECS §19).
@@ -1366,7 +1444,28 @@ impl AppState {
             return Ok(Effect::Refused("No child terminal selected.".to_string()));
         };
         tab.session.close_child(child)?;
-        Ok(Effect::Message("Closed child terminal.".to_string()))
+        // The tab disappearing is its own confirmation; no toast needed.
+        Ok(Effect::None)
+    }
+
+    /// Close the selected tab's currently-selected child terminal, but only when
+    /// it is an additional *agent* (not a shell). Refuses otherwise (SPECS §19).
+    fn cmd_close_agent_child(&mut self) -> Result<Effect> {
+        let Some(tab) = self.selected_mut() else {
+            return Err(FlightDeckError::Other("no tab selected".to_string()));
+        };
+        let Some(child) = tab.session.selected_child() else {
+            return Ok(Effect::Refused("No agent tab selected.".to_string()));
+        };
+        let is_agent = tab.session.child(child).map(|t| t.kind)
+            == Some(crate::terminal::session::TerminalKind::Agent);
+        if !is_agent {
+            return Ok(Effect::Refused(
+                "The selected tab is not an agent.".to_string(),
+            ));
+        }
+        tab.session.close_child(child)?;
+        Ok(Effect::None)
     }
 
     /// Switch the selected Agent Tab (SPECS §22). Preserves each tab's own
@@ -2135,6 +2234,83 @@ mod tests {
         assert_eq!(
             effect,
             Effect::Refused("No .env.local or .env found in base folder.".to_string())
+        );
+    }
+
+    #[test]
+    fn new_agent_tab_symlinks_env_files_from_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new()
+            .with_file("/repo/.env", "BASE=1\n")
+            .with_file("/repo/.env.local", "LOCAL=1\n");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Fix Login Bug".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // Both `.env` and `.env.local` are symlinked into the worktree pointing
+        // back at the base folder — no copy is made.
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            Some(PathBuf::from("/repo/.env"))
+        );
+        assert_eq!(
+            fs.symlink_target(Path::new(
+                "/repo/.flightdeck/worktrees/fix-login-bug/.env.local"
+            )),
+            Some(PathBuf::from("/repo/.env.local"))
+        );
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            None
+        );
+    }
+
+    #[test]
+    fn new_agent_tab_without_env_files_creates_no_symlink() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        // Absent `.env`/`.env.local` must not fail session creation.
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "No Env".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/no-env/.env")),
+            None
+        );
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/no-env/.env.local")),
+            None
         );
     }
 
@@ -3662,6 +3838,60 @@ mod tests {
         assert_eq!(last.1[0], "exec");
         assert_eq!(last.1[1], "-it");
         assert_eq!(last.1[2], name, "execs into the agent's container");
+    }
+
+    #[test]
+    fn new_agent_child_spawns_agent_and_close_is_type_checked() {
+        use crate::terminal::session::TerminalKind;
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session(); // primary agent
+        pty.queue_session(); // + agent child
+        pty.queue_session(); // shell child
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+        let mut app = fresh_state(config);
+
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // "+ agent" spawns the agent command as an agent-kind child.
+        app.dispatch(Command::NewAgentTerminal { agent_key: None }, &svc)
+            .unwrap();
+        assert_eq!(app.tabs[0].session.child_count(), 1);
+        assert_eq!(
+            app.tabs[0].session.child(0).unwrap().kind,
+            TerminalKind::Agent
+        );
+        assert_eq!(
+            pty.spawns().pop().unwrap().0,
+            cmd,
+            "agent child runs the agent command, not a shell"
+        );
+
+        // "Close Agent" closes the selected agent child.
+        app.dispatch(Command::CloseAgentTerminal, &svc).unwrap();
+        assert_eq!(app.tabs[0].session.child_count(), 0);
+
+        // A shell child is refused by CloseAgentTerminal (type-checked).
+        app.dispatch(Command::NewChildTerminal, &svc).unwrap();
+        let effect = app.dispatch(Command::CloseAgentTerminal, &svc).unwrap();
+        assert!(matches!(effect, Effect::Refused(_)));
+        assert_eq!(
+            app.tabs[0].session.child_count(),
+            1,
+            "the shell must survive a Close Agent"
+        );
     }
 
     #[test]
