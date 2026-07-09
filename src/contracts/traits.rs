@@ -94,6 +94,9 @@ pub trait FileSystem {
     fn read_to_string(&self, p: &Path) -> Result<String>;
     /// Write (truncating) a file.
     fn write(&self, p: &Path, contents: &str) -> Result<()>;
+    /// Create a symbolic link at `link` pointing to `target`. Used to share the
+    /// base folder's `.env`/`.env.local` into a new worktree without copying.
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()>;
     /// Append a single line (with trailing newline) to a file, creating it if
     /// absent. Used for the append-only `.gitignore` updater (SPECS §6).
     fn append_line(&self, p: &Path, line: &str) -> Result<()>;

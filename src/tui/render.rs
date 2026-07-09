@@ -73,6 +73,12 @@ pub enum UiOverlay {
 const SIDEBAR_HEADER_ROWS: u16 = 1;
 /// Rows each agent tab occupies in the sidebar: divider + name + agent + git.
 const SIDEBAR_ROWS_PER_TAB: u16 = 4;
+/// The close control glyph shown inside tabs / on sidebar rows. A crisp "✕"
+/// reads better than a bracketed `[x]` text link.
+const CLOSE_GLYPH: &str = "✕";
+/// Right-side tab-bar buttons, in left-to-right display order.
+const NEW_AGENT_LABEL: &str = "+ agent";
+const NEW_SHELL_LABEL: &str = "+ shell";
 
 /// Which child-terminal tab a click landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +94,8 @@ pub enum ChildTarget {
 pub enum HitTarget {
     /// An Agent Tab in the sidebar (by index).
     AgentTab(usize),
+    /// The `✕` close control on a sidebar Agent Tab's name row (by index).
+    CloseAgentTab(usize),
     /// The sidebar chrome itself (header/heading/empty space below the tabs) —
     /// anywhere in the left panel that is not an Agent Tab row. A click here
     /// still focuses the app (APP mode) without changing the selected tab, so
@@ -95,6 +103,13 @@ pub enum HitTarget {
     Sidebar,
     /// A child-terminal tab in the main pane.
     Child(ChildTarget),
+    /// The `✕` close control inside a child-terminal tab. `Primary` closes the
+    /// whole Agent Tab; `Child(i)` closes shell `i`.
+    CloseChild(ChildTarget),
+    /// The "+ agent" button at the right of the child tab bar (new Agent Tab).
+    NewAgentButton,
+    /// The "+ shell" button at the right of the child tab bar (new child shell).
+    NewShellButton,
 }
 
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
@@ -102,14 +117,12 @@ pub enum HitTarget {
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
     let ml = layout::compute(area);
     if rect_contains(ml.sidebar, col, row) {
-        // A click on an actual Agent Tab row selects it; anywhere else in the
-        // sidebar (logo header, "Agents" heading, or the empty space below the
-        // last tab) resolves to the sidebar chrome so the click still focuses
-        // the app — even with no agents or just one (SPECS §23).
-        return Some(
-            sidebar_tab_at(ml.sidebar, state.tabs.len(), col, row)
-                .map_or(HitTarget::Sidebar, HitTarget::AgentTab),
-        );
+        // A click on the `✕` on a tab's name row closes it; elsewhere on a tab
+        // row selects it; anywhere else in the sidebar (logo header, "Agents"
+        // heading, or the empty space below the last tab) resolves to the
+        // sidebar chrome so the click still focuses the app — even with no
+        // agents or just one (SPECS §23).
+        return Some(sidebar_hit(ml.sidebar, state.tabs.len(), col, row).unwrap_or(HitTarget::Sidebar));
     }
     if state.split_view {
         // In split view a click on a column's header row switches to that
@@ -130,9 +143,20 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         return None;
     }
     if rect_contains(ml.child_tabs, col, row) {
-        for (target, start, w) in child_tab_positions(ml.child_tabs, state) {
+        // The right-side buttons are drawn on top of the tab strip, so they win
+        // hit-testing where they overlap a long tab strip: check them first.
+        for (target, start, w) in child_tab_buttons(ml.child_tabs, state) {
             if col >= start && col < start.saturating_add(w) {
-                return Some(HitTarget::Child(target));
+                return Some(target);
+            }
+        }
+        for seg in child_tab_positions(ml.child_tabs, state) {
+            if col >= seg.start && col < seg.start.saturating_add(seg.width) {
+                // A click on the tab's `✕` closes it; elsewhere selects it.
+                if col == seg.close_col {
+                    return Some(HitTarget::CloseChild(seg.target));
+                }
+                return Some(HitTarget::Child(seg.target));
             }
         }
     }
@@ -147,8 +171,10 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
         && row < r.y.saturating_add(r.height)
 }
 
-/// Map a click in the sidebar `area` to an agent tab index (or `None`).
-fn sidebar_tab_at(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<usize> {
+/// Map a click in the sidebar `area` to an agent tab hit: the `✕` close control
+/// (on the name row, at the far right) or the tab row itself. Returns `None` for
+/// clicks that are not on a tab (header/heading/empty space below the tabs).
+fn sidebar_hit(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<HitTarget> {
     let inner = Block::default().borders(Borders::RIGHT).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
@@ -157,8 +183,21 @@ fn sidebar_tab_at(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<us
     if row < first {
         return None;
     }
-    let idx = ((row - first) / SIDEBAR_ROWS_PER_TAB) as usize;
-    (idx < tab_count).then_some(idx)
+    let rel = row - first;
+    let idx = (rel / SIDEBAR_ROWS_PER_TAB) as usize;
+    if idx >= tab_count {
+        return None;
+    }
+    // Within a tab block the rows are: divider(0), name(1), agent(2), git(3).
+    // The `✕` lives on the name row at the far right; give it a forgiving
+    // 3-column target so it stays easy to click.
+    if rel % SIDEBAR_ROWS_PER_TAB == 1 {
+        let close_col = inner.x.saturating_add(inner.width).saturating_sub(1);
+        if col >= close_col.saturating_sub(2) {
+            return Some(HitTarget::CloseAgentTab(idx));
+        }
+    }
+    Some(HitTarget::AgentTab(idx))
 }
 
 /// The child-terminal tab entries for the selected tab: the primary "agent" tab
@@ -174,18 +213,64 @@ fn child_tab_entries(state: &AppState) -> Vec<(ChildTarget, String)> {
     v
 }
 
-/// Compute `(target, start_col, width)` for each child-terminal tab segment,
-/// matching exactly how [`draw_child_tab_bar`] lays them out.
-fn child_tab_positions(area: Rect, state: &AppState) -> Vec<(ChildTarget, u16, u16)> {
+/// The screen geometry of one child-terminal tab segment.
+struct ChildTabSeg {
+    target: ChildTarget,
+    /// First column of the segment.
+    start: u16,
+    /// Total width of the segment, including the `✕` close control.
+    width: u16,
+    /// Column of the `✕` close control within the segment.
+    close_col: u16,
+}
+
+/// Compute the geometry of each child-terminal tab segment, matching exactly how
+/// [`draw_child_tab_bar`] lays them out. Each segment renders as
+/// `" {label} ✕ "`: a leading space, the label, a space, the close glyph, and a
+/// trailing space, so its width is `label.len() + 4` and the `✕` sits at
+/// `start + label.len() + 2`.
+fn child_tab_positions(area: Rect, state: &AppState) -> Vec<ChildTabSeg> {
     let mut out = Vec::new();
     let mut x = area.x;
     for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
         if i > 0 {
             x = x.saturating_add(3); // " | " separator
         }
-        let w = label.chars().count() as u16 + 2; // " label "
-        out.push((target, x, w));
+        let label_len = label.chars().count() as u16;
+        let w = label_len + 4; // " label ✕ "
+        out.push(ChildTabSeg {
+            target,
+            start: x,
+            width: w,
+            close_col: x.saturating_add(label_len).saturating_add(2),
+        });
         x = x.saturating_add(w);
+    }
+    out
+}
+
+/// The tab-bar buttons (`+ agent`, `+ shell`) as `(target, start_col, width)`,
+/// right-aligned in `area`. `+ shell` is only offered when a tab is selected (a
+/// child shell needs a host tab). Shared by rendering and hit-testing so the
+/// clickable regions always match what is drawn.
+fn child_tab_buttons(area: Rect, state: &AppState) -> Vec<(HitTarget, u16, u16)> {
+    // Each button renders as " label " (one space of padding each side).
+    let agent_w = NEW_AGENT_LABEL.chars().count() as u16 + 2;
+    let shell_w = NEW_SHELL_LABEL.chars().count() as u16 + 2;
+    let has_tab = state.selected().is_some();
+
+    let right = area.x.saturating_add(area.width);
+    let mut out = Vec::new();
+    if has_tab {
+        // Lay out right-to-left: shell is flush right, agent sits to its left
+        // separated by a single space.
+        let shell_start = right.saturating_sub(shell_w);
+        let agent_start = shell_start.saturating_sub(1).saturating_sub(agent_w);
+        out.push((HitTarget::NewAgentButton, agent_start, agent_w));
+        out.push((HitTarget::NewShellButton, shell_start, shell_w));
+    } else {
+        let agent_start = right.saturating_sub(agent_w);
+        out.push((HitTarget::NewAgentButton, agent_start, agent_w));
     }
     out
 }
@@ -373,11 +458,13 @@ pub fn draw_sidebar(
         // the user always sees that something is happening (SPECS §16/§17).
         if tab.phase == TabPhase::Creating {
             let spin = Style::default().fg(Color::Cyan);
-            lines.push(Line::from(vec![
-                Span::styled(marker, name_style),
+            lines.push(sidebar_name_line(
+                width,
+                marker,
+                name_style,
                 Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
-                Span::styled(tab.meta.name.clone(), name_style),
-            ]));
+                &tab.meta.name,
+            ));
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("creating worktree…", spin),
@@ -393,11 +480,13 @@ pub fn draw_sidebar(
             .manual
             .map(|_| Color::Cyan)
             .unwrap_or_else(|| status_label_color(ds.interpreted).1);
-        lines.push(Line::from(vec![
-            Span::styled(marker, name_style),
+        lines.push(sidebar_name_line(
+            width,
+            marker,
+            name_style,
             Span::styled("● ", Style::default().fg(dot_color)),
-            Span::styled(tab.meta.name.clone(), name_style),
-        ]));
+            &tab.meta.name,
+        ));
 
         // Agent name + simplified status, e.g. "Claude Code [in progress]".
         // A manual override (cyan) takes visual priority; otherwise the
@@ -429,6 +518,43 @@ pub fn draw_sidebar(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build a sidebar tab name line: `<marker><lead><name>` on the left with a
+/// right-aligned `✕` close control filling to `width`. The name is truncated
+/// with an ellipsis if it would collide with the close control (SPECS §20/§23).
+fn sidebar_name_line(width: usize, marker: &'static str, name_style: Style, lead: Span<'static>, name: &str) -> Line<'static> {
+    let marker_w = marker.chars().count();
+    let lead_w = lead.content.chars().count();
+    // Reserve two columns at the far right for a padding space and the glyph.
+    let name_budget = width.saturating_sub(marker_w + lead_w + 2);
+    let shown = truncate_ellipsis(name, name_budget);
+    let used = marker_w + lead_w + shown.chars().count();
+    // Pad so the glyph lands in the last inner column.
+    let pad = width.saturating_sub(used).saturating_sub(1);
+    Line::from(vec![
+        Span::styled(marker, name_style),
+        lead,
+        Span::styled(shown, name_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(CLOSE_GLYPH, Style::default().fg(Color::Red)),
+    ])
+}
+
+/// Truncate `s` to at most `max` display columns, appending `…` when clipped.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    match max {
+        0 => String::new(),
+        1 => "…".to_string(),
+        _ => {
+            let taken: String = s.chars().take(max - 1).collect();
+            format!("{taken}…")
+        }
+    }
 }
 
 /// A braille spinner frame chosen from the wall clock (≈12.5 fps), used to
@@ -511,43 +637,80 @@ fn build_git_indicator_line(
 // ---------------------------------------------------------------------------
 
 /// Draw the horizontal child terminal tab bar inside the main pane (SPECS §19).
+///
+/// Layout: `agent ✕ | shell 1 ✕ | …` on the left, with `+ agent` / `+ shell`
+/// buttons right-aligned. Each tab carries a `✕` close control; the buttons are
+/// styled distinctly from the tabs so they read as actions, not tabs.
 pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let Some(tab) = state.selected() else {
-        let empty = Paragraph::new(" No tab selected ").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(empty, area);
-        return;
-    };
-
-    // Build "agent | shell 1 | shell 2 …" from the shared segmentation so the
-    // rendered positions line up with mouse hit-testing (SPECS §19).
-    let active = tab.session.selected_child(); // None = primary
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    match state.selected() {
+        None => {
+            let empty =
+                Paragraph::new(" No tab selected ").style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(empty, area);
         }
-        let is_active = match target {
-            ChildTarget::Primary => active.is_none(),
-            ChildTarget::Child(c) => active == Some(c),
-        };
-        let style = if is_active {
-            let bg = if matches!(target, ChildTarget::Primary) {
-                Color::Yellow
-            } else {
-                Color::Cyan
-            };
-            Style::default()
-                .fg(Color::Black)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
+        Some(tab) => {
+            // Build "agent ✕ | shell 1 ✕ …" from the shared segmentation so the
+            // rendered positions line up with mouse hit-testing (SPECS §19).
+            let active = tab.session.selected_child(); // None = primary
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                }
+                let is_active = match target {
+                    ChildTarget::Primary => active.is_none(),
+                    ChildTarget::Child(c) => active == Some(c),
+                };
+                let style = if is_active {
+                    let bg = if matches!(target, ChildTarget::Primary) {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    };
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                // " {label} ✕ ": the close glyph keeps the tab's background but
+                // is tinted red so it reads as a distinct control.
+                spans.push(Span::styled(format!(" {label} "), style));
+                spans.push(Span::styled(CLOSE_GLYPH, style.fg(Color::Red)));
+                spans.push(Span::styled(" ", style));
+            }
+            let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
+            frame.render_widget(para, area);
+        }
     }
 
-    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
-    frame.render_widget(para, area);
+    // Right-aligned action buttons, drawn on top of the tab strip.
+    for (target, start, width) in child_tab_buttons(area, state) {
+        if start < area.x {
+            continue; // no room
+        }
+        let (label, style) = match target {
+            HitTarget::NewAgentButton => (
+                NEW_AGENT_LABEL,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            HitTarget::NewShellButton => (
+                NEW_SHELL_LABEL,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            _ => continue,
+        };
+        let rect = Rect::new(start, area.y, width.min(area.width), 1);
+        let btn = Paragraph::new(Line::from(Span::styled(format!(" {label} "), style)));
+        frame.render_widget(btn, rect);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,21 +1464,85 @@ fn shortcut_line(keys: &'static str, desc: &'static str) -> Line<'static> {
 // Toast / message overlay
 // ---------------------------------------------------------------------------
 
-/// Draw a one-line message toast at the bottom of the screen.
+/// Draw a message toast at the bottom of the screen. Long messages (status
+/// feedback and prompt hints) that do not fit the window width wrap across
+/// several stacked lines instead of being truncated at the edge.
 pub fn draw_message_toast(frame: &mut Frame, msg: &str, area: Rect) {
-    if area.height == 0 {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let toast_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-    let para = Paragraph::new(Line::from(vec![
-        Span::styled(" ", Style::default().bg(Color::DarkGray)),
-        Span::styled(
-            msg.to_string(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        Span::styled(" ", Style::default().bg(Color::DarkGray)),
-    ]));
-    frame.render_widget(para, toast_area);
+    let width = area.width as usize;
+    // One column of padding on each side; the glyphs in messages are ASCII, so
+    // char counts match display columns.
+    let text_width = width.saturating_sub(2).max(1);
+    let mut wrapped = wrap_message(msg, text_width);
+    // Never cover more than half the window, so the terminal stays visible.
+    let max_rows = (area.height / 2).max(1) as usize;
+    if wrapped.len() > max_rows {
+        wrapped.truncate(max_rows);
+        if let Some(last) = wrapped.last_mut() {
+            *last = truncate_ellipsis(last, text_width);
+        }
+    }
+
+    let style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let lines: Vec<Line> = wrapped
+        .into_iter()
+        .map(|line| {
+            // Pad each line to the full width so the bar background is solid.
+            let mut s = String::with_capacity(width);
+            s.push(' ');
+            s.push_str(&line);
+            let pad = width.saturating_sub(s.chars().count());
+            s.push_str(&" ".repeat(pad));
+            Line::from(Span::styled(s, style))
+        })
+        .collect();
+
+    let height = lines.len() as u16;
+    let top = area.y + area.height - height;
+    let toast_area = Rect::new(area.x, top, area.width, height);
+    frame.render_widget(Paragraph::new(lines).style(style), toast_area);
+}
+
+/// Greedily word-wrap `msg` to lines of at most `width` display columns. Words
+/// longer than `width` are hard-split so a single long token never overflows.
+fn wrap_message(msg: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in msg.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            // Flush the current line, then hard-split the oversized word.
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            cur = chunk;
+            continue;
+        }
+        let cur_len = cur.chars().count();
+        let needed = if cur.is_empty() { word_len } else { cur_len + 1 + word_len };
+        if needed > width {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,6 +1678,59 @@ mod tests {
             hit_test(area, &state, 30, 2),
             Some(HitTarget::Child(ChildTarget::Primary))
         );
+    }
+
+    #[test]
+    fn hit_test_maps_child_tab_close_glyph() {
+        let state = state_with_tabs(1);
+        let area = Rect::new(0, 0, 80, 24);
+        // " agent ✕ " starts at col 28; the ✕ sits at 28 + len("agent") + 2 = 35.
+        assert_eq!(
+            hit_test(area, &state, 35, 2),
+            Some(HitTarget::CloseChild(ChildTarget::Primary))
+        );
+        // A column just left of the glyph still selects the tab, not close it.
+        assert_eq!(
+            hit_test(area, &state, 30, 2),
+            Some(HitTarget::Child(ChildTarget::Primary))
+        );
+    }
+
+    #[test]
+    fn hit_test_maps_tab_bar_buttons() {
+        let state = state_with_tabs(1);
+        let area = Rect::new(0, 0, 80, 24);
+        // With a tab selected both buttons show, right-aligned: "+ shell" flush
+        // right (cols 71..=79), "+ agent" to its left (cols 61..=69).
+        assert_eq!(hit_test(area, &state, 72, 2), Some(HitTarget::NewShellButton));
+        assert_eq!(hit_test(area, &state, 62, 2), Some(HitTarget::NewAgentButton));
+    }
+
+    #[test]
+    fn hit_test_maps_sidebar_close_glyph() {
+        let state = state_with_tabs(2);
+        let area = Rect::new(0, 0, 80, 24);
+        // Tab 0's name row is row 4; the ✕ occupies the far-right inner columns.
+        assert_eq!(hit_test(area, &state, 26, 4), Some(HitTarget::CloseAgentTab(0)));
+        // A click on the left of the same row selects the tab instead.
+        assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
+    }
+
+    #[test]
+    fn wrap_message_splits_long_text_across_lines() {
+        let msg = "Rebase flightdeck/foo onto main then remove the worktree";
+        let lines = wrap_message(msg, 20);
+        assert!(lines.len() > 1, "long message should wrap");
+        assert!(lines.iter().all(|l| l.chars().count() <= 20));
+        // Round-trips the words in order.
+        assert_eq!(lines.join(" "), msg);
+    }
+
+    #[test]
+    fn wrap_message_hard_splits_oversized_word() {
+        let lines = wrap_message("supercalifragilistic", 5);
+        assert!(lines.iter().all(|l| l.chars().count() <= 5));
+        assert_eq!(lines.concat(), "supercalifragilistic");
     }
 
     #[test]

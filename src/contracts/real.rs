@@ -32,6 +32,14 @@ impl FileSystem for RealFs {
         fs::write(p, contents).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
     }
 
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::symlink_file(target, link);
+        r.map_err(|e| FlightDeckError::Io(format!("{}: {e}", link.display())))
+    }
+
     fn append_line(&self, p: &Path, line: &str) -> Result<()> {
         // If the file already has content that doesn't end in a newline, add
         // one first so the new line doesn't get glued onto the last existing

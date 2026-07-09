@@ -30,6 +30,8 @@ pub struct FakeFs {
 struct FakeFsState {
     files: BTreeMap<PathBuf, String>,
     dirs: HashSet<PathBuf>,
+    /// Symlinks as `link -> target`.
+    symlinks: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl FakeFs {
@@ -69,6 +71,11 @@ impl FakeFs {
     pub fn files(&self) -> Vec<PathBuf> {
         self.inner.lock().unwrap().files.keys().cloned().collect()
     }
+
+    /// The target of a symlink at `link`, if one exists.
+    pub fn symlink_target(&self, link: &Path) -> Option<PathBuf> {
+        self.inner.lock().unwrap().symlinks.get(link).cloned()
+    }
 }
 
 fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
@@ -85,7 +92,7 @@ fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
 impl FileSystem for FakeFs {
     fn exists(&self, p: &Path) -> bool {
         let st = self.inner.lock().unwrap();
-        st.files.contains_key(p) || st.dirs.contains(p)
+        st.files.contains_key(p) || st.dirs.contains(p) || st.symlinks.contains_key(p)
     }
 
     fn create_dir_all(&self, p: &Path) -> Result<()> {
@@ -109,6 +116,19 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.files.insert(p.to_path_buf(), contents.to_string());
+        Ok(())
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        if st.files.contains_key(link) || st.dirs.contains(link) || st.symlinks.contains_key(link) {
+            return Err(FlightDeckError::Io(format!(
+                "{}: already exists",
+                link.display()
+            )));
+        }
+        mark_parents(&mut st.dirs, link);
+        st.symlinks.insert(link.to_path_buf(), target.to_path_buf());
         Ok(())
     }
 

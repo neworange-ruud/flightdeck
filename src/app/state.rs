@@ -925,6 +925,11 @@ impl AppState {
         let attached = self.tabs[idx].meta.attached_existing_branch;
         let tab_id = self.tabs[idx].meta.id.clone();
 
+        // Share the base folder's `.env`/`.env.local` into the worktree before
+        // the agent starts, so it inherits the developer's secrets. Best-effort:
+        // never fails the session (SPECS §17 keeps creation robust).
+        self.link_env_files(&worktree_abs, services);
+
         // Resolve the launch (local command, or a fresh `podman run`) then spawn
         // the primary terminal (fast; stays on the UI thread — SPECS §31 keeps
         // the spawn path synchronous and never builds an image here).
@@ -966,6 +971,21 @@ impl AppState {
             Ok(Effect::AttachedExisting { branch })
         } else {
             Ok(Effect::Message(format!("Created Agent Tab on {branch}")))
+        }
+    }
+
+    /// Symlink the base folder's `.env` / `.env.local` into a new worktree so
+    /// the agent shares the developer's secrets without a copy that could drift.
+    /// Best-effort: any file that is absent in the base, already present in the
+    /// worktree, or fails to link is silently skipped — a missing `.env` must
+    /// never bother the user or fail session creation.
+    fn link_env_files(&self, worktree: &Path, services: &Services) {
+        for name in [".env", ".env.local"] {
+            let source = self.repo_root.join(name);
+            let destination = worktree.join(name);
+            if services.fs.exists(&source) && !services.fs.exists(&destination) {
+                let _ = services.fs.symlink(&source, &destination);
+            }
         }
     }
 
@@ -2135,6 +2155,83 @@ mod tests {
         assert_eq!(
             effect,
             Effect::Refused("No .env.local or .env found in base folder.".to_string())
+        );
+    }
+
+    #[test]
+    fn new_agent_tab_symlinks_env_files_from_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new()
+            .with_file("/repo/.env", "BASE=1\n")
+            .with_file("/repo/.env.local", "LOCAL=1\n");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Fix Login Bug".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // Both `.env` and `.env.local` are symlinked into the worktree pointing
+        // back at the base folder — no copy is made.
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            Some(PathBuf::from("/repo/.env"))
+        );
+        assert_eq!(
+            fs.symlink_target(Path::new(
+                "/repo/.flightdeck/worktrees/fix-login-bug/.env.local"
+            )),
+            Some(PathBuf::from("/repo/.env.local"))
+        );
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/.flightdeck/worktrees/fix-login-bug/.env")),
+            None
+        );
+    }
+
+    #[test]
+    fn new_agent_tab_without_env_files_creates_no_symlink() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        // Absent `.env`/`.env.local` must not fail session creation.
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "No Env".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/no-env/.env")),
+            None
+        );
+        assert_eq!(
+            fs.symlink_target(Path::new("/repo/.flightdeck/worktrees/no-env/.env.local")),
+            None
         );
     }
 

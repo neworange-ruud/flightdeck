@@ -67,11 +67,6 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         group: "Worktree",
-        label: "Copy .env(.local)",
-        action: PaletteAction::Dispatch(Command::CopyEnvFile),
-    },
-    PaletteEntry {
-        group: "Worktree",
         label: "Rebase Worktree",
         action: PaletteAction::Dispatch(Command::RebaseWorktree { confirm: false }),
     },
@@ -143,8 +138,10 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 ];
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
-/// View", "Rebase Worktree", "Copy .env(.local)", and "Pull Base" commands.
-pub const REQUIRED_ACTION_COUNT: usize = 20;
+/// View", "Rebase Worktree", and "Pull Base" commands. (The `.env` files are now
+/// symlinked into new worktrees automatically, so the "Copy .env(.local)" entry
+/// is hidden from the palette; the [`Command::CopyEnvFile`] command remains.)
+pub const REQUIRED_ACTION_COUNT: usize = 19;
 
 /// The command palette model (SPECS §22).
 ///
@@ -279,7 +276,6 @@ mod tests {
             "New Agent Tab",
             "Rename Agent Tab",
             "Close Agent Tab",
-            "Copy .env(.local)",
             "Push Branch",
             "Finish / Local Merge",
             "Pull Base",
@@ -308,11 +304,11 @@ mod tests {
 
     #[test]
     fn entries_have_groups() {
-        let copy = ALL_ENTRIES
+        let rebase = ALL_ENTRIES
             .iter()
-            .find(|e| e.label == "Copy .env(.local)")
-            .expect("copy env action present");
-        assert_eq!(copy.group, "Worktree");
+            .find(|e| e.label == "Rebase Worktree")
+            .expect("rebase worktree action present");
+        assert_eq!(rebase.group, "Worktree");
         assert!(ALL_ENTRIES.iter().all(|e| !e.group.is_empty()));
     }
 

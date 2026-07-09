@@ -681,6 +681,12 @@ enum Prompt {
     SetManualStatus,
     /// Choose how to handle running processes when closing (SPECS §25).
     CloseTab { actions: Vec<CloseAction> },
+    /// Confirm closing a child shell terminal (from the tab's `✕` or Ctrl-w).
+    /// `label` is the shell's display name, e.g. "shell 2".
+    CloseChildConfirm { label: String },
+    /// Sidebar `✕`: abandon the worktree, just close the agent, or cancel.
+    /// `index` is the Agent Tab the action targets.
+    CloseAgentChoice { index: usize },
     /// Confirm a push despite uncommitted changes (SPECS §14).
     PushConfirm,
     /// Confirm abandoning a worktree (SPECS §5/§15). `dirty` is true when it has
@@ -1109,6 +1115,15 @@ fn handle_mouse(
                             state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
                         state.focus_app();
                     }
+                    HitTarget::CloseAgentTab(i) => {
+                        // Sidebar [x]: select the tab, then ask whether to abandon
+                        // the worktree or just close the agent (never destructive
+                        // without confirmation).
+                        let _ =
+                            state.dispatch(Command::SwitchAgentTab(Selector::Index(i)), services);
+                        state.focus_app();
+                        start_prompt(ui, Prompt::CloseAgentChoice { index: i });
+                    }
                     HitTarget::Sidebar => {
                         // Clicking the sidebar chrome (header/heading/empty space)
                         // focuses the app without changing the selected tab, so
@@ -1119,6 +1134,18 @@ fn handle_mouse(
                     HitTarget::Child(target) => {
                         select_target(state, services, target);
                         state.focus_terminal();
+                    }
+                    HitTarget::CloseChild(target) => close_child_target(state, services, ui, target),
+                    HitTarget::NewAgentButton => {
+                        state.focus_app();
+                        start_new_tab_flow(state, ui);
+                    }
+                    HitTarget::NewShellButton => {
+                        if let Err(e) =
+                            dispatch_command(Command::NewChildTerminal, state, services, ui)
+                        {
+                            ui.message(format!("Error: {e}"));
+                        }
                     }
                 }
                 return;
@@ -1207,6 +1234,37 @@ fn select_target(state: &mut AppState, services: &Services, target: ChildTarget)
         }
         ChildTarget::Child(i) => {
             let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+        }
+    }
+}
+
+/// Handle a click on a child-terminal tab's `✕`. The primary "agent" tab closes
+/// the whole Agent Tab (its own confirming flow, SPECS §25); a shell selects
+/// itself and asks a yes/no confirm before closing.
+fn close_child_target(
+    state: &mut AppState,
+    services: &Services,
+    ui: &mut Ui,
+    target: ChildTarget,
+) {
+    match target {
+        ChildTarget::Primary => {
+            state.focus_app();
+            if let Err(e) = dispatch_command(Command::CloseAgentTab { action: None }, state, services, ui)
+            {
+                ui.message(format!("Error: {e}"));
+            }
+        }
+        ChildTarget::Child(i) => {
+            // Select the shell so the confirmed close acts on it.
+            let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
+            state.focus_app();
+            start_prompt(
+                ui,
+                Prompt::CloseChildConfirm {
+                    label: format!("shell {}", i + 1),
+                },
+            );
         }
     }
 }
@@ -1605,6 +1663,22 @@ fn dispatch_command(
             // Fall through: dispatch returns the option set, which we surface
             // as a Close prompt (SPECS §25, never auto-escalate).
         }
+        Command::CloseChildTerminal => {
+            // Confirm before closing a child shell (Ctrl-w), mirroring the
+            // tab's `✕` click. Acts on the currently-selected child.
+            match state.selected().and_then(|t| t.session.selected_child()) {
+                Some(i) => {
+                    start_prompt(
+                        ui,
+                        Prompt::CloseChildConfirm {
+                            label: format!("shell {}", i + 1),
+                        },
+                    );
+                }
+                None => ui.message("No child terminal selected."),
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -1740,6 +1814,13 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
                 parts.push(format!("[{}] {}", i + 1, close_action_label(*a)));
             }
             format!("Close tab — {}  (Esc cancel)", parts.join("  "))
+        }
+        Prompt::CloseChildConfirm { label } => {
+            format!("Close {label}? [y] close  [n] cancel  (Esc cancel)")
+        }
+        Prompt::CloseAgentChoice { .. } => {
+            "Abandon worktree or close agent? [a] abandon  [c] close  [n] cancel  (Esc cancel)"
+                .to_string()
         }
         Prompt::PushConfirm => {
             "Worktree has uncommitted changes. [p] push committed only  [c] cancel  (Esc cancel)"
@@ -1937,6 +2018,42 @@ fn handle_prompt_key(
                 }
             }
             ui.prompt = Some(pstate);
+        }
+        Prompt::CloseChildConfirm { .. } => match key.code {
+            KeyCode::Char('y') => {
+                let result = state.dispatch(Command::CloseChildTerminal, services);
+                finish_prompt(result, ui);
+            }
+            KeyCode::Char('n') => ui.clear(),
+            _ => ui.prompt = Some(pstate),
+        },
+        Prompt::CloseAgentChoice { index } => {
+            let index = *index;
+            match key.code {
+                KeyCode::Char('a') => {
+                    // Route through the standard abandon flow, which always asks
+                    // before discarding (warns extra loudly when dirty).
+                    let _ =
+                        state.dispatch(Command::SwitchAgentTab(Selector::Index(index)), services);
+                    ui.prompt = None;
+                    match state.dispatch(Command::AbandonWorktree { confirm: false }, services) {
+                        Ok(effect) => apply_effect_no_state(effect, ui),
+                        Err(e) => ui.message(format!("Error: {e}")),
+                    }
+                }
+                KeyCode::Char('c') => {
+                    // Close the agent via the standard close-options flow (§25).
+                    let _ =
+                        state.dispatch(Command::SwitchAgentTab(Selector::Index(index)), services);
+                    ui.prompt = None;
+                    match state.dispatch(Command::CloseAgentTab { action: None }, services) {
+                        Ok(effect) => apply_effect_no_state(effect, ui),
+                        Err(e) => ui.message(format!("Error: {e}")),
+                    }
+                }
+                KeyCode::Char('n') => ui.clear(),
+                _ => ui.prompt = Some(pstate),
+            }
         }
         Prompt::PushConfirm => {
             let confirm = match key.code {

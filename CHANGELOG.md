@@ -8,7 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Mouse-driven tab management on the child tab bar.** The horizontal tab bar
+  now carries **`+ agent`** and **`+ shell`** buttons, right-aligned and styled
+  distinctly from the tabs, for creating a new Agent Tab or a new child shell
+  without touching the keyboard. Each tab (agent or shell) also shows a `✕`
+  close control you can click to close it.
+- **Sidebar close control.** Each Agent Tab in the sidebar shows a right-aligned
+  `✕` on its name row. Clicking it asks whether to **Abandon** the worktree,
+  just **Close** the agent, or **Cancel**.
 
 ### Improvements
 
@@ -26,6 +33,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   ready" (and drop the macOS/Windows-only `podman machine start` hint on Linux),
   surface the underlying cause when a repository can't be discovered, and
   include the agent name in the "build the image first" guidance.
+- **Closing always confirms first.** Clicking a shell tab's `✕` (or pressing
+  `Ctrl-w`) now asks for confirmation before closing the child terminal, matching
+  the existing confirmation flow for closing an Agent Tab.
+- **Status messages wrap instead of truncating.** Long status/confirmation
+  messages at the bottom of the screen now break across multiple lines when they
+  do not fit the window width, rather than being cut off at the edge.
+- New agent sessions now **symlink** the base folder's `.env` and `.env.local`
+  into the worktree automatically, instead of requiring a manual copy. The link
+  keeps secrets in sync with the base and is best-effort — sessions where the
+  base has no `.env`/`.env.local` are created silently, with nothing to do. The
+  now-redundant *Copy .env(.local)* command is hidden from the palette.
 
 ### Bug fixes
 
