@@ -19,8 +19,17 @@ fi
 version="${1#v}"
 tag="v${version}"
 
+version_core="${version%%[-+]*}"
+
 case "$version" in
-  *[!0-9A-Za-z.+-]*|""|*.*.*.*)
+  *[!0-9A-Za-z.+-]*|"")
+    printf 'Invalid SemVer-ish version: %s\n' "$version" >&2
+    exit 2
+    ;;
+esac
+
+case "$version_core" in
+  *.*.*.*)
     printf 'Invalid SemVer-ish version: %s\n' "$version" >&2
     exit 2
     ;;

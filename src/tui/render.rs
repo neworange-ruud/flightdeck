@@ -665,7 +665,7 @@ fn render_screen(
             }
         }
     }
-    if focused && !screen.hide_cursor() {
+    if focused && offset == 0 && !screen.hide_cursor() {
         let (cr, cc) = screen.cursor_position();
         if cr < area.height && cc < area.width {
             frame.set_cursor_position((area.x + cc, area.y + cr));

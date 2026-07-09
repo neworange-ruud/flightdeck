@@ -35,12 +35,38 @@ pub fn agent_install_command(agent: &str) -> Option<&'static str> {
 /// A FlightDeck-owned base image tag (for users who prefer to pre-build a base
 /// and point `containers.base_image` at it; not used by the default flow).
 pub fn base_image_tag(agent: &str) -> String {
-    format!("localhost/flightdeck-{agent}-base:latest")
+    format!(
+        "localhost/flightdeck-{}-base:latest",
+        sanitize_tag_component(agent)
+    )
 }
 
 /// The per-project, per-agent image built from base + customization.
 pub fn project_image_tag(repo_hash: &str, agent: &str) -> String {
-    format!("localhost/flightdeck-{repo_hash}-{agent}:local")
+    format!(
+        "localhost/flightdeck-{repo_hash}-{}:local",
+        sanitize_tag_component(agent)
+    )
+}
+
+/// Sanitize an arbitrary agent key into a valid Docker/Podman image-tag
+/// repository component (`^[a-z0-9]+([._-][a-z0-9]+)*$`): uppercase is
+/// lowercased and anything else disallowed becomes `-`, with a leading
+/// non-alphanumeric prefixed by `x` (mirrors [`crate::runtime::name::sanitize`],
+/// adjusted for the stricter lowercase-only tag charset).
+fn sanitize_tag_component(s: &str) -> String {
+    let mapped: String = s
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect();
+    match mapped.chars().next() {
+        Some(c) if c.is_ascii_alphanumeric() => mapped,
+        _ => format!("x{mapped}"),
+    }
 }
 
 /// The image tag a launch will use: an explicit `containers.image`, else the
@@ -225,9 +251,9 @@ pub fn ensure_image(
 
 /// A clear error explaining a containerized launch cannot proceed because the
 /// image is missing (used on the fast launch path, which does not build).
-pub fn missing_image_error(tag: &str) -> FlightDeckError {
+pub fn missing_image_error(tag: &str, agent: &str) -> FlightDeckError {
     FlightDeckError::Refused(format!(
-        "container image '{tag}' not found — build it first with `flightdeck image build`"
+        "container image '{tag}' not found — build it first with `flightdeck image build {agent}`"
     ))
 }
 
@@ -247,6 +273,20 @@ mod tests {
         assert_eq!(
             project_image_tag("deadbeef", "claude"),
             "localhost/flightdeck-deadbeef-claude:local"
+        );
+    }
+
+    #[test]
+    fn tag_components_are_sanitized() {
+        // Uppercase/space/slash agent keys must not leak invalid chars into a
+        // Docker/Podman repository component (lowercase-only).
+        assert_eq!(
+            base_image_tag("MyAgent"),
+            "localhost/flightdeck-myagent-base:latest"
+        );
+        assert_eq!(
+            project_image_tag("deadbeef", "my agent/v2"),
+            "localhost/flightdeck-deadbeef-my-agent-v2:local"
         );
     }
 
@@ -405,6 +445,30 @@ mod tests {
         assert!(
             rt.builds.lock().unwrap().is_empty(),
             "current image → no rebuild"
+        );
+    }
+
+    #[test]
+    fn ensure_image_rebuilds_when_label_is_stale() {
+        let fs = FakeFs::new();
+        let exec = ContainersConfig {
+            enabled: true,
+            packages: vec!["jq".to_string()],
+            ..Default::default()
+        };
+        // Image exists but its baked label does not match the current
+        // customization hash — must rebuild, not skip.
+        let rt = ImgFake {
+            exists: true,
+            label: Some("stale".to_string()),
+            ..Default::default()
+        };
+        let tag = ensure_image(&rt, &fs, Path::new("/repo"), "h", "claude", &exec).unwrap();
+        assert_eq!(tag, "localhost/flightdeck-h-claude:local");
+        assert_eq!(
+            rt.builds.lock().unwrap().len(),
+            1,
+            "stale label → must rebuild"
         );
     }
 

@@ -190,40 +190,68 @@ fn save_clipboard_image_linux() -> Option<PathBuf> {
     None
 }
 
-/// Pipe `text` into the first available platform clipboard command. Returns
+/// Pipe `text` into the first available platform clipboard command. On
+/// Windows this returns PowerShell's actual success/failure so the OSC 52
+/// fallback still runs when `Set-Clipboard` fails; elsewhere it returns
 /// `true` once a command was spawned (regardless of whether it ultimately
 /// succeeded), so the OSC 52 fallback is skipped when a native tool exists.
 fn try_command_clipboard(text: &str) -> bool {
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbcopy", &[])]
-    } else if cfg!(target_os = "windows") {
-        // `clip` reads stdin and sets the clipboard.
-        &[("clip", &[])]
-    } else {
-        &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["-ib"]),
-        ]
-    };
-
-    for (cmd, args) in candidates {
-        let spawned = Command::new(cmd)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(mut child) = spawned {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-                // `stdin` drops here, closing the pipe so the command sees EOF.
-            }
-            let _ = child.wait();
-            return true;
-        }
+    #[cfg(target_os = "windows")]
+    {
+        return try_windows_clipboard(text);
     }
-    false
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+            &[("pbcopy", &[])]
+        } else {
+            &[
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["-ib"]),
+            ]
+        };
+
+        for (cmd, args) in candidates {
+            let spawned = Command::new(cmd)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(mut child) = spawned {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                    // `stdin` drops here, closing the pipe so the command sees EOF.
+                }
+                let _ = child.wait();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Windows: set the clipboard via PowerShell's `Set-Clipboard` instead of
+/// piping into `clip`. `clip` decodes piped stdin using the process's
+/// OEM/ANSI code page rather than UTF-8, so any non-ASCII text gets mangled
+/// on the way in; base64-encoding the UTF-8 bytes and decoding them inside
+/// PowerShell avoids that entirely (and sidesteps `-Command` quoting issues,
+/// since the base64 alphabet never contains a `'`).
+#[cfg(target_os = "windows")]
+fn try_windows_clipboard(text: &str) -> bool {
+    let b64 = base64_encode(text.as_bytes());
+    let script = format!(
+        "Set-Clipboard -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64}')))"
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Write an OSC 52 clipboard-set sequence to stdout.

@@ -7,7 +7,7 @@
 
 use crate::config::load::serialize_config;
 use crate::config::schema::default_config;
-use crate::contracts::{FileSystem, ProjectState, Result, STATE_VERSION};
+use crate::contracts::{FileSystem, Result};
 use std::path::Path;
 
 /// What first-run init created (each `true` only if it was missing before).
@@ -49,12 +49,7 @@ pub fn initialize(
 
     // 3. Create state.json if missing
     if !fs.exists(&state_path) {
-        let state = ProjectState {
-            version: STATE_VERSION,
-            project_root_relative: ".".to_string(),
-            base_branch: base_branch.to_string(),
-            tabs: vec![],
-        };
+        let state = crate::persistence::project_state::default_state(base_branch);
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| crate::contracts::FlightDeckError::State(e.to_string()))?;
         fs.write(&state_path, &json)?;

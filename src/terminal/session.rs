@@ -407,25 +407,51 @@ impl Session {
     }
 
     /// Send Ctrl-C to the primary and all child terminals (SPECS §25).
+    ///
+    /// Every terminal is attempted even if an earlier one fails (e.g. the
+    /// primary has already exited and signaling it returns an error) so a
+    /// single failure cannot prevent still-running terminals from being
+    /// signaled. The first error encountered, if any, is returned after all
+    /// attempts have been made.
     pub fn ctrl_c_all(&mut self) -> Result<()> {
+        let mut result = Ok(());
         if let Some(primary) = self.primary.as_mut() {
-            primary.session_mut().send_ctrl_c()?;
+            if let Err(e) = primary.session_mut().send_ctrl_c() {
+                result = Err(e);
+            }
         }
         for child in self.children.iter_mut() {
-            child.session_mut().send_ctrl_c()?;
+            if let Err(e) = child.session_mut().send_ctrl_c() {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
         }
-        Ok(())
+        result
     }
 
     /// Force-terminate every process in this session (SPECS §25 force path).
+    ///
+    /// Every terminal is attempted even if an earlier one fails (e.g. the
+    /// primary has already exited and been reaped, so killing it returns an
+    /// error) so a single failure cannot prevent still-running terminals
+    /// from being terminated. The first error encountered, if any, is
+    /// returned after all attempts have been made.
     pub fn terminate_all(&mut self) -> Result<()> {
+        let mut result = Ok(());
         if let Some(primary) = self.primary.as_mut() {
-            primary.session_mut().terminate_tree()?;
+            if let Err(e) = primary.session_mut().terminate_tree() {
+                result = Err(e);
+            }
         }
         for child in self.children.iter_mut() {
-            child.session_mut().terminate_tree()?;
+            if let Err(e) = child.session_mut().terminate_tree() {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
         }
-        Ok(())
+        result
     }
 
     /// Whether all terminals (primary + children) have stopped (SPECS §25

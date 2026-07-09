@@ -114,6 +114,12 @@ pub fn build_exec_args(name: &str, shell_cmd: &str, shell_args: &[String]) -> Ve
 }
 
 /// `host:dst[:opts]` for the workspace mount.
+///
+/// NOTE: container isolation targets macOS and Linux hosts. On Windows the
+/// host path's drive-letter colon (e.g. `C:\...`) would collide with podman's
+/// `host:container[:opts]` colon delimiter; supporting Windows would require
+/// translating host paths to the podman-machine VM's expected form. Container
+/// mode is not offered on Windows, so no translation is done here.
 fn volume_arg(host: &Path, dst: &str, read_only: bool, flags: &Option<String>) -> String {
     let mut opts: Vec<&str> = Vec::new();
     if read_only {

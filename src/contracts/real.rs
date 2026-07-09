@@ -33,11 +33,22 @@ impl FileSystem for RealFs {
     }
 
     fn append_line(&self, p: &Path, line: &str) -> Result<()> {
+        // If the file already has content that doesn't end in a newline, add
+        // one first so the new line doesn't get glued onto the last existing
+        // line (a real-world state for files saved without a final newline).
+        let needs_leading_newline = match fs::read(p) {
+            Ok(bytes) => !bytes.is_empty() && bytes.last() != Some(&b'\n'),
+            Err(_) => false,
+        };
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(p)
             .map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))?;
+        if needs_leading_newline {
+            f.write_all(b"\n")
+                .map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))?;
+        }
         writeln!(f, "{line}").map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
     }
 

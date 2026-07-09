@@ -28,6 +28,8 @@ pub fn ensure_gitignore_entry(fs: &dyn FileSystem, repo_root: &Path, entry: &str
     if existing.lines().map(str::trim).any(|l| l == entry) {
         return Ok(false);
     }
+    // `append_line` inserts a separating newline itself when the existing
+    // content lacks a trailing one, honouring the append-only contract.
     fs.append_line(&gitignore_path, entry)?;
     Ok(true)
 }
@@ -194,6 +196,33 @@ mod tests {
         assert!(node_idx < state_idx);
         assert!(target_idx < wt_idx);
         assert!(node_idx < wt_idx);
+    }
+
+    // Regression: a .gitignore whose last line has no trailing newline must not
+    // have the first appended entry glued onto it.
+    #[test]
+    fn appends_cleanly_when_file_lacks_trailing_newline() {
+        // Note: no trailing '\n' after "node_modules".
+        let fs = FakeFs::new().with_file(GITIGNORE, "/target\nnode_modules");
+        let (update, contents) = run(&fs);
+
+        assert!(update.changed);
+        let lines: Vec<&str> = contents.lines().collect();
+        // The last pre-existing line must survive intact on its own line.
+        assert!(
+            lines.contains(&"node_modules"),
+            "existing last line was corrupted: {contents:?}"
+        );
+        // And the appended entries are each on their own line.
+        assert!(lines.contains(&STATE_IGNORE_ENTRY));
+        assert!(lines.contains(&WORKTREES_IGNORE_ENTRY));
+        // No line accidentally concatenated the two.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("node_modules") && l.len() > "node_modules".len()),
+            "an entry was glued onto node_modules: {contents:?}"
+        );
     }
 
     // §26: changed=true with correct added list when it appends

@@ -294,9 +294,7 @@ impl PtySession for PortablePtySession {
             // that re-parent (daemonize / double-fork) may survive. Killing the
             // pty's direct child (the shell/agent) is acceptable, and dropping
             // the pty master delivers SIGHUP to the foreground group.
-            self.killer
-                .kill()
-                .map_err(|e| FlightDeckError::Io(format!("failed to kill pty child: {e}")))?;
+            let _ = self.killer.kill();
         }
         // Block until the direct child has actually exited so the OS releases the
         // handles it held — most importantly its working directory. On Windows

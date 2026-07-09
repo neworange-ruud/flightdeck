@@ -130,10 +130,10 @@ pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
 
-    let git = GitCli::discover(&cwd).map_err(|_| {
-        FlightDeckError::Git(
-            "not inside a Git repository (run FlightDeck from a git project)".to_string(),
-        )
+    let git = GitCli::discover(&cwd).map_err(|e| {
+        FlightDeckError::Git(format!(
+            "not inside a Git repository (run FlightDeck from a git project): {e}"
+        ))
     })?;
     let repo_root = git.root().to_path_buf();
 
@@ -362,6 +362,10 @@ fn run_setup_update() -> Result<()> {
     println!("background) and show a status-bar hint when a newer version is available.");
     println!("It never auto-updates — run `flightdeck update` (or `brew upgrade flightdeck`).");
     println!("Disable any time by setting `check = false` under [update].");
+    #[cfg(not(all(feature = "self-update", not(windows))))]
+    println!(
+        "Note: this build was compiled without self-update support, so the check above will never run."
+    );
     Ok(())
 }
 
@@ -397,6 +401,16 @@ fn run_image() -> Result<()> {
         initialize(&fs, &repo_root, &project_name, &base_branch)?;
     }
     let config = load_config(&fs, &config_path)?;
+
+    // `validate_containers` skips its checks whenever `enabled` is false (so a
+    // disabled-but-malformed table never blocks an ordinary launch), but
+    // `image build` is an explicit, container-specific action that customizes
+    // the image regardless of `enabled` — validate as if enabled so a bad
+    // combination (e.g. `containerfile` + `packages`) is rejected here instead
+    // of silently dropping the customization in `ensure_image`.
+    let mut containers_for_validation = config.containers.clone();
+    containers_for_validation.enabled = true;
+    crate::config::schema::validate_containers(&containers_for_validation)?;
 
     let agent = std::env::args()
         .nth(3)
@@ -500,6 +514,12 @@ fn run_doctor() -> Result<()> {
 /// `.gitignore` update + §6 notice, load + recover state, build [`AppState`],
 /// and record the §13 dirty-base warning if the base repo is dirty at startup.
 fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState> {
+    // Capture dirtiness before any of FlightDeck's own first-run writes below
+    // (config.toml, .gitignore) touch the working tree — otherwise those
+    // bootstrap writes would themselves make an actually-clean repo look dirty
+    // (SPECS §13).
+    let dirty = services.git.is_dirty(repo_root).unwrap_or(false);
+
     // Detect the base branch using the configured value if a config already
     // exists, otherwise the current branch (SPECS §7 step 3, §12).
     let flightdeck_dir = repo_root.join(".flightdeck");
@@ -538,7 +558,7 @@ fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState
     // agents (SPECS §10).
     let mut project_state =
         load_state(services.fs, &state_path).unwrap_or_else(|_| default_state(&base_branch));
-    let _report = recover(
+    let report = recover(
         services.fs,
         services.git,
         repo_root,
@@ -548,8 +568,16 @@ fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState
 
     let mut state = AppState::new(config, project_state, repo_root, &state_path);
 
+    // Surface stale entries (worktree missing on disk / unregistered in git)
+    // so the user knows to remove them, instead of silently discarding them.
+    for id in &report.stale_entries {
+        state.warnings.push(format!(
+            "Stale tab entry: {id} (worktree missing) — remove it from the tab actions menu"
+        ));
+    }
+
     // SPECS §13: dirty base at startup → persistent warning (merge disabled).
-    if services.git.is_dirty(repo_root).unwrap_or(false) {
+    if dirty {
         let warning = "Base repo dirty: local merge disabled".to_string();
         if !state.warnings.contains(&warning) {
             state.warnings.push(warning);
@@ -797,6 +825,11 @@ fn event_loop(
 
         // --- Apply completed background worktree-creation jobs. ---
         drain_create_outcomes(&create_rx, state, services, &mut ui);
+
+        // --- Prune cache entries for tabs that no longer exist (closed,
+        // abandoned, or failed creation) so a long-running session doesn't
+        // accumulate stale WorktreeStatus entries indefinitely. ---
+        cache.retain(|id, _| state.tabs.iter().any(|t| &t.meta.id == id));
 
         // --- Apply background git-status results into the cache. ---
         while let Ok(msg) = status_rx.try_recv() {
@@ -1515,8 +1548,11 @@ fn handle_paste(
         return Ok(());
     }
 
-    // Any other overlay swallows input the way a key press would; ignore it.
-    if !matches!(ui.overlay, UiOverlay::None) || ui.modal_active() {
+    // Any other overlay swallows input the way a key press would; dismiss it
+    // (mirroring the analogous branch in `handle_key`) rather than silently
+    // dropping the paste with the overlay left stuck on screen.
+    if !matches!(ui.overlay, UiOverlay::None) {
+        ui.clear();
         return Ok(());
     }
 
@@ -1633,10 +1669,10 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
                 },
             );
         }
-        Effect::GitStatus(status) => {
+        Effect::GitStatus { status, pr_url } => {
             ui.overlay = UiOverlay::GitStatus {
                 status: *status,
-                pr_url: None,
+                pr_url,
             };
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,
@@ -2007,10 +2043,10 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
                 actions: opts.actions,
             },
         ),
-        Effect::GitStatus(status) => {
+        Effect::GitStatus { status, pr_url } => {
             ui.overlay = UiOverlay::GitStatus {
                 status: *status,
-                pr_url: None,
+                pr_url,
             }
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,

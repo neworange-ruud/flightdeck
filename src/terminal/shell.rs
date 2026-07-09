@@ -29,6 +29,20 @@ pub fn shell_launch() -> (String, Vec<String>) {
     (default_shell(), vec![])
 }
 
+/// The shell used for a child terminal that runs inside a container via
+/// `podman exec`.
+///
+/// Containers are always Linux (see `runtime::container`), regardless of the
+/// host OS, so a containerized child must use a Linux-native shell rather
+/// than [`default_shell`] (which resolves to PowerShell on a Windows host and
+/// would not exist inside the container). Existence checks against the
+/// container's filesystem can't be performed from the host process, so this
+/// always resolves to `/bin/bash`; callers that need a `/bin/sh` fallback
+/// should handle it as part of the exec invocation itself.
+pub fn container_shell() -> String {
+    "/bin/bash".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +58,12 @@ mod tests {
     fn default_shell_is_non_empty() {
         // Regardless of environment, we always resolve to *some* shell path.
         assert!(!default_shell().is_empty());
+    }
+
+    #[test]
+    fn container_shell_is_linux_native_regardless_of_host() {
+        // Containers are always Linux, so this must never resolve to a
+        // Windows shell, even when the host is Windows.
+        assert_eq!(container_shell(), "/bin/bash");
     }
 }

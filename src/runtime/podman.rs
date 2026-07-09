@@ -62,18 +62,36 @@ impl ContainerRuntime for PodmanCli {
         if out.status.success() {
             Ok(())
         } else {
-            // Installed but not ready — almost always the machine being down.
+            // Installed but not ready — almost always the machine being down
+            // (macOS/Windows only; `podman machine` has no Linux equivalent).
+            let hint = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+                "\nTry: podman machine start"
+            } else {
+                ""
+            };
             Err(FlightDeckError::Refused(format!(
-                "podman is installed but not ready (is the machine running?): {}\n\
-                 Try: podman machine start",
+                "podman is installed but not ready (is the machine running?): {}{hint}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )))
         }
     }
 
     fn image_exists(&self, tag: &str) -> Result<bool> {
-        // `podman image exists` exits 0 when present, non-zero otherwise.
-        Ok(Self::output(&["image", "exists", tag])?.status.success())
+        // `podman image exists` exits 0 when present, 1 when absent (the
+        // documented "does not exist" result). Any other exit status (e.g.
+        // 125 for an internal/connection error) means podman itself failed,
+        // not that the image is missing — don't conflate the two.
+        let out = Self::output(&["image", "exists", tag])?;
+        if out.status.success() {
+            Ok(true)
+        } else if out.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            Err(FlightDeckError::Other(format!(
+                "podman image exists failed for {tag}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
     }
 
     fn image_label(&self, tag: &str, key: &str) -> Result<Option<String>> {

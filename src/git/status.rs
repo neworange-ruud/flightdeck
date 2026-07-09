@@ -134,10 +134,11 @@ pub struct MergeRequest<'a> {
 const BASE_DIRTY_MESSAGE: &str = "Base worktree has uncommitted changes. Local merge is disabled.\nRecommended action: push this branch and create a PR instead.";
 
 /// Check the technical local merge-back preconditions (SPECS §15): both
-/// worktrees clean and both branches exist. Refuses with a clear reason
-/// otherwise; base-dirty disables merge entirely (SPECS §13). A running primary
-/// agent does NOT block the merge — "Finish" stops the agent and removes the
-/// worktree after merging. User confirmation is handled at the command layer.
+/// worktrees clean, the base worktree actually has `base_branch` checked out,
+/// and both branches exist. Refuses with a clear reason otherwise; base-dirty
+/// disables merge entirely (SPECS §13). A running primary agent does NOT block
+/// the merge — "Finish" stops the agent and removes the worktree after
+/// merging. User confirmation is handled at the command layer.
 pub fn check_merge_preconditions(
     git: &dyn GitExecutor,
     req: &MergeRequest<'_>,
@@ -151,6 +152,15 @@ pub fn check_merge_preconditions(
         return Ok(MergeDecision::Refused(format!(
             "Agent worktree '{}' has uncommitted changes; commit or discard them before merging.",
             req.agent_worktree.display()
+        )));
+    }
+    // Base worktree must actually have base_branch checked out — merging
+    // merges into whatever is currently HEAD there, not the named branch.
+    let current = git.current_branch(req.base_worktree)?;
+    if current != req.base_branch {
+        return Ok(MergeDecision::Refused(format!(
+            "Base worktree is on '{}', not the base branch '{}'.",
+            current, req.base_branch
         )));
     }
     // Base branch exists.
@@ -220,8 +230,9 @@ pub struct RebaseRequest<'a> {
 
 /// Check the technical preconditions for rebasing the agent worktree onto its
 /// base branch (SPECS §5 carve-out): the agent worktree must be clean (a rebase
-/// refuses on uncommitted changes anyway, and we never stash or discard) and
-/// both branches must exist. Unlike merge-back this does not touch the base
+/// refuses on uncommitted changes anyway, and we never stash or discard), the
+/// agent worktree must actually have `agent_branch` checked out, and both
+/// branches must exist. Unlike merge-back this does not touch the base
 /// worktree, so the base's dirty state is irrelevant. User confirmation is
 /// handled at the command layer.
 pub fn check_rebase_preconditions(
@@ -232,6 +243,17 @@ pub fn check_rebase_preconditions(
         return Ok(RebaseDecision::Refused(format!(
             "Agent worktree '{}' has uncommitted changes; commit or discard them before rebasing.",
             req.agent_worktree.display()
+        )));
+    }
+    // Agent worktree must actually have agent_branch checked out — a rebase
+    // rewrites whatever is currently HEAD there, not the named branch.
+    let current = git.current_branch(req.agent_worktree)?;
+    if current != req.agent_branch {
+        return Ok(RebaseDecision::Refused(format!(
+            "Agent worktree '{}' is on '{}', not the agent branch '{}'.",
+            req.agent_worktree.display(),
+            current,
+            req.agent_branch
         )));
     }
     if !git.branch_exists(req.base_branch)? {
@@ -437,6 +459,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_refused_when_base_worktree_on_wrong_branch() {
+        // Both worktrees are clean and both branches exist, but the base
+        // worktree has some other branch checked out — merging into it
+        // would silently land on the wrong branch.
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("some-other-branch");
+        let base_wt = Path::new("/repo");
+        let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
+        let decision =
+            check_merge_preconditions(&git, &req("main", "flightdeck/feat", base_wt, agent_wt))
+                .unwrap();
+        match decision {
+            MergeDecision::Refused(msg) => {
+                assert!(msg.contains("some-other-branch"));
+                assert!(msg.contains("main"));
+            }
+            MergeDecision::Allowed => panic!("expected refusal"),
+        }
+    }
+
+    #[test]
     fn merge_refused_when_branch_missing() {
         let git = FakeGit::new().with_branches(["main"]);
         let base_wt = Path::new("/repo");
@@ -517,12 +561,35 @@ mod tests {
 
     #[test]
     fn rebase_allowed_when_clean_and_branches_exist() {
-        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("flightdeck/feat");
         let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
         let decision =
             check_rebase_preconditions(&git, &rebase_req("main", "flightdeck/feat", agent_wt))
                 .unwrap();
         assert_eq!(decision, RebaseDecision::Allowed);
+    }
+
+    #[test]
+    fn rebase_refused_when_agent_worktree_on_wrong_branch() {
+        // The agent worktree is clean and both branches exist, but the
+        // checked-out branch there is not agent_branch — rebasing would
+        // silently rewrite whatever is actually checked out.
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("some-other-branch");
+        let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
+        let decision =
+            check_rebase_preconditions(&git, &rebase_req("main", "flightdeck/feat", agent_wt))
+                .unwrap();
+        match decision {
+            RebaseDecision::Refused(msg) => {
+                assert!(msg.contains("some-other-branch"));
+                assert!(msg.contains("flightdeck/feat"));
+            }
+            RebaseDecision::Allowed => panic!("expected refusal"),
+        }
     }
 
     #[test]
@@ -539,7 +606,9 @@ mod tests {
 
     #[test]
     fn rebase_refused_when_base_branch_missing() {
-        let git = FakeGit::new().with_branches(["flightdeck/feat"]);
+        let git = FakeGit::new()
+            .with_branches(["flightdeck/feat"])
+            .with_current_branch("flightdeck/feat");
         let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
         let decision =
             check_rebase_preconditions(&git, &rebase_req("main", "flightdeck/feat", agent_wt))
@@ -549,7 +618,9 @@ mod tests {
 
     #[test]
     fn rebase_onto_base_rebases_on_allowed() {
-        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("flightdeck/feat");
         let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
         let outcome =
             rebase_onto_base(&git, &rebase_req("main", "flightdeck/feat", agent_wt)).unwrap();
@@ -575,7 +646,9 @@ mod tests {
 
     #[test]
     fn rebase_onto_base_surfaces_aborted_conflict() {
-        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("flightdeck/feat");
         let agent_wt = Path::new("/repo/.flightdeck/worktrees/feat");
         git.set_rebase_outcome(RebaseOutcome {
             rebased: false,

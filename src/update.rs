@@ -150,7 +150,9 @@ fn current_version() -> Option<Version> {
 }
 
 /// Per-user cache file (global, not repo-scoped). macOS-first; honors
-/// `FLIGHTDECK_UPDATE_CACHE` (tests) and `XDG_CACHE_HOME` when set.
+/// `FLIGHTDECK_UPDATE_CACHE` (tests) and `XDG_CACHE_HOME` when set. Falls back
+/// to `USERPROFILE` on native Windows shells (cmd.exe/PowerShell), which don't
+/// set `HOME`, so the once-a-day cache still has a stable location there.
 fn cache_path() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("FLIGHTDECK_UPDATE_CACHE") {
         return Some(PathBuf::from(explicit));
@@ -162,8 +164,20 @@ fn cache_path() -> Option<PathBuf> {
                 .join("update-check.json"),
         );
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/flightdeck/update-check.json"))
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(
+            PathBuf::from(home).join("Library/Application Support/flightdeck/update-check.json"),
+        );
+    }
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(
+                PathBuf::from(profile).join("AppData\\Local\\flightdeck\\update-check.json"),
+            );
+        }
+    }
+    None
 }
 
 /// Pure: is a fresh check due, given the last check time and now?

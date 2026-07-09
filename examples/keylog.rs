@@ -28,6 +28,17 @@ fn main() -> io::Result<()> {
     )?;
     out.flush()?;
 
+    let result = read_loop(&mut out);
+
+    // Always restore the terminal, even if the read loop above errored out,
+    // so a closed/piped stdin or stdout doesn't leave the user's shell in
+    // raw mode.
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    disable_raw_mode()?;
+    result
+}
+
+fn read_loop(out: &mut io::Stdout) -> io::Result<()> {
     loop {
         if let Event::Key(KeyEvent {
             code,
@@ -49,8 +60,5 @@ fn main() -> io::Result<()> {
             }
         }
     }
-
-    let _ = execute!(out, PopKeyboardEnhancementFlags);
-    disable_raw_mode()?;
     Ok(())
 }

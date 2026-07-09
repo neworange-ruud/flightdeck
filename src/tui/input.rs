@@ -256,13 +256,10 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                vec![0x1b, b'[', b'Z']
-            } else {
-                vec![b'\t']
-            }
-        }
+        KeyCode::Tab => vec![b'\t'],
+        // crossterm reports Shift+Tab as the dedicated `BackTab` variant (with
+        // SHIFT set), never as `Tab` + SHIFT, on Unix and Windows alike.
+        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => vec![0x1b, b'[', b'A'],
         KeyCode::Down => vec![0x1b, b'[', b'B'],
@@ -703,8 +700,10 @@ mod tests {
 
     #[test]
     fn encode_key_shift_tab_backtab() {
+        // crossterm delivers Shift+Tab as `KeyCode::BackTab` (with SHIFT set),
+        // never as `KeyCode::Tab` + SHIFT — this is the event it actually emits.
         let k = KeyEvent {
-            code: KeyCode::Tab,
+            code: KeyCode::BackTab,
             modifiers: KeyModifiers::SHIFT,
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),

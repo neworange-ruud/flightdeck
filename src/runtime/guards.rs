@@ -19,10 +19,10 @@ pub fn enforce_guardrails(args: &[String]) -> Result<()> {
 /// touching the environment.
 pub fn enforce_guardrails_with_home(args: &[String], home: Option<&Path>) -> Result<()> {
     for arg in args {
-        if arg == "--privileged" {
+        if arg == "--privileged" || arg.starts_with("--privileged=") {
             return refuse("--privileged is not permitted");
         }
-        if arg == "--env-host" {
+        if arg == "--env-host" || arg.starts_with("--env-host=") {
             return refuse("--env-host is not permitted (no full host env inheritance)");
         }
         if mentions_runtime_socket(arg) {
@@ -129,6 +129,18 @@ mod tests {
     #[test]
     fn rejects_env_host() {
         let a = args(&["run", "--env-host", "img"]);
+        assert!(enforce_guardrails_with_home(&a, None).is_err());
+    }
+
+    #[test]
+    fn rejects_privileged_equals_form() {
+        let a = args(&["run", "--privileged=true", "img"]);
+        assert!(enforce_guardrails_with_home(&a, None).is_err());
+    }
+
+    #[test]
+    fn rejects_env_host_equals_form() {
+        let a = args(&["run", "--env-host=true", "img"]);
         assert!(enforce_guardrails_with_home(&a, None).is_err());
     }
 

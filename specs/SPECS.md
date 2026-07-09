@@ -794,18 +794,19 @@ Global
   ?               Help / keybindings
 
 Agent Tab Navigation
-  Alt-Left        Previous Agent Tab
-  Alt-Right       Next Agent Tab
+  Alt-Up          Previous Agent Tab
+  Alt-Down        Next Agent Tab
   Alt-1..Alt-9    Jump to Agent Tab by index
 
 Child Terminal Navigation
   Ctrl-t          New child terminal
   Ctrl-w          Close active child terminal
-  Ctrl-Tab        Next child terminal
-  Ctrl-Shift-Tab  Previous child terminal
+  Alt-Left        Previous child terminal (cycles agent + shells)
+  Alt-Right       Next child terminal (cycles agent + shells)
 
 Focus
-  Esc             Leave terminal input focus / focus app chrome
+  Alt-Esc         Leave terminal input focus / focus app chrome
+                  (Shift-Esc on Windows/Linux, where Alt-Esc is reserved)
   Enter           Focus active terminal
 
 Status
