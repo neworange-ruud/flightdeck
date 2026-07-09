@@ -12,7 +12,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Add a code-review topic breakdown that splits the codebase into small,
+  independently reviewable scopes.
 
 ### Bug fixes
 
