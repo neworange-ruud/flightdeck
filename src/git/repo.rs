@@ -253,9 +253,17 @@ impl GitExecutor for GitCli {
         }
         let combined = format!("{}\n{}", stdout_trimmed(&out), stderr_trimmed(&out));
         let conflicted = combined.to_lowercase().contains("conflict");
-        // Abort any rebase left in progress (no-op/harmless if none is). We
-        // ignore its result: the worktree state is reported via the outcome.
-        let _ = self.run_in(cwd, &["rebase", "--abort"]);
+        // Abort any rebase left in progress (no-op/harmless if none is). The
+        // abort's success is verified: if it fails too, we must not report a
+        // normal "aborted, unchanged" outcome — that would falsely claim the
+        // §5 safety invariant held when the worktree may be mid-rebase.
+        let abort_out = self.run_in(cwd, &["rebase", "--abort"])?;
+        if !abort_out.status.success() {
+            return Err(FlightDeckError::Git(format!(
+                "rebase onto '{onto}' failed and the abort also failed ({}); the worktree may be left mid-rebase and needs manual `git rebase --abort`",
+                stderr_trimmed(&abort_out)
+            )));
+        }
         Ok(RebaseOutcome {
             rebased: false,
             conflicted,
@@ -279,7 +287,15 @@ impl GitExecutor for GitCli {
         }
         let combined = format!("{}\n{}", stdout_trimmed(&out), stderr_trimmed(&out));
         let conflicted = combined.to_lowercase().contains("conflict");
-        let _ = self.run_in(cwd, &["rebase", "--abort"]);
+        // See rebase_onto: verify the abort itself succeeded before reporting
+        // an "unchanged" outcome.
+        let abort_out = self.run_in(cwd, &["rebase", "--abort"])?;
+        if !abort_out.status.success() {
+            return Err(FlightDeckError::Git(format!(
+                "pull --rebase failed and the abort also failed ({}); the base folder may be left mid-rebase and needs manual `git rebase --abort`",
+                stderr_trimmed(&abort_out)
+            )));
+        }
         Ok(RebaseOutcome {
             rebased: false,
             conflicted,

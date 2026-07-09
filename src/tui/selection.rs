@@ -78,6 +78,9 @@ impl Selection {
     /// `rfb`, or `None` if that line lies outside the selection. `cols` is the
     /// screen width, used to clamp and to extend full-row segments.
     pub fn col_range_for_rfb(&self, rfb: i64, cols: u16) -> Option<(u16, u16)> {
+        if self.is_empty() {
+            return None;
+        }
         let (first, last) = self.first_last();
         if rfb > first.rows_from_bottom || rfb < last.rows_from_bottom {
             return None;
@@ -144,7 +147,7 @@ mod tests {
     fn empty_selection_has_no_range() {
         let s = Selection::new(p(0, 3));
         assert!(s.is_empty());
-        assert_eq!(s.col_range_for_rfb(0, 80), Some((3, 3)));
+        assert_eq!(s.col_range_for_rfb(0, 80), None);
     }
 
     #[test]

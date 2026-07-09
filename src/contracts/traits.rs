@@ -2,9 +2,10 @@
 //!
 //! Git, filesystem, and PTY access all sit behind these traits so logic can be
 //! unit-tested against the fakes in [`crate::testing`]. The [`GitExecutor`] trait
-//! deliberately exposes **no** history-rewriting operation (no stage, commit,
-//! amend, squash, rebase, cherry-pick, or PR creation) — the SPECS §5 safety
-//! boundary is enforced by construction.
+//! deliberately exposes **no unguarded** history-rewriting operation (no stage,
+//! commit, amend, squash, cherry-pick, or PR creation) — the SPECS §5 safety
+//! boundary is enforced by construction, with the sole sanctioned exception of
+//! the guarded rebase carve-out (`rebase_onto`/`pull_base`) documented below.
 
 use crate::contracts::domain::{
     ContainerState, MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,

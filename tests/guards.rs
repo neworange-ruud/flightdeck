@@ -4,7 +4,9 @@
 //! non-negotiable invariants that are easy to violate by accident:
 //!
 //! 1. The old placeholder name "Agent Orchestrator" must appear nowhere in
-//!    code, UI, config, folders, or branches (SPECS §2).
+//!    code, UI, config, folders, or branches (SPECS §2). This file's guard
+//!    for that invariant only scans `.rs` files under `src/`; UI, config,
+//!    folder, and branch names are not covered here.
 //! 2. The git layer must never invoke a history-rewriting / commit-creating /
 //!    PR-creating git subcommand (SPECS §5). FlightDeck's trustworthiness rests
 //!    on never mutating commit history.
@@ -109,7 +111,7 @@ fn git_layer_has_no_history_rewriting_subcommands() {
         // Every line bearing the `--force` literal must therefore be a worktree
         // removal — this still catches force-push and any other force op.
         for line in contents.lines() {
-            if line.contains("\"--force\"") {
+            if line.contains("\"--force") {
                 assert!(
                     line.contains("\"worktree\"") && line.contains("\"remove\""),
                     "SPECS §5 violation: \"--force\" outside `worktree remove` found in {}: {}",

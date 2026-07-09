@@ -116,6 +116,11 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         let entry = st.files.entry(p.to_path_buf()).or_default();
+        // Mirror RealFs: if the existing content doesn't end in a newline, add
+        // one first so the appended line isn't glued onto the last line.
+        if !entry.is_empty() && !entry.ends_with('\n') {
+            entry.push('\n');
+        }
         entry.push_str(line);
         entry.push('\n');
         Ok(())
@@ -260,6 +265,12 @@ impl FakeGit {
         self
     }
 
+    /// Set the current branch at runtime (non-consuming), e.g. after a tab's
+    /// branch has been created and its name is known.
+    pub fn set_current_branch(&self, branch: impl Into<String>) {
+        self.inner.lock().unwrap().current_branch = branch.into();
+    }
+
     /// Set the default dirty state used when a `cwd` has no specific override.
     pub fn set_dirty(&self, dirty: bool) {
         self.inner.lock().unwrap().default_dirty = dirty;
@@ -277,11 +288,11 @@ impl FakeGit {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.inner
-            .lock()
-            .unwrap()
-            .porcelain
-            .insert(path.into(), lines.into_iter().map(Into::into).collect());
+        let path = path.into();
+        let lines: Vec<String> = lines.into_iter().map(Into::into).collect();
+        let mut st = self.inner.lock().unwrap();
+        st.dirty.insert(path.clone(), !lines.is_empty());
+        st.porcelain.insert(path, lines);
     }
 
     /// Map a refname to a SHA.

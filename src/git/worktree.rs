@@ -104,9 +104,10 @@ pub fn remove_worktree_if_safe(
 
 /// Whether a git error means the path is not a tracked worktree, so a directory
 /// at that path (if any) is an orphan we can remove directly. Matches git's
-/// "<path> is not a worktree" message from `git worktree remove`.
+/// "'<path>' is not a working tree" message from `git worktree remove` (and the
+/// older/alternate "is not a worktree" wording, for safety across git versions).
 fn is_unregistered_worktree(err: &FlightDeckError) -> bool {
-    matches!(err, FlightDeckError::Git(msg) if msg.contains("is not a worktree"))
+    matches!(err, FlightDeckError::Git(msg) if msg.contains("is not a working tree") || msg.contains("is not a worktree"))
 }
 
 /// Whether an error reflects a transient file lock — on Windows a directory
@@ -258,7 +259,7 @@ mod tests {
         let git = FakeGit::new();
         let path = Path::new("/repo/.flightdeck/worktrees/orphan");
         let fs = FakeFs::new().with_dir(path);
-        git.set_remove_worktree_error(format!("\"{}\" is not a worktree.", path.display()));
+        git.set_remove_worktree_error(format!("fatal: '{}' is not a working tree", path.display()));
 
         remove_worktree_if_safe(&git, &fs, path, true).unwrap();
 
@@ -273,7 +274,7 @@ mod tests {
         let git = FakeGit::new();
         let fs = FakeFs::new();
         let path = Path::new("/repo/.flightdeck/worktrees/gone");
-        git.set_remove_worktree_error(format!("\"{}\" is not a worktree.", path.display()));
+        git.set_remove_worktree_error(format!("fatal: '{}' is not a working tree", path.display()));
 
         remove_worktree_if_safe(&git, &fs, path, true).unwrap();
         assert_eq!(git.prune_count(), 1);

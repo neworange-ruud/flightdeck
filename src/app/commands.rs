@@ -232,8 +232,13 @@ pub enum Effect {
     /// The close-tab option set; the UI re-dispatches `CloseAgentTab` with a
     /// chosen [`CloseAction`] (SPECS §25).
     CloseTabOptions(CloseTabOptions),
-    /// The git status panel data for the selected tab (SPECS §21).
-    GitStatus(Box<WorktreeStatus>),
+    /// The git status panel data for the selected tab (SPECS §21), plus the
+    /// GitHub PR compare URL when the branch has been pushed and the remote is
+    /// a GitHub remote.
+    GitStatus {
+        status: Box<WorktreeStatus>,
+        pr_url: Option<String>,
+    },
     /// The help screen should be shown (SPECS §23).
     ShowHelp,
 }

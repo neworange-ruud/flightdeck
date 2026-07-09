@@ -12,13 +12,58 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Add a code-review topic breakdown that splits the codebase into small,
+  independently reviewable scopes.
+- Refresh the code-review topic breakdown for the current codebase, including
+  container runtime, update, guarded rebase, pull-base, PTY, and TUI changes.
+- Complete a full code review across all topics; the fixes below are its result.
+- Harden the container security guardrails to also reject the `--flag=value`
+  form of `--privileged` and `--env-host` (previously only the bare flag was
+  caught).
+- The Git Status overlay now shows the GitHub PR compare URL once the branch
+  has been pushed (SPECS §21).
+- Clearer error messages: distinguish "podman not installed" from "podman not
+  ready" (and drop the macOS/Windows-only `podman machine start` hint on Linux),
+  surface the underlying cause when a repository can't be discovered, and
+  include the agent name in the "build the image first" guidance.
 
 ### Bug fixes
 
 - Use `Shift+Esc` to leave terminal focus on Linux, where the window manager
   (e.g. GNOME) reserves `Alt+Esc` for cycling windows and FlightDeck never
   receives it. Matches the existing Windows behaviour; macOS keeps `Alt+Esc`.
+- Container child terminals now launch a Linux shell inside the container via
+  `podman exec` instead of the host shell, so child shells work on Windows hosts.
+- Local merge and worktree rebase now verify the target worktree actually has
+  the expected branch checked out before acting, preventing a merge from landing
+  on — or a rebase from rewriting — the wrong branch.
+- Force-terminate and quit now signal every terminal (primary and all children)
+  even when one has already exited, so tabs close reliably and no child
+  processes are left running.
+- Restarting the primary agent stops the previous process first, preventing two
+  agent instances from running against the same worktree.
+- Container teardown no longer leaks a running container when spawn/attach fails
+  partway, and container-removal failures on close/finish/abandon are now
+  reported instead of silently succeeding.
+- The base repository is no longer falsely reported as dirty on first run (the
+  check now runs before FlightDeck writes its own config and `.gitignore`).
+- Appending to a `.gitignore` whose last line lacks a trailing newline no longer
+  glues the new entry onto that line.
+- Stale recovered-tab entries are now surfaced as warnings instead of being
+  silently dropped.
+- Windows clipboard copy no longer corrupts non-ASCII text and correctly falls
+  back to OSC 52 on failure.
+- Windows clipboard handling is now clean under platform-specific Clippy checks.
+- `Shift+Tab` is now forwarded to the terminal; the cursor is no longer drawn
+  over scrollback when scrolled into history; and pasting while an overlay is
+  open now dismisses it instead of swallowing the paste.
+- Podman image-existence checks distinguish "not found" from runtime errors,
+  agent keys are sanitized into valid image tags, and `flightdeck image build`
+  validates the `[containers]` config even when containers are disabled.
+- The once-a-day update-check cache now has a Windows fallback path
+  (`USERPROFILE`).
+- `scripts/release` accepts SemVer versions with dotted pre-release/build
+  metadata, and the `keylog` example restores the terminal on error.
 
 ## [1.3.0] - 2026-07-01
 

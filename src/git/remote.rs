@@ -19,6 +19,7 @@ pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
     ];
     let path = prefixes.iter().find_map(|p| url.strip_prefix(p))?;
 
+    let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let path = path.trim_matches('/');
     let mut parts = path.splitn(2, '/');

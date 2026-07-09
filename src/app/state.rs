@@ -38,7 +38,7 @@ use crate::runtime::image;
 use crate::runtime::name::{container_name, repo_hash};
 use crate::runtime::spec::{ContainerSpec, ResolvedAuthMount};
 use crate::terminal::session::Session;
-use crate::terminal::shell::shell_launch;
+use crate::terminal::shell::{container_shell, shell_launch};
 
 /// The services the app core dispatches into (SPECS §27). Passing these as a
 /// bundle keeps the core headless: the wiring layer (T9) constructs real
@@ -191,11 +191,12 @@ fn validate_launchable(
     agent: &AgentDef,
     exec: &ContainersConfig,
     container: &dyn ContainerRuntime,
+    base: &Path,
 ) -> Result<()> {
     if exec.enabled {
         container.available()
     } else {
-        validate_agent(agent)
+        validate_agent(agent, base)
     }
 }
 
@@ -799,7 +800,12 @@ impl AppState {
 
         // (b) validate the command (or container runtime) BEFORE any git
         //     mutation (SPECS §16/§31).
-        validate_launchable(&agent, &self.config.containers, services.container)?;
+        validate_launchable(
+            &agent,
+            &self.config.containers,
+            services.container,
+            &self.repo_root,
+        )?;
 
         // (c) slug + branch name with the configured prefix.
         let slug = slugify(name);
@@ -810,6 +816,16 @@ impl AppState {
         }
         let prefix = self.config.git.branch_prefix.clone();
         let branch = branch_name(&prefix, &slug);
+
+        // Refuse a second placeholder for the same branch/slug: the tab `id`
+        // is only unique to the second (`{slug}-{created_at}`), so two rapid
+        // creates for the same name could otherwise collide and let
+        // `finalize_new_tab`/`fail_new_tab` target the wrong tab.
+        if self.tabs.iter().any(|t| t.meta.branch == branch) {
+            return Err(FlightDeckError::Refused(format!(
+                "an Agent Tab for branch '{branch}' already exists"
+            )));
+        }
 
         // (d) decide create vs attach (surface attach, never silent, SPECS §11).
         let decision = decide_branch(services.git, &branch)?;
@@ -918,13 +934,23 @@ impl AppState {
             services.container.start_detached(start_args)?;
         }
         let mut session = Session::new();
-        session.spawn_primary(
+        if let Err(e) = session.spawn_primary(
             services.pty,
             &spawn.command,
             &spawn.args,
             &worktree_abs,
             self.pty_size,
-        )?;
+        ) {
+            // The container (if any) was already started; a spawn failure here
+            // must not leak it, since the tab is about to be removed by
+            // `fail_new_tab` with no record of the container left behind.
+            if spawn.start_args.is_some() {
+                let _ = services
+                    .container
+                    .remove_container(&container_name(&tab_id), true);
+            }
+            return Err(e);
+        }
 
         let tab = &mut self.tabs[idx];
         tab.session = session;
@@ -1006,11 +1032,16 @@ impl AppState {
         }
 
         // Remove the backing container (if any), then the tab from runtime state.
-        self.destroy_container_if_any(idx, services);
+        let container_result = self.destroy_container_if_any(idx, services);
         self.tabs.remove(idx);
         self.fix_selection_after_removal(idx);
         self.persist(services)?;
-        Ok(Effect::Message("Closed Agent Tab.".to_string()))
+        match container_result {
+            Ok(()) => Ok(Effect::Message("Closed Agent Tab.".to_string())),
+            Err(e) => Ok(Effect::Warning(format!(
+                "Closed Agent Tab, but removing its container failed: {e}. It may still be running."
+            ))),
+        }
     }
 
     /// Push (SPECS §14): plan; warn on uncommitted; on confirm push; then PR URL.
@@ -1102,8 +1133,15 @@ impl AppState {
         // Merge succeeded: stop the agent's session and remove its worktree, then
         // drop the tab (the work now lives on the base branch). Force removal — the
         // merge is already committed onto base, so nothing is lost.
-        let _ = self.tabs[idx].session.terminate_all();
-        self.destroy_container_if_any(idx, services);
+        if let Err(e) = self.tabs[idx].session.terminate_all() {
+            // Mirror the force-close path: a termination failure must not be
+            // silently swallowed right before an irreversible teardown, or the
+            // still-running process(es) are orphaned once the worktree is gone.
+            return Ok(Effect::Warning(format!(
+                "Merged {agent_branch} into {base_branch}, but stopping the session failed: {e}. The worktree was not removed; retry closing it manually."
+            )));
+        }
+        let _ = self.destroy_container_if_any(idx, services);
         match remove_worktree_if_safe(services.git, services.fs, &agent_worktree, true) {
             Ok(()) => {
                 self.tabs.remove(idx);
@@ -1246,8 +1284,15 @@ impl AppState {
         // open (the agent/shell keeps its cwd inside the worktree, and a container
         // may bind-mount it), so `git worktree remove` would fail with a
         // permission-denied error. Mirrors the merge path's ordering (SPECS §5/§15).
-        let _ = self.tabs[idx].session.terminate_all();
-        self.destroy_container_if_any(idx, services);
+        if let Err(e) = self.tabs[idx].session.terminate_all() {
+            // Don't remove the worktree out from under a session we failed to
+            // stop — that would orphan the still-running process(es) with a
+            // deleted cwd. Leave the tab in place so the user can retry.
+            return Ok(Effect::Warning(format!(
+                "Could not stop the running session: {e}. The worktree was not removed; retry Abandon once the process has stopped."
+            )));
+        }
+        let _ = self.destroy_container_if_any(idx, services);
 
         match remove_worktree_if_safe(services.git, services.fs, &worktree, confirm) {
             Ok(()) => {
@@ -1293,15 +1338,18 @@ impl AppState {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let cwd = to_absolute(&repo_root, Path::new(&tab.meta.worktree_path_relative));
-        let (shell_cmd, shell_args) = shell_launch();
         let (cmd, args) = if tab.meta.containerized {
             let name = container_name(&tab.meta.id);
+            // The container is always Linux, so the child shell must be a
+            // Linux-native shell run *inside* it — not the host's default
+            // shell (which is PowerShell on Windows and absent from the
+            // container). See `container_shell`.
             (
                 "podman".to_string(),
-                build_exec_args(&name, &shell_cmd, &shell_args),
+                build_exec_args(&name, &container_shell(), &[]),
             )
         } else {
-            (shell_cmd, shell_args)
+            shell_launch()
         };
         let idx = tab
             .session
@@ -1435,7 +1483,7 @@ impl AppState {
         let rhash = repo_hash(&self.repo_root);
         let image = image::resolve_image_tag(&rhash, &agent.key, &self.config.containers);
         if !services.container.image_exists(&image)? {
-            return Err(image::missing_image_error(&image));
+            return Err(image::missing_image_error(&image, &agent.key));
         }
         // Clear any stale exited container so `--name` does not clash.
         let _ = services.container.remove_container(&name, true);
@@ -1543,12 +1591,12 @@ impl AppState {
     /// Remove the container backing tab `idx`, if it is containerized. Called on
     /// the teardown paths (force-close, abandon, merge) so a stopped session
     /// leaves no container behind (SPECS §31).
-    fn destroy_container_if_any(&self, idx: usize, services: &Services) {
+    fn destroy_container_if_any(&self, idx: usize, services: &Services) -> Result<()> {
         if !self.tabs[idx].meta.containerized {
-            return;
+            return Ok(());
         }
         let name = container_name(&self.tabs[idx].meta.id);
-        let _ = services.container.remove_container(&name, true);
+        services.container.remove_container(&name, true)
     }
 
     /// Spawn (or re-spawn) the primary agent for tab `idx`. Re-validates the
@@ -1570,7 +1618,12 @@ impl AppState {
             .get(&agent_key)
             .cloned()
             .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
-        validate_launchable(&agent, &self.config.containers, services.container)?;
+        validate_launchable(
+            &agent,
+            &self.config.containers,
+            services.container,
+            &self.repo_root,
+        )?;
 
         let cwd = to_absolute(
             &repo_root,
@@ -1585,8 +1638,29 @@ impl AppState {
         }
 
         let tab = &mut self.tabs[idx];
-        tab.session
-            .spawn_primary(services.pty, &spawn.command, &spawn.args, &cwd, size)?;
+        // An explicit restart always starts fresh (never silently reattaches,
+        // see `cmd_restart_agent`): terminate any still-running primary first,
+        // or `spawn_primary` below would silently drop it without killing the
+        // process, leaking it. `resume_agents` only calls this when there is
+        // no running primary, so this is a no-op on that path.
+        if tab.session.primary_state() == ProcessState::Running {
+            if let Some(primary) = tab.session.primary_mut() {
+                let _ = primary.session_mut().terminate_tree();
+            }
+        }
+        if let Err(e) =
+            tab.session
+                .spawn_primary(services.pty, &spawn.command, &spawn.args, &cwd, size)
+        {
+            // The container (if any) was already started; don't leak it on a
+            // spawn failure.
+            if spawn.start_args.is_some() {
+                let _ = services
+                    .container
+                    .remove_container(&container_name(&tab_id), true);
+            }
+            return Err(e);
+        }
         tab.interpreted = Some(InterpretedStatus::Starting);
         tab.interpreted_at_ms = None;
         tab.last_activity_ms = None;
@@ -1651,15 +1725,30 @@ impl AppState {
         let Some(tab) = self.selected() else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
+        let branch = tab.meta.branch.clone();
+        let base_branch = tab.meta.base_branch.clone();
+        let base_commit_sha = tab.meta.base_commit_sha.clone();
         let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
         let status = collect_status(
             services.git,
-            &tab.meta.branch,
-            &tab.meta.base_branch,
-            &tab.meta.base_commit_sha,
+            &branch,
+            &base_branch,
+            &base_commit_sha,
             &worktree,
         )?;
-        Ok(Effect::GitStatus(Box::new(status)))
+        // Surface the GitHub PR compare URL once the branch has an upstream
+        // (i.e. it has been pushed) and the remote is a GitHub remote (SPECS
+        // §21). Best-effort: any remote-lookup failure simply omits the URL.
+        let pr_url = if status.upstream.is_some() {
+            let remote = self.config.git.default_remote.clone();
+            github_pr_url(services.git, &remote, &base_branch, &branch).unwrap_or(None)
+        } else {
+            None
+        };
+        Ok(Effect::GitStatus {
+            status: Box::new(status),
+            pr_url,
+        })
     }
 
     /// After removing the tab at `removed`, clamp `selected_tab` so it stays
@@ -2798,6 +2887,10 @@ mod tests {
             &svc,
         )
         .unwrap();
+        // The rebase preconditions require the agent worktree to actually have
+        // the agent branch checked out (FakeGit's current_branch is a single
+        // global, so set it once the created branch name is known).
+        git.set_current_branch(app.tabs[0].meta.branch.clone());
         handle.set_state(ProcessState::Running);
 
         // First dispatch (confirm: false) asks rather than rebasing.
@@ -2840,6 +2933,10 @@ mod tests {
             &svc,
         )
         .unwrap();
+        // The rebase preconditions require the agent worktree to actually have
+        // the agent branch checked out (FakeGit's current_branch is a single
+        // global, so set it once the created branch name is known).
+        git.set_current_branch(app.tabs[0].meta.branch.clone());
         // The base branch has advanced since tab creation.
         git.set_rev("main", "sha-main-new");
 
@@ -2881,6 +2978,10 @@ mod tests {
             &svc,
         )
         .unwrap();
+        // The rebase preconditions require the agent worktree to actually have
+        // the agent branch checked out (FakeGit's current_branch is a single
+        // global, so set it once the created branch name is known).
+        git.set_current_branch(app.tabs[0].meta.branch.clone());
         let sha_before = app.tabs[0].meta.base_commit_sha.clone();
         git.set_rebase_outcome(crate::contracts::RebaseOutcome {
             rebased: false,
@@ -3062,6 +3163,80 @@ mod tests {
             other => panic!("expected PrUrl, got {other:?}"),
         }
         assert_eq!(git.pushes().len(), 1);
+    }
+
+    // --- §21: git status overlay surfaces the PR compare URL after push ---
+
+    #[test]
+    fn git_status_overlay_includes_pr_url_when_pushed_to_github() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        let branch = app.tabs[0].meta.branch.clone();
+        // The branch has been pushed (has an upstream) and origin is GitHub.
+        git.set_upstream(&branch, Some(format!("origin/{branch}")));
+        git.set_remote("origin", "git@github.com:owner/repo.git");
+
+        let effect = app.dispatch(Command::ShowGitStatus, &svc).unwrap();
+        match effect {
+            Effect::GitStatus { pr_url, .. } => {
+                let url = pr_url.expect("expected a PR compare URL after push");
+                assert!(
+                    url.contains("/compare/main...flightdeck/task"),
+                    "got: {url}"
+                );
+            }
+            other => panic!("expected GitStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_status_overlay_has_no_pr_url_before_push() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        // A GitHub remote exists, but the branch has no upstream (not pushed).
+        git.set_remote("origin", "git@github.com:owner/repo.git");
+
+        let effect = app.dispatch(Command::ShowGitStatus, &svc).unwrap();
+        match effect {
+            Effect::GitStatus { pr_url, .. } => {
+                assert!(pr_url.is_none(), "no PR URL should show before a push");
+            }
+            other => panic!("expected GitStatus, got {other:?}"),
+        }
     }
 
     // --- §5/§15: abandon warns (not refuses) on dirty worktree ----------

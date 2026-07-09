@@ -41,12 +41,23 @@ fn is_path_like(command: &str) -> bool {
     command.contains('/') || (cfg!(windows) && command.contains('\\'))
 }
 
-/// Whether `path` names an existing file we could launch. On Windows, a path
-/// with no extension also matches when appending a `PATHEXT` extension yields a
-/// real file.
+/// Whether `path` names an existing file we could launch. On Unix, this also
+/// requires the executable permission bit to be set. On Windows, a path with
+/// no extension also matches when appending a `PATHEXT` extension yields a
+/// real file (Windows has no executable permission bit to check).
 fn candidate_is_executable(path: &Path) -> bool {
     if path.is_file() {
-        return true;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            return std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
     }
     #[cfg(windows)]
     {
@@ -81,11 +92,23 @@ pub fn command_exists(command: &str) -> bool {
 
 /// Validate that an agent's command exists, before any git mutation (SPECS §16).
 /// Returns [`FlightDeckError::AgentMissing`] if not found.
-pub fn validate_agent(agent: &AgentDef) -> Result<()> {
-    if command_exists(&agent.command) {
+///
+/// A relative path-like command (e.g. `./bin/agent`) is resolved against `base`
+/// — the directory the agent will actually run in (the repo root) — rather than
+/// the FlightDeck process's own current directory, so validation agrees with the
+/// eventual spawn. Bare names (searched on `PATH`) and absolute paths ignore
+/// `base`.
+pub fn validate_agent(agent: &AgentDef, base: &Path) -> Result<()> {
+    let cmd = &agent.command;
+    let found = if is_path_like(cmd) && Path::new(cmd).is_relative() {
+        candidate_is_executable(&base.join(cmd))
+    } else {
+        command_exists(cmd)
+    };
+    if found {
         Ok(())
     } else {
-        Err(FlightDeckError::AgentMissing(agent.command.clone()))
+        Err(FlightDeckError::AgentMissing(cmd.clone()))
     }
 }
 
@@ -129,8 +152,8 @@ mod tests {
     fn create_executable(dir: &TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, "#!/bin/sh\n").expect("write fake binary");
-        // Make it a regular file (executable bit not required for our check — we
-        // only check exists+is_file, and Windows has no POSIX mode bits).
+        // On Unix, candidate_is_executable also requires the executable bit,
+        // so set it here (Windows has no POSIX mode bits to set).
         #[cfg(unix)]
         {
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -202,7 +225,8 @@ mod tests {
     #[test]
     fn validate_agent_returns_agent_missing_when_command_not_found() {
         let agent = make_agent("__definitely_not_in_path_xyz__");
-        let err = validate_agent(&agent).expect_err("should fail for missing command");
+        let err =
+            validate_agent(&agent, Path::new("/")).expect_err("should fail for missing command");
         match err {
             FlightDeckError::AgentMissing(cmd) => {
                 assert_eq!(cmd, "__definitely_not_in_path_xyz__");
@@ -230,7 +254,32 @@ mod tests {
         // validate_agent uses command_exists which reads real PATH, so we test
         // the absolute-path branch: an agent with an absolute path to an
         // existing file must pass validation.
-        validate_agent(&agent).expect("should succeed for existing file path");
+        validate_agent(&agent, dir.path()).expect("should succeed for existing file path");
+    }
+
+    #[test]
+    fn validate_agent_resolves_relative_command_against_base() {
+        // A relative path-like command must be resolved against the provided
+        // base (the repo root), not the FlightDeck process's own cwd.
+        let dir = TempDir::new().expect("tempdir");
+        let tools = dir.path().join("tools");
+        std::fs::create_dir_all(&tools).expect("mkdir tools");
+        let bin = tools.join("agent");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("write fake binary");
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        let agent = make_agent("./tools/agent");
+        // Found when resolved against the base that actually contains it.
+        validate_agent(&agent, dir.path()).expect("relative command found under base");
+        // Not found when resolved against an unrelated base.
+        let empty = TempDir::new().expect("tempdir");
+        validate_agent(&agent, empty.path())
+            .expect_err("relative command must not resolve outside its base");
     }
 
     // -------------------------------------------------------------------------
