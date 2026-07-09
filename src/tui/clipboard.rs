@@ -198,7 +198,7 @@ fn save_clipboard_image_linux() -> Option<PathBuf> {
 fn try_command_clipboard(text: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
-        return try_windows_clipboard(text);
+        try_windows_clipboard(text)
     }
 
     #[cfg(not(target_os = "windows"))]

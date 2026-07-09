@@ -53,6 +53,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   silently dropped.
 - Windows clipboard copy no longer corrupts non-ASCII text and correctly falls
   back to OSC 52 on failure.
+- Windows clipboard handling is now clean under platform-specific Clippy checks.
 - `Shift+Tab` is now forwarded to the terminal; the cursor is no longer drawn
   over scrollback when scrolled into history; and pasting while an overlay is
   open now dismisses it instead of swallowing the paste.
