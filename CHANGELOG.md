@@ -14,6 +14,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 - Add a code-review topic breakdown that splits the codebase into small,
   independently reviewable scopes.
+- Refresh the code-review topic breakdown for the current codebase, including
+  container runtime, update, guarded rebase, pull-base, PTY, and TUI changes.
 - Complete a full code review across all topics; the fixes below are its result.
 - Harden the container security guardrails to also reject the `--flag=value`
   form of `--privileged` and `--env-host` (previously only the bare flag was
