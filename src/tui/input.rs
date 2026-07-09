@@ -18,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::commands::{Command, Selector};
 use crate::app::modes::InputMode;
+use crate::tui::platform;
 
 /// The result of mapping a key event (SPECS §23).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +48,9 @@ pub enum KeyAction {
 /// Map a key event to a [`KeyAction`] based on the current input mode (SPECS §23).
 ///
 /// In [`InputMode::Terminal`] most keys produce `Passthrough`; the global
-/// shortcuts (`Ctrl-g`, `Ctrl-q`) and `Alt+Esc` (leave terminal focus) are
-/// intercepted first. Bare `Esc` passes through to the PTY.
+/// shortcuts (`Ctrl-g`, `Ctrl-q`) and the leave-terminal-focus key (`Alt+Esc`,
+/// or `Shift+Esc` on Windows/Linux) are intercepted first. Bare `Esc` passes
+/// through to the PTY.
 ///
 /// In [`InputMode::App`] all keys are interpreted as FlightDeck commands.
 pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
@@ -75,12 +77,14 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::ALT {
         return KeyAction::FocusApp;
     }
-    // Windows: Alt+Esc is a reserved OS shortcut (cycles windows in z-order), so
-    // the shell grabs it before FlightDeck ever sees it. Offer Shift+Esc as the
-    // leave-terminal-focus key there instead. Bare Esc (and 2×Esc) still pass
-    // through to hosted agents.
-    #[cfg(windows)]
-    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::SHIFT {
+    // Windows and Linux: Alt+Esc is a reserved shortcut that cycles windows —
+    // the OS/window manager (e.g. GNOME) grabs it before FlightDeck ever sees
+    // it. Offer Shift+Esc as the leave-terminal-focus key on those platforms
+    // instead. Bare Esc (and 2×Esc) still pass through to hosted agents.
+    if platform::LEAVE_FOCUS_USES_SHIFT
+        && key.code == KeyCode::Esc
+        && key.modifiers == KeyModifiers::SHIFT
+    {
         return KeyAction::FocusApp;
     }
     // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
@@ -601,25 +605,20 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn terminal_mode_shift_esc_focuses_app_on_windows() {
-        // Windows reserves Alt+Esc (cycles windows), so Shift+Esc is the
-        // leave-terminal-focus key there.
-        assert_eq!(
-            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
-            KeyAction::FocusApp
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn terminal_mode_shift_esc_passes_through_off_windows() {
-        // Off Windows, Shift+Esc is not a focus key — it stays a PTY passthrough.
-        assert_eq!(
-            map_key(InputMode::Terminal, shift(KeyCode::Esc)),
-            KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
-        );
+    fn terminal_mode_shift_esc_focus_depends_on_platform() {
+        let action = map_key(InputMode::Terminal, shift(KeyCode::Esc));
+        if platform::LEAVE_FOCUS_USES_SHIFT {
+            // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc
+            // is the leave-terminal-focus key there.
+            assert_eq!(action, KeyAction::FocusApp);
+        } else {
+            // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
+            assert_eq!(
+                action,
+                KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
+            );
+        }
     }
 
     #[test]

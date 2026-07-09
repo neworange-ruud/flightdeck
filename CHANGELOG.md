@@ -16,7 +16,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Use `Shift+Esc` to leave terminal focus on Linux, where the window manager
+  (e.g. GNOME) reserves `Alt+Esc` for cycling windows and FlightDeck never
+  receives it. Matches the existing Windows behaviour; macOS keeps `Alt+Esc`.
 
 ## [1.3.0] - 2026-07-01
 
