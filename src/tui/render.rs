@@ -30,6 +30,7 @@ use ratatui::Frame;
 use crate::app::modes::InputMode;
 use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
+use crate::terminal::session::TerminalKind;
 use crate::tui::layout;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::platform;
@@ -61,8 +62,122 @@ pub enum UiOverlay {
         /// A PR compare URL, if available (SPECS §14, §21).
         pr_url: Option<String>,
     },
-    /// A transient toast/message line (effect feedback).
-    Message(String),
+    /// A centered modal dialog: a confirmation/notification with clickable
+    /// buttons (each also bound to a keyboard accelerator).
+    Dialog(Dialog),
+}
+
+// ---------------------------------------------------------------------------
+// Modal dialog model (confirmations & notifications)
+// ---------------------------------------------------------------------------
+
+/// The keyboard accelerator bound to a dialog button. Clicking the button
+/// synthesizes the matching key, so mouse and keyboard drive the exact same
+/// prompt-handling code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogAccel {
+    /// A character key, e.g. `y`, `n`, `1`.
+    Char(char),
+    /// The Enter key (confirm text entry).
+    Enter,
+    /// The Esc key (cancel/dismiss).
+    Esc,
+}
+
+impl DialogAccel {
+    /// The label shown in brackets on the button, e.g. `y`, `Enter`, `Esc`.
+    fn key_label(self) -> String {
+        match self {
+            DialogAccel::Char(c) => c.to_string(),
+            DialogAccel::Enter => "Enter".to_string(),
+            DialogAccel::Esc => "Esc".to_string(),
+        }
+    }
+}
+
+/// One button in a [`Dialog`]: a label plus the accelerator that triggers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogButton {
+    pub label: String,
+    pub accel: DialogAccel,
+}
+
+impl DialogButton {
+    pub fn new(accel: DialogAccel, label: impl Into<String>) -> DialogButton {
+        DialogButton {
+            accel,
+            label: label.into(),
+        }
+    }
+
+    /// The rendered cell text, e.g. `" [y] Close "`.
+    fn cell(&self) -> String {
+        format!(" [{}] {} ", self.accel.key_label(), self.label)
+    }
+
+    /// The cell width in columns.
+    fn width(&self) -> u16 {
+        self.cell().chars().count() as u16
+    }
+}
+
+/// A centered modal dialog. Used for every confirmation, selection, text-entry
+/// prompt, and notification, so they read clearly instead of as a cramped
+/// bottom line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dialog {
+    /// The question / message (wrapped across lines when rendered).
+    pub title: String,
+    /// `Some(buffer)` for a text-entry prompt: renders an input field.
+    pub input: Option<String>,
+    /// The action buttons, in display order.
+    pub buttons: Vec<DialogButton>,
+    /// Border / accent colour (confirmations vs notifications).
+    pub accent: Color,
+}
+
+impl Dialog {
+    /// A confirmation/selection dialog with the given buttons.
+    pub fn confirm(title: impl Into<String>, buttons: Vec<DialogButton>) -> Dialog {
+        Dialog {
+            title: title.into(),
+            input: None,
+            buttons,
+            accent: Color::Cyan,
+        }
+    }
+
+    /// A text-entry dialog with an input field and the given buttons.
+    pub fn input(title: impl Into<String>, buffer: String, buttons: Vec<DialogButton>) -> Dialog {
+        Dialog {
+            title: title.into(),
+            input: Some(buffer),
+            buttons,
+            accent: Color::Cyan,
+        }
+    }
+
+    /// A plain notification: a message with a single "OK" button. It is also
+    /// dismissed by any key or a click (SPECS §22).
+    pub fn notification(msg: impl Into<String>) -> Dialog {
+        Dialog {
+            title: msg.into(),
+            input: None,
+            buttons: vec![DialogButton::new(DialogAccel::Enter, "OK")],
+            accent: Color::Blue,
+        }
+    }
+}
+
+/// Where a click landed relative to an open [`Dialog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogHit {
+    /// On the button at this index.
+    Button(usize),
+    /// Inside the dialog box, but not on a button.
+    Inside,
+    /// Outside the dialog box entirely.
+    Outside,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +237,9 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // heading, or the empty space below the last tab) resolves to the
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
-        return Some(sidebar_hit(ml.sidebar, state.tabs.len(), col, row).unwrap_or(HitTarget::Sidebar));
+        return Some(
+            sidebar_hit(ml.sidebar, state.tabs.len(), col, row).unwrap_or(HitTarget::Sidebar),
+        );
     }
     if state.split_view {
         // In split view a click on a column's header row switches to that
@@ -204,10 +321,24 @@ fn sidebar_hit(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<HitTa
 /// plus one per child shell. Shared by rendering and hit-testing so positions
 /// always agree.
 fn child_tab_entries(state: &AppState) -> Vec<(ChildTarget, String)> {
+    // The primary agent terminal is "agent"; additional agents count up from 2,
+    // shells count up from 1, each numbered in creation order (SPECS §19).
     let mut v = vec![(ChildTarget::Primary, "agent".to_string())];
     if let Some(tab) = state.selected() {
+        let mut agent_n = 2;
+        let mut shell_n = 1;
         for i in 0..tab.session.child_count() {
-            v.push((ChildTarget::Child(i), format!("shell {}", i + 1)));
+            let is_agent = tab.session.child(i).map(|t| t.kind) == Some(TerminalKind::Agent);
+            let label = if is_agent {
+                let l = format!("agent {agent_n}");
+                agent_n += 1;
+                l
+            } else {
+                let l = format!("shell {shell_n}");
+                shell_n += 1;
+                l
+            };
+            v.push((ChildTarget::Child(i), label));
         }
     }
     v
@@ -222,6 +353,16 @@ struct ChildTabSeg {
     width: u16,
     /// Column of the `✕` close control within the segment.
     close_col: u16,
+}
+
+/// The display label of a child-terminal `target` (e.g. "agent 2", "shell 1"),
+/// as shown on the tab bar. Used so close confirmations name the same thing the
+/// user clicked. Returns `None` if the target is not present.
+pub fn child_tab_label(state: &AppState, target: ChildTarget) -> Option<String> {
+    child_tab_entries(state)
+        .into_iter()
+        .find(|(t, _)| *t == target)
+        .map(|(_, label)| label)
 }
 
 /// Compute the geometry of each child-terminal tab segment, matching exactly how
@@ -322,7 +463,7 @@ pub fn draw(
     // Draw overlay on top if active.
     match overlay {
         UiOverlay::None => {}
-        UiOverlay::Message(msg) => draw_message_toast(frame, msg, area),
+        UiOverlay::Dialog(dialog) => draw_dialog(frame, dialog, area),
         UiOverlay::Palette(palette) => draw_palette_overlay(frame, palette, area),
         UiOverlay::Help => draw_help_overlay(frame, area),
         UiOverlay::GitStatus { status, pr_url } => {
@@ -523,7 +664,13 @@ pub fn draw_sidebar(
 /// Build a sidebar tab name line: `<marker><lead><name>` on the left with a
 /// right-aligned `✕` close control filling to `width`. The name is truncated
 /// with an ellipsis if it would collide with the close control (SPECS §20/§23).
-fn sidebar_name_line(width: usize, marker: &'static str, name_style: Style, lead: Span<'static>, name: &str) -> Line<'static> {
+fn sidebar_name_line(
+    width: usize,
+    marker: &'static str,
+    name_style: Style,
+    lead: Span<'static>,
+    name: &str,
+) -> Line<'static> {
     let marker_w = marker.chars().count();
     let lead_w = lead.content.chars().count();
     // Reserve two columns at the far right for a padding space and the glyph.
@@ -723,7 +870,7 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
     let Some(tab) = state.selected() else {
         let p = Paragraph::new(
-            "\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.",
+            "\n  FlightDeck — no Agent Session Tab selected.\n  Press Ctrl-n to create one.",
         )
         .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
@@ -857,7 +1004,7 @@ fn vt_color(c: vt100::Color) -> Color {
 pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms: u64) {
     let Some(tab) = state.selected() else {
         let p = Paragraph::new(
-            "\n  FlightDeck — no Agent Tab selected.\n  Press Ctrl-n to create one.",
+            "\n  FlightDeck — no Agent Session Tab selected.\n  Press Ctrl-n to create one.",
         )
         .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, region);
@@ -981,7 +1128,7 @@ fn info_sep() -> Span<'static> {
 pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> {
     let Some(tab) = state.selected() else {
         return Line::from(Span::styled(
-            " No Agent Tab selected",
+            " No Agent Session Tab selected",
             Style::default().fg(Color::DarkGray),
         ));
     };
@@ -1385,20 +1532,20 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("Global", Style::default().fg(Color::Yellow))),
         shortcut_line("  Ctrl-g", "Command palette"),
         shortcut_line("  Ctrl-q", "Quit / close app"),
-        shortcut_line("  Ctrl-n", "New Agent Tab"),
+        shortcut_line("  Ctrl-n", "New Agent Session Tab"),
         shortcut_line("  Ctrl-p", "Push current branch"),
         shortcut_line("  Ctrl-u", "Pull base (git pull --rebase)"),
-        shortcut_line("  Ctrl-f", "Finish current Agent Tab"),
-        shortcut_line("  Ctrl-k", "Close current Agent Tab"),
+        shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
+        shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
         shortcut_line("  ?", "Help / keybindings"),
         Line::raw(""),
         Line::from(Span::styled(
-            "Agent Tab Navigation",
+            "Agent Session Tab Navigation",
             Style::default().fg(Color::Yellow),
         )),
-        shortcut_line("  Up / Down (or Alt)", "Previous / Next Agent Tab"),
-        shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Tab by index"),
-        shortcut_line("  Mouse click", "Select Agent Tab"),
+        shortcut_line("  Up / Down (or Alt)", "Previous / Next Agent Session Tab"),
+        shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Session Tab by index"),
+        shortcut_line("  Mouse click", "Select Agent Session Tab"),
         Line::raw(""),
         Line::from(Span::styled(
             "Child Terminal Navigation",
@@ -1461,48 +1608,194 @@ fn shortcut_line(keys: &'static str, desc: &'static str) -> Line<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Toast / message overlay
+// Modal dialog overlay (confirmations & notifications)
 // ---------------------------------------------------------------------------
 
-/// Draw a message toast at the bottom of the screen. Long messages (status
-/// feedback and prompt hints) that do not fit the window width wrap across
-/// several stacked lines instead of being truncated at the edge.
-pub fn draw_message_toast(frame: &mut Frame, msg: &str, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
+/// The computed geometry of a [`Dialog`], shared by rendering and hit-testing so
+/// the clickable button regions always match what is drawn.
+struct DialogLayout {
+    /// The full dialog box (border included).
+    rect: Rect,
+    /// The content region inside the border and one column of padding.
+    inner: Rect,
+    /// Title text, pre-wrapped to the content width.
+    title_lines: Vec<String>,
+    /// Screen rect of each button, aligned with `Dialog::buttons`.
+    button_rects: Vec<Rect>,
+}
+
+/// Compute the centered geometry for `dialog` within `area`.
+fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
+    const GAP: u16 = 1;
+    // Cap the content width so the box stays comfortably inside the screen.
+    let cap_w = area.width.saturating_sub(6).clamp(16, 72);
+
+    // Base width on the longest title line, the input field, and the buttons.
+    let title_probe = wrap_message(&dialog.title, cap_w as usize);
+    let mut content_w = title_probe
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    if let Some(inp) = &dialog.input {
+        // "> " prefix + text + cursor.
+        content_w = content_w.max(inp.chars().count() as u16 + 4).max(24);
     }
-    let width = area.width as usize;
-    // One column of padding on each side; the glyphs in messages are ASCII, so
-    // char counts match display columns.
-    let text_width = width.saturating_sub(2).max(1);
-    let mut wrapped = wrap_message(msg, text_width);
-    // Never cover more than half the window, so the terminal stays visible.
-    let max_rows = (area.height / 2).max(1) as usize;
-    if wrapped.len() > max_rows {
-        wrapped.truncate(max_rows);
-        if let Some(last) = wrapped.last_mut() {
-            *last = truncate_ellipsis(last, text_width);
+    let widest_btn = dialog.buttons.iter().map(|b| b.width()).max().unwrap_or(0);
+    content_w = content_w.max(widest_btn);
+    // Prefer fitting all buttons on one row when they reasonably fit.
+    let one_row: u16 = dialog
+        .buttons
+        .iter()
+        .map(|b| b.width())
+        .sum::<u16>()
+        .saturating_add(GAP * dialog.buttons.len().saturating_sub(1) as u16);
+    content_w = content_w.max(one_row.min(cap_w)).clamp(1, cap_w);
+
+    let title_lines = wrap_message(&dialog.title, content_w as usize);
+
+    // Pack buttons greedily into rows within the content width.
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_w = 0u16;
+    for (i, b) in dialog.buttons.iter().enumerate() {
+        let bw = b.width();
+        let projected = if cur.is_empty() { bw } else { cur_w + GAP + bw };
+        if !cur.is_empty() && projected > content_w {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur_w = if cur.is_empty() { bw } else { cur_w + GAP + bw };
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+
+    // Inner height: title + (blank + input) + (blank + button rows).
+    let mut inner_h = title_lines.len() as u16;
+    if dialog.input.is_some() {
+        inner_h += 2;
+    }
+    if !rows.is_empty() {
+        inner_h += 1 + rows.len() as u16;
+    }
+
+    // Box = content + 1 col padding + 1 col border on each side; + border/pad rows.
+    let box_w = content_w + 4;
+    let box_h = inner_h + 4;
+    let rect = layout::centered_overlay(area, box_w, box_h);
+    let inner = Rect::new(
+        rect.x + 2,
+        rect.y + 2,
+        rect.width.saturating_sub(4),
+        rect.height.saturating_sub(4),
+    );
+
+    // Button rects: below the title (and input), each row centered.
+    let mut y = inner.y + title_lines.len() as u16;
+    if dialog.input.is_some() {
+        y += 2;
+    }
+    if !rows.is_empty() {
+        y += 1; // blank separator row
+    }
+    let mut button_rects = vec![Rect::new(0, 0, 0, 0); dialog.buttons.len()];
+    for row in &rows {
+        let row_w: u16 = row.iter().map(|&i| dialog.buttons[i].width()).sum::<u16>()
+            + GAP * row.len().saturating_sub(1) as u16;
+        let mut x = inner.x + inner.width.saturating_sub(row_w) / 2;
+        for &i in row {
+            let bw = dialog.buttons[i].width();
+            button_rects[i] = Rect::new(x, y, bw, 1);
+            x += bw + GAP;
+        }
+        y += 1;
+    }
+
+    DialogLayout {
+        rect,
+        inner,
+        title_lines,
+        button_rects,
+    }
+}
+
+/// Resolve a click at `(col, row)` against an open `dialog`.
+pub fn dialog_hit(area: Rect, dialog: &Dialog, col: u16, row: u16) -> DialogHit {
+    let dl = layout_dialog(area, dialog);
+    for (i, r) in dl.button_rects.iter().enumerate() {
+        if rect_contains(*r, col, row) {
+            return DialogHit::Button(i);
         }
     }
+    if rect_contains(dl.rect, col, row) {
+        DialogHit::Inside
+    } else {
+        DialogHit::Outside
+    }
+}
 
-    let style = Style::default().bg(Color::DarkGray).fg(Color::White);
-    let lines: Vec<Line> = wrapped
-        .into_iter()
-        .map(|line| {
-            // Pad each line to the full width so the bar background is solid.
-            let mut s = String::with_capacity(width);
-            s.push(' ');
-            s.push_str(&line);
-            let pad = width.saturating_sub(s.chars().count());
-            s.push_str(&" ".repeat(pad));
-            Line::from(Span::styled(s, style))
-        })
-        .collect();
+/// Draw a centered modal dialog (confirmation / notification) over the UI.
+pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let dl = layout_dialog(area, dialog);
+    frame.render_widget(Clear, dl.rect);
 
-    let height = lines.len() as u16;
-    let top = area.y + area.height - height;
-    let toast_area = Rect::new(area.x, top, area.width, height);
-    frame.render_widget(Paragraph::new(lines).style(style), toast_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(dialog.accent))
+        .title(Span::styled(
+            " FlightDeck ",
+            Style::default()
+                .fg(dialog.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(block, dl.rect);
+
+    let mut y = dl.inner.y;
+    // Title lines.
+    for line in &dl.title_lines {
+        let rect = Rect::new(dl.inner.x, y, dl.inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                line.clone(),
+                Style::default().fg(Color::White),
+            ))),
+            rect,
+        );
+        y += 1;
+    }
+    // Input field, if any.
+    if let Some(buffer) = &dialog.input {
+        y += 1; // blank separator
+        let rect = Rect::new(dl.inner.x, y, dl.inner.width, 1);
+        let line = Line::from(vec![
+            Span::styled("> ", Style::default().fg(dialog.accent)),
+            Span::styled(buffer.clone(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(dialog.accent)),
+        ]);
+        frame.render_widget(Paragraph::new(line), rect);
+    }
+    // Buttons.
+    for (i, button) in dialog.buttons.iter().enumerate() {
+        let rect = dl.button_rects[i];
+        if rect.width == 0 {
+            continue;
+        }
+        let base = Style::default().bg(Color::DarkGray).fg(Color::White);
+        let line = Line::from(vec![
+            Span::styled(" [", base),
+            Span::styled(
+                button.accel.key_label(),
+                base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("] {} ", button.label), base),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(base), rect);
+    }
 }
 
 /// Greedily word-wrap `msg` to lines of at most `width` display columns. Words
@@ -1528,7 +1821,11 @@ fn wrap_message(msg: &str, width: usize) -> Vec<String> {
             continue;
         }
         let cur_len = cur.chars().count();
-        let needed = if cur.is_empty() { word_len } else { cur_len + 1 + word_len };
+        let needed = if cur.is_empty() {
+            word_len
+        } else {
+            cur_len + 1 + word_len
+        };
         if needed > width {
             lines.push(std::mem::take(&mut cur));
             cur.push_str(word);
@@ -1681,6 +1978,32 @@ mod tests {
     }
 
     #[test]
+    fn child_tab_entries_label_agents_and_shells() {
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        let session = &mut state.tabs[0].session;
+        session
+            .spawn_agent_child(&pty, "claude", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        session
+            .spawn_child(&pty, "zsh", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+
+        let labels: Vec<String> = child_tab_entries(&state)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        // Primary "agent", the extra agent numbered from 2, the shell from 1.
+        assert_eq!(labels, vec!["agent", "agent 2", "shell 1"]);
+    }
+
+    #[test]
     fn hit_test_maps_child_tab_close_glyph() {
         let state = state_with_tabs(1);
         let area = Rect::new(0, 0, 80, 24);
@@ -1702,8 +2025,14 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         // With a tab selected both buttons show, right-aligned: "+ shell" flush
         // right (cols 71..=79), "+ agent" to its left (cols 61..=69).
-        assert_eq!(hit_test(area, &state, 72, 2), Some(HitTarget::NewShellButton));
-        assert_eq!(hit_test(area, &state, 62, 2), Some(HitTarget::NewAgentButton));
+        assert_eq!(
+            hit_test(area, &state, 72, 2),
+            Some(HitTarget::NewShellButton)
+        );
+        assert_eq!(
+            hit_test(area, &state, 62, 2),
+            Some(HitTarget::NewAgentButton)
+        );
     }
 
     #[test]
@@ -1711,7 +2040,10 @@ mod tests {
         let state = state_with_tabs(2);
         let area = Rect::new(0, 0, 80, 24);
         // Tab 0's name row is row 4; the ✕ occupies the far-right inner columns.
-        assert_eq!(hit_test(area, &state, 26, 4), Some(HitTarget::CloseAgentTab(0)));
+        assert_eq!(
+            hit_test(area, &state, 26, 4),
+            Some(HitTarget::CloseAgentTab(0))
+        );
         // A click on the left of the same row selects the tab instead.
         assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
     }
@@ -1893,7 +2225,10 @@ mod tests {
     fn info_bar_without_selection_says_no_tab() {
         let state = empty_state();
         let flat = flatten(&info_bar_line(&state, &empty_cache()));
-        assert!(flat.contains("No Agent Tab selected"), "got: {flat:?}");
+        assert!(
+            flat.contains("No Agent Session Tab selected"),
+            "got: {flat:?}"
+        );
     }
 
     #[test]
@@ -2064,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_does_not_panic_with_message_overlay() {
+    fn draw_does_not_panic_with_dialog_overlay() {
         let mut term = test_terminal(80, 24);
         let state = empty_state();
         let cache = empty_cache();
@@ -2073,11 +2408,58 @@ mod tests {
                 frame,
                 &state,
                 &cache,
-                &UiOverlay::Message("Test message".to_string()),
+                &UiOverlay::Dialog(Dialog::notification("Test message")),
                 0,
             );
         })
         .unwrap();
+    }
+
+    #[test]
+    fn draw_dialog_renders_title_and_buttons() {
+        let mut term = test_terminal(80, 24);
+        let dialog = Dialog::confirm(
+            "Abandon this worktree?",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Abandon"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        );
+        term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("Abandon this worktree?"), "title must render");
+        assert!(
+            text.contains("[y]") && text.contains("Abandon"),
+            "buttons must render"
+        );
+        assert!(
+            text.contains("[n]") && text.contains("Cancel"),
+            "cancel must render"
+        );
+    }
+
+    #[test]
+    fn dialog_hit_maps_click_to_button() {
+        let area = Rect::new(0, 0, 80, 24);
+        let dialog = Dialog::confirm(
+            "Abandon this worktree?",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Abandon"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        );
+        // Hit-test the center of the first button's rect.
+        let dl = layout_dialog(area, &dialog);
+        let r = dl.button_rects[0];
+        let (cx, cy) = (r.x + r.width / 2, r.y);
+        assert_eq!(dialog_hit(area, &dialog, cx, cy), DialogHit::Button(0));
+        // A click far outside the box resolves to Outside.
+        assert_eq!(dialog_hit(area, &dialog, 0, 0), DialogHit::Outside);
     }
 
     #[test]

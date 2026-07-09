@@ -10,10 +10,13 @@ use std::path::Path;
 /// Scrollback lines kept by each terminal's VT parser.
 const SCROLLBACK: usize = 2000;
 
-/// Whether a terminal hosts the primary agent or a child shell.
+/// What a terminal hosts: the primary agent, an additional agent (a second
+/// agent process running in the same worktree), or a child shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalKind {
     Primary,
+    /// An additional agent process spawned in the same worktree (SPECS §19).
+    Agent,
     Child,
 }
 
@@ -292,13 +295,36 @@ impl Session {
         cwd: &Path,
         size: PtySize,
     ) -> Result<usize> {
+        self.spawn_child_of_kind(TerminalKind::Child, backend, cmd, args, cwd, size)
+    }
+
+    /// Spawn an additional agent terminal in the worktree, returning its index.
+    /// Identical to [`Session::spawn_child`] but tagged [`TerminalKind::Agent`]
+    /// so the tab bar labels it as an agent rather than a shell (SPECS §19).
+    pub fn spawn_agent_child(
+        &mut self,
+        backend: &dyn PtyBackend,
+        cmd: &str,
+        args: &[String],
+        cwd: &Path,
+        size: PtySize,
+    ) -> Result<usize> {
+        self.spawn_child_of_kind(TerminalKind::Agent, backend, cmd, args, cwd, size)
+    }
+
+    /// Shared implementation for spawning a child terminal of a given kind.
+    fn spawn_child_of_kind(
+        &mut self,
+        kind: TerminalKind,
+        backend: &dyn PtyBackend,
+        cmd: &str,
+        args: &[String],
+        cwd: &Path,
+        size: PtySize,
+    ) -> Result<usize> {
         let session = backend.spawn(cmd, args, cwd, size)?;
-        self.children.push(Terminal::new(
-            TerminalKind::Child,
-            cmd.to_string(),
-            session,
-            size,
-        ));
+        self.children
+            .push(Terminal::new(kind, cmd.to_string(), session, size));
         let index = self.children.len() - 1;
         self.selected_child = Some(index);
         Ok(index)
@@ -550,6 +576,22 @@ mod tests {
         assert_eq!(session.child_count(), 1);
         assert_eq!(session.selected_child(), Some(0));
         assert_eq!(session.child(0).unwrap().kind, TerminalKind::Child);
+    }
+
+    // §19: an additional agent child is tagged as an agent, not a shell.
+    #[test]
+    fn spawn_agent_child_is_tagged_agent() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+
+        let idx = session
+            .spawn_agent_child(&pty, "claude", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        assert_eq!(idx, 0);
+        assert_eq!(session.child_count(), 1);
+        assert_eq!(session.child(0).unwrap().kind, TerminalKind::Agent);
     }
 
     // §26: switches child terminal.

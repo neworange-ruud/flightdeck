@@ -71,7 +71,10 @@ use crate::persistence::recovery::recover;
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::input::{map_key, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
-use crate::tui::render::{draw, hit_test, ChildTarget, GitStatusCache, HitTarget, UiOverlay};
+use crate::tui::render::{
+    child_tab_label, dialog_hit, draw, hit_test, ChildTarget, Dialog, DialogAccel, DialogButton,
+    DialogHit, GitStatusCache, HitTarget, UiOverlay,
+};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -669,6 +672,10 @@ enum Prompt {
     /// `(key, display_name)` of each registered agent; a number key selects one
     /// and advances to [`Prompt::NewTabName`] (SPECS §4, §22).
     SelectAgent { agents: Vec<(String, String)> },
+    /// Pick which agent backend to spawn as an additional agent in the current
+    /// session's worktree (the "+ agent" flow). A number key selects one and
+    /// dispatches `NewAgentTerminal`. Holds each agent's `(key, display_name)`.
+    SelectChildAgent { agents: Vec<(String, String)> },
     /// Free-text entry for a new Agent Tab name; dispatches `NewAgentTab` with
     /// the agent chosen in [`Prompt::SelectAgent`] (`None` = configured default).
     NewTabName {
@@ -743,10 +750,10 @@ struct Ui {
     pending_jobs: Vec<WorktreeJob>,
 }
 
-/// A prompt plus the rendered hint shown to the user (drawn as a message line).
+/// A prompt plus the modal dialog rendered for it (title + buttons).
 struct PromptState {
     prompt: Prompt,
-    hint: String,
+    dialog: Dialog,
 }
 
 impl Ui {
@@ -756,9 +763,9 @@ impl Ui {
         self.palette.is_some() || self.prompt.is_some() || !matches!(self.overlay, UiOverlay::None)
     }
 
-    /// Set a transient message toast.
+    /// Show a notification message as a centered modal dialog (SPECS §22).
     fn message(&mut self, msg: impl Into<String>) {
-        self.overlay = UiOverlay::Message(msg.into());
+        self.overlay = UiOverlay::Dialog(Dialog::notification(msg));
     }
 
     /// Clear every overlay/prompt back to the normal main view.
@@ -768,16 +775,31 @@ impl Ui {
         self.prompt = None;
     }
 
-    /// The overlay to render this frame: a live prompt hint takes precedence
-    /// over a plain message, the palette over both.
+    /// The overlay to render this frame: a live prompt dialog takes precedence
+    /// over a plain notification, the palette over both.
     fn render_overlay(&self) -> UiOverlay {
         if let Some(palette) = &self.palette {
             return UiOverlay::Palette(palette.clone());
         }
         if let Some(p) = &self.prompt {
-            return UiOverlay::Message(p.hint.clone());
+            return UiOverlay::Dialog(p.dialog.clone());
         }
         self.overlay.clone()
+    }
+
+    /// The dialog currently accepting clicks, if any: a live prompt's dialog, or
+    /// a notification dialog set as the overlay.
+    fn active_dialog(&self) -> Option<Dialog> {
+        if self.palette.is_some() {
+            return None;
+        }
+        if let Some(p) = &self.prompt {
+            return Some(p.dialog.clone());
+        }
+        match &self.overlay {
+            UiOverlay::Dialog(d) => Some(d.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -1096,7 +1118,25 @@ fn handle_mouse(
     services: &Services,
     ui: &mut Ui,
 ) {
-    // Ignore mouse while a modal/prompt/overlay is capturing input.
+    // A modal dialog captures clicks first: a button fires its accelerator; an
+    // outside click dismisses a plain notification (confirmations ignore it so
+    // they are never dismissed by accident).
+    if let Some(dialog) = ui.active_dialog() {
+        if me.kind == MouseEventKind::Down(MouseButton::Left) {
+            match dialog_hit(area, &dialog, me.column, me.row) {
+                DialogHit::Button(i) => {
+                    if let Some(button) = dialog.buttons.get(i) {
+                        trigger_dialog_button(button.accel, state, services, ui);
+                    }
+                }
+                DialogHit::Outside if ui.prompt.is_none() => ui.clear(),
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // Ignore mouse while any other modal/overlay is capturing input.
     if ui.modal_active() {
         return;
     }
@@ -1135,10 +1175,13 @@ fn handle_mouse(
                         select_target(state, services, target);
                         state.focus_terminal();
                     }
-                    HitTarget::CloseChild(target) => close_child_target(state, services, ui, target),
+                    HitTarget::CloseChild(target) => {
+                        close_child_target(state, services, ui, target)
+                    }
                     HitTarget::NewAgentButton => {
-                        state.focus_app();
-                        start_new_tab_flow(state, ui);
+                        // Spawn another agent in the selected tab's worktree,
+                        // asking which backend to use first (SPECS §19).
+                        start_new_child_agent_flow(state, services, ui);
                     }
                     HitTarget::NewShellButton => {
                         if let Err(e) =
@@ -1238,33 +1281,50 @@ fn select_target(state: &mut AppState, services: &Services, target: ChildTarget)
     }
 }
 
-/// Handle a click on a child-terminal tab's `✕`. The primary "agent" tab closes
-/// the whole Agent Tab (its own confirming flow, SPECS §25); a shell selects
-/// itself and asks a yes/no confirm before closing.
-fn close_child_target(
+/// Fire a dialog button: synthesize its accelerator key and route it exactly
+/// like a keypress, so mouse and keyboard share one code path. A notification
+/// (no active prompt) is simply dismissed.
+fn trigger_dialog_button(
+    accel: DialogAccel,
     state: &mut AppState,
     services: &Services,
     ui: &mut Ui,
-    target: ChildTarget,
 ) {
+    let code = match accel {
+        DialogAccel::Char(c) => KeyCode::Char(c),
+        DialogAccel::Enter => KeyCode::Enter,
+        DialogAccel::Esc => KeyCode::Esc,
+    };
+    if ui.prompt.is_some() {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if let Err(e) = handle_prompt_key(key, state, services, ui) {
+            ui.message(format!("Error: {e}"));
+        }
+    } else {
+        ui.clear();
+    }
+}
+
+/// Handle a click on a child-terminal tab's `✕`. The primary "agent" tab closes
+/// the whole Agent Tab (its own confirming flow, SPECS §25); a shell selects
+/// itself and asks a yes/no confirm before closing.
+fn close_child_target(state: &mut AppState, services: &Services, ui: &mut Ui, target: ChildTarget) {
     match target {
         ChildTarget::Primary => {
             state.focus_app();
-            if let Err(e) = dispatch_command(Command::CloseAgentTab { action: None }, state, services, ui)
+            if let Err(e) =
+                dispatch_command(Command::CloseAgentTab { action: None }, state, services, ui)
             {
                 ui.message(format!("Error: {e}"));
             }
         }
         ChildTarget::Child(i) => {
-            // Select the shell so the confirmed close acts on it.
+            let label = child_tab_label(state, ChildTarget::Child(i))
+                .unwrap_or_else(|| format!("shell {}", i + 1));
+            // Select the terminal so the confirmed close acts on it.
             let _ = state.dispatch(Command::SwitchChildTerminal(Selector::Index(i)), services);
             state.focus_app();
-            start_prompt(
-                ui,
-                Prompt::CloseChildConfirm {
-                    label: format!("shell {}", i + 1),
-                },
-            );
+            start_prompt(ui, Prompt::CloseChildConfirm { label });
         }
     }
 }
@@ -1640,7 +1700,7 @@ fn dispatch_command(
         }
         Command::RenameAgentTab { new_name } if new_name.is_empty() => {
             if state.selected().is_none() {
-                ui.message("No Agent Tab selected.");
+                ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
             start_prompt(
@@ -1653,7 +1713,7 @@ fn dispatch_command(
         }
         Command::SetManualStatus(None) => {
             if state.selected().is_none() {
-                ui.message("No Agent Tab selected.");
+                ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
             start_prompt(ui, Prompt::SetManualStatus);
@@ -1664,18 +1724,34 @@ fn dispatch_command(
             // as a Close prompt (SPECS §25, never auto-escalate).
         }
         Command::CloseChildTerminal => {
-            // Confirm before closing a child shell (Ctrl-w), mirroring the
+            // Confirm before closing a child terminal (Ctrl-w), mirroring the
             // tab's `✕` click. Acts on the currently-selected child.
             match state.selected().and_then(|t| t.session.selected_child()) {
                 Some(i) => {
-                    start_prompt(
-                        ui,
-                        Prompt::CloseChildConfirm {
-                            label: format!("shell {}", i + 1),
-                        },
-                    );
+                    let label = child_tab_label(state, ChildTarget::Child(i))
+                        .unwrap_or_else(|| format!("shell {}", i + 1));
+                    start_prompt(ui, Prompt::CloseChildConfirm { label });
                 }
                 None => ui.message("No child terminal selected."),
+            }
+            return Ok(());
+        }
+        Command::CloseAgentTerminal => {
+            // Confirm before closing the selected child agent. Refuse (no prompt)
+            // when the selected terminal is not an additional agent.
+            let selected_agent = state.selected().and_then(|t| {
+                let i = t.session.selected_child()?;
+                let is_agent = t.session.child(i).map(|c| c.kind)
+                    == Some(crate::terminal::session::TerminalKind::Agent);
+                is_agent.then_some(i)
+            });
+            match selected_agent {
+                Some(i) => {
+                    let label = child_tab_label(state, ChildTarget::Child(i))
+                        .unwrap_or_else(|| format!("agent {}", i + 1));
+                    start_prompt(ui, Prompt::CloseChildConfirm { label });
+                }
+                None => ui.message("No agent tab selected."),
             }
             return Ok(());
         }
@@ -1753,12 +1829,12 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
     }
 }
 
-/// Begin an interactive prompt, computing its on-screen hint.
+/// Begin an interactive prompt, building its modal dialog.
 fn start_prompt(ui: &mut Ui, prompt: Prompt) {
-    let hint = prompt_hint(&prompt, "");
+    let dialog = prompt_dialog(&prompt);
     ui.palette = None;
     ui.overlay = UiOverlay::None;
-    ui.prompt = Some(PromptState { prompt, hint });
+    ui.prompt = Some(PromptState { prompt, dialog });
 }
 
 /// Begin the New Agent Tab flow (SPECS §4, §22): if more than one agent is
@@ -1785,54 +1861,138 @@ fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
     }
 }
 
-/// Build the message-line hint for a prompt given the current text buffer.
-fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
+/// Begin the "+ agent" flow: spawn an additional agent in the selected session
+/// tab's worktree, after picking a backend when more than one agent is
+/// registered. With no session tab yet, fall back to creating a fresh Agent
+/// Session Tab/worktree (there is no session to add an agent to).
+fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mut Ui) {
+    if state.selected().is_none() {
+        state.focus_app();
+        start_new_tab_flow(state, ui);
+        return;
+    }
+    let agents: Vec<(String, String)> = state
+        .registry
+        .all()
+        .iter()
+        .map(|a| (a.key.clone(), a.display_name.clone()))
+        .collect();
+    if agents.len() > 1 {
+        start_prompt(ui, Prompt::SelectChildAgent { agents });
+    } else {
+        // Zero or one agent: no meaningful choice — spawn the tab's default.
+        state.focus_terminal();
+        if let Err(e) = dispatch_command(
+            Command::NewAgentTerminal { agent_key: None },
+            state,
+            services,
+            ui,
+        ) {
+            ui.message(format!("Error: {e}"));
+        }
+    }
+}
+
+/// A digit accelerator for the i-th (0-based) numbered choice, e.g. index 0 → '1'.
+fn digit_accel(i: usize) -> DialogAccel {
+    DialogAccel::Char(char::from_digit((i as u32 + 1) % 10, 10).unwrap_or('?'))
+}
+
+/// Build the modal [`Dialog`] for a prompt: the question/notification text plus
+/// one button per available action. Each button's accelerator matches the key
+/// [`handle_prompt_key`] expects, so mouse and keyboard stay in lockstep.
+fn prompt_dialog(prompt: &Prompt) -> Dialog {
+    let cancel = DialogButton::new(DialogAccel::Esc, "Cancel");
     match prompt {
         Prompt::SelectAgent { agents } => {
-            let mut parts = Vec::new();
-            for (i, (_key, display)) in agents.iter().enumerate() {
-                parts.push(format!("[{}] {}", i + 1, display));
-            }
-            format!(
-                "New Agent Tab — pick agent: {}  (Esc cancel)",
-                parts.join("  ")
+            let mut buttons: Vec<DialogButton> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, (_key, display))| DialogButton::new(digit_accel(i), display.clone()))
+                .collect();
+            buttons.push(cancel);
+            Dialog::confirm("New Agent Session Tab — pick an agent", buttons)
+        }
+        Prompt::SelectChildAgent { agents } => {
+            let mut buttons: Vec<DialogButton> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, (_key, display))| DialogButton::new(digit_accel(i), display.clone()))
+                .collect();
+            buttons.push(cancel);
+            Dialog::confirm("New agent — pick a backend", buttons)
+        }
+        Prompt::NewTabName { buffer, .. } => Dialog::input(
+            "New Agent Session Tab name",
+            buffer.clone(),
+            vec![DialogButton::new(DialogAccel::Enter, "Create"), cancel],
+        ),
+        Prompt::RenameTab { buffer } => Dialog::input(
+            "Rename this Agent Session Tab",
+            buffer.clone(),
+            vec![DialogButton::new(DialogAccel::Enter, "Rename"), cancel],
+        ),
+        Prompt::SetManualStatus => Dialog::confirm(
+            "Set status override",
+            vec![
+                DialogButton::new(DialogAccel::Char('i'), "In progress"),
+                DialogButton::new(DialogAccel::Char('w'), "Waiting"),
+                DialogButton::new(DialogAccel::Char('b'), "Blocked"),
+                DialogButton::new(DialogAccel::Char('d'), "Done"),
+                DialogButton::new(DialogAccel::Char('c'), "Clear"),
+                cancel,
+            ],
+        ),
+        Prompt::CloseTab { actions } => {
+            let mut buttons: Vec<DialogButton> = actions
+                .iter()
+                .enumerate()
+                .map(|(i, a)| DialogButton::new(digit_accel(i), close_action_label(*a)))
+                .collect();
+            buttons.push(cancel);
+            Dialog::confirm(
+                "Close tab — how should running processes be handled?",
+                buttons,
             )
         }
-        Prompt::NewTabName { .. } => {
-            format!("New Agent Tab name: {buffer}_   (Enter to create, Esc to cancel)")
-        }
-        Prompt::RenameTab { .. } => {
-            format!("Rename tab to: {buffer}_   (Enter to apply, Esc to cancel)")
-        }
-        Prompt::SetManualStatus => {
-            "Set status — [i]n progress  [w]aiting  [b]locked  [d]one  [c]lear  (Esc cancel)"
-                .to_string()
-        }
-        Prompt::CloseTab { actions } => {
-            let mut parts = Vec::new();
-            for (i, a) in actions.iter().enumerate() {
-                parts.push(format!("[{}] {}", i + 1, close_action_label(*a)));
-            }
-            format!("Close tab — {}  (Esc cancel)", parts.join("  "))
-        }
-        Prompt::CloseChildConfirm { label } => {
-            format!("Close {label}? [y] close  [n] cancel  (Esc cancel)")
-        }
-        Prompt::CloseAgentChoice { .. } => {
-            "Abandon worktree or close agent? [a] abandon  [c] close  [n] cancel  (Esc cancel)"
-                .to_string()
-        }
-        Prompt::PushConfirm => {
-            "Worktree has uncommitted changes. [p] push committed only  [c] cancel  (Esc cancel)"
-                .to_string()
-        }
+        Prompt::CloseChildConfirm { label } => Dialog::confirm(
+            format!("Close {label}?"),
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Close"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
+        Prompt::CloseAgentChoice { .. } => Dialog::confirm(
+            "Abandon the worktree, or just close the agent?",
+            vec![
+                DialogButton::new(DialogAccel::Char('a'), "Abandon"),
+                DialogButton::new(DialogAccel::Char('c'), "Close"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
+        Prompt::PushConfirm => Dialog::confirm(
+            "The worktree has uncommitted changes. Push the committed changes only?",
+            vec![
+                DialogButton::new(DialogAccel::Char('p'), "Push committed"),
+                DialogButton::new(DialogAccel::Char('c'), "Cancel"),
+            ],
+        ),
         Prompt::AbandonConfirm { dirty } => {
-            if *dirty {
-                "Worktree has uncommitted changes — discard them? [y] abandon (force)  [n] cancel  (Esc cancel)"
-                    .to_string()
+            let (title, yes): (&str, &str) = if *dirty {
+                (
+                    "The worktree has uncommitted changes. Discard them and abandon it?",
+                    "Abandon (force)",
+                )
             } else {
-                "Abandon this worktree? [y] abandon  [n] cancel  (Esc cancel)".to_string()
-            }
+                ("Abandon this worktree?", "Abandon")
+            };
+            Dialog::confirm(
+                title,
+                vec![
+                    DialogButton::new(DialogAccel::Char('y'), yes),
+                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                ],
+            )
         }
         Prompt::MergeConfirm {
             agent_branch,
@@ -1844,8 +2004,14 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             } else {
                 ""
             };
-            format!(
-                "Merge {agent_branch} into {base_branch} then remove the worktree{running}? [y] merge  [n] cancel  (Esc cancel)"
+            Dialog::confirm(
+                format!(
+                    "Merge {agent_branch} into {base_branch} then remove the worktree{running}?"
+                ),
+                vec![
+                    DialogButton::new(DialogAccel::Char('y'), "Merge"),
+                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                ],
             )
         }
         Prompt::RebaseConfirm {
@@ -1864,20 +2030,16 @@ fn prompt_hint(prompt: &Prompt, buffer: &str) -> String {
             } else {
                 ""
             };
-            format!(
-                "Rebase {agent_branch} onto {base_branch}{moved}{running}? Rewrites history; aborts on conflict. [y] rebase  [n] cancel  (Esc cancel)"
+            Dialog::confirm(
+                format!(
+                    "Rebase {agent_branch} onto {base_branch}{moved}{running}? Rewrites history; aborts on conflict."
+                ),
+                vec![
+                    DialogButton::new(DialogAccel::Char('y'), "Rebase"),
+                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                ],
             )
         }
-    }
-}
-
-/// Hint for the two free-text prompts, parameterised by whether it is the
-/// New-Tab (vs Rename) prompt and the current buffer.
-fn text_prompt_hint(is_new: bool, buffer: &str) -> String {
-    if is_new {
-        format!("New Agent Tab name: {buffer}_   (Enter to create, Esc to cancel)")
-    } else {
-        format!("Rename tab to: {buffer}_   (Enter to apply, Esc to cancel)")
     }
 }
 
@@ -1919,8 +2081,27 @@ fn handle_prompt_key(
                         buffer: String::new(),
                         agent_key: Some(agent_key.clone()),
                     };
-                    let hint = prompt_hint(&prompt, "");
-                    ui.prompt = Some(PromptState { prompt, hint });
+                    let dialog = prompt_dialog(&prompt);
+                    ui.prompt = Some(PromptState { prompt, dialog });
+                    return Ok(());
+                }
+            }
+            // Any other key: keep showing the picker.
+            ui.prompt = Some(pstate);
+        }
+        Prompt::SelectChildAgent { agents } => {
+            // A number key picks the backend and spawns the agent in-session.
+            if let KeyCode::Char(c @ '1'..='9') = key.code {
+                let idx = (c as usize) - ('1' as usize);
+                if let Some((agent_key, _display)) = agents.get(idx) {
+                    let result = state.dispatch(
+                        Command::NewAgentTerminal {
+                            agent_key: Some(agent_key.clone()),
+                        },
+                        services,
+                    );
+                    state.focus_terminal();
+                    finish_prompt(result, ui);
                     return Ok(());
                 }
             }
@@ -1935,16 +2116,17 @@ fn handle_prompt_key(
                 Prompt::NewTabName { agent_key, .. } => agent_key.clone(),
                 _ => None,
             };
-            let buffer = match &mut pstate.prompt {
-                Prompt::NewTabName { buffer, .. } | Prompt::RenameTab { buffer } => buffer,
-                _ => unreachable!(),
-            };
             match key.code {
                 KeyCode::Enter => {
-                    let name = buffer.trim().to_string();
+                    let name = match &pstate.prompt {
+                        Prompt::NewTabName { buffer, .. } | Prompt::RenameTab { buffer } => {
+                            buffer.trim().to_string()
+                        }
+                        _ => unreachable!(),
+                    };
                     if name.is_empty() {
                         // Keep prompting; nothing entered yet.
-                        pstate.hint = text_prompt_hint(is_new, "");
+                        pstate.dialog = prompt_dialog(&pstate.prompt);
                         ui.prompt = Some(pstate);
                         return Ok(());
                     }
@@ -1969,15 +2151,21 @@ fn handle_prompt_key(
                     }
                 }
                 KeyCode::Backspace => {
-                    buffer.pop();
-                    let buf = buffer.clone();
-                    pstate.hint = text_prompt_hint(is_new, &buf);
+                    if let Prompt::NewTabName { buffer, .. } | Prompt::RenameTab { buffer } =
+                        &mut pstate.prompt
+                    {
+                        buffer.pop();
+                    }
+                    pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    buffer.push(c);
-                    let buf = buffer.clone();
-                    pstate.hint = text_prompt_hint(is_new, &buf);
+                    if let Prompt::NewTabName { buffer, .. } | Prompt::RenameTab { buffer } =
+                        &mut pstate.prompt
+                    {
+                        buffer.push(c);
+                    }
+                    pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 _ => {
@@ -2223,9 +2411,13 @@ fn run_palette_action(
             start_new_tab_flow(state, ui);
             Ok(())
         }
+        PaletteAction::NewAgentChild => {
+            start_new_child_agent_flow(state, services, ui);
+            Ok(())
+        }
         PaletteAction::RenameAgentTab => {
             if state.selected().is_none() {
-                ui.message("No Agent Tab selected.");
+                ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
             start_prompt(
@@ -2242,7 +2434,7 @@ fn run_palette_action(
         }
         PaletteAction::SetManualStatus => {
             if state.selected().is_none() {
-                ui.message("No Agent Tab selected.");
+                ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
             start_prompt(ui, Prompt::SetManualStatus);
@@ -2537,31 +2729,39 @@ mod tests {
         config
     }
 
-    // --- prompt hints -----------------------------------------------------
+    // --- prompt dialogs ---------------------------------------------------
 
     #[test]
-    fn new_tab_prompt_hint_includes_buffer() {
+    fn new_tab_dialog_shows_input_and_buttons() {
         let p = Prompt::NewTabName {
-            buffer: String::new(),
+            buffer: "fix bug".to_string(),
             agent_key: None,
         };
-        let hint = prompt_hint(&p, "fix bug");
-        assert!(hint.contains("fix bug"));
-        assert!(hint.to_lowercase().contains("name"));
+        let dialog = prompt_dialog(&p);
+        assert_eq!(dialog.input.as_deref(), Some("fix bug"));
+        assert!(dialog.title.to_lowercase().contains("name"));
+        // Create (Enter) + Cancel (Esc).
+        assert!(dialog
+            .buttons
+            .iter()
+            .any(|b| b.accel == DialogAccel::Enter && b.label == "Create"));
+        assert!(dialog.buttons.iter().any(|b| b.accel == DialogAccel::Esc));
     }
 
     #[test]
-    fn select_agent_prompt_hint_lists_numbered_agents() {
+    fn select_agent_dialog_lists_numbered_agents() {
         let p = Prompt::SelectAgent {
             agents: vec![
                 ("claude".to_string(), "Claude Code".to_string()),
                 ("opencode".to_string(), "OpenCode".to_string()),
             ],
         };
-        let hint = prompt_hint(&p, "");
-        assert!(hint.contains("[1] Claude Code"), "got: {hint}");
-        assert!(hint.contains("[2] OpenCode"), "got: {hint}");
-        assert!(hint.to_lowercase().contains("pick agent"), "got: {hint}");
+        let dialog = prompt_dialog(&p);
+        assert!(dialog.title.to_lowercase().contains("pick"));
+        assert_eq!(dialog.buttons[0].accel, DialogAccel::Char('1'));
+        assert_eq!(dialog.buttons[0].label, "Claude Code");
+        assert_eq!(dialog.buttons[1].accel, DialogAccel::Char('2'));
+        assert_eq!(dialog.buttons[1].label, "OpenCode");
     }
 
     #[test]
@@ -2638,25 +2838,35 @@ mod tests {
     }
 
     #[test]
-    fn close_prompt_hint_lists_numbered_actions() {
+    fn close_prompt_dialog_lists_numbered_actions() {
         let p = Prompt::CloseTab {
             actions: vec![CloseAction::CtrlCPrimary, CloseAction::ForceTerminate],
         };
-        let hint = prompt_hint(&p, "");
-        assert!(hint.contains("[1]"));
-        assert!(hint.contains("[2]"));
-        assert!(hint.contains("Ctrl-C primary"));
+        let dialog = prompt_dialog(&p);
+        assert_eq!(dialog.buttons[0].accel, DialogAccel::Char('1'));
+        assert_eq!(dialog.buttons[1].accel, DialogAccel::Char('2'));
+        assert_eq!(dialog.buttons[0].label, "Ctrl-C primary");
+        // Plus a trailing Cancel button.
+        assert!(dialog
+            .buttons
+            .last()
+            .is_some_and(|b| b.accel == DialogAccel::Esc));
     }
 
     // --- effect → overlay mapping ----------------------------------------
 
     #[test]
-    fn effect_message_becomes_message_overlay() {
+    fn effect_message_becomes_dialog_overlay() {
         let mut ui = Ui::default();
         apply_effect_no_state(Effect::Message("hi".to_string()), &mut ui);
         match ui.render_overlay() {
-            UiOverlay::Message(m) => assert_eq!(m, "hi"),
-            other => panic!("expected message overlay, got {other:?}"),
+            UiOverlay::Dialog(d) => {
+                assert_eq!(d.title, "hi");
+                // A notification carries a single OK button.
+                assert_eq!(d.buttons.len(), 1);
+                assert_eq!(d.buttons[0].accel, DialogAccel::Enter);
+            }
+            other => panic!("expected dialog overlay, got {other:?}"),
         }
     }
 
@@ -2698,10 +2908,10 @@ mod tests {
         );
         let pstate = ui.prompt.as_ref().expect("merge prompt set");
         assert!(matches!(pstate.prompt, Prompt::MergeConfirm { .. }));
-        // The hint names both branches and warns about stopping the agent.
-        assert!(pstate.hint.contains("flightdeck/feat"));
-        assert!(pstate.hint.contains("main"));
-        assert!(pstate.hint.contains("stops the running agent"));
+        // The dialog title names both branches and warns about stopping the agent.
+        assert!(pstate.dialog.title.contains("flightdeck/feat"));
+        assert!(pstate.dialog.title.contains("main"));
+        assert!(pstate.dialog.title.contains("stops the running agent"));
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub enum PaletteAction {
     Dispatch(Command),
     /// T9 must prompt for a tab name then dispatch `NewAgentTab`.
     NewAgentTab,
+    /// T9 must pick an agent backend then dispatch `NewAgentTerminal` (spawns an
+    /// additional agent in the current session's worktree).
+    NewAgentChild,
     /// T9 must prompt for a new name then dispatch `RenameAgentTab`.
     RenameAgentTab,
     /// T9 must present the close-action menu then dispatch `CloseAgentTab`.
@@ -41,27 +44,27 @@ pub enum PaletteAction {
 /// All §22 command-palette entries, in display order.
 const ALL_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
-        group: "Agent Tabs",
-        label: "New Agent Tab",
+        group: "Agent Session Tabs",
+        label: "New Agent Session Tab",
         action: PaletteAction::NewAgentTab,
     },
     PaletteEntry {
-        group: "Agent Tabs",
-        label: "Rename Agent Tab",
+        group: "Agent Session Tabs",
+        label: "Rename Agent Session Tab",
         action: PaletteAction::RenameAgentTab,
     },
     PaletteEntry {
-        group: "Agent Tabs",
-        label: "Close Agent Tab",
+        group: "Agent Session Tabs",
+        label: "Close Agent Session Tab",
         action: PaletteAction::CloseAgentTab,
     },
     PaletteEntry {
-        group: "Agent Tabs",
-        label: "Switch Agent Tab",
+        group: "Agent Session Tabs",
+        label: "Switch Agent Session Tab",
         action: PaletteAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
     },
     PaletteEntry {
-        group: "Agent Tabs",
+        group: "Agent Session Tabs",
         label: "Restart Agent",
         action: PaletteAction::Dispatch(Command::RestartAgent),
     },
@@ -107,6 +110,16 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         group: "Terminals",
+        label: "New Agent",
+        action: PaletteAction::NewAgentChild,
+    },
+    PaletteEntry {
+        group: "Terminals",
+        label: "Close Agent",
+        action: PaletteAction::Dispatch(Command::CloseAgentTerminal),
+    },
+    PaletteEntry {
+        group: "Terminals",
         label: "Switch Child Terminal",
         action: PaletteAction::Dispatch(Command::SwitchChildTerminal(Selector::Next)),
     },
@@ -138,10 +151,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 ];
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
-/// View", "Rebase Worktree", and "Pull Base" commands. (The `.env` files are now
-/// symlinked into new worktrees automatically, so the "Copy .env(.local)" entry
-/// is hidden from the palette; the [`Command::CopyEnvFile`] command remains.)
-pub const REQUIRED_ACTION_COUNT: usize = 19;
+/// View", "Rebase Worktree", and "Pull Base" commands and the in-session agent
+/// actions ("New Agent" / "Close Agent"). (The `.env` files are now symlinked
+/// into new worktrees automatically, so the "Copy .env(.local)" entry is hidden
+/// from the palette; the [`Command::CopyEnvFile`] command remains.)
+pub const REQUIRED_ACTION_COUNT: usize = 21;
 
 /// The command palette model (SPECS §22).
 ///
@@ -273,9 +287,9 @@ mod tests {
     #[test]
     fn all_action_labels_present() {
         let required = [
-            "New Agent Tab",
-            "Rename Agent Tab",
-            "Close Agent Tab",
+            "New Agent Session Tab",
+            "Rename Agent Session Tab",
+            "Close Agent Session Tab",
             "Push Branch",
             "Finish / Local Merge",
             "Pull Base",
@@ -283,7 +297,9 @@ mod tests {
             "Abandon Worktree",
             "New Child Terminal",
             "Close Child Terminal",
-            "Switch Agent Tab",
+            "New Agent",
+            "Close Agent",
+            "Switch Agent Session Tab",
             "Switch Child Terminal",
             "Set Manual Status",
             "Restart Agent",
@@ -315,18 +331,17 @@ mod tests {
     #[test]
     fn filter_narrows_list() {
         let mut palette = CommandPalette::new();
-        palette.set_filter("agent tab");
+        palette.set_filter("agent session tab");
         let results = palette.filtered();
-        // Should match "New Agent Tab", "Rename Agent Tab", "Close Agent Tab",
-        // "Switch Agent Tab"
+        // Should match "New/Rename/Close/Switch Agent Session Tab".
         assert!(
             results.len() >= 3,
-            "expected at least 3 results for 'agent tab', got {}",
+            "expected at least 3 results for 'agent session tab', got {}",
             results.len()
         );
         for entry in &results {
             assert!(
-                entry.label.to_lowercase().contains("agent tab"),
+                entry.label.to_lowercase().contains("agent session tab"),
                 "unexpected match: {}",
                 entry.label
             );
@@ -378,13 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn selected_action_new_agent_tab() {
+    fn selected_action_new_agent_session_tab() {
         let mut palette = CommandPalette::new();
-        palette.set_filter("New Agent Tab");
+        palette.set_filter("New Agent Session Tab");
         let results = palette.filtered();
-        // First result should be "New Agent Tab"
+        // First result should be "New Agent Session Tab".
         let first_label = results.first().map(|e| e.label).unwrap_or("");
-        assert_eq!(first_label, "New Agent Tab");
+        assert_eq!(first_label, "New Agent Session Tab");
         let action = palette.selected_action().unwrap();
         assert_eq!(action, &PaletteAction::NewAgentTab);
     }
