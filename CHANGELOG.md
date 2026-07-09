@@ -12,7 +12,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Enable the once-a-day update notice by default and tell Homebrew users to run
+  `brew update && brew upgrade flightdeck` so stale tap metadata is refreshed.
 
 ### Bug fixes
 

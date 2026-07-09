@@ -43,27 +43,27 @@ exists. It only self-updates installs done via the installer above; for Homebrew
 installs it defers to the package manager — update those with:
 
 ```bash
-brew upgrade flightdeck
+brew update && brew upgrade flightdeck
 ```
 
 The Windows build is pure-Rust and ships **without** the self-updater
 (`flightdeck update` is a no-op there); upgrade by re-running the PowerShell
 installer above, which fetches the latest release.
 
-### Update notice (opt-in)
+### Update Notice
 
-FlightDeck can tell you when a newer release is out. It's **off by default**
-(it makes a network request on launch). Turn it on with:
+FlightDeck tells you when a newer release is out. It's **on by default** and
+checks GitHub Releases at most **once a day** in the background (cached per-user,
+never blocking startup). Ensure it is enabled with:
 
 ```bash
 flightdeck setup-update          # sets update.check = true in config.toml
 ```
 
-When enabled, FlightDeck checks GitHub Releases at most **once a day** in the
-background (cached per-user, never blocking startup) and shows a status-bar hint
-when a newer version is available. It only informs — it never auto-updates; you
-still run `flightdeck update` (or `brew upgrade flightdeck`) yourself. Disable
-any time by setting `check = false` under `[update]`.
+When a newer version is available, FlightDeck shows a status-bar hint. It only
+informs — it never auto-updates; you still run `flightdeck update` (or
+`brew update && brew upgrade flightdeck`) yourself. Disable any time by setting
+`check = false` under `[update]`.
 
 ```bash
 cd /path/to/your/git/repo

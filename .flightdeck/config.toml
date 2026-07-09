@@ -20,6 +20,9 @@ on_finish = true
 on_waiting = true
 on_failed = true
 
+[update]
+check = true
+
 [agents.claude]
 display_name = "Claude Code"
 command = "claude"

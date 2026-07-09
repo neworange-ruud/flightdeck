@@ -438,7 +438,7 @@ pub struct AppState {
     /// active terminal behind a horizontal tab bar. Runtime-only (not persisted).
     pub split_view: bool,
     /// Latest published version when a newer release than this binary exists,
-    /// set by the opt-in once-a-day update check (SPECS §30). `None` until the
+    /// set by the once-a-day update check (SPECS §30). `None` until the
     /// check completes (or when up to date / the check is disabled). Drives the
     /// status-bar update hint. Runtime-only.
     pub update_available: Option<String>,

@@ -164,6 +164,12 @@ mod tests {
     }
 
     #[test]
+    fn default_config_enables_update_check() {
+        let cfg = default_config("my-project", "main");
+        assert!(cfg.update.check);
+    }
+
+    #[test]
     fn default_config_opencode_has_status_patterns() {
         let cfg = default_config("my-project", "main");
         let opencode = cfg.agents.get("opencode").unwrap();

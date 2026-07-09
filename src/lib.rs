@@ -111,14 +111,14 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Subcommand dispatch. These configure the opt-in status/notification
+    // Subcommand dispatch. These configure status/notification
     // features and exit without launching the TUI (SPECS §24).
     match std::env::args().nth(1).as_deref() {
         // Install the precise status hooks/plugin (Layer 2).
         Some("setup-status") => return run_setup_status(),
         // Enable OS notifications in config (off by default).
         Some("setup-notifications") => return run_setup_notifications(),
-        // Enable the opt-in once-a-day update notice in config (SPECS §30).
+        // Ensure the once-a-day update notice is enabled in config (SPECS §30).
         Some("setup-update") => return run_setup_update(),
         // Self-update installer-based installs from GitHub Releases (SPECS §29).
         Some("update") => return update::run(),
@@ -321,11 +321,11 @@ fn run_setup_notifications() -> Result<()> {
     Ok(())
 }
 
-/// `flightdeck setup-update`: turn on the opt-in update notice by setting
+/// `flightdeck setup-update`: turn on the update notice by setting
 /// `update.check = true` in `<repo>/.flightdeck/config.toml` (creating the
 /// config on first run), then explain the behavior. Does not launch the TUI
-/// (SPECS §24, §30). The check is off by default because it makes a network
-/// request on launch; this is the quick way to opt in without hand-editing.
+/// (SPECS §24, §30). The check is on by default; this keeps the command useful
+/// for configs that previously disabled it.
 fn run_setup_update() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
@@ -363,7 +363,9 @@ fn run_setup_update() -> Result<()> {
     println!();
     println!("On startup FlightDeck will check GitHub Releases at most once a day (in the");
     println!("background) and show a status-bar hint when a newer version is available.");
-    println!("It never auto-updates — run `flightdeck update` (or `brew upgrade flightdeck`).");
+    println!(
+        "It never auto-updates — run `flightdeck update` (or `brew update && brew upgrade flightdeck`)."
+    );
     println!("Disable any time by setting `check = false` under [update].");
     #[cfg(not(all(feature = "self-update", not(windows))))]
     println!(
@@ -622,7 +624,7 @@ fn print_help() {
     println!("SETUP:");
     println!("    setup-status           Install the opt-in precise agent-status integrations");
     println!("    setup-notifications    Enable OS notifications when agents finish");
-    println!("    setup-update           Enable the opt-in once-a-day update notice");
+    println!("    setup-update           Enable the once-a-day update notice");
     println!();
     println!("CONTAINERS (optional — run agents in isolated Podman containers):");
     println!("    doctor                 Check the container runtime and images are ready");
@@ -830,9 +832,9 @@ fn event_loop(
     let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
     let mut status_in_flight = false;
 
-    // Opt-in once-a-day update notice (SPECS §30): surface any cached "newer
+    // Once-a-day update notice (SPECS §30): surface any cached "newer
     // version" finding immediately and, when due, kick off a background check.
-    // Never blocks startup; disabled installs return `None` and never spawn.
+    // Never blocks startup; disabled configs return `None` and never spawn.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
     if let Some(latest) = crate::update::start_check(
         state.config.update.check,

@@ -92,15 +92,15 @@ fn must_defer(receipt_loaded: bool, receipt_matches_executable: bool) -> bool {
 
 /// Guidance printed when this install can't be self-updated — no receipt, or a
 /// receipt that isn't for this binary. Kept pure (no I/O) so the deferral path
-/// is unit-testable: it must steer Homebrew users to `brew upgrade` and never
-/// imply a self-update happened.
+/// is unit-testable: it must steer Homebrew users to refresh the tap before
+/// upgrading and never imply a self-update happened.
 fn not_self_updatable_guidance() -> String {
     format!(
         "FlightDeck: this install can't self-update via `{APP_NAME} update` (no install \
          receipt for this binary).\n\
          \n\
          If you installed via Homebrew, update with:\n\
-         \x20\x20brew upgrade {APP_NAME}\n\
+         \x20\x20brew update && brew upgrade {APP_NAME}\n\
          \n\
          Otherwise re-run the installer to get the latest release:\n\
          \x20\x20curl --proto '=https' --tlsv1.2 -LsSf \
@@ -109,7 +109,7 @@ fn not_self_updatable_guidance() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in update notice (SPECS §30)
+// Update notice (SPECS §30)
 // ---------------------------------------------------------------------------
 //
 // When `[update] check = true`, FlightDeck makes a once-a-day background check
@@ -121,8 +121,8 @@ fn not_self_updatable_guidance() -> String {
 //
 // The check uses `query_new_version`, which only needs the release source — it
 // does NOT rely on an install receipt, so the notice works for Homebrew installs
-// too (the common case), even though those defer to `brew upgrade` to actually
-// update.
+// too (the common case), even though those defer to `brew update && brew upgrade`
+// to actually update.
 
 /// On-disk record of the last check, so a restart within the interval reuses the
 /// result instead of hitting the network again. Stored per-user (not per-repo).
@@ -234,7 +234,7 @@ fn write_cache(cache: &CheckCache) {
     }
 }
 
-/// Start the opt-in update check (SPECS §30). Returns an immediate notice (the
+/// Start the update check (SPECS §30). Returns an immediate notice (the
 /// latest version string) when a *cached* result already shows a newer release,
 /// so a restart surfaces yesterday's finding instantly. When a fresh check is
 /// due (a day has elapsed, or no cache exists) it additionally spawns a
@@ -275,8 +275,8 @@ mod tests {
         let msg = not_self_updatable_guidance();
         // Must point Homebrew users at the package manager, not self-update.
         assert!(
-            msg.contains("brew upgrade flightdeck"),
-            "guidance must steer Homebrew users to `brew upgrade`: {msg}"
+            msg.contains("brew update && brew upgrade flightdeck"),
+            "guidance must steer Homebrew users to refresh the tap before `brew upgrade`: {msg}"
         );
         // Must offer the installer fallback for non-managed installs.
         assert!(

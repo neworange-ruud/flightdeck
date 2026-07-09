@@ -1281,8 +1281,9 @@ pub fn status_bar_text(mode: InputMode, update_available: Option<&str>) -> Line<
     };
 
     // Update notice (SPECS §30): a non-intrusive hint, never a modal. It points
-    // at `flightdeck update`, which itself routes Homebrew installs to `brew
-    // upgrade`, so a single message is correct for every install method.
+    // at `flightdeck update`, which itself routes Homebrew installs to
+    // `brew update && brew upgrade`, so a single message is correct for every
+    // install method.
     if let Some(version) = update_available {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(

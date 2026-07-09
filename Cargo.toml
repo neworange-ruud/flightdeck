@@ -19,7 +19,7 @@ name = "flightdeck"
 path = "src/main.rs"
 
 [features]
-# On by default: self-update (`flightdeck update`) and the opt-in update notice.
+# On by default: self-update (`flightdeck update`) and the update notice.
 # Its dependency graph pulls in `aws-lc-sys` (a C crypto library) which needs a C
 # toolchain, so it is excluded two ways: by feature (`--no-default-features` for a
 # pure-Rust graph, e.g. the self-contained windows-gnu target with no
@@ -52,7 +52,7 @@ vt100 = "0.16.2"
 # updater at our GitHub Releases. See src/update.rs.
 axoupdater = { version = "0.10", features = ["blocking"], optional = true }
 # Drives axoupdater's async `query_new_version` from the background update-check
-# thread (the opt-in once-a-day notice). A current-thread runtime; tokio is
+# thread (the once-a-day notice). A current-thread runtime; tokio is
 # already in the graph via axoupdater's `blocking` feature.
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 

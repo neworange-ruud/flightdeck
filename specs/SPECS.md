@@ -1116,24 +1116,23 @@ executable.
   install`, hand-copied binary, or a stale/foreign receipt left by a
   since-removed installer copy): FlightDeck **must not** self-replace the binary
   — that would desync the managing package manager. It prints guidance instead:
-  Homebrew users run `brew upgrade flightdeck`; others re-run the installer. This
+  Homebrew users run `brew update && brew upgrade flightdeck`; others re-run the installer. This
   is **not** an error (exit 0). The match is verified by comparing the receipt's
   install path against the running executable's path; a non-matching receipt is
   treated exactly like a missing one, so a leftover receipt can never produce a
   misleading "already up to date".
 
 FlightDeck never auto-updates silently: downloading and replacing the binary is
-always an explicit, user-invoked command. (The optional update *notice* in §30
+always an explicit, user-invoked command. (The update *notice* in §30
 may check for a newer version, but it only informs — it never updates.)
 
 ## 30. Update Notice
 
-An **opt-in** convenience that tells the user when a newer release exists. It is
-purely informational and is governed by these rules:
+An informational convenience that tells the user when a newer release exists. It
+is governed by these rules:
 
-- **Off by default.** Enabled with `update.check = true` in `config.toml`
-  (or `flightdeck setup-update`). It makes a network request on launch, so it is
-  never on without consent.
+- **On by default.** Disable with `update.check = false` in `config.toml`.
+  `flightdeck setup-update` ensures the check is enabled for existing configs.
 - **Once a day.** On startup, when enabled, FlightDeck checks GitHub Releases at
   most once per 24h. The last check time and result are cached per-user (not in
   the repo), so restarts within the day reuse the cached result with no network
@@ -1148,8 +1147,8 @@ purely informational and is governed by these rules:
   status bar shows an unobtrusive hint pointing at `flightdeck update`. Never a
   modal, never an interruption.
 - **Notice ≠ update.** It never downloads or replaces anything; acting on it is
-  the user's explicit choice (`flightdeck update`, or `brew upgrade flightdeck`
-  for Homebrew installs).
+  the user's explicit choice (`flightdeck update`, or
+  `brew update && brew upgrade flightdeck` for Homebrew installs).
 
 ## 31. Container Execution
 

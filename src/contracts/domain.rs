@@ -293,18 +293,22 @@ impl Default for NotificationsConfig {
     }
 }
 
-/// `[update]` config section (SPECS §30): the opt-in update notice. When
+/// `[update]` config section (SPECS §30): the update notice. When
 /// `check` is true, FlightDeck makes a once-a-day background check against
 /// GitHub Releases on startup and shows a status-bar hint when a newer version
-/// exists. It never auto-updates and never blocks startup; the check is **off by
-/// default** (opt-in) because it makes a network request on launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// exists. It never auto-updates and never blocks startup; the check is **on by
+/// default** and can be disabled with `check = false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateConfig {
-    /// Master switch for the background update check. **Off by default**
-    /// (opt-in) — `false` is the `Default`, so no network call happens on launch
-    /// until the user turns it on.
-    #[serde(default)]
+    /// Master switch for the background update check. On by default.
+    #[serde(default = "default_true")]
     pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig { check: true }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -87,6 +87,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_defaults_update_check_to_true() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "proj"
+default_base_branch = "main"
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.update.check);
+    }
+
+    #[test]
     fn load_config_reads_from_fakefs() {
         let cfg = default_config("fakefs-proj", "main");
         let toml_str = serialize_config(&cfg).unwrap();
