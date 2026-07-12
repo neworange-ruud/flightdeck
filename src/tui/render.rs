@@ -121,6 +121,15 @@ impl DialogButton {
     }
 }
 
+/// One row of a [`Dialog`]'s optional list (e.g. the folder browser's
+/// subdirectories). Rendered between the title and the input/buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogListItem {
+    pub label: String,
+    /// Highlighted as the current selection.
+    pub selected: bool,
+}
+
 /// A centered modal dialog. Used for every confirmation, selection, text-entry
 /// prompt, and notification, so they read clearly instead of as a cramped
 /// bottom line.
@@ -130,6 +139,9 @@ pub struct Dialog {
     pub title: String,
     /// `Some(buffer)` for a text-entry prompt: renders an input field.
     pub input: Option<String>,
+    /// An optional scrollable list rendered between the title and the buttons
+    /// (used by the project-folder browser). Empty for ordinary dialogs.
+    pub list: Vec<DialogListItem>,
     /// The action buttons, in display order.
     pub buttons: Vec<DialogButton>,
     /// Border / accent colour (confirmations vs notifications).
@@ -142,6 +154,7 @@ impl Dialog {
         Dialog {
             title: title.into(),
             input: None,
+            list: Vec::new(),
             buttons,
             accent: Color::Cyan,
         }
@@ -152,6 +165,25 @@ impl Dialog {
         Dialog {
             title: title.into(),
             input: Some(buffer),
+            list: Vec::new(),
+            buttons,
+            accent: Color::Cyan,
+        }
+    }
+
+    /// A browser dialog: a title, a text-entry field (a typed path), a
+    /// scrollable list of choices (e.g. subdirectories), and action buttons.
+    /// Used by the project-folder picker.
+    pub fn browser(
+        title: impl Into<String>,
+        typed: String,
+        list: Vec<DialogListItem>,
+        buttons: Vec<DialogButton>,
+    ) -> Dialog {
+        Dialog {
+            title: title.into(),
+            input: Some(typed),
+            list,
             buttons,
             accent: Color::Cyan,
         }
@@ -163,6 +195,7 @@ impl Dialog {
         Dialog {
             title: msg.into(),
             input: None,
+            list: Vec::new(),
             buttons: vec![DialogButton::new(DialogAccel::Enter, "OK")],
             accent: Color::Blue,
         }
@@ -194,6 +227,32 @@ const CLOSE_GLYPH: &str = "✕";
 /// Right-side tab-bar buttons, in left-to-right display order.
 const NEW_AGENT_LABEL: &str = "+ agent";
 const NEW_SHELL_LABEL: &str = "+ shell";
+/// The right-aligned "open another project" button on the project tab row.
+const NEW_PROJECT_LABEL: &str = "+ project";
+
+/// One project's summary for the project tab row (SPECS: multi-project). Carries
+/// only what the row needs to render, so the pure renderer never touches the
+/// runtime `Workspace`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTabInfo {
+    /// Display name (the project's folder name).
+    pub name: String,
+    /// An agent in this project needs attention / is waiting / failed.
+    pub attention: bool,
+    /// An agent in this project is actively working.
+    pub busy: bool,
+}
+
+/// What a click on the project tab row resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectHit {
+    /// A project tab (by index) — switch to it.
+    Tab(usize),
+    /// The `✕` close control on a project tab (by index).
+    Close(usize),
+    /// The right-aligned "+ project" button — open another project.
+    NewButton,
+}
 
 /// Which child-terminal tab a click landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +591,145 @@ pub fn header_line(width: usize) -> Line<'static> {
             block_style,
         ),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Project tab row (SPECS: multi-project)
+// ---------------------------------------------------------------------------
+
+/// The screen geometry of one project tab segment on the project tab row.
+struct ProjectTabSeg {
+    index: usize,
+    /// First column of the segment.
+    start: u16,
+    /// Total width, including the `✕` close control.
+    width: u16,
+    /// Column of the `✕` close control within the segment.
+    close_col: u16,
+}
+
+/// The display label for a project tab (a leading status dot + the name). The
+/// dot width is fixed at two columns so hit-testing and rendering agree.
+fn project_tab_label(name: &str) -> String {
+    format!("● {name}")
+}
+
+/// Compute the geometry of each project tab segment, matching exactly how
+/// [`draw_project_tab_bar`] lays them out. Each renders as `" {label} ✕ "`, so
+/// its width is `label.len() + 4` and the `✕` sits at `start + label.len() + 2`.
+/// Mirrors [`child_tab_positions`] so mouse hit-testing and drawing never drift.
+fn project_tab_positions(area: Rect, names: &[String]) -> Vec<ProjectTabSeg> {
+    let mut out = Vec::new();
+    let mut x = area.x;
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(3); // " | " separator
+        }
+        let label_len = project_tab_label(name).chars().count() as u16;
+        let w = label_len + 4; // " label ✕ "
+        out.push(ProjectTabSeg {
+            index: i,
+            start: x,
+            width: w,
+            close_col: x.saturating_add(label_len).saturating_add(2),
+        });
+        x = x.saturating_add(w);
+    }
+    out
+}
+
+/// The "+ project" button as `(start_col, width)`, right-aligned in `area`.
+fn project_new_button(area: Rect) -> (u16, u16) {
+    let w = NEW_PROJECT_LABEL.chars().count() as u16 + 2; // " + project "
+    let start = area.x.saturating_add(area.width).saturating_sub(w);
+    (start, w)
+}
+
+/// Resolve a click at `(col, row)` on the project tab row `area` to a
+/// [`ProjectHit`]. `names` are the project display names in tab order. The
+/// right-aligned "+ project" button is checked first so it wins where it
+/// overlaps a long tab strip.
+pub fn project_tab_hit_test(
+    area: Rect,
+    names: &[String],
+    col: u16,
+    row: u16,
+) -> Option<ProjectHit> {
+    if !rect_contains(area, col, row) {
+        return None;
+    }
+    let (btn_start, btn_w) = project_new_button(area);
+    if col >= btn_start && col < btn_start.saturating_add(btn_w) {
+        return Some(ProjectHit::NewButton);
+    }
+    for seg in project_tab_positions(area, names) {
+        if col >= seg.start && col < seg.start.saturating_add(seg.width) {
+            if col == seg.close_col {
+                return Some(ProjectHit::Close(seg.index));
+            }
+            return Some(ProjectHit::Tab(seg.index));
+        }
+    }
+    None
+}
+
+/// Draw the full-width project tab row: `● name ✕ | ● name ✕ …` on the left with
+/// a right-aligned `+ project` button. The active project is highlighted; the
+/// status dot is red when a project needs attention, cyan when busy, else dim.
+pub fn draw_project_tab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    projects: &[ProjectTabInfo],
+    active: usize,
+) {
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, p) in projects.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        }
+        let is_active = i == active;
+        let tab_style = if is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        // Status dot colour: attention (red) > busy (cyan) > idle. On the active
+        // (magenta) tab an idle dot reads best as black; elsewhere dim gray.
+        let dot_color = if p.attention {
+            Color::Red
+        } else if p.busy {
+            Color::Cyan
+        } else if is_active {
+            Color::Black
+        } else {
+            Color::DarkGray
+        };
+        spans.push(Span::styled(" ", tab_style));
+        spans.push(Span::styled("●", tab_style.fg(dot_color)));
+        spans.push(Span::styled(format!(" {} ", p.name), tab_style));
+        spans.push(Span::styled(CLOSE_GLYPH, tab_style.fg(Color::Red)));
+        spans.push(Span::styled(" ", tab_style));
+    }
+    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Reset));
+    frame.render_widget(para, area);
+
+    // Right-aligned "+ project" button, drawn on top of the tab strip.
+    let (start, width) = project_new_button(area);
+    if start >= area.x {
+        let style = Style::default()
+            .fg(Color::White)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let rect = Rect::new(start, area.y, width.min(area.width), 1);
+        let btn = Paragraph::new(Line::from(Span::styled(
+            format!(" {NEW_PROJECT_LABEL} "),
+            style,
+        )));
+        frame.render_widget(btn, rect);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1738,11 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
         shortcut_line("  ?", "Help / keybindings"),
         Line::raw(""),
+        Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
+        shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
+        shortcut_line("  Mouse click", "Switch project (top tab row)"),
+        shortcut_line("  + project", "Open another project folder"),
+        Line::raw(""),
         Line::from(Span::styled(
             "Agent Session Tab Navigation",
             Style::default().fg(Color::Yellow),
@@ -1625,6 +1828,24 @@ struct DialogLayout {
     button_rects: Vec<Rect>,
 }
 
+/// Maximum number of list rows rendered in a dialog before it windows around
+/// the selected item (so a folder with hundreds of subdirs stays compact).
+const MAX_DIALOG_LIST_ROWS: usize = 10;
+
+/// The list rows actually shown, windowed around the selected item when the
+/// full list exceeds [`MAX_DIALOG_LIST_ROWS`]. Shared by layout and drawing so
+/// the two never disagree on height.
+fn windowed_list(dialog: &Dialog) -> Vec<DialogListItem> {
+    let n = dialog.list.len();
+    if n <= MAX_DIALOG_LIST_ROWS {
+        return dialog.list.clone();
+    }
+    let sel = dialog.list.iter().position(|i| i.selected).unwrap_or(0);
+    let half = MAX_DIALOG_LIST_ROWS / 2;
+    let start = sel.saturating_sub(half).min(n - MAX_DIALOG_LIST_ROWS);
+    dialog.list[start..start + MAX_DIALOG_LIST_ROWS].to_vec()
+}
+
 /// Compute the centered geometry for `dialog` within `area`.
 fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
     const GAP: u16 = 1;
@@ -1641,6 +1862,11 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
     if let Some(inp) = &dialog.input {
         // "> " prefix + text + cursor.
         content_w = content_w.max(inp.chars().count() as u16 + 4).max(24);
+    }
+    let vlist = windowed_list(dialog);
+    for it in &vlist {
+        // "▸ " marker + label.
+        content_w = content_w.max(it.label.chars().count() as u16 + 2);
     }
     let widest_btn = dialog.buttons.iter().map(|b| b.width()).max().unwrap_or(0);
     content_w = content_w.max(widest_btn);
@@ -1673,8 +1899,11 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rows.push(cur);
     }
 
-    // Inner height: title + (blank + input) + (blank + button rows).
+    // Inner height: title + (blank + list) + (blank + input) + (blank + buttons).
     let mut inner_h = title_lines.len() as u16;
+    if !vlist.is_empty() {
+        inner_h += 1 + vlist.len() as u16;
+    }
     if dialog.input.is_some() {
         inner_h += 2;
     }
@@ -1693,8 +1922,11 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rect.height.saturating_sub(4),
     );
 
-    // Button rects: below the title (and input), each row centered.
+    // Button rects: below the title, list, and input, each row centered.
     let mut y = inner.y + title_lines.len() as u16;
+    if !vlist.is_empty() {
+        y += 1 + vlist.len() as u16;
+    }
     if dialog.input.is_some() {
         y += 2;
     }
@@ -1768,6 +2000,30 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             rect,
         );
         y += 1;
+    }
+    // Scrollable list (e.g. the folder browser), if any.
+    let vlist = windowed_list(dialog);
+    if !vlist.is_empty() {
+        y += 1; // blank separator
+        for it in &vlist {
+            let rect = Rect::new(dl.inner.x, y, dl.inner.width, 1);
+            let style = if it.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let marker = if it.selected { "▸ " } else { "  " };
+            let budget = dl.inner.width.saturating_sub(2) as usize;
+            let label = truncate_ellipsis(&it.label, budget);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("{marker}{label}"), style))),
+                rect,
+            );
+            y += 1;
+        }
     }
     // Input field, if any.
     if let Some(buffer) = &dialog.input {
@@ -1906,16 +2162,16 @@ mod tests {
     fn hit_test_maps_sidebar_rows_to_agent_tabs() {
         let state = state_with_tabs(2);
         let area = Rect::new(0, 0, 80, 24);
-        // Rows 0-1 are the logo header + divider; row 2 is the sidebar's "Agent
-        // Tabs" heading. Tab 0 occupies rows 3..=6, tab 1 rows 7..=10.
-        assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::AgentTab(0)));
-        assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::AgentTab(0)));
-        assert_eq!(hit_test(area, &state, 2, 7), Some(HitTarget::AgentTab(1)));
+        // Rows 0-2 are the logo header, project tab row, and divider; row 3 is
+        // the sidebar's "Agents" heading. Tab 0 occupies rows 4..=7, tab 1 8..=11.
+        assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 7), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 8), Some(HitTarget::AgentTab(1)));
         // The header band sits above the sidebar and selects nothing.
         assert_eq!(hit_test(area, &state, 2, 0), None);
         // The sidebar heading (and any non-tab sidebar row) resolves to the
         // sidebar chrome, so the click still focuses the app (SPECS §23).
-        assert_eq!(hit_test(area, &state, 2, 2), Some(HitTarget::Sidebar));
+        assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::Sidebar));
     }
 
     #[test]
@@ -1925,8 +2181,8 @@ mod tests {
         // reachable by clicking the left panel (SPECS §23).
         let state = state_with_tabs(0);
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(hit_test(area, &state, 2, 2), Some(HitTarget::Sidebar));
-        assert_eq!(hit_test(area, &state, 2, 5), Some(HitTarget::Sidebar));
+        assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::Sidebar));
+        assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::Sidebar));
     }
 
     #[test]
@@ -1970,10 +2226,10 @@ mod tests {
     fn hit_test_maps_child_tab_bar_to_primary() {
         let state = state_with_tabs(1);
         let area = Rect::new(0, 0, 80, 24);
-        // Child tab bar is the first body row (row 2, below the logo + divider);
-        // the "agent" segment starts at the sidebar width (28), spanning " agent ".
+        // Child tab bar is the first body row (row 3, below logo + project tabs
+        // + divider); the "agent" segment starts at the sidebar width (28).
         assert_eq!(
-            hit_test(area, &state, 30, 2),
+            hit_test(area, &state, 30, 3),
             Some(HitTarget::Child(ChildTarget::Primary))
         );
     }
@@ -2010,12 +2266,12 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         // " agent ✕ " starts at col 28; the ✕ sits at 28 + len("agent") + 2 = 35.
         assert_eq!(
-            hit_test(area, &state, 35, 2),
+            hit_test(area, &state, 35, 3),
             Some(HitTarget::CloseChild(ChildTarget::Primary))
         );
         // A column just left of the glyph still selects the tab, not close it.
         assert_eq!(
-            hit_test(area, &state, 30, 2),
+            hit_test(area, &state, 30, 3),
             Some(HitTarget::Child(ChildTarget::Primary))
         );
     }
@@ -2027,11 +2283,11 @@ mod tests {
         // With a tab selected both buttons show, right-aligned: "+ shell" flush
         // right (cols 71..=79), "+ agent" to its left (cols 61..=69).
         assert_eq!(
-            hit_test(area, &state, 72, 2),
+            hit_test(area, &state, 72, 3),
             Some(HitTarget::NewShellButton)
         );
         assert_eq!(
-            hit_test(area, &state, 62, 2),
+            hit_test(area, &state, 62, 3),
             Some(HitTarget::NewAgentButton)
         );
     }
@@ -2040,13 +2296,64 @@ mod tests {
     fn hit_test_maps_sidebar_close_glyph() {
         let state = state_with_tabs(2);
         let area = Rect::new(0, 0, 80, 24);
-        // Tab 0's name row is row 4; the ✕ occupies the far-right inner columns.
+        // Tab 0's name row is row 5; the ✕ occupies the far-right inner columns.
         assert_eq!(
-            hit_test(area, &state, 26, 4),
+            hit_test(area, &state, 26, 5),
             Some(HitTarget::CloseAgentTab(0))
         );
         // A click on the left of the same row selects the tab instead.
-        assert_eq!(hit_test(area, &state, 2, 4), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 2, 5), Some(HitTarget::AgentTab(0)));
+    }
+
+    // --- Project tab row (multi-project) ---------------------------------
+
+    #[test]
+    fn project_tab_hit_test_maps_tabs_close_and_new_button() {
+        // Project row sits at y = 1 (row 0 header, row 1 project tabs).
+        let area = Rect::new(0, 1, 80, 1);
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        // "● alpha" is 7 cols; segment " label ✕ " spans cols 0..11, ✕ at col 9.
+        assert_eq!(
+            project_tab_hit_test(area, &names, 2, 1),
+            Some(ProjectHit::Tab(0))
+        );
+        assert_eq!(
+            project_tab_hit_test(area, &names, 9, 1),
+            Some(ProjectHit::Close(0))
+        );
+        // The "+ project" button is flush right.
+        assert_eq!(
+            project_tab_hit_test(area, &names, 79, 1),
+            Some(ProjectHit::NewButton)
+        );
+        // A row outside the project tab row resolves to nothing.
+        assert_eq!(project_tab_hit_test(area, &names, 2, 0), None);
+    }
+
+    #[test]
+    fn draw_project_tab_bar_renders_names_and_button() {
+        let mut term = test_terminal(80, 3);
+        let projects = vec![
+            ProjectTabInfo {
+                name: "alpha".to_string(),
+                attention: false,
+                busy: true,
+            },
+            ProjectTabInfo {
+                name: "beta".to_string(),
+                attention: true,
+                busy: false,
+            },
+        ];
+        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let row: String = (0..80)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(row.contains("alpha"), "first project name: {row:?}");
+        assert!(row.contains("beta"), "second project name: {row:?}");
+        assert!(row.contains("+ project"), "new-project button: {row:?}");
     }
 
     #[test]
@@ -2200,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn header_and_divider_render_on_top_two_rows() {
+    fn header_and_divider_render_on_top_rows() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(120, 24);
         term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
@@ -2209,16 +2516,18 @@ mod tests {
         let row0: String = (0..120)
             .map(|x| buffer[(x, 0)].symbol().to_string())
             .collect();
-        let row1: String = (0..120)
-            .map(|x| buffer[(x, 1)].symbol().to_string())
+        // Row 1 is the project tab row (drawn by the wiring layer, not `draw`);
+        // row 2 is the divider.
+        let row2: String = (0..120)
+            .map(|x| buffer[(x, 2)].symbol().to_string())
             .collect();
         // The logo (block flourish + brand) sits on the very first row.
         assert!(row0.contains("██████"), "logo row: {row0:?}");
         assert!(row0.contains("F L I G H T"), "brand on logo row: {row0:?}");
-        // The divider fills the second row.
+        // The divider fills the third row (below the header + project tab row).
         assert!(
-            row1.chars().filter(|&c| c == '─').count() > 100,
-            "divider row should be a full-width rule: {row1:?}"
+            row2.chars().filter(|&c| c == '─').count() > 100,
+            "divider row should be a full-width rule: {row2:?}"
         );
     }
 

@@ -88,6 +88,9 @@ pub trait GitExecutor {
 pub trait FileSystem {
     /// Whether a path exists.
     fn exists(&self, p: &Path) -> bool;
+    /// Whether a path exists and is a directory. Used by the project-folder
+    /// browser to list only navigable subdirectories.
+    fn is_dir(&self, p: &Path) -> bool;
     /// Recursively create a directory.
     fn create_dir_all(&self, p: &Path) -> Result<()>;
     /// Read a file to a string.

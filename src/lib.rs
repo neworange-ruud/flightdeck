@@ -47,7 +47,7 @@ pub mod update {
     }
 }
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,7 +60,10 @@ use crate::config::load::{load_config, serialize_config};
 use crate::config::schema::default_config;
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs};
-use crate::contracts::{FileSystem, ManualStatus, Notifier, PtySize, TabId};
+use crate::contracts::{
+    Clock, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, PtyBackend, PtySize,
+    TabId,
+};
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
 use crate::git::repo::{detect_base_branch, GitCli};
@@ -68,12 +71,16 @@ use crate::git::status::{collect_status, WorktreeStatus};
 use crate::notify::SystemNotifier;
 use crate::persistence::project_state::{default_state, load_state, save_state};
 use crate::persistence::recovery::recover;
+use crate::persistence::workspace::{
+    load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
+};
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::input::{map_key, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
-    child_tab_label, dialog_hit, draw, hit_test, ChildTarget, Dialog, DialogAccel, DialogButton,
-    DialogHit, GitStatusCache, HitTarget, UiOverlay,
+    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
+    ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
+    HitTarget, ProjectHit, ProjectTabInfo, UiOverlay,
 };
 
 use crossterm::event::{
@@ -129,31 +136,56 @@ pub fn run() -> Result<()> {
         _ => {}
     }
 
-    // 1–4. Construct services + run startup (init, gitignore, recover, build state).
+    // 1–4. Construct the shared services + build the workspace of open projects.
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
-
-    let git = GitCli::discover(&cwd).map_err(|e| {
-        FlightDeckError::Git(format!(
-            "not inside a Git repository (run FlightDeck from a git project): {e}"
-        ))
-    })?;
-    let repo_root = git.root().to_path_buf();
 
     let fs = RealFs;
     let pty = PortablePtyBackend;
     let clock = RealClock;
     let container = crate::runtime::PodmanCli;
-
-    let services = Services {
-        git: &git,
+    let env = Env {
         fs: &fs,
         pty: &pty,
         clock: &clock,
         container: &container,
     };
 
-    let mut state = startup(&services, &repo_root, &cwd)?;
+    // The launch project (the cwd's repository) must be a git repo — fail fast
+    // with the friendly message if not. It is always opened and made active.
+    let launch = open_project(&env, &cwd).map_err(|e| {
+        FlightDeckError::Git(format!(
+            "not inside a Git repository (run FlightDeck from a git project): {e}"
+        ))
+    })?;
+    let repo_root = launch.git.root().to_path_buf();
+
+    let mut workspace = Workspace {
+        projects: vec![launch],
+        active: 0,
+    };
+
+    // Reopen any other projects remembered from the previous session (best
+    // effort): skip the launch project, folders that no longer exist, and any
+    // that are no longer git repositories. Each project's own tabs are still
+    // recovered from its `state.json` (agents are never auto-relaunched).
+    let ws_path = workspace_state_path();
+    if let Some(ref wp) = ws_path {
+        if let Ok(saved) = load_workspace(&fs, wp) {
+            for p in &saved.projects {
+                let pr = Path::new(p);
+                if !fs.is_dir(pr) {
+                    continue;
+                }
+                match open_project(&env, pr) {
+                    Ok(proj) if !workspace.contains_root(proj.git.root()) => {
+                        workspace.projects.push(proj)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     // 5–8. Initialise the terminal (raw mode + alt screen + panic-restore hook)
     // and run the loop, ensuring teardown happens no matter how we exit.
@@ -196,23 +228,28 @@ pub fn run() -> Result<()> {
         save_and_set_terminal_title(&format!("flightdeck — {}", derive_project_name(&repo_root)));
 
     // Seed the PTY size from the terminal viewport (not the whole screen) so
-    // agents wrap at the right width.
+    // agents wrap at the right width — for every open project.
     if let Ok(size) = terminal.size() {
-        state.set_pty_size(viewport_pty_size(PtySize {
+        let vp = viewport_pty_size(PtySize {
             rows: size.height,
             cols: size.width,
-        }));
+        });
+        for p in workspace.projects.iter_mut() {
+            p.state.set_pty_size(vp);
+        }
     }
 
     // Resume: start the primary agent for every recovered/loaded tab whose
-    // worktree still exists (best effort). Done here, after the viewport size is
-    // known, rather than in `recover`/`AppState::new` which never spawn.
-    let _ = state.resume_agents(&services);
+    // worktree still exists (best effort), across every open project. Done here,
+    // after the viewport size is known, rather than in `recover`/`AppState::new`
+    // which never spawn.
+    for p in workspace.projects.iter_mut() {
+        let services = env.services(&p.git);
+        let _ = p.state.resume_agents(&services);
+    }
 
     let notifier = SystemNotifier;
-    // Background workers (worktree creation, git-status refresh) run git off
-    // the UI thread; they need an owned, cloneable git handle.
-    let loop_result = event_loop(&mut terminal, &mut state, &services, &notifier, git.clone());
+    let loop_result = event_loop(&mut terminal, &mut workspace, &env, &notifier);
 
     // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
     // every session so no orphaned child processes remain. Persist on the way
@@ -224,8 +261,33 @@ pub fn run() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     let _ = restore_terminal_title();
     ratatui::restore();
-    let persist_result = persist_quietly(&state, &services);
-    terminate_all_sessions(&mut state);
+
+    // Persist every project's own state.json (SPECS §9), then the workspace file
+    // recording which projects were open + the active one (best effort — a save
+    // failure never overrides the loop result).
+    let mut persist_result = Ok(());
+    for p in workspace.projects.iter() {
+        let services = env.services(&p.git);
+        if let Err(e) = persist_quietly(&p.state, &services) {
+            persist_result = Err(e);
+        }
+    }
+    if let Some(wp) = &ws_path {
+        let ws_state = WorkspaceState {
+            version: WORKSPACE_VERSION,
+            projects: workspace
+                .projects
+                .iter()
+                .map(|p| p.git.root().to_string_lossy().to_string())
+                .collect(),
+            active: workspace.active,
+        };
+        let _ = save_workspace(&fs, wp, &ws_state);
+    }
+
+    for p in workspace.projects.iter_mut() {
+        terminate_all_sessions(&mut p.state);
+    }
 
     loop_result.and(persist_result)
 }
@@ -716,6 +778,26 @@ enum Prompt {
         drift: u32,
         primary_running: bool,
     },
+    /// Open another project (multi-project): a folder browser that also lets the
+    /// user type a path. Confirming opens the folder as a new project tab.
+    OpenProject { browse: BrowseState },
+    /// Confirm closing an open project tab (`index`). Closing stops that
+    /// project's agents and removes it from the workspace.
+    CloseProjectConfirm { index: usize },
+}
+
+/// State for the project-folder browser prompt ([`Prompt::OpenProject`]): the
+/// directory currently being browsed, its immediate subdirectories (navigable),
+/// the highlighted entry, and any path the user has typed directly.
+struct BrowseState {
+    /// The directory currently shown.
+    dir: PathBuf,
+    /// Immediate subdirectories of `dir`, sorted (for arrow-key selection).
+    entries: Vec<PathBuf>,
+    /// Index of the highlighted entry within `entries`.
+    selected: usize,
+    /// A path typed directly by the user (takes precedence on confirm).
+    typed: String,
 }
 
 /// An in-progress mouse text selection drag over the terminal viewport (SPECS
@@ -748,8 +830,16 @@ struct Ui {
     drag: Option<DragState>,
     /// Worktree-creation jobs queued by [`AppState::begin_new_agent_tab`] this
     /// turn, awaiting hand-off to a background worker by the event loop. Keeps
-    /// the slow `git worktree add` off the UI thread.
-    pending_jobs: Vec<WorktreeJob>,
+    /// the slow `git worktree add` off the UI thread. Each is tagged with the
+    /// index of the project it belongs to, so it is handed to the right
+    /// project's worker even if the active project changes before hand-off.
+    pending_jobs: Vec<PendingJob>,
+}
+
+/// A queued worktree-creation job plus the index of the project that owns it.
+struct PendingJob {
+    project: usize,
+    job: WorktreeJob,
 }
 
 /// A prompt plus the modal dialog rendered for it (title + buttons).
@@ -806,105 +896,267 @@ impl Ui {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace: multiple open projects, each a full AppState + its own git handle
+// ---------------------------------------------------------------------------
+
+/// The stateless services shared by every project. Everything except git is
+/// process-wide (a `RealFs`/`RealClock`/…); git is per-repository, so
+/// [`Env::services`] pairs this bundle with a project's own [`GitCli`] to build
+/// the [`Services`] a dispatch needs. Built once in [`run`].
+struct Env<'a> {
+    fs: &'a dyn FileSystem,
+    pty: &'a dyn PtyBackend,
+    clock: &'a dyn Clock,
+    container: &'a dyn ContainerRuntime,
+}
+
+impl<'a> Env<'a> {
+    /// Pair the shared services with a specific project's git handle.
+    fn services<'b>(&'b self, git: &'b dyn GitExecutor) -> Services<'b> {
+        Services {
+            git,
+            fs: self.fs,
+            pty: self.pty,
+            clock: self.clock,
+            container: self.container,
+        }
+    }
+}
+
+/// One open project: a full [`AppState`] plus everything the event loop needs to
+/// service it independently — its own repository git handle, git-status cache,
+/// and per-project background-worker channels. Every open project stays live
+/// (its PTYs are drained and its agents notify) even when another is on screen.
+struct Project {
+    /// Display name for the project tab (the repo folder name).
+    name: String,
+    /// This project's repository git handle (rooted at its own repo).
+    git: GitCli,
+    /// The project's headless application state.
+    state: AppState,
+    /// Git-status cache for this project's tabs (keyed by tab id).
+    cache: GitStatusCache,
+    /// Completed-worktree-creation channel for this project's background worker.
+    create_tx: Sender<CreateOutcome>,
+    create_rx: Receiver<CreateOutcome>,
+    /// Background git-status refresh channel for this project.
+    status_tx: Sender<StatusMsg>,
+    status_rx: Receiver<StatusMsg>,
+    /// Whether a git-status refresh is in flight for this project.
+    status_in_flight: bool,
+    /// Serializes this project's `git worktree add`s so two quick new-tab
+    /// requests don't race on the repo's index/worktree locks.
+    git_lock: Arc<Mutex<()>>,
+}
+
+/// Open the git project rooted at (or containing) `path`: discover its repo
+/// root, run the SPECS §7 startup (init, recover — never relaunch agents), and
+/// build a [`Project`] with fresh per-project worker channels. Fails if `path`
+/// is not inside a git repository.
+fn open_project(env: &Env, path: &Path) -> Result<Project> {
+    let git = GitCli::discover(path)?;
+    let root = git.root().to_path_buf();
+    let name = derive_project_name(&root);
+    let state = {
+        let services = env.services(&git);
+        startup(&services, &root, &root)?
+    };
+    let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
+    let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
+    Ok(Project {
+        name,
+        git,
+        state,
+        cache: GitStatusCache::new(),
+        create_tx,
+        create_rx,
+        status_tx,
+        status_rx,
+        status_in_flight: false,
+        git_lock: Arc::new(Mutex::new(())),
+    })
+}
+
+/// The set of open projects plus the active (on-screen) one. The active project
+/// renders in the main pane; all projects are serviced in the background.
+struct Workspace {
+    projects: Vec<Project>,
+    active: usize,
+}
+
+impl Workspace {
+    /// The active project (immutable).
+    fn active_project(&self) -> &Project {
+        &self.projects[self.active]
+    }
+
+    /// The active project (mutable).
+    fn active_project_mut(&mut self) -> &mut Project {
+        let i = self.active;
+        &mut self.projects[i]
+    }
+
+    /// Whether a project rooted at `root` is already open.
+    fn contains_root(&self, root: &Path) -> bool {
+        self.projects.iter().any(|p| p.git.root() == root)
+    }
+
+    /// Set the active project by index (clamped to a valid index).
+    fn set_active(&mut self, idx: usize) {
+        if idx < self.projects.len() {
+            self.active = idx;
+        }
+    }
+
+    /// Switch the active project relative to the current one (wrapping).
+    fn switch(&mut self, sel: Selector) {
+        let len = self.projects.len();
+        if len == 0 {
+            return;
+        }
+        self.active = match sel {
+            Selector::Index(i) => i.min(len - 1),
+            Selector::Next => (self.active + 1) % len,
+            Selector::Prev => (self.active + len - 1) % len,
+        };
+    }
+
+    /// Build the per-project summaries for the project tab row.
+    fn tab_infos(&self, now_ms: u64) -> Vec<ProjectTabInfo> {
+        use crate::contracts::InterpretedStatus::*;
+        self.projects
+            .iter()
+            .map(|p| {
+                let mut busy = false;
+                let mut attention = false;
+                for tab in &p.state.tabs {
+                    match tab.display_status(now_ms).interpreted {
+                        Starting | Running | Working => busy = true,
+                        WaitingForInput | NeedsAttention | Failed => attention = true,
+                        _ => {}
+                    }
+                }
+                ProjectTabInfo {
+                    name: p.name.clone(),
+                    attention,
+                    busy,
+                }
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event loop (SPECS §23)
 // ---------------------------------------------------------------------------
 
-/// The main event loop. Drains PTY output, refreshes git status, renders, and
-/// routes input until the user quits or a fatal error occurs.
+/// The main event loop. Services every open project's PTYs/status/notifications
+/// each tick (so background projects stay live), renders the active project plus
+/// the project tab row, and routes input until the user quits or a fatal error
+/// occurs.
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    state: &mut AppState,
-    services: &Services,
+    workspace: &mut Workspace,
+    env: &Env,
     notifier: &dyn Notifier,
-    worker_git: GitCli,
 ) -> Result<()> {
     let mut ui = Ui::default();
-    let mut cache: GitStatusCache = GitStatusCache::new();
     let mut tick: u64 = 0;
 
     // Suppress notifications briefly at startup so resumed/just-launched agents
     // settling to idle don't produce a burst of "finished" alerts (SPECS §24).
-    state.begin_notification_grace(services.clock.now_millis());
-
-    // Background-work channels (SPECS §16/§17/§21): slow git runs off the UI
-    // thread so the loop keeps drawing, draining PTYs, and handling input.
-    let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
-    let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
-    let mut status_in_flight = false;
-
-    // Once-a-day update notice (SPECS §30): surface any cached "newer
-    // version" finding immediately and, when due, kick off a background check.
-    // Never blocks startup; disabled configs return `None` and never spawn.
-    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    if let Some(latest) = crate::update::start_check(
-        state.config.update.check,
-        services.clock.now_unix_secs(),
-        update_tx,
-    ) {
-        state.update_available = Some(latest);
+    let now0 = env.clock.now_millis();
+    for p in workspace.projects.iter_mut() {
+        p.state.begin_notification_grace(now0);
     }
-    // Serializes THIS instance's `git worktree add`s so two quick new-tab
-    // requests don't race on the repo's index/worktree locks.
-    let git_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+    // Once-a-day update notice (SPECS §30): surface any cached "newer version"
+    // finding immediately and, when due, kick off a background check. Applied to
+    // every project so whichever is active shows the hint.
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+    let check_enabled = workspace.active_project().state.config.update.check;
+    if let Some(latest) =
+        crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
+    {
+        for p in workspace.projects.iter_mut() {
+            p.state.update_available = Some(latest.clone());
+        }
+    }
 
     loop {
-        let now_ms = services.clock.now_millis();
+        let now_ms = env.clock.now_millis();
+        let active = workspace.active;
+        let n = workspace.projects.len();
 
-        // --- Drain PTY output and feed each terminal's VT parser + status. ---
-        drain_pty_output(state, now_ms);
+        // --- Service EVERY project each tick so background projects stay live:
+        //     drain their PTYs, finalize completed worktrees, poll status files,
+        //     and fire notifications regardless of which project is on screen. ---
+        for idx in 0..n {
+            let is_active = idx == active;
+            let p = &mut workspace.projects[idx];
 
-        // --- Apply completed background worktree-creation jobs. ---
-        drain_create_outcomes(&create_rx, state, services, &mut ui);
+            drain_pty_output(&mut p.state, now_ms);
 
-        // --- Prune cache entries for tabs that no longer exist (closed,
-        // abandoned, or failed creation) so a long-running session doesn't
-        // accumulate stale WorktreeStatus entries indefinitely. ---
-        cache.retain(|id, _| state.tabs.iter().any(|t| &t.meta.id == id));
+            {
+                let services = env.services(&p.git);
+                drain_create_outcomes(&p.create_rx, &mut p.state, &services, &mut ui, is_active);
+            }
 
-        // --- Apply background git-status results into the cache. ---
-        while let Ok(msg) = status_rx.try_recv() {
-            match msg {
-                StatusMsg::Update(id, status) => {
-                    cache.insert(id, status);
+            // Prune cache entries for tabs that no longer exist.
+            p.cache
+                .retain(|id, _| p.state.tabs.iter().any(|t| &t.meta.id == id));
+
+            while let Ok(msg) = p.status_rx.try_recv() {
+                match msg {
+                    StatusMsg::Update(id, status) => {
+                        p.cache.insert(id, status);
+                    }
+                    StatusMsg::Done => p.status_in_flight = false,
                 }
-                StatusMsg::Done => status_in_flight = false,
+            }
+
+            {
+                let services = env.services(&p.git);
+                p.state.poll_status_files(&services, now_ms);
+            }
+
+            for note in p.state.take_finish_notifications(now_ms) {
+                notifier.notify(&note);
             }
         }
 
         // --- Apply a completed background update check (SPECS §30). ---
         while let Ok(latest) = update_rx.try_recv() {
-            state.update_available = Some(latest);
-        }
-
-        // --- Poll opt-in agent status files (precise idle/working signals). ---
-        state.poll_status_files(services, now_ms);
-
-        // --- Fire OS notifications for agents that just finished a task. ---
-        for n in state.take_finish_notifications(now_ms) {
-            notifier.notify(&n);
-        }
-
-        // --- Periodically refresh the git-status cache off the UI thread. ---
-        if tick.is_multiple_of(GIT_REFRESH_EVERY)
-            && !status_in_flight
-            && spawn_status_refresh(state, &worker_git, &status_tx)
-        {
-            status_in_flight = true;
-        }
-        tick = tick.wrapping_add(1);
-
-        // --- Auto-scroll the terminal while a selection drag rests at an edge. ---
-        if ui.drag.is_some() {
-            if let Ok(size) = terminal.size() {
-                autoscroll_drag(state, &ui, Rect::new(0, 0, size.width, size.height));
+            for p in workspace.projects.iter_mut() {
+                p.state.update_available = Some(latest.clone());
             }
         }
 
-        // --- Keep the selected tab's terminals sized to the current layout
-        //     (per-column in split view, full viewport otherwise). ---
+        // --- Refresh the git-status cache for the ACTIVE project only (it is
+        //     the only one whose sidebar/info bar is on screen). ---
+        if tick.is_multiple_of(GIT_REFRESH_EVERY) {
+            let p = &mut workspace.projects[active];
+            if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
+                p.status_in_flight = true;
+            }
+        }
+        tick = tick.wrapping_add(1);
+
+        // --- Auto-scroll the active terminal while a drag rests at an edge. ---
+        if ui.drag.is_some() {
+            if let Ok(size) = terminal.size() {
+                autoscroll_drag(
+                    &mut workspace.projects[active].state,
+                    &ui,
+                    Rect::new(0, 0, size.width, size.height),
+                );
+            }
+        }
+
+        // --- Keep the active tab's terminals sized to the current layout. ---
         if let Ok(size) = terminal.size() {
             sync_terminal_sizes(
-                state,
+                &mut workspace.projects[active].state,
                 PtySize {
                     rows: size.height,
                     cols: size.width,
@@ -912,10 +1164,20 @@ fn event_loop(
             );
         }
 
-        // --- Render. ---
+        // --- Render: the project tab row (workspace-level) plus the active
+        //     project's full UI. The project row is painted first so any
+        //     centered overlay drawn by `draw` still wins on tiny screens. ---
         let overlay = ui.render_overlay();
+        let infos = workspace.tab_infos(now_ms);
+        let active_idx = workspace.active;
+        let p = &workspace.projects[active_idx];
         terminal
-            .draw(|frame| draw(frame, state, &cache, &overlay, now_ms))
+            .draw(|frame| {
+                let area = frame.area();
+                let ml = crate::tui::layout::compute(area);
+                draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx);
+                draw(frame, &p.state, &p.cache, &overlay, now_ms);
+            })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
         // --- Poll for input (short timeout so PTY output keeps flowing). ---
@@ -927,7 +1189,7 @@ fn event_loop(
 
         match event::read().map_err(|e| FlightDeckError::Io(format!("event read failed: {e}")))? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_key(key, state, services, &mut ui)? {
+                if handle_key(key, workspace, env, &mut ui)? {
                     break; // Quit requested via the Ctrl-q key action.
                 }
             }
@@ -936,23 +1198,29 @@ fn event_loop(
                     Ok(s) => Rect::new(0, 0, s.width, s.height),
                     Err(_) => continue,
                 };
-                handle_mouse(me, area, state, services, &mut ui);
+                handle_mouse(me, area, workspace, env, &mut ui);
             }
             Event::Paste(data) => {
-                handle_paste(data, state, services, &mut ui)?;
+                handle_paste(data, workspace, env, &mut ui)?;
             }
             Event::Resize(cols, rows) => {
                 let size = viewport_pty_size(PtySize { rows, cols });
-                state.set_pty_size(size);
-                resize_sessions(state, size);
+                // Resize every project's sessions so a background agent's output
+                // wraps correctly the moment the user switches back to it.
+                for p in workspace.projects.iter_mut() {
+                    p.state.set_pty_size(size);
+                    resize_sessions(&mut p.state, size);
+                }
             }
             _ => {}
         }
 
-        // --- Hand off any queued worktree-creation jobs to background workers
-        //     so `git worktree add` never blocks the loop (SPECS §16/§17). ---
-        for job in ui.pending_jobs.drain(..) {
-            spawn_worktree_job(job, &worker_git, &git_lock, &create_tx);
+        // --- Hand off queued worktree-creation jobs to the owning project's
+        //     background worker so `git worktree add` never blocks the loop. ---
+        for pj in ui.pending_jobs.drain(..) {
+            if let Some(p) = workspace.projects.get(pj.project) {
+                spawn_worktree_job(pj.job, &p.git, &p.git_lock, &p.create_tx);
+            }
         }
 
         // A dispatched Effect::Quit (e.g. the "Quit" palette action) also exits.
@@ -1014,19 +1282,31 @@ fn drain_create_outcomes(
     state: &mut AppState,
     services: &Services,
     ui: &mut Ui,
+    is_active: bool,
 ) {
     while let Ok(outcome) = create_rx.try_recv() {
         match outcome.result {
             Ok(()) => match state.finalize_new_tab(&outcome.tab_id, services) {
-                Ok(effect) => apply_effect(effect, state, ui),
+                // Finalize (spawn the agent, flip to Ready) happens regardless of
+                // which project is on screen; only surface the toast for the
+                // active one so a background project's completion is not noisy.
+                Ok(effect) => {
+                    if is_active {
+                        apply_effect(effect, state, ui)
+                    }
+                }
                 Err(e) => {
                     state.fail_new_tab(&outcome.tab_id);
-                    ui.message(format!("Failed to start agent: {e}"));
+                    if is_active {
+                        ui.message(format!("Failed to start agent: {e}"));
+                    }
                 }
             },
             Err(e) => {
                 state.fail_new_tab(&outcome.tab_id);
-                ui.message(format!("Failed to create worktree: {e}"));
+                if is_active {
+                    ui.message(format!("Failed to create worktree: {e}"));
+                }
             }
         }
     }
@@ -1113,13 +1393,7 @@ const MOUSE_WHEEL_DOWN: u8 = 65;
 /// When the hosted application has its own mouse reporting enabled (a full-screen
 /// TUI), plain button/drag events are forwarded to it so it still works; holding
 /// Shift forces local text selection instead.
-fn handle_mouse(
-    me: MouseEvent,
-    area: Rect,
-    state: &mut AppState,
-    services: &Services,
-    ui: &mut Ui,
-) {
+fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
     // A modal dialog captures clicks first: a button fires its accelerator; an
     // outside click dismisses a plain notification (confirmations ignore it so
     // they are never dismissed by accident).
@@ -1128,7 +1402,7 @@ fn handle_mouse(
             match dialog_hit(area, &dialog, me.column, me.row) {
                 DialogHit::Button(i) => {
                     if let Some(button) = dialog.buttons.get(i) {
-                        trigger_dialog_button(button.accel, state, services, ui);
+                        trigger_dialog_button(button.accel, workspace, env, ui);
                     }
                 }
                 DialogHit::Outside if ui.prompt.is_none() => ui.clear(),
@@ -1142,6 +1416,43 @@ fn handle_mouse(
     if ui.modal_active() {
         return;
     }
+
+    // The project tab row (workspace-level) is checked before the active
+    // project's own layout: a click switches/opens/closes a project.
+    if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        let ml = crate::tui::layout::compute(area);
+        let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
+        if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
+            ui.drag = None;
+            match hit {
+                ProjectHit::Tab(i) => workspace.set_active(i),
+                ProjectHit::Close(i) => {
+                    workspace.set_active(i);
+                    start_close_project_flow(workspace, ui, i);
+                }
+                ProjectHit::NewButton => start_open_project_flow(workspace, env, ui),
+            }
+            return;
+        }
+    }
+
+    // Otherwise route the click into the active project's UI.
+    let active = workspace.active;
+    let p = &mut workspace.projects[active];
+    let services = env.services(&p.git);
+    handle_mouse_project(me, area, &mut p.state, &services, ui);
+}
+
+/// Handle a mouse event within the active project's UI (tabs, terminals, drag
+/// selection, wheel). Split out of [`handle_mouse`] so the workspace-level
+/// chrome (dialogs, project tab row) is handled by the caller.
+fn handle_mouse_project(
+    me: MouseEvent,
+    area: Rect,
+    state: &mut AppState,
+    services: &Services,
+    ui: &mut Ui,
+) {
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // A click on a tab/header switches to it (and never starts a
@@ -1286,12 +1597,7 @@ fn select_target(state: &mut AppState, services: &Services, target: ChildTarget)
 /// Fire a dialog button: synthesize its accelerator key and route it exactly
 /// like a keypress, so mouse and keyboard share one code path. A notification
 /// (no active prompt) is simply dismissed.
-fn trigger_dialog_button(
-    accel: DialogAccel,
-    state: &mut AppState,
-    services: &Services,
-    ui: &mut Ui,
-) {
+fn trigger_dialog_button(accel: DialogAccel, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
     let code = match accel {
         DialogAccel::Char(c) => KeyCode::Char(c),
         DialogAccel::Enter => KeyCode::Enter,
@@ -1299,7 +1605,7 @@ fn trigger_dialog_button(
     };
     if ui.prompt.is_some() {
         let key = KeyEvent::new(code, KeyModifiers::NONE);
-        if let Err(e) = handle_prompt_key(key, state, services, ui) {
+        if let Err(e) = handle_prompt_key(key, workspace, env, ui) {
             ui.message(format!("Error: {e}"));
         }
     } else {
@@ -1572,21 +1878,18 @@ fn encode_mouse_button(
     }
 }
 
-/// Route a key press. Returns `Ok(true)` when the loop should quit.
-fn handle_key(
-    key: KeyEvent,
-    state: &mut AppState,
-    services: &Services,
-    ui: &mut Ui,
-) -> Result<bool> {
+/// Route a key press. Returns `Ok(true)` when the loop should quit. Workspace-
+/// level actions (switch project) act on `workspace`; everything else acts on
+/// the active project's [`AppState`].
+fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<bool> {
     // 1. An active prompt captures all input first.
     if ui.prompt.is_some() {
-        return handle_prompt_key(key, state, services, ui).map(|_| false);
+        return handle_prompt_key(key, workspace, env, ui).map(|_| false);
     }
 
     // 2. The command palette, if open, captures input next (SPECS §22).
     if ui.palette.is_some() {
-        return handle_palette_key(key, state, services, ui).map(|_| false);
+        return handle_palette_key(key, workspace, env, ui).map(|_| false);
     }
 
     // 3. A non-interactive overlay (help, git status, message): any key dismisses.
@@ -1600,17 +1903,26 @@ fn handle_key(
     if ui.modal_active() {
         return Ok(false);
     }
-    match map_key(state.mode(), key) {
+    let mode = workspace.active_project().state.mode();
+    match map_key(mode, key) {
         KeyAction::Dispatch(cmd) => {
-            dispatch_command(cmd, state, services, ui)?;
+            let active = workspace.active;
+            let p = &mut workspace.projects[active];
+            let services = env.services(&p.git);
+            dispatch_command(cmd, &mut p.state, &services, ui)?;
+            Ok(false)
+        }
+        // Project switching is workspace-level, not an AppState command.
+        KeyAction::SwitchProject(sel) => {
+            workspace.switch(sel);
             Ok(false)
         }
         KeyAction::Passthrough(bytes) => {
-            write_active_pty(state, &bytes);
+            write_active_pty(&mut workspace.active_project_mut().state, &bytes);
             Ok(false)
         }
         KeyAction::Paste => {
-            paste_into_active_pty(state);
+            paste_into_active_pty(&mut workspace.active_project_mut().state);
             Ok(false)
         }
         KeyAction::OpenPalette => {
@@ -1622,11 +1934,11 @@ fn handle_key(
             Ok(false)
         }
         KeyAction::FocusApp => {
-            state.focus_app();
+            workspace.active_project_mut().state.focus_app();
             Ok(false)
         }
         KeyAction::FocusTerminal => {
-            state.focus_terminal();
+            workspace.active_project_mut().state.focus_terminal();
             Ok(false)
         }
         KeyAction::Quit => Ok(true),
@@ -1642,12 +1954,7 @@ fn handle_key(
 /// logic applies — this is exactly what these modals saw before bracketed paste
 /// mode coalesced a paste into one event. Otherwise, only a focused terminal
 /// receives it, forwarded to the PTY via [`paste_text_into_active_pty`].
-fn handle_paste(
-    data: String,
-    state: &mut AppState,
-    services: &Services,
-    ui: &mut Ui,
-) -> Result<()> {
+fn handle_paste(data: String, workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<()> {
     if ui.prompt.is_some() || ui.palette.is_some() {
         for ch in data.chars() {
             let code = match ch {
@@ -1656,8 +1963,8 @@ fn handle_paste(
             };
             handle_key(
                 KeyEvent::new(code, KeyModifiers::empty()),
-                state,
-                services,
+                workspace,
+                env,
                 ui,
             )?;
             // Stop if the modal closed mid-paste (e.g. a newline submitted it).
@@ -1677,6 +1984,7 @@ fn handle_paste(
     }
 
     // Only a focused terminal receives pasted text; in App mode it is a no-op.
+    let state = &mut workspace.active_project_mut().state;
     if state.mode() == InputMode::Terminal {
         paste_text_into_active_pty(state, &data);
     }
@@ -1895,6 +2203,240 @@ fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Project flows (multi-project): open / close / browse
+// ---------------------------------------------------------------------------
+
+/// The immediate, non-hidden subdirectories of `dir`, sorted — the navigable
+/// entries in the folder browser. Best effort: an unreadable directory yields
+/// an empty list rather than an error.
+fn list_subdirs(fs: &dyn FileSystem, dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs
+        .list_dir(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| fs.is_dir(p))
+        .filter(|p| {
+            !p.file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Begin the Open Project flow: a folder browser rooted at the sibling
+/// directory of the active project (its neighbours are the likely next
+/// projects), falling back to `$HOME` then the filesystem root.
+fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    let start_dir = workspace
+        .active_project()
+        .git
+        .root()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let entries = list_subdirs(env.fs, &start_dir);
+    start_prompt(
+        ui,
+        Prompt::OpenProject {
+            browse: BrowseState {
+                dir: start_dir,
+                entries,
+                selected: 0,
+                typed: String::new(),
+            },
+        },
+    );
+}
+
+/// Begin the Close Project flow: confirm first (SPECS §25 no-surprise rule).
+/// Refuses to close the only remaining project — that is what Ctrl-q is for.
+fn start_close_project_flow(workspace: &Workspace, ui: &mut Ui, index: usize) {
+    if workspace.projects.len() <= 1 {
+        ui.message("Can't close the only project. Use Ctrl-q to quit FlightDeck.");
+        return;
+    }
+    start_prompt(ui, Prompt::CloseProjectConfirm { index });
+}
+
+/// The folder the browser opens on Enter: the typed path (absolute, or relative
+/// to the browsed dir) when non-empty, else the highlighted subdirectory, else
+/// the browsed directory itself.
+fn resolve_browse_target(browse: &BrowseState) -> PathBuf {
+    let typed = browse.typed.trim();
+    if !typed.is_empty() {
+        let t = PathBuf::from(typed);
+        return if t.is_absolute() {
+            t
+        } else {
+            browse.dir.join(t)
+        };
+    }
+    if let Some(sel) = browse.entries.get(browse.selected) {
+        return sel.clone();
+    }
+    browse.dir.clone()
+}
+
+/// Handle a key for the [`Prompt::OpenProject`] folder browser.
+fn handle_open_project_key(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    let Some(mut pstate) = ui.prompt.take() else {
+        return Ok(());
+    };
+
+    // Enter confirms — resolve the target and open (or switch to) that project.
+    if key.code == KeyCode::Enter {
+        let target = match &pstate.prompt {
+            Prompt::OpenProject { browse } => resolve_browse_target(browse),
+            _ => {
+                ui.prompt = Some(pstate);
+                return Ok(());
+            }
+        };
+        match open_project(env, &target) {
+            Ok(mut proj) => {
+                if workspace.contains_root(proj.git.root()) {
+                    let root = proj.git.root().to_path_buf();
+                    if let Some(i) = workspace.projects.iter().position(|p| p.git.root() == root) {
+                        workspace.set_active(i);
+                    }
+                    ui.message("Project already open — switched to it.");
+                } else {
+                    // Seed the new project's PTY size from the active one and
+                    // resume its recovered agents (never auto-relaunched beyond
+                    // this explicit open), matching startup behaviour.
+                    let sz = workspace.active_project().state.pty_size;
+                    {
+                        let services = env.services(&proj.git);
+                        proj.state.set_pty_size(sz);
+                        let _ = proj.state.resume_agents(&services);
+                    }
+                    let name = proj.name.clone();
+                    workspace.projects.push(proj);
+                    workspace.active = workspace.projects.len() - 1;
+                    ui.message(format!("Opened project '{name}'."));
+                }
+            }
+            Err(e) => ui.message(format!("Could not open project: {e}")),
+        }
+        return Ok(());
+    }
+
+    // Navigation / typing edits the browse state in place.
+    {
+        let Prompt::OpenProject { browse } = &mut pstate.prompt else {
+            ui.prompt = Some(pstate);
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Up => {
+                browse.selected = browse.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if browse.selected + 1 < browse.entries.len() {
+                    browse.selected += 1;
+                }
+            }
+            // Descend into the highlighted subdirectory.
+            KeyCode::Right | KeyCode::Tab => {
+                if let Some(dir) = browse.entries.get(browse.selected).cloned() {
+                    browse.dir = dir;
+                    browse.entries = list_subdirs(env.fs, &browse.dir);
+                    browse.selected = 0;
+                    browse.typed.clear();
+                }
+            }
+            // Go to the parent directory (also Backspace when the typed path is
+            // empty), highlighting the folder we came from.
+            KeyCode::Left => {
+                if let Some(parent) = browse.dir.parent().map(|p| p.to_path_buf()) {
+                    let prev = browse.dir.clone();
+                    browse.dir = parent;
+                    browse.entries = list_subdirs(env.fs, &browse.dir);
+                    browse.selected = browse.entries.iter().position(|e| *e == prev).unwrap_or(0);
+                    browse.typed.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                if browse.typed.is_empty() {
+                    if let Some(parent) = browse.dir.parent().map(|p| p.to_path_buf()) {
+                        let prev = browse.dir.clone();
+                        browse.dir = parent;
+                        browse.entries = list_subdirs(env.fs, &browse.dir);
+                        browse.selected =
+                            browse.entries.iter().position(|e| *e == prev).unwrap_or(0);
+                    }
+                } else {
+                    browse.typed.pop();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                browse.typed.push(c);
+            }
+            _ => {}
+        }
+    }
+    pstate.dialog = prompt_dialog(&pstate.prompt);
+    ui.prompt = Some(pstate);
+    Ok(())
+}
+
+/// Handle a key for the [`Prompt::CloseProjectConfirm`] confirmation. On `y` the
+/// project's sessions are stopped, its state persisted, and it is removed.
+fn handle_close_project_key(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    let Some(pstate) = ui.prompt.take() else {
+        return Ok(());
+    };
+    let index = match &pstate.prompt {
+        Prompt::CloseProjectConfirm { index } => *index,
+        _ => {
+            ui.prompt = Some(pstate);
+            return Ok(());
+        }
+    };
+    match key.code {
+        KeyCode::Char('y') => {
+            if workspace.projects.len() <= 1 || index >= workspace.projects.len() {
+                ui.message("Can't close the only project. Use Ctrl-q to quit FlightDeck.");
+                return Ok(());
+            }
+            // Persist the closing project's tab state, then stop its sessions.
+            {
+                let p = &workspace.projects[index];
+                let services = env.services(&p.git);
+                let _ = persist_quietly(&p.state, &services);
+            }
+            terminate_all_sessions(&mut workspace.projects[index].state);
+            let name = workspace.projects[index].name.clone();
+            workspace.projects.remove(index);
+            // Keep the active index pointing at a valid, sensible project.
+            if index < workspace.active {
+                workspace.active -= 1;
+            }
+            if workspace.active >= workspace.projects.len() {
+                workspace.active = workspace.projects.len() - 1;
+            }
+            ui.message(format!("Closed project '{name}'."));
+        }
+        KeyCode::Char('n') => ui.clear(),
+        _ => ui.prompt = Some(pstate),
+    }
+    Ok(())
+}
+
 /// A digit accelerator for the i-th (0-based) numbered choice, e.g. index 0 → '1'.
 fn digit_accel(i: usize) -> DialogAccel {
     DialogAccel::Char(char::from_digit((i as u32 + 1) % 10, 10).unwrap_or('?'))
@@ -2042,6 +2584,47 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 ],
             )
         }
+        Prompt::OpenProject { browse } => {
+            let title = format!(
+                "Open project — {}   (↑↓ select · → open folder · ← parent · Enter to open · or type a path)",
+                browse.dir.display()
+            );
+            let list: Vec<DialogListItem> = if browse.entries.is_empty() {
+                vec![DialogListItem {
+                    label: "(no subfolders)".to_string(),
+                    selected: false,
+                }]
+            } else {
+                browse
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| DialogListItem {
+                        label: e
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| e.display().to_string()),
+                        selected: i == browse.selected,
+                    })
+                    .collect()
+            };
+            Dialog::browser(
+                title,
+                browse.typed.clone(),
+                list,
+                vec![
+                    DialogButton::new(DialogAccel::Enter, "Open"),
+                    DialogButton::new(DialogAccel::Esc, "Cancel"),
+                ],
+            )
+        }
+        Prompt::CloseProjectConfirm { .. } => Dialog::confirm(
+            "Close this project? Its agents will be stopped.",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Close"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
     }
 }
 
@@ -2055,13 +2638,47 @@ fn close_action_label(a: CloseAction) -> &'static str {
     }
 }
 
-/// Handle a key while a prompt is active. On confirmation, dispatches the
-/// corresponding command and clears the prompt.
+/// Handle a key while a prompt is active. Routes the two workspace-level prompts
+/// (open / close project) to their own handlers and everything else to the
+/// active project's prompt handler.
 fn handle_prompt_key(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    // Esc always cancels the prompt.
+    if key.code == KeyCode::Esc {
+        ui.clear();
+        return Ok(());
+    }
+
+    // Workspace-level prompts don't touch the active project's AppState.
+    match ui.prompt.as_ref().map(|p| &p.prompt) {
+        Some(Prompt::OpenProject { .. }) => {
+            return handle_open_project_key(key, workspace, env, ui)
+        }
+        Some(Prompt::CloseProjectConfirm { .. }) => {
+            return handle_close_project_key(key, workspace, env, ui)
+        }
+        _ => {}
+    }
+
+    let active = workspace.active;
+    let p = &mut workspace.projects[active];
+    let services = env.services(&p.git);
+    handle_prompt_key_project(key, &mut p.state, &services, ui, active)
+}
+
+/// Handle a key for a project-level prompt (new tab, rename, close, push, …) on
+/// the active project. `active` is the active project index, tagged onto any
+/// queued worktree job so it is handed to the right project's worker.
+fn handle_prompt_key_project(
     key: KeyEvent,
     state: &mut AppState,
     services: &Services,
     ui: &mut Ui,
+    active: usize,
 ) -> Result<()> {
     // Esc always cancels the prompt.
     if key.code == KeyCode::Esc {
@@ -2141,7 +2758,10 @@ fn handle_prompt_key(
                         match state.begin_new_agent_tab(&name, new_agent_key.as_deref(), services) {
                             Ok(job) => {
                                 let branch = job.branch.clone();
-                                ui.pending_jobs.push(job);
+                                ui.pending_jobs.push(PendingJob {
+                                    project: active,
+                                    job,
+                                });
                                 ui.message(format!("Creating worktree for {branch}…"));
                             }
                             Err(e) => ui.message(format!("Error: {e}")),
@@ -2288,6 +2908,12 @@ fn handle_prompt_key(
             KeyCode::Char('n') => ui.clear(),
             _ => ui.prompt = Some(pstate),
         },
+        // Workspace-level prompts are routed to their own handlers by
+        // `handle_prompt_key` before reaching here; keep the prompt if one
+        // slips through so it is never silently dropped.
+        Prompt::OpenProject { .. } | Prompt::CloseProjectConfirm { .. } => {
+            ui.prompt = Some(pstate);
+        }
     }
 
     Ok(())
@@ -2367,8 +2993,8 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
 /// Handle a key while the command palette is open (SPECS §22).
 fn handle_palette_key(
     key: KeyEvent,
-    state: &mut AppState,
-    services: &Services,
+    workspace: &mut Workspace,
+    env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
     let Some(palette) = ui.palette.as_mut() else {
@@ -2388,7 +3014,7 @@ fn handle_palette_key(
             let action = palette.selected_action().cloned();
             ui.palette = None;
             if let Some(action) = action {
-                run_palette_action(action, state, services, ui)?;
+                run_palette_action(action, workspace, env, ui)?;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2400,21 +3026,49 @@ fn handle_palette_key(
 }
 
 /// Convert a confirmed [`PaletteAction`] into a command (possibly opening a
-/// secondary prompt for payloads first), then dispatch (SPECS §22).
+/// secondary prompt for payloads first), then dispatch (SPECS §22). Project
+/// actions act on `workspace`; everything else on the active project.
 fn run_palette_action(
     action: PaletteAction,
-    state: &mut AppState,
-    services: &Services,
+    workspace: &mut Workspace,
+    env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
+    // Workspace-level project actions.
     match action {
-        PaletteAction::Dispatch(cmd) => dispatch_command(cmd, state, services, ui),
+        PaletteAction::OpenProject => {
+            start_open_project_flow(workspace, env, ui);
+            return Ok(());
+        }
+        PaletteAction::CloseProject => {
+            let i = workspace.active;
+            start_close_project_flow(workspace, ui, i);
+            return Ok(());
+        }
+        PaletteAction::SwitchProjectNext => {
+            workspace.switch(Selector::Next);
+            return Ok(());
+        }
+        PaletteAction::SwitchProjectPrev => {
+            workspace.switch(Selector::Prev);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Project-level actions act on the active project.
+    let active = workspace.active;
+    let p = &mut workspace.projects[active];
+    let services = env.services(&p.git);
+    let state = &mut p.state;
+    match action {
+        PaletteAction::Dispatch(cmd) => dispatch_command(cmd, state, &services, ui),
         PaletteAction::NewAgentTab => {
             start_new_tab_flow(state, ui);
             Ok(())
         }
         PaletteAction::NewAgentChild => {
-            start_new_child_agent_flow(state, services, ui);
+            start_new_child_agent_flow(state, &services, ui);
             Ok(())
         }
         PaletteAction::RenameAgentTab => {
@@ -2432,7 +3086,12 @@ fn run_palette_action(
         }
         PaletteAction::CloseAgentTab => {
             // Ask dispatch for the option set, then present the menu (SPECS §25).
-            dispatch_command(Command::CloseAgentTab { action: None }, state, services, ui)
+            dispatch_command(
+                Command::CloseAgentTab { action: None },
+                state,
+                &services,
+                ui,
+            )
         }
         PaletteAction::SetManualStatus => {
             if state.selected().is_none() {
@@ -2442,6 +3101,11 @@ fn run_palette_action(
             start_prompt(ui, Prompt::SetManualStatus);
             Ok(())
         }
+        // Handled above.
+        PaletteAction::OpenProject
+        | PaletteAction::CloseProject
+        | PaletteAction::SwitchProjectNext
+        | PaletteAction::SwitchProjectPrev => Ok(()),
     }
 }
 
@@ -2824,11 +3488,12 @@ mod tests {
         };
 
         // Pressing '1' picks Claude Code and advances to the name prompt.
-        handle_prompt_key(
+        handle_prompt_key_project(
             KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
             &mut state,
             &services,
             &mut ui,
+            0,
         )
         .unwrap();
         match &ui.prompt.as_ref().expect("name prompt active").prompt {

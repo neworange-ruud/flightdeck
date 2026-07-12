@@ -24,6 +24,9 @@ pub const INFO_BAR_HEIGHT: u16 = 1;
 /// Height of the full-width branded header (logo) row.
 pub const HEADER_HEIGHT: u16 = 1;
 
+/// Height of the full-width project tab row (switch between open projects).
+pub const PROJECT_TAB_BAR_HEIGHT: u16 = 1;
+
 /// Height of the divider row between the header and the rest of the app.
 pub const DIVIDER_HEIGHT: u16 = 1;
 
@@ -60,6 +63,8 @@ pub const INFO_DIVIDER_HEIGHT: u16 = 1;
 pub struct MainLayout {
     /// Full-width branded header (logo) row at the very top.
     pub header: Rect,
+    /// Full-width project tab row, directly below the header.
+    pub project_tabs: Rect,
     /// Full-width divider row between the header and the rest of the app.
     pub divider: Rect,
     /// Left Agent Tabs sidebar.
@@ -88,9 +93,10 @@ pub struct MainLayout {
 /// If the area is too small (e.g. less than the minimum heights/widths),
 /// sub-rects may be zero-sized — callers must handle this gracefully.
 pub fn compute(area: Rect) -> MainLayout {
-    // Full-width top band: header (logo) | divider | body.
-    let [header, divider, body] = Layout::vertical([
+    // Full-width top band: header (logo) | project tabs | divider | body.
+    let [header, project_tabs, divider, body] = Layout::vertical([
         Constraint::Length(HEADER_HEIGHT),
+        Constraint::Length(PROJECT_TAB_BAR_HEIGHT),
         Constraint::Length(DIVIDER_HEIGHT),
         Constraint::Fill(1),
     ])
@@ -115,6 +121,7 @@ pub fn compute(area: Rect) -> MainLayout {
 
     MainLayout {
         header,
+        project_tabs,
         divider,
         sidebar,
         child_tabs,
@@ -222,11 +229,12 @@ mod tests {
         Rect::new(0, 0, 120, 40)
     }
 
-    /// Total height consumed by the full-width top band (header + divider).
-    const TOP_BAND: u16 = HEADER_HEIGHT + DIVIDER_HEIGHT;
+    /// Total height consumed by the full-width top band
+    /// (header + project tabs + divider).
+    const TOP_BAND: u16 = HEADER_HEIGHT + PROJECT_TAB_BAR_HEIGHT + DIVIDER_HEIGHT;
 
     #[test]
-    fn header_and_divider_span_full_width_at_top() {
+    fn header_project_tabs_and_divider_span_full_width_at_top() {
         let area = full_terminal();
         let layout = compute(area);
         // Header is the very first row, full width.
@@ -234,8 +242,13 @@ mod tests {
         assert_eq!(layout.header.x, 0);
         assert_eq!(layout.header.width, area.width);
         assert_eq!(layout.header.height, HEADER_HEIGHT);
-        // Divider sits directly below the header, also full width.
-        assert_eq!(layout.divider.y, HEADER_HEIGHT);
+        // Project tab row sits directly below the header, full width.
+        assert_eq!(layout.project_tabs.y, HEADER_HEIGHT);
+        assert_eq!(layout.project_tabs.x, 0);
+        assert_eq!(layout.project_tabs.width, area.width);
+        assert_eq!(layout.project_tabs.height, PROJECT_TAB_BAR_HEIGHT);
+        // Divider sits directly below the project tabs, also full width.
+        assert_eq!(layout.divider.y, HEADER_HEIGHT + PROJECT_TAB_BAR_HEIGHT);
         assert_eq!(layout.divider.x, 0);
         assert_eq!(layout.divider.width, area.width);
         assert_eq!(layout.divider.height, DIVIDER_HEIGHT);

@@ -8,7 +8,25 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Multiple projects in one window.** FlightDeck can now run several project
+  folders side by side. A new **project tab row** at the top of the screen
+  switches between them; the folder you launch from is the first (active)
+  project. Each project keeps its own Agent Session Tabs, worktrees, git status,
+  and base branch — and every open project stays **live in the background**, so
+  agents in a project you're not looking at keep running and still fire OS
+  notifications when they finish or need input.
+  - **Open another project** with the **`+ project`** button on the tab row or
+    the **Open Project** palette command. A folder picker lets you **type a
+    path** or **browse** directories (↑↓ select · → open folder · ← parent ·
+    Enter to open).
+  - **Switch projects** with **`Shift`+`Left` / `Shift`+`Right`** (works while a
+    terminal is focused too), by clicking a project tab, or via the **Next/
+    Previous Project** palette commands.
+  - **Close a project** with the tab's `✕` (confirmed first — it stops that
+    project's agents) or the **Close Project** palette command.
+  - **Open projects are remembered across restarts** (per-user
+    `~/.flightdeck/workspace.json`); each project's own tabs are still recovered
+    from its `state.json`, and agents are never auto-relaunched.
 
 ### Improvements
 
