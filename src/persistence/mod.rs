@@ -3,3 +3,4 @@
 
 pub mod project_state;
 pub mod recovery;
+pub mod workspace;

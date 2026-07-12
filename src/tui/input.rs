@@ -25,6 +25,9 @@ use crate::tui::platform;
 pub enum KeyAction {
     /// Dispatch the given [`Command`] via `AppState::dispatch`.
     Dispatch(Command),
+    /// Switch the active project (workspace-level; handled by the wiring layer,
+    /// not `AppState`). `Prev`/`Next` cycle the project tab row.
+    SwitchProject(Selector),
     /// Forward these raw bytes to the active PTY (Terminal mode passthrough).
     Passthrough(Vec<u8>),
     /// Paste from the system clipboard into the active terminal. The wiring
@@ -187,12 +190,21 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
 fn map_global(key: KeyEvent) -> Option<KeyAction> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
         // Ctrl-g: Command palette (both modes).
         KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
         // Ctrl-q: Quit.
         KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
+
+        // --- Project navigation (multi-project) --------------------------
+        // Shift-Left / Shift-Right cycle the open projects. Global so they work
+        // while a terminal is focused too; distinct from the Alt/plain arrows
+        // that switch agent tabs and child terminals. (`alt` takes precedence
+        // when both are held, since those arms are matched first below.)
+        KeyCode::Left if shift && !alt && !ctrl => Some(KeyAction::SwitchProject(Selector::Prev)),
+        KeyCode::Right if shift && !alt && !ctrl => Some(KeyAction::SwitchProject(Selector::Next)),
 
         // --- Agent + child-terminal navigation (SPECS §23) ---------------
         // Alt-based navigation is global so it works while a terminal is
@@ -392,6 +404,21 @@ mod tests {
             map_key(InputMode::Terminal, alt(KeyCode::Right)),
             KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
         );
+    }
+
+    #[test]
+    fn shift_left_right_switch_project_in_both_modes() {
+        // Project switching is global (works while a terminal is focused too).
+        for mode in [InputMode::App, InputMode::Terminal] {
+            assert_eq!(
+                map_key(mode, shift(KeyCode::Left)),
+                KeyAction::SwitchProject(Selector::Prev)
+            );
+            assert_eq!(
+                map_key(mode, shift(KeyCode::Right)),
+                KeyAction::SwitchProject(Selector::Next)
+            );
+        }
     }
 
     #[test]

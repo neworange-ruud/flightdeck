@@ -20,6 +20,10 @@ impl FileSystem for RealFs {
         p.exists()
     }
 
+    fn is_dir(&self, p: &Path) -> bool {
+        p.is_dir()
+    }
+
     fn create_dir_all(&self, p: &Path) -> Result<()> {
         fs::create_dir_all(p).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
     }

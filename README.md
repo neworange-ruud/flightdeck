@@ -161,25 +161,35 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
   `?` shows help.
 
 Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
-`Ctrl-n` new tab · `Ctrl-p` push · `Ctrl-u` pull base · `Ctrl-f`
+`Shift-←/→` previous/next **project** · `Ctrl-n` new tab · `Ctrl-p` push ·
+`Ctrl-u` pull base · `Ctrl-f`
 finish/local-merge · `Ctrl-k` close tab · `Alt-↑/↓` previous/next **agent tab**
 · `Alt-1..9` jump to agent tab ·
 `Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` cycle the
 **terminal tabs** (agent + shells) · `Ctrl-s` set manual status · `Ctrl-r`
-restart agent. The `Alt`-modified navigation works in **both** modes, so you can
-switch tabs without leaving terminal focus; in App mode the bare arrow keys also
-work (handy because some terminals intercept `Alt`+arrows). The full table is in
-the in-app help (`?`).
+restart agent. The `Alt`- and `Shift`-modified navigation works in **both**
+modes, so you can switch projects and tabs without leaving terminal focus; in
+App mode the bare arrow keys also work (handy because some terminals intercept
+`Alt`+arrows). The full table is in the in-app help (`?`).
 
-**Mouse**: click an Agent Tab in the sidebar to select it (or click anywhere
-else in the sidebar to switch to App mode without changing the selection), or a
-child-terminal tab (`agent | shell 1 | …`) to switch terminals.
+**Multiple projects**: the **project tab row** at the top switches between open
+project folders. Open another with the **`+ project`** button (or palette →
+*Open Project*) — type a path or browse folders. Every open project stays live
+in the background (its agents keep running and still notify), and open projects
+are remembered across restarts. See [Multiple projects](#multiple-projects).
+
+**Mouse**: click a **project tab** at the top to switch projects (or its `✕` to
+close it, `+ project` to open one); click an Agent Tab in the sidebar to select
+it (or click anywhere else in the sidebar to switch to App mode without changing
+the selection), or a child-terminal tab (`agent | shell 1 | …`) to switch
+terminals.
 
 ## Screen layout
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ ░░░▒▒▒▓▓▓██████   F · L · I · G · H · T · D · E · C · K   ██████▓▓▓▒▒▒░░░ │  logo header
+│ ● flightdeck ✕ | ● api ✕ | ● web ✕                              + project │  project tabs
 ├──────────────────────────────────────────────────────────────────────────┤  divider
 │ Agents          │ agent | shell 1 | shell 2                                │  terminal tabs
 │  ▸ fix-login    │                                                          │
@@ -194,6 +204,10 @@ child-terminal tab (`agent | shell 1 | …`) to switch terminals.
 
 - **Logo header + divider** — a full-width branded title row. The logo centers
   itself and shrinks to a tighter variant on narrow terminals.
+- **Project tabs** — one tab per open project (its folder name) with a status
+  dot (red = needs attention, cyan = an agent is working, dim = idle) and a `✕`
+  to close it; the active project is highlighted. `+ project` opens another.
+  See [Multiple projects](#multiple-projects).
 - **Agents sidebar** — the list of Agent Tabs (each shows agent, process/status,
   and git indicators), under a centered **Agents** heading.
 - **Git info bar** — a one-line summary for the selected tab's worktree: branch,
@@ -201,6 +215,32 @@ child-terminal tab (`agent | shell 1 | …`) to switch terminals.
   ahead/behind vs upstream (or `no upstream` until the branch is pushed), base
   drift, and the base branch. It reflects the tab's worktree regardless of
   whether the agent or a shell is focused.
+
+## Multiple projects
+
+FlightDeck can run several project folders at once. The folder you launch from
+is the first project; the **project tab row** at the top switches between them.
+
+- **Open a project** — click **`+ project`** on the tab row, or run the
+  **Open Project** command from the palette (`Ctrl-g`). The picker lets you
+  **type a folder path** or **browse**: `↑`/`↓` select a subfolder, `→` (or
+  `Tab`) opens it, `←` goes to the parent, `Enter` opens the highlighted folder
+  (or the typed path) as a project. It must be a Git repository.
+- **Switch projects** — `Shift+←` / `Shift+→` (works in both modes, so it does
+  not require leaving terminal focus), click a project tab, or use the
+  **Next/Previous Project** palette commands.
+- **Close a project** — click a project tab's `✕`, or run **Close Project**.
+  Closing is confirmed first and **stops that project's agents**; you can't close
+  the only remaining project (use `Ctrl-q` to quit).
+- **Everything runs in parallel.** Every open project stays live in the
+  background — its agents keep running and still fire OS notifications when they
+  finish or need input, even while you're looking at another project. Each
+  project keeps its own Agent Session Tabs, worktrees, git status, and base
+  branch.
+- **Remembered across restarts.** The set of open projects is saved to
+  `~/.flightdeck/workspace.json`; relaunching reopens the same project tabs.
+  Each project's own tabs are still recovered from its `state.json`, and agents
+  are **never auto-relaunched** (restart one with `Ctrl-r`).
 
 ## Agent status indicators
 

@@ -39,10 +39,39 @@ pub enum PaletteAction {
     CloseAgentTab,
     /// T9 must prompt for a manual status choice then dispatch `SetManualStatus`.
     SetManualStatus,
+    /// T9 must open the project-folder picker then open the chosen folder as a
+    /// new project (workspace-level, not an `AppState` command).
+    OpenProject,
+    /// T9 must confirm, then close the active project (workspace-level).
+    CloseProject,
+    /// Switch to the next open project (workspace-level).
+    SwitchProjectNext,
+    /// Switch to the previous open project (workspace-level).
+    SwitchProjectPrev,
 }
 
 /// All §22 command-palette entries, in display order.
 const ALL_ENTRIES: &[PaletteEntry] = &[
+    PaletteEntry {
+        group: "Projects",
+        label: "Open Project",
+        action: PaletteAction::OpenProject,
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "Close Project",
+        action: PaletteAction::CloseProject,
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "Next Project",
+        action: PaletteAction::SwitchProjectNext,
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "Previous Project",
+        action: PaletteAction::SwitchProjectPrev,
+    },
     PaletteEntry {
         group: "Agent Session Tabs",
         label: "New Agent Session Tab",
@@ -155,7 +184,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// actions ("New Agent" / "Close Agent"). (The `.env` files are now symlinked
 /// into new worktrees automatically, so the "Copy .env(.local)" entry is hidden
 /// from the palette; the [`Command::CopyEnvFile`] command remains.)
-pub const REQUIRED_ACTION_COUNT: usize = 21;
+pub const REQUIRED_ACTION_COUNT: usize = 25;
 
 /// The command palette model (SPECS §22).
 ///
@@ -287,6 +316,10 @@ mod tests {
     #[test]
     fn all_action_labels_present() {
         let required = [
+            "Open Project",
+            "Close Project",
+            "Next Project",
+            "Previous Project",
             "New Agent Session Tab",
             "Rename Agent Session Tab",
             "Close Agent Session Tab",

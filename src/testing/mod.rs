@@ -95,6 +95,11 @@ impl FileSystem for FakeFs {
         st.files.contains_key(p) || st.dirs.contains(p) || st.symlinks.contains_key(p)
     }
 
+    fn is_dir(&self, p: &Path) -> bool {
+        let st = self.inner.lock().unwrap();
+        st.dirs.contains(p)
+    }
+
     fn create_dir_all(&self, p: &Path) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
