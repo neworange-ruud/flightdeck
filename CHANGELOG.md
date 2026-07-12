@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.5.0] - 2026-07-12
+
+### New features
+
 - **Multiple projects in one window.** FlightDeck can now run several project
   folders side by side. A new **project tab row** at the top of the screen
   switches between them; the folder you launch from is the first (active)
