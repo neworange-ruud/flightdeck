@@ -2068,8 +2068,14 @@ fn dispatch_command(
         _ => {}
     }
 
-    let effect = state.dispatch(cmd, services)?;
-    apply_effect(effect, state, ui);
+    // A command that can't run (e.g. an action needing a selected tab when the
+    // project has none, or a git failure) must surface as a message, never
+    // crash the event loop. Errors always become a toast; only the Ok path
+    // maps its effect onto the UI.
+    match state.dispatch(cmd, services) {
+        Ok(effect) => apply_effect(effect, state, ui),
+        Err(e) => ui.message(format!("Error: {e}")),
+    }
     Ok(())
 }
 

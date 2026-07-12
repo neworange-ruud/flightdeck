@@ -1485,8 +1485,11 @@ impl AppState {
     /// cycle the full horizontal tab ring — the primary "agent" terminal plus
     /// every child shell — wrapping around. `Index(i)` selects child shell `i`.
     fn cmd_switch_child(&mut self, sel: Selector) -> Result<Effect> {
+        // No selected tab (e.g. a freshly-opened project with no agents yet):
+        // switching terminals is simply a no-op, never an error — pressing an
+        // arrow must never be fatal. Mirrors `cmd_switch_tab`.
         let Some(tab) = self.selected_mut() else {
-            return Err(FlightDeckError::Other("no tab selected".to_string()));
+            return Ok(Effect::None);
         };
         let child_count = tab.session.child_count();
         match sel {
@@ -1949,6 +1952,35 @@ mod tests {
             clock,
             container,
         }
+    }
+
+    // --- Switching with no selected tab is a graceful no-op ---------------
+
+    #[test]
+    fn switching_with_no_tab_is_not_an_error() {
+        // Regression: a freshly-opened project has no Agent Tabs. Pressing an
+        // arrow (which dispatches SwitchChildTerminal / SwitchAgentTab) must be
+        // a harmless no-op, never a hard error that crashes the event loop.
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let mut app = fresh_state(Config::default());
+        assert!(app.selected_tab.is_none());
+
+        let svc = services(&git, &fs, &pty, &clock);
+        assert!(matches!(
+            app.dispatch(Command::SwitchChildTerminal(Selector::Prev), &svc),
+            Ok(Effect::None)
+        ));
+        assert!(matches!(
+            app.dispatch(Command::SwitchChildTerminal(Selector::Next), &svc),
+            Ok(Effect::None)
+        ));
+        // Agent-tab switching is likewise graceful (refused, never Err).
+        assert!(app
+            .dispatch(Command::SwitchAgentTab(Selector::Next), &svc)
+            .is_ok());
     }
 
     // --- §26: create tab (happy path) -------------------------------------
