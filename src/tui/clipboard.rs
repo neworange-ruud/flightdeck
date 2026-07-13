@@ -33,6 +33,11 @@ pub fn copy(text: &str) {
 /// Best effort: any failure (no image, missing tool) yields `None` so the caller
 /// can fall back to a normal paste.
 pub fn save_clipboard_image() -> Option<PathBuf> {
+    // Containerized agents mount this dedicated directory read-only. Creating
+    // it here also keeps local image paste self-contained when no container is
+    // involved.
+    std::fs::create_dir_all(image_paste_dir()).ok()?;
+
     #[cfg(target_os = "macos")]
     {
         save_clipboard_image_macos()
@@ -47,13 +52,31 @@ pub fn save_clipboard_image() -> Option<PathBuf> {
     }
 }
 
+/// Directory on the host used exclusively for temporary pasted-image files.
+///
+/// Keeping these files in a dedicated directory (rather than directly under
+/// the system temp directory) lets containerized agents read a pasted image
+/// without granting access to unrelated host temporary files.
+pub fn image_paste_dir() -> PathBuf {
+    std::env::temp_dir().join("flightdeck-paste")
+}
+
+/// Map a pasted-image path from `host_dir` to its corresponding path under a
+/// container bind mount. Returns `None` when the path is not inside the shared
+/// host directory.
+pub fn container_image_path(path: &Path, host_dir: &Path, container_dir: &Path) -> Option<PathBuf> {
+    path.strip_prefix(host_dir)
+        .ok()
+        .map(|relative| container_dir.join(relative))
+}
+
 /// A unique path under the system temp dir for a pasted image, namespaced by pid
 /// and a per-process counter so concurrent pastes never collide.
 fn unique_image_path(ext: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("flightdeck-paste-{pid}-{n}.{ext}"))
+    image_paste_dir().join(format!("flightdeck-paste-{pid}-{n}.{ext}"))
 }
 
 /// `true` if `path` now refers to a non-empty file.
@@ -289,7 +312,8 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, container_image_path};
+    use std::path::Path;
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -300,5 +324,25 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn maps_pasted_image_to_its_container_mount() {
+        assert_eq!(
+            container_image_path(
+                Path::new("/tmp/flightdeck-paste/flightdeck-paste-42-0.png"),
+                Path::new("/tmp/flightdeck-paste"),
+                Path::new("/tmp/flightdeck-paste"),
+            ),
+            Some(Path::new("/tmp/flightdeck-paste/flightdeck-paste-42-0.png").to_path_buf())
+        );
+        assert_eq!(
+            container_image_path(
+                Path::new("/tmp/unrelated.png"),
+                Path::new("/tmp/flightdeck-paste"),
+                Path::new("/tmp/flightdeck-paste"),
+            ),
+            None
+        );
     }
 }
