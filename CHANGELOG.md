@@ -8,7 +8,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Play a distinctive two-note "ding" chime when an agent finishes its turn
+  (transitions from working to idle/completed). The sound is embedded in the
+  binary, plays on macOS, Linux, and Windows, and can be turned off with
+  `sound = false` under `[notifications]`.
 
 ### Improvements
 

@@ -375,6 +375,7 @@ fn run_setup_notifications() -> Result<()> {
     println!("  on_finish  = true   # agent went idle / completed");
     println!("  on_waiting = true   # agent is waiting for input / needs attention");
     println!("  on_failed  = true   # agent errored out");
+    println!("  sound      = true   # play a chime when an agent finishes");
     println!();
     println!("macOS delivery: `brew install terminal-notifier` for best reliability,");
     println!("or allow Script Editor under System Settings → Notifications.");

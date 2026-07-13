@@ -124,6 +124,10 @@ pub struct Notification {
     pub title: String,
     /// Body line (e.g. `"Claude Code finished"`).
     pub body: String,
+    /// Whether to play the "ding" chime alongside this notification. Set only
+    /// when an agent transitions from working into idle/completed (SPECS §24)
+    /// and the `notifications.sound` toggle is on.
+    pub sound: bool,
 }
 
 /// Manual status override set by the user (SPECS §24). `None` = cleared.
@@ -287,6 +291,10 @@ pub struct NotificationsConfig {
     /// Notify when an agent errors out (failed).
     #[serde(default = "default_true")]
     pub on_failed: bool,
+    /// Play the "ding" chime when an agent finishes its turn (idle / completed).
+    /// On by default; independent of the visual/OS notification categories.
+    #[serde(default = "default_true")]
+    pub sound: bool,
 }
 
 impl Default for NotificationsConfig {
@@ -297,6 +305,7 @@ impl Default for NotificationsConfig {
             on_finish: true,
             on_waiting: true,
             on_failed: true,
+            sound: true,
         }
     }
 }

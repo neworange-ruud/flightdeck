@@ -653,6 +653,9 @@ impl AppState {
                         out.push(Notification {
                             title: tab.meta.name.clone(),
                             body: format!("{agent} {}", kind.verb()),
+                            // The chime marks a finished turn (working → idle /
+                            // completed); other categories stay silent (SPECS §24).
+                            sound: cfg.sound && matches!(kind, NotifyKind::Finish),
                         });
                     }
                 }
@@ -2742,6 +2745,8 @@ mod tests {
         // Body names the agent (the test agent's display name is "opencode").
         assert!(notes[0].body.contains("opencode"), "got: {}", notes[0].body);
         assert!(notes[0].body.contains("finished"), "got: {}", notes[0].body);
+        // A finished turn arms the chime.
+        assert!(notes[0].sound, "finish notification should play the chime");
 
         // Staying idle must not re-notify.
         assert!(app.take_finish_notifications(1_201).is_empty());
@@ -2751,6 +2756,22 @@ mod tests {
         assert!(app.take_finish_notifications(1_300).is_empty());
         write_status(&mut app, &fs, &git, &pty, &clock, "idle", 1_400);
         assert_eq!(app.take_finish_notifications(1_400).len(), 1);
+    }
+
+    #[test]
+    fn sound_toggle_off_silences_the_finish_chime() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_notify_on(&dir);
+        config.notifications.sound = false;
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config);
+
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_000);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+        write_status(&mut app, &fs, &git, &pty, &clock, "idle", 1_200);
+        let notes = app.take_finish_notifications(1_200);
+        // The notification still fires; only the chime is suppressed.
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].sound, "sound = false must silence the chime");
     }
 
     #[test]
@@ -2776,6 +2797,11 @@ mod tests {
         let notes = app.take_finish_notifications(1_250);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].body.contains("waiting"), "got: {}", notes[0].body);
+        // Only a finished turn chimes; waiting stays silent.
+        assert!(
+            !notes[0].sound,
+            "waiting notification must not play the chime"
+        );
     }
 
     #[test]
