@@ -29,6 +29,9 @@ pub struct ContainerSpec {
     pub image: String,
     /// Absolute host worktree path, bind-mounted at `/workspace`.
     pub workspace_host: PathBuf,
+    /// Host directory containing temporary pasted images, bind-mounted
+    /// read-only at [`crate::runtime::container::IMAGE_PASTE_DIR`].
+    pub image_paste_host: PathBuf,
     /// The agent command run inside the container.
     pub agent_cmd: String,
     /// The agent's arguments.

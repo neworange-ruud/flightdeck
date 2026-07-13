@@ -3430,7 +3430,8 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     }
 }
 
-/// Paste from the system clipboard into the active terminal (Ctrl-V).
+/// Paste from the system clipboard into the active terminal (Ctrl-V or Cmd-V
+/// when the macOS terminal reports Command as a key modifier).
 ///
 /// When the clipboard holds an image, it is written to a temp file and the
 /// file path is sent to the agent — matching how a terminal inserts a path when
@@ -3438,8 +3439,35 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
 /// trailing space is appended so the user can keep typing. With no image on the
 /// clipboard, a literal Ctrl-V (0x16) is forwarded, preserving prior behaviour.
 fn paste_into_active_pty(state: &mut AppState) {
+    let (agent, containerized) = state
+        .selected()
+        .map(|tab| (tab.meta.agent.as_str(), tab.meta.containerized))
+        .unwrap_or_default();
+
+    // Codex CLI owns native image paste in its interactive composer. Let a
+    // locally-running instance read the host clipboard directly rather than
+    // replacing the paste with plain text. A containerized Codex cannot access
+    // that clipboard, so it uses the shared-file path below.
+    if use_native_codex_image_paste(agent, containerized) {
+        write_active_pty(state, &[0x16]);
+        return;
+    }
+
     match crate::tui::clipboard::save_clipboard_image() {
         Some(path) => {
+            // A container cannot see the host's temp path. Fresh containers
+            // bind-mount FlightDeck's dedicated paste directory at the same
+            // container path, so translate only paths within that directory.
+            let path = if containerized {
+                crate::tui::clipboard::container_image_path(
+                    &path,
+                    &crate::tui::clipboard::image_paste_dir(),
+                    std::path::Path::new(crate::runtime::container::IMAGE_PASTE_DIR),
+                )
+                .unwrap_or(path)
+            } else {
+                path
+            };
             let raw = path.to_string_lossy();
             // Quote the path if it could be word-split by the agent's input.
             let mut text = if raw.contains(char::is_whitespace) {
@@ -3452,6 +3480,10 @@ fn paste_into_active_pty(state: &mut AppState) {
         }
         None => write_active_pty(state, &[0x16]),
     }
+}
+
+fn use_native_codex_image_paste(agent: &str, containerized: bool) -> bool {
+    agent == "codex" && !containerized
 }
 
 /// Forward externally-pasted text (one bracketed paste from the host terminal)
@@ -3907,6 +3939,13 @@ mod tests {
     fn encode_paste_normalises_crlf_and_lf_to_cr() {
         // Both CRLF (Windows clipboard) and bare LF collapse to a single CR.
         assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn local_codex_uses_its_native_image_paste_handler() {
+        assert!(use_native_codex_image_paste("codex", false));
+        assert!(!use_native_codex_image_paste("codex", true));
+        assert!(!use_native_codex_image_paste("claude", false));
     }
 
     #[test]

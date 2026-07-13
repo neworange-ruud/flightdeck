@@ -90,18 +90,28 @@ fn map_terminal_mode(key: KeyEvent) -> KeyAction {
     {
         return KeyAction::FocusApp;
     }
-    // Ctrl-V: paste. Hosted agents (e.g. Claude Code) accept images via Ctrl-V
-    // but cannot see the host clipboard's image flavour through the PTY, so the
-    // wiring layer reads it and sends a temp-file path instead. With no image on
-    // the clipboard it falls back to a literal Ctrl-V (0x16) passthrough.
-    if key.code == KeyCode::Char('v')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
+    // Ctrl-V / Cmd-V on macOS: paste. The wiring layer gives local Codex CLI
+    // the literal key so it can read its native clipboard image; other agents,
+    // and containerized Codex, receive a temporary file path instead. With no
+    // image on the clipboard every agent falls back to Ctrl-V passthrough.
+    if is_paste_shortcut(key, platform::IS_MACOS) {
         return KeyAction::Paste;
     }
     // Everything else passes through to the PTY.
     KeyAction::Passthrough(encode_key(key))
+}
+
+/// Whether a terminal-focused key event is FlightDeck's image-aware paste
+/// shortcut. macOS terminals that report Command as `SUPER` get Command-V;
+/// all platforms retain Ctrl-V.
+fn is_paste_shortcut(key: KeyEvent, is_macos: bool) -> bool {
+    if key.code != KeyCode::Char('v') || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        || (is_macos
+            && key.modifiers.contains(KeyModifiers::SUPER)
+            && !key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +339,15 @@ mod tests {
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
+        }
+    }
+
+    fn super_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::SUPER,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
         }
     }
 
@@ -690,6 +709,12 @@ mod tests {
             map_key(InputMode::Terminal, ctrl(KeyCode::Char('v'))),
             KeyAction::Paste
         );
+    }
+
+    #[test]
+    fn command_v_is_paste_on_macos_when_the_terminal_reports_it() {
+        assert!(is_paste_shortcut(super_key(KeyCode::Char('v')), true));
+        assert!(!is_paste_shortcut(super_key(KeyCode::Char('v')), false));
     }
 
     #[test]

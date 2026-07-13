@@ -16,7 +16,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Fix image paste for Codex CLI: local sessions now receive Codex's native
+  clipboard paste shortcut (`Ctrl-V` and reported `Cmd-V` on macOS), while
+  containerized sessions receive a path to a safely shared temporary image file.
 
 ## [1.7.0] - 2026-07-13
 

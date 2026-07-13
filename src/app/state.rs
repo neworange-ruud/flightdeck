@@ -1612,6 +1612,12 @@ impl AppState {
         if !services.container.image_exists(&image)? {
             return Err(image::missing_image_error(&image, &agent.key));
         }
+        // Podman requires a bind-mount source to exist before launch. The
+        // directory holds only temporary image-paste files and is mounted
+        // read-only into the agent container.
+        services
+            .fs
+            .create_dir_all(&crate::tui::clipboard::image_paste_dir())?;
         // Clear any stale exited container so `--name` does not clash.
         let _ = services.container.remove_container(&name, true);
 
@@ -1715,6 +1721,7 @@ impl AppState {
             labels: standard_labels(tab_id, rhash),
             image: image.to_string(),
             workspace_host: worktree_abs.to_path_buf(),
+            image_paste_host: crate::tui::clipboard::image_paste_dir(),
             agent_cmd: agent.command.clone(),
             agent_args: agent.args.clone(),
             cpu: exec.limits.cpu.clone(),

@@ -13,6 +13,13 @@ use std::path::Path;
 /// The container workdir the host worktree is mounted at.
 pub const WORKSPACE: &str = "/workspace";
 
+/// Container path where FlightDeck exposes temporary pasted-image files.
+///
+/// The source is a FlightDeck-owned directory under the host temp directory,
+/// mounted read-only so agents can attach an image without seeing unrelated
+/// host temporary files.
+pub const IMAGE_PASTE_DIR: &str = "/tmp/flightdeck-paste";
+
 /// Build the `podman run …` argv (everything after the `podman` binary name).
 ///
 /// The container is started **detached** (`-d`) with a TTY allocated (`-it`) so
@@ -58,6 +65,17 @@ pub fn build_run_args(spec: &ContainerSpec) -> Vec<String> {
         &spec.workspace_host,
         WORKSPACE,
         false,
+        &spec.mount_flags,
+    ));
+
+    // Clipboard images originate on the host. Bind-mount only FlightDeck's
+    // dedicated paste directory so a path sent to a containerized agent is
+    // readable there too, without exposing the whole host temp directory.
+    flag!("--volume");
+    a.push(volume_arg(
+        &spec.image_paste_host,
+        IMAGE_PASTE_DIR,
+        true,
         &spec.mount_flags,
     ));
 
@@ -168,6 +186,7 @@ mod tests {
             labels: standard_labels("x", "deadbeef"),
             image: "localhost/img:local".to_string(),
             workspace_host: PathBuf::from("/repo/.flightdeck/worktrees/x"),
+            image_paste_host: PathBuf::from("/tmp/flightdeck-paste"),
             agent_cmd: "claude".to_string(),
             agent_args: vec!["--foo".to_string()],
             cpu: "4".to_string(),
@@ -236,7 +255,10 @@ mod tests {
         let vols = all_values_after(&a, "--volume");
         assert_eq!(
             vols,
-            vec!["/repo/.flightdeck/worktrees/x:/workspace".to_string()]
+            vec![
+                "/repo/.flightdeck/worktrees/x:/workspace".to_string(),
+                "/tmp/flightdeck-paste:/tmp/flightdeck-paste:ro".to_string(),
+            ]
         );
     }
 
@@ -247,6 +269,7 @@ mod tests {
         let a = build_run_args(&spec);
         let vols = all_values_after(&a, "--volume");
         assert_eq!(vols[0], "/repo/.flightdeck/worktrees/x:/workspace:z");
+        assert_eq!(vols[1], "/tmp/flightdeck-paste:/tmp/flightdeck-paste:ro,z");
     }
 
     #[test]
