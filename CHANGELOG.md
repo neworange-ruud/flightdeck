@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.6.0] - 2026-07-13
+
+### New features
+
 - Play a distinctive two-note "ding" chime when an agent finishes its turn
   (transitions from working to idle/completed). The sound is embedded in the
   binary, plays on macOS, Linux, and Windows, and can be turned off with
