@@ -1,60 +1,34 @@
-[project]
-name = "flightdeck"
-default_base_branch = "main"
-
-[worktrees]
-root = ".flightdeck/worktrees"
-
-[git]
-default_remote = "origin"
-primary_host = "github"
-branch_prefix = "flightdeck/"
-
-[ui]
-agent_tab_position = "left"
-default_agent = "opencode"
-
-[notifications]
-enabled = false
-on_finish = true
-on_waiting = true
-on_failed = true
-
-[update]
-check = true
+# FlightDeck project configuration (<repo>/.flightdeck/config.toml).
+#
+# Only values that differ from the global config (~/.flightdeck/config.toml)
+# need to live here. Anything omitted is inherited from the global base.
 
 [agents.claude]
-display_name = "Claude Code"
-command = "claude"
 args = []
+command = "claude"
+display_name = "Claude Code"
 
 [agents.claude.status_patterns]
-waiting = []
 completed = []
 error = []
+waiting = []
 
 [agents.codex]
-display_name = "Codex CLI"
-command = "codex"
 args = []
+command = "codex"
+display_name = "Codex CLI"
 
 [agents.codex.status_patterns]
-waiting = []
 completed = []
 error = []
+waiting = []
 
 [agents.opencode]
-display_name = "OpenCode"
-command = "opencode"
 args = []
+command = "opencode"
+display_name = "OpenCode"
 
 [agents.opencode.status_patterns]
-waiting = [
-    "Proceed?",
-    "Confirm",
-    "Approve",
-    "Do you want to",
-]
 completed = [
     "Done",
     "Complete",
@@ -64,3 +38,28 @@ error = [
     "Error",
     "Failed",
 ]
+waiting = [
+    "Proceed?",
+    "Confirm",
+    "Approve",
+    "Do you want to",
+]
+
+[git]
+branch_prefix = "flightdeck/"
+default_remote = "origin"
+primary_host = "github"
+
+[project]
+default_base_branch = "main"
+name = "flightdeck"
+
+[ui]
+agent_tab_position = "left"
+default_agent = "opencode"
+
+[update]
+check = true
+
+[worktrees]
+root = ".flightdeck/worktrees"
