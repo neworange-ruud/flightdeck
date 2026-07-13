@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.7.0] - 2026-07-13
+
+### New features
+
 - Add a **configuration manager**, opened from the command palette
   ("Open Configuration"). It edits the common settings as toggles/choices —
   OS notifications and per-category alerts, the finish chime, update checks,
