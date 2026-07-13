@@ -1,0 +1,55 @@
+{
+  "type": "transcript",
+  "session_id": "sess_fix_login",
+  "from_index": 0,
+  "replace": true,
+  "items": [
+    {
+      "type": "user_message",
+      "item_id": "item_0001",
+      "text": "Fix the login redirect loop.",
+      "at_ms": 1752412700000
+    },
+    {
+      "type": "agent_message",
+      "item_id": "item_0002",
+      "text": "Found it: the session cookie was cleared before the redirect. Patching auth.ts.",
+      "at_ms": 1752412705000
+    },
+    {
+      "type": "activity",
+      "item_id": "item_0003",
+      "summary": "Edited auth.ts +18 −4",
+      "detail": null,
+      "body": "@@ -12,4 +12,18 @@ export function login() { ... }",
+      "kind": "edit",
+      "at_ms": 1752412706000
+    },
+    {
+      "type": "activity",
+      "item_id": "item_0004",
+      "summary": "Ran npm test",
+      "detail": "42 passed",
+      "body": null,
+      "kind": "test",
+      "at_ms": 1752412720000
+    },
+    {
+      "type": "permission_prompt",
+      "item_id": "item_0005",
+      "prompt_id": "prompt_ab12",
+      "command": "rm -rf dist/",
+      "options": [
+        {
+          "choice": "allow_once",
+          "label": "Allow once"
+        },
+        {
+          "choice": "deny",
+          "label": "Deny"
+        }
+      ],
+      "at_ms": 1752412730000
+    }
+  ]
+}

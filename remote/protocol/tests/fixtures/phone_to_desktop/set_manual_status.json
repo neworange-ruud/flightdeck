@@ -1,0 +1,7 @@
+{
+  "command_id": "cmd_00000006",
+  "issued_at_ms": 1752412815000,
+  "type": "set_manual_status",
+  "session_id": "sess_fix_login",
+  "label": "reviewing by hand"
+}
