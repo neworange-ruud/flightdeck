@@ -16,20 +16,30 @@ name = "flightdeck-relay"
 path = "src/main.rs"
 
 [dependencies]
-# NOTE: not yet imported from — this scaffold task deliberately does not
-# consume protocol types. Routing/auth (a later task) will change that.
 flightdeck-remote-protocol = { path = "../protocol" }
 
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures-util = "0.3"
+async-trait = "0.1"
+# Device auth: ECDSA P-256 / SHA-256 challenge-response (spec §5.1). p256's
+# `Verifier` impl hashes the message with SHA-256 internally, matching CryptoKit
+# on the phone; no separate digest step is needed on the relay.
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# Tests generate real P-256 keypairs to sign challenges end-to-end.
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"

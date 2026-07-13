@@ -36,6 +36,20 @@ pub struct Config {
     /// threaded through the Dockerfile into an `ENV`). Falls back to
     /// `"unknown"` for local `cargo run`.
     pub git_sha: String,
+
+    /// How long an unauthenticated connection may stay open before the relay
+    /// drops it (spec §5.1 "unauthenticated connections dropped after ~10s").
+    /// `AUTH_TIMEOUT_SECS`, default `10`.
+    pub auth_timeout_secs: u64,
+
+    /// Maximum number of un-acked envelopes held per `(pairing, sender)` stream
+    /// before drop-oldest overflow kicks in (spec §6 amendment).
+    /// `QUEUE_MAX_PER_PAIRING`, default `1000`.
+    pub queue_max_per_pairing: usize,
+
+    /// Time-to-live of a pairing claim token, in seconds (spec §5.2 "short-TTL
+    /// and single-use"). `CLAIM_TOKEN_TTL_SECS`, default `120`.
+    pub claim_token_ttl_secs: u64,
 }
 
 impl Config {
@@ -48,6 +62,9 @@ impl Config {
             port,
             log_format,
             git_sha: git_sha.into(),
+            auth_timeout_secs: 10,
+            queue_max_per_pairing: 1000,
+            claim_token_ttl_secs: 120,
         }
     }
 
@@ -59,16 +76,23 @@ impl Config {
             env::var("PORT").ok(),
             env::var("LOG_FORMAT").ok(),
             env::var("GIT_SHA").ok(),
+            env::var("AUTH_TIMEOUT_SECS").ok(),
+            env::var("QUEUE_MAX_PER_PAIRING").ok(),
+            env::var("CLAIM_TOKEN_TTL_SECS").ok(),
         )
     }
 
     /// Pure parsing logic, factored out of [`Config::from_env`] so it can be
     /// unit-tested without mutating process-global env vars (which would
     /// race across parallel test threads).
+    #[allow(clippy::too_many_arguments)]
     fn from_vars(
         port: Option<String>,
         log_format: Option<String>,
         git_sha: Option<String>,
+        auth_timeout_secs: Option<String>,
+        queue_max_per_pairing: Option<String>,
+        claim_token_ttl_secs: Option<String>,
     ) -> Self {
         let port = port.and_then(|v| v.parse::<u16>().ok()).unwrap_or(8080);
 
@@ -79,10 +103,28 @@ impl Config {
 
         let git_sha = git_sha.unwrap_or_else(|| "unknown".to_string());
 
+        // Malformed optional values fall back to their defaults rather than
+        // failing startup (matches the existing `PORT` behavior).
+        let auth_timeout_secs = auth_timeout_secs
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(10);
+        let queue_max_per_pairing = queue_max_per_pairing
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1000);
+        let claim_token_ttl_secs = claim_token_ttl_secs
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(120);
+
         Self {
             port,
             log_format,
             git_sha,
+            auth_timeout_secs,
+            queue_max_per_pairing,
+            claim_token_ttl_secs,
         }
     }
 }
@@ -93,10 +135,13 @@ mod tests {
 
     #[test]
     fn defaults_when_unset() {
-        let config = Config::from_vars(None, None, None);
+        let config = Config::from_vars(None, None, None, None, None, None);
         assert_eq!(config.port, 8080);
         assert_eq!(config.log_format, LogFormat::Pretty);
         assert_eq!(config.git_sha, "unknown");
+        assert_eq!(config.auth_timeout_secs, 10);
+        assert_eq!(config.queue_max_per_pairing, 1000);
+        assert_eq!(config.claim_token_ttl_secs, 120);
     }
 
     #[test]
@@ -105,15 +150,37 @@ mod tests {
             Some("9090".to_string()),
             Some("JSON".to_string()),
             Some("abc1234".to_string()),
+            Some("30".to_string()),
+            Some("50".to_string()),
+            Some("300".to_string()),
         );
         assert_eq!(config.port, 9090);
         assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(config.git_sha, "abc1234");
+        assert_eq!(config.auth_timeout_secs, 30);
+        assert_eq!(config.queue_max_per_pairing, 50);
+        assert_eq!(config.claim_token_ttl_secs, 300);
     }
 
     #[test]
     fn falls_back_on_invalid_port() {
-        let config = Config::from_vars(Some("not-a-port".to_string()), None, None);
+        let config =
+            Config::from_vars(Some("not-a-port".to_string()), None, None, None, None, None);
         assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn falls_back_on_invalid_or_zero_tuning_values() {
+        let config = Config::from_vars(
+            None,
+            None,
+            None,
+            Some("0".to_string()),   // zero timeout is nonsensical → default
+            Some("nan".to_string()), // unparseable → default
+            Some("0".to_string()),   // zero TTL → default
+        );
+        assert_eq!(config.auth_timeout_secs, 10);
+        assert_eq!(config.queue_max_per_pairing, 1000);
+        assert_eq!(config.claim_token_ttl_secs, 120);
     }
 }

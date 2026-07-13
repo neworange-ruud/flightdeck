@@ -117,7 +117,7 @@ fn fixture_counts_are_exhaustive() {
     let count = |plane: &str| read_fixtures(&fixtures_dir().join(plane)).len();
     assert_eq!(
         count("relay"),
-        18,
+        20,
         "expected one fixture per RelayFrame variant"
     );
     assert_eq!(

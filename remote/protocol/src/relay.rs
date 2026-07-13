@@ -160,6 +160,41 @@ pub enum RelayFrame {
         pairing_ids: Vec<PairingId>,
     },
 
+    /// endpoint (desktop) -> relay. Desktop-side pairing bootstrap: registers
+    /// the desktop's device public key and asks the relay to mint a
+    /// short-lived, single-use **claim token** to display as the 4-digit code
+    /// / QR (spec §5.2). The phone later redeems that token with
+    /// [`Self::PairingClaim`].
+    ///
+    /// The spec's §5.2 flow only shows the phone redeeming a token; it does not
+    /// pin down how the desktop *obtains* one. This frame (with
+    /// [`Self::PairingOfferOk`]) closes that gap symmetrically with the phone
+    /// side: it is sent after `hello_ok` and before the desktop's own
+    /// `auth_response`, self-registering the desktop's key just as
+    /// `pairing_claim` self-registers the phone's.
+    PairingOffer {
+        /// The desktop device requesting a pairing.
+        device_id: DeviceId,
+        /// Base64 (standard, padded) ECDSA P-256 public key to register for
+        /// routing, X9.63 uncompressed SEC1 form (65 bytes, `0x04 ‖ x ‖ y`).
+        device_public_key: String,
+        /// The role making the offer (normally `desktop`).
+        role: Role,
+    },
+
+    /// relay -> endpoint (desktop). A pairing was provisioned; `claim_token` is
+    /// the one-time secret to encode in the 4-digit code / QR, valid until
+    /// `expires_at_ms`. The relay notifies this same desktop connection with a
+    /// [`Self::PairingClaimed`] once a phone redeems the token.
+    PairingOfferOk {
+        /// The pairing id created for this offer.
+        pairing_id: PairingId,
+        /// One-time, short-TTL token to hand to the phone out of band.
+        claim_token: String,
+        /// Relay wall-clock time (unix ms) after which the token is rejected.
+        expires_at_ms: i64,
+    },
+
     /// endpoint -> relay. Short-lived pairing bootstrap: redeem the code/QR token
     /// shown on the desktop, registering this device's public key against a new
     /// pairing. Used once, during pairing.

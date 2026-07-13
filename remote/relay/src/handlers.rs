@@ -13,9 +13,22 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use flightdeck_remote_protocol::RelayFrame;
+use futures_util::{
+    stream::{SplitSink, StreamExt},
+    SinkExt,
+};
 use serde::Serialize;
+use tokio::sync::mpsc;
 
+use crate::session::Connection;
 use crate::AppState;
+
+/// Bound on a connection's outbound frame channel. Small: the queue's job is to
+/// smooth momentary write bursts, not to buffer without limit — a peer that
+/// cannot keep up applies back-pressure to whoever is forwarding to it (spec
+/// §12 "treat delivery as at-least-once", correctness via receiver dedup).
+const OUTBOUND_CHANNEL_BOUND: usize = 256;
 
 /// Liveness probe: "is the process up and able to handle a request at all."
 /// Container Apps restarts the replica if this fails repeatedly. Deliberately
@@ -53,47 +66,54 @@ pub async fn version(State(state): State<AppState>) -> Json<VersionInfo> {
 }
 
 /// Upgrades an HTTP connection to a WebSocket and hands it to
-/// [`handle_socket`].
-pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_socket)
+/// [`handle_socket`], carrying the shared [`AppState`] in.
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Services a single WebSocket connection.
 ///
-/// Scaffold behavior only: read frames until the peer closes or the
-/// connection errors, then return (which sends a close frame and drops the
-/// socket). Ping frames need no handling here — axum's WebSocket
-/// implementation (via `tungstenite`) answers them with a Pong
-/// automatically as part of driving the read loop; see the note on
-/// `axum::extract::ws::Message::Ping`.
-///
-/// Text/Binary frames are intentionally ignored: this scaffold does not
-/// route anything. That's the [`crate::router`] seam's job.
-async fn handle_socket(mut socket: WebSocket) {
-    loop {
-        match socket.recv().await {
-            // The WebSocket close handshake (RFC 6455 §7.1.5) requires the
-            // side that receives a close frame to echo one back before the
-            // TCP connection goes away — otherwise the peer sees an abrupt
-            // reset rather than a clean close. The underlying `tungstenite`
-            // stack queues that reply automatically when it reads a Close
-            // frame, but only flushes it as a side effect of the *next*
-            // read — so one more `recv()` (whatever it returns; the
-            // connection is going away either way) is what actually puts
-            // the reply on the wire before we drop the socket.
-            Some(Ok(Message::Close(_))) => {
-                let _ = socket.recv().await;
-                break;
+/// Splits the socket into a read half (driven by the [`Connection`] state
+/// machine, spec §5) and a write half (drained by a dedicated writer task from
+/// a bounded outbound channel). Keeping writes on their own task lets the relay
+/// push to a connection from anywhere — its own state machine *and* the peer
+/// leg forwarding envelopes — through one serialized sink, while the bounded
+/// channel supplies back-pressure.
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (sink, stream) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<RelayFrame>(OUTBOUND_CHANNEL_BOUND);
+
+    // Writer task owns the sink; it exits when the channel closes (all senders
+    // dropped once the state machine returns and the registry handle is
+    // detached), then completes the close handshake.
+    let writer = tokio::spawn(writer_task(sink, out_rx));
+
+    // Run the state machine to completion (this also cleans up the registry).
+    Connection::new(state, out_tx).run(stream).await;
+
+    // Dropping the last sender lets the writer drain and close.
+    let _ = writer.await;
+}
+
+/// Drains outbound [`RelayFrame`]s to the WebSocket sink as JSON text, then
+/// sends a Close frame to finish the RFC 6455 handshake cleanly.
+async fn writer_task(mut sink: SplitSink<WebSocket, Message>, mut rx: mpsc::Receiver<RelayFrame>) {
+    while let Some(frame) = rx.recv().await {
+        // Serialization of these small, well-typed frames does not fail in
+        // practice; if the socket write fails the peer is gone, so stop.
+        match serde_json::to_string(&frame) {
+            Ok(text) => {
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
             }
-            // Peer sent a real message; nothing to do with it yet (no
-            // routing in this scaffold) but keep servicing the connection so
-            // ping/pong keeps flowing and the loop notices a later close.
-            Some(Ok(_)) => continue,
-            // Peer error or the underlying connection dropped — nothing more
-            // to service.
-            Some(Err(_)) => break,
-            // Peer closed the stream without a close frame.
-            None => break,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize outbound frame");
+            }
         }
     }
+    // Drive the RFC 6455 close handshake: `close()` emits a Close frame (if one
+    // has not already gone out) and flushes, so the peer sees a clean shutdown
+    // rather than a TCP reset.
+    let _ = sink.close().await;
 }

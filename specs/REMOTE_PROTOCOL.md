@@ -94,9 +94,10 @@ Every connection begins with version negotiation on the relay plane.
     closes the socket.
 - **Negotiation rule** (`negotiate_version`): if the peer's preferred version is
   within `[local_min, local_max]`, use it; if it is **higher**, fall back to
-  `local_max`; if it is **lower than `local_min`**, it is incompatible. Because
-  v1 has a single version, any `protocol_version != 1` yields
-  `version_incompatible`.
+  `local_max` (the relay answers `hello_ok` at its own max — forward compatible);
+  if it is **lower than `local_min`**, it is incompatible. In a v1 build only a
+  preferred version **below 1** yields `version_incompatible`; a future client
+  preferring v2 gets clamped to v1.
 - The negotiated version governs the whole connection, including how the E2E
   payloads inside envelopes are interpreted. The E2E application messages do not
   carry a second version field in v1 — the relay-plane negotiated version is
@@ -148,16 +149,37 @@ Pairing is initiated on the desktop (Settings → Remote), which displays a
 needed to bootstrap the E2E channel.
 
 ```
+// Desktop side — obtain a claim token to display as the 4-digit code / QR:
+desktop → relay : hello { … role: desktop … }
+relay   → desktop: hello_ok { … }
+relay   → desktop: auth_challenge { nonce, server_time_ms }
+desktop → relay : pairing_offer { device_id, device_public_key, role }
+relay   → desktop: pairing_offer_ok { pairing_id, claim_token, expires_at_ms }
+desktop → relay : auth_response { … }              // then proceeds as §5.1
+…
+// Phone side — redeem it (typically moments later, code entered / QR scanned):
 phone → relay : hello { … role: phone … }
 relay → phone : hello_ok { … }
+relay → phone : auth_challenge { nonce, server_time_ms }
 phone → relay : pairing_claim { claim_token, device_id, device_public_key, role }
 relay → phone : pairing_claimed { pairing_id, peer_device_id }
               // (or error { code: pairing_claim_rejected } if token bad/expired)
+relay → desktop: pairing_claimed { pairing_id, peer_device_id }  // notifies the
+              // waiting desktop connection that the phone has joined
 phone → relay : auth_response { … }   // then proceeds as §5.1
 ```
 
-- `pairing_claim` **registers the phone's device public key** against a new
-  pairing and redeems the one-time token. Tokens are short-TTL and single-use.
+- **Where the claim token comes from (v1 amendment).** The desktop mints it with
+  `pairing_offer` → `pairing_offer_ok`. The relay creates the `pairing_id`,
+  registers the desktop's device public key, and returns a short-TTL, single-use
+  `claim_token` (default TTL `CLAIM_TOKEN_TTL_SECS`). `pairing_offer` is sent
+  after `hello_ok` and before the desktop's `auth_response`, mirroring how the
+  phone's `pairing_claim` self-registers *its* key before auth — so a brand-new
+  desktop with no registered key can still bootstrap. (The original §5.2 prose
+  only specified the phone's redemption; these two frames close that gap and are
+  now part of the normative type set + fixtures.)
+- `pairing_claim` **registers the phone's device public key** against the pairing
+  and redeems the one-time token. Tokens are short-TTL and single-use.
 - The **QR/code also carries the shared secret that bootstraps the E2E channel**
   (PRD §9.1). That secret is consumed by the crypto layer (§7); it is **not** part
   of any relay frame and never transits the relay. The relay only ever sees the
@@ -219,6 +241,21 @@ Application payloads are carried by `envelope` frames wrapping an
 - The sender assigns `seq`. The relay preserves order and **queues** envelopes
   for a peer that is currently disconnected (bounded by "the Mac must be
   running" — PRD §9).
+- **Seq-gap enforcement (v1 amendment).** The relay rejects an inbound envelope
+  whose `seq` is not exactly `high_water + 1` for its (pairing, sender) — a
+  regression or a gap is a `bad_frame` error and the envelope is not queued. A
+  duplicate re-send of the current high-water `seq` is tolerated as an idempotent
+  no-op (reconnect races), not an error. This makes the queue's ordering
+  guarantee exact rather than best-effort.
+- **Queue bound & overflow (v1 amendment).** Each (pairing, sender) buffer is
+  bounded to `QUEUE_MAX_PER_PAIRING` un-acked envelopes (default 1000). On
+  overflow the relay drops the **oldest** buffered envelope to make room for the
+  newest and emits `error { code: rate_limited, pairing_id }` to the sender as an
+  advisory back-pressure signal (the drop is silent to the offline peer; the
+  sender learns its backlog is being shed). Correctness still relies on the
+  desktop persisting its own outbound stream — a dropped-then-needed envelope is
+  recovered by the sender re-queuing, not by the relay. (The PRD did not specify
+  overflow behavior; drop-oldest is chosen so the newest state always wins.)
 
 ### 6.2 Acks
 

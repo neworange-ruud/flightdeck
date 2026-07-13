@@ -4,16 +4,24 @@
 //! architecture (desktop keeps an outbound connection; phones connect in;
 //! the relay routes ciphertext by pairing ID and can never read content).
 //!
-//! **This crate is a scaffold.** It stands up the production shape — HTTP/WS
-//! surface, env-based config, structured logging, graceful shutdown — with
-//! no business logic. Routing (matching a phone to its desktop by pairing
-//! ID and forwarding ciphertext) and auth (verifying per-device identity
-//! keypairs) are separate, later tasks; see the [`router`] module doc
-//! comment for the seam they plug into.
+//! The relay implements the phone ⇄ desktop wire protocol
+//! (`flightdeck-remote-protocol`): version negotiation, per-device ECDSA P-256
+//! challenge-response auth ([`auth`]), pairing bootstrap + claim tokens
+//! ([`claims`]), zero-knowledge envelope routing by pairing id ([`router`]),
+//! and a server-side pending-event queue with gapless sequencing, resume, and
+//! cumulative-ack pruning ([`queue`]). Durable state sits behind the
+//! [`store::RelayStore`] seam (in-memory for v1). The per-connection state
+//! machine lives in [`session`].
 
+pub mod auth;
+pub mod claims;
 pub mod config;
 pub mod handlers;
+pub mod ids;
+pub mod queue;
 pub mod router;
+pub mod session;
+pub mod store;
 pub mod telemetry;
 
 use std::sync::Arc;
@@ -22,15 +30,33 @@ use axum::{routing::get, Router};
 use tower_http::trace::TraceLayer;
 
 use config::Config;
+use router::Registry;
+use store::{InMemoryStore, RelayStore};
 
 /// Shared application state, handed to every handler via `axum::State`.
-///
-/// Kept to just the config for now. The routing task will likely add a
-/// connection registry here (see [`router`]); the auth task will likely add
-/// whatever key material / verifier it needs.
 #[derive(Clone)]
 pub struct AppState {
+    /// Immutable runtime configuration.
     pub config: Arc<Config>,
+    /// Durable relay state (device keys, pairings, claim tokens, queues) behind
+    /// the persistence seam. v1 is [`InMemoryStore`]; a Redis/Azure impl slots
+    /// in here without touching the connection state machine.
+    pub store: Arc<dyn RelayStore>,
+    /// The live, ephemeral connection routing table.
+    pub registry: Arc<Registry>,
+}
+
+impl AppState {
+    /// Build application state from `config`, wiring up the default in-memory
+    /// store and an empty connection registry.
+    pub fn new(config: Config) -> Self {
+        let store = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
+        Self {
+            config: Arc::new(config),
+            store,
+            registry: Arc::new(Registry::new()),
+        }
+    }
 }
 
 /// Build the relay's Axum router.
@@ -39,9 +65,7 @@ pub struct AppState {
 /// `main` — so integration tests can mount the exact same app on an
 /// ephemeral port without going through the process entry point.
 pub fn app(config: Config) -> Router {
-    let state = AppState {
-        config: Arc::new(config),
-    };
+    let state = AppState::new(config);
 
     Router::new()
         .route("/healthz", get(handlers::healthz))

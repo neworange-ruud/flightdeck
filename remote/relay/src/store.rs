@@ -1,0 +1,344 @@
+//! Persistence seam.
+//!
+//! All durable relay state lives behind the [`RelayStore`] trait: registered
+//! device public keys, pairings and their membership, live claim tokens, the
+//! per-`(pairing, sender)` envelope queues, and push tokens. v1 ships one
+//! implementation, [`InMemoryStore`], which keeps everything in process memory
+//! behind a single mutex.
+//!
+//! **Why a trait.** A networked implementation (Redis, Azure Cache / Table
+//! Storage) slots in behind the same async interface so that device
+//! registrations, pairings, and queues survive relay restarts and scale across
+//! replicas — see the "Relay team" notes in `specs/REMOTE_PROTOCOL.md` §12
+//! ("persist per-pairing queues and sequence high-water marks so `resume` works
+//! across relay restarts"). The trait methods are already `async` for exactly
+//! that future; the in-memory impl simply completes synchronously.
+//!
+//! **v1 limitation (documented).** Because [`InMemoryStore`] is not persistent,
+//! a relay restart drops all registrations, pairings, and queues. The desktop's
+//! `pairing_offer` re-registers its key on reconnect, and the phone can re-pair,
+//! but any envelopes queued for an offline peer at restart time are lost — the
+//! sender is responsible for re-queuing (spec §6 amendment). Swapping in a
+//! persistent [`RelayStore`] removes this limitation with no changes to the
+//! connection state machine.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
+
+use crate::claims::{ClaimError, ClaimTable, RedeemedClaim};
+use crate::queue::{AppendOutcome, QueueError, SenderQueue};
+
+/// The desktop + (optional) phone device ids of a pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingMembers {
+    /// The desktop device that created the pairing.
+    pub desktop: DeviceId,
+    /// The phone device, once it has claimed the pairing.
+    pub phone: Option<DeviceId>,
+}
+
+impl PairingMembers {
+    /// Whether `device` is one of this pairing's members.
+    pub fn contains(&self, device: &DeviceId) -> bool {
+        self.desktop == *device || self.phone.as_ref() == Some(device)
+    }
+}
+
+/// Why a store mutation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreError {
+    /// The referenced pairing id is not known to the relay.
+    UnknownPairing,
+}
+
+/// Durable relay state. See the module docs for the persistence rationale.
+#[async_trait]
+pub trait RelayStore: Send + Sync {
+    /// Register (or replace) a device's public key. Called from `pairing_offer`
+    /// and `pairing_claim`, which self-register the connecting device's key.
+    async fn register_device(&self, device: DeviceId, public_key_b64: String);
+
+    /// Fetch a device's registered public key, if any.
+    async fn device_public_key(&self, device: &DeviceId) -> Option<String>;
+
+    /// Create a new pairing owned by `desktop`, returning its fresh id.
+    async fn create_pairing(&self, desktop: DeviceId) -> PairingId;
+
+    /// Attach `phone` to an existing pairing, returning the desktop peer's id.
+    async fn add_phone_to_pairing(
+        &self,
+        pairing: &PairingId,
+        phone: DeviceId,
+    ) -> Result<DeviceId, StoreError>;
+
+    /// The members of a pairing, if it exists.
+    async fn pairing_members(&self, pairing: &PairingId) -> Option<PairingMembers>;
+
+    /// Issue a single-use claim token bound to `pairing` / `desktop`.
+    async fn issue_claim(
+        &self,
+        token: String,
+        pairing: PairingId,
+        desktop: DeviceId,
+        expires_at_ms: i64,
+    );
+
+    /// Redeem a claim token at wall-clock `now_ms`.
+    async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError>;
+
+    /// Append an outbound envelope to its `(pairing, sender)` queue, enforcing
+    /// gapless sequencing and the bound. `Err` means the seq was invalid.
+    async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError>;
+
+    /// Envelopes to replay for a `resume { from_seq }`: the `sender` stream of
+    /// `pairing`, `seq > from_seq`, in order.
+    async fn replay(
+        &self,
+        pairing: &PairingId,
+        sender: Role,
+        from_seq: u64,
+    ) -> Vec<EncryptedEnvelope>;
+
+    /// Prune the `sender` stream of `pairing` up to and including `cursor`.
+    async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64);
+
+    /// Store/refresh a pairing's APNs push token (opaque; never encrypted).
+    async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment);
+}
+
+/// A queue key. `Role` is not `Hash` in the protocol crate, so we index the
+/// sender direction by a small local tag rather than requiring a protocol
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueueKey(PairingId, u8);
+
+impl QueueKey {
+    fn new(pairing: PairingId, sender: Role) -> Self {
+        let dir = match sender {
+            Role::Desktop => 0,
+            Role::Phone => 1,
+        };
+        QueueKey(pairing, dir)
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    devices: HashMap<DeviceId, String>,
+    pairings: HashMap<PairingId, PairingMembers>,
+    claims: ClaimTable,
+    queues: HashMap<QueueKey, SenderQueue>,
+    push_tokens: HashMap<PairingId, (String, ApnsEnvironment)>,
+    /// Monotonic counter feeding readable pairing ids in tests/logs.
+    pairing_counter: u64,
+}
+
+/// In-process, non-persistent [`RelayStore`]. Correct for a single replica;
+/// state is lost on restart (see module docs).
+pub struct InMemoryStore {
+    inner: Mutex<Inner>,
+    /// Per-`(pairing, sender)` queue bound.
+    queue_max_per_pairing: usize,
+}
+
+impl InMemoryStore {
+    /// Build an empty store whose queues each hold at most
+    /// `queue_max_per_pairing` un-acked envelopes.
+    pub fn new(queue_max_per_pairing: usize) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            queue_max_per_pairing: queue_max_per_pairing.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // The lock is only ever held for the duration of a small synchronous
+        // mutation; poisoning would mean a prior panic mid-mutation, which we
+        // surface by unwrapping (a poisoned relay store is unrecoverable).
+        self.inner.lock().expect("relay store mutex poisoned")
+    }
+}
+
+#[async_trait]
+impl RelayStore for InMemoryStore {
+    async fn register_device(&self, device: DeviceId, public_key_b64: String) {
+        self.lock().devices.insert(device, public_key_b64);
+    }
+
+    async fn device_public_key(&self, device: &DeviceId) -> Option<String> {
+        self.lock().devices.get(device).cloned()
+    }
+
+    async fn create_pairing(&self, desktop: DeviceId) -> PairingId {
+        let mut inner = self.lock();
+        inner.pairing_counter += 1;
+        let id = PairingId::new(format!(
+            "pair_{:04}_{}",
+            inner.pairing_counter,
+            crate::ids::random_suffix()
+        ));
+        inner.pairings.insert(
+            id.clone(),
+            PairingMembers {
+                desktop,
+                phone: None,
+            },
+        );
+        id
+    }
+
+    async fn add_phone_to_pairing(
+        &self,
+        pairing: &PairingId,
+        phone: DeviceId,
+    ) -> Result<DeviceId, StoreError> {
+        let mut inner = self.lock();
+        let members = inner
+            .pairings
+            .get_mut(pairing)
+            .ok_or(StoreError::UnknownPairing)?;
+        members.phone = Some(phone);
+        Ok(members.desktop.clone())
+    }
+
+    async fn pairing_members(&self, pairing: &PairingId) -> Option<PairingMembers> {
+        self.lock().pairings.get(pairing).cloned()
+    }
+
+    async fn issue_claim(
+        &self,
+        token: String,
+        pairing: PairingId,
+        desktop: DeviceId,
+        expires_at_ms: i64,
+    ) {
+        self.lock()
+            .claims
+            .issue(token, pairing, desktop, expires_at_ms);
+    }
+
+    async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError> {
+        self.lock().claims.redeem(token, now_ms)
+    }
+
+    async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError> {
+        let mut inner = self.lock();
+        let max = self.queue_max_per_pairing;
+        let key = QueueKey::new(env.pairing_id.clone(), env.sender);
+        inner
+            .queues
+            .entry(key)
+            .or_insert_with(|| SenderQueue::new(max))
+            .append(env)
+    }
+
+    async fn replay(
+        &self,
+        pairing: &PairingId,
+        sender: Role,
+        from_seq: u64,
+    ) -> Vec<EncryptedEnvelope> {
+        self.lock()
+            .queues
+            .get(&QueueKey::new(pairing.clone(), sender))
+            .map(|q| q.replay(from_seq))
+            .unwrap_or_default()
+    }
+
+    async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64) {
+        if let Some(q) = self
+            .lock()
+            .queues
+            .get_mut(&QueueKey::new(pairing.clone(), sender))
+        {
+            q.ack(cursor);
+        }
+    }
+
+    async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment) {
+        self.lock().push_tokens.insert(pairing, (token, env));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairing: &str, sender: Role, seq: u64) -> EncryptedEnvelope {
+        EncryptedEnvelope {
+            pairing_id: PairingId::new(pairing),
+            seq,
+            sender,
+            sent_at_ms: 0,
+            nonce: "bm9uY2U=".into(),
+            ciphertext: "opaque".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_registration_round_trips() {
+        let store = InMemoryStore::new(1000);
+        let dev = DeviceId::new("dev_1");
+        assert_eq!(store.device_public_key(&dev).await, None);
+        store.register_device(dev.clone(), "pk".into()).await;
+        assert_eq!(store.device_public_key(&dev).await, Some("pk".into()));
+    }
+
+    #[tokio::test]
+    async fn pairing_membership_and_peer_lookup() {
+        let store = InMemoryStore::new(1000);
+        let desktop = DeviceId::new("dev_mac");
+        let pairing = store.create_pairing(desktop.clone()).await;
+
+        let members = store.pairing_members(&pairing).await.unwrap();
+        assert_eq!(members.desktop, desktop);
+        assert_eq!(members.phone, None);
+        assert!(members.contains(&desktop));
+
+        let phone = DeviceId::new("dev_phone");
+        let peer = store
+            .add_phone_to_pairing(&pairing, phone.clone())
+            .await
+            .unwrap();
+        assert_eq!(peer, desktop);
+        let members = store.pairing_members(&pairing).await.unwrap();
+        assert_eq!(members.phone, Some(phone.clone()));
+        assert!(members.contains(&phone));
+    }
+
+    #[tokio::test]
+    async fn add_phone_to_unknown_pairing_errors() {
+        let store = InMemoryStore::new(1000);
+        assert_eq!(
+            store
+                .add_phone_to_pairing(&PairingId::new("nope"), DeviceId::new("p"))
+                .await,
+            Err(StoreError::UnknownPairing)
+        );
+    }
+
+    #[tokio::test]
+    async fn queues_are_isolated_per_sender_direction() {
+        let store = InMemoryStore::new(1000);
+        // Desktop stream and phone stream have independent seq spaces.
+        store.enqueue(env("pair", Role::Desktop, 1)).await.unwrap();
+        store.enqueue(env("pair", Role::Phone, 1)).await.unwrap();
+        store.enqueue(env("pair", Role::Desktop, 2)).await.unwrap();
+
+        let d = store
+            .replay(&PairingId::new("pair"), Role::Desktop, 0)
+            .await;
+        let p = store.replay(&PairingId::new("pair"), Role::Phone, 0).await;
+        assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(p.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+
+        store.ack(&PairingId::new("pair"), Role::Desktop, 1).await;
+        let d = store
+            .replay(&PairingId::new("pair"), Role::Desktop, 0)
+            .await;
+        assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    }
+}
