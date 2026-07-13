@@ -306,16 +306,54 @@ new commands rather than sending blind.
 - The plaintext of an envelope is a **serialized E2E message**: a
   `DesktopToPhone` (desktop→phone) or a `PhoneCommand` (phone→desktop). Serialize
   to JSON, seal, and place the base64 result in `ciphertext`.
-- **Sealing is out of this crate.** The recommended construction (engineering
-  detail, not pinned here — PRD §13) is an AEAD (e.g. XChaCha20-Poly1305) with a
-  per-message random `nonce`, keyed by a session key derived from the pairing's
-  shared secret established during pairing bootstrap (§5.2).
-- **Authenticated associated data (AAD):** the envelope header fields
-  `pairing_id`, `seq`, `sender`, `sent_at_ms` SHOULD be bound as AAD so the relay
-  cannot tamper with routing/ordering/attribution undetected. The receiver must
-  reject an envelope whose header does not authenticate.
+- **Sealing is out of the `flightdeck-remote-protocol` crate.** It lives in the
+  desktop's `src/remote/crypto.rs` and the iOS `E2EChannel.swift`, proven
+  byte-compatible by `remote/protocol/tests/fixtures/e2e_crypto/vectors.json`.
 - The relay **cannot** read, and must not depend on, anything inside
   `ciphertext`. All routing decisions use `pairing_id` (and connection role).
+
+### 7.1 E2E channel construction (normative, v1 — pinned)
+
+> **⚠️ AMENDMENT (E2E task).** The original §7 left the sealing construction
+> deliberately unpinned ("engineering detail, not pinned here"). It is now pinned
+> exactly, because both platforms must derive identical keys and produce
+> byte-identical ciphertext. Where this text and the fixtures disagree, the
+> fixtures win.
+
+1. **Input keying material (IKM).** A **static-static P-256 ECDH** between the two
+   devices' *identity* keypairs (the same keys used for relay auth, §5.1). Both
+   endpoints compute the identical shared secret; the IKM is its **big-endian
+   x-coordinate**, 32 bytes (Rust `p256::ecdh` `SharedSecret::raw_secret_bytes`;
+   CryptoKit `SharedSecret` raw bytes). This input exists on **both** pairing
+   paths (QR and 4-digit code), since both exchange identity public keys.
+   * *Forward secrecy:* v1 has **none** — the long-lived identity keys are used
+     directly. Ephemeral-key rotation is deferred (PRD §13). Documented, not an
+     oversight.
+2. **Salt = the pairing bootstrap secret.** The 32-byte random `pairing_secret`
+   carried in the **QR** payload, or, for the 4-digit **code** path, the
+   `claim_token` bytes. This binds the derived keys to *this* pairing act (an
+   attacker with a device key but no bootstrap observation still cannot derive the
+   channel keys). Neither secret ever transits the relay.
+3. **KDF = HKDF-SHA256(ikm, salt)**, expanded twice into two independent 32-byte
+   AEAD keys, one per direction:
+   * `info = "flightdeck-remote-e2e-v1:" ‖ pairing_id ‖ ":d2p"` → **desktop→phone**
+   * `info = "flightdeck-remote-e2e-v1:" ‖ pairing_id ‖ ":p2d"` → **phone→desktop**
+     (all UTF-8; `pairing_id` is the id's string form).
+4. **AEAD = ChaCha20-Poly1305** with a fresh **random 12-byte nonce** per message
+   (the envelope's `nonce`, base64 standard-padded). The `ciphertext` field is the
+   AEAD output **with the 16-byte Poly1305 tag appended** (CryptoKit's separate
+   `ciphertext`/`tag` are concatenated in that order), base64 standard-padded.
+5. **AAD (mandatory, not merely SHOULD).** The AAD is the **UTF-8 of the canonical
+   string** `pairing_id ‖ ":" ‖ seq ‖ ":" ‖ sender ‖ ":" ‖ sent_at_ms`, where
+   `seq`/`sent_at_ms` are base-10 integers and `sender` is `desktop`/`phone`. This
+   binds the envelope header, so the relay cannot alter
+   routing/ordering/attribution without the receiver's open failing. The receiver
+   **must reject** any envelope whose header does not authenticate.
+
+The desktop API is `E2eChannel::{derive, seal, open}` (plus a test-only
+`seal_with_nonce`); iOS mirrors it as `E2EChannel`. The pairing-flow layer
+derives one channel per pairing per endpoint and feeds `salt` (the QR
+`pairing_secret` or the code's claim-token bytes) in at derive time.
 
 ---
 

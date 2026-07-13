@@ -54,8 +54,19 @@ tungstenite = { version = "0.24", default-features = false, features = ["handsha
 # Per-device identity: ECDSA over NIST P-256 with SHA-256 (spec §5.1). P-256 is
 # mandated by the protocol because the iPhone key is Secure-Enclave-resident and
 # the Enclave only speaks P-256; the desktop must use the same curve to be
-# verifiable by the relay. `ecdsa` enables sign/verify.
-p256 = { version = "0.13", features = ["ecdsa"] }
+# verifiable by the relay. `ecdsa` enables sign/verify; `ecdh` enables the
+# static-static P-256 key agreement that seeds the E2E channel (spec §7, src/remote/crypto.rs).
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+# E2E channel key derivation: HKDF-SHA256 over the P-256 ECDH shared secret
+# (spec §7). Pure-Rust RustCrypto crate, same family/versions as p256+sha2, so
+# it adds no C toolchain and keeps the Windows build pure-Rust. sha2 above is the
+# hash; hkdf provides extract+expand.
+hkdf = "0.12"
+# E2E authenticated encryption: ChaCha20-Poly1305 AEAD (spec §7). Pure-Rust
+# RustCrypto crate; chosen over AES-GCM because it needs no hardware AES and is
+# constant-time in software, matching CryptoKit's `ChaChaPoly` on the iOS side so
+# the two platforms produce byte-identical ciphertext. 12-byte nonce per message.
+chacha20poly1305 = "0.10"
 # Device id = SHA-256 of the X9.63 public key (matches the iOS convention).
 sha2 = "0.10"
 # Wire encodings: standard-padded base64 for keys/signatures/nonces/ciphertext
