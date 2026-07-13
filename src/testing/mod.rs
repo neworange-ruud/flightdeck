@@ -648,6 +648,7 @@ impl FakePtyHandle {
 pub struct FakePty {
     queued: Mutex<VecDeque<Arc<Mutex<FakePtyInner>>>>,
     spawns: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
+    spawn_envs: Mutex<Vec<Vec<(String, String)>>>,
     fail_next: Mutex<bool>,
 }
 
@@ -674,6 +675,11 @@ impl FakePty {
     pub fn spawns(&self) -> Vec<(String, Vec<String>, PathBuf)> {
         self.spawns.lock().unwrap().clone()
     }
+
+    /// Environment overrides supplied for each spawn, in spawn order.
+    pub fn spawn_envs(&self) -> Vec<Vec<(String, String)>> {
+        self.spawn_envs.lock().unwrap().clone()
+    }
 }
 
 impl PtyBackend for FakePty {
@@ -681,6 +687,7 @@ impl PtyBackend for FakePty {
         &self,
         cmd: &str,
         args: &[String],
+        env: &[(String, String)],
         cwd: &Path,
         _size: PtySize,
     ) -> Result<Box<dyn PtySession>> {
@@ -697,6 +704,7 @@ impl PtyBackend for FakePty {
             .lock()
             .unwrap()
             .push((cmd.to_string(), args.to_vec(), cwd.to_path_buf()));
+        self.spawn_envs.lock().unwrap().push(env.to_vec());
         let inner = self
             .queued
             .lock()
@@ -1042,7 +1050,7 @@ mod tests {
         let pty = FakePty::new();
         let handle = pty.queue_session();
         let mut session = pty
-            .spawn("opencode", &[], Path::new("/wt"), PtySize::default())
+            .spawn("opencode", &[], &[], Path::new("/wt"), PtySize::default())
             .unwrap();
         handle.push_output(b"Proceed?".to_vec());
         assert_eq!(session.try_read_output().unwrap(), b"Proceed?");
@@ -1059,11 +1067,11 @@ mod tests {
         let pty = FakePty::new();
         pty.fail_next_spawn();
         assert!(pty
-            .spawn("missing", &[], Path::new("/wt"), PtySize::default())
+            .spawn("missing", &[], &[], Path::new("/wt"), PtySize::default())
             .is_err());
         // subsequent spawn succeeds
         assert!(pty
-            .spawn("ok", &[], Path::new("/wt"), PtySize::default())
+            .spawn("ok", &[], &[], Path::new("/wt"), PtySize::default())
             .is_ok());
     }
 }

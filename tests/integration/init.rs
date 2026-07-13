@@ -10,7 +10,8 @@ use flightdeck::config::init::initialize;
 use flightdeck::config::load::load_config;
 use flightdeck::contracts::{FileSystem, RealFs};
 use flightdeck::fs::ignore::{
-    ensure_flightdeck_gitignore, STATE_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY,
+    ensure_flightdeck_gitignore, STATE_IGNORE_ENTRY, STATUS_IGNORE_ENTRY,
+    STATUS_RUNTIME_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY,
 };
 use std::path::Path;
 use std::process::Command;
@@ -114,12 +115,19 @@ fn ensure_gitignore_adds_both_entries_and_is_idempotent() {
     assert!(first.changed);
     assert_eq!(
         first.added,
-        vec![STATE_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY]
+        vec![
+            STATE_IGNORE_ENTRY,
+            WORKTREES_IGNORE_ENTRY,
+            STATUS_IGNORE_ENTRY,
+            STATUS_RUNTIME_IGNORE_ENTRY,
+        ]
     );
 
     let contents = std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
     assert!(contents.contains(STATE_IGNORE_ENTRY));
     assert!(contents.contains(WORKTREES_IGNORE_ENTRY));
+    assert!(contents.contains(STATUS_IGNORE_ENTRY));
+    assert!(contents.contains(STATUS_RUNTIME_IGNORE_ENTRY));
     // Prior content preserved and still first.
     assert_eq!(contents.lines().next(), Some("/target"));
 

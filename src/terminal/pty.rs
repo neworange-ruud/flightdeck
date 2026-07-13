@@ -135,6 +135,7 @@ impl PtyBackend for PortablePtyBackend {
         &self,
         cmd: &str,
         args: &[String],
+        env: &[(String, String)],
         cwd: &Path,
         size: PtySize,
     ) -> Result<Box<dyn PtySession>> {
@@ -145,6 +146,9 @@ impl PtyBackend for PortablePtyBackend {
 
         let mut builder = build_command_builder(cmd, args);
         builder.cwd(cwd);
+        for (key, value) in env {
+            builder.env(key, value);
+        }
 
         let child = pair
             .slave
@@ -325,6 +329,7 @@ mod tests {
             .spawn(
                 "echo",
                 &["flightdeck".to_string()],
+                &[],
                 &cwd,
                 PtySize::default(),
             )

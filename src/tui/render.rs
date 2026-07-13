@@ -229,6 +229,8 @@ const NEW_AGENT_LABEL: &str = "+ agent";
 const NEW_SHELL_LABEL: &str = "+ shell";
 /// The right-aligned "open another project" button on the project tab row.
 const NEW_PROJECT_LABEL: &str = "+ project";
+/// Dark navy used for the active project tab and its row-level action.
+const PROJECT_TAB_ACTIVE_BG: Color = Color::Rgb(16, 38, 68);
 
 /// One project's summary for the project tab row (SPECS: multi-project). Carries
 /// only what the row needs to render, so the pure renderer never touches the
@@ -608,8 +610,9 @@ struct ProjectTabSeg {
     close_col: u16,
 }
 
-/// The display label for a project tab (a leading status dot + the name). The
-/// dot width is fixed at two columns so hit-testing and rendering agree.
+/// The display label for a project tab (a leading one-cell status indicator +
+/// the name). The indicator width stays fixed while its glyph animates, so
+/// hit-testing and rendering agree.
 fn project_tab_label(name: &str) -> String {
     format!("● {name}")
 }
@@ -675,12 +678,14 @@ pub fn project_tab_hit_test(
 
 /// Draw the full-width project tab row: `● name ✕ | ● name ✕ …` on the left with
 /// a right-aligned `+ project` button. The active project is highlighted; the
-/// status dot is red when a project needs attention, cyan when busy, else dim.
+/// status indicator is red when a project needs attention, an animated red
+/// spinner when busy, and a green dot when idle.
 pub fn draw_project_tab_bar(
     frame: &mut Frame,
     area: Rect,
     projects: &[ProjectTabInfo],
     active: usize,
+    now_ms: u64,
 ) {
     let mut spans: Vec<Span> = Vec::new();
     for (i, p) in projects.iter().enumerate() {
@@ -690,25 +695,26 @@ pub fn draw_project_tab_bar(
         let is_active = i == active;
         let tab_style = if is_active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
+                .fg(PROJECT_TAB_ACTIVE_BG)
+                .bg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
-        // Status dot colour: attention (red) > busy (cyan) > idle. On the active
-        // (magenta) tab an idle dot reads best as black; elsewhere dim gray.
-        let dot_color = if p.attention {
-            Color::Red
+        // Attention keeps visual priority when one agent needs input while
+        // another is working in the same project.
+        let (indicator, indicator_color) = if p.attention {
+            ('●', Color::Red)
         } else if p.busy {
-            Color::Cyan
-        } else if is_active {
-            Color::Black
+            (spinner_frame(now_ms), Color::Red)
         } else {
-            Color::DarkGray
+            ('●', Color::Green)
         };
         spans.push(Span::styled(" ", tab_style));
-        spans.push(Span::styled("●", tab_style.fg(dot_color)));
+        spans.push(Span::styled(
+            indicator.to_string(),
+            tab_style.fg(indicator_color),
+        ));
         spans.push(Span::styled(format!(" {} ", p.name), tab_style));
         spans.push(Span::styled(CLOSE_GLYPH, tab_style.fg(Color::Red)));
         spans.push(Span::styled(" ", tab_style));
@@ -721,7 +727,7 @@ pub fn draw_project_tab_bar(
     if start >= area.x {
         let style = Style::default()
             .fg(Color::White)
-            .bg(Color::Magenta)
+            .bg(PROJECT_TAB_ACTIVE_BG)
             .add_modifier(Modifier::BOLD);
         let rect = Rect::new(start, area.y, width.min(area.width), 1);
         let btn = Paragraph::new(Line::from(Span::styled(
@@ -796,7 +802,7 @@ pub fn draw_sidebar(
         // worker shows an animated spinner instead of a process/status line, so
         // the user always sees that something is happening (SPECS §16/§17).
         if tab.phase == TabPhase::Creating {
-            let spin = Style::default().fg(Color::Cyan);
+            let spin = Style::default().fg(Color::Red);
             lines.push(sidebar_name_line(
                 width,
                 marker,
@@ -812,18 +818,30 @@ pub fn draw_sidebar(
             lines.push(Line::from(Span::raw("")));
             continue;
         }
-        // A colour-coded status dot on the name line so idle (green) vs in
-        // progress (blue) vs error (red) is glanceable per tab (SPECS §24).
-        // Manual override takes visual priority but never hides the dot.
-        let dot_color = ds
-            .manual
-            .map(|_| Color::Cyan)
-            .unwrap_or_else(|| status_label_color(ds.interpreted).1);
+        // A colour-coded status indicator on the name line: idle is a green
+        // dot, active work is a red spinner, and errors are red (SPECS §24).
+        // Manual override takes colour priority but never hides the lifecycle.
+        let indicator_color = if matches!(
+            ds.interpreted,
+            crate::contracts::InterpretedStatus::Starting
+                | crate::contracts::InterpretedStatus::Running
+                | crate::contracts::InterpretedStatus::Working
+        ) {
+            Color::Red
+        } else {
+            ds.manual
+                .map(|_| Color::Cyan)
+                .unwrap_or_else(|| status_label_color(ds.interpreted).1)
+        };
+        let indicator = status_indicator(ds.interpreted, now_ms);
         lines.push(sidebar_name_line(
             width,
             marker,
             name_style,
-            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled(
+                format!("{indicator} "),
+                Style::default().fg(indicator_color),
+            ),
             &tab.meta.name,
         ));
 
@@ -907,6 +925,16 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
 pub fn spinner_frame(now_ms: u64) -> char {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[((now_ms / 80) % FRAMES.len() as u64) as usize]
+}
+
+/// Use the smooth one-cell braille spinner for active lifecycle states and the
+/// stable centered dot for every settled state.
+fn status_indicator(status: crate::contracts::InterpretedStatus, now_ms: u64) -> char {
+    use crate::contracts::InterpretedStatus::*;
+    match status {
+        Starting | Running | Working => spinner_frame(now_ms),
+        _ => '●',
+    }
 }
 
 /// Collapse an interpreted status to a glanceable sidebar label + colour
@@ -2345,7 +2373,7 @@ mod tests {
                 busy: false,
             },
         ];
-        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0))
+        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let row: String = (0..80)
@@ -2354,6 +2382,36 @@ mod tests {
         assert!(row.contains("alpha"), "first project name: {row:?}");
         assert!(row.contains("beta"), "second project name: {row:?}");
         assert!(row.contains("+ project"), "new-project button: {row:?}");
+    }
+
+    #[test]
+    fn project_tab_uses_spinner_when_busy_and_green_dot_when_idle() {
+        let mut term = test_terminal(80, 1);
+        let projects = vec![
+            ProjectTabInfo {
+                name: "alpha".to_string(),
+                attention: false,
+                busy: true,
+            },
+            ProjectTabInfo {
+                name: "beta".to_string(),
+                attention: false,
+                busy: false,
+            },
+        ];
+
+        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))
+            .unwrap();
+        let buffer = term.backend().buffer();
+
+        // First indicator is at x=1. The second tab begins after the first
+        // segment and separator, placing its indicator at x=15.
+        assert_eq!(buffer[(1, 0)].symbol(), "⠋");
+        assert_eq!(buffer[(1, 0)].fg, Color::Red);
+        assert_eq!(buffer[(2, 0)].bg, Color::White);
+        assert_eq!(buffer[(2, 0)].fg, PROJECT_TAB_ACTIVE_BG);
+        assert_eq!(buffer[(15, 0)].symbol(), "●");
+        assert_eq!(buffer[(15, 0)].fg, Color::Green);
     }
 
     #[test]
@@ -2945,6 +3003,20 @@ mod tests {
         ] {
             assert_eq!(status_label_color(s), ("idle", Color::Green));
         }
+    }
+
+    #[test]
+    fn active_status_indicator_uses_smooth_braille_spinner() {
+        use crate::contracts::InterpretedStatus::*;
+
+        let frames: String = (0..10)
+            .map(|frame| status_indicator(Working, frame * 80))
+            .collect();
+        assert_eq!(frames, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        assert_eq!(status_indicator(Starting, 80), '⠙');
+        assert_eq!(status_indicator(Running, 160), '⠹');
+        assert_eq!(status_indicator(Idle, 160), '●');
+        assert_eq!(status_indicator(Failed, 160), '●');
     }
 
     #[test]

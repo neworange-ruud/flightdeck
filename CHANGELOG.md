@@ -12,11 +12,16 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Show a compact red animated Braille spinner on working Agent and Project
+  tabs, with green dots for idle projects and a high-contrast white active
+  Project tab with dark navy text.
 
 ### Bug fixes
 
-- None yet.
+- Detect working and waiting states from explicit Claude Code, Codex, and
+  OpenCode lifecycle events instead of terminal output/silence, preventing typed
+  prompts from arming false completion notifications and making project-tab
+  progress indicators dependable.
 
 ## [1.5.0] - 2026-07-12
 
