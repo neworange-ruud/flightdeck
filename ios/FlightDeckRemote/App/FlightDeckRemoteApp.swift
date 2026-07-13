@@ -16,11 +16,11 @@ import SwiftUI
 
 @main
 struct FlightDeckRemoteApp: App {
-    @State private var pairingStore = PairingStore()
+    @State private var router = AppRouter(pairingStore: PairingStore())
 
     var body: some Scene {
         WindowGroup {
-            AppRouter(pairingStore: pairingStore)
+            RootView(router: router)
                 .preferredColorScheme(.dark)
                 .componentGalleryDebugEntry()
         }

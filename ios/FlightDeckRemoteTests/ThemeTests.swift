@@ -3,7 +3,10 @@
 //  FlightDeckRemoteTests
 //
 //  Verifies the design-system color tokens resolve to the exact PRD §11
-//  values, and that AppRouter picks the Pairing route when unpaired.
+//  values. Router/pairing-state behavior moved to
+//  NavigationTests/AppRouterTests.swift and PairingStoreTests.swift, which
+//  use an in-memory `PairingStateProviding` so they're hermetic and don't
+//  share `UserDefaults` state across test runs.
 //
 
 import Testing
@@ -36,18 +39,5 @@ struct ThemeTests {
             #expect(abs(Double(actual.green) - Double(expected.green)) < 0.01)
             #expect(abs(Double(actual.blue) - Double(expected.blue)) < 0.01)
         }
-    }
-
-    @Test func routerEntersPairingWhenUnpaired() {
-        // Entry flow per PRD §5.8: unpaired -> Pairing, paired -> Projects.
-        let store = PairingStore()
-        #expect(store.isPaired == false)
-        #expect(AppRouter(pairingStore: store).route == .pairing)
-    }
-
-    @Test func routerEntersProjectsWhenPaired() {
-        let store = PairingStore()
-        store.isPaired = true
-        #expect(AppRouter(pairingStore: store).route == .projects)
     }
 }
