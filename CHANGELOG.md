@@ -22,6 +22,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   OpenCode lifecycle events instead of terminal output/silence, preventing typed
   prompts from arming false completion notifications and making project-tab
   progress indicators dependable.
+- Fix the `create_tab_happy_path` test failing on Windows by normalizing path
+  separators when asserting the OpenCode config directory environment variable.
 
 ## [1.5.0] - 2026-07-12
 

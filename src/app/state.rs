@@ -2048,8 +2048,20 @@ mod tests {
         assert_eq!(git.added_worktrees().len(), 1);
         // Primary spawned.
         assert_eq!(pty.spawns().len(), 1);
+        // Normalize separators: the launch-scoped path is built with the host's
+        // native separator (backslashes on Windows), which is correct on a real
+        // host but mixes with the Unix-style `REPO` literal used in this test.
+        let spawn_envs: Vec<Vec<(String, String)>> = pty
+            .spawn_envs()
+            .into_iter()
+            .map(|env| {
+                env.into_iter()
+                    .map(|(k, v)| (k, v.replace('\\', "/")))
+                    .collect()
+            })
+            .collect();
         assert_eq!(
-            pty.spawn_envs(),
+            spawn_envs,
             vec![vec![(
                 "OPENCODE_CONFIG_DIR".to_string(),
                 "/repo/.flightdeck/worktrees/fix-login-bug/.flightdeck/runtime/status/opencode"
