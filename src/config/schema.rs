@@ -2,7 +2,7 @@
 
 use crate::contracts::{
     AgentDef, Config, ContainersConfig, FlightDeckError, GitConfig, NotificationsConfig,
-    ProjectConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WorktreesConfig,
+    ProjectConfig, RemoteConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WorktreesConfig,
 };
 use std::collections::BTreeMap;
 
@@ -60,6 +60,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         },
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
+        remote: RemoteConfig::default(),
         containers: ContainersConfig::default(),
         agents,
     }

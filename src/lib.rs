@@ -16,6 +16,7 @@ pub mod fs;
 pub mod git;
 pub mod notify;
 pub mod persistence;
+pub mod remote;
 pub mod runtime;
 pub mod terminal;
 pub mod tui;
@@ -74,6 +75,10 @@ use crate::persistence::recovery::recover;
 use crate::persistence::workspace::{
     load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
 };
+use crate::remote::client::RemoteHandle;
+use crate::remote::identity::load_or_create_identity;
+use crate::remote::state::remote_state_path;
+use crate::remote::{RemoteInbound, RemoteOutbound};
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key, KeyAction};
@@ -1158,6 +1163,16 @@ fn event_loop(
         }
     }
 
+    // FlightDeck Remote (optional): a long-lived relay-client thread, mirroring
+    // the update-check thread idiom above. Off by default — when disabled this
+    // spawns nothing and the channels stay idle, so behaviour is unchanged. The
+    // `_remote_out_tx` end is retained (unused for now) because the app→relay
+    // bridge that feeds it is a later task; keeping the channel here fixes the
+    // wiring shape so that task is purely additive.
+    let (remote_in_tx, remote_in_rx) = std::sync::mpsc::channel::<RemoteInbound>();
+    let (_remote_out_tx, remote_out_rx) = std::sync::mpsc::channel::<RemoteOutbound>();
+    let remote_handle = start_remote(env, workspace, remote_in_tx, remote_out_rx);
+
     loop {
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
@@ -1208,6 +1223,14 @@ fn event_loop(
             for p in workspace.projects.iter_mut() {
                 p.state.update_available = Some(latest.clone());
             }
+        }
+
+        // --- Drain relay-client events (link state, envelopes, presence). For
+        //     now this is a stub: the real bridge (a later task) will translate
+        //     these into UI state and dispatched commands. Draining here keeps
+        //     the channel from filling and proves the enabled path is live. ---
+        while let Ok(msg) = remote_in_rx.try_recv() {
+            handle_remote_inbound(msg);
         }
 
         // --- Refresh the git-status cache for the ACTIVE project only (it is
@@ -1317,8 +1340,38 @@ fn event_loop(
         }
     }
 
+    // Tear down the relay client (best-effort join). A dropped handle also
+    // signals the thread, so an early `?` return above still winds it down.
+    if let Some(handle) = remote_handle {
+        handle.stop();
+    }
+
     Ok(())
 }
+
+/// Construct the FlightDeck Remote client thread when `[remote]` is enabled and
+/// a relay URL is configured. Returns `None` (spawning nothing) when disabled,
+/// when no relay URL is set, or when the per-user identity file cannot be
+/// located/created — the app runs exactly as before in every such case.
+fn start_remote(
+    env: &Env,
+    workspace: &Workspace,
+    inbound_tx: Sender<RemoteInbound>,
+    outbound_rx: Receiver<RemoteOutbound>,
+) -> Option<RemoteHandle> {
+    let cfg = workspace.active_project().state.config.remote.clone();
+    if !cfg.enabled || cfg.relay_url.is_empty() {
+        return None;
+    }
+    let path = remote_state_path()?;
+    let (identity, _state) = load_or_create_identity(env.fs, &path).ok()?;
+    Some(RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx))
+}
+
+/// Stub handler for relay-client events until the bridge task consumes them.
+/// Intentionally does nothing (a TUI cannot log to stdout without corrupting
+/// the screen); it exists so the drain site has a clear extension point.
+fn handle_remote_inbound(_msg: RemoteInbound) {}
 
 /// One completed background worktree-creation job: which placeholder tab to
 /// finalize, and whether materialization succeeded (SPECS §16/§17).

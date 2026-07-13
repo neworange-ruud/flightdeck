@@ -341,6 +341,39 @@ impl Default for UpdateConfig {
     }
 }
 
+/// Placeholder default relay endpoint for FlightDeck Remote. Overridable in
+/// `config.toml` (or per-device in `~/.flightdeck/remote.json`). An empty
+/// `relay_url` is treated as "no relay configured" and disables the client even
+/// when `enabled = true`.
+fn default_relay_url() -> String {
+    "wss://relay.flightdeck.invalid/ws".to_string()
+}
+
+/// `[remote]` config section: FlightDeck Remote, the phone <-> desktop link over
+/// a hosted relay. **Off by default** — the desktop opens no outbound connection
+/// and behaves bit-for-bit as before until `enabled = true`. When enabled, a
+/// background thread (see `src/remote/`) maintains one WebSocket to `relay_url`,
+/// authenticates with the per-device key, and reports link state to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Master switch for the relay client. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay WebSocket URL (`wss://…`, or `ws://…` for local dev). Empty means
+    /// "not configured" and keeps the client dormant even if `enabled`.
+    #[serde(default = "default_relay_url")]
+    pub relay_url: String,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        RemoteConfig {
+            enabled: false,
+            relay_url: default_relay_url(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Container execution model (SPECS §31) — the optional `[containers]` section.
 // ---------------------------------------------------------------------------
@@ -475,6 +508,9 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// FlightDeck Remote (phone link). Absent table → disabled → no relay.
+    #[serde(default)]
+    pub remote: RemoteConfig,
     /// Container execution (SPECS §31). Absent table → disabled → local model.
     /// Accepts the legacy `[execution]` section name as a deprecated alias.
     #[serde(default, alias = "execution")]
