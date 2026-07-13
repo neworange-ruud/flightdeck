@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 pub fn default_config(project_name: &str, base_branch: &str) -> Config {
     let mut agents: BTreeMap<String, AgentDef> = BTreeMap::new();
 
-    // opencode — default agent with status patterns (SPECS §8 example)
+    // opencode — default agent
     agents.insert(
         "opencode".to_string(),
         AgentDef {
@@ -19,20 +19,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
             display_name: "OpenCode".to_string(),
             command: "opencode".to_string(),
             args: vec![],
-            status_patterns: StatusPatterns {
-                waiting: vec![
-                    "Proceed?".to_string(),
-                    "Confirm".to_string(),
-                    "Approve".to_string(),
-                    "Do you want to".to_string(),
-                ],
-                completed: vec![
-                    "Done".to_string(),
-                    "Complete".to_string(),
-                    "Task complete".to_string(),
-                ],
-                error: vec!["Error".to_string(), "Failed".to_string()],
-            },
+            status_patterns: StatusPatterns::default(),
         },
     );
 
@@ -170,24 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn default_config_opencode_has_status_patterns() {
+    fn default_config_opencode_uses_explicit_lifecycle_status() {
         let cfg = default_config("my-project", "main");
         let opencode = cfg.agents.get("opencode").unwrap();
         assert_eq!(opencode.display_name, "OpenCode");
         assert_eq!(opencode.command, "opencode");
-        assert!(!opencode.status_patterns.waiting.is_empty());
-        assert!(opencode
-            .status_patterns
-            .waiting
-            .contains(&"Proceed?".to_string()));
-        assert!(opencode
-            .status_patterns
-            .completed
-            .contains(&"Done".to_string()));
-        assert!(opencode
-            .status_patterns
-            .error
-            .contains(&"Error".to_string()));
+        assert_eq!(opencode.status_patterns, StatusPatterns::default());
     }
 
     #[test]

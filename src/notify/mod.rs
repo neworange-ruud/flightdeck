@@ -12,12 +12,20 @@
 
 use crate::contracts::{Notification, Notifier};
 
+/// The distinctive two-note "ding" chime played when an agent finishes its turn
+/// (SPECS §24). A custom bell so it never collides with a system sound. Embedded
+/// in the binary so playback needs no external asset.
+const DING_WAV: &[u8] = include_bytes!("../../assets/notify-ding.wav");
+
 /// The production notifier. Zero-sized; cheap to construct and pass by reference.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemNotifier;
 
 impl Notifier for SystemNotifier {
     fn notify(&self, notification: &Notification) {
+        if notification.sound {
+            play_ding();
+        }
         #[cfg(target_os = "macos")]
         {
             post_macos(&notification.title, &notification.body);
@@ -130,9 +138,92 @@ fn applescript_string(s: &str) -> String {
     out
 }
 
+/// Play the finish chime on a detached thread so the render loop never blocks
+/// (SPECS §24). Best-effort: the embedded WAV is materialized to a stable file
+/// in the OS temp dir once, then handed to the platform's audio player. Any
+/// failure — no player, no audio device, write error — is silently ignored,
+/// exactly like the visual-notification path.
+fn play_ding() {
+    std::thread::spawn(|| {
+        if let Some(path) = ding_file_path() {
+            play_wav(&path);
+        }
+    });
+}
+
+/// Materialize the embedded chime to `<temp>/flightdeck-notify-ding.wav` and
+/// return its path. Written once and reused; rewritten if the on-disk size no
+/// longer matches (e.g. after an upgrade changed the asset). Returns `None` if
+/// the file cannot be written.
+fn ding_file_path() -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join("flightdeck-notify-ding.wav");
+    let up_to_date = std::fs::metadata(&path)
+        .map(|m| m.len() == DING_WAV.len() as u64)
+        .unwrap_or(false);
+    if !up_to_date && std::fs::write(&path, DING_WAV).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
+/// Play a WAV file via the platform's audio CLI. macOS uses `afplay`; Linux
+/// tries PulseAudio (`paplay`) then ALSA (`aplay`); Windows uses PowerShell's
+/// `SoundPlayer`. Best-effort — output is discarded and errors are ignored.
+#[cfg(target_os = "macos")]
+fn play_wav(path: &std::path::Path) {
+    let _ = std::process::Command::new("afplay")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(target_os = "linux")]
+fn play_wav(path: &std::path::Path) {
+    for (player, pre_args) in [("paplay", &[][..]), ("aplay", &["-q"][..])] {
+        let ok = std::process::Command::new(player)
+            .args(pre_args)
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn play_wav(path: &std::path::Path) {
+    // Single-quoted PowerShell literal; double any embedded quote so a path
+    // under a username with a `'` cannot break out. The filename is ours.
+    let literal = path.display().to_string().replace('\'', "''");
+    let script = format!("(New-Object System.Media.SoundPlayer '{literal}').PlaySync();");
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn play_wav(path: &std::path::Path) {
+    // No audio backend on this platform; drop the request.
+    let _ = path;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ding_asset_is_a_nonempty_wav() {
+        assert!(DING_WAV.len() > 44, "WAV must exceed its 44-byte header");
+        assert_eq!(&DING_WAV[0..4], b"RIFF");
+        assert_eq!(&DING_WAV[8..12], b"WAVE");
+    }
 
     #[test]
     fn wraps_plain_string_in_quotes() {

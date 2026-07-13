@@ -62,7 +62,6 @@ use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs};
 use crate::contracts::{
     Clock, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, PtyBackend, PtySize,
-    TabId,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -121,7 +120,7 @@ pub fn run() -> Result<()> {
     // Subcommand dispatch. These configure status/notification
     // features and exit without launching the TUI (SPECS §24).
     match std::env::args().nth(1).as_deref() {
-        // Install the precise status hooks/plugin (Layer 2).
+        // Generate reusable standalone status hooks/plugins.
         Some("setup-status") => return run_setup_status(),
         // Enable OS notifications in config (off by default).
         Some("setup-notifications") => return run_setup_notifications(),
@@ -292,10 +291,9 @@ pub fn run() -> Result<()> {
     loop_result.and(persist_result)
 }
 
-/// `flightdeck setup-status`: install the opt-in precise agent status
-/// integrations (hooks/plugin) into `<repo>/.flightdeck/integrations/` and add
-/// the `.flightdeck/agent-status` `.gitignore` entry, then print wiring
-/// instructions. Does not launch the TUI (SPECS §24, Layer 2).
+/// `flightdeck setup-status`: generate reusable global lifecycle integrations
+/// for sessions launched outside FlightDeck. Normal FlightDeck sessions inject
+/// equivalent launch-scoped hooks/plugins automatically.
 fn run_setup_status() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
@@ -321,8 +319,8 @@ fn run_setup_status() -> Result<()> {
         println!("FlightDeck: added .flightdeck/agent-status to .gitignore (commit this).");
     }
     println!();
-    println!("Status detection works out of the box (output-activity based).");
-    println!("To enable PRECISE status, wire one or more agents — see:");
+    println!("FlightDeck sessions already use explicit lifecycle status automatically.");
+    println!("To reuse the integration outside FlightDeck, see:");
     println!("  {}/README.md", dir.display());
     println!();
     println!("  Claude Code → merge claude-code.settings.json into ~/.claude/settings.json");
@@ -377,6 +375,7 @@ fn run_setup_notifications() -> Result<()> {
     println!("  on_finish  = true   # agent went idle / completed");
     println!("  on_waiting = true   # agent is waiting for input / needs attention");
     println!("  on_failed  = true   # agent errored out");
+    println!("  sound      = true   # play a chime when an agent finishes");
     println!();
     println!("macOS delivery: `brew install terminal-notifier` for best reliability,");
     println!("or allow Script Editor under System Settings → Notifications.");
@@ -684,7 +683,7 @@ fn print_help() {
     println!("Run with no arguments inside a Git repository to launch the TUI.");
     println!();
     println!("SETUP:");
-    println!("    setup-status           Install the opt-in precise agent-status integrations");
+    println!("    setup-status           Generate reusable agent-status integrations");
     println!("    setup-notifications    Enable OS notifications when agents finish");
     println!("    setup-update           Enable the once-a-day update notice");
     println!();
@@ -1023,19 +1022,15 @@ impl Workspace {
 
     /// Build the per-project summaries for the project tab row.
     fn tab_infos(&self, now_ms: u64) -> Vec<ProjectTabInfo> {
-        use crate::contracts::InterpretedStatus::*;
         self.projects
             .iter()
             .map(|p| {
-                let mut busy = false;
-                let mut attention = false;
-                for tab in &p.state.tabs {
-                    match tab.display_status(now_ms).interpreted {
-                        Starting | Running | Working => busy = true,
-                        WaitingForInput | NeedsAttention | Failed => attention = true,
-                        _ => {}
-                    }
-                }
+                let (attention, busy) = project_status_flags(
+                    p.state
+                        .tabs
+                        .iter()
+                        .map(|tab| tab.display_status(now_ms).interpreted),
+                );
                 ProjectTabInfo {
                     name: p.name.clone(),
                     attention,
@@ -1044,6 +1039,25 @@ impl Workspace {
             })
             .collect()
     }
+}
+
+/// Collapse agent lifecycle states into the two indicators shown on a project
+/// tab. Because callers pass display-ready states, project progress follows the
+/// same explicit backend events as each agent tab.
+fn project_status_flags(
+    statuses: impl IntoIterator<Item = crate::contracts::InterpretedStatus>,
+) -> (bool, bool) {
+    use crate::contracts::InterpretedStatus::*;
+    let mut busy = false;
+    let mut attention = false;
+    for status in statuses {
+        match status {
+            Starting | Running | Working => busy = true,
+            WaitingForInput | NeedsAttention | Failed => attention = true,
+            _ => {}
+        }
+    }
+    (attention, busy)
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,7 +1189,7 @@ fn event_loop(
             .draw(|frame| {
                 let area = frame.area();
                 let ml = crate::tui::layout::compute(area);
-                draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx);
+                draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
                 draw(frame, &p.state, &p.cache, &overlay, now_ms);
             })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
@@ -3119,18 +3133,14 @@ fn run_palette_action(
 // PTY plumbing
 // ---------------------------------------------------------------------------
 
-/// Drain output from every terminal of every tab, feeding each terminal's VT
-/// parser (so it can be rendered) and feeding each primary's output to status
-/// classification (SPECS §24).
-fn drain_pty_output(state: &mut AppState, now_ms: u64) {
-    // Collect (tab id, primary bytes) first so we can call `ingest_output`
-    // (which borrows `state` mutably) without overlapping the session borrow.
-    let mut ingest: Vec<(TabId, Vec<u8>)> = Vec::new();
-
+/// Drain output from every terminal of every tab and feed each terminal's VT
+/// parser so it can be rendered. Lifecycle status is handled separately by
+/// backend hooks/plugins (SPECS §24).
+fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
     for tab in state.tabs.iter_mut() {
-        let id = TabId(tab.meta.id.clone());
-
-        // Primary: drain → VT parser + status classification.
+        // Primary: drain into the VT parser. Lifecycle status comes only from
+        // backend hooks/plugins; PTY output includes echoed user keystrokes and
+        // is deliberately not treated as agent activity.
         if let Some(primary) = tab.session.primary_mut() {
             if let Ok(bytes) = primary.session_mut().try_read_output() {
                 if !bytes.is_empty() {
@@ -3138,7 +3148,6 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
-                    ingest.push((id.clone(), bytes));
                 }
             }
         }
@@ -3155,10 +3164,6 @@ fn drain_pty_output(state: &mut AppState, now_ms: u64) {
                 }
             }
         }
-    }
-
-    for (id, bytes) in ingest {
-        state.ingest_output(&id, &bytes, now_ms);
     }
 }
 
@@ -3360,6 +3365,27 @@ mod tests {
             args: vec![],
             status_patterns: StatusPatterns::default(),
         }
+    }
+
+    #[test]
+    fn project_progress_uses_explicit_agent_lifecycle_states() {
+        use crate::contracts::InterpretedStatus;
+
+        assert_eq!(
+            project_status_flags([InterpretedStatus::Idle]),
+            (false, false)
+        );
+        assert_eq!(
+            project_status_flags([InterpretedStatus::Idle, InterpretedStatus::Working]),
+            (false, true)
+        );
+        assert_eq!(
+            project_status_flags([
+                InterpretedStatus::Working,
+                InterpretedStatus::WaitingForInput,
+            ]),
+            (true, true)
+        );
     }
 
     // §20: SGR mouse reports use 1-based viewport coordinates and a trailing 'M'.
@@ -3657,6 +3683,52 @@ mod tests {
         assert!(ui.modal_active());
         ui.clear();
         assert!(!ui.modal_active());
+    }
+
+    #[test]
+    fn echoed_prompt_input_does_not_mark_an_agent_working() {
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let mut config = config_with_agent(agent);
+        config.notifications.enabled = true;
+
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+        };
+        let mut state = AppState::new(
+            config,
+            default_state("main"),
+            "/repo",
+            "/repo/.flightdeck/state.json",
+        );
+        state
+            .dispatch(
+                Command::NewAgentTab {
+                    name: "Typing regression".to_string(),
+                    agent_key: None,
+                },
+                &services,
+            )
+            .unwrap();
+
+        handle.push_output(b"echoed user keystrokes".to_vec());
+        drain_pty_output(&mut state, 1_000);
+
+        assert_eq!(
+            state.tabs[0].display_status(1_000).interpreted,
+            crate::contracts::InterpretedStatus::Idle
+        );
+        assert!(state.take_finish_notifications(1_000).is_empty());
     }
 
     // --- startup builds an AppState with the fakes (no terminal) ----------

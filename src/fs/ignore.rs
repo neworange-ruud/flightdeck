@@ -10,10 +10,10 @@ use std::path::Path;
 pub const STATE_IGNORE_ENTRY: &str = ".flightdeck/state.json";
 /// Required entry: the ignored managed worktrees directory.
 pub const WORKTREES_IGNORE_ENTRY: &str = ".flightdeck/worktrees/";
-/// Opt-in entry added by `flightdeck setup-status`: the per-worktree agent
-/// status file written by status hooks/plugins (SPECS §24, Layer 2). Not part of
-/// the core §6 required set — only added when the user opts into status hooks.
+/// Per-worktree agent status file written by lifecycle hooks/plugins.
 pub const STATUS_IGNORE_ENTRY: &str = ".flightdeck/agent-status";
+/// Generated launch-scoped hook/plugin artifacts.
+pub const STATUS_RUNTIME_IGNORE_ENTRY: &str = ".flightdeck/runtime/";
 
 /// Ensure a single entry is present in `<repo_root>/.gitignore`, appending it
 /// only if missing (same append-only contract as
@@ -43,7 +43,7 @@ pub struct GitignoreUpdate {
     pub added: Vec<String>,
 }
 
-/// Ensure the two required FlightDeck entries are present in `<repo_root>/.gitignore`,
+/// Ensure the required FlightDeck entries are present in `<repo_root>/.gitignore`,
 /// appending only the missing ones (SPECS §6).
 pub fn ensure_flightdeck_gitignore(
     fs: &dyn FileSystem,
@@ -61,7 +61,12 @@ pub fn ensure_flightdeck_gitignore(
     // Collect trimmed lines for exact-match comparison.
     let trimmed_lines: Vec<&str> = existing.lines().map(str::trim).collect();
 
-    let required = [STATE_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY];
+    let required = [
+        STATE_IGNORE_ENTRY,
+        WORKTREES_IGNORE_ENTRY,
+        STATUS_IGNORE_ENTRY,
+        STATUS_RUNTIME_IGNORE_ENTRY,
+    ];
     let missing: Vec<&str> = required
         .iter()
         .copied()
@@ -113,7 +118,12 @@ mod tests {
         assert!(update.changed);
         assert_eq!(
             update.added,
-            vec![STATE_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY]
+            vec![
+                STATE_IGNORE_ENTRY,
+                WORKTREES_IGNORE_ENTRY,
+                STATUS_IGNORE_ENTRY,
+                STATUS_RUNTIME_IGNORE_ENTRY,
+            ]
         );
         assert!(contents.contains(STATE_IGNORE_ENTRY));
         assert!(contents.contains(WORKTREES_IGNORE_ENTRY));
@@ -128,7 +138,12 @@ mod tests {
         assert!(update.changed);
         assert_eq!(
             update.added,
-            vec![STATE_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY]
+            vec![
+                STATE_IGNORE_ENTRY,
+                WORKTREES_IGNORE_ENTRY,
+                STATUS_IGNORE_ENTRY,
+                STATUS_RUNTIME_IGNORE_ENTRY,
+            ]
         );
         assert!(contents.contains(STATE_IGNORE_ENTRY));
         assert!(contents.contains(WORKTREES_IGNORE_ENTRY));
@@ -143,7 +158,14 @@ mod tests {
         let (update, contents) = run(&fs);
 
         assert!(update.changed);
-        assert_eq!(update.added, vec![WORKTREES_IGNORE_ENTRY]);
+        assert_eq!(
+            update.added,
+            vec![
+                WORKTREES_IGNORE_ENTRY,
+                STATUS_IGNORE_ENTRY,
+                STATUS_RUNTIME_IGNORE_ENTRY,
+            ]
+        );
 
         // STATE_IGNORE_ENTRY must appear exactly once.
         let count = contents
@@ -156,7 +178,9 @@ mod tests {
     // §26: does NOT duplicate when both entries are already present
     #[test]
     fn no_change_when_both_already_present() {
-        let initial = format!("{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n");
+        let initial = format!(
+            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+        );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let (update, _) = run(&fs);
 
@@ -233,15 +257,21 @@ mod tests {
             ensure_flightdeck_gitignore(&fs, Path::new(REPO_ROOT)).expect("should not fail");
 
         assert!(update.changed);
-        assert_eq!(update.added.len(), 2);
+        assert_eq!(update.added.len(), 4);
         assert!(update.added.contains(&STATE_IGNORE_ENTRY.to_string()));
         assert!(update.added.contains(&WORKTREES_IGNORE_ENTRY.to_string()));
+        assert!(update.added.contains(&STATUS_IGNORE_ENTRY.to_string()));
+        assert!(update
+            .added
+            .contains(&STATUS_RUNTIME_IGNORE_ENTRY.to_string()));
     }
 
     // §26: changed=false, added=[] when nothing to do
     #[test]
     fn returns_no_change_when_nothing_to_do() {
-        let initial = format!("{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n");
+        let initial = format!(
+            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+        );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let update =
             ensure_flightdeck_gitignore(&fs, Path::new(REPO_ROOT)).expect("should not fail");
@@ -254,7 +284,9 @@ mod tests {
     #[test]
     fn trimmed_match_prevents_duplicate() {
         // Entry present with leading/trailing spaces — should still be detected.
-        let initial = format!("  {STATE_IGNORE_ENTRY}  \n{WORKTREES_IGNORE_ENTRY}\n");
+        let initial = format!(
+            "  {STATE_IGNORE_ENTRY}  \n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+        );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let (update, _) = run(&fs);
 

@@ -275,7 +275,20 @@ impl Session {
         cwd: &Path,
         size: PtySize,
     ) -> Result<()> {
-        let session = backend.spawn(cmd, args, cwd, size)?;
+        self.spawn_primary_with_env(backend, cmd, args, &[], cwd, size)
+    }
+
+    /// Spawn the primary agent with launch-scoped environment overrides.
+    pub fn spawn_primary_with_env(
+        &mut self,
+        backend: &dyn PtyBackend,
+        cmd: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: &Path,
+        size: PtySize,
+    ) -> Result<()> {
+        let session = backend.spawn(cmd, args, env, cwd, size)?;
         self.primary = Some(Terminal::new(
             TerminalKind::Primary,
             cmd.to_string(),
@@ -322,7 +335,7 @@ impl Session {
         cwd: &Path,
         size: PtySize,
     ) -> Result<usize> {
-        let session = backend.spawn(cmd, args, cwd, size)?;
+        let session = backend.spawn(cmd, args, &[], cwd, size)?;
         self.children
             .push(Terminal::new(kind, cmd.to_string(), session, size));
         let index = self.children.len() - 1;

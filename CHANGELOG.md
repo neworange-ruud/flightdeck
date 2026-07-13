@@ -8,15 +8,25 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Play a distinctive two-note "ding" chime when an agent finishes its turn
+  (transitions from working to idle/completed). The sound is embedded in the
+  binary, plays on macOS, Linux, and Windows, and can be turned off with
+  `sound = false` under `[notifications]`.
 
 ### Improvements
 
-- None yet.
+- Show a compact red animated Braille spinner on working Agent and Project
+  tabs, with green dots for idle projects and a high-contrast white active
+  Project tab with dark navy text.
 
 ### Bug fixes
 
-- None yet.
+- Detect working and waiting states from explicit Claude Code, Codex, and
+  OpenCode lifecycle events instead of terminal output/silence, preventing typed
+  prompts from arming false completion notifications and making project-tab
+  progress indicators dependable.
+- Fix the `create_tab_happy_path` test failing on Windows by normalizing path
+  separators when asserting the OpenCode config directory environment variable.
 
 ## [1.5.0] - 2026-07-12
 

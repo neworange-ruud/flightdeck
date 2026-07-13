@@ -86,11 +86,13 @@ is preserved):
 ```gitignore
 .flightdeck/state.json
 .flightdeck/worktrees/
+.flightdeck/agent-status
+.flightdeck/runtime/
 ```
 
 Configured agents live in `.flightdeck/config.toml` (OpenCode is the default;
 Claude Code and Codex CLI are pre-configured). Agent definitions are
-config-driven — edit the `command`, `args`, and `status_patterns` there. When
+config-driven — edit the `command` and `args` there. When
 you create a tab you pick which agent it runs from a quick menu, so you can mix
 agents (e.g. Claude Code in one tab, OpenCode in another); the menu is skipped
 when only one agent is configured.
@@ -244,24 +246,31 @@ is the first project; the **project tab row** at the top switches between them.
 
 ## Agent status indicators
 
-Every Agent Tab shows its agent's live status — a colour-coded **dot** next to
-the tab name plus a `proc: <process> | <status>` line in the sidebar. The
-minimum signal is **idle vs in progress**, and it works for **all** agents
-(OpenCode, Claude Code, Codex CLI) with **zero setup**:
+Every Agent Tab shows its agent's live status — a one-cell indicator next to the
+tab name plus a simplified status line in the sidebar. The same indicator is
+summarized on Project tabs. The minimum signal is **idle vs in progress**, and
+it works for every built-in backend (OpenCode, Claude Code, Codex CLI) through
+automatically injected integrations:
 
-- 🟢 **working** — the agent is actively producing output (in progress).
-- ⚪ **idle** — the process is up but quiet (finished its turn / waiting on you).
+- 🔴 **working** — a red animated Braille spinner while the backend reports an active turn.
+- 🟢 **idle** — a green dot while the backend waits for a prompt.
 - 🔵 manual override (`Ctrl-s`) — shown in cyan, never hides the process state.
 
-This baseline is purely **output-activity based**: FlightDeck watches each
-agent's terminal and flips a tab to `idle` once output has been silent past a
-short threshold, back to `working` the moment it resumes. Nothing is installed
-into the agents.
+FlightDeck injects a launch-scoped lifecycle bridge for each built-in backend:
+Claude Code prompt/stop hooks, Codex prompt/stop hooks, and OpenCode's explicit
+`session.status` events. Generated bridge files live below the ignored
+`.flightdeck/runtime/` directory. Terminal output is never used as activity, so
+typing into a prompt cannot mark an agent working or arm a false notification.
+Unsupported custom agents stay neutral instead of being guessed from output.
 
-### Optional: precise status (waiting / needs-attention / completed)
+Codex requires non-managed hooks to be reviewed once. If Codex shows a hook
+warning, open `/hooks`, review the FlightDeck lifecycle hooks, and trust them;
+until then FlightDeck deliberately remains idle and emits no completion alert.
 
-For exact `waiting` / `completed` signals (e.g. light up the moment an agent
-asks for confirmation, rather than after the silence timeout), run:
+### Optional: reusable global status integrations
+
+The automatic launch integration is normally sufficient. To generate equivalent
+hooks/plugins for sessions launched outside FlightDeck, run:
 
 ```bash
 flightdeck setup-status
@@ -269,19 +278,18 @@ flightdeck setup-status
 
 This writes ready-to-use, self-contained hook/plugin artifacts to
 `.flightdeck/integrations/` and adds `.flightdeck/agent-status` to `.gitignore`.
-Each agent's hook writes a keyword (`working`/`idle`/`waiting`) to
-`<worktree>/.flightdeck/agent-status`, which FlightDeck polls; a fresh hook
-signal is shown immediately yet is still superseded by later output activity, so
-agents that only signal turn-completion (Codex) still behave correctly. The
-hooks are gated on `.flightdeck/` existing, so they're a no-op outside FlightDeck
-worktrees. Wire them per the generated `README.md`:
+Each integration writes lifecycle events (`working`/`idle`/`waiting`) to
+`<worktree>/.flightdeck/agent-status`. The hooks are gated on `.flightdeck/`
+existing, so they're a no-op outside FlightDeck worktrees. Wire them per the
+generated `README.md`:
 
 - **Claude Code** — merge `claude-code.settings.json` into `~/.claude/settings.json`
-  (`UserPromptSubmit`→working, `Stop`/`StopFailure`→idle, `Notification`→waiting).
+  (`UserPromptSubmit`→working, `Stop`/`StopFailure`→idle, permission/input
+  notifications→waiting).
 - **Codex CLI** — append `codex-config.toml` to `~/.codex/config.toml`
   (`UserPromptSubmit`→working, `Stop`→idle; `notify` fallback for older builds).
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
-  (`session.idle`→idle, message activity→working, permission prompt→waiting).
+  (`session.status` busy/idle→working/idle, permission prompt→waiting).
 
 ### OS notifications (macOS and Linux)
 
@@ -296,8 +304,7 @@ elsewhere. A notification fires on the **edge** from an active state
 
 It fires once per transition (a quiet agent never re-notifies until it resumes
 work) and is suppressed briefly at startup so resumed agents settling to idle
-don't produce a burst. Accuracy follows the status model above: precise with the
-optional hooks, best-effort with the zero-setup activity heuristic.
+don't produce a burst. Only explicit lifecycle transitions can arm an alert.
 
 Notifications are **off by default** (opt-in). Turn them on with:
 
@@ -347,7 +354,7 @@ src/
   config/      load/serialize config.toml, defaults, first-run init
   fs/          relative/absolute paths, append-only .gitignore updater
   git/         real GitExecutor + branch/worktree/status/remote workflow logic
-  agents/      registry, PATH validation, output→status classification
+  agents/      registry, PATH validation, lifecycle-status integrations
   persistence/ state.json load/save + worktree recovery
   terminal/    portable-pty backend + session model (primary + child shells)
   app/         headless state, commands, dispatch, input modes

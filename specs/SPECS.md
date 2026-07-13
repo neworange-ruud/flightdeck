@@ -297,10 +297,6 @@ display_name = "Codex CLI"
 command = "codex"
 args = []
 
-[agents.opencode.status_patterns]
-waiting = ["Proceed?", "Confirm", "Approve", "Do you want to"]
-completed = ["Done", "Complete", "Task complete"]
-error = ["Error", "Failed"]
 ```
 
 Supported initial agents:
@@ -820,12 +816,21 @@ Shortcut conflicts are expected. The command palette must be the dependable path
 
 ## 24. Agent Status Detection
 
-MVP combines:
+FlightDeck combines:
 
 1. Process state
-2. Output pattern matching
+2. Explicit backend lifecycle events
 3. Manual status override
-4. Future plugin hook architecture, not implemented yet
+
+For Claude Code, Codex CLI, and OpenCode, FlightDeck injects a launch-scoped
+hook/plugin that reports `working`, `idle`, and `waiting` events. PTY output and
+silence are not lifecycle signals: echoed prompt input must never mark an agent
+working or arm a completion notification. Unknown/custom agents fail closed in
+a neutral state when they do not provide an explicit integration.
+
+Agent and Project tabs show a one-cell red animated Braille spinner while
+working and a stable green dot while idle. The active Project tab uses a white
+background with dark navy text. Attention/error state retains visual priority.
 
 Statuses:
 
@@ -957,7 +962,7 @@ Agent handling:
 - Builds agent command from config
 - Starts selected agent
 - Does not pass initial prompts in MVP
-- Classifies output patterns
+- Applies explicit backend lifecycle events
 - Applies manual status override correctly
 
 Terminal/session abstraction:

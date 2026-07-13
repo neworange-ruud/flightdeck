@@ -36,6 +36,7 @@ pub fn load_config(fs: &dyn FileSystem, path: &Path) -> Result<Config> {
 mod tests {
     use super::*;
     use crate::config::schema::default_config;
+    use crate::contracts::StatusPatterns;
     use crate::testing::FakeFs;
     use std::path::Path;
 
@@ -52,7 +53,14 @@ mod tests {
 
     #[test]
     fn serialize_then_parse_round_trip() {
-        let original = default_config("round-trip", "develop");
+        let mut original = default_config("round-trip", "develop");
+        // Deprecated patterns are no longer generated, but existing configs
+        // must continue to deserialize and round-trip unchanged.
+        original.agents.get_mut("opencode").unwrap().status_patterns = StatusPatterns {
+            waiting: vec!["Proceed?".to_string()],
+            completed: vec!["Done".to_string()],
+            error: vec!["Error".to_string()],
+        };
         let toml_str = serialize_config(&original).unwrap();
         let parsed = parse_config(&toml_str).unwrap();
 
@@ -78,6 +86,12 @@ mod tests {
             .status_patterns
             .error
             .contains(&"Error".to_string()));
+    }
+
+    #[test]
+    fn default_config_omits_deprecated_status_patterns() {
+        let serialized = serialize_config(&default_config("proj", "main")).unwrap();
+        assert!(!serialized.contains("status_patterns"));
     }
 
     #[test]

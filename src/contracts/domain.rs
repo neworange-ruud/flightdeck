@@ -50,14 +50,14 @@ impl ProcessState {
     }
 }
 
-/// Status interpreted from process state + output pattern matching (SPECS §24).
+/// Status interpreted from process state + explicit lifecycle events (SPECS §24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpretedStatus {
     Starting,
     Running,
-    /// Actively producing output — the agent is working on something.
+    /// The backend reports an active agent turn.
     Working,
-    /// Process is up but quiet — finished a turn / waiting on the user.
+    /// The backend reports that the agent is waiting for a prompt.
     Idle,
     WaitingForInput,
     NeedsAttention,
@@ -124,6 +124,10 @@ pub struct Notification {
     pub title: String,
     /// Body line (e.g. `"Claude Code finished"`).
     pub body: String,
+    /// Whether to play the "ding" chime alongside this notification. Set only
+    /// when an agent transitions from working into idle/completed (SPECS §24)
+    /// and the `notifications.sound` toggle is on.
+    pub sound: bool,
 }
 
 /// Manual status override set by the user (SPECS §24). `None` = cleared.
@@ -162,7 +166,9 @@ impl ManualStatus {
 // Config model (SPECS §8) — committed, human-editable `config.toml`.
 // ---------------------------------------------------------------------------
 
-/// Output→status substring patterns for an agent (SPECS §8, §24).
+/// Deprecated output→status substring patterns retained so existing project
+/// configs still deserialize and round-trip. Runtime status comes exclusively
+/// from explicit backend lifecycle integrations (SPECS §8, §24).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusPatterns {
     #[serde(default)]
@@ -171,6 +177,12 @@ pub struct StatusPatterns {
     pub completed: Vec<String>,
     #[serde(default)]
     pub error: Vec<String>,
+}
+
+impl StatusPatterns {
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty() && self.completed.is_empty() && self.error.is_empty()
+    }
 }
 
 /// A configured agent (a `[agents.<key>]` table in `config.toml`).
@@ -185,7 +197,7 @@ pub struct AgentDef {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "StatusPatterns::is_empty")]
     pub status_patterns: StatusPatterns,
 }
 
@@ -279,6 +291,10 @@ pub struct NotificationsConfig {
     /// Notify when an agent errors out (failed).
     #[serde(default = "default_true")]
     pub on_failed: bool,
+    /// Play the "ding" chime when an agent finishes its turn (idle / completed).
+    /// On by default; independent of the visual/OS notification categories.
+    #[serde(default = "default_true")]
+    pub sound: bool,
 }
 
 impl Default for NotificationsConfig {
@@ -289,6 +305,7 @@ impl Default for NotificationsConfig {
             on_finish: true,
             on_waiting: true,
             on_failed: true,
+            sound: true,
         }
     }
 }
