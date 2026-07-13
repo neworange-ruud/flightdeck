@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.7.1] - 2026-07-13
+
+### New features
+
 - Waiting-for-input alerts now post an OS notification and play a distinctive
   three-pulse sound, separate from the completion chime, including OpenCode
   question prompts.
