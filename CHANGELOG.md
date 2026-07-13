@@ -8,7 +8,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Waiting-for-input alerts now post an OS notification and play a distinctive
+  three-pulse sound, separate from the completion chime, including OpenCode
+  question prompts.
 
 ### Improvements
 

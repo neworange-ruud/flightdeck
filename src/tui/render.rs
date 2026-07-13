@@ -824,8 +824,9 @@ pub fn draw_sidebar(
             continue;
         }
         // A colour-coded status indicator on the name line: idle is a green
-        // dot, active work is a red spinner, and errors are red (SPECS §24).
-        // Manual override takes colour priority but never hides the lifecycle.
+        // dot, active work is a red spinner, and input-required/errors are
+        // red. Manual override takes colour priority but never hides the
+        // lifecycle.
         let indicator_color = if matches!(
             ds.interpreted,
             crate::contracts::InterpretedStatus::Starting
@@ -852,7 +853,7 @@ pub fn draw_sidebar(
 
         // Agent name + simplified status, e.g. "Claude Code [in progress]".
         // A manual override (cyan) takes visual priority; otherwise the
-        // interpreted status collapses to idle / in progress / error.
+        // interpreted status collapses to idle / in progress / waiting / error.
         let agent_name = state
             .registry
             .get(&tab.meta.agent)
@@ -942,16 +943,14 @@ fn status_indicator(status: crate::contracts::InterpretedStatus, now_ms: u64) ->
     }
 }
 
-/// Collapse an interpreted status to a glanceable sidebar label + colour
-/// (SPECS §24): in progress (cyan), error (red), otherwise idle (green).
+/// Collapse an interpreted status to a glanceable sidebar label + colour.
 fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
     use crate::contracts::InterpretedStatus::*;
     match status {
         Starting | Running | Working => ("in progress", Color::Cyan),
+        WaitingForInput | NeedsAttention => ("waiting", Color::Red),
         Failed | SessionLost => ("error", Color::Red),
-        Idle | WaitingForInput | NeedsAttention | Completed | Stopped | Recovered | Unknown => {
-            ("idle", Color::Green)
-        }
+        Idle | Completed | Stopped | Recovered | Unknown => ("idle", Color::Green),
     }
 }
 
@@ -3109,10 +3108,10 @@ mod tests {
         );
     }
 
-    // --- §24: simplified sidebar status (idle / in progress / error) ------
+    // --- §24: simplified sidebar status ------------------------------------
 
     #[test]
-    fn status_label_color_collapses_to_three_buckets() {
+    fn status_label_color_preserves_waiting_attention() {
         use crate::contracts::InterpretedStatus::*;
         use ratatui::style::Color;
 
@@ -3124,16 +3123,12 @@ mod tests {
         for s in [Failed, SessionLost] {
             assert_eq!(status_label_color(s), ("error", Color::Red));
         }
-        // Everything else reads as idle (green).
-        for s in [
-            Idle,
-            WaitingForInput,
-            NeedsAttention,
-            Completed,
-            Stopped,
-            Recovered,
-            Unknown,
-        ] {
+        // Waiting for input needs the same red visual priority as project tabs.
+        for s in [WaitingForInput, NeedsAttention] {
+            assert_eq!(status_label_color(s), ("waiting", Color::Red));
+        }
+        // All other settled statuses read as idle (green).
+        for s in [Idle, Completed, Stopped, Recovered, Unknown] {
             assert_eq!(status_label_color(s), ("idle", Color::Green));
         }
     }

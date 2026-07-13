@@ -18,7 +18,7 @@ use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushCo
 use crate::app::modes::InputMode;
 use crate::contracts::{
     AgentDef, Clock, Config, ContainerRuntime, ContainerState, ContainersConfig, FileSystem,
-    FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
+    FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification, NotificationSound,
     NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result, TabId, TabState,
     STATE_VERSION,
 };
@@ -662,9 +662,15 @@ impl AppState {
                         out.push(Notification {
                             title: tab.meta.name.clone(),
                             body: format!("{agent} {}", kind.verb()),
-                            // The chime marks a finished turn (working → idle /
-                            // completed); other categories stay silent (SPECS §24).
-                            sound: cfg.sound && matches!(kind, NotifyKind::Finish),
+                            sound: if !cfg.sound {
+                                NotificationSound::None
+                            } else {
+                                match kind {
+                                    NotifyKind::Finish => NotificationSound::Completion,
+                                    NotifyKind::Waiting => NotificationSound::InputRequired,
+                                    NotifyKind::Failed => NotificationSound::None,
+                                }
+                            },
                         });
                     }
                 }
@@ -2780,8 +2786,11 @@ mod tests {
         // Body names the agent (the test agent's display name is "opencode").
         assert!(notes[0].body.contains("opencode"), "got: {}", notes[0].body);
         assert!(notes[0].body.contains("finished"), "got: {}", notes[0].body);
-        // A finished turn arms the chime.
-        assert!(notes[0].sound, "finish notification should play the chime");
+        assert_eq!(
+            notes[0].sound,
+            NotificationSound::Completion,
+            "finish notification should play the completion chime"
+        );
 
         // Staying idle must not re-notify.
         assert!(app.take_finish_notifications(1_201).is_empty());
@@ -2806,7 +2815,11 @@ mod tests {
         let notes = app.take_finish_notifications(1_200);
         // The notification still fires; only the chime is suppressed.
         assert_eq!(notes.len(), 1);
-        assert!(!notes[0].sound, "sound = false must silence the chime");
+        assert_eq!(
+            notes[0].sound,
+            NotificationSound::None,
+            "sound = false must silence the completion chime"
+        );
     }
 
     #[test]
@@ -2832,11 +2845,26 @@ mod tests {
         let notes = app.take_finish_notifications(1_250);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].body.contains("waiting"), "got: {}", notes[0].body);
-        // Only a finished turn chimes; waiting stays silent.
-        assert!(
-            !notes[0].sound,
-            "waiting notification must not play the chime"
+        assert_eq!(
+            notes[0].sound,
+            NotificationSound::InputRequired,
+            "waiting notification must play the distinct input-required alert"
         );
+    }
+
+    #[test]
+    fn sound_toggle_off_silences_input_required_alert() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_notify_on(&dir);
+        config.notifications.sound = false;
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config);
+
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_000);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+        write_status(&mut app, &fs, &git, &pty, &clock, "waiting", 1_200);
+        let notes = app.take_finish_notifications(1_250);
+        assert_eq!(notes.len(), 1, "input notification must still be posted");
+        assert_eq!(notes[0].sound, NotificationSound::None);
     }
 
     #[test]

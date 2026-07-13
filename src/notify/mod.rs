@@ -10,12 +10,23 @@
 //! spawns its command on a detached thread and ignores the result. A failed
 //! notification must never disrupt the UI.
 
-use crate::contracts::{Notification, Notifier};
+use crate::contracts::{Notification, NotificationSound, Notifier};
 
 /// The distinctive two-note "ding" chime played when an agent finishes its turn
 /// (SPECS §24). A custom bell so it never collides with a system sound. Embedded
 /// in the binary so playback needs no external asset.
 const DING_WAV: &[u8] = include_bytes!("../../assets/notify-ding.wav");
+
+/// The input-required alert is synthesized into a WAV on first use. Its three
+/// quick ascending tones are intentionally unlike the completion ding, so a
+/// user can tell an agent is blocked without looking at FlightDeck.
+const INPUT_SAMPLE_RATE: u32 = 22_050;
+const INPUT_PIP_SAMPLES: u32 = 2_200;
+const INPUT_GAP_SAMPLES: u32 = 700;
+const INPUT_PIP_COUNT: u32 = 3;
+const INPUT_WAV_LEN: u64 = 44
+    + ((INPUT_PIP_SAMPLES * INPUT_PIP_COUNT + INPUT_GAP_SAMPLES * (INPUT_PIP_COUNT - 1)) * 2)
+        as u64;
 
 /// The production notifier. Zero-sized; cheap to construct and pass by reference.
 #[derive(Debug, Default, Clone, Copy)]
@@ -23,8 +34,8 @@ pub struct SystemNotifier;
 
 impl Notifier for SystemNotifier {
     fn notify(&self, notification: &Notification) {
-        if notification.sound {
-            play_ding();
+        if notification.sound != NotificationSound::None {
+            play_alert(notification.sound);
         }
         #[cfg(target_os = "macos")]
         {
@@ -138,14 +149,19 @@ fn applescript_string(s: &str) -> String {
     out
 }
 
-/// Play the finish chime on a detached thread so the render loop never blocks
-/// (SPECS §24). Best-effort: the embedded WAV is materialized to a stable file
-/// in the OS temp dir once, then handed to the platform's audio player. Any
-/// failure — no player, no audio device, write error — is silently ignored,
-/// exactly like the visual-notification path.
-fn play_ding() {
-    std::thread::spawn(|| {
-        if let Some(path) = ding_file_path() {
+/// Play an alert sound on a detached thread so the render loop never blocks.
+/// Best-effort: the selected WAV is materialized to a stable temp file once,
+/// then handed to the platform's audio player. Any failure — no player, no
+/// audio device, write error — is silently ignored, exactly like the
+/// visual-notification path.
+fn play_alert(sound: NotificationSound) {
+    std::thread::spawn(move || {
+        let path = match sound {
+            NotificationSound::None => None,
+            NotificationSound::Completion => completion_file_path(),
+            NotificationSound::InputRequired => input_required_file_path(),
+        };
+        if let Some(path) = path {
             play_wav(&path);
         }
     });
@@ -155,7 +171,7 @@ fn play_ding() {
 /// return its path. Written once and reused; rewritten if the on-disk size no
 /// longer matches (e.g. after an upgrade changed the asset). Returns `None` if
 /// the file cannot be written.
-fn ding_file_path() -> Option<std::path::PathBuf> {
+fn completion_file_path() -> Option<std::path::PathBuf> {
     let path = std::env::temp_dir().join("flightdeck-notify-ding.wav");
     let up_to_date = std::fs::metadata(&path)
         .map(|m| m.len() == DING_WAV.len() as u64)
@@ -164,6 +180,66 @@ fn ding_file_path() -> Option<std::path::PathBuf> {
         return None;
     }
     Some(path)
+}
+
+/// Materialize the synthesized input-required alert to a stable file in the
+/// OS temp directory. Its expected length lets us reuse the file until an
+/// updated version of FlightDeck changes the signal.
+fn input_required_file_path() -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join("flightdeck-notify-input.wav");
+    let up_to_date = std::fs::metadata(&path)
+        .map(|m| m.len() == INPUT_WAV_LEN)
+        .unwrap_or(false);
+    if !up_to_date && std::fs::write(&path, input_required_wav()).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
+/// Build a compact PCM WAV containing three ascending tones. The short gaps
+/// and rising pitch make this immediately different from the completion chime.
+fn input_required_wav() -> Vec<u8> {
+    let sample_count =
+        INPUT_PIP_SAMPLES * INPUT_PIP_COUNT + INPUT_GAP_SAMPLES * (INPUT_PIP_COUNT - 1);
+    let data_len = sample_count * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM header size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&INPUT_SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(INPUT_SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block alignment
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+
+    for sample_index in 0..sample_count {
+        let span = INPUT_PIP_SAMPLES + INPUT_GAP_SAMPLES;
+        let pip = sample_index / span;
+        let within_pip = sample_index % span;
+        let sample = if within_pip >= INPUT_PIP_SAMPLES {
+            0
+        } else {
+            let frequency = [880.0_f32, 1_176.0, 1_568.0][pip as usize];
+            // A tiny fade avoids a click at the start and end of each pulse.
+            let fade_samples = 96;
+            let envelope = if within_pip < fade_samples {
+                within_pip as f32 / fade_samples as f32
+            } else if within_pip + fade_samples > INPUT_PIP_SAMPLES {
+                (INPUT_PIP_SAMPLES - within_pip) as f32 / fade_samples as f32
+            } else {
+                1.0
+            };
+            let phase =
+                std::f32::consts::TAU * frequency * sample_index as f32 / INPUT_SAMPLE_RATE as f32;
+            (phase.sin() * envelope * i16::MAX as f32 * 0.28) as i16
+        };
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 /// Play a WAV file via the platform's audio CLI. macOS uses `afplay`; Linux
@@ -223,6 +299,15 @@ mod tests {
         assert!(DING_WAV.len() > 44, "WAV must exceed its 44-byte header");
         assert_eq!(&DING_WAV[0..4], b"RIFF");
         assert_eq!(&DING_WAV[8..12], b"WAVE");
+    }
+
+    #[test]
+    fn input_required_alert_is_a_distinct_valid_wav() {
+        let wav = input_required_wav();
+        assert_eq!(wav.len() as u64, INPUT_WAV_LEN);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_ne!(wav.as_slice(), DING_WAV, "alerts must not share a sound");
     }
 
     #[test]
