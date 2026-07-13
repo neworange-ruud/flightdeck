@@ -31,6 +31,7 @@ use crate::app::modes::InputMode;
 use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
 use crate::terminal::session::TerminalKind;
+use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::platform;
@@ -65,6 +66,9 @@ pub enum UiOverlay {
     /// A centered modal dialog: a confirmation/notification with clickable
     /// buttons (each also bound to a keyboard accelerator).
     Dialog(Dialog),
+    /// The configuration manager: curated toggles for the global/project config
+    /// (SPECS §8).
+    Config(ConfigManager),
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +534,7 @@ pub fn draw(
         UiOverlay::GitStatus { status, pr_url } => {
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
         }
+        UiOverlay::Config(manager) => draw_config_overlay(frame, manager, area),
     }
 }
 
@@ -1830,6 +1835,115 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(para, overlay_area);
 }
 
+/// Draw the configuration manager overlay (SPECS §8): a scope selector, the
+/// file being edited, the curated toggles/choices, and the key legend.
+pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rect) {
+    use crate::tui::config_manager::ConfigScope;
+
+    let overlay_area = layout::centered_overlay(area, 66, 60);
+    frame.render_widget(Clear, overlay_area);
+
+    let scope = manager.scope();
+    let accent = Color::Cyan;
+
+    // Scope selector line: the active scope is highlighted; the project scope
+    // names the project so it is always clear what is being edited.
+    let scope_style = |on: bool| {
+        if on {
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let project_label = format!(" Project ({}) ", manager.project_name());
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Scope:  ", Style::default().fg(Color::White)),
+        Span::styled(" Global ", scope_style(scope == ConfigScope::Global)),
+        Span::raw("  "),
+        Span::styled(project_label, scope_style(scope == ConfigScope::Project)),
+    ]));
+
+    // The file being edited (so the target is unambiguous).
+    let path_str = manager
+        .current_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no home dir — global config unavailable)".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("Editing: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(path_str, Style::default().fg(Color::Gray)),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Curated rows.
+    for row in manager.rows() {
+        let marker = if row.selected { "▸ " } else { "  " };
+        let control = if row.is_bool {
+            if row.bool_value {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            }
+        } else {
+            format!("‹{}›", row.value)
+        };
+        let name_style = if row.selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let origin_style = match row.origin {
+            Origin::SetHere => Style::default().fg(Color::Green),
+            Origin::Global => Style::default().fg(Color::Blue),
+            Origin::Default => Style::default().fg(Color::DarkGray),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(accent)),
+            Span::styled(format!("{control:<8} "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<22}", row.label), name_style),
+            Span::styled(format!("({})", row.origin.label()), origin_style),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    if let Some(status) = manager.status() {
+        lines.push(Line::from(Span::styled(
+            status.to_string(),
+            Style::default().fg(Color::Green),
+        )));
+    } else if manager.dirty() {
+        lines.push(Line::from(Span::styled(
+            "Unsaved changes",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ move   Space toggle   Tab switch scope   c clear override",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "s save   e edit file in $EDITOR   Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(" Configuration ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent));
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, overlay_area);
+}
+
 /// Build a shortcut description line for the help overlay.
 fn shortcut_line(keys: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
@@ -2849,6 +2963,25 @@ mod tests {
         let palette = CommandPalette::new();
         term.draw(|frame| {
             draw(frame, &state, &cache, &UiOverlay::Palette(palette), 0);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn draw_does_not_panic_with_config_overlay() {
+        let mut term = test_terminal(80, 24);
+        let state = empty_state();
+        let cache = empty_cache();
+        let manager = ConfigManager::new(
+            "demo-project",
+            Some(PathBuf::from("/home/u/.flightdeck/config.toml")),
+            PathBuf::from("/repo/.flightdeck/config.toml"),
+            toml::Table::new(),
+            toml::Table::new(),
+            vec!["opencode".to_string(), "claude".to_string()],
+        );
+        term.draw(|frame| {
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
         })
         .unwrap();
     }

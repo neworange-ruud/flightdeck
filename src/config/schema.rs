@@ -65,6 +65,14 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
     }
 }
 
+/// Build the default GLOBAL base config: the same defaults as [`default_config`]
+/// but with placeholder project identity, since `[project]` is stripped when the
+/// global file is written (SPECS §8). Every other section carries the shipping
+/// defaults so a fresh `~/.flightdeck/config.toml` documents them all.
+pub fn default_global_config() -> Config {
+    default_config("project", "main")
+}
+
 /// Validate a parsed config, rejecting structurally invalid configs with clear
 /// errors (SPECS §8, §26 "Rejects invalid config").
 pub fn validate(config: &Config) -> Result<()> {

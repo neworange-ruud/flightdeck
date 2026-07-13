@@ -48,6 +48,9 @@ pub enum PaletteAction {
     SwitchProjectNext,
     /// Switch to the previous open project (workspace-level).
     SwitchProjectPrev,
+    /// T9 must open the configuration manager overlay for the active project
+    /// (workspace-level: it reads/writes the global and project config files).
+    OpenConfig,
 }
 
 /// All §22 command-palette entries, in display order.
@@ -163,6 +166,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::SetManualStatus,
     },
     PaletteEntry {
+        group: "Configuration",
+        label: "Open Configuration",
+        action: PaletteAction::OpenConfig,
+    },
+    PaletteEntry {
         group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
@@ -180,11 +188,12 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 ];
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
-/// View", "Rebase Worktree", and "Pull Base" commands and the in-session agent
-/// actions ("New Agent" / "Close Agent"). (The `.env` files are now symlinked
-/// into new worktrees automatically, so the "Copy .env(.local)" entry is hidden
-/// from the palette; the [`Command::CopyEnvFile`] command remains.)
-pub const REQUIRED_ACTION_COUNT: usize = 25;
+/// View", "Rebase Worktree", and "Pull Base" commands, the in-session agent
+/// actions ("New Agent" / "Close Agent"), and "Open Configuration". (The `.env`
+/// files are now symlinked into new worktrees automatically, so the "Copy
+/// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
+/// command remains.)
+pub const REQUIRED_ACTION_COUNT: usize = 26;
 
 /// The command palette model (SPECS §22).
 ///
@@ -338,6 +347,7 @@ mod tests {
             "Restart Agent",
             "Open Shell",
             "Show Git Status",
+            "Open Configuration",
             "Toggle Split View",
             "Show Help",
             "Quit",

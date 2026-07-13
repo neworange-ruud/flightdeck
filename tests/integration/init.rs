@@ -6,8 +6,8 @@
 //!   and preserves prior `.gitignore` content.
 //! - `load_config` reads back what was written.
 
-use flightdeck::config::init::initialize;
-use flightdeck::config::load::load_config;
+use flightdeck::config::init::{ensure_global_config, initialize};
+use flightdeck::config::load::{load_layered_config, parse_config};
 use flightdeck::contracts::{FileSystem, RealFs};
 use flightdeck::fs::ignore::{
     ensure_flightdeck_gitignore, STATE_IGNORE_ENTRY, STATUS_IGNORE_ENTRY,
@@ -163,18 +163,46 @@ fn ensure_gitignore_creates_file_when_absent() {
 }
 
 #[test]
-fn load_config_reads_back_what_initialize_wrote() {
+fn initialize_writes_minimal_project_config() {
     let repo = setup_repo();
     let root = repo.path();
     let fs = RealFs;
 
     initialize(&fs, root, "round-trip-project", "develop").expect("initialize");
 
-    let cfg = load_config(&fs, &root.join(".flightdeck/config.toml")).expect("load config");
+    // The project config is minimal — only project identity, parsed directly
+    // (it does not validate stand-alone because agents live in the global base).
+    let contents = fs
+        .read_to_string(&root.join(".flightdeck/config.toml"))
+        .expect("read project config");
+    let cfg = parse_config(&contents).expect("parse project config");
     assert_eq!(cfg.project.name, "round-trip-project");
     assert_eq!(cfg.project.default_base_branch, "develop");
-    // Default config ships the three known agents.
+    assert!(cfg.agents.is_empty(), "project config carries no agents");
+}
+
+#[test]
+fn layered_config_reads_back_global_plus_project() {
+    let repo = setup_repo();
+    let root = repo.path();
+    let fs = RealFs;
+
+    // Write the global base into a temp home, then the minimal project config,
+    // and load the effective (layered) config back.
+    let home = tempfile::tempdir().expect("tempdir");
+    let global_path = home.path().join(".flightdeck/config.toml");
+    ensure_global_config(&fs, &global_path).expect("ensure global");
+    initialize(&fs, root, "round-trip-project", "develop").expect("initialize");
+
+    let cfg = load_layered_config(&fs, &global_path, &root.join(".flightdeck/config.toml"))
+        .expect("load layered config");
+    // Project identity from the project file...
+    assert_eq!(cfg.project.name, "round-trip-project");
+    assert_eq!(cfg.project.default_base_branch, "develop");
+    // ...and the three known agents inherited from the global base.
     assert!(cfg.agents.contains_key("opencode"));
     assert!(cfg.agents.contains_key("claude"));
     assert!(cfg.agents.contains_key("codex"));
+    // Notifications are on by default.
+    assert!(cfg.notifications.enabled);
 }

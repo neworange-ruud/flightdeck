@@ -492,6 +492,15 @@ impl AppState {
         }
     }
 
+    /// Replace the effective config and rebuild the agent registry from it
+    /// (SPECS §8). Called after the configuration manager (or an `$EDITOR` edit)
+    /// changes the global/project config; running tabs are untouched — only
+    /// newly-spawned agents and config-derived UI reflect the change.
+    pub fn reload_config(&mut self, config: Config) {
+        self.registry = AgentRegistry::from_config(&config);
+        self.config = config;
+    }
+
     // -----------------------------------------------------------------------
     // Mode handling (SPECS §23)
     // -----------------------------------------------------------------------
@@ -1987,6 +1996,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reload_config_swaps_config_and_rebuilds_registry() {
+        let mut app = fresh_state(crate::config::schema::default_config("p", "main"));
+        assert!(app.config.notifications.enabled);
+        assert!(app.registry.get("codex").is_some());
+
+        // A new effective config with notifications off and a single agent.
+        let mut next = crate::config::schema::default_config("p", "main");
+        next.notifications.enabled = false;
+        next.agents.retain(|k, _| k == "opencode");
+        next.ui.default_agent = "opencode".to_string();
+        app.reload_config(next);
+
+        assert!(!app.config.notifications.enabled);
+        assert_eq!(app.registry.all().len(), 1);
+        assert!(app.registry.get("codex").is_none());
+        assert!(app.registry.get("opencode").is_some());
+    }
+
     // --- Switching with no selected tab is a graceful no-op ---------------
 
     #[test]
@@ -2683,8 +2711,8 @@ mod tests {
         (app, git, fs, pty, clock, id)
     }
 
-    /// A config with one real agent and OS notifications enabled (off by
-    /// default, so tests that expect alerts must opt in).
+    /// A config with one real agent and OS notifications enabled (on by default,
+    /// but set explicitly here so the intent is clear at each call site).
     fn config_notify_on(dir: &TempDir) -> Config {
         let (agent, _cmd) = make_real_agent(dir, "opencode");
         let mut config = config_with_agent(agent);
@@ -2842,13 +2870,14 @@ mod tests {
     }
 
     #[test]
-    fn notifications_are_off_by_default() {
-        // Opt-in: the master switch is off until the user enables it, but the
-        // per-category toggles stay on so enabling is a single flip.
+    fn notifications_are_on_by_default() {
+        // On by default: the master switch, all three categories, and the sound
+        // chime are enabled out of the box.
         let cfg = NotificationsConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert!(cfg.on_finish && cfg.on_waiting && cfg.on_failed);
-        assert!(!Config::default().notifications.enabled);
+        assert!(cfg.sound);
+        assert!(Config::default().notifications.enabled);
     }
 
     #[test]

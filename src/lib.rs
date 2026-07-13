@@ -55,13 +55,14 @@ use std::time::Duration;
 use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::app::state::{materialize_worktree, AppState, Services, TabPhase, WorktreeJob};
-use crate::config::init::initialize;
-use crate::config::load::{load_config, serialize_config};
+use crate::config::init::{ensure_global_config, initialize};
+use crate::config::load::{global_config_path, load_config, load_layered_config};
 use crate::config::schema::default_config;
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs};
 use crate::contracts::{
-    Clock, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, PtyBackend, PtySize,
+    Clock, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, PtyBackend,
+    PtySize,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -74,6 +75,7 @@ use crate::persistence::workspace::{
     load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
 };
 use crate::terminal::pty::PortablePtyBackend;
+use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
@@ -122,7 +124,7 @@ pub fn run() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         // Generate reusable standalone status hooks/plugins.
         Some("setup-status") => return run_setup_status(),
-        // Enable OS notifications in config (off by default).
+        // Ensure OS notifications are enabled in config (on by default).
         Some("setup-notifications") => return run_setup_notifications(),
         // Ensure the once-a-day update notice is enabled in config (SPECS §30).
         Some("setup-update") => return run_setup_update(),
@@ -329,11 +331,13 @@ fn run_setup_status() -> Result<()> {
     Ok(())
 }
 
-/// `flightdeck setup-notifications`: turn on OS notifications by setting
-/// `notifications.enabled = true` in `<repo>/.flightdeck/config.toml` (creating
-/// the config on first run), then print how to tune or disable them. Does not
-/// launch the TUI (SPECS §24). Notifications are off by default; this is the
-/// quick way to opt in without hand-editing the config.
+/// `flightdeck setup-notifications`: ensure OS notifications are on for this
+/// project by writing `notifications.enabled = true` as an override in
+/// `<repo>/.flightdeck/config.toml` (creating the config on first run), then
+/// print how to tune or disable them. Does not launch the TUI (SPECS §24).
+/// Notifications are on by default (via the global config); this command is the
+/// quick way to re-enable them for a project that turned them off, without
+/// hand-editing the config.
 fn run_setup_notifications() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| FlightDeckError::Io(format!("could not determine current directory: {e}")))?;
@@ -347,24 +351,23 @@ fn run_setup_notifications() -> Result<()> {
     let fs = RealFs;
     let config_path = repo_root.join(".flightdeck").join("config.toml");
 
-    // Ensure a config exists (first run writes the default), then load it.
+    // Ensure a project config exists (first run writes the minimal default),
+    // then load the effective (global + project) config to check the state.
     if !fs.exists(&config_path) {
         let project_name = derive_project_name(&repo_root);
         let base_branch = detect_base_branch(&git, &cwd, None)?;
         initialize(&fs, &repo_root, &project_name, &base_branch)?;
     }
-    let mut config = load_config(&fs, &config_path)?;
+    let config = load_effective_for_repo(&fs, &repo_root)?;
 
     if config.notifications.enabled {
-        println!(
-            "FlightDeck: OS notifications are already enabled in {}.",
-            config_path.display()
-        );
+        println!("FlightDeck: OS notifications are already enabled (they are on by default).");
     } else {
-        config.notifications.enabled = true;
-        fs.write(&config_path, &serialize_config(&config)?)?;
+        // They were turned off (globally or for this project). Re-enable them
+        // as an explicit project override, leaving other settings inherited.
+        set_project_bool_override(&fs, &config_path, "notifications", "enabled", true)?;
         println!(
-            "FlightDeck: enabled OS notifications in {}.",
+            "FlightDeck: enabled OS notifications for this project in {}.",
             config_path.display()
         );
     }
@@ -400,24 +403,21 @@ fn run_setup_update() -> Result<()> {
     let fs = RealFs;
     let config_path = repo_root.join(".flightdeck").join("config.toml");
 
-    // Ensure a config exists (first run writes the default), then load it.
+    // Ensure a project config exists (first run writes the minimal default),
+    // then load the effective (global + project) config to check the state.
     if !fs.exists(&config_path) {
         let project_name = derive_project_name(&repo_root);
         let base_branch = detect_base_branch(&git, &cwd, None)?;
         initialize(&fs, &repo_root, &project_name, &base_branch)?;
     }
-    let mut config = load_config(&fs, &config_path)?;
+    let config = load_effective_for_repo(&fs, &repo_root)?;
 
     if config.update.check {
-        println!(
-            "FlightDeck: the update notice is already enabled in {}.",
-            config_path.display()
-        );
+        println!("FlightDeck: the update notice is already enabled (it is on by default).");
     } else {
-        config.update.check = true;
-        fs.write(&config_path, &serialize_config(&config)?)?;
+        set_project_bool_override(&fs, &config_path, "update", "check", true)?;
         println!(
-            "FlightDeck: enabled the update notice in {}.",
+            "FlightDeck: enabled the update notice for this project in {}.",
             config_path.display()
         );
     }
@@ -466,7 +466,7 @@ fn run_image() -> Result<()> {
         let base_branch = detect_base_branch(&git, &cwd, None)?;
         initialize(&fs, &repo_root, &project_name, &base_branch)?;
     }
-    let config = load_config(&fs, &config_path)?;
+    let config = load_effective_for_repo(&fs, &repo_root)?;
 
     // `validate_containers` skips its checks whenever `enabled` is false (so a
     // disabled-but-malformed table never blocks an ordinary launch), but
@@ -521,12 +521,7 @@ fn run_doctor() -> Result<()> {
     })?;
     let repo_root = git.root().to_path_buf();
     let fs = RealFs;
-    let config_path = repo_root.join(".flightdeck").join("config.toml");
-    let config = if fs.exists(&config_path) {
-        load_config(&fs, &config_path)?
-    } else {
-        crate::contracts::Config::default()
-    };
+    let config = load_effective_for_repo(&fs, &repo_root)?;
 
     println!("FlightDeck doctor");
     if !config.containers.enabled {
@@ -600,11 +595,19 @@ fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState
     let project_name = derive_project_name(repo_root);
     initialize(services.fs, repo_root, &project_name, &base_branch)?;
 
-    // Load config; fall back to a freshly-created default if loading fails.
-    let config = match load_config(services.fs, &config_path) {
-        Ok(cfg) => cfg,
-        Err(_) => default_config(&project_name, &base_branch),
-    };
+    // Ensure the per-user global base exists (documents every overridable
+    // setting), then load the effective config by layering it under this
+    // project's overrides (SPECS §8). Fall back to a freshly-built default if
+    // loading fails, or when there is no home dir to host a global config.
+    let global_path = global_config_path();
+    if let Some(gp) = &global_path {
+        let _ = ensure_global_config(services.fs, gp);
+    }
+    let config = match &global_path {
+        Some(gp) => load_layered_config(services.fs, gp, &config_path),
+        None => load_config(services.fs, &config_path),
+    }
+    .unwrap_or_else(|_| default_config(&project_name, &base_branch));
 
     // Append .gitignore entries and surface the §6 notice if it changed.
     let update = ensure_flightdeck_gitignore(services.fs, repo_root)?;
@@ -651,6 +654,49 @@ fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState
     }
 
     Ok(state)
+}
+
+/// Load the effective config for the repo at `repo_root`: the per-user global
+/// base layered under this project's overrides (SPECS §8), ensuring the global
+/// base exists first. Falls back to the single project file when there is no
+/// home dir to host a global config. Used by the non-TUI subcommands.
+fn load_effective_for_repo(fs: &dyn FileSystem, repo_root: &Path) -> Result<Config> {
+    let config_path = repo_root.join(".flightdeck").join("config.toml");
+    match global_config_path() {
+        Some(gp) => {
+            let _ = ensure_global_config(fs, &gp);
+            load_layered_config(fs, &gp, &config_path)
+        }
+        None => load_config(fs, &config_path),
+    }
+}
+
+/// Set a boolean `section.key = value` override in the project config at
+/// `config_path`, preserving any other overrides already present and leaving
+/// everything else inherited from the global base (SPECS §8). Creates the file
+/// and/or section if missing.
+fn set_project_bool_override(
+    fs: &dyn FileSystem,
+    config_path: &Path,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<()> {
+    let mut table = if fs.exists(config_path) {
+        crate::config::load::parse_table(&fs.read_to_string(config_path)?)?
+    } else {
+        toml::Table::new()
+    };
+    let entry = table
+        .entry(section.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(t) = entry {
+        t.insert(key.to_string(), toml::Value::Boolean(value));
+    }
+    let body = toml::to_string_pretty(&table)
+        .map_err(|e| FlightDeckError::Config(format!("failed to serialize config: {e}")))?;
+    fs.write(config_path, &body)?;
+    Ok(())
 }
 
 /// Read the `default_base_branch` out of an existing config, if present, without
@@ -833,6 +879,13 @@ struct Ui {
     /// index of the project it belongs to, so it is handed to the right
     /// project's worker even if the active project changes before hand-off.
     pending_jobs: Vec<PendingJob>,
+    /// The configuration manager overlay, if open (SPECS §8). Held separately
+    /// from `overlay` (like `palette`) because it carries its own mutable state.
+    config: Option<ConfigManager>,
+    /// A config file the user asked to edit in `$EDITOR` (SPECS §8). Deferred to
+    /// the event loop, which owns the terminal it must suspend/restore. Tagged
+    /// with the project index whose config was opened.
+    pending_editor: Option<(usize, PathBuf)>,
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -851,7 +904,10 @@ impl Ui {
     /// Whether any modal/prompt currently captures input. Used to decide whether
     /// the normal mode-aware key map should run.
     fn modal_active(&self) -> bool {
-        self.palette.is_some() || self.prompt.is_some() || !matches!(self.overlay, UiOverlay::None)
+        self.palette.is_some()
+            || self.prompt.is_some()
+            || self.config.is_some()
+            || !matches!(self.overlay, UiOverlay::None)
     }
 
     /// Show a notification message as a centered modal dialog (SPECS §22).
@@ -864,11 +920,16 @@ impl Ui {
         self.overlay = UiOverlay::None;
         self.palette = None;
         self.prompt = None;
+        self.config = None;
     }
 
     /// The overlay to render this frame: a live prompt dialog takes precedence
-    /// over a plain notification, the palette over both.
+    /// over a plain notification, the palette over both, and the configuration
+    /// manager over everything (it is only ever open on its own).
     fn render_overlay(&self) -> UiOverlay {
+        if let Some(config) = &self.config {
+            return UiOverlay::Config(config.clone());
+        }
         if let Some(palette) = &self.palette {
             return UiOverlay::Palette(palette.clone());
         }
@@ -881,7 +942,7 @@ impl Ui {
     /// The dialog currently accepting clicks, if any: a live prompt's dialog, or
     /// a notification dialog set as the overlay.
     fn active_dialog(&self) -> Option<Dialog> {
-        if self.palette.is_some() {
+        if self.palette.is_some() || self.config.is_some() {
             return None;
         }
         if let Some(p) = &self.prompt {
@@ -1134,7 +1195,10 @@ fn event_loop(
                 p.state.poll_status_files(&services, now_ms);
             }
 
-            for note in p.state.take_finish_notifications(now_ms) {
+            // Prefix the project name so alerts read "project: tab" — useful
+            // when several projects are open at once (SPECS §24).
+            for mut note in p.state.take_finish_notifications(now_ms) {
+                note.title = format!("{}: {}", p.name, note.title);
                 notifier.notify(&note);
             }
         }
@@ -1235,6 +1299,16 @@ fn event_loop(
             if let Some(p) = workspace.projects.get(pj.project) {
                 spawn_worktree_job(pj.job, &p.git, &p.git_lock, &p.create_tx);
             }
+        }
+
+        // --- Open a config file in $EDITOR if requested (SPECS §8). Done here,
+        //     where we own the terminal to suspend/restore, then reload every
+        //     project's effective config to pick up any edits. ---
+        if let Some((_project, path)) = ui.pending_editor.take() {
+            if let Err(e) = open_in_editor(terminal, &path) {
+                ui.message(format!("Editor failed: {e}"));
+            }
+            reload_all_projects_config(workspace, env);
         }
 
         // A dispatched Effect::Quit (e.g. the "Quit" palette action) also exits.
@@ -1901,7 +1975,12 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return handle_prompt_key(key, workspace, env, ui).map(|_| false);
     }
 
-    // 2. The command palette, if open, captures input next (SPECS §22).
+    // 2. The configuration manager overlay, if open, captures input (SPECS §8).
+    if ui.config.is_some() {
+        return handle_config_key(key, workspace, env, ui).map(|_| false);
+    }
+
+    // 3. The command palette, if open, captures input next (SPECS §22).
     if ui.palette.is_some() {
         return handle_palette_key(key, workspace, env, ui).map(|_| false);
     }
@@ -3073,6 +3152,10 @@ fn run_palette_action(
             workspace.switch(Selector::Prev);
             return Ok(());
         }
+        PaletteAction::OpenConfig => {
+            open_config_manager(workspace, env, ui);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -3125,7 +3208,172 @@ fn run_palette_action(
         PaletteAction::OpenProject
         | PaletteAction::CloseProject
         | PaletteAction::SwitchProjectNext
-        | PaletteAction::SwitchProjectPrev => Ok(()),
+        | PaletteAction::SwitchProjectPrev
+        | PaletteAction::OpenConfig => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configuration manager (SPECS §8)
+// ---------------------------------------------------------------------------
+
+/// Build and open the configuration manager for the active project, reading the
+/// global base and this project's override files into an editable model. Ensures
+/// the global base exists first so it is always editable.
+fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    let global_path = global_config_path();
+    if let Some(gp) = &global_path {
+        let _ = ensure_global_config(env.fs, gp);
+    }
+
+    let read_table = |path: &Path| -> toml::Table {
+        if env.fs.exists(path) {
+            env.fs
+                .read_to_string(path)
+                .ok()
+                .and_then(|s| crate::config::load::parse_table(&s).ok())
+                .unwrap_or_default()
+        } else {
+            toml::Table::new()
+        }
+    };
+
+    let p = workspace.active_project();
+    let project_path = p.git.root().join(".flightdeck").join("config.toml");
+    let global = global_path.as_deref().map(&read_table).unwrap_or_default();
+    let project = read_table(&project_path);
+    let agent_keys: Vec<String> = p.state.config.agents.keys().cloned().collect();
+
+    ui.config = Some(ConfigManager::new(
+        p.name.clone(),
+        global_path,
+        project_path,
+        global,
+        project,
+        agent_keys,
+    ));
+}
+
+/// Handle a key while the configuration manager overlay is open (SPECS §8).
+fn handle_config_key(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    let Some(cm) = ui.config.as_mut() else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Esc => ui.config = None,
+        KeyCode::Up => cm.select_prev(),
+        KeyCode::Down => cm.select_next(),
+        KeyCode::Tab => cm.switch_scope(),
+        KeyCode::Char(' ') | KeyCode::Enter => cm.toggle_selected(),
+        KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => cm.clear_selected(),
+        KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            save_config_manager(workspace, env, ui)?;
+        }
+        KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(path) = cm.current_path() {
+                ui.pending_editor = Some((workspace.active, path));
+                ui.config = None;
+            } else {
+                ui.config = None;
+                ui.message("No global config to edit (no home directory).");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Write the configuration manager's dirty scopes to disk, then reload the
+/// effective config for every open project (a global change affects them all).
+fn save_config_manager(workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<()> {
+    let outputs = match ui.config.as_ref() {
+        Some(cm) => cm.outputs()?,
+        None => return Ok(()),
+    };
+    for (path, contents) in &outputs {
+        if let Some(parent) = path.parent() {
+            if !env.fs.exists(parent) {
+                env.fs.create_dir_all(parent)?;
+            }
+        }
+        env.fs.write(path, contents)?;
+    }
+    if let Some(cm) = ui.config.as_mut() {
+        cm.mark_saved();
+    }
+    reload_all_projects_config(workspace, env);
+    Ok(())
+}
+
+/// Recompute and apply the effective config for every open project by layering
+/// the (possibly just-edited) global base under each project's own overrides
+/// (SPECS §8). Best-effort: a project whose config fails to load keeps its
+/// current config.
+fn reload_all_projects_config(workspace: &mut Workspace, env: &Env) {
+    let global_path = global_config_path();
+    for p in workspace.projects.iter_mut() {
+        let project_path = p.git.root().join(".flightdeck").join("config.toml");
+        let loaded = match &global_path {
+            Some(gp) => load_layered_config(env.fs, gp, &project_path),
+            None => load_config(env.fs, &project_path),
+        };
+        if let Ok(cfg) = loaded {
+            p.state.reload_config(cfg);
+        }
+    }
+}
+
+/// The user's preferred editor: `$VISUAL`, then `$EDITOR`, then a platform
+/// default (`notepad` on Windows, `vi` elsewhere).
+fn preferred_editor() -> String {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "vi" }.to_string())
+}
+
+/// Suspend the TUI, open `path` in the user's editor, then re-initialise the
+/// terminal (SPECS §8). The editor inherits the real terminal so full-screen
+/// editors work; on return the alt screen, mouse capture, and bracketed paste
+/// are re-enabled and the screen is cleared for a full redraw.
+fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Result<()> {
+    // Tear down our terminal ownership so the editor has a clean TTY.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
+    ratatui::restore();
+
+    let editor = preferred_editor();
+    let status = std::process::Command::new(&editor).arg(path).status();
+
+    // Re-initialise the terminal regardless of how the editor exited.
+    *terminal = ratatui::try_init()
+        .map_err(|e| FlightDeckError::Io(format!("failed to re-initialise terminal: {e}")))?;
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    if matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+    let _ = terminal.clear();
+
+    match status {
+        Ok(_) => Ok(()),
+        Err(e) => Err(FlightDeckError::Io(format!(
+            "failed to launch editor '{editor}': {e}"
+        ))),
     }
 }
 

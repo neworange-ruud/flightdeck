@@ -273,14 +273,15 @@ fn default_true() -> bool {
 /// `[notifications]` config section (SPECS §24): OS notifications fired when an
 /// agent transitions out of an active state (working/starting) into a settled
 /// one. Each category can be toggled independently; `enabled` is the master
-/// switch and is **off by default** (opt-in) — enable it with `flightdeck
-/// setup-notifications` or by editing the config. The per-category toggles
-/// default to `true`, so once enabled all three categories fire unless one is
-/// turned off; a partial `[notifications]` table fills the rest in.
+/// switch and is **on by default** — turn it off with `enabled = false` (in the
+/// global or a project `config.toml`) or from the configuration manager. The
+/// per-category toggles also default to `true`, so out of the box all three
+/// categories fire unless one is turned off; a partial `[notifications]` table
+/// fills the rest in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationsConfig {
-    /// Master switch for all OS notifications. Off by default (opt-in).
-    #[serde(default)]
+    /// Master switch for all OS notifications. On by default.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Notify when an agent finishes its turn (idle / completed).
     #[serde(default = "default_true")]
@@ -300,8 +301,8 @@ pub struct NotificationsConfig {
 impl Default for NotificationsConfig {
     fn default() -> Self {
         NotificationsConfig {
-            // Opt-in: off until the user enables it (config or setup command).
-            enabled: false,
+            // On by default: notify when agents finish/wait/fail out of the box.
+            enabled: true,
             on_finish: true,
             on_waiting: true,
             on_failed: true,
