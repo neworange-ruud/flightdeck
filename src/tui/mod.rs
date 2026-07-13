@@ -5,6 +5,7 @@
 //! directly (SPECS §27).
 
 pub mod clipboard;
+pub mod config_manager;
 pub mod input;
 pub mod layout;
 pub mod palette;

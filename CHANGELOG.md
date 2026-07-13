@@ -8,11 +8,31 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Add a **configuration manager**, opened from the command palette
+  ("Open Configuration"). It edits the common settings as toggles/choices —
+  OS notifications and per-category alerts, the finish chime, update checks,
+  agent tab position, and the default agent. `Tab` switches between the
+  **Global** and **Project** scope (the header always names the file being
+  edited and, for a project, which project), `Space` toggles, `c` clears a
+  project override so it re-inherits, `s` saves, and `e` opens the raw
+  `config.toml` in `$EDITOR` for the full surface. Saving reloads every open
+  project's effective config immediately.
+- Introduce a per-user **global config** at `~/.flightdeck/config.toml`,
+  created on first run with every setting present and documented so it is clear
+  what can be overridden. Each project's `.flightdeck/config.toml` now only
+  needs to store the values it overrides; everything else is inherited from the
+  global base. The project layer wins field-by-field, except `[agents]`, which
+  a project replaces wholesale when it defines any of its own. Existing
+  fully-populated project configs keep working unchanged.
 
 ### Improvements
 
-- None yet.
+- OS notifications are now **on by default** (previously opt-in), including the
+  finish chime (`sound`). Turn them off with `enabled = false` under
+  `[notifications]` in the global or a project config, or from the
+  configuration manager.
+- OS notifications now include the project name, e.g. `myproject: my-agent`,
+  so alerts are unambiguous when several projects are open.
 
 ### Bug fixes
 

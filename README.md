@@ -90,12 +90,37 @@ is preserved):
 .flightdeck/runtime/
 ```
 
-Configured agents live in `.flightdeck/config.toml` (OpenCode is the default;
-Claude Code and Codex CLI are pre-configured). Agent definitions are
-config-driven — edit the `command` and `args` there. When
-you create a tab you pick which agent it runs from a quick menu, so you can mix
-agents (e.g. Claude Code in one tab, OpenCode in another); the menu is skipped
-when only one agent is configured.
+Configured agents live in the config (OpenCode is the default; Claude Code and
+Codex CLI are pre-configured). Agent definitions are config-driven — edit the
+`command` and `args` there. When you create a tab you pick which agent it runs
+from a quick menu, so you can mix agents (e.g. Claude Code in one tab, OpenCode
+in another); the menu is skipped when only one agent is configured.
+
+## Configuration
+
+FlightDeck layers two config files into one effective config:
+
+```text
+~/.flightdeck/config.toml       # per-user GLOBAL base (all settings, documented)
+<repo>/.flightdeck/config.toml  # per-project OVERRIDE (only changed values)
+```
+
+The **global** file is created on first run with every setting present and
+commented, so it's clear what you can override. Each **project** only stores the
+values it changes — everything else is inherited from the global base. The
+project layer wins field-by-field, except `[agents]`, which a project replaces
+wholesale when it defines any of its own. (Existing fully-populated project
+configs keep working unchanged.)
+
+Open the **configuration manager** from the command palette
+("Open Configuration") to edit the common settings without leaving FlightDeck:
+
+- `↑`/`↓` move, `Space` toggles a setting or cycles a choice.
+- `Tab` switches between **Global** and **Project** scope — the header always
+  shows which file you're editing (and which project).
+- `c` clears a project override so the value re-inherits from the global base.
+- `s` saves (and reloads every open project's config); `e` opens the raw
+  `config.toml` in `$EDITOR` for the full surface (containers, agents, git, …).
 
 ## Running agents in containers (optional)
 
@@ -304,28 +329,26 @@ elsewhere. A notification fires on the **edge** from an active state
 
 It fires once per transition (a quiet agent never re-notifies until it resumes
 work) and is suppressed briefly at startup so resumed agents settling to idle
-don't produce a burst. Only explicit lifecycle transitions can arm an alert.
+don't produce a burst. Only explicit lifecycle transitions can arm an alert. The
+notification title is prefixed with the project name (`myproject: my-agent`), so
+alerts stay unambiguous when several projects are open.
 
-Notifications are **off by default** (opt-in). Turn them on with:
-
-```bash
-flightdeck setup-notifications
-```
-
-This flips `notifications.enabled = true` in `.flightdeck/config.toml` (creating
-it on first run) and prints the macOS delivery tips below. You can also edit the
-config by hand — the master switch is `enabled`; the three per-category toggles
-default to `true`, so enabling is a single flip:
+Notifications are **on by default**. The master switch is `enabled`; the three
+per-category toggles and the finish chime (`sound`) also default to `true`:
 
 ```toml
 [notifications]
-enabled = true     # master switch (off by default)
+enabled = true     # master switch (on by default)
 on_finish = true   # agent went idle / completed
 on_waiting = true  # agent is waiting for input / needs attention
 on_failed = true   # agent errored out
+sound = true       # play a chime when an agent finishes
 ```
 
-Set `enabled = false` (or re-edit the config) to turn them off again.
+Turn them off from the configuration manager (see [Configuration](#configuration))
+or by setting `enabled = false` under `[notifications]` in the global or a
+project config. `flightdeck setup-notifications` re-enables them for a project
+that turned them off.
 
 Delivery on macOS: if [`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
 is installed (`brew install terminal-notifier`) FlightDeck uses it — the most

@@ -253,17 +253,54 @@ Future CLI support for `flightdeck init` is acceptable, but not required for MVP
 
 ## 8. Config File
 
-Config file:
+FlightDeck layers two TOML files into one effective config:
 
 ```text
-.flightdeck/config.toml
+~/.flightdeck/config.toml       # per-user GLOBAL base (all settings, documented)
+<repo>/.flightdeck/config.toml  # per-project OVERRIDE (only changed values)
 ```
 
-The config is committed and human-readable.
+The per-project config is committed and human-readable. The global base is
+per-user (created on first run) and documents every overridable setting so it is
+clear what a project may override; it deliberately omits `[project]` (project
+identity — `name` / `default_base_branch` — is per-repo).
 
-No in-TUI settings editor for MVP.
+### Layering rules
 
-Example MVP config:
+- The project layer wins **field-by-field** over the global base, which wins
+  over the shipped defaults.
+- Sub-tables merge recursively (e.g. a project that sets only
+  `notifications.enabled` keeps the global `notifications.sound`).
+- The `[agents]` map is the one exception: it is **replaced wholesale** when the
+  project defines any agents, so a project either inherits the global agent set
+  or specifies its own set in full.
+- A project's `config.toml` only needs to store the values it overrides. On
+  first run FlightDeck writes a minimal project config containing just
+  `[project]`. Existing fully-populated project configs keep working (they
+  simply override every field).
+
+### Configuration manager
+
+An in-TUI configuration manager (command palette → "Open Configuration") edits
+the common settings as toggles/choices. `Tab` switches between **Global** and
+**Project** scope (the manager always shows which file is being edited, and for
+a project which project), editing writes an override into the active scope, `c`
+clears a project override so the value re-inherits, `s` saves, and `e` opens the
+raw `config.toml` in `$EDITOR` for the full surface. Saving reloads every open
+project's effective config immediately.
+
+Example project override (only what differs from the global base):
+
+```toml
+[project]
+name = "my-project"
+default_base_branch = "main"
+
+[notifications]
+enabled = false
+```
+
+Example global base:
 
 ```toml
 [project]
