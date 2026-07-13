@@ -176,6 +176,7 @@ async fn claim_token_is_single_use() {
             claim_token: token.clone(),
             device_id: DeviceId::new("dev_phone_2"),
             device_public_key: phone2.public_key_b64.clone(),
+            key_agreement_public_key: phone2.key_agreement_public_key_b64.clone(),
             role: Role::Phone,
         })
         .await;
@@ -196,6 +197,7 @@ async fn full_pairing_routing_resume_and_dedup() {
 
     // 1. Desktop connects, bootstraps a pairing, authenticates.
     let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let desktop_ka_key = desktop.key_agreement_public_key_b64.clone();
     let (pairing, token) = desktop.offer_pairing().await;
     let activated = desktop.authenticate(vec![pairing.clone()]).await;
     assert_eq!(activated, vec![pairing.clone()]);
@@ -203,8 +205,28 @@ async fn full_pairing_routing_resume_and_dedup() {
     // 2. Phone connects, claims the token, authenticates.
     let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
     let phone_key = phone.key();
-    let joined = phone.claim_pairing(&token).await;
+    let phone_ka_key = phone.key_agreement_public_key_b64.clone();
+    let (joined, peer_ka) = phone.claim_pairing_full(&token).await;
     assert_eq!(joined, pairing);
+    // The phone must receive the desktop's key-agreement key for the E2E ECDH.
+    assert_eq!(peer_ka, Some(desktop_ka_key));
+
+    // The waiting desktop is notified of the join and receives the phone's KA key.
+    let desk_claimed = desktop
+        .recv_until(|f| matches!(f, RelayFrame::PairingClaimed { .. }))
+        .await;
+    match desk_claimed {
+        RelayFrame::PairingClaimed {
+            peer_device_id,
+            peer_key_agreement_public_key,
+            ..
+        } => {
+            assert_eq!(peer_device_id, Some(DeviceId::new("dev_phone")));
+            assert_eq!(peer_key_agreement_public_key, Some(phone_ka_key));
+        }
+        other => panic!("expected pairing_claimed on desktop, got {other:?}"),
+    }
+
     let activated = phone.authenticate(vec![pairing.clone()]).await;
     assert_eq!(activated, vec![pairing.clone()]);
 

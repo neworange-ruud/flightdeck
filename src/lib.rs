@@ -78,7 +78,7 @@ use crate::persistence::workspace::{
 use crate::remote::client::RemoteHandle;
 use crate::remote::identity::load_or_create_identity;
 use crate::remote::state::remote_state_path;
-use crate::remote::{RemoteInbound, RemoteOutbound};
+use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key, KeyAction};
@@ -88,6 +88,7 @@ use crate::tui::render::{
     ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
     HitTarget, ProjectHit, ProjectTabInfo, UiOverlay,
 };
+use flightdeck_remote_protocol::ProjectId;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -1170,8 +1171,16 @@ fn event_loop(
     // bridge that feeds it is a later task; keeping the channel here fixes the
     // wiring shape so that task is purely additive.
     let (remote_in_tx, remote_in_rx) = std::sync::mpsc::channel::<RemoteInbound>();
-    let (_remote_out_tx, remote_out_rx) = std::sync::mpsc::channel::<RemoteOutbound>();
+    let (remote_out_tx, remote_out_rx) = std::sync::mpsc::channel::<RemoteOutbound>();
     let remote_handle = start_remote(env, workspace, remote_in_tx, remote_out_rx);
+    // The outbound feed bridge exists only while the relay thread does. It builds
+    // the phone-facing snapshots/deltas/transcript/events each tick and seals
+    // them (a passthrough sealer for now; the crypto task swaps in real AEAD).
+    // When remote is disabled this stays `None`, so every tee/tick below is a
+    // cheap no-op and behaviour is bit-for-bit unchanged.
+    let mut remote_bridge: Option<RemoteBridge> = remote_handle
+        .as_ref()
+        .map(|_| RemoteBridge::passthrough(now0 + crate::app::state::NOTIFY_STARTUP_GRACE_MS));
 
     loop {
         let now_ms = env.clock.now_millis();
@@ -1185,7 +1194,11 @@ fn event_loop(
             let is_active = idx == active;
             let p = &mut workspace.projects[idx];
 
-            drain_pty_output(&mut p.state, now_ms);
+            drain_pty_output(&mut p.state, now_ms, |sid, bytes| {
+                if let Some(b) = remote_bridge.as_mut() {
+                    b.tee_primary(sid, bytes, now_ms as i64);
+                }
+            });
 
             {
                 let services = env.services(&p.git);
@@ -1225,12 +1238,32 @@ fn event_loop(
             }
         }
 
-        // --- Drain relay-client events (link state, envelopes, presence). For
-        //     now this is a stub: the real bridge (a later task) will translate
-        //     these into UI state and dispatched commands. Draining here keeps
-        //     the channel from filling and proves the enabled path is live. ---
-        while let Ok(msg) = remote_in_rx.try_recv() {
-            handle_remote_inbound(msg);
+        // --- Drain relay-client events (link state, envelopes, presence) into
+        //     the outbound bridge, then push this tick's feed. Inbound is
+        //     handled before the tick so a just-arrived `request_snapshot` /
+        //     pairing is reflected in what we send. Command envelopes beyond
+        //     snapshot/transcript requests are queued for the command-bridge
+        //     task via `RemoteBridge::take_pending_commands`. ---
+        if let Some(b) = remote_bridge.as_mut() {
+            while let Ok(msg) = remote_in_rx.try_recv() {
+                b.handle_inbound(msg);
+            }
+            let views: Vec<ProjectView> = workspace
+                .projects
+                .iter()
+                .map(|p| ProjectView {
+                    id: ProjectId::new(p.name.clone()),
+                    name: &p.name,
+                    state: &p.state,
+                    cache: &p.cache,
+                })
+                .collect();
+            b.tick(&views, now_ms, &mut |out| {
+                let _ = remote_out_tx.send(out);
+            });
+        } else {
+            // Remote disabled: drain (and drop) so the channel never fills.
+            while remote_in_rx.try_recv().is_ok() {}
         }
 
         // --- Refresh the git-status cache for the ACTIVE project only (it is
@@ -1367,11 +1400,6 @@ fn start_remote(
     let (identity, _state) = load_or_create_identity(env.fs, &path).ok()?;
     Some(RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx))
 }
-
-/// Stub handler for relay-client events until the bridge task consumes them.
-/// Intentionally does nothing (a TUI cannot log to stdout without corrupting
-/// the screen); it exists so the drain site has a clear extension point.
-fn handle_remote_inbound(_msg: RemoteInbound) {}
 
 /// One completed background worktree-creation job: which placeholder tab to
 /// finalize, and whether materialization succeeded (SPECS §16/§17).
@@ -3437,7 +3465,7 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 /// Drain output from every terminal of every tab and feed each terminal's VT
 /// parser so it can be rendered. Lifecycle status is handled separately by
 /// backend hooks/plugins (SPECS §24).
-fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
+fn drain_pty_output(state: &mut AppState, _now_ms: u64, mut tee: impl FnMut(&str, &[u8])) {
     for tab in state.tabs.iter_mut() {
         // Primary: drain into the VT parser. Lifecycle status comes only from
         // backend hooks/plugins; PTY output includes echoed user keystrokes and
@@ -3449,6 +3477,10 @@ fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
+                    // Tee the raw primary bytes to the remote transcript builder
+                    // (a no-op when remote is disabled). `tab.meta` is a disjoint
+                    // field from `tab.session`, so this borrows cleanly.
+                    tee(&tab.meta.id, &bytes);
                 }
             }
         }
@@ -4062,7 +4094,7 @@ mod tests {
             .unwrap();
 
         handle.push_output(b"echoed user keystrokes".to_vec());
-        drain_pty_output(&mut state, 1_000);
+        drain_pty_output(&mut state, 1_000, |_, _| {});
 
         assert_eq!(
             state.tabs[0].display_status(1_000).interpreted,

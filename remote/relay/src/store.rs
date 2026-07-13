@@ -64,6 +64,16 @@ pub trait RelayStore: Send + Sync {
     /// Fetch a device's registered public key, if any.
     async fn device_public_key(&self, device: &DeviceId) -> Option<String>;
 
+    /// Register (or replace) a device's **key-agreement** public key, carried
+    /// alongside the identity key in `pairing_offer` / `pairing_claim`. Public
+    /// keys are not secret; the relay stores it only to hand each endpoint its
+    /// peer's KA key in `pairing_claimed` (spec §5.2 / §7.1). The relay never
+    /// holds the private scalar.
+    async fn register_key_agreement_key(&self, device: DeviceId, key_agreement_key_b64: String);
+
+    /// Fetch a device's registered key-agreement public key, if any.
+    async fn device_key_agreement_key(&self, device: &DeviceId) -> Option<String>;
+
     /// Create a new pairing owned by `desktop`, returning its fresh id.
     async fn create_pairing(&self, desktop: DeviceId) -> PairingId;
 
@@ -128,6 +138,8 @@ impl QueueKey {
 #[derive(Default)]
 struct Inner {
     devices: HashMap<DeviceId, String>,
+    /// Per-device key-agreement public keys (see [`RelayStore::register_key_agreement_key`]).
+    key_agreement_keys: HashMap<DeviceId, String>,
     pairings: HashMap<PairingId, PairingMembers>,
     claims: ClaimTable,
     queues: HashMap<QueueKey, SenderQueue>,
@@ -170,6 +182,16 @@ impl RelayStore for InMemoryStore {
 
     async fn device_public_key(&self, device: &DeviceId) -> Option<String> {
         self.lock().devices.get(device).cloned()
+    }
+
+    async fn register_key_agreement_key(&self, device: DeviceId, key_agreement_key_b64: String) {
+        self.lock()
+            .key_agreement_keys
+            .insert(device, key_agreement_key_b64);
+    }
+
+    async fn device_key_agreement_key(&self, device: &DeviceId) -> Option<String> {
+        self.lock().key_agreement_keys.get(device).cloned()
     }
 
     async fn create_pairing(&self, desktop: DeviceId) -> PairingId {

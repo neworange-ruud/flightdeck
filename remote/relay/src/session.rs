@@ -256,19 +256,27 @@ impl Connection {
             RelayFrame::PairingOffer {
                 device_id,
                 device_public_key,
+                key_agreement_public_key,
                 role,
             } => {
-                self.on_pairing_offer(device_id, device_public_key, role)
+                self.on_pairing_offer(device_id, device_public_key, key_agreement_public_key, role)
                     .await
             }
             RelayFrame::PairingClaim {
                 claim_token,
                 device_id,
                 device_public_key,
+                key_agreement_public_key,
                 role,
             } => {
-                self.on_pairing_claim(claim_token, device_id, device_public_key, role)
-                    .await
+                self.on_pairing_claim(
+                    claim_token,
+                    device_id,
+                    device_public_key,
+                    key_agreement_public_key,
+                    role,
+                )
+                .await
             }
             RelayFrame::AuthResponse {
                 device_id,
@@ -294,6 +302,7 @@ impl Connection {
         &mut self,
         device_id: DeviceId,
         device_public_key: String,
+        key_agreement_public_key: String,
         role: Role,
     ) -> Flow {
         // The offer must come from the connection's own (desktop) identity.
@@ -311,11 +320,27 @@ impl Connection {
             .await;
             return Flow::Close;
         }
+        // The KA key is not secret and is never used for signature verification,
+        // but it must be a well-formed P-256 SEC1 point so the peer can ECDH.
+        if auth::parse_public_key(&key_agreement_public_key).is_err() {
+            self.send_error(
+                RelayErrorCode::BadFrame,
+                "malformed key-agreement public key",
+                None,
+            )
+            .await;
+            return Flow::Close;
+        }
 
-        // Self-register the desktop's key so it can authenticate right after.
+        // Self-register the desktop's identity + key-agreement keys so it can
+        // authenticate right after and the phone can later receive the KA key.
         self.state
             .store
             .register_device(device_id.clone(), device_public_key)
+            .await;
+        self.state
+            .store
+            .register_key_agreement_key(device_id.clone(), key_agreement_public_key)
             .await;
         let pairing_id = self.state.store.create_pairing(device_id).await;
 
@@ -353,6 +378,7 @@ impl Connection {
         claim_token: String,
         device_id: DeviceId,
         device_public_key: String,
+        key_agreement_public_key: String,
         role: Role,
     ) -> Flow {
         if !self.hello_device_matches(&device_id) || role != Role::Phone {
@@ -364,6 +390,15 @@ impl Connection {
             self.send_error(
                 RelayErrorCode::BadFrame,
                 "malformed device public key",
+                None,
+            )
+            .await;
+            return Flow::Close;
+        }
+        if auth::parse_public_key(&key_agreement_public_key).is_err() {
+            self.send_error(
+                RelayErrorCode::BadFrame,
+                "malformed key-agreement public key",
                 None,
             )
             .await;
@@ -384,10 +419,15 @@ impl Connection {
             }
         };
 
-        // Register the phone's key and attach it to the pairing.
+        // Register the phone's identity + key-agreement keys and attach it to
+        // the pairing.
         self.state
             .store
             .register_device(device_id.clone(), device_public_key)
+            .await;
+        self.state
+            .store
+            .register_key_agreement_key(device_id.clone(), key_agreement_public_key)
             .await;
         let desktop_device = match self
             .state
@@ -407,20 +447,32 @@ impl Connection {
             }
         };
 
-        // Tell the phone which pairing it joined and who its peer is.
+        // The phone needs the desktop's KA key; the desktop needs the phone's.
+        // Both were self-registered during their respective bootstrap frames.
+        let desktop_ka_key = self
+            .state
+            .store
+            .device_key_agreement_key(&desktop_device)
+            .await;
+        let phone_ka_key = self.state.store.device_key_agreement_key(&device_id).await;
+
+        // Tell the phone which pairing it joined, who its peer is, and the
+        // desktop's key-agreement public key for the E2E ECDH (spec §7.1).
         self.send(RelayFrame::PairingClaimed {
             pairing_id: claim.pairing_id.clone(),
             peer_device_id: Some(desktop_device),
+            peer_key_agreement_public_key: desktop_ka_key,
         })
         .await;
 
         // Notify the waiting desktop connection, if it is currently connected,
-        // that a phone has joined this pairing.
+        // that a phone has joined this pairing, and hand it the phone's KA key.
         if let Some(desktop) = self.state.registry.peer(&claim.pairing_id, Role::Phone) {
             desktop
                 .send(RelayFrame::PairingClaimed {
                     pairing_id: claim.pairing_id,
                     peer_device_id: Some(device_id),
+                    peer_key_agreement_public_key: phone_ka_key,
                 })
                 .await;
         }
@@ -553,9 +605,10 @@ impl Connection {
             RelayFrame::PairingOffer {
                 device_id,
                 device_public_key,
+                key_agreement_public_key,
                 role,
             } => {
-                self.on_pairing_offer(device_id, device_public_key, role)
+                self.on_pairing_offer(device_id, device_public_key, key_agreement_public_key, role)
                     .await
             }
             RelayFrame::Bye { .. } => Flow::Close,

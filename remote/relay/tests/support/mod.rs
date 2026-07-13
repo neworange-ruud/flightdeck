@@ -69,6 +69,10 @@ pub struct TestClient {
     ws: Ws,
     signing_key: SigningKey,
     pub public_key_b64: String,
+    /// A **separate** software P-256 key-agreement public key (base64 SEC1),
+    /// mirroring the iOS split where the identity key is a Secure-Enclave
+    /// signing key and the KA key is a distinct software key.
+    pub key_agreement_public_key_b64: String,
     pub device_id: DeviceId,
     pub role: Role,
     /// The most recent `auth_challenge` nonce (decoded), ready to sign.
@@ -107,12 +111,19 @@ impl TestClient {
         let (ws, resp) = connect_async(ws_url).await.expect("ws handshake");
         assert_eq!(resp.status(), 101, "expected protocol switch");
 
+        // A distinct software P-256 key for ECDH key agreement. Its private
+        // scalar is irrelevant to the relay tests (the relay only stores/relays
+        // the public point); we just need a well-formed SEC1 point. Computed
+        // before `public_key_b64` shadows the helper fn of the same name.
+        let key_agreement_public_key_b64 =
+            public_key_b64(SigningKey::random(&mut OsRng).verifying_key());
         let public_key_b64 = public_key_b64(signing_key.verifying_key());
 
         let mut client = Self {
             ws,
             signing_key,
             public_key_b64,
+            key_agreement_public_key_b64,
             device_id: DeviceId::new(device_id),
             role,
             nonce: Vec::new(),
@@ -202,6 +213,7 @@ impl TestClient {
         self.send(RelayFrame::PairingOffer {
             device_id: self.device_id.clone(),
             device_public_key: self.public_key_b64.clone(),
+            key_agreement_public_key: self.key_agreement_public_key_b64.clone(),
             role: self.role,
         })
         .await;
@@ -217,15 +229,26 @@ impl TestClient {
 
     /// Phone bootstrap: redeem `token`, return the joined `pairing_id`.
     pub async fn claim_pairing(&mut self, token: &str) -> PairingId {
+        self.claim_pairing_full(token).await.0
+    }
+
+    /// Phone bootstrap: redeem `token`, returning both the joined `pairing_id`
+    /// and the peer (desktop) key-agreement public key the relay hands back.
+    pub async fn claim_pairing_full(&mut self, token: &str) -> (PairingId, Option<String>) {
         self.send(RelayFrame::PairingClaim {
             claim_token: token.to_string(),
             device_id: self.device_id.clone(),
             device_public_key: self.public_key_b64.clone(),
+            key_agreement_public_key: self.key_agreement_public_key_b64.clone(),
             role: self.role,
         })
         .await;
         match self.recv().await {
-            RelayFrame::PairingClaimed { pairing_id, .. } => pairing_id,
+            RelayFrame::PairingClaimed {
+                pairing_id,
+                peer_key_agreement_public_key,
+                ..
+            } => (pairing_id, peer_key_agreement_public_key),
             other => panic!("expected pairing_claimed, got {other:?}"),
         }
     }

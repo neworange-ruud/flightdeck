@@ -178,6 +178,17 @@ pub enum RelayFrame {
         /// Base64 (standard, padded) ECDSA P-256 public key to register for
         /// routing, X9.63 uncompressed SEC1 form (65 bytes, `0x04 ‖ x ‖ y`).
         device_public_key: String,
+        /// Base64 (standard, padded) **key-agreement** P-256 public key,
+        /// same X9.63 uncompressed SEC1 encoding as `device_public_key`
+        /// (65 bytes, `0x04 ‖ x ‖ y`). This is the point the peer feeds into
+        /// the static-static ECDH that bootstraps the E2E channel (spec §7.1);
+        /// the private scalar never leaves this device and never transits the
+        /// relay. On desktop this MAY equal `device_public_key` (the keystore
+        /// identity key is usable for ECDH); on iOS it MUST be a **separate
+        /// software P-256 key**, because the device identity key is a
+        /// Secure-Enclave *signing* key whose scalar cannot be used for key
+        /// agreement.
+        key_agreement_public_key: String,
         /// The role making the offer (normally `desktop`).
         role: Role,
     },
@@ -206,6 +217,16 @@ pub enum RelayFrame {
         /// Base64 (standard, padded) ECDSA P-256 public key to register for
         /// routing, X9.63 uncompressed SEC1 form (65 bytes, `0x04 ‖ x ‖ y`).
         device_public_key: String,
+        /// Base64 (standard, padded) **key-agreement** P-256 public key,
+        /// same X9.63 uncompressed SEC1 encoding as `device_public_key`
+        /// (65 bytes, `0x04 ‖ x ‖ y`). This is the point the desktop feeds into
+        /// the static-static ECDH that bootstraps the E2E channel (spec §7.1);
+        /// the private scalar never leaves this device and never transits the
+        /// relay. On desktop this MAY equal `device_public_key`; on iOS it MUST
+        /// be a **separate software P-256 key**, because the device identity
+        /// key is a Secure-Enclave *signing* key whose scalar cannot be used
+        /// for key agreement.
+        key_agreement_public_key: String,
         /// The role redeeming (normally `phone`).
         role: Role,
     },
@@ -216,6 +237,13 @@ pub enum RelayFrame {
         pairing_id: PairingId,
         /// The peer device id, if already known to the relay.
         peer_device_id: Option<DeviceId>,
+        /// The peer's **key-agreement** public key (base64 standard-padded,
+        /// X9.63 uncompressed SEC1, 65 bytes), if the relay has recorded it.
+        /// The phone receives the desktop's KA key here; the desktop's
+        /// notification receives the phone's. Each endpoint feeds the peer's KA
+        /// key into the static-static ECDH of spec §7.1. `Option` to match
+        /// `peer_device_id`'s shape (the relay may not yet hold the peer's key).
+        peer_key_agreement_public_key: Option<String>,
     },
 
     /// relay -> endpoint. The peer for a pairing connected or disconnected.

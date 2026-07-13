@@ -153,7 +153,7 @@ needed to bootstrap the E2E channel.
 desktop → relay : hello { … role: desktop … }
 relay   → desktop: hello_ok { … }
 relay   → desktop: auth_challenge { nonce, server_time_ms }
-desktop → relay : pairing_offer { device_id, device_public_key, role }
+desktop → relay : pairing_offer { device_id, device_public_key, key_agreement_public_key, role }
 relay   → desktop: pairing_offer_ok { pairing_id, claim_token, expires_at_ms }
 desktop → relay : auth_response { … }              // then proceeds as §5.1
 …
@@ -161,11 +161,13 @@ desktop → relay : auth_response { … }              // then proceeds as §5.1
 phone → relay : hello { … role: phone … }
 relay → phone : hello_ok { … }
 relay → phone : auth_challenge { nonce, server_time_ms }
-phone → relay : pairing_claim { claim_token, device_id, device_public_key, role }
-relay → phone : pairing_claimed { pairing_id, peer_device_id }
+phone → relay : pairing_claim { claim_token, device_id, device_public_key, key_agreement_public_key, role }
+relay → phone : pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key }
+              // (peer_key_agreement_public_key = the desktop's KA key)
               // (or error { code: pairing_claim_rejected } if token bad/expired)
-relay → desktop: pairing_claimed { pairing_id, peer_device_id }  // notifies the
-              // waiting desktop connection that the phone has joined
+relay → desktop: pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key }
+              // notifies the waiting desktop connection that the phone has
+              // joined; peer_key_agreement_public_key = the phone's KA key
 phone → relay : auth_response { … }   // then proceeds as §5.1
 ```
 
@@ -180,6 +182,24 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
   now part of the normative type set + fixtures.)
 - `pairing_claim` **registers the phone's device public key** against the pairing
   and redeems the one-time token. Tokens are short-TTL and single-use.
+- **Key-agreement public keys (KA keys).** Both `pairing_offer` and
+  `pairing_claim` additionally carry a `key_agreement_public_key`: the P-256
+  public point each endpoint contributes to the static-static ECDH that
+  bootstraps the E2E channel (§7.1). Same encoding as `device_public_key`
+  (base64 standard-padded X9.63 uncompressed SEC1, 65 bytes). The relay stores
+  each device's KA key alongside its identity key and hands each endpoint its
+  **peer's** KA key back in `pairing_claimed.peer_key_agreement_public_key`
+  (the phone receives the desktop's; the desktop notification receives the
+  phone's). Public keys are not secret, so carrying them through the relay is
+  safe — the relay never holds either private scalar and still derives nothing.
+  - **Why a separate key (SE rationale).** On iOS the per-device *identity* key
+    (§5.1) is a **Secure-Enclave signing key**: the SE performs ECDSA with it but
+    will not expose or apply its scalar for ECDH, so it cannot be used for key
+    agreement. iOS therefore MUST generate a **distinct software P-256 key** for
+    key agreement and send its public point as `key_agreement_public_key`. On
+    desktop the keystore identity key is usable for ECDH, so the desktop **MAY**
+    reuse it (i.e. `key_agreement_public_key` == `device_public_key`); it may
+    also use a separate key. The two sides are symmetric on the wire regardless.
 - The **QR/code also carries the shared secret that bootstraps the E2E channel**
   (PRD §9.1). That secret is consumed by the crypto layer (§7); it is **not** part
   of any relay frame and never transits the relay. The relay only ever sees the
@@ -321,12 +341,22 @@ new commands rather than sending blind.
 > fixtures win.
 
 1. **Input keying material (IKM).** A **static-static P-256 ECDH** between the two
-   devices' *identity* keypairs (the same keys used for relay auth, §5.1). Both
-   endpoints compute the identical shared secret; the IKM is its **big-endian
+   devices' **key-agreement (KA) keypairs** — the keys whose public points are
+   exchanged during pairing as `key_agreement_public_key` (§5.2), **not**
+   necessarily the identity keys used for relay auth (§5.1). Each endpoint feeds
+   its own KA private key and the peer's KA public key (delivered in
+   `pairing_claimed.peer_key_agreement_public_key`) into the ECDH. Both endpoints
+   compute the identical shared secret; the IKM is its **big-endian
    x-coordinate**, 32 bytes (Rust `p256::ecdh` `SharedSecret::raw_secret_bytes`;
    CryptoKit `SharedSecret` raw bytes). This input exists on **both** pairing
-   paths (QR and 4-digit code), since both exchange identity public keys.
-   * *Forward secrecy:* v1 has **none** — the long-lived identity keys are used
+   paths (QR and 4-digit code), since both exchange KA public keys.
+   * *Why a distinct KA key.* On iOS the identity key is a Secure-Enclave signing
+     key whose scalar cannot be applied to ECDH, so iOS uses a separate software
+     P-256 KA key (§5.2). The **desktop MAY reuse** its identity key as its KA key
+     (its keystore key is usable for both), in which case its
+     `key_agreement_public_key` equals its `device_public_key`; the derivation is
+     identical either way, since it operates on whichever KA keys were exchanged.
+   * *Forward secrecy:* v1 has **none** — the long-lived KA keys are used
      directly. Ephemeral-key rotation is deferred (PRD §13). Documented, not an
      oversight.
 2. **Salt = the pairing bootstrap secret.** The 32-byte random `pairing_secret`

@@ -751,6 +751,9 @@ fn handle_frame(
         RelayFrame::PairingClaimed {
             pairing_id,
             peer_device_id,
+            // The peer's key-agreement key is consumed by the desktop pairing/crypto
+            // task (spec §5.2 / §7.1), not here; ignore it in the relay-routing match.
+            ..
         } => {
             if let Some(id) = &peer_device_id {
                 if let Some(p) = state.pairing_mut(pairing_id.as_str()) {

@@ -29,10 +29,16 @@
 //! socket; the thread drains [`RemoteOutbound`] each ~100 ms poll. Shutdown is a
 //! shared atomic flag flipped by [`client::RemoteHandle::stop`].
 
+pub mod bridge;
 pub mod client;
+pub mod crypto;
+pub mod feed;
 pub mod identity;
+pub mod notifier;
 pub mod state;
+pub mod transcript;
 
+pub use bridge::{ProjectView, RemoteBridge};
 pub use client::{RemoteHandle, RemoteLinkState};
 pub use identity::DeviceIdentity;
 pub use state::{Pairing, RemoteState};
