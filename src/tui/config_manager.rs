@@ -331,7 +331,7 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
     };
     vec![
         b("OS notifications", "notifications", "enabled"),
-        b("Sound on finish", "notifications", "sound"),
+        b("Notification sounds", "notifications", "sound"),
         b("Notify when finished", "notifications", "on_finish"),
         b("Notify when waiting", "notifications", "on_waiting"),
         b("Notify when failed", "notifications", "on_failed"),

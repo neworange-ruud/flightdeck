@@ -112,7 +112,7 @@ impl InterpretedStatus {
 // OS notifications (SPECS §24) — alert the user when an agent finishes a task.
 // ---------------------------------------------------------------------------
 
-/// A pending OS notification produced when an agent finishes a running task.
+/// A pending OS notification produced when an agent needs the user's attention.
 ///
 /// Built by [`crate::app::state::AppState::take_finish_notifications`] and posted
 /// by a [`crate::contracts::Notifier`] (the macOS implementation lives in
@@ -124,10 +124,21 @@ pub struct Notification {
     pub title: String,
     /// Body line (e.g. `"Claude Code finished"`).
     pub body: String,
-    /// Whether to play the "ding" chime alongside this notification. Set only
-    /// when an agent transitions from working into idle/completed (SPECS §24)
-    /// and the `notifications.sound` toggle is on.
-    pub sound: bool,
+    /// The optional alert sound that accompanies this notification. Completion
+    /// and input-required events deliberately use different sounds so they can
+    /// be distinguished without looking at the screen.
+    pub sound: NotificationSound,
+}
+
+/// The sound to play alongside an OS notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSound {
+    /// Do not play an alert sound.
+    None,
+    /// The two-note chime for a completed agent turn.
+    Completion,
+    /// The three-pulse alert for an agent waiting on user input.
+    InputRequired,
 }
 
 /// Manual status override set by the user (SPECS §24). `None` = cleared.
@@ -292,8 +303,9 @@ pub struct NotificationsConfig {
     /// Notify when an agent errors out (failed).
     #[serde(default = "default_true")]
     pub on_failed: bool,
-    /// Play the "ding" chime when an agent finishes its turn (idle / completed).
-    /// On by default; independent of the visual/OS notification categories.
+    /// Play distinctive alert sounds when an agent finishes its turn or needs
+    /// input. On by default; independent of the visual/OS notification
+    /// categories.
     #[serde(default = "default_true")]
     pub sound: bool,
 }

@@ -76,7 +76,8 @@ pub fn status_backend(agent: &AgentDef) -> Option<StatusBackend> {
 
 /// Materialize and attach a launch-scoped lifecycle integration for a built-in
 /// backend. Hooks/plugins write `working`, `idle`, or `waiting` to the status
-/// file that [`crate::app::state::AppState`] polls.
+/// file that [`crate::app::state::AppState`] polls. OpenCode questions and
+/// permission prompts both mean the agent is waiting for user input.
 ///
 /// `containerized` changes only paths passed to the agent: the generated files
 /// live in the bind-mounted worktree in both modes.
@@ -209,8 +210,17 @@ export const FlightDeckStatus = async ({ directory, worktree }) => {
         return;
       }
       if (event.type === "session.idle") write("idle");
-      if (event.type === "permission.asked") write("waiting");
-      if (event.type === "permission.replied") write("working");
+      if (event.type === "permission.asked" || event.type === "question.asked") {
+        write("waiting");
+        return;
+      }
+      if (
+        event.type === "permission.replied" ||
+        event.type === "question.replied" ||
+        event.type === "question.rejected"
+      ) {
+        write("working");
+      }
     },
   };
 };
@@ -307,7 +317,7 @@ fallback (idle-only, for older Codex) is included as a comment.
 
 Copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/flightdeck.js`
 (global) — or to `.opencode/plugin/` in your project. It maps `session.status`
-busy/idle → `working`/`idle`, and permission prompts → `waiting`.
+busy/idle → `working`/`idle`, and permission or question prompts → `waiting`.
 
 ---
 
@@ -455,12 +465,18 @@ export const FlightDeck = async ({ directory, worktree }) => {
         return;
       }
       if (event.type === "session.idle") write("idle");
-      // Needs the user's attention (permission / confirmation prompt).
-      if (event.type === "permission.asked") {
+      // Needs the user's attention (permission or AskUserQuestion prompt).
+      if (event.type === "permission.asked" || event.type === "question.asked") {
         write("waiting");
         return;
       }
-      if (event.type === "permission.replied") write("working");
+      if (
+        event.type === "permission.replied" ||
+        event.type === "question.replied" ||
+        event.type === "question.rejected"
+      ) {
+        write("working");
+      }
     },
   };
 };
@@ -547,6 +563,13 @@ mod tests {
             .iter()
             .any(|a| a.starts_with("hooks.UserPromptSubmit=")));
         assert!(launch.args.iter().any(|a| a.starts_with("hooks.Stop=")));
+        assert!(
+            launch
+                .args
+                .iter()
+                .any(|a| a.starts_with("hooks.PermissionRequest=")),
+            "Codex input prompts must report the waiting state"
+        );
     }
 
     #[test]
@@ -570,6 +593,12 @@ mod tests {
         assert!(plugin.contains("session.status"));
         assert!(plugin.contains("type === \"busy\""));
         assert!(plugin.contains("type === \"idle\""));
+        for event in ["question.asked", "question.replied", "question.rejected"] {
+            assert!(
+                plugin.contains(event),
+                "runtime plugin must handle the OpenCode {event} lifecycle event"
+            );
+        }
     }
 
     #[test]
@@ -622,6 +651,12 @@ mod tests {
         assert!(CLAUDE_SETTINGS.contains(".flightdeck/agent-status"));
         assert!(CODEX_CONFIG.contains(".flightdeck/agent-status"));
         assert!(OPENCODE_PLUGIN.contains(".flightdeck/agent-status"));
+        for event in ["question.asked", "question.replied", "question.rejected"] {
+            assert!(
+                OPENCODE_RUNTIME_PLUGIN.contains(event) && OPENCODE_PLUGIN.contains(event),
+                "all OpenCode bridges must handle {event}"
+            );
+        }
     }
 
     #[test]

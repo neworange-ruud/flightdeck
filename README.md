@@ -314,7 +314,7 @@ generated `README.md`:
 - **Codex CLI** — append `codex-config.toml` to `~/.codex/config.toml`
   (`UserPromptSubmit`→working, `Stop`→idle; `notify` fallback for older builds).
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
-  (`session.status` busy/idle→working/idle, permission prompt→waiting).
+  (`session.status` busy/idle→working/idle, permission and question prompts→waiting).
 
 ### OS notifications (macOS and Linux)
 
@@ -334,7 +334,7 @@ notification title is prefixed with the project name (`myproject: my-agent`), so
 alerts stay unambiguous when several projects are open.
 
 Notifications are **on by default**. The master switch is `enabled`; the three
-per-category toggles and the finish chime (`sound`) also default to `true`:
+per-category toggles and the alert sounds (`sound`) also default to `true`:
 
 ```toml
 [notifications]
@@ -342,7 +342,7 @@ enabled = true     # master switch (on by default)
 on_finish = true   # agent went idle / completed
 on_waiting = true  # agent is waiting for input / needs attention
 on_failed = true   # agent errored out
-sound = true       # play a chime when an agent finishes
+sound = true       # play distinct sounds for completion and input-required alerts
 ```
 
 Turn them off from the configuration manager (see [Configuration](#configuration))
