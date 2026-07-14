@@ -180,10 +180,9 @@ auto-resolve merge conflicts. You (or your agent) make the commits; FlightDeck s
 FlightDeck is keyboard-first with two modes. The **command palette** (`Ctrl-g`)
 is the dependable fallback because terminal shortcut collisions are unavoidable.
 
-- **Terminal mode** — keystrokes go to the active terminal. `Alt+Esc` leaves to
-  app mode (`Shift+Esc` on Windows/Linux); `Ctrl-g` opens the palette. Bare
-  `Esc` passes through to the terminal so hosted agents can use their own Esc
-  gestures.
+- **Terminal mode** — keystrokes go to the active terminal. `F2` leaves to
+  app mode; `Ctrl-g` opens the palette. Bare `Esc` passes through to the
+  terminal so hosted agents can use their own Esc gestures.
 - **App mode** — keystrokes control FlightDeck. `Enter` focuses the terminal;
   `?` shows help.
 
@@ -225,7 +224,7 @@ terminals.
 │                 ├──────────────────────────────────────────────────────────┤
 │                 │ ⎇ flightdeck/fix-login │ +3 ~2 -1 (6 files) │ ↑0 ↓0 │ …  │  git info bar
 │                 ├──────────────────────────────────────────────────────────┤
-│                 │ MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: palette │  status bar
+│                 │ MODE: TERMINAL | F2: app commands | Ctrl-g: palette      │  status bar
 └─────────────────┴──────────────────────────────────────────────────────────┘
 ```
 

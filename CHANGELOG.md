@@ -12,7 +12,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Leave terminal focus with **F2** on every platform. The previous
+  `Alt+Esc` / `Shift+Esc` binding depended on the terminal supporting the kitty
+  keyboard protocol to distinguish a modified Esc from a bare Esc, so it
+  silently did nothing on terminals without it (e.g. Konsole). F2 has an
+  unambiguous encoding everywhere and does not collide with the bare Esc that
+  must reach the hosted agent.
 
 ### Bug fixes
 

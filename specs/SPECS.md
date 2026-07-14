@@ -838,8 +838,7 @@ Child Terminal Navigation
   Alt-Right       Next child terminal (cycles agent + shells)
 
 Focus
-  Alt-Esc         Leave terminal input focus / focus app chrome
-                  (Shift-Esc on Windows/Linux, where Alt-Esc is reserved)
+  F2              Leave terminal input focus / focus app chrome
   Enter           Focus active terminal
 
 Status
