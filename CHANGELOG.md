@@ -8,7 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- FlightDeck Remote desktop pairing (Settings → Remote): a "Pair Phone" command
+  palette action shows a scannable QR code and a 4-digit code, then completes
+  pairing over the relay and brings the end-to-end-encrypted channel live. A
+  "Unpair Phone" action (with confirmation) forgets the pairing. The relay honors
+  a 4-digit `claim_token_hint` (short TTL, single use, per-connection rate limit),
+  and the E2E salt is pinned to the claim-token bytes on both pairing paths.
 
 ### Improvements
 

@@ -191,6 +191,17 @@ pub enum RelayFrame {
         key_agreement_public_key: String,
         /// The role making the offer (normally `desktop`).
         role: Role,
+        /// Optional desired claim token the desktop asks the relay to mint (spec
+        /// §5.2 amendment). When `Some` and the string is **free** (not a live
+        /// token) and well-formed, the relay issues exactly this token so the
+        /// desktop can display a short, human-typeable **4-digit code**; when
+        /// `None`, unusable, or already taken, the relay mints its own random
+        /// token and returns it in [`Self::PairingOfferOk`]. Either way the
+        /// desktop displays whatever token the relay returns, so the two sides
+        /// never disagree. A 4-digit token is low-entropy, so the relay pins it
+        /// to a short TTL + single use + a per-connection claim rate limit; the
+        /// E2E channel's confidentiality never rests on this token (spec §7.1).
+        claim_token_hint: Option<String>,
     },
 
     /// relay -> endpoint (desktop). A pairing was provisioned; `claim_token` is

@@ -530,7 +530,15 @@ fn run_session(
     }
 
     // Authenticated. Pump until the socket drops or we are told to stop.
-    pump(&mut sock, state, store, inbound_tx, outbound_rx, stop)
+    pump(
+        &mut sock,
+        identity,
+        state,
+        store,
+        inbound_tx,
+        outbound_rx,
+        stop,
+    )
 }
 
 /// After `auth_ok`: report Connected, then `resume` each active pairing from the
@@ -566,8 +574,10 @@ fn on_authenticated(
 }
 
 /// The steady-state loop: drain outbound, fire pings, read inbound frames.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     sock: &mut RelaySocket,
+    identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     inbound_tx: &Sender<RemoteInbound>,
@@ -586,7 +596,7 @@ fn pump(
         loop {
             match outbound_rx.try_recv() {
                 Ok(out) => {
-                    if !handle_outbound(sock, state, store, out) {
+                    if !handle_outbound(sock, identity, state, store, out) {
                         return SessionEnd::Ended { authed: true };
                     }
                 }
@@ -625,6 +635,7 @@ fn pump(
 /// Handle one app→relay message. Returns `false` if the socket broke.
 fn handle_outbound(
     sock: &mut RelaySocket,
+    identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     out: RemoteOutbound,
@@ -632,35 +643,37 @@ fn handle_outbound(
     match out {
         RemoteOutbound::SendEnvelope {
             pairing_id,
+            seq,
+            sent_at_ms,
             nonce,
             ciphertext,
         } => {
             let key = pairing_id.as_str().to_string();
-            // Ensure the pairing exists so we can assign a gapless seq.
+            // Ensure the pairing exists to persist the outbound high-water mark.
             if state.pairing(&key).is_none() {
                 state
                     .pairings
                     .push(crate::remote::Pairing::new(key.clone()));
             }
-            let next = state
-                .pairing(&key)
-                .map(|p| p.last_sent_seq + 1)
-                .unwrap_or(1);
+            // The bridge owns and assigns the gapless `seq` (it must seal under
+            // the exact header, spec §7.1); the client sends it verbatim.
             let envelope = EncryptedEnvelope {
                 pairing_id: pairing_id.clone(),
-                seq: next,
+                seq,
                 sender: Role::Desktop,
-                sent_at_ms: now_ms(),
+                sent_at_ms,
                 nonce,
                 ciphertext,
             };
             if send_frame(sock, &RelayFrame::Envelope(envelope)).is_err() {
                 return false;
             }
-            // Commit the seq only once the send succeeded so a failed write never
-            // leaves a gap the peer's dedup would stall on.
+            // Commit the high-water mark only once the send succeeded so a failed
+            // write never leaves a gap the peer's dedup would stall on.
             if let Some(p) = state.pairing_mut(&key) {
-                p.last_sent_seq = next;
+                if seq > p.last_sent_seq {
+                    p.last_sent_seq = seq;
+                }
             }
             store.save(state);
             true
@@ -668,9 +681,27 @@ fn handle_outbound(
         RemoteOutbound::Ack { pairing_id, cursor } => {
             send_frame(sock, &RelayFrame::Ack { pairing_id, cursor }).is_ok()
         }
-        RemoteOutbound::RequestPairing => {
-            // No desktop-initiated pairing frame exists in v1 (the phone redeems
-            // the shown code). Accepted and ignored until that layer lands.
+        RemoteOutbound::RequestPairing { claim_token_hint } => {
+            // Desktop-initiated pairing bootstrap (spec §5.2). The desktop reuses
+            // its identity key as its key-agreement key (its keystore key is
+            // usable for ECDH), so both public keys are the same X9.63 point —
+            // one less key to manage. The relay honors a free 4-digit hint.
+            let public_key = identity.public_key_base64();
+            let offer = RelayFrame::PairingOffer {
+                device_id: DeviceId::new(identity.device_id()),
+                device_public_key: public_key.clone(),
+                key_agreement_public_key: public_key,
+                role: Role::Desktop,
+                claim_token_hint,
+            };
+            send_frame(sock, &offer).is_ok()
+        }
+        RemoteOutbound::Unpair { pairing_id } => {
+            // Local clear only (no relay-plane unpair frame in v1): drop the
+            // pairing so it is never resumed/activated again.
+            let key = pairing_id.as_str().to_string();
+            state.pairings.retain(|p| p.pairing_id != key);
+            store.save(state);
             true
         }
     }
@@ -748,22 +779,52 @@ fn handle_frame(
             });
             true
         }
+        RelayFrame::PairingOfferOk {
+            pairing_id,
+            claim_token,
+            expires_at_ms,
+        } => {
+            // Persist the pairing so it is activated on the next connect, and
+            // record the claim token (its bytes are the E2E salt, spec §7.1).
+            let key = pairing_id.as_str().to_string();
+            if state.pairing(&key).is_none() {
+                state
+                    .pairings
+                    .push(crate::remote::Pairing::new(key.clone()));
+            }
+            if let Some(p) = state.pairing_mut(&key) {
+                p.claim_token = Some(claim_token.clone());
+            }
+            store.save(state);
+            let _ = inbound_tx.send(RemoteInbound::PairingOffered {
+                pairing_id,
+                claim_token,
+                expires_at_ms,
+            });
+            true
+        }
         RelayFrame::PairingClaimed {
             pairing_id,
             peer_device_id,
-            // The peer's key-agreement key is consumed by the desktop pairing/crypto
-            // task (spec §5.2 / §7.1), not here; ignore it in the relay-routing match.
-            ..
+            peer_key_agreement_public_key,
         } => {
-            if let Some(id) = &peer_device_id {
-                if let Some(p) = state.pairing_mut(pairing_id.as_str()) {
+            // The phone joined: record the peer id + its key-agreement key and
+            // mark the pairing established so the E2E channel can be derived now
+            // and reconstructed on the next launch (spec §5.2 / §7.1).
+            if let Some(p) = state.pairing_mut(pairing_id.as_str()) {
+                if let Some(id) = &peer_device_id {
                     p.peer_device_id = Some(id.as_str().to_string());
-                    store.save(state);
                 }
+                if let Some(ka) = &peer_key_agreement_public_key {
+                    p.peer_key_agreement_public_key = Some(ka.clone());
+                    p.established = true;
+                }
+                store.save(state);
             }
-            let _ = inbound_tx.send(RemoteInbound::Paired {
+            let _ = inbound_tx.send(RemoteInbound::PairingClaimed {
                 pairing_id,
                 peer_device_id,
+                peer_key_agreement_public_key,
             });
             true
         }

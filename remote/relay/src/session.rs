@@ -47,6 +47,24 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Maximum `pairing_claim` attempts a single connection may make before the
+/// relay rate-limits it and closes the socket (spec §5.2 / §12: "rate-limit
+/// `pairing_claim`"). A 4-digit claim token has only ~10^4 of entropy, so this
+/// per-connection cap — together with the token's short TTL and single-use
+/// semantics — keeps online brute force impractical: an attacker must pay a
+/// fresh `hello`/`auth_challenge` round trip for every handful of guesses.
+const MAX_CLAIM_ATTEMPTS_PER_CONN: u32 = 5;
+
+/// Whether a desktop-supplied `claim_token_hint` is well-formed enough to issue
+/// verbatim. Kept deliberately tight: short, printable ASCII, no whitespace —
+/// enough for a 4-digit code or the relay's own `NNNN-<hex>` shape, but not an
+/// avenue to smuggle arbitrary large strings into the claim table.
+fn is_valid_claim_hint(hint: &str) -> bool {
+    !hint.is_empty()
+        && hint.len() <= 32
+        && hint.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// What to do after handling one inbound frame.
 enum Flow {
     /// Keep servicing the connection.
@@ -90,6 +108,9 @@ pub struct Connection {
     connection_id: String,
     /// Role declared in `hello` (set once hello is accepted).
     role: Option<Role>,
+    /// How many `pairing_claim` frames this connection has attempted, for the
+    /// per-connection rate limit ([`MAX_CLAIM_ATTEMPTS_PER_CONN`]).
+    claim_attempts: u32,
     phase: Phase,
 }
 
@@ -101,6 +122,7 @@ impl Connection {
             out_tx,
             connection_id: ids::connection_id(),
             role: None,
+            claim_attempts: 0,
             phase: Phase::AwaitingHello,
         }
     }
@@ -258,9 +280,16 @@ impl Connection {
                 device_public_key,
                 key_agreement_public_key,
                 role,
+                claim_token_hint,
             } => {
-                self.on_pairing_offer(device_id, device_public_key, key_agreement_public_key, role)
-                    .await
+                self.on_pairing_offer(
+                    device_id,
+                    device_public_key,
+                    key_agreement_public_key,
+                    role,
+                    claim_token_hint,
+                )
+                .await
             }
             RelayFrame::PairingClaim {
                 claim_token,
@@ -304,6 +333,7 @@ impl Connection {
         device_public_key: String,
         key_agreement_public_key: String,
         role: Role,
+        claim_token_hint: Option<String>,
     ) -> Flow {
         // The offer must come from the connection's own (desktop) identity.
         if !self.hello_device_matches(&device_id) || role != Role::Desktop {
@@ -346,7 +376,18 @@ impl Connection {
 
         let ttl = self.state.config.claim_token_ttl_secs as i64 * 1000;
         let expires_at_ms = now_ms() + ttl;
-        let token = ids::claim_token();
+        // Honor a well-formed, currently-free `claim_token_hint` so the desktop
+        // can show a short 4-digit code; otherwise mint a random token. Either
+        // way the desktop displays the token we return here (spec §5.2).
+        let token = match claim_token_hint {
+            Some(hint)
+                if is_valid_claim_hint(&hint)
+                    && self.state.store.claim_token_is_free(&hint).await =>
+            {
+                hint
+            }
+            _ => ids::claim_token(),
+        };
         // NB: the desktop peer id is recorded so the phone's claim can report it.
         let members = self
             .state
@@ -363,6 +404,27 @@ impl Connection {
                 expires_at_ms,
             )
             .await;
+
+        // If the desktop is **already authenticated** (an on-demand pairing from
+        // Settings → Remote, rather than a pre-auth bootstrap), activate and
+        // attach the new pairing on this live connection right away. Without
+        // this the desktop would not be in the routing table for the new
+        // pairing, so the phone's later `pairing_claim` could not notify it and
+        // envelopes would be rejected as inactive — the alternative being a full
+        // reconnect just to pair. Pre-auth offers need nothing here: the pairing
+        // is activated normally via the pending `auth_response`.
+        if let Phase::Authed { activated, .. } = &mut self.phase {
+            if !activated.contains(&pairing_id) {
+                activated.push(pairing_id.clone());
+            }
+            let handle = ConnHandle {
+                connection_id: self.connection_id.clone(),
+                tx: self.out_tx.clone(),
+            };
+            self.state
+                .registry
+                .attach(&pairing_id, Role::Desktop, handle);
+        }
 
         self.send(RelayFrame::PairingOfferOk {
             pairing_id,
@@ -381,6 +443,20 @@ impl Connection {
         key_agreement_public_key: String,
         role: Role,
     ) -> Flow {
+        // Per-connection rate limit: cap online brute force of the short
+        // (4-digit) claim token (spec §5.2 / §12). Once over the cap the relay
+        // stops even looking the token up and closes the socket.
+        self.claim_attempts += 1;
+        if self.claim_attempts > MAX_CLAIM_ATTEMPTS_PER_CONN {
+            self.send_error(
+                RelayErrorCode::RateLimited,
+                "too many pairing_claim attempts on this connection",
+                None,
+            )
+            .await;
+            return Flow::Close;
+        }
+
         if !self.hello_device_matches(&device_id) || role != Role::Phone {
             self.send_error(RelayErrorCode::BadFrame, "invalid pairing_claim", None)
                 .await;
@@ -607,9 +683,16 @@ impl Connection {
                 device_public_key,
                 key_agreement_public_key,
                 role,
+                claim_token_hint,
             } => {
-                self.on_pairing_offer(device_id, device_public_key, key_agreement_public_key, role)
-                    .await
+                self.on_pairing_offer(
+                    device_id,
+                    device_public_key,
+                    key_agreement_public_key,
+                    role,
+                    claim_token_hint,
+                )
+                .await
             }
             RelayFrame::Bye { .. } => Flow::Close,
             _ => {

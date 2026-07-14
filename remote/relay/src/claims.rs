@@ -84,6 +84,17 @@ impl ClaimTable {
         })
     }
 
+    /// Whether `token` is currently present (issued and not yet redeemed).
+    /// Used to decide whether a desktop's `claim_token_hint` is free to reuse
+    /// (spec §5.2 amendment): a hint that collides with a live token is refused
+    /// and a fresh random token is minted instead. An expired-but-unredeemed
+    /// entry still counts as present (it is only removed on a redeem attempt),
+    /// which is the safe answer — the relay never re-issues a token string that
+    /// another pairing could still be trying to redeem.
+    pub fn contains(&self, token: &str) -> bool {
+        self.entries.contains_key(token)
+    }
+
     /// Number of live (issued, un-redeemed) tokens. Test/metric helper.
     pub fn len(&self) -> usize {
         self.entries.len()

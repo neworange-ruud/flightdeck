@@ -210,11 +210,19 @@ impl TestClient {
 
     /// Desktop bootstrap: send `pairing_offer`, return `(pairing_id, claim_token)`.
     pub async fn offer_pairing(&mut self) -> (PairingId, String) {
+        self.offer_pairing_hint(None).await
+    }
+
+    /// Desktop bootstrap carrying an explicit `claim_token_hint` (spec §5.2).
+    /// Returns `(pairing_id, claim_token)` — the token the relay actually
+    /// issued, which equals the hint when it was honored.
+    pub async fn offer_pairing_hint(&mut self, hint: Option<&str>) -> (PairingId, String) {
         self.send(RelayFrame::PairingOffer {
             device_id: self.device_id.clone(),
             device_public_key: self.public_key_b64.clone(),
             key_agreement_public_key: self.key_agreement_public_key_b64.clone(),
             role: self.role,
+            claim_token_hint: hint.map(str::to_string),
         })
         .await;
         match self.recv().await {

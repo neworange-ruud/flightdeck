@@ -51,6 +51,11 @@ pub enum PaletteAction {
     /// T9 must open the configuration manager overlay for the active project
     /// (workspace-level: it reads/writes the global and project config files).
     OpenConfig,
+    /// Begin pairing a phone (FlightDeck Remote): show the QR + 4-digit code
+    /// overlay (workspace-level: it drives the relay client + pairing session).
+    PairPhone,
+    /// Forget the paired phone (FlightDeck Remote), after a confirmation.
+    UnpairPhone,
 }
 
 /// All §22 command-palette entries, in display order.
@@ -171,6 +176,16 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::OpenConfig,
     },
     PaletteEntry {
+        group: "Remote",
+        label: "Pair Phone",
+        action: PaletteAction::PairPhone,
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Unpair Phone",
+        action: PaletteAction::UnpairPhone,
+    },
+    PaletteEntry {
         group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
@@ -192,8 +207,9 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// actions ("New Agent" / "Close Agent"), and "Open Configuration". (The `.env`
 /// files are now symlinked into new worktrees automatically, so the "Copy
 /// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
-/// command remains.)
-pub const REQUIRED_ACTION_COUNT: usize = 26;
+/// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
+/// Phone") bring the total to 28.
+pub const REQUIRED_ACTION_COUNT: usize = 28;
 
 /// The command palette model (SPECS §22).
 ///
@@ -348,6 +364,8 @@ mod tests {
             "Open Shell",
             "Show Git Status",
             "Open Configuration",
+            "Pair Phone",
+            "Unpair Phone",
             "Toggle Split View",
             "Show Help",
             "Quit",

@@ -179,7 +179,21 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
   phone's `pairing_claim` self-registers *its* key before auth — so a brand-new
   desktop with no registered key can still bootstrap. (The original §5.2 prose
   only specified the phone's redemption; these two frames close that gap and are
-  now part of the normative type set + fixtures.)
+  now part of the normative type set + fixtures.) A desktop that is **already
+  authenticated** may also send `pairing_offer` (an on-demand pairing from
+  Settings → Remote); the relay then activates and attaches the new pairing on
+  that live connection so the phone's later `pairing_claimed` can reach it, with
+  no reconnect needed.
+- **`claim_token_hint` (4-digit code, v1 amendment).** `pairing_offer` carries an
+  optional `claim_token_hint`. When it is present, well-formed (short printable
+  ASCII), and **not currently a live token**, the relay issues it verbatim so the
+  desktop can display a short, human-typeable **4-digit code**; otherwise the
+  relay mints its own random token. Either way the desktop displays the token the
+  relay returns in `pairing_offer_ok`, so the two sides never disagree. A 4-digit
+  token has only ~10⁴ of entropy, so the relay pins it to a short TTL, single use,
+  **and a per-connection `pairing_claim` rate limit** (`MAX_CLAIM_ATTEMPTS_PER_CONN`,
+  default 5) that closes the socket on excess — bounding online brute force. The
+  low entropy weakens only the **salt** (§7.1), never the key agreement.
 - `pairing_claim` **registers the phone's device public key** against the pairing
   and redeems the one-time token. Tokens are short-TTL and single-use.
 - **Key-agreement public keys (KA keys).** Both `pairing_offer` and
@@ -359,11 +373,30 @@ new commands rather than sending blind.
    * *Forward secrecy:* v1 has **none** — the long-lived KA keys are used
      directly. Ephemeral-key rotation is deferred (PRD §13). Documented, not an
      oversight.
-2. **Salt = the pairing bootstrap secret.** The 32-byte random `pairing_secret`
-   carried in the **QR** payload, or, for the 4-digit **code** path, the
-   `claim_token` bytes. This binds the derived keys to *this* pairing act (an
+2. **Salt = the `claim_token` bytes (reconciled contract, v1).** The HKDF salt is
+   the UTF-8 bytes of the effective `claim_token`, on **both** the QR and the
+   4-digit-code paths. This binds the derived keys to *this* pairing act (an
    attacker with a device key but no bootstrap observation still cannot derive the
-   channel keys). Neither secret ever transits the relay.
+   channel keys). The `claim_token` never transits the relay's E2E plane — it is
+   the token the relay minted, known to both endpoints (the desktop displays it;
+   the QR carries it; the 4-digit code *is* it).
+   * *Why not the QR `pairing_secret`?* The desktop derives the channel from the
+     `pairing_claimed` notification and **cannot know which path the phone used**,
+     so a path-dependent salt (the 32-byte `pairing_secret` for QR vs. the token
+     for the code) would be underivable on the desktop. The `claim_token` is the
+     one value both endpoints share on both paths, so it is the only deterministic
+     choice. The QR still carries a random `pairing_secret` field for wire
+     compatibility with the iOS decoder, but it is **not** used in key derivation.
+   * *Entropy trade-off.* With a 4-digit `claim_token` the salt is low-entropy.
+     That is acceptable because the salt is only defence in depth: the channel's
+     confidentiality rests on the static-static P-256 ECDH between the KA keys
+     (whose private scalars never leave the devices and never transit the relay),
+     not on the salt. Short TTL + single use + the per-connection claim rate limit
+     (§5.2) bound the token's exposure window.
+   * **iOS side (must match):** set the E2E salt to the `claim_token` UTF-8 bytes
+     on **both** pairing paths (e.g. `PairingRecord.saltB64 =
+     base64Standard(claimToken.utf8)`), regardless of whether the user scanned the
+     QR or typed the code. Do **not** use the QR `pairing_secret` as the salt.
 3. **KDF = HKDF-SHA256(ikm, salt)**, expanded twice into two independent 32-byte
    AEAD keys, one per direction:
    * `info = "flightdeck-remote-e2e-v1:" ‖ pairing_id ‖ ":d2p"` → **desktop→phone**

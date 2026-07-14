@@ -205,6 +205,8 @@ fn happy_path_auth_resume_ack_and_echo() {
                     out_tx
                         .send(RemoteOutbound::SendEnvelope {
                             pairing_id: PairingId::new("pair_test"),
+                            seq: 1,
+                            sent_at_ms: 1_000,
                             nonce: "bg==".to_string(),
                             ciphertext: "Y2lwaGVy".to_string(),
                         })

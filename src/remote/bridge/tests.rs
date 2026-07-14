@@ -274,7 +274,7 @@ fn teed_bytes_flush_as_transcript_append() {
 
 fn envelope(cmd: &PhoneCommand) -> EncryptedEnvelope {
     let plain = serde_json::to_vec(cmd).unwrap();
-    let (nonce, ciphertext) = passthrough_seal()(&plain).unwrap();
+    let (nonce, ciphertext) = passthrough_seal()(&plain, 1, 0).unwrap();
     EncryptedEnvelope {
         pairing_id: PairingId::new("pair-1"),
         seq: 1,
@@ -368,8 +368,8 @@ fn seal_open_round_trip_preserves_message() {
     let open = passthrough_open();
     let msg = DesktopToPhone::Rollup(flightdeck_remote_protocol::RollupUpdate { projects: vec![] });
     let bytes = serde_json::to_vec(&msg).unwrap();
-    let (nonce, ciphertext) = seal(&bytes).unwrap();
-    let plain = open(&nonce, &ciphertext).unwrap();
+    let (nonce, ciphertext) = seal(&bytes, 1, 0).unwrap();
+    let plain = open(1, Role::Desktop, 0, &nonce, &ciphertext).unwrap();
     let round: DesktopToPhone = serde_json::from_slice(&plain).unwrap();
     assert_eq!(round, msg);
 }

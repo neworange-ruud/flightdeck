@@ -53,6 +53,26 @@ pub struct Pairing {
     /// `from_seq` on `resume`; incoming envelopes at or below it are duplicates.
     #[serde(default)]
     pub last_received_seq: u64,
+    /// The peer (phone) **key-agreement** public key, base64 (standard, padded)
+    /// X9.63 uncompressed SEC1 (65 bytes) — as delivered in
+    /// `pairing_claimed.peer_key_agreement_public_key` (spec §5.2). Fed into the
+    /// static-static ECDH that bootstraps the E2E channel (spec §7.1). `None`
+    /// until the phone claims the pairing.
+    #[serde(default)]
+    pub peer_key_agreement_public_key: Option<String>,
+    /// The pairing bootstrap **salt** source: the effective `claim_token` string
+    /// the relay issued (spec §5.2). The E2E salt is its UTF-8 bytes — the one
+    /// value both endpoints share on *both* the QR and 4-digit-code paths, so
+    /// the derivation is deterministic regardless of how the phone paired (spec
+    /// §7.1, reconciled contract). `None` until an offer is minted.
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    /// Whether the E2E channel is live: set once the phone has claimed and this
+    /// desktop has recorded the peer KA key. On the next launch a pairing with
+    /// this set (plus a peer KA key + claim token) has its real `E2eChannel`
+    /// reconstructed at startup instead of the passthrough sealer.
+    #[serde(default)]
+    pub established: bool,
 }
 
 impl Pairing {
@@ -64,7 +84,19 @@ impl Pairing {
             last_sent_seq: 0,
             last_acked_by_peer: 0,
             last_received_seq: 0,
+            peer_key_agreement_public_key: None,
+            claim_token: None,
+            established: false,
         }
+    }
+
+    /// Whether this pairing has everything needed to reconstruct its E2E channel
+    /// (a recorded peer KA key + salt source, and the `established` flag). The
+    /// startup go-live in `lib.rs` builds the real sealer only for these.
+    pub fn is_e2e_ready(&self) -> bool {
+        self.established
+            && self.peer_key_agreement_public_key.is_some()
+            && self.claim_token.is_some()
     }
 }
 
@@ -184,6 +216,9 @@ mod tests {
                 last_sent_seq: 7,
                 last_acked_by_peer: 5,
                 last_received_seq: 12,
+                peer_key_agreement_public_key: Some("BPeerKaKey".to_string()),
+                claim_token: Some("4729".to_string()),
+                established: true,
             }],
         };
         save_remote_state(&fs, path, &state).expect("save");

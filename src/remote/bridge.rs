@@ -38,29 +38,42 @@ use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
     AgentStatus, CommandAck, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId,
-    PhoneCommand, ProjectId, PromptId, SessionId, StateSnapshot,
+    PhoneCommand, ProjectId, PromptId, Role, SessionId, StateSnapshot,
 };
 
-/// Seals E2E plaintext for the wire. Given the JSON plaintext, returns
+/// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
+/// header the payload will travel under (`seq`, `sent_at_ms`), returns
 /// `(nonce_b64, ciphertext_b64)` for a [`RemoteOutbound::SendEnvelope`], or
-/// `None` to drop the message. The crypto task supplies the real AEAD sealer;
-/// [`passthrough_seal`] is the test/dev stand-in.
-pub type SealFn = Box<dyn Fn(&[u8]) -> Option<(String, String)> + Send>;
+/// `None` to drop the message. `seq`/`sent_at_ms` are passed in because the real
+/// AEAD binds them as additional authenticated data (spec §7.1): the sealer and
+/// the envelope header must agree exactly, so the bridge assigns the outbound
+/// `seq` here and hands the same value to the relay client.
+/// [`passthrough_seal`] is the test/dev stand-in (no crypto, ignores the header).
+pub type SealFn = Box<dyn Fn(&[u8], u64, i64) -> Option<(String, String)> + Send>;
 
-/// Opens an inbound envelope: given `(nonce_b64, ciphertext_b64)`, returns the
-/// JSON plaintext bytes, or `None` if it cannot be opened. Paired with
+/// Opens an inbound envelope: given the header (`seq`, `sender`, `sent_at_ms`)
+/// and `(nonce_b64, ciphertext_b64)`, returns the JSON plaintext bytes, or
+/// `None` if it cannot be opened (wrong key / tamper / bad header). The header
+/// fields are the AAD the real AEAD authenticates (spec §7.1). Paired with
 /// [`SealFn`]; [`passthrough_open`] is the test/dev stand-in.
-pub type OpenFn = Box<dyn Fn(&str, &str) -> Option<Vec<u8>> + Send>;
+pub type OpenFn = Box<dyn Fn(u64, Role, i64, &str, &str) -> Option<Vec<u8>> + Send>;
 
 /// A no-crypto sealer: the plaintext is base64-encoded as the "ciphertext" with
 /// an empty nonce. For local dev and tests only — the crypto task replaces it.
+/// The `seq`/`sent_at_ms` header is ignored (there is no AAD to bind).
 pub fn passthrough_seal() -> SealFn {
-    Box::new(|plain: &[u8]| Some((String::new(), STANDARD.encode(plain))))
+    Box::new(|plain: &[u8], _seq: u64, _sent_at_ms: i64| {
+        Some((String::new(), STANDARD.encode(plain)))
+    })
 }
 
-/// The inverse of [`passthrough_seal`].
+/// The inverse of [`passthrough_seal`]. Ignores the header fields.
 pub fn passthrough_open() -> OpenFn {
-    Box::new(|_nonce: &str, ciphertext: &str| STANDARD.decode(ciphertext).ok())
+    Box::new(
+        |_seq: u64, _sender: Role, _sent_at_ms: i64, _nonce: &str, ciphertext: &str| {
+            STANDARD.decode(ciphertext).ok()
+        },
+    )
 }
 
 /// A read-only view of one open project, passed into [`RemoteBridge::tick`].
@@ -91,6 +104,13 @@ pub struct RemoteBridge {
     pending_commands: Vec<PhoneCommand>,
     seal: SealFn,
     open: OpenFn,
+    /// Highest outbound envelope `seq` this bridge has assigned. The next
+    /// envelope uses `out_seq + 1` (envelopes start at 1). The bridge is the
+    /// sole producer of outbound envelopes for a pairing, so it owns the counter
+    /// and hands each assigned `seq` to the relay client, which persists it. On
+    /// restart with an established pairing, [`Self::install_channel`] seeds this
+    /// from the persisted high-water mark so the phone's dedup never stalls.
+    out_seq: u64,
 }
 
 impl RemoteBridge {
@@ -113,12 +133,36 @@ impl RemoteBridge {
             pending_commands: Vec::new(),
             seal,
             open,
+            out_seq: 0,
         }
     }
 
     /// A bridge using the no-crypto [`passthrough_seal`]/[`passthrough_open`].
     pub fn passthrough(grace_until_ms: u64) -> Self {
         Self::new(passthrough_seal(), passthrough_open(), grace_until_ms)
+    }
+
+    /// Swap in the real E2E sealer/opener once a pairing is established (spec
+    /// §7.1), seeding the outbound `seq` counter from the persisted high-water
+    /// mark (`resume_from_seq`; 0 for a fresh pairing). This is the moment E2E
+    /// goes live on the desktop: `lib.rs` calls it at startup for an already
+    /// established pairing, and at runtime the instant a phone claims. Accumulated
+    /// transcript/feed state is preserved (only the crypto seam is replaced), so
+    /// a phone that pairs mid-session still receives a populated history.
+    pub fn install_channel(&mut self, seal: SealFn, open: OpenFn, resume_from_seq: u64) {
+        self.seal = seal;
+        self.open = open;
+        self.out_seq = resume_from_seq;
+    }
+
+    /// Revert to the no-crypto passthrough and forget the active pairing — used
+    /// when the user unpairs, so the desktop stops sealing to a peer that is no
+    /// longer trusted and is ready to pair afresh.
+    pub fn reset_to_passthrough(&mut self) {
+        self.seal = passthrough_seal();
+        self.open = passthrough_open();
+        self.out_seq = 0;
+        self.pairing = None;
     }
 
     /// Tee a chunk of a session's primary-terminal PTY bytes into its transcript
@@ -139,15 +183,26 @@ impl RemoteBridge {
     /// [`Self::take_pending_commands`].
     pub fn handle_inbound(&mut self, msg: RemoteInbound) {
         match msg {
-            RemoteInbound::Paired { pairing_id, .. } => {
+            RemoteInbound::Paired { pairing_id, .. }
+            | RemoteInbound::PairingClaimed { pairing_id, .. } => {
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
             }
+            // The offer (code shown) does not itself activate a pairing for the
+            // outbound feed — the phone has not joined yet. Handled by the
+            // pairing overlay, not the bridge.
+            RemoteInbound::PairingOffered { .. } => {}
             RemoteInbound::Envelope(env) => {
                 if self.pairing.is_none() {
                     self.pairing = Some(env.pairing_id.clone());
                 }
-                if let Some(plain) = (self.open)(&env.nonce, &env.ciphertext) {
+                if let Some(plain) = (self.open)(
+                    env.seq,
+                    env.sender,
+                    env.sent_at_ms,
+                    &env.nonce,
+                    &env.ciphertext,
+                ) {
                     if let Ok(cmd) = serde_json::from_slice::<PhoneCommand>(&plain) {
                         self.route_command(cmd);
                     }
@@ -197,8 +252,9 @@ impl RemoteBridge {
 
     /// Seal and enqueue a [`CommandAck`] on the outbound path (the command
     /// bridge acks every drained phone command with its actual outcome).
-    pub fn send_ack(&self, ack: CommandAck, send: &mut dyn FnMut(RemoteOutbound)) {
-        self.send_msg(DesktopToPhone::CommandAck(ack), send);
+    /// `now_ms` stamps the envelope header the AEAD binds (spec §7.1).
+    pub fn send_ack(&mut self, ack: CommandAck, now_ms: i64, send: &mut dyn FnMut(RemoteOutbound)) {
+        self.send_msg(DesktopToPhone::CommandAck(ack), now_ms, send);
     }
 
     /// The one-tick pass: derive events, build/diff state, flush transcript, and
@@ -250,9 +306,11 @@ impl RemoteBridge {
             return;
         }
 
+        let sent_at = now_ms as i64;
+
         // Send typed events first (most urgent).
         for ev in events {
-            self.send_msg(DesktopToPhone::Event(ev), send);
+            self.send_msg(DesktopToPhone::Event(ev), sent_at, send);
         }
 
         // Build the current world and reconcile against what the phone saw.
@@ -261,13 +319,14 @@ impl RemoteBridge {
         if self.snapshot_needed || delta.set_changed {
             self.feed.record_snapshot(&snap);
             self.snapshot_needed = false;
-            self.send_msg(DesktopToPhone::Snapshot(snap), send);
+            self.send_msg(DesktopToPhone::Snapshot(snap), sent_at, send);
         } else {
             if !delta.status.is_empty() {
                 self.send_msg(
                     DesktopToPhone::StatusUpdate(flightdeck_remote_protocol::StatusUpdate {
                         updates: delta.status,
                     }),
+                    sent_at,
                     send,
                 );
             }
@@ -276,6 +335,7 @@ impl RemoteBridge {
                     DesktopToPhone::Rollup(flightdeck_remote_protocol::RollupUpdate {
                         projects: delta.rollups,
                     }),
+                    sent_at,
                     send,
                 );
             }
@@ -289,14 +349,18 @@ impl RemoteBridge {
             }
         }
         for feed in appends {
-            self.send_msg(DesktopToPhone::TranscriptAppend(feed), send);
+            self.send_msg(DesktopToPhone::TranscriptAppend(feed), sent_at, send);
         }
 
         // Answer transcript requests.
         let requests = std::mem::take(&mut self.pending_transcript_requests);
         for (sid, from_index) in requests {
             if let Some(builder) = self.transcripts.get(&sid) {
-                self.send_msg(DesktopToPhone::Transcript(builder.load(from_index)), send);
+                self.send_msg(
+                    DesktopToPhone::Transcript(builder.load(from_index)),
+                    sent_at,
+                    send,
+                );
             }
         }
     }
@@ -375,16 +439,23 @@ impl RemoteBridge {
     }
 
     /// Seal a message and enqueue it as an outbound envelope for the pairing.
-    fn send_msg(&self, msg: DesktopToPhone, send: &mut dyn FnMut(RemoteOutbound)) {
+    /// Assigns the next gapless `seq` and stamps `sent_at_ms = now_ms`, sealing
+    /// under that exact header (the AEAD binds it, spec §7.1) and handing the
+    /// same values to the relay client so the wire envelope matches.
+    fn send_msg(&mut self, msg: DesktopToPhone, now_ms: i64, send: &mut dyn FnMut(RemoteOutbound)) {
         let Some(pairing_id) = self.pairing.clone() else {
             return;
         };
         let Ok(bytes) = serde_json::to_vec(&msg) else {
             return;
         };
-        if let Some((nonce, ciphertext)) = (self.seal)(&bytes) {
+        let seq = self.out_seq + 1;
+        if let Some((nonce, ciphertext)) = (self.seal)(&bytes, seq, now_ms) {
+            self.out_seq = seq;
             send(RemoteOutbound::SendEnvelope {
                 pairing_id,
+                seq,
+                sent_at_ms: now_ms,
                 nonce,
                 ciphertext,
             });

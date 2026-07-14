@@ -96,6 +96,10 @@ pub trait RelayStore: Send + Sync {
         expires_at_ms: i64,
     );
 
+    /// Whether `token` is free to issue — i.e. not currently a live claim.
+    /// Backs the `claim_token_hint` honoring in `pairing_offer` (spec §5.2).
+    async fn claim_token_is_free(&self, token: &str) -> bool;
+
     /// Redeem a claim token at wall-clock `now_ms`.
     async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError>;
 
@@ -240,6 +244,10 @@ impl RelayStore for InMemoryStore {
         self.lock()
             .claims
             .issue(token, pairing, desktop, expires_at_ms);
+    }
+
+    async fn claim_token_is_free(&self, token: &str) -> bool {
+        !self.lock().claims.contains(token)
     }
 
     async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError> {

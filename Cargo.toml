@@ -69,6 +69,12 @@ hkdf = "0.12"
 chacha20poly1305 = "0.10"
 # Device id = SHA-256 of the X9.63 public key (matches the iOS convention).
 sha2 = "0.10"
+# QR code generation for the desktop pairing overlay (Settings → Remote). The
+# `fdr1:` payload is encoded and rendered as terminal half-block cells (spec
+# §5.2, src/remote/pairing.rs). `default-features = false` drops the optional
+# `image`/`svg` renderers we do not use, keeping the graph pure-Rust with no C
+# toolchain (matching the rest of the remote crypto stack).
+qrcode = { version = "0.14", default-features = false }
 # Wire encodings: standard-padded base64 for keys/signatures/nonces/ciphertext
 # (spec §2/§5.1) and url-safe-no-pad for the device id.
 base64 = "0.22"

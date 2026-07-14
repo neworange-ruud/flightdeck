@@ -189,6 +189,78 @@ async fn claim_token_is_single_use() {
     ));
 }
 
+// ── claim_token_hint (4-digit code) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn claim_token_hint_is_honored_when_free() {
+    let base = spawn_app().await;
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+
+    // A free, well-formed 4-digit hint is issued verbatim so the desktop can
+    // display it as the short code.
+    let (pairing, token) = desktop.offer_pairing_hint(Some("4729")).await;
+    assert_eq!(
+        token, "4729",
+        "relay must issue the requested 4-digit token"
+    );
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    // The phone redeems exactly that 4-digit code.
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    let joined = phone.claim_pairing("4729").await;
+    assert_eq!(joined, pairing);
+}
+
+#[tokio::test]
+async fn claim_token_hint_collision_falls_back_to_minted_token() {
+    let base = spawn_app().await;
+
+    // First desktop takes "4729".
+    let mut desktop1 = TestClient::connect(&base, Role::Desktop, "dev_mac_1").await;
+    let (_p1, token1) = desktop1.offer_pairing_hint(Some("4729")).await;
+    assert_eq!(token1, "4729");
+
+    // Second desktop asks for the same hint while it is still live → refused,
+    // the relay mints its own distinct token instead of colliding.
+    let mut desktop2 = TestClient::connect(&base, Role::Desktop, "dev_mac_2").await;
+    let (_p2, token2) = desktop2.offer_pairing_hint(Some("4729")).await;
+    assert_ne!(token2, "4729", "a colliding hint must not be reused");
+}
+
+// ── pairing_claim rate limiting ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn repeated_bad_claims_are_rate_limited_and_closed() {
+    let base = spawn_app().await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_attacker").await;
+
+    // Hammer the relay with wrong tokens. The first few are advisory rejects;
+    // once over the per-connection cap the relay rate-limits and closes.
+    let mut saw_rate_limited = false;
+    for _ in 0..12 {
+        phone
+            .send(RelayFrame::PairingClaim {
+                claim_token: "0000".to_string(),
+                device_id: DeviceId::new("dev_attacker"),
+                device_public_key: phone.public_key_b64.clone(),
+                key_agreement_public_key: phone.key_agreement_public_key_b64.clone(),
+                role: Role::Phone,
+            })
+            .await;
+        if let RelayFrame::Error { code, .. } = phone.recv().await {
+            if matches!(code, RelayErrorCode::RateLimited) {
+                saw_rate_limited = true;
+                break;
+            }
+            assert!(matches!(code, RelayErrorCode::PairingClaimRejected));
+        }
+    }
+    assert!(
+        saw_rate_limited,
+        "relay must rate-limit repeated pairing_claim attempts"
+    );
+}
+
 // ── the full happy path ─────────────────────────────────────────────────────
 
 #[tokio::test]

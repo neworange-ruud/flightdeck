@@ -36,6 +36,7 @@ pub mod crypto;
 pub mod feed;
 pub mod identity;
 pub mod notifier;
+pub mod pairing;
 pub mod state;
 pub mod transcript;
 
@@ -64,12 +65,39 @@ pub enum RemoteInbound {
         /// New presence.
         state: PresenceState,
     },
-    /// A pairing was (re)confirmed active on the connection.
+    /// A pairing was (re)confirmed active on the connection (e.g. re-activated
+    /// on reconnect via `auth_ok`). Drives the outbound bridge to send a fresh
+    /// snapshot; does not by itself establish the E2E channel.
     Paired {
         /// The active pairing.
         pairing_id: PairingId,
         /// The peer device id, if the relay reported one.
         peer_device_id: Option<DeviceId>,
+    },
+    /// The relay minted a claim token for a desktop-initiated pairing offer
+    /// (`pairing_offer_ok`, spec §5.2). Drives the pairing overlay to display
+    /// the 4-digit code + QR and start the expiry countdown.
+    PairingOffered {
+        /// The pairing the relay provisioned.
+        pairing_id: PairingId,
+        /// The effective claim token (equals the requested 4-digit hint when
+        /// honored). Shown as the manual code; its UTF-8 bytes are the E2E salt.
+        claim_token: String,
+        /// Relay wall-clock time (unix ms) after which the token is rejected.
+        expires_at_ms: i64,
+    },
+    /// A phone redeemed the claim token and joined the pairing
+    /// (`pairing_claimed`, spec §5.2). Carries the peer's key-agreement public
+    /// key — the moment the desktop can derive the E2E channel (spec §7.1).
+    PairingClaimed {
+        /// The now-established pairing.
+        pairing_id: PairingId,
+        /// The peer (phone) device id, if the relay reported one.
+        peer_device_id: Option<DeviceId>,
+        /// The peer's key-agreement public key (base64 standard-padded, X9.63),
+        /// fed into the static-static ECDH. `None` if the relay had not recorded
+        /// it (then the channel cannot be derived and pairing has not completed).
+        peer_key_agreement_public_key: Option<String>,
     },
 }
 
@@ -82,6 +110,15 @@ pub enum RemoteOutbound {
     SendEnvelope {
         /// Destination pairing.
         pairing_id: PairingId,
+        /// The gapless per-pairing sequence number assigned by the outbound
+        /// bridge (spec §6.1). The bridge owns this counter because it is the
+        /// sole producer of outbound envelopes and it must seal under the exact
+        /// header the envelope carries (the AEAD binds `seq`/`sent_at_ms` as AAD,
+        /// spec §7.1). The client sends it verbatim and persists it as the
+        /// high-water mark for `resume`.
+        seq: u64,
+        /// Sender wall-clock time (unix ms) the payload was sealed under.
+        sent_at_ms: i64,
         /// Base64 (standard, padded) AEAD nonce chosen by the sealing layer.
         nonce: String,
         /// Base64 (standard, padded) sealed payload.
@@ -96,9 +133,22 @@ pub enum RemoteOutbound {
         /// Highest contiguous incoming `seq` durably handled.
         cursor: u64,
     },
-    /// Placeholder for a future desktop-initiated pairing offer. The v1 relay
-    /// protocol has the *phone* redeem a claim token (`pairing_claim`); the
-    /// desktop shows the code out of band. Wired now so the bridge/UI layer has
-    /// a stable channel shape; currently a no-op the client logs and ignores.
-    RequestPairing,
+    /// Desktop-initiated pairing offer (Settings → Remote, spec §5.2). The
+    /// client sends a `pairing_offer` carrying its device + key-agreement public
+    /// keys and this optional 4-digit `claim_token_hint`, then routes the
+    /// resulting `pairing_offer_ok` back as [`RemoteInbound::PairingOffered`].
+    RequestPairing {
+        /// A short human-typeable code the desktop would like the relay to use
+        /// as the claim token, or `None` to let the relay mint one.
+        claim_token_hint: Option<String>,
+    },
+    /// Forget a pairing (Settings → Remote → Unpair). The client drops it from
+    /// its persisted [`RemoteState`] so it is no longer activated on future
+    /// connections. There is no relay-plane "unpair" frame in v1, so this is a
+    /// local clear; the pairing simply stops being resumed and the peer sees the
+    /// desktop as permanently absent for it.
+    Unpair {
+        /// The pairing to forget.
+        pairing_id: PairingId,
+    },
 }

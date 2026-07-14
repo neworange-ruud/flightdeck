@@ -81,6 +81,7 @@ use crate::remote::commands::{
     MainLoopAction, PendingFirstTask, Translation,
 };
 use crate::remote::identity::load_or_create_identity;
+use crate::remote::pairing::{build_channel, PairingSession};
 use crate::remote::state::remote_state_path;
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::terminal::pty::PortablePtyBackend;
@@ -90,9 +91,9 @@ use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
     child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
     ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
-    HitTarget, ProjectHit, ProjectTabInfo, UiOverlay,
+    HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, UiOverlay,
 };
-use flightdeck_remote_protocol::{CommandAck, CommandOutcome, ProjectId};
+use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -839,6 +840,9 @@ enum Prompt {
     /// Confirm closing an open project tab (`index`). Closing stops that
     /// project's agents and removes it from the workspace.
     CloseProjectConfirm { index: usize },
+    /// Confirm unpairing the phone (FlightDeck Remote). On confirm the event
+    /// loop forgets the pairing and reverts to the passthrough sealer.
+    UnpairConfirm,
 }
 
 /// State for the project-folder browser prompt ([`Prompt::OpenProject`]): the
@@ -896,6 +900,11 @@ struct Ui {
     /// the event loop, which owns the terminal it must suspend/restore. Tagged
     /// with the project index whose config was opened.
     pending_editor: Option<(usize, PathBuf)>,
+    /// Set by the "Remote: Pair Phone" palette action; the event loop (which owns
+    /// the relay channels + pairing session) starts the pairing offer next tick.
+    pending_pair: bool,
+    /// Set by confirming "Remote: Unpair"; the event loop forgets the pairing.
+    pending_unpair: bool,
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -1176,15 +1185,31 @@ fn event_loop(
     // wiring shape so that task is purely additive.
     let (remote_in_tx, remote_in_rx) = std::sync::mpsc::channel::<RemoteInbound>();
     let (remote_out_tx, remote_out_rx) = std::sync::mpsc::channel::<RemoteOutbound>();
-    let remote_handle = start_remote(env, workspace, remote_in_tx, remote_out_rx);
+    let remote_setup = start_remote(env, workspace, remote_in_tx, remote_out_rx);
     // The outbound feed bridge exists only while the relay thread does. It builds
     // the phone-facing snapshots/deltas/transcript/events each tick and seals
-    // them (a passthrough sealer for now; the crypto task swaps in real AEAD).
+    // them. A passthrough sealer is the default; when an already-established
+    // pairing exists, the real E2E channel is installed right away (spec §7.1).
     // When remote is disabled this stays `None`, so every tee/tick below is a
     // cheap no-op and behaviour is bit-for-bit unchanged.
-    let mut remote_bridge: Option<RemoteBridge> = remote_handle
+    let mut remote_bridge: Option<RemoteBridge> = remote_setup
         .as_ref()
         .map(|_| RemoteBridge::passthrough(now0 + crate::app::state::NOTIFY_STARTUP_GRACE_MS));
+    if let (Some(b), Some(setup)) = (remote_bridge.as_mut(), remote_setup.as_ref()) {
+        if let Some(est) = &setup.established {
+            if let Ok((seal, open)) = build_channel(
+                &setup.identity_scalar,
+                &est.peer_ka_b64,
+                est.pairing_id.as_str(),
+                &est.claim_token,
+            ) {
+                b.install_channel(seal, open, est.last_sent_seq);
+            }
+        }
+    }
+    // The desktop pairing surface (Settings → Remote overlay). `Some` only while
+    // the QR/code overlay is on screen.
+    let mut pairing_session: Option<PairingSession> = None;
     // Inbound command-bridge state: the idempotency ledger and the first tasks
     // of phone-created sessions awaiting a ready agent. Only ever touched when
     // the remote bridge exists, so disabled-remote behaviour is unchanged.
@@ -1254,7 +1279,42 @@ fn event_loop(
         //     snapshot/transcript requests are queued for the command-bridge
         //     task via `RemoteBridge::take_pending_commands`. ---
         if let Some(b) = remote_bridge.as_mut() {
+            let identity_scalar = remote_setup
+                .as_ref()
+                .map(|s| s.identity_scalar.as_slice())
+                .unwrap_or(&[]);
             while let Ok(msg) = remote_in_rx.try_recv() {
+                // Drive the pairing overlay + E2E go-live off the pairing frames.
+                match &msg {
+                    RemoteInbound::PairingOffered {
+                        pairing_id,
+                        claim_token,
+                        expires_at_ms,
+                    } => {
+                        if let Some(ps) = pairing_session.as_mut() {
+                            ps.on_offered(pairing_id.clone(), claim_token.clone(), *expires_at_ms);
+                        }
+                    }
+                    RemoteInbound::PairingClaimed {
+                        pairing_id,
+                        peer_key_agreement_public_key,
+                        ..
+                    } => {
+                        if let Some(ps) = pairing_session.as_mut() {
+                            if ps.on_claimed(
+                                pairing_id.clone(),
+                                peer_key_agreement_public_key.clone(),
+                            ) {
+                                // The instant a phone joins: derive the real
+                                // channel and swap it in for the passthrough.
+                                if let Ok((_pid, seal, open)) = ps.derive_channel(identity_scalar) {
+                                    b.install_channel(seal, open, 0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 b.handle_inbound(msg);
             }
             {
@@ -1290,6 +1350,17 @@ fn event_loop(
             // Remote disabled: drain (and drop) so the channel never fills.
             while remote_in_rx.try_recv().is_ok() {}
         }
+
+        // --- Desktop pairing surface (Settings → Remote): start an offer, keep
+        //     the overlay in sync with the pairing session, and handle unpair. ---
+        drive_pairing_overlay(
+            &mut ui,
+            &mut pairing_session,
+            remote_bridge.as_mut(),
+            remote_setup.as_ref(),
+            &remote_out_tx,
+            now_ms,
+        );
 
         // --- Refresh the git-status cache for the ACTIVE project only (it is
         //     the only one whose sidebar/info bar is on screen). ---
@@ -1400,11 +1471,33 @@ fn event_loop(
 
     // Tear down the relay client (best-effort join). A dropped handle also
     // signals the thread, so an early `?` return above still winds it down.
-    if let Some(handle) = remote_handle {
-        handle.stop();
+    if let Some(setup) = remote_setup {
+        setup.handle.stop();
     }
 
     Ok(())
+}
+
+/// An already-established pairing found in `remote.json` at startup: everything
+/// needed to reconstruct its live E2E channel before the phone reconnects.
+struct EstablishedPairing {
+    pairing_id: PairingId,
+    peer_ka_b64: String,
+    claim_token: String,
+    last_sent_seq: u64,
+}
+
+/// The result of starting FlightDeck Remote: the client thread plus the bits the
+/// event loop needs to drive the pairing surface and bring E2E live.
+struct RemoteSetup {
+    handle: RemoteHandle,
+    /// This device's identity private scalar, reused as the key-agreement key
+    /// (spec §7.1) to derive the E2E channel on pairing/startup.
+    identity_scalar: Vec<u8>,
+    /// The effective relay URL to embed in the pairing QR.
+    relay_url: String,
+    /// An already-paired pairing to bring live immediately, if any.
+    established: Option<EstablishedPairing>,
 }
 
 /// Construct the FlightDeck Remote client thread when `[remote]` is enabled and
@@ -1416,14 +1509,144 @@ fn start_remote(
     workspace: &Workspace,
     inbound_tx: Sender<RemoteInbound>,
     outbound_rx: Receiver<RemoteOutbound>,
-) -> Option<RemoteHandle> {
+) -> Option<RemoteSetup> {
     let cfg = workspace.active_project().state.config.remote.clone();
     if !cfg.enabled || cfg.relay_url.is_empty() {
         return None;
     }
     let path = remote_state_path()?;
-    let (identity, _state) = load_or_create_identity(env.fs, &path).ok()?;
-    Some(RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx))
+    let (identity, state) = load_or_create_identity(env.fs, &path).ok()?;
+    let identity_scalar = identity.private_key_bytes();
+    // A per-device relay URL override wins over config (matches the client).
+    let relay_url = match &state.relay_url {
+        Some(u) if !u.is_empty() => u.clone(),
+        _ => cfg.relay_url.clone(),
+    };
+    // The first already-established pairing (single-Mac UI in v1) is brought
+    // live at startup so a reconnecting phone gets real ciphertext, not the
+    // passthrough sealer (spec §7.1).
+    let established =
+        state
+            .pairings
+            .iter()
+            .find(|p| p.is_e2e_ready())
+            .map(|p| EstablishedPairing {
+                pairing_id: PairingId::new(p.pairing_id.clone()),
+                peer_ka_b64: p.peer_key_agreement_public_key.clone().unwrap_or_default(),
+                claim_token: p.claim_token.clone().unwrap_or_default(),
+                last_sent_seq: p.last_sent_seq,
+            });
+    let handle = RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx);
+    Some(RemoteSetup {
+        handle,
+        identity_scalar,
+        relay_url,
+        established,
+    })
+}
+
+/// Per-tick driver for the desktop pairing overlay: start an offer when the
+/// palette asked, keep the on-screen overlay in sync with the pairing session
+/// (countdown, status), handle unpair, and drop the session once the overlay is
+/// dismissed.
+fn drive_pairing_overlay(
+    ui: &mut Ui,
+    pairing_session: &mut Option<PairingSession>,
+    bridge: Option<&mut RemoteBridge>,
+    setup: Option<&RemoteSetup>,
+    out_tx: &Sender<RemoteOutbound>,
+    now_ms: u64,
+) {
+    if ui.pending_pair {
+        ui.pending_pair = false;
+        match setup {
+            Some(s) => {
+                let session = PairingSession::begin(s.relay_url.clone());
+                let _ = out_tx.send(RemoteOutbound::RequestPairing {
+                    claim_token_hint: Some(session.hint().to_string()),
+                });
+                ui.overlay = UiOverlay::Remote(remote_pairing_view(&session, now_ms));
+                *pairing_session = Some(session);
+            }
+            None => ui.message(
+                "FlightDeck Remote is disabled — enable it in configuration to pair a phone.",
+            ),
+        }
+    }
+
+    if ui.pending_unpair {
+        ui.pending_unpair = false;
+        // Forget any pairing we know about (single-Mac UI in v1): the one loaded
+        // at startup and any established this session. The client drops each from
+        // persisted state; the bridge reverts to the passthrough sealer.
+        if let Some(s) = setup {
+            if let Some(est) = &s.established {
+                let _ = out_tx.send(RemoteOutbound::Unpair {
+                    pairing_id: est.pairing_id.clone(),
+                });
+            }
+        }
+        if let Some(pid) = pairing_session.as_ref().and_then(|ps| ps.pairing_id()) {
+            let _ = out_tx.send(RemoteOutbound::Unpair {
+                pairing_id: pid.clone(),
+            });
+        }
+        if let Some(b) = bridge {
+            b.reset_to_passthrough();
+        }
+        *pairing_session = None;
+        if matches!(ui.overlay, UiOverlay::Remote(_)) {
+            ui.overlay = UiOverlay::None;
+        }
+        ui.message("Phone unpaired.");
+        return;
+    }
+
+    // Keep the overlay live while a session runs; drop it once dismissed.
+    if let Some(ps) = pairing_session.as_ref() {
+        if matches!(ui.overlay, UiOverlay::Remote(_)) {
+            ui.overlay = UiOverlay::Remote(remote_pairing_view(ps, now_ms));
+        } else {
+            *pairing_session = None;
+        }
+    }
+}
+
+/// Build the render-ready [`RemotePairing`] snapshot from the pairing session.
+fn remote_pairing_view(session: &PairingSession, now_ms: u64) -> RemotePairing {
+    use crate::remote::pairing::{qr_art, PairingPhase};
+    match session.phase() {
+        PairingPhase::Idle | PairingPhase::Offering => RemotePairing {
+            status_line: "Requesting a pairing code from the relay…".to_string(),
+            ..RemotePairing::default()
+        },
+        PairingPhase::Displaying {
+            code, qr_payload, ..
+        } => {
+            let (qr_rows, qr_width) = qr_art(qr_payload)
+                .map(|a| (a.rows, a.width))
+                .unwrap_or_default();
+            RemotePairing {
+                status_line: "Scan the QR or type the code on your phone — waiting…".to_string(),
+                code: Some(code.clone()),
+                qr_rows,
+                qr_width,
+                seconds_remaining: session.seconds_remaining(now_ms as i64),
+                done: false,
+                failed: false,
+            }
+        }
+        PairingPhase::Established { .. } => RemotePairing {
+            status_line: "Phone connected — paired. End-to-end encrypted.".to_string(),
+            done: true,
+            ..RemotePairing::default()
+        },
+        PairingPhase::Failed { message } => RemotePairing {
+            status_line: message.clone(),
+            failed: true,
+            ..RemotePairing::default()
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1677,7 @@ fn service_remote_commands(
     for cmd in bridge.take_pending_commands() {
         // Idempotency: a retransmitted command id is acked, never re-applied.
         if let Some(ack) = ledger.duplicate_ack(&cmd.command_id) {
-            bridge.send_ack(ack, send);
+            bridge.send_ack(ack, now_ms as i64, send);
             continue;
         }
         // A fresh index per command: an earlier command in this batch may have
@@ -1482,6 +1705,7 @@ fn service_remote_commands(
                 outcome,
                 message,
             },
+            now_ms as i64,
             send,
         );
     }
@@ -3080,6 +3304,13 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 DialogButton::new(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
+        Prompt::UnpairConfirm => Dialog::confirm(
+            "Unpair this phone? It loses access until you pair it again.",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Unpair"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
     }
 }
 
@@ -3115,6 +3346,14 @@ fn handle_prompt_key(
         }
         Some(Prompt::CloseProjectConfirm { .. }) => {
             return handle_close_project_key(key, workspace, env, ui)
+        }
+        Some(Prompt::UnpairConfirm) => {
+            ui.prompt = None;
+            if key.code == KeyCode::Char('y') {
+                // Deferred to the event loop, which owns the relay channels.
+                ui.pending_unpair = true;
+            }
+            return Ok(());
         }
         _ => {}
     }
@@ -3366,7 +3605,7 @@ fn handle_prompt_key_project(
         // Workspace-level prompts are routed to their own handlers by
         // `handle_prompt_key` before reaching here; keep the prompt if one
         // slips through so it is never silently dropped.
-        Prompt::OpenProject { .. } | Prompt::CloseProjectConfirm { .. } => {
+        Prompt::OpenProject { .. } | Prompt::CloseProjectConfirm { .. } | Prompt::UnpairConfirm => {
             ui.prompt = Some(pstate);
         }
     }
@@ -3512,6 +3751,16 @@ fn run_palette_action(
             open_config_manager(workspace, env, ui);
             return Ok(());
         }
+        PaletteAction::PairPhone => {
+            // The event loop (which owns the relay channels + pairing session)
+            // starts the offer and opens the overlay next tick.
+            ui.pending_pair = true;
+            return Ok(());
+        }
+        PaletteAction::UnpairPhone => {
+            start_prompt(ui, Prompt::UnpairConfirm);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -3565,7 +3814,9 @@ fn run_palette_action(
         | PaletteAction::CloseProject
         | PaletteAction::SwitchProjectNext
         | PaletteAction::SwitchProjectPrev
-        | PaletteAction::OpenConfig => Ok(()),
+        | PaletteAction::OpenConfig
+        | PaletteAction::PairPhone
+        | PaletteAction::UnpairPhone => Ok(()),
     }
 }
 
@@ -4550,7 +4801,7 @@ mod tests {
 
         fn envelope(seq: u64, cmd: &PhoneCommand) -> EncryptedEnvelope {
             let plain = serde_json::to_vec(cmd).unwrap();
-            let (nonce, ciphertext) = passthrough_seal()(&plain).unwrap();
+            let (nonce, ciphertext) = passthrough_seal()(&plain, seq, 0).unwrap();
             EncryptedEnvelope {
                 pairing_id: PairingId::new("pair-1"),
                 seq,
