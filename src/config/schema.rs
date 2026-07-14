@@ -57,7 +57,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         ui: UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
-            use_f2_to_leave_terminal_focus: false,
+            ..UiConfig::default()
         },
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
@@ -73,6 +73,11 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
 pub fn default_global_config() -> Config {
     default_config("project", "main")
 }
+
+/// Allowed mode-cue color names (SPECS §23).
+const MODE_COLORS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white"];
+/// Allowed live-pane border levels (SPECS §23).
+const MODE_BORDER_LEVELS: &[&str] = &["off", "dim", "normal", "bright"];
 
 /// Validate a parsed config, rejecting structurally invalid configs with clear
 /// errors (SPECS §8, §26 "Rejects invalid config").
@@ -97,6 +102,25 @@ pub fn validate(config: &Config) -> Result<()> {
                 key
             )));
         }
+    }
+
+    if !MODE_COLORS.contains(&config.ui.terminal_mode_color.as_str()) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.terminal_mode_color '{}' is not a valid color (expected one of {MODE_COLORS:?})",
+            config.ui.terminal_mode_color
+        )));
+    }
+    if !MODE_COLORS.contains(&config.ui.app_mode_color.as_str()) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.app_mode_color '{}' is not a valid color (expected one of {MODE_COLORS:?})",
+            config.ui.app_mode_color
+        )));
+    }
+    if !MODE_BORDER_LEVELS.contains(&config.ui.mode_border.as_str()) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.mode_border '{}' is not valid (expected one of {MODE_BORDER_LEVELS:?})",
+            config.ui.mode_border
+        )));
     }
 
     validate_containers(&config.containers)?;
@@ -269,6 +293,54 @@ mod tests {
         cfg.containers.enabled = true;
         cfg.containers.packages = vec!["jq".to_string(), "curl".to_string()];
         cfg.containers.forward_ports = vec![3000, 8080];
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn ui_config_defaults_for_mode_cues() {
+        let cfg = default_config("proj", "main");
+        assert_eq!(cfg.ui.terminal_mode_color, "green");
+        assert_eq!(cfg.ui.app_mode_color, "cyan");
+        assert_eq!(cfg.ui.mode_border, "off");
+        assert!(cfg.ui.dim_terminal_in_app_mode);
+    }
+
+    #[test]
+    fn ui_config_partial_table_fills_mode_defaults() {
+        // A config that only sets agent_tab_position must still get the new defaults.
+        let cfg: Config = "[ui]\nagent_tab_position = \"right\"\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(cfg.ui.agent_tab_position, "right");
+        assert_eq!(cfg.ui.terminal_mode_color, "green");
+        assert_eq!(cfg.ui.mode_border, "off");
+        assert!(cfg.ui.dim_terminal_in_app_mode);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_mode_color() {
+        let mut cfg = default_config("proj", "main");
+        cfg.ui.terminal_mode_color = "chartreuse".to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("terminal_mode_color"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_border_level() {
+        let mut cfg = default_config("proj", "main");
+        cfg.ui.mode_border = "flashing".to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("mode_border"));
+    }
+
+    #[test]
+    fn validate_accepts_valid_mode_cue_config() {
+        let mut cfg = default_config("proj", "main");
+        cfg.ui.terminal_mode_color = "magenta".to_string();
+        cfg.ui.app_mode_color = "yellow".to_string();
+        cfg.ui.mode_border = "bright".to_string();
         assert!(validate(&cfg).is_ok());
     }
 }
