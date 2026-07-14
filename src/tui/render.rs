@@ -1458,8 +1458,8 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(
         state.mode(),
+        &state.config.ui,
         state.update_available.as_deref(),
-        state.config.ui.use_f2_to_leave_terminal_focus,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
@@ -1471,9 +1471,11 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Exported for snapshot testing.
 pub fn status_bar_text(
     mode: InputMode,
+    ui: &crate::contracts::UiConfig,
     update_available: Option<&str>,
-    use_f2: bool,
 ) -> Line<'static> {
+    let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
+    let use_f2 = ui.use_f2_to_leave_terminal_focus;
     let mut spans = match mode {
         InputMode::Terminal => vec![
             Span::raw(" "),
@@ -1481,7 +1483,7 @@ pub fn status_bar_text(
                 "MODE: TERMINAL",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Green)
+                    .bg(chip_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
@@ -1499,7 +1501,7 @@ pub fn status_bar_text(
                 "MODE: APP",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(chip_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
@@ -2832,7 +2834,8 @@ mod tests {
 
     #[test]
     fn status_bar_terminal_mode_text() {
-        let line = status_bar_text(InputMode::Terminal, None, false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(
@@ -2846,14 +2849,19 @@ mod tests {
 
     #[test]
     fn status_bar_shows_f2_when_enabled() {
-        let line = status_bar_text(InputMode::Terminal, None, true);
+        let ui = crate::contracts::UiConfig {
+            use_f2_to_leave_terminal_focus: true,
+            ..crate::contracts::UiConfig::default()
+        };
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("F2"));
     }
 
     #[test]
     fn status_bar_app_mode_text() {
-        let line = status_bar_text(InputMode::App, None, false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -2866,7 +2874,8 @@ mod tests {
 
     #[test]
     fn status_bar_shows_update_hint_when_available() {
-        let line = status_bar_text(InputMode::App, Some("1.0.3"), false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"));
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -2877,9 +2886,24 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, None, false);
+        let none = status_bar_text(InputMode::App, &ui, None);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
+    }
+
+    #[test]
+    fn status_bar_chip_uses_configured_color() {
+        let ui = crate::contracts::UiConfig {
+            terminal_mode_color: "magenta".to_string(),
+            ..crate::contracts::UiConfig::default()
+        };
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
+        let chip = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("MODE: TERMINAL"))
+            .expect("chip span present");
+        assert_eq!(chip.style.bg, Some(ratatui::style::Color::Magenta));
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------
