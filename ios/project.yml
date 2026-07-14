@@ -54,6 +54,10 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          # Permit ws:// to localhost / 127.0.0.1 for local relay dev and the
+          # transport integration test. Does not relax ATS for any real host.
+          NSAllowsLocalNetworking: true
         NSFaceIDUsageDescription: "Unlock FlightDeck Remote"
         NSCameraUsageDescription: "FlightDeck Remote uses the camera to scan the pairing QR code shown on your Mac."
         NSMicrophoneUsageDescription: "FlightDeck Remote uses the microphone so you can reply to agents by voice."

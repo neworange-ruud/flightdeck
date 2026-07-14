@@ -1,0 +1,511 @@
+//
+//  TransportClient.swift
+//  FlightDeckRemote
+//
+//  The relay-plane state machine (REMOTE_PROTOCOL §5/§6), as an actor. It is
+//  the phone-side counterpart to the desktop's `src/remote/client.rs` and
+//  mirrors its semantics:
+//
+//    connect → hello → hello_ok → auth_challenge → auth_response → auth_ok
+//            → resume (from the persisted inbound cursor) + request_snapshot
+//            → pump: read inbound / seal & send outbound / periodic ping
+//
+//  Responsibilities:
+//   - Auth: sign the relay's nonce with `DeviceIdentity` (ECDSA P-256), §5.1.
+//   - Inbound envelopes: dedup by `seq` per (pairing, sender=desktop), open via
+//     `E2EChannel`, decode `DesktopToPhone`, publish, then cumulatively `ack`
+//     durable receipt (§6.2/§6.4). A failed open/AAD-mismatch is rejected and
+//     never advances the cursor (§7.1).
+//   - Outbound commands: assign a gapless `seq` from the persisted cursor, seal
+//     the `PhoneCommand` with `E2EChannel`, send the envelope, and persist the
+//     cursor only after a successful send (§6.1). Delivery honesty (§6.5): a
+//     command is `.sending` until the desktop's `command_ack`; a ~10s timeout
+//     (or a send failure / peer-down) flips it to `.failed`.
+//   - Reconnect: exponential backoff + jitter on any drop (`Backoff`, §5.3); a
+//     session that reached `auth_ok` resets the attempt counter.
+//   - Latency: a relay-plane `ping` every ~20s; `pong` updates `connected`.
+//
+//  It publishes `TransportEvent`s through a `@Sendable` handler that
+//  `TransportStore` sets to fold state onto the main actor. The state machine
+//  is fully UI-agnostic and driven by an injected `WebSocketConnecting`, so
+//  unit tests run it against a scripted mock socket.
+//
+
+import Foundation
+
+actor TransportClient {
+
+    // MARK: - Tuning
+
+    struct Config: Sendable {
+        /// Latency-probe interval.
+        var pingInterval: Duration = .seconds(20)
+        /// Delivery-honesty deadline: a command with no `command_ack` by this
+        /// point is reported `.failed` (PRD §5.8).
+        var commandTimeout: Duration = .seconds(10)
+        /// Whether to request a fresh snapshot right after `resume`.
+        var requestSnapshotOnResume: Bool = true
+
+        init() {}
+    }
+
+    // MARK: - Dependencies
+
+    private let identity: DeviceIdentity
+    private let keyAgreement: KeyAgreementKeys
+    private let recordStore: PairingRecordStore
+    private let connector: any WebSocketConnecting
+    private let clientInfo: Wire.ClientInfo
+    private let config: Config
+    private let jitter: @Sendable () -> Double
+    private let now: @Sendable () -> Int64
+
+    // MARK: - Runtime state
+
+    private var eventHandler: (@Sendable (TransportEvent) -> Void)?
+    private var supervisor: Task<Void, Never>?
+
+    private var record: PairingRecord?
+    private var channel: (any WebSocketChannel)?
+    private var e2e: E2EChannel?
+    private var pinger: Task<Void, Never>?
+
+    private var linkState: RemoteLinkState = .disconnected
+    private var latencyMs: Int = 0
+    private var phase: Phase = .idle
+    private var sessionAuthed = false
+    private var peerConnected: Bool?
+
+    private var pending: [Wire.CommandId: PendingCommand] = [:]
+
+    /// The pre-`auth_ok` handshake phase within one session.
+    private enum Phase: Equatable {
+        case idle
+        case awaitingHelloOk
+        case awaitingChallenge
+        case awaitingAuthOk
+        case live
+    }
+
+    private struct PendingCommand {
+        let seq: UInt64
+        let timeout: Task<Void, Never>
+    }
+
+    // MARK: - Init
+
+    init(
+        identity: DeviceIdentity,
+        keyAgreement: KeyAgreementKeys,
+        recordStore: PairingRecordStore,
+        connector: any WebSocketConnecting,
+        clientInfo: Wire.ClientInfo? = nil,
+        config: Config = Config(),
+        jitter: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) },
+        now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    ) {
+        self.identity = identity
+        self.keyAgreement = keyAgreement
+        self.recordStore = recordStore
+        self.connector = connector
+        self.clientInfo = clientInfo ?? Wire.ClientInfo(
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
+            platform: "ios",
+            osVersion: nil
+        )
+        self.config = config
+        self.jitter = jitter
+        self.now = now
+    }
+
+    /// Set the observer that receives every `TransportEvent`.
+    func setEventHandler(_ handler: @escaping @Sendable (TransportEvent) -> Void) {
+        self.eventHandler = handler
+    }
+
+    // MARK: - Lifecycle
+
+    /// Start the reconnect supervisor. No-op if already running.
+    func start() {
+        guard supervisor == nil else { return }
+        supervisor = Task { [weak self] in
+            await self?.runSupervisor()
+        }
+    }
+
+    /// Stop the supervisor and tear down the current connection.
+    func stop() async {
+        supervisor?.cancel()
+        supervisor = nil
+        pinger?.cancel()
+        pinger = nil
+        await channel?.close()
+        channel = nil
+        for (_, p) in pending { p.timeout.cancel() }
+        pending.removeAll()
+        phase = .idle
+        setLink(.disconnected)
+    }
+
+    /// The current link state (test/inspection convenience).
+    func currentLinkState() -> RemoteLinkState { linkState }
+
+    // MARK: - Public command API
+
+    /// Seal and send a phone command. Delivery honesty is reported through the
+    /// event stream keyed by `command.commandId`.
+    func send(_ command: Wire.PhoneCommand) async {
+        await sendEnvelope(for: command, track: true)
+    }
+
+    // MARK: - Supervisor
+
+    private func runSupervisor() async {
+        record = (try? recordStore.load()) ?? nil
+        guard record != nil else {
+            setLink(.disconnected)
+            return
+        }
+
+        var attempt = 0
+        while !Task.isCancelled {
+            setLink(.connecting)
+            let authed = await runSession()
+            if Task.isCancelled { break }
+            setLink(.disconnected)
+            attempt = authed ? 0 : attempt + 1
+            let delay = Backoff.delay(attempt: attempt, jitterUnit: jitter())
+            try? await Task.sleep(for: delay)
+        }
+    }
+
+    /// One connection session. Returns whether it reached `auth_ok` (so the
+    /// supervisor can reset backoff after a genuinely-good session dropped).
+    private func runSession() async -> Bool {
+        guard let record else { return false }
+        guard let url = URL(string: record.relayURL) else { return false }
+
+        let ch: any WebSocketChannel
+        do {
+            ch = try await connector.connect(to: url)
+        } catch {
+            return false
+        }
+        channel = ch
+        sessionAuthed = false
+        phase = .awaitingHelloOk
+
+        // Derive the E2E channel for this pairing up front (needed the instant a
+        // replayed envelope arrives after resume).
+        do {
+            e2e = try deriveChannel(record)
+        } catch {
+            await ch.close()
+            channel = nil
+            return false
+        }
+
+        // hello.
+        do {
+            try await ch.send(.hello(
+                protocolVersion: Wire.protocolVersion,
+                role: .phone,
+                deviceId: Wire.DeviceId(identity.deviceId),
+                client: clientInfo
+            ))
+        } catch {
+            await ch.close()
+            channel = nil
+            return false
+        }
+        setLink(.authenticating)
+
+        startPinger(ch)
+
+        // Single receive loop driving the handshake then steady-state pump.
+        while !Task.isCancelled {
+            let frame: Wire.RelayFrame
+            do {
+                frame = try await ch.receive()
+            } catch {
+                break // drop / clean close / decode failure ends the session
+            }
+            let keepGoing = await handle(frame, on: ch)
+            if !keepGoing { break }
+        }
+
+        pinger?.cancel()
+        pinger = nil
+        await ch.close()
+        channel = nil
+        e2e = nil
+        phase = .idle
+        return sessionAuthed
+    }
+
+    private func startPinger(_ ch: any WebSocketChannel) {
+        pinger?.cancel()
+        let interval = config.pingInterval
+        let clock = now
+        pinger = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                if Task.isCancelled { return }
+                try? await ch.send(.ping(clientTimeMs: clock()))
+                _ = self // keep capture explicit
+            }
+        }
+    }
+
+    // MARK: - Frame handling
+
+    /// Handle one inbound frame. Returns `false` to end the session (reconnect).
+    private func handle(_ frame: Wire.RelayFrame, on ch: any WebSocketChannel) async -> Bool {
+        switch frame {
+        case .helloOk:
+            if phase == .awaitingHelloOk { phase = .awaitingChallenge }
+            return true
+
+        case .versionIncompatible:
+            return false
+
+        case let .authChallenge(nonce, _):
+            guard phase == .awaitingChallenge else { return true }
+            let signature: String
+            do {
+                signature = try identity.signBase64(nonceBase64: nonce)
+            } catch {
+                return false
+            }
+            let pairingIds = record.map { [Wire.PairingId($0.pairingId)] } ?? []
+            do {
+                try await ch.send(.authResponse(
+                    deviceId: Wire.DeviceId(identity.deviceId),
+                    signature: signature,
+                    pairingIds: pairingIds
+                ))
+            } catch {
+                return false
+            }
+            phase = .awaitingAuthOk
+            return true
+
+        case .authOk:
+            guard phase == .awaitingAuthOk else { return true }
+            sessionAuthed = true
+            phase = .live
+            latencyMs = 0
+            setLink(.connected(latencyMs: 0))
+            await onAuthenticated(ch)
+            return true
+
+        case let .peerPresence(_, peer, state, _):
+            let connected = state == .connected
+            if peer == .desktop { peerConnected = connected }
+            emit(.presence(peer: peer, connected: connected))
+            return true
+
+        case let .envelope(env):
+            await handleEnvelope(env, on: ch)
+            return true
+
+        case let .pong(clientTimeMs, _):
+            latencyMs = max(0, Int(now() - clientTimeMs))
+            setLink(.connected(latencyMs: latencyMs))
+            return true
+
+        case let .error(code, _, _):
+            return !isFatal(code)
+
+        case .bye:
+            return false
+
+        // Frames the phone never receives in steady state, or handshake
+        // restatements: ignore and keep the session alive.
+        case .ack, .resume, .ping, .hello, .authResponse,
+             .pairingOffer, .pairingOfferOk, .pairingClaim, .pairingClaimed,
+             .registerPushToken, .pushTokenAck:
+            return true
+        }
+    }
+
+    /// After `auth_ok`: resume from the persisted inbound cursor, then request a
+    /// fresh snapshot so the UI has current state immediately.
+    private func onAuthenticated(_ ch: any WebSocketChannel) async {
+        guard let record else { return }
+        try? await ch.send(.resume(
+            pairingId: Wire.PairingId(record.pairingId),
+            fromSeq: record.lastReceivedSeq
+        ))
+        if config.requestSnapshotOnResume {
+            let cmd = Wire.PhoneCommand(
+                commandId: Wire.CommandId("cmd_snap_\(shortToken())"),
+                issuedAtMs: now(),
+                body: .requestSnapshot(projectId: nil)
+            )
+            // A read: don't surface delivery honesty for the implicit refresh.
+            await sendEnvelope(for: cmd, track: false)
+        }
+    }
+
+    private func handleEnvelope(_ env: Wire.EncryptedEnvelope, on ch: any WebSocketChannel) async {
+        guard var record, env.pairingId.rawValue == record.pairingId else { return }
+        // The phone only consumes desktop→phone traffic.
+        guard env.sender == .desktop else { return }
+        // Dedup: ignore anything at/below the durable inbound cursor (§6.4).
+        guard env.seq > record.lastReceivedSeq else { return }
+        guard let e2e else { return }
+
+        // Open + decode BEFORE advancing the cursor: a failed open / AAD
+        // mismatch must be rejected without acking or advancing (§7.1).
+        let plaintext: Data
+        do {
+            plaintext = try e2e.open(
+                seq: env.seq,
+                sender: .desktop,
+                sentAtMs: env.sentAtMs,
+                nonceB64: env.nonce,
+                ciphertextB64: env.ciphertext
+            )
+        } catch {
+            return
+        }
+        let message: Wire.DesktopToPhone
+        do {
+            message = try JSONDecoder().decode(Wire.DesktopToPhone.self, from: plaintext)
+        } catch {
+            return
+        }
+
+        // Commit the cursor durably, then publish and ack contiguous receipt.
+        record.lastReceivedSeq = env.seq
+        self.record = record
+        try? recordStore.setLastReceivedSeq(env.seq)
+
+        if case let .commandAck(ack) = message {
+            resolvePending(ack)
+        }
+        emit(.message(message))
+
+        try? await ch.send(.ack(
+            pairingId: Wire.PairingId(record.pairingId),
+            cursor: env.seq
+        ))
+    }
+
+    // MARK: - Outbound
+
+    private func sendEnvelope(for command: Wire.PhoneCommand, track: Bool) async {
+        let commandId = command.commandId
+        guard phase == .live, let ch = channel, let e2e, var record else {
+            if track { fail(commandId, "not connected") }
+            return
+        }
+        // Never send blind when the desktop is known-absent (§5.3).
+        if peerConnected == false {
+            if track { fail(commandId, "peer unavailable") }
+            return
+        }
+
+        let plaintext: Data
+        do {
+            plaintext = try JSONEncoder().encode(command)
+        } catch {
+            if track { fail(commandId, "encode failed") }
+            return
+        }
+
+        let next = record.lastSentSeq + 1
+        let sentAt = now()
+        let sealed: (nonceB64: String, ciphertextB64: String)
+        do {
+            sealed = try e2e.seal(plaintext, seq: next, sentAtMs: sentAt)
+        } catch {
+            if track { fail(commandId, "seal failed") }
+            return
+        }
+
+        let envelope = Wire.EncryptedEnvelope(
+            pairingId: Wire.PairingId(record.pairingId),
+            seq: next,
+            sender: .phone,
+            sentAtMs: sentAt,
+            nonce: sealed.nonceB64,
+            ciphertext: sealed.ciphertextB64
+        )
+        do {
+            try await ch.send(.envelope(envelope))
+        } catch {
+            if track { fail(commandId, "send failed") }
+            return
+        }
+
+        // Commit the outbound cursor only after a successful send (§6.1).
+        record.lastSentSeq = next
+        self.record = record
+        try? recordStore.setLastSentSeq(next)
+
+        if track {
+            emit(.delivery(commandId: commandId, state: .sending))
+            let timeout = Task { [weak self] in
+                try? await Task.sleep(for: self?.config.commandTimeout ?? .seconds(10))
+                if Task.isCancelled { return }
+                await self?.timeoutCommand(commandId)
+            }
+            pending[commandId] = PendingCommand(seq: next, timeout: timeout)
+        }
+    }
+
+    private func resolvePending(_ ack: Wire.CommandAck) {
+        guard let p = pending.removeValue(forKey: ack.commandId) else { return }
+        p.timeout.cancel()
+        emit(.delivery(commandId: ack.commandId, state: .delivered(ack.outcome)))
+    }
+
+    private func timeoutCommand(_ commandId: Wire.CommandId) {
+        guard pending.removeValue(forKey: commandId) != nil else { return }
+        emit(.delivery(commandId: commandId, state: .failed(reason: "timed out")))
+    }
+
+    private func fail(_ commandId: Wire.CommandId, _ reason: String) {
+        emit(.delivery(commandId: commandId, state: .failed(reason: reason)))
+    }
+
+    // MARK: - Helpers
+
+    private func deriveChannel(_ record: PairingRecord) throws -> E2EChannel {
+        guard let peerPub = Data(base64Encoded: record.peerKeyAgreementPublicKeyB64) else {
+            throw E2EChannelError.invalidKeyMaterial
+        }
+        return try E2EChannel.derive(
+            identityPrivateScalar: keyAgreement.privateScalar,
+            peerPublicKeyX963: peerPub,
+            pairingID: record.pairingId,
+            salt: record.salt,
+            role: .phone
+        )
+    }
+
+    private func setLink(_ state: RemoteLinkState) {
+        guard state != linkState else { return }
+        linkState = state
+        emit(.link(state))
+    }
+
+    private func emit(_ event: TransportEvent) {
+        eventHandler?(event)
+    }
+
+    private func isFatal(_ code: Wire.RelayErrorCode) -> Bool {
+        switch code {
+        case .authFailed, .unsupportedVersion, .notAuthenticated, .badFrame, .internalError:
+            return true
+        case .unknownPairing, .pairingClaimRejected, .peerUnavailable, .rateLimited:
+            return false
+        }
+    }
+
+    private func shortToken() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased()
+    }
+}

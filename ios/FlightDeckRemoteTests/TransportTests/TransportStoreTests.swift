@@ -1,0 +1,138 @@
+//
+//  TransportStoreTests.swift
+//  FlightDeckRemoteTests
+//
+//  End-to-end through the app-facing facade: `TransportStore` runs a real
+//  `TransportClient` over a scripted socket and folds the event stream —
+//  snapshot, incremental status/rollup deltas, transcript replace/append,
+//  deduped AgentEvents, and per-command delivery honesty.
+//
+
+import Testing
+import Foundation
+@testable import FlightDeckRemote
+
+@MainActor
+@Suite struct TransportStoreTests {
+
+    private func git() -> Wire.GitIndicators {
+        Wire.GitIndicators(branch: "main", added: 0, modified: 0, removed: 0,
+                           ahead: 0, behind: 0, drift: 0, hasUpstream: true)
+    }
+
+    private func rollup() -> Wire.StatusRollup {
+        Wire.StatusRollup(dot: .idle, summary: "1 agent", working: 0, idle: 1,
+                          needsInput: 0, manual: 0, agentCount: 1)
+    }
+
+    private func snapshot() -> Wire.StateSnapshot {
+        let session = Wire.SessionState(
+            sessionId: Wire.SessionId("s1"), projectId: Wire.ProjectId("p1"),
+            name: "fix-login", agentType: .claudeCode, status: .idle, git: git(),
+            runningTimeSecs: 0, pendingQuestion: nil)
+        let project = Wire.ProjectState(projectId: Wire.ProjectId("p1"), name: "Proj",
+                                        rollup: rollup(), sessions: [session])
+        return Wire.StateSnapshot(serverTimeMs: 1, projects: [project])
+    }
+
+    private func makeStore(keychain: InMemoryKeychainStore, channel: ScriptedChannel,
+                           peer: DesktopPeer, ka: KeyAgreementKeys) throws -> (TransportStore, TransportClient) {
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .seconds(30)
+        let client = TransportClient(
+            identity: identity, keyAgreement: ka, recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config, jitter: { 0 }, now: { 1 })
+        let store = TransportStore(client: client, now: { 1 })
+        return (store, client)
+    }
+
+    private func handshake(_ channel: ScriptedChannel, store: TransportStore) async {
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_test_1")]))
+        _ = await waitUntilMain { if case .connected = store.linkState { return true }; return false }
+    }
+
+    @Test func foldsSnapshotStatusRollupTranscriptAndEvents() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let (store, client) = try makeStore(keychain: keychain, channel: channel, peer: peer, ka: ka)
+        await store.start()
+        await handshake(channel, store: store)
+
+        // Snapshot (seq 1).
+        try await channel.push(peer.envelopeFrame(.snapshot(snapshot()), seq: 1))
+        _ = await waitUntilMain { store.snapshot != nil }
+        #expect(store.snapshot?.projects.first?.sessions.first?.status == .idle)
+
+        // Status delta (seq 2): flip the session to needs_input.
+        let delta = Wire.SessionStatusDelta(
+            sessionId: Wire.SessionId("s1"), projectId: Wire.ProjectId("p1"),
+            status: .needsInput, runningTimeSecs: 42, pendingQuestion: "Run it?")
+        try await channel.push(peer.envelopeFrame(.statusUpdate(Wire.StatusUpdate(updates: [delta])), seq: 2))
+        _ = await waitUntilMain { store.snapshot?.projects.first?.sessions.first?.status == .needsInput }
+        #expect(store.snapshot?.projects.first?.sessions.first?.runningTimeSecs == 42)
+        #expect(store.snapshot?.projects.first?.sessions.first?.pendingQuestion == "Run it?")
+
+        // Rollup refresh (seq 3).
+        let newRollup = Wire.StatusRollup(dot: .needsInput, summary: "1 needs input",
+                                          working: 0, idle: 0, needsInput: 1, manual: 0, agentCount: 1)
+        try await channel.push(peer.envelopeFrame(
+            .rollup(Wire.RollupUpdate(projects: [Wire.ProjectRollup(projectId: Wire.ProjectId("p1"), rollup: newRollup)])), seq: 3))
+        _ = await waitUntilMain { store.snapshot?.projects.first?.rollup.dot == .needsInput }
+
+        // Transcript replace (seq 4) then append (seq 5).
+        let item1 = Wire.TranscriptItem.userMessage(itemId: Wire.ItemId("i1"), text: "hello", atMs: 1)
+        try await channel.push(peer.envelopeFrame(
+            .transcript(Wire.TranscriptFeed(sessionId: Wire.SessionId("s1"), fromIndex: 0, replace: true, items: [item1])), seq: 4))
+        _ = await waitUntilMain { store.transcripts[Wire.SessionId("s1")]?.count == 1 }
+        let item2 = Wire.TranscriptItem.agentMessage(itemId: Wire.ItemId("i2"), text: "hi", atMs: 2)
+        try await channel.push(peer.envelopeFrame(
+            .transcriptAppend(Wire.TranscriptFeed(sessionId: Wire.SessionId("s1"), fromIndex: 1, replace: false, items: [item2])), seq: 5))
+        _ = await waitUntilMain { store.transcripts[Wire.SessionId("s1")]?.count == 2 }
+
+        // AgentEvents deduped by event_id across two distinct envelopes.
+        let event = Wire.AgentEvent(
+            eventId: Wire.EventId("evt1"), kind: .finished(summary: "done", filesChanged: 2, readyToPush: true),
+            deepLink: Wire.DeepLink(projectId: Wire.ProjectId("p1"), sessionId: Wire.SessionId("s1"), itemId: nil),
+            occurredAtMs: 1, title: "finished")
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 6))
+        _ = await waitUntilMain { store.agentEvents.count == 1 }
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 7)) // same event_id, new seq
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(store.agentEvents.count == 1)
+
+        await client.stop()
+    }
+
+    @Test func sendCommandTracksDeliveryHonestyThroughAck() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let (store, client) = try makeStore(keychain: keychain, channel: channel, peer: peer, ka: ka)
+        await store.start()
+        await handshake(channel, store: store)
+
+        let handle = store.sendCommand(.reply(sessionId: Wire.SessionId("s1"), text: "yes"))
+        #expect(handle.delivery == .sending)
+
+        // Wait for the outbound envelope, then desktop acks the command.
+        _ = await waitUntilMain {
+            await channel.sentFrames().contains { if case .envelope = $0 { return true }; return false }
+        }
+        let ack = Wire.CommandAck(commandId: handle.commandId, outcome: .applied, message: nil)
+        try await channel.push(peer.envelopeFrame(.commandAck(ack), seq: 1))
+
+        _ = await waitUntilMain { handle.delivery == .delivered(.applied) }
+        #expect(handle.delivery == .delivered(.applied))
+        await client.stop()
+    }
+}

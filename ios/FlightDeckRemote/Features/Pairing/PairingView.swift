@@ -20,7 +20,9 @@ import SwiftUI
 
 struct PairingView: View {
     var pairingStore: PairingStore
-    var service: PairingServicing = MockPairingService()
+    // Chosen at the composition root: the deterministic mock under UI tests /
+    // in DEBUG, the real relay-backed service otherwise (PairingServiceFactory).
+    var service: PairingServicing = PairingServiceFactory.makeDefault()
 
     @State private var code: String = ""
     @State private var isLoading = false
