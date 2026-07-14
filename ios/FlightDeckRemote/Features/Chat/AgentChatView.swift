@@ -20,9 +20,10 @@
 //     `transcript`/`transcript_append` deltas stream straight in via the
 //     view-model's store binding, and the store is the command sender + gate
 //     source.
-//   - `ChatComposeBar.onHoldToTalk` — the custom hold-to-talk voice task
-//     (`remote-control-chat-voice-dictation`) fills this in; v1 mic uses system
-//     keyboard dictation only (PRD §7).
+//  Voice (PRD §7): the compose bar's mic is push-to-talk (hold to record,
+//  release to drop an EDITABLE transcript into the field — never auto-sent),
+//  driven by `DictationController`. A quick tap still falls back to focusing the
+//  field for system keyboard dictation (the v1 affordance).
 //
 
 import SwiftUI
@@ -39,6 +40,12 @@ struct AgentChatView: View {
     @State private var scriptedSender = ScriptedChatCommandSender()
     @State private var fixtureSource = FixtureConnectionSource()
     #endif
+
+    // Push-to-talk voice compose (PRD §7). The controller picks the real
+    // recognizer, or the DEBUG scripted one under `-uitest-dictation-transcript`.
+    @State private var dictation = DictationController()
+    // Eyes-free focus mode (PRD §5.3 3b), presented over the chat.
+    @State private var showFocusMode = false
 
     @Environment(\.dismiss) private var dismiss
 
@@ -95,13 +102,25 @@ struct AgentChatView: View {
                 ChatComposeBar(sessionName: model.sessionName,
                                text: $model.draft,
                                commandsPaused: commandsPaused,
-                               onSend: { model.send() })
+                               onSend: { model.send() },
+                               isListening: dictation.isListening,
+                               onHoldBegin: { dictation.beginHold() },
+                               onHoldEnd: { dictation.endHold() })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep)
         .navigationBarBackButtonHidden(true)
+        .fullScreenCover(isPresented: $showFocusMode) {
+            FocusModeView(model: model, dictation: dictation)
+        }
         .task {
+            // Dictation drops its transcript into the field as editable text —
+            // edit-before-send, always (PRD §7); it is never auto-sent.
+            await dictation.prepare()
+            dictation.onCommit = { text in
+                model.draft = model.draft.isEmpty ? text : model.draft + " " + text
+            }
             // Fixture (DEBUG / preview) wins so UI tests are deterministic;
             // otherwise bind to the live store and stream deltas in.
             if model.loadFixtureIfRequested() {
@@ -153,6 +172,21 @@ struct AgentChatView: View {
                 }
             }
             Spacer(minLength: 0)
+            // Eyes-free focus mode (PRD §5.3 3b) — offered when the agent is
+            // waiting on the human (a pending permission / question to pin).
+            if model.pendingPromptItemId != nil {
+                Button {
+                    showFocusMode = true
+                } label: {
+                    Image(systemName: "person.crop.circle.badge.moon")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Focus mode")
+                .accessibilityIdentifier("focus-enter")
+            }
             SessionActionsButton(sessionId: model.sessionId, sessionName: model.sessionName, status: model.status, store: store) // Control feature hook (PRD §5.6)
         }
         .padding(.horizontal, Theme.Spacing.lg)

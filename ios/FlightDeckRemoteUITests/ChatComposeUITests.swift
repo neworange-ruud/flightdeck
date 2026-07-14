@@ -43,10 +43,11 @@ final class ChatComposeUITests: XCTestCase {
 
         let field = element(app, "compose-field")
         XCTAssertTrue(field.waitForExistence(timeout: 3))
-        // The mic button programmatically focuses the field (the v1 dictation
-        // affordance) — a deterministic focus path for SwiftUI text fields,
-        // whose direct taps can race the keyboard. Fall back to a direct tap.
-        element(app, "compose-mic").tap()
+        // A quick tap on the push-to-talk mic focuses the field (the v1
+        // keyboard-dictation fallback) — a deterministic focus path for SwiftUI
+        // text fields, whose direct taps can race the keyboard. Fall back to a
+        // direct tap.
+        element(app, "compose-hold-to-talk").tap()
         if !app.keyboards.firstMatch.waitForExistence(timeout: 3) {
             field.tap()
             _ = app.keyboards.firstMatch.waitForExistence(timeout: 3)
@@ -99,5 +100,53 @@ final class ChatComposeUITests: XCTestCase {
                        "Allow should be disabled while the link is down")
         XCTAssertFalse(element(app, "permission-deny").isEnabled,
                        "Deny should be disabled while the link is down")
+    }
+
+    // MARK: - Voice compose (hold-to-talk, edit-before-send — PRD §7)
+
+    /// Launch with the scripted-transcript dictation seam so hold-to-talk yields
+    /// a deterministic transcript (real STT is unavailable in the simulator).
+    private func launchChatWithDictation(transcript: String) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += ["-uitest-reset-pairing", "-uitest-fixture-transcript",
+                                "-uitest-linkstate", "connected:20",
+                                "-uitest-dictation-transcript", transcript]
+        app.launch()
+        let toggle = element(app, "debug-toggle-paired-button")
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        toggle.tap()
+        XCTAssertTrue(element(app, "AgentChatView").waitForExistence(timeout: 5))
+        return app
+    }
+
+    @MainActor
+    func testHoldToTalkDropsEditableTranscriptThenEditAndSend() throws {
+        let app = launchChatWithDictation(transcript: "Yes, run it")
+
+        let mic = element(app, "compose-hold-to-talk")
+        XCTAssertTrue(mic.waitForExistence(timeout: 3))
+        // HOLD to record → RELEASE to stop. Held well past the dictation minimum
+        // so the scripted transcript commits (a quick tap would just focus).
+        mic.press(forDuration: 1.0)
+
+        // The transcript lands in the field as EDITABLE text — never auto-sent.
+        let field = element(app, "compose-field")
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        let value = (field.value as? String) ?? ""
+        XCTAssertTrue(value.contains("Yes, run it"),
+                      "Expected the dictated transcript in the editable field, got: \(value)")
+
+        // Nothing was sent yet — no optimistic message exists.
+        XCTAssertFalse(element(app, "prose-user-sending").exists,
+                       "Dictation must never auto-send (edit-before-send, always)")
+
+        // Edit the dictated text, then Send.
+        field.tap()
+        field.typeText(". Then rebuild.")
+        let send = element(app, "compose-send")
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+        XCTAssertTrue(element(app, "prose-user-sending").waitForExistence(timeout: 3),
+                      "Expected an optimistic pending message after editing + Send")
     }
 }

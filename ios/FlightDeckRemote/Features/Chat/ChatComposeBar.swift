@@ -8,11 +8,12 @@
 //  is down the send button is disabled and a subtle "paused — reconnecting"
 //  label states it honestly, rather than letting the user send blind.
 //
-//  Voice: v1 mic is the *system keyboard dictation* affordance only (PRD §7
-//  MVP: native dictation + strict edit-before-send). The mic button focuses the
-//  field and surfaces the keyboard (whose dictation key does the STT); a
-//  separate `onHoldToTalk` seam closure is left for the custom hold-to-talk
-//  voice task (`remote-control-chat-voice-dictation`) and is not wired here.
+//  Voice (PRD §7): the mic is push-to-talk. HOLD it to record ("Listening…"),
+//  RELEASE to stop; the transcription drops into this field as EDITABLE text
+//  (edit-before-send, always — never auto-sent). A quick tap (a hold released
+//  before the dictation minimum) falls back to focusing the field so the system
+//  keyboard's dictation key is reachable — the v1 affordance, still available
+//  (and the only behaviour when no hold-to-talk handler is wired).
 //
 
 import SwiftUI
@@ -26,12 +27,26 @@ struct ChatComposeBar: View {
     let commandsPaused: Bool
     /// Send the current text.
     let onSend: () -> Void
-    /// Seam for the future custom hold-to-talk voice task. When set, the mic
-    /// button routes to it; otherwise the mic focuses the field so the system
-    /// keyboard's dictation key is reachable (the v1 behaviour).
-    var onHoldToTalk: (() -> Void)?
+    /// Whether push-to-talk is actively recording — drives the "Listening…"
+    /// indicator and the mic's hot appearance.
+    var isListening: Bool = false
+    /// Push-to-talk hold began (mic pressed). When set, the mic drives voice
+    /// dictation; when `nil`, the mic just focuses the field (v1 behaviour).
+    var onHoldBegin: (() -> Void)?
+    /// Push-to-talk hold ended (mic released) — the controller stops recording
+    /// and either drops the transcript in or (on a mis-tap) triggers the field.
+    var onHoldEnd: (() -> Void)?
 
     @FocusState private var isFocused: Bool
+    /// When the mic is pressed, the wall-clock press start — a release before
+    /// `quickTapThreshold` is treated as a tap (focus the field), not a hold.
+    @State private var pressStart: Date?
+
+    /// Below this hold duration a mic press is a tap (focus the field), not a
+    /// dictation. Matches `DictationStateMachine.minimumHoldDuration`.
+    private let quickTapThreshold: TimeInterval = 0.35
+
+    private var voiceEnabled: Bool { onHoldBegin != nil }
 
     private var trimmed: String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -41,7 +56,9 @@ struct ChatComposeBar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            if commandsPaused {
+            if isListening {
+                listeningIndicator
+            } else if commandsPaused {
                 Text("paused — reconnecting")
                     .typography(Typography.caption)
                     .foregroundStyle(Theme.textDim)
@@ -85,25 +102,60 @@ struct ChatComposeBar: View {
         .accessibilityIdentifier("chat-compose-bar")
     }
 
-    private var micButton: some View {
-        Button {
-            if let onHoldToTalk {
-                onHoldToTalk()
-            } else {
-                // v1: focus the field so the keyboard (with its dictation key)
-                // comes up — free iOS dictation, edit-before-send preserved.
-                isFocused = true
-            }
-        } label: {
-            Image(systemName: "mic.fill")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Theme.textMuted)
-                .frame(width: 44, height: 44)
-                .background(Circle().fill(Theme.bgField))
-                .contentShape(Circle())
+    private var listeningIndicator: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            Circle()
+                .fill(Theme.accent)
+                .frame(width: 8, height: 8)
+            Text("Listening…")
+                .typography(Typography.caption)
+                .foregroundStyle(Theme.accent)
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("compose-mic")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Listening")
+        .accessibilityIdentifier("compose-listening-indicator")
+    }
+
+    // The mic is a plain shape driven by a press/release gesture when voice is
+    // wired (hold to talk, quick tap to focus); a simple Button otherwise.
+    private var micButton: some View {
+        micLabel
+            .contentShape(Circle())
+            .accessibilityIdentifier("compose-hold-to-talk")
+            .accessibilityLabel(isListening ? "Recording — release to stop"
+                                             : "Hold to talk")
+            .accessibilityAddTraits(.isButton)
+            .gesture(voiceEnabled ? micGesture : nil)
+            .onTapGesture {
+                // The no-voice fallback (and a belt-and-braces path for the
+                // gesture): a plain tap focuses the field for keyboard dictation.
+                if !voiceEnabled { isFocused = true }
+            }
+    }
+
+    private var micLabel: some View {
+        Image(systemName: isListening ? "waveform" : "mic.fill")
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(isListening ? Theme.bgDeep : Theme.textMuted)
+            .frame(width: 44, height: 44)
+            .background(Circle().fill(isListening ? Theme.accent : Theme.bgField))
+    }
+
+    /// Press-and-hold to record; release to stop. A release before
+    /// `quickTapThreshold` focuses the field instead (v1 keyboard dictation).
+    private var micGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                guard pressStart == nil else { return }
+                pressStart = Date()
+                onHoldBegin?()
+            }
+            .onEnded { _ in
+                let held = pressStart.map { Date().timeIntervalSince($0) } ?? 0
+                pressStart = nil
+                onHoldEnd?()
+                if held < quickTapThreshold { isFocused = true }
+            }
     }
 
     private var sendButton: some View {
