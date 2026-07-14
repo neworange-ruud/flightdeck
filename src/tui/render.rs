@@ -3247,10 +3247,11 @@ mod tests {
         .unwrap();
 
         let buffer = term.backend().buffer();
-        // Nine settings plus headers, spacing, legend, and two border rows need
-        // 19 rows. The box should be centered rather than filling all 24 rows.
-        assert_eq!(buffer[(7, 2)].symbol(), "┌");
-        assert_eq!(buffer[(7, 20)].symbol(), "└");
+        // Thirteen settings plus headers, spacing, legend, and two border rows
+        // fit the box to its content (23 of 24 rows) rather than stretching to a
+        // fixed height; centered_overlay places its top-left corner at column 7.
+        assert_eq!(buffer[(7, 0)].symbol(), "┌");
+        assert_eq!(buffer[(7, 22)].symbol(), "└");
     }
 
     #[test]
