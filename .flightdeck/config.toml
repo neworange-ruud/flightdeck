@@ -57,6 +57,7 @@ name = "flightdeck"
 [ui]
 agent_tab_position = "left"
 default_agent = "opencode"
+use_f2_to_leave_terminal_focus = true
 
 [update]
 check = true

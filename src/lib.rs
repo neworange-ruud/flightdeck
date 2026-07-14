@@ -253,20 +253,11 @@ pub fn run() -> Result<()> {
     let notifier = SystemNotifier;
     let loop_result = event_loop(&mut terminal, &mut workspace, &env, &notifier);
 
-    // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
-    // every session so no orphaned child processes remain. Persist on the way
-    // out (best effort) regardless of how the loop ended.
-    if keyboard_enhanced {
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    let _ = restore_terminal_title();
-    ratatui::restore();
-
-    // Persist every project's own state.json (SPECS §9), then the workspace file
-    // recording which projects were open + the active one (best effort — a save
-    // failure never overrides the loop result).
+    // CLEAN TEARDOWN (SPECS §25). Persist FIRST, before touching the terminal:
+    // on a severed terminal (Konsole/window close closes stdin+stdout+stderr) the
+    // terminal-restore step is worthless anyway, and it must never run ahead of
+    // the save — otherwise a failed restore that writes to the dead stderr can
+    // take the process down before the state is written.
     let mut persist_result = Ok(());
     for p in workspace.projects.iter() {
         let services = env.services(&p.git);
@@ -287,6 +278,27 @@ pub fn run() -> Result<()> {
         let _ = save_workspace(&fs, wp, &ws_state);
     }
 
+    // Restore the terminal (best effort). Use `try_restore` — NOT `restore` —
+    // because `ratatui::restore` `eprintln!`s on failure, and `eprintln!` itself
+    // panics when stderr is gone (the exact Konsole-close case), which would
+    // abort the process. `try_restore` just returns the error for us to ignore.
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = restore_terminal_title();
+    let _ = ratatui::try_restore();
+    // Show the cursor ourselves, then skip the `Terminal`'s own `Drop`. ratatui's
+    // Drop `eprintln!`s when showing the cursor fails, and `eprintln!` panics when
+    // stderr is also gone (Konsole close severs stdin+stdout+stderr) — which would
+    // abort the process here, after we've already persisted. Our explicit call
+    // restores the cursor on a live terminal; on a dead one the doomed write is
+    // simply dropped, and `forget` prevents the aborting Drop.
+    let _ = terminal.show_cursor();
+    std::mem::forget(terminal);
+
+    // Terminate every session so no orphaned child processes remain.
     for p in workspace.projects.iter_mut() {
         terminate_all_sessions(&mut p.state);
     }
@@ -1126,6 +1138,52 @@ fn project_status_flags(
 // Event loop (SPECS §23)
 // ---------------------------------------------------------------------------
 
+/// One decision of the main loop's input step: what to do next.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopStep {
+    /// Shut down cleanly (a shutdown signal fired, or the input source is gone).
+    Shutdown,
+    /// Handle this input event.
+    Input(Event),
+    /// Nothing happened this tick; run the per-tick work and loop again.
+    Idle,
+}
+
+/// Decide the next loop step from the shutdown flag and the input channel,
+/// waiting at most `timeout` for an event.
+///
+/// Crucially, this NEVER blocks longer than `timeout`, so the shutdown flag is
+/// always observed promptly — even when the controlling terminal has been
+/// severed (Konsole/window close), where crossterm's own `event::poll`/`read`
+/// busy-loops on EOF and never returns. The blocking `event::read` runs on a
+/// separate thread feeding `rx`; if that thread ends (channel disconnected) we
+/// also shut down. The flag is checked both before and after the wait so a
+/// signal that arrives *during* the wait is caught on this same tick.
+fn next_loop_step(
+    shutdown: &std::sync::atomic::AtomicBool,
+    rx: &Receiver<Event>,
+    timeout: Duration,
+) -> LoopStep {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    if shutdown.load(Ordering::Relaxed) {
+        return LoopStep::Shutdown;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(event) => LoopStep::Input(event),
+        Err(RecvTimeoutError::Timeout) => {
+            if shutdown.load(Ordering::Relaxed) {
+                LoopStep::Shutdown
+            } else {
+                LoopStep::Idle
+            }
+        }
+        // The input reader thread exited (e.g. terminal gone) → shut down.
+        Err(RecvTimeoutError::Disconnected) => LoopStep::Shutdown,
+    }
+}
+
 /// The main event loop. Services every open project's PTYs/status/notifications
 /// each tick (so background projects stay live), renders the active project plus
 /// the project tab row, and routes input until the user quits or a fatal error
@@ -1164,11 +1222,27 @@ fn event_loop(
     // runs, instead of the process dying without saving or cleaning up.
     let shutdown = crate::signals::install_shutdown_flag();
 
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+    // Read terminal input on a dedicated thread that feeds a channel. The main
+    // loop then waits on the channel with a timeout (`next_loop_step`) instead of
+    // calling crossterm's `event::poll`/`read` directly. This decouples the loop
+    // from crossterm's blocking behaviour: when the controlling terminal is
+    // severed (Konsole/window close) crossterm busy-loops on EOF and never
+    // returns, but the main loop still wakes every `POLL_TIMEOUT`, sees the
+    // shutdown flag (SIGHUP), and exits cleanly so teardown can persist + stop
+    // agents. The reader thread is detached; it ends with the process.
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<Event>();
+    std::thread::spawn(move || {
+        // `event::read` blocks until an event (or busy-loops on a dead tty); the
+        // main loop no longer depends on it returning. Stop if the receiver is
+        // gone or crossterm reports a hard error.
+        while let Ok(event) = event::read() {
+            if input_tx.send(event).is_err() {
+                break;
+            }
         }
+    });
 
+    loop {
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
         let n = workspace.projects.len();
@@ -1268,14 +1342,15 @@ fn event_loop(
             })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
-        // --- Poll for input (short timeout so PTY output keeps flowing). ---
-        let has_event = event::poll(POLL_TIMEOUT)
-            .map_err(|e| FlightDeckError::Io(format!("event poll failed: {e}")))?;
-        if !has_event {
-            continue;
-        }
+        // --- Wait for input via the reader thread (short timeout so PTY output
+        //     keeps flowing and the shutdown flag is observed promptly). ---
+        let event = match next_loop_step(&shutdown, &input_rx, POLL_TIMEOUT) {
+            LoopStep::Shutdown => break,
+            LoopStep::Idle => continue,
+            LoopStep::Input(event) => event,
+        };
 
-        match event::read().map_err(|e| FlightDeckError::Io(format!("event read failed: {e}")))? {
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if handle_key(key, workspace, env, &mut ui)? {
                     break; // Quit requested via the Ctrl-q key action.
@@ -3654,6 +3729,58 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    // --- next_loop_step: the shutdown-flag / input decision --------------
+
+    #[test]
+    fn loop_step_shuts_down_when_flag_set_without_touching_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(true);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        // An event is available, but the shutdown flag must win — and we must
+        // not consume the event.
+        tx.send(Event::Resize(80, 24)).unwrap();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Shutdown
+        );
+        assert!(rx.try_recv().is_ok(), "input event must not be consumed");
+    }
+
+    #[test]
+    fn loop_step_returns_queued_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        tx.send(Event::Resize(120, 40)).unwrap();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Input(Event::Resize(120, 40))
+        );
+    }
+
+    #[test]
+    fn loop_step_is_idle_on_timeout_with_no_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel::<Event>();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Idle
+        );
+    }
+
+    #[test]
+    fn loop_step_shuts_down_when_input_source_disconnected() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        drop(tx); // reader thread gone (e.g. terminal severed)
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Shutdown
+        );
+    }
 
     fn make_real_agent(dir: &TempDir, key: &str) -> AgentDef {
         let path = dir.path().join(key);

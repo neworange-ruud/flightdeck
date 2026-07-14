@@ -33,6 +33,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - Terminate agents gracefully on shutdown: send `SIGTERM` to the whole process
   group, allow a short grace period, then `SIGKILL` — so agents can exit cleanly
   and child processes are no longer orphaned.
+- Exit cleanly and still save `state.json` when the terminal window is closed
+  (e.g. Konsole), where stdin/stdout/stderr are all severed. Input is now read on
+  a dedicated thread so the loop always notices the shutdown signal instead of
+  hanging on crossterm's EOF busy-loop; state is persisted before the terminal is
+  restored; and the cursor-restore is made panic-safe on a dead tty.
 
 ## [1.7.2] - 2026-07-14
 
