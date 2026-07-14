@@ -4,3 +4,6 @@
 .flightdeck/agent-status
 .flightdeck/runtime/
 .reference-developer-agent-container/
+
+# Superpowers scratch (brainstorm companion, sdd ledger/briefs)
+.superpowers/
