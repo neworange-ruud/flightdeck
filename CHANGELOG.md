@@ -12,9 +12,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- The terminal viewport now dims while in APP mode (configurable via
-  `UiConfig.dim_terminal_in_app_mode`), making it clearer at a glance which
-  mode has input focus.
+- The input mode (APP / TERMINAL) is now more visible at a glance: a
+  mode-colored status chip, an opt-in colored border around the pane that has
+  keyboard focus (`ui.mode_border`, off by default), and terminal dimming in
+  APP mode (`ui.dim_terminal_in_app_mode`, on by default). New `[ui]` settings:
+  `terminal_mode_color`, `app_mode_color`, `mode_border`,
+  `dim_terminal_in_app_mode`.
 
 ### Bug fixes
 

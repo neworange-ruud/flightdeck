@@ -815,6 +815,29 @@ layout:
 
 This is in addition to the keyboard focus controls (Esc / Enter) above.
 
+### Mode visibility
+
+Because typing in the wrong mode is jarring, the current mode is shown by three
+reinforcing cues, all configurable in `[ui]`:
+
+- **Mode chip** — the `MODE: …` chip in the status bar, colored by the mode.
+- **Live-pane border** — when `ui.mode_border` is `dim`/`normal`/`bright`, the
+  pane receiving keystrokes is framed: the terminal viewport in TERMINAL mode,
+  the sidebar in APP mode. Colors come from `ui.terminal_mode_color` /
+  `ui.app_mode_color`. Border space is reserved statically so switching modes
+  never resizes the terminal. Default `off`.
+- **Terminal dimming** — when `ui.dim_terminal_in_app_mode` is `true` (default),
+  the terminal viewport dims in APP mode, signalling it is not listening.
+
+Settings (`[ui]`):
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `terminal_mode_color` | green, cyan, blue, magenta, yellow, red, white | green |
+| `app_mode_color` | (same set) | cyan |
+| `mode_border` | off, dim, normal, bright | off |
+| `dim_terminal_in_app_mode` | true / false | true |
+
 Required shortcuts:
 
 ```text
