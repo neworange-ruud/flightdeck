@@ -525,28 +525,34 @@ pub fn draw(
         draw_terminal_viewport(frame, state, ml.terminal, now_ms);
     }
 
-    // Live-pane border (SPECS §23): frame whichever pane is receiving keys. The
+    // Live-pane border (SPECS §23): frame ONLY the pane receiving keys. The
     // frame rects are present only when `mode_border != off`; geometry is fixed
-    // by layout::compute, so only the color changes with the mode.
-    if let Some(frame_rect) = ml.sidebar_frame {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(mode_style::pane_border_style(
-                &state.config.ui,
-                state.mode(),
-                mode_style::Pane::Sidebar,
-            ));
-        frame.render_widget(block, frame_rect);
+    // by layout::compute. The non-focused pane's frame is not drawn at all —
+    // previously it was rendered dark gray, which read as visual clutter.
+    let mode = state.mode();
+    if mode == InputMode::App {
+        if let Some(frame_rect) = ml.sidebar_frame {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(mode_style::pane_border_style(
+                    &state.config.ui,
+                    mode,
+                    mode_style::Pane::Sidebar,
+                ));
+            frame.render_widget(block, frame_rect);
+        }
     }
-    if let Some(frame_rect) = ml.terminal_frame {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(mode_style::pane_border_style(
-                &state.config.ui,
-                state.mode(),
-                mode_style::Pane::Terminal,
-            ));
-        frame.render_widget(block, frame_rect);
+    if mode == InputMode::Terminal {
+        if let Some(frame_rect) = ml.terminal_frame {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(mode_style::pane_border_style(
+                    &state.config.ui,
+                    mode,
+                    mode_style::Pane::Terminal,
+                ));
+            frame.render_widget(block, frame_rect);
+        }
     }
 
     let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
@@ -788,7 +794,15 @@ pub fn draw_sidebar(
     area: Rect,
     now_ms: u64,
 ) {
-    let block = Block::default().borders(Borders::RIGHT);
+    // When the live-pane border feature is on, the focused pane's frame
+    // already supplies the separating vertical line, so the sidebar's own
+    // right divider is suppressed here — otherwise two adjacent vertical
+    // lines would be drawn (SPECS §23).
+    let block = if mode_style::border_enabled(&state.config.ui) {
+        Block::default()
+    } else {
+        Block::default().borders(Borders::RIGHT)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1234,6 +1248,16 @@ fn render_screen(
                 if cell.inverse() {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
+                // Gray out dimmed (unfocused) terminal text: force a muted gray
+                // foreground and drop bold, so inactive terminal content reads
+                // clearly as "asleep". Applied BEFORE the selection override
+                // below so a selected cell's highlight always wins.
+                if dim {
+                    style = style
+                        .fg(Color::DarkGray)
+                        .remove_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::DIM);
+                }
                 // Selection highlight overrides the cell background and drops any
                 // inverse so the highlight reads consistently.
                 if sel_cols.map(|(a, b)| c >= a && c <= b).unwrap_or(false) {
@@ -1241,9 +1265,6 @@ fn render_screen(
                         .bg(SELECTION_BG)
                         .fg(Color::White)
                         .remove_modifier(Modifier::REVERSED);
-                }
-                if dim {
-                    style = style.add_modifier(Modifier::DIM);
                 }
                 target.set_style(style);
             }
@@ -2994,6 +3015,129 @@ mod tests {
         assert!(
             text.contains('┐') || text.contains('┌') || text.contains('└') || text.contains('┘'),
             "expected a border corner glyph when mode_border = normal"
+        );
+    }
+
+    #[test]
+    fn draw_renders_only_focused_pane_border_in_terminal_mode() {
+        // Change 1: only the live pane gets a frame. In TERMINAL mode the
+        // terminal frame is drawn (a corner glyph appears inside its rect);
+        // the sidebar frame must NOT be drawn at all (no corner glyph inside
+        // its rect), since the inactive pane no longer gets a DarkGray frame.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.config.ui.mode_border = "normal".to_string();
+        state.focus_terminal();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let ml = layout::compute(area, mode_style::border_enabled(&state.config.ui));
+        let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
+        let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
+
+        let mut term = test_terminal(120, 40);
+        let cache = GitStatusCache::new();
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let is_corner = |r: Rect| -> bool {
+            let mut found = false;
+            for y in r.y..r.y.saturating_add(r.height) {
+                for x in r.x..r.x.saturating_add(r.width) {
+                    let sym = buf[(x, y)].symbol();
+                    if matches!(sym, "┐" | "┌" | "└" | "┘") {
+                        found = true;
+                    }
+                }
+            }
+            found
+        };
+
+        assert!(
+            is_corner(terminal_frame),
+            "expected a border corner glyph in the terminal frame when live in TERMINAL mode"
+        );
+        assert!(
+            !is_corner(sidebar_frame),
+            "sidebar frame must not be drawn when it is not the live pane"
+        );
+    }
+
+    #[test]
+    fn render_screen_dim_grays_out_non_selected_cells() {
+        // Change 3: dimming must strongly gray out inactive terminal text
+        // (fg forced to DarkGray), not just apply a subtle DIM modifier, and
+        // must not corrupt the selection highlight for selected cells.
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"HELLO");
+        let screen = parser.screen().clone();
+
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 10, 4);
+        term.draw(|f| {
+            render_screen(f, area, &screen, false, None, true);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let cell = &buf[(0, 0)];
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::DarkGray),
+            "dimmed non-selected cell should be forced to DarkGray fg"
+        );
+    }
+
+    #[test]
+    fn render_screen_dim_preserves_selection_highlight() {
+        // The selection override must win over the dim gray-out: a selected
+        // cell keeps White fg / SELECTION_BG bg even when `dim` is true.
+        use crate::tui::selection::{Point, Selection};
+
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"HELLO");
+        let screen = parser.screen().clone();
+
+        // Screen row 0 (top of a 4-row screen at offset 0) is rows-from-bottom
+        // 3; select columns 0..=4 on that row so cell (0, 0) is covered.
+        let selection = Selection {
+            anchor: Point {
+                rows_from_bottom: 3,
+                col: 0,
+            },
+            head: Point {
+                rows_from_bottom: 3,
+                col: 4,
+            },
+        };
+
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 10, 4);
+        term.draw(|f| {
+            render_screen(f, area, &screen, false, Some(&selection), true);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let cell = &buf[(0, 0)];
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::White),
+            "selected cell must keep white fg even while dimmed"
+        );
+        assert_eq!(
+            cell.style().bg,
+            Some(SELECTION_BG),
+            "selected cell must keep the selection background even while dimmed"
         );
     }
 
