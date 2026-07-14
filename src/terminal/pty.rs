@@ -138,7 +138,9 @@ const TERMINATE_GRACE_STEPS: usize = 20;
 #[cfg(unix)]
 const TERMINATE_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// What graceful termination ended up doing (for tests / clarity).
+/// What graceful termination ended up doing (for tests / clarity). Unix-only:
+/// Windows terminates via `taskkill /T /F` and never uses this policy.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TerminationOutcome {
     /// The process was already gone; nothing was signalled.
@@ -153,6 +155,8 @@ pub(crate) enum TerminationOutcome {
 /// a graceful stop, then poll up to `grace_steps` times (sleeping via `step`
 /// between checks) for it to exit, and force-kill if it never does. Pure control
 /// flow with injected effects, so it is unit-testable without a real process.
+/// Unix-only (see [`TerminationOutcome`]).
+#[cfg(unix)]
 pub(crate) fn escalate_terminate(
     is_alive: impl Fn() -> bool,
     graceful: impl FnOnce(),
@@ -393,8 +397,10 @@ impl PtySession for PortablePtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::cell::Cell;
 
+    #[cfg(unix)]
     #[test]
     fn escalate_skips_signals_when_already_exited() {
         let graceful = Cell::new(false);
@@ -411,6 +417,7 @@ mod tests {
         assert!(!forced.get(), "no force-kill for a dead process");
     }
 
+    #[cfg(unix)]
     #[test]
     fn escalate_is_graceful_when_it_exits_within_grace() {
         let checks = Cell::new(0);
@@ -430,6 +437,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn escalate_force_kills_when_still_alive_after_grace() {
         let graceful = Cell::new(false);
