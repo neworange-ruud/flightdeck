@@ -269,6 +269,13 @@ pub struct UiConfig {
     /// terminal focus. Off by default.
     #[serde(default)]
     pub use_f2_to_leave_terminal_focus: bool,
+    /// Auto-continuation: capture an agent's on-exit resume command and replay
+    /// it on restart/recovery so a tab continues its previous session. On by
+    /// default. Turn it off (`auto_continue = false`) to disable both halves —
+    /// nothing is captured from output and nothing is replayed on start; tabs
+    /// simply start fresh. Agent termination on shutdown is unaffected.
+    #[serde(default = "default_true")]
+    pub auto_continue: bool,
 }
 
 impl Default for UiConfig {
@@ -277,6 +284,7 @@ impl Default for UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            auto_continue: true,
         }
     }
 }

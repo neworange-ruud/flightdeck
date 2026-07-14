@@ -52,6 +52,7 @@ mod tests {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
                 use_f2_to_leave_terminal_focus: false,
+                auto_continue: true,
             },
             ..Config::default()
         };

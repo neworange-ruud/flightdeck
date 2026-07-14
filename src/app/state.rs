@@ -289,11 +289,12 @@ impl RuntimeTab {
     /// so a later restart continues the same session. Keeps a bounded rolling
     /// tail so a hint split across output chunks is still matched. Called from
     /// `drain_pty_output`; the captured value persists via the normal paths.
-    pub fn capture_resume_hint(&mut self, bytes: &[u8]) {
+    pub fn capture_resume_hint(&mut self, bytes: &[u8], enabled: bool) {
         /// Retained tail bound: big enough for a multi-line hint, cheap to rescan.
         const RESUME_SCAN_CAP: usize = 8192;
 
-        if self.meta.agent.is_empty() {
+        // Auto-continuation off (or no agent yet): don't fetch a resume hint.
+        if !enabled || self.meta.agent.is_empty() {
             return;
         }
         self.resume_scan.push_str(&String::from_utf8_lossy(bytes));
@@ -1808,7 +1809,7 @@ impl AppState {
         // stored agent (recovery cannot know which one ran), so fall back to the
         // configured default so it can still be continued.
         let agent_key = self.tabs[idx].meta.agent.clone();
-        let agent =
+        let mut agent =
             if agent_key.is_empty() {
                 self.registry.default_agent().cloned().ok_or_else(|| {
                     FlightDeckError::Config("no default agent configured".to_string())
@@ -1824,6 +1825,20 @@ impl AppState {
             services.container,
             &self.repo_root,
         )?;
+
+        // Replay a captured resume command so the agent continues its previous
+        // session instead of starting fresh (e.g. `claude --resume <id>`). We set
+        // it as the agent's *base* args — replacing the configured base args —
+        // BEFORE building the spawn, so the status-integration flags that
+        // `build_primary_spawn` appends (e.g. `--plugin-dir`, codex hooks) are
+        // preserved on top. Local mode only; container resume is out of scope.
+        // Gated on the auto-continuation setting: off means never replay.
+        if self.config.ui.auto_continue && !self.config.containers.enabled {
+            let resume = self.tabs[idx].meta.resume_args.clone();
+            if !resume.is_empty() {
+                agent.args = resume;
+            }
+        }
 
         let cwd = to_absolute(
             &repo_root,
@@ -1841,17 +1856,7 @@ impl AppState {
         }
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
-        let mut spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
-        // Replay a captured resume command so the agent continues its previous
-        // session instead of starting fresh (e.g. `claude --resume <id>`). Local
-        // mode only — the resume args replace the configured base args. Container
-        // launches are left untouched (resume-in-container is out of scope).
-        if !spawn.containerized {
-            let resume = self.tabs[idx].meta.resume_args.clone();
-            if !resume.is_empty() {
-                spawn.args = resume;
-            }
-        }
+        let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
         // Fresh container: start it detached before attaching its PTY.
         if let Some(start_args) = &spawn.start_args {
             services.container.start_detached(start_args)?;
@@ -2042,6 +2047,7 @@ mod tests {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
                 use_f2_to_leave_terminal_focus: false,
+                auto_continue: true,
             },
             worktrees: WorktreesConfig {
                 root: ".flightdeck/worktrees".to_string(),
@@ -3893,6 +3899,7 @@ mod tests {
 
         app.tabs[0].capture_resume_hint(
             b"Resume this session with:\n  claude --resume 3d74d44d-e9e7-407f-9938-c59ef4045e3f\n",
+            true,
         );
         assert_eq!(
             app.tabs[0].meta.resume_args,
@@ -3901,6 +3908,39 @@ mod tests {
                 "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
             ],
             "the agent's on-exit resume hint should be captured onto the tab"
+        );
+    }
+
+    #[test]
+    fn capture_resume_hint_is_skipped_when_auto_continue_disabled() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // enabled = false → the resume hint must NOT be captured.
+        app.tabs[0].capture_resume_hint(
+            b"Resume this session with:\n  claude --resume 3d74d44d-e9e7-407f-9938-c59ef4045e3f\n",
+            false,
+        );
+        assert!(
+            app.tabs[0].meta.resume_args.is_empty(),
+            "no resume hint should be captured when auto-continuation is off"
         );
     }
 
@@ -3932,13 +3972,104 @@ mod tests {
         let spawns = pty.spawns();
         assert_eq!(spawns.len(), 1);
         assert_eq!(spawns[0].0, cmd, "launches the agent binary");
+        let args = &spawns[0].1;
+        // Resume args replace the configured base args...
         assert_eq!(
-            spawns[0].1,
-            vec![
+            &args[0..2],
+            &[
                 "--resume".to_string(),
                 "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
             ],
-            "resume args must replace the configured base args"
+            "resume args must replace the configured base args, and come first"
+        );
+        // ...but the status-integration flags must still be appended on top, so a
+        // resumed tab keeps live lifecycle status (regression guard).
+        assert!(
+            args.iter().any(|a| a == "--plugin-dir"),
+            "status-integration flags must survive a resume, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resume_preserves_codex_status_integration_flags() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "codex"); // classified as Codex
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "codex".to_string();
+        tab.resume_args = vec![
+            "resume".to_string(),
+            "019f378e-76e9-7de3-a1db-41a027b7b719".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd);
+        let args = &spawns[0].1;
+        // `codex resume <id>` must come first (resume is a subcommand)...
+        assert_eq!(
+            &args[0..2],
+            &[
+                "resume".to_string(),
+                "019f378e-76e9-7de3-a1db-41a027b7b719".to_string()
+            ],
+            "the `resume <id>` subcommand must lead the args"
+        );
+        // ...and Codex's hook integration flags must still be appended after it.
+        assert!(
+            args.iter().any(|a| a == "--enable") && args.iter().any(|a| a == "hooks"),
+            "codex hook integration flags must survive a resume, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resume_is_not_replayed_when_auto_continue_disabled() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "claude");
+        let mut config = config_with_agent(agent);
+        config.ui.auto_continue = false; // disable auto-continuation
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        tab.resume_args = vec![
+            "--resume".to_string(),
+            "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd);
+        // With auto-continuation off, the stored resume args must NOT be replayed
+        // — the tab starts fresh (only the status-integration flags, no --resume).
+        assert!(
+            !spawns[0].1.iter().any(|a| a == "--resume"),
+            "resume args must not be replayed when auto-continuation is off, got: {:?}",
+            spawns[0].1
         );
     }
 

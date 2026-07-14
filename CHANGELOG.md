@@ -11,7 +11,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - Resume agent sessions across restarts: FlightDeck captures the resume command
   an agent prints on exit (`claude --resume <id>`, `codex resume <id>`) and
   replays it when the tab is restarted or recovered, so the conversation
-  continues instead of starting fresh.
+  continues instead of starting fresh. Controlled by `ui.auto_continue`
+  (default on); set it to `false` to disable capture and replay so tabs always
+  start a fresh session.
 
 ### Improvements
 

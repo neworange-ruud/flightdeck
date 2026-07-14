@@ -3401,6 +3401,9 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 /// parser so it can be rendered. Lifecycle status is handled separately by
 /// backend hooks/plugins (SPECS §24).
 fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
+    // Read once before the loop: auto-continuation gates resume-hint capture,
+    // and the per-tab borrow below would otherwise conflict with reading config.
+    let auto_continue = state.config.ui.auto_continue;
     for tab in state.tabs.iter_mut() {
         // Primary: drain into the VT parser. Lifecycle status comes only from
         // backend hooks/plugins; PTY output includes echoed user keystrokes and
@@ -3420,7 +3423,7 @@ fn drain_pty_output(state: &mut AppState, _now_ms: u64) {
         // Capture the agent's on-exit resume hint from that output (borrow of
         // `tab.session` has ended, so we can touch the rest of the tab).
         if let Some(bytes) = primary_bytes {
-            tab.capture_resume_hint(&bytes);
+            tab.capture_resume_hint(&bytes, auto_continue);
         }
 
         // Child terminals: drain → VT parser (so they don't stall and so their
@@ -3721,6 +3724,7 @@ mod tests {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
                 use_f2_to_leave_terminal_focus: false,
+                auto_continue: true,
             },
             worktrees: WorktreesConfig {
                 root: ".flightdeck/worktrees".to_string(),
@@ -3777,6 +3781,7 @@ mod tests {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
                 use_f2_to_leave_terminal_focus: false,
+                auto_continue: true,
             },
             ..Config::default()
         };
