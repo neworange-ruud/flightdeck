@@ -62,8 +62,8 @@ use crate::config::schema::default_config;
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs};
 use crate::contracts::{
-    Clock, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, PtyBackend,
-    PtySize,
+    Clock, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, ProcessState,
+    PtyBackend, PtySize,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -76,6 +76,10 @@ use crate::persistence::workspace::{
     load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
 };
 use crate::remote::client::RemoteHandle;
+use crate::remote::commands::{
+    build_index, encode_reply, first_task_decision, translate, CommandLedger, FirstTaskDecision,
+    MainLoopAction, PendingFirstTask, Translation,
+};
 use crate::remote::identity::load_or_create_identity;
 use crate::remote::state::remote_state_path;
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
@@ -88,7 +92,7 @@ use crate::tui::render::{
     ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
     HitTarget, ProjectHit, ProjectTabInfo, UiOverlay,
 };
-use flightdeck_remote_protocol::ProjectId;
+use flightdeck_remote_protocol::{CommandAck, CommandOutcome, ProjectId};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -1181,6 +1185,11 @@ fn event_loop(
     let mut remote_bridge: Option<RemoteBridge> = remote_handle
         .as_ref()
         .map(|_| RemoteBridge::passthrough(now0 + crate::app::state::NOTIFY_STARTUP_GRACE_MS));
+    // Inbound command-bridge state: the idempotency ledger and the first tasks
+    // of phone-created sessions awaiting a ready agent. Only ever touched when
+    // the remote bridge exists, so disabled-remote behaviour is unchanged.
+    let mut remote_ledger = CommandLedger::new();
+    let mut remote_first_tasks: Vec<PendingFirstTask> = Vec::new();
 
     loop {
         let now_ms = env.clock.now_millis();
@@ -1248,19 +1257,35 @@ fn event_loop(
             while let Ok(msg) = remote_in_rx.try_recv() {
                 b.handle_inbound(msg);
             }
-            let views: Vec<ProjectView> = workspace
-                .projects
-                .iter()
-                .map(|p| ProjectView {
-                    id: ProjectId::new(p.name.clone()),
-                    name: &p.name,
-                    state: &p.state,
-                    cache: &p.cache,
-                })
-                .collect();
-            b.tick(&views, now_ms, &mut |out| {
-                let _ = remote_out_tx.send(out);
-            });
+            {
+                let views: Vec<ProjectView> = workspace
+                    .projects
+                    .iter()
+                    .map(|p| ProjectView {
+                        id: ProjectId::new(p.name.clone()),
+                        name: &p.name,
+                        state: &p.state,
+                        cache: &p.cache,
+                    })
+                    .collect();
+                b.tick(&views, now_ms, &mut |out| {
+                    let _ = remote_out_tx.send(out);
+                });
+            }
+            // Inbound phone commands queued by the bridge: idempotency-check,
+            // translate, execute on this (main) thread through the existing
+            // Command/PTY paths, and ack each with its actual outcome.
+            service_remote_commands(
+                b,
+                &mut remote_ledger,
+                &mut remote_first_tasks,
+                workspace,
+                env,
+                now_ms,
+                &mut |out| {
+                    let _ = remote_out_tx.send(out);
+                },
+            );
         } else {
             // Remote disabled: drain (and drop) so the channel never fills.
             while remote_in_rx.try_recv().is_ok() {}
@@ -1399,6 +1424,256 @@ fn start_remote(
     let path = remote_state_path()?;
     let (identity, _state) = load_or_create_identity(env.fs, &path).ok()?;
     Some(RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx))
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Remote: inbound command bridge (phone → desktop)
+// ---------------------------------------------------------------------------
+
+/// Drain the phone commands the outbound bridge queued this tick, run each
+/// through the idempotency ledger and the pure translator
+/// ([`crate::remote::commands`]), execute the translation on the main thread
+/// — a PTY write to the target session's primary terminal, an
+/// [`AppState::dispatch`] through the existing safety-guarded [`Command`]
+/// layer, or the two-phase new-tab flow — and ack every command with its
+/// **actual** outcome. Also delivers queued first tasks of phone-created
+/// sessions once their agent is ready.
+///
+/// Never called when remote is disabled (the bridge is `None`), so disabled
+/// behaviour is bit-for-bit unchanged.
+#[allow(clippy::too_many_arguments)]
+fn service_remote_commands(
+    bridge: &mut RemoteBridge,
+    ledger: &mut CommandLedger,
+    first_tasks: &mut Vec<PendingFirstTask>,
+    workspace: &mut Workspace,
+    env: &Env,
+    now_ms: u64,
+    send: &mut dyn FnMut(RemoteOutbound),
+) {
+    for cmd in bridge.take_pending_commands() {
+        // Idempotency: a retransmitted command id is acked, never re-applied.
+        if let Some(ack) = ledger.duplicate_ack(&cmd.command_id) {
+            bridge.send_ack(ack, send);
+            continue;
+        }
+        // A fresh index per command: an earlier command in this batch may have
+        // closed a tab and shifted indices.
+        let index = {
+            let views: Vec<ProjectView> = workspace
+                .projects
+                .iter()
+                .map(|p| ProjectView {
+                    id: ProjectId::new(p.name.clone()),
+                    name: &p.name,
+                    state: &p.state,
+                    cache: &p.cache,
+                })
+                .collect();
+            build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
+        };
+        let translation = translate(&cmd.body, &index);
+        let (outcome, message) =
+            execute_remote_translation(translation, workspace, env, now_ms, first_tasks);
+        ledger.record(cmd.command_id.clone(), outcome, message.clone());
+        bridge.send_ack(
+            CommandAck {
+                command_id: cmd.command_id,
+                outcome,
+                message,
+            },
+            send,
+        );
+    }
+    deliver_first_tasks(first_tasks, workspace, now_ms);
+}
+
+/// The ack for a session/project that vanished between translation and
+/// execution (possible only if an earlier command in the same batch removed it).
+fn remote_target_gone() -> (CommandOutcome, Option<String>) {
+    (
+        CommandOutcome::Failed,
+        Some("the target session no longer exists".to_string()),
+    )
+}
+
+/// Execute one [`Translation`] and report the honest ack outcome.
+fn execute_remote_translation(
+    translation: Translation,
+    workspace: &mut Workspace,
+    env: &Env,
+    now_ms: u64,
+    first_tasks: &mut Vec<PendingFirstTask>,
+) -> (CommandOutcome, Option<String>) {
+    match translation {
+        Translation::Reject { reason } => (CommandOutcome::Rejected, Some(reason)),
+
+        Translation::PtyInput {
+            project,
+            tab,
+            bytes,
+        } => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            if write_primary_pty(&mut p.state, tab, &bytes) {
+                (CommandOutcome::Applied, None)
+            } else {
+                (
+                    CommandOutcome::Failed,
+                    Some("could not write to the agent terminal".to_string()),
+                )
+            }
+        }
+
+        Translation::Dispatch {
+            project,
+            tab,
+            command,
+        } => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            dispatch_remote_command(p, env, tab, command)
+        }
+
+        Translation::NeedsMainLoop(MainLoopAction::NewAgent {
+            project,
+            name,
+            agent_key,
+            first_task,
+        }) => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            // Mirror the desktop palette flow: reserve the placeholder tab
+            // (cheap, validation-first) and queue the slow `git worktree add`
+            // on the project's background worker. Keep the desktop user's
+            // on-screen selection where it was — a phone-initiated create
+            // must not yank the TUI to the new tab.
+            let prev_selected = p.state.selected().map(|t| t.meta.id.clone());
+            let begun = {
+                let services = env.services(&p.git);
+                p.state
+                    .begin_new_agent_tab(&name, Some(&agent_key), &services)
+            };
+            if let Some(prev) = prev_selected {
+                if let Some(idx) = p.state.tabs.iter().position(|t| t.meta.id == prev) {
+                    p.state.selected_tab = Some(idx);
+                }
+            }
+            match begun {
+                Ok(job) => {
+                    let branch = job.branch.clone();
+                    let tab_id = job.tab_id.clone();
+                    spawn_worktree_job(job, &p.git, &p.git_lock, &p.create_tx);
+                    if !first_task.trim().is_empty() {
+                        first_tasks.push(PendingFirstTask {
+                            tab_id,
+                            text: first_task,
+                            queued_at_ms: now_ms,
+                        });
+                    }
+                    (
+                        CommandOutcome::Accepted,
+                        Some(format!(
+                            "Creating worktree for {branch}; the first task will \
+                             be sent when the agent is ready."
+                        )),
+                    )
+                }
+                Err(e) => (CommandOutcome::Failed, Some(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Dispatch an app [`Command`] against a specific tab on behalf of the phone:
+/// temporarily select the target (dispatch acts on the selection), run it
+/// through [`AppState::dispatch`] — inheriting every safety guard — then
+/// restore the user's selection by id (indices may have shifted if the
+/// command removed a tab). The returned [`Effect`] is folded into an honest
+/// ack outcome instead of being surfaced as desktop UI.
+fn dispatch_remote_command(
+    p: &mut Project,
+    env: &Env,
+    tab: usize,
+    command: Command,
+) -> (CommandOutcome, Option<String>) {
+    if tab >= p.state.tabs.len() {
+        return remote_target_gone();
+    }
+    let prev_selected = p.state.selected().map(|t| t.meta.id.clone());
+    p.state.selected_tab = Some(tab);
+    let result = {
+        let services = env.services(&p.git);
+        p.state.dispatch(command, &services)
+    };
+    if let Some(prev) = prev_selected {
+        if let Some(idx) = p.state.tabs.iter().position(|t| t.meta.id == prev) {
+            p.state.selected_tab = Some(idx);
+        }
+        // else: the previously selected tab is the one that was removed;
+        // dispatch already fixed the selection to a sensible neighbour.
+    }
+    match result {
+        Ok(Effect::Refused(reason)) => (CommandOutcome::Rejected, Some(reason)),
+        Ok(Effect::Message(m)) => (CommandOutcome::Applied, Some(m)),
+        Ok(Effect::Warning(w)) => (CommandOutcome::Applied, Some(w)),
+        Ok(_) => (CommandOutcome::Applied, None),
+        Err(e) => (CommandOutcome::Failed, Some(e.to_string())),
+    }
+}
+
+/// Deliver queued first tasks of phone-created sessions whose agent is now
+/// ready, waiting for bracketed-paste support (or a fallback window) so the
+/// task lands in the agent's composer exactly like a desktop paste + Enter.
+fn deliver_first_tasks(
+    first_tasks: &mut Vec<PendingFirstTask>,
+    workspace: &mut Workspace,
+    now_ms: u64,
+) {
+    let mut i = 0;
+    while i < first_tasks.len() {
+        let age_ms = now_ms.saturating_sub(first_tasks[i].queued_at_ms);
+        // Locate the tab by id across all projects (creation may still be in
+        // flight; a missing tab means creation failed or the tab was closed).
+        let mut located: Option<(usize, usize)> = None;
+        for (pi, p) in workspace.projects.iter().enumerate() {
+            if let Some(ti) = p
+                .state
+                .tabs
+                .iter()
+                .position(|t| t.meta.id == first_tasks[i].tab_id)
+            {
+                located = Some((pi, ti));
+                break;
+            }
+        }
+        let Some((pi, ti)) = located else {
+            first_tasks.remove(i);
+            continue;
+        };
+        let tab = &workspace.projects[pi].state.tabs[ti];
+        let running =
+            tab.phase == TabPhase::Ready && tab.session.primary_state() == ProcessState::Running;
+        let bracketed_now = tab
+            .session
+            .primary()
+            .map(|t| t.bracketed_paste())
+            .unwrap_or(false);
+        match first_task_decision(running, bracketed_now, age_ms) {
+            FirstTaskDecision::Wait => i += 1,
+            FirstTaskDecision::Expire => {
+                first_tasks.remove(i);
+            }
+            FirstTaskDecision::Send { bracketed } => {
+                let bytes = encode_reply(&first_tasks[i].text, bracketed);
+                let _ = write_primary_pty(&mut workspace.projects[pi].state, ti, &bytes);
+                first_tasks.remove(i);
+            }
+        }
+    }
 }
 
 /// One completed background worktree-creation job: which placeholder tab to
@@ -3515,6 +3790,24 @@ fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     }
 }
 
+/// Write bytes to a specific tab's **primary** agent terminal (the phone
+/// reply/permission path). Mirrors [`write_active_pty`]'s behaviour exactly
+/// (drop any selection, snap back to the live bottom) but targets the tab by
+/// index and always its primary — a phone reply must reach the agent even
+/// when the desktop user is focused on a child shell of another tab. Returns
+/// whether the write succeeded.
+fn write_primary_pty(state: &mut AppState, tab: usize, bytes: &[u8]) -> bool {
+    let Some(t) = state.tabs.get_mut(tab) else {
+        return false;
+    };
+    let Some(term) = t.session.primary_mut() else {
+        return false;
+    };
+    term.clear_selection();
+    term.scroll_to_bottom();
+    term.session_mut().write_input(bytes).is_ok()
+}
+
 /// Paste from the system clipboard into the active terminal (Ctrl-V or Cmd-V
 /// when the macOS terminal reports Command as a key modifier).
 ///
@@ -4171,5 +4464,340 @@ mod tests {
     #[test]
     fn derive_project_name_uses_dir_name() {
         assert_eq!(derive_project_name(Path::new("/a/b/myproj")), "myproj");
+    }
+
+    // -----------------------------------------------------------------------
+    // FlightDeck Remote: inbound command bridge (phone → desktop)
+    // -----------------------------------------------------------------------
+
+    mod remote_commands {
+        use super::*;
+        use crate::contracts::{ProjectState as CoreProjectState, TabState, STATE_VERSION};
+        use crate::remote::bridge::passthrough_seal;
+        use crate::remote::commands::PendingFirstTask;
+        use crate::testing::{FakeContainerRuntime, FakePtyHandle};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use flightdeck_remote_protocol::relay::EncryptedEnvelope;
+        use flightdeck_remote_protocol::{
+            CommandBody, CommandId, DesktopToPhone, PairingId, Role, SessionId,
+        };
+        use flightdeck_remote_protocol::{CommandOutcome, PhoneCommand};
+
+        fn tab_state(id: &str, name: &str, agent: &str) -> TabState {
+            TabState {
+                id: id.to_string(),
+                name: name.to_string(),
+                slug: name.to_string(),
+                agent: agent.to_string(),
+                branch: format!("{name}-branch"),
+                worktree_path_relative: format!("worktrees/{name}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+            }
+        }
+
+        /// An [`AppState`] with the given tabs, each spawned with a running
+        /// fake primary. Returns the per-tab PTY handles for input assertions.
+        fn app_with_tabs(
+            config: Config,
+            tabs: Vec<TabState>,
+            pty: &FakePty,
+        ) -> (AppState, Vec<FakePtyHandle>) {
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs,
+            };
+            let mut app = AppState::new(config, state, "/repo", "/repo/.flightdeck/state.json");
+            let mut handles = Vec::new();
+            for tab in app.tabs.iter_mut() {
+                handles.push(pty.queue_session());
+                tab.session
+                    .spawn_primary(pty, "agent", &[], Path::new("/repo"), PtySize::default())
+                    .unwrap();
+            }
+            (app, handles)
+        }
+
+        fn workspace_with(app: AppState) -> Workspace {
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            Workspace {
+                projects: vec![Project {
+                    name: "proj".to_string(),
+                    git: GitCli::new(PathBuf::from("/repo")),
+                    state: app,
+                    cache: GitStatusCache::new(),
+                    create_tx,
+                    create_rx,
+                    status_tx,
+                    status_rx,
+                    status_in_flight: false,
+                    git_lock: Arc::new(Mutex::new(())),
+                }],
+                active: 0,
+            }
+        }
+
+        fn envelope(seq: u64, cmd: &PhoneCommand) -> EncryptedEnvelope {
+            let plain = serde_json::to_vec(cmd).unwrap();
+            let (nonce, ciphertext) = passthrough_seal()(&plain).unwrap();
+            EncryptedEnvelope {
+                pairing_id: PairingId::new("pair-1"),
+                seq,
+                sender: Role::Phone,
+                sent_at_ms: 0,
+                nonce,
+                ciphertext,
+            }
+        }
+
+        fn decode_acks(sent: &[RemoteOutbound]) -> Vec<flightdeck_remote_protocol::CommandAck> {
+            sent.iter()
+                .filter_map(|o| match o {
+                    RemoteOutbound::SendEnvelope { ciphertext, .. } => {
+                        let bytes = STANDARD.decode(ciphertext).unwrap();
+                        match serde_json::from_slice::<DesktopToPhone>(&bytes).unwrap() {
+                            DesktopToPhone::CommandAck(ack) => Some(ack),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// End-to-endish: a `reply` envelope through the full drain path —
+        /// bridge inbound → ledger → translate → primary-PTY write → ack.
+        #[test]
+        fn reply_reaches_primary_pty_and_acks_applied() {
+            let pty = FakePty::new();
+            let (app, handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c1"),
+                issued_at_ms: 0,
+                body: CommandBody::Reply {
+                    session_id: SessionId::new("t1"),
+                    text: "hello agent".to_string(),
+                },
+            };
+            bridge.handle_inbound(RemoteInbound::Envelope(envelope(1, &cmd)));
+
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                &mut bridge,
+                &mut ledger,
+                &mut first_tasks,
+                &mut workspace,
+                &env,
+                1_000,
+                &mut |o| sent.push(o),
+            );
+
+            // The fake PTY received the exact reply bytes (raw + Enter; the
+            // fresh terminal has not enabled bracketed paste).
+            assert_eq!(handles[0].input(), b"hello agent\r".to_vec());
+            // …and an applied ack was queued for the command id.
+            let acks = decode_acks(&sent);
+            assert_eq!(acks.len(), 1);
+            assert_eq!(acks[0].command_id, CommandId::new("c1"));
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+        }
+
+        /// A retransmitted command id is acked as duplicate, never re-applied.
+        #[test]
+        fn duplicate_command_is_acked_but_not_reapplied() {
+            let pty = FakePty::new();
+            let (app, handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c1"),
+                issued_at_ms: 0,
+                body: CommandBody::Reply {
+                    session_id: SessionId::new("t1"),
+                    text: "again".to_string(),
+                },
+            };
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+
+            // Two deliveries of the same logical command (a client retry).
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            for seq in [1, 2] {
+                bridge.handle_inbound(RemoteInbound::Envelope(envelope(seq, &cmd)));
+                service_remote_commands(
+                    &mut bridge,
+                    &mut ledger,
+                    &mut first_tasks,
+                    &mut workspace,
+                    &env,
+                    1_000,
+                    &mut |o| sent.push(o),
+                );
+            }
+
+            // Written once, acked twice: applied then duplicate.
+            assert_eq!(handles[0].input(), b"again\r".to_vec());
+            let acks = decode_acks(&sent);
+            assert_eq!(acks.len(), 2);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+            assert_eq!(acks[1].outcome, CommandOutcome::Duplicate);
+        }
+
+        /// A phone `restart_agent` reaches `Command::RestartAgent` through the
+        /// dispatch path (temporary selection, guards intact) and respawns the
+        /// primary, leaving the desktop user's selection untouched.
+        #[test]
+        fn restart_dispatches_and_preserves_selection() {
+            let dir = TempDir::new().unwrap();
+            let agent = make_real_agent(&dir, "opencode");
+            let config = config_with_agent(agent);
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                config,
+                vec![
+                    tab_state("t0", "other", "opencode"),
+                    tab_state("t1", "target", "opencode"),
+                ],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            workspace.projects[0].state.selected_tab = Some(0);
+            // The worktree must exist for the restart spawn's status snapshot.
+            let fs = FakeFs::new().with_dir("/repo/worktrees/target");
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-restart"),
+                issued_at_ms: 0,
+                body: CommandBody::RestartAgent {
+                    session_id: SessionId::new("t1"),
+                },
+            };
+            bridge.handle_inbound(RemoteInbound::Envelope(envelope(1, &cmd)));
+
+            let spawns_before = pty.spawns().len();
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                &mut bridge,
+                &mut ledger,
+                &mut first_tasks,
+                &mut workspace,
+                &env,
+                1_000,
+                &mut |o| sent.push(o),
+            );
+
+            let acks = decode_acks(&sent);
+            assert_eq!(acks.len(), 1);
+            assert_eq!(
+                acks[0].outcome,
+                CommandOutcome::Applied,
+                "ack: {:?}",
+                acks[0].message
+            );
+            // A fresh primary was spawned for the restart…
+            assert_eq!(pty.spawns().len(), spawns_before + 1);
+            // …and the user's on-screen selection was not yanked to the target.
+            assert_eq!(workspace.projects[0].state.selected_tab, Some(0));
+        }
+
+        /// First tasks queued by `new_agent` wait for the agent, then land as
+        /// a bracketed paste + Enter the moment the agent enables the mode.
+        #[test]
+        fn first_task_delivered_when_agent_enables_bracketed_paste() {
+            let pty = FakePty::new();
+            let (app, handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+
+            let mut first_tasks = vec![PendingFirstTask {
+                tab_id: "t1".to_string(),
+                text: "make the tests pass".to_string(),
+                queued_at_ms: 0,
+            }];
+
+            // Agent up but bracketed paste not enabled yet: wait.
+            deliver_first_tasks(&mut first_tasks, &mut workspace, 1_000);
+            assert_eq!(first_tasks.len(), 1);
+            assert!(handles[0].input().is_empty());
+
+            // The agent enables bracketed paste (DECSET 2004): deliver.
+            workspace.projects[0].state.tabs[0]
+                .session
+                .primary_mut()
+                .unwrap()
+                .process_output(b"\x1b[?2004h");
+            deliver_first_tasks(&mut first_tasks, &mut workspace, 2_000);
+            assert!(first_tasks.is_empty());
+            assert_eq!(
+                handles[0].input(),
+                b"\x1b[200~make the tests pass\x1b[201~\r".to_vec()
+            );
+
+            // A task whose tab vanished (creation failed / closed) is dropped.
+            let mut gone = vec![PendingFirstTask {
+                tab_id: "ghost".to_string(),
+                text: "hi".to_string(),
+                queued_at_ms: 0,
+            }];
+            deliver_first_tasks(&mut gone, &mut workspace, 3_000);
+            assert!(gone.is_empty());
+        }
     }
 }

@@ -581,6 +581,16 @@ impl TranscriptBuilder {
     pub fn total(&self) -> u64 {
         self.total
     }
+
+    /// The id of the most recently minted permission prompt, if any — the
+    /// pending one while the session is waiting for input. The command bridge
+    /// checks a phone `permission_decision` against this so a stale decision
+    /// (already answered on the desktop, or superseded by a newer prompt) is
+    /// rejected instead of injecting a keystroke into the wrong prompt.
+    pub fn last_prompt_id(&self) -> Option<PromptId> {
+        (self.prompt_seq > 0)
+            .then(|| PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq)))
+    }
 }
 
 /// Split a trailing `· detail` (or a diff stat) off a pill summary, so a pill

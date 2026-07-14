@@ -37,8 +37,8 @@ use crate::remote::{RemoteInbound, RemoteOutbound};
 use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
-    AgentStatus, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId, PhoneCommand,
-    ProjectId, SessionId, StateSnapshot,
+    AgentStatus, CommandAck, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId,
+    PhoneCommand, ProjectId, PromptId, SessionId, StateSnapshot,
 };
 
 /// Seals E2E plaintext for the wire. Given the JSON plaintext, returns
@@ -183,6 +183,22 @@ impl RemoteBridge {
     /// Whether a phone pairing is currently active.
     pub fn is_paired(&self) -> bool {
         self.pairing.is_some()
+    }
+
+    /// The currently pending permission-prompt id for a session, if any (the
+    /// most recently minted one). The command bridge validates a phone
+    /// `permission_decision` against this so a stale decision is rejected
+    /// instead of typed into the wrong prompt.
+    pub fn pending_prompt_id(&self, session_id: &str) -> Option<PromptId> {
+        self.transcripts
+            .get(&SessionId::new(session_id))
+            .and_then(|b| b.last_prompt_id())
+    }
+
+    /// Seal and enqueue a [`CommandAck`] on the outbound path (the command
+    /// bridge acks every drained phone command with its actual outcome).
+    pub fn send_ack(&self, ack: CommandAck, send: &mut dyn FnMut(RemoteOutbound)) {
+        self.send_msg(DesktopToPhone::CommandAck(ack), send);
     }
 
     /// The one-tick pass: derive events, build/diff state, flush transcript, and

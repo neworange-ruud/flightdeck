@@ -31,6 +31,7 @@
 
 pub mod bridge;
 pub mod client;
+pub mod commands;
 pub mod crypto;
 pub mod feed;
 pub mod identity;
