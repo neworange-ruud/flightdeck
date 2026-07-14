@@ -21,7 +21,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Fixed the terminal being clipped by 2 columns/rows after enabling
+  `ui.mode_border` until the next window resize: the terminal PTY is now
+  resized immediately when the border setting changes, instead of using a
+  stale cached size.
 
 ## [1.7.2] - 2026-07-14
 

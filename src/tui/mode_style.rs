@@ -38,15 +38,6 @@ pub fn border_enabled(ui: &UiConfig) -> bool {
     border_level(ui) != BorderLevel::Off
 }
 
-/// Cells reserved on each side of a framed pane: 1 when the border is on, else 0.
-pub fn border_inset(ui: &UiConfig) -> u16 {
-    if border_enabled(ui) {
-        1
-    } else {
-        0
-    }
-}
-
 /// Base ratatui color for a validated mode-color name. Falls back to white for
 /// any unexpected value (config validation rejects those at load).
 fn base_color(name: &str) -> Color {
@@ -137,12 +128,6 @@ mod tests {
         assert!(border_enabled(&ui("green", "cyan", "dim")));
         assert!(border_enabled(&ui("green", "cyan", "normal")));
         assert!(border_enabled(&ui("green", "cyan", "bright")));
-    }
-
-    #[test]
-    fn border_inset_is_one_when_enabled() {
-        assert_eq!(border_inset(&ui("green", "cyan", "off")), 0);
-        assert_eq!(border_inset(&ui("green", "cyan", "normal")), 1);
     }
 
     #[test]

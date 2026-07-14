@@ -3298,8 +3298,8 @@ mod tests {
 
     #[test]
     fn terminal_dims_in_app_mode_when_enabled() {
-        // A helper `dim_flag` mirrors the production rule so the test pins the
-        // policy: dim only when NOT focused (i.e. APP mode) and the setting is on.
+        // Calls `dim_terminal` directly to pin the production policy: dim only
+        // when NOT focused (i.e. APP mode) and the setting is on.
         let mut ui = crate::contracts::UiConfig {
             dim_terminal_in_app_mode: true,
             ..Default::default()
