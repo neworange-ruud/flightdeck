@@ -22,7 +22,12 @@ final class FlightDeckRemoteUITests: XCTestCase {
         app.launchArguments += ["-uitest-reset-pairing"]
         app.launch()
 
-        let pairingView = app.otherElements["PairingView"]
+        // Type-agnostic query (mirrors NavigationUITests' helper): the
+        // PairingView root is a SwiftUI container whose XCUIElement type
+        // depends on its current layout (it became a ScrollView-rooted
+        // screen in the real pairing flow), so a naive
+        // `app.otherElements[...]` lookup is brittle.
+        let pairingView = app.descendants(matching: .any).matching(identifier: "PairingView").firstMatch
         XCTAssertTrue(pairingView.waitForExistence(timeout: 5), "Expected the Pairing screen to appear on launch while unpaired")
     }
 }

@@ -55,6 +55,15 @@ final class PairingStore {
         }
     }
 
+    /// Metadata about the currently paired Mac, set by `completePairing(with:)`
+    /// when a real pairing transaction (`PairingServicing`) succeeds. Unlike
+    /// `isPaired`, this is not persisted through `PairingStateProviding` —
+    /// only the paired boolean needs to survive relaunch for routing;
+    /// persisting/rehydrating the device metadata itself is a follow-up for
+    /// whichever task builds the Settings "connected device" surface
+    /// (PRD §5.6) and the Keychain-backed secret storage.
+    private(set) var pairedDevice: PairedDevice?
+
     init(storage: PairingStateProviding = UserDefaultsPairingStateProvider()) {
         self.storage = storage
         var initial = storage.loadIsPaired()
@@ -70,6 +79,14 @@ final class PairingStore {
         }
         #endif
         self.isPaired = initial
+    }
+
+    /// Records a successful pairing transaction (see `PairingServicing`) and
+    /// flips `isPaired` — `AppRouter`/`RootView` react automatically and
+    /// swap the Pairing screen for the main tab container (PRD §5.8).
+    func completePairing(with device: PairedDevice) {
+        pairedDevice = device
+        isPaired = true
     }
 
     #if DEBUG

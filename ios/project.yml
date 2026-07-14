@@ -55,6 +55,7 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSFaceIDUsageDescription: "Unlock FlightDeck Remote"
+        NSCameraUsageDescription: "FlightDeck Remote uses the camera to scan the pairing QR code shown on your Mac."
         NSMicrophoneUsageDescription: "FlightDeck Remote uses the microphone so you can reply to agents by voice."
         NSSpeechRecognitionUsageDescription: "FlightDeck Remote uses speech recognition to turn your voice into a reply you can review before sending."
         UIAppFonts:

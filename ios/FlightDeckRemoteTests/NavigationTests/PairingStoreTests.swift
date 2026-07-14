@@ -8,6 +8,7 @@
 //
 
 import Testing
+import Foundation
 @testable import FlightDeckRemote
 
 /// In-memory `PairingStateProviding` for hermetic tests — mirrors the
@@ -61,4 +62,18 @@ struct PairingStoreTests {
         #expect(store.isPaired == false)
     }
     #endif
+
+    @Test func completePairingSetsIsPairedAndPairedDevice() {
+        let provider = InMemoryPairingStateProvider()
+        let store = PairingStore(storage: provider)
+        #expect(store.isPaired == false)
+        #expect(store.pairedDevice == nil)
+
+        let device = PairedDevice(pairingId: "pairing-123", peerName: "Ruud's MacBook Pro", pairedAt: Date())
+        store.completePairing(with: device)
+
+        #expect(store.isPaired == true)
+        #expect(store.pairedDevice == device)
+        #expect(provider.loadIsPaired() == true)
+    }
 }
