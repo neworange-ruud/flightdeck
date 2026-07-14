@@ -12,16 +12,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- Leave terminal focus with **F2** on every platform. The previous
-  `Alt+Esc` / `Shift+Esc` binding depended on the terminal supporting the kitty
-  keyboard protocol to distinguish a modified Esc from a bare Esc, so it
-  silently did nothing on terminals without it (e.g. Konsole). F2 has an
-  unambiguous encoding everywhere and does not collide with the bare Esc that
-  must reach the hosted agent.
+- Keep `Alt+Esc` (macOS) and `Shift+Esc` (Windows/Linux) as the default way to
+  leave terminal focus, with an optional **F2** binding for terminals that
+  cannot distinguish modified Esc. The F2 preference is available in the
+  configuration manager and can be set globally or per project.
 
 ### Bug fixes
 
-- None yet.
+- Size the configuration manager to its content instead of stretching it
+  vertically in tall terminals.
 
 ## [1.7.1] - 2026-07-13
 

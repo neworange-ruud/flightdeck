@@ -336,6 +336,11 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
         b("Notify when waiting", "notifications", "on_waiting"),
         b("Notify when failed", "notifications", "on_failed"),
         b("Check for updates", "update", "check"),
+        b(
+            "Use F2 to leave terminal focus",
+            "ui",
+            "use_f2_to_leave_terminal_focus",
+        ),
         CuratedField {
             label: "Agent tab position",
             section: "ui",
@@ -393,6 +398,12 @@ mod tests {
         // Notifications default on; nothing set anywhere → Default origin.
         assert!(notif.bool_value);
         assert_eq!(notif.origin, Origin::Default);
+        let f2 = rows
+            .iter()
+            .find(|r| r.label == "Use F2 to leave terminal focus")
+            .unwrap();
+        assert!(!f2.bool_value);
+        assert_eq!(f2.origin, Origin::Default);
     }
 
     #[test]
@@ -446,16 +457,29 @@ mod tests {
     #[test]
     fn choice_cycles_through_options() {
         let mut m = mgr(toml::Table::new(), toml::Table::new());
-        // Move to "Agent tab position" (index 6).
+        // Move to "Agent tab position" (index 7).
+        for _ in 0..7 {
+            m.select_next();
+        }
+        let before = m.rows()[7].value.clone();
+        assert_eq!(before, "left");
+        m.toggle_selected();
+        assert_eq!(m.rows()[7].value, "right");
+        m.toggle_selected();
+        assert_eq!(m.rows()[7].value, "left");
+    }
+
+    #[test]
+    fn f2_leave_focus_setting_writes_ui_override() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
         for _ in 0..6 {
             m.select_next();
         }
-        let before = m.rows()[6].value.clone();
-        assert_eq!(before, "left");
         m.toggle_selected();
-        assert_eq!(m.rows()[6].value, "right");
-        m.toggle_selected();
-        assert_eq!(m.rows()[6].value, "left");
+
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[ui]"));
+        assert!(body.contains("use_f2_to_leave_terminal_focus = true"));
     }
 
     #[test]

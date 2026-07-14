@@ -57,6 +57,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         ui: UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
+            use_f2_to_leave_terminal_focus: false,
         },
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
@@ -156,6 +157,12 @@ mod tests {
     fn default_config_default_agent_is_opencode() {
         let cfg = default_config("my-project", "main");
         assert_eq!(cfg.ui.default_agent, "opencode");
+    }
+
+    #[test]
+    fn default_config_uses_platform_leave_focus_key() {
+        let cfg = default_config("my-project", "main");
+        assert!(!cfg.ui.use_f2_to_leave_terminal_focus);
     }
 
     #[test]

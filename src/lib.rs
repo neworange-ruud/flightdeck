@@ -76,7 +76,7 @@ use crate::persistence::workspace::{
 };
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::config_manager::ConfigManager;
-use crate::tui::input::{map_key, KeyAction};
+use crate::tui::input::{map_key_with_f2, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
     child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
@@ -205,11 +205,10 @@ pub fn run() -> Result<()> {
 
     // Enable the kitty keyboard protocol's "disambiguate escape codes" mode when
     // the terminal supports it. Without it, terminals report modified keys like
-    // Alt+Arrow as bare/ambiguous sequences, so the Alt-navigation shortcuts are
-    // unreliable; with it, modified keys carry their real modifiers. (Leaving
-    // terminal focus does not depend on this — it is F2, which every terminal
-    // encodes unambiguously.) Best effort; popped on teardown only if we pushed
-    // it.
+    // Alt+Esc and Alt+Arrow as bare/ambiguous sequences, so the default
+    // leave-focus binding and Alt-navigation shortcuts are unreliable. Users can
+    // opt into F2 for leave-focus when their terminal lacks protocol support.
+    // Best effort; popped on teardown only if we pushed it.
     let keyboard_enhanced = matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
@@ -1998,7 +1997,13 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return Ok(false);
     }
     let mode = workspace.active_project().state.mode();
-    match map_key(mode, key) {
+    let use_f2 = workspace
+        .active_project()
+        .state
+        .config
+        .ui
+        .use_f2_to_leave_terminal_focus;
+    match map_key_with_f2(mode, key, use_f2) {
         KeyAction::Dispatch(cmd) => {
             let active = workspace.active;
             let p = &mut workspace.projects[active];
@@ -3698,6 +3703,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
+                use_f2_to_leave_terminal_focus: false,
             },
             worktrees: WorktreesConfig {
                 root: ".flightdeck/worktrees".to_string(),
@@ -3753,6 +3759,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
+                use_f2_to_leave_terminal_focus: false,
             },
             ..Config::default()
         };

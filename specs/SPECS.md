@@ -318,6 +318,7 @@ branch_prefix = "flightdeck/"
 [ui]
 agent_tab_position = "left"
 default_agent = "opencode"
+use_f2_to_leave_terminal_focus = false
 
 [agents.opencode]
 display_name = "OpenCode"
@@ -838,7 +839,9 @@ Child Terminal Navigation
   Alt-Right       Next child terminal (cycles agent + shells)
 
 Focus
-  F2              Leave terminal input focus / focus app chrome
+  Alt-Esc         Leave terminal input focus / focus app chrome (macOS default)
+  Shift-Esc       Leave terminal input focus / focus app chrome (Windows/Linux default)
+  F2              Optional replacement when ui.use_f2_to_leave_terminal_focus = true
   Enter           Focus active terminal
 
 Status

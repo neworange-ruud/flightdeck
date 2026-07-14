@@ -265,6 +265,10 @@ impl Default for GitConfig {
 pub struct UiConfig {
     pub agent_tab_position: String,
     pub default_agent: String,
+    /// Use F2 instead of the platform-default modified-Esc shortcut to leave
+    /// terminal focus. Off by default.
+    #[serde(default)]
+    pub use_f2_to_leave_terminal_focus: bool,
 }
 
 impl Default for UiConfig {
@@ -272,6 +276,7 @@ impl Default for UiConfig {
         UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
+            use_f2_to_leave_terminal_focus: false,
         }
     }
 }

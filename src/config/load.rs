@@ -307,6 +307,20 @@ default_base_branch = "main"
     }
 
     #[test]
+    fn existing_ui_config_defaults_f2_leave_focus_to_false() {
+        let cfg = parse_config(
+            r#"
+[ui]
+agent_tab_position = "left"
+default_agent = "opencode"
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.ui.use_f2_to_leave_terminal_focus);
+    }
+
+    #[test]
     fn load_config_reads_from_fakefs() {
         let cfg = default_config("fakefs-proj", "main");
         let toml_str = serialize_config(&cfg).unwrap();

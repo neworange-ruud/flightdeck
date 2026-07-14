@@ -1242,7 +1242,7 @@ Supporting scope:
 
 Review focus:
 - Terminal/App mode distinction.
-- F2 leave-terminal-focus behavior.
+- Platform-default and optional F2 leave-terminal-focus behavior.
 - Global shortcuts and Ctrl+U Pull Base.
 - Ctrl-V image paste interception.
 - VT key encoding.
@@ -1403,7 +1403,7 @@ Supporting scope:
 
 Review focus:
 - Info bar fallback and status formatting.
-- Leave-focus key label (F2).
+- Configured leave-focus key label.
 - Update-available status bar hint.
 
 Keep out:
