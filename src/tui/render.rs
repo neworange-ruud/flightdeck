@@ -294,7 +294,10 @@ pub enum HitTarget {
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
-    let ml = layout::compute(area);
+    let ml = layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
     if rect_contains(ml.sidebar, col, row) {
         // A click on the `✕` on a tab's name row closes it; elsewhere on a tab
         // row selects it; anywhere else in the sidebar (logo header, "Agents"
@@ -503,7 +506,10 @@ pub fn draw(
     now_ms: u64,
 ) {
     let area = frame.area();
-    let ml = layout::compute(area);
+    let ml = layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
@@ -2624,7 +2630,7 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area));
+        let region = layout::split_region(&layout::compute(area, false));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
