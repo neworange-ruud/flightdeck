@@ -70,7 +70,7 @@ import CryptoKit
         #expect(sent.contains { if case .authResponse = $0 { return true }; return false })
     }
 
-    @Test func qrPathUsesPairingSecretAsSalt() async throws {
+    @Test func qrPathAlsoUsesClaimTokenAsSalt() async throws {
         let keychain = InMemoryKeychainStore()
         let channel = ScriptedChannel()
         let (service, recordStore) = makeService(keychain: keychain, channel: channel)
@@ -92,7 +92,10 @@ import CryptoKit
 
         _ = try await service.pair(with: .qr(payload))
         let record = try #require(try recordStore.load())
-        #expect(record.salt == secretBytes)
+        // §7.1 reconciled contract: the salt is the claim-token UTF-8 bytes on
+        // BOTH paths; the QR pairing_secret is wire-compat only.
+        #expect(record.salt == Data("clm_abc".utf8))
+        #expect(record.salt != secretBytes)
     }
 
     @Test func codeRejectionMapsToInvalidCode() async throws {

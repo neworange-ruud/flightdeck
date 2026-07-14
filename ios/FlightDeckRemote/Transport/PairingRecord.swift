@@ -28,9 +28,10 @@ struct PairingRecord: Codable, Equatable, Sendable {
     /// (`pairing_claimed.peer_key_agreement_public_key`, §5.2). Fed to
     /// `E2EChannel.derive` as the peer public key.
     var peerKeyAgreementPublicKeyB64: String
-    /// The E2E bootstrap salt, base64(standard, padded): the decoded QR
-    /// `pairing_secret`, or the claim-token UTF-8 bytes for the code path
-    /// (§7.1). Never transits the relay.
+    /// The E2E bootstrap salt, base64(standard, padded): ALWAYS the
+    /// claim-token UTF-8 bytes, on both the QR and manual-code paths (§7.1,
+    /// reconciled contract — the QR `pairing_secret` is wire-compat only and
+    /// plays no role in derivation). Never transits the relay's E2E plane.
     var saltB64: String
     /// The relay endpoint this pairing connects to.
     var relayURL: String

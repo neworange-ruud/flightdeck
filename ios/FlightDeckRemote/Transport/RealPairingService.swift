@@ -21,8 +21,11 @@
 //
 //  The phone MUST send its *software* key-agreement public key (KeyAgreementKeys)
 //  in `pairing_claim`, distinct from the Secure-Enclave signing identity
-//  (§5.2). The E2E salt is the QR `pairing_secret` (decoded) or, for the manual
-//  code path, the claim-token UTF-8 bytes (§7.1).
+//  (§5.2). The E2E salt is ALWAYS the claim-token UTF-8 bytes, on BOTH the QR
+//  and manual-code paths (§7.1, reconciled contract): the desktop derives its
+//  channel from the `pairing_claimed` notification and cannot know which path
+//  the phone used. The QR still carries `pairing_secret` for wire-compat, but
+//  it is NOT used in key derivation.
 //
 
 import Foundation
@@ -241,23 +244,27 @@ struct RealPairingService: PairingServicing {
         let input: PairingInput
         let relayURL: URL
         let claimToken: String
-        /// The E2E bootstrap salt bytes (§7.1).
-        let salt: Data
+        /// The E2E bootstrap salt bytes: ALWAYS the claim-token UTF-8 bytes,
+        /// on both the QR and manual-code paths (§7.1, reconciled contract).
+        var salt: Data { Data(claimToken.utf8) }
     }
 
     private func resolve(_ input: PairingInput) throws -> Params {
         switch input {
         case let .qr(payload):
             guard !payload.claimToken.isEmpty else { throw PairingError.malformedQRPayload }
+            // The QR still carries `pairing_secret` (fdr1 wire-compat); validate
+            // its shape so a truncated/corrupt QR is rejected honestly, but it
+            // plays NO role in key derivation (§7.1: salt = claim-token bytes).
             guard let secret = Data(base64URLEncodedNoPadding: payload.pairingSecret), !secret.isEmpty else {
                 throw PairingError.malformedQRPayload
             }
-            return Params(input: input, relayURL: payload.relayURL, claimToken: payload.claimToken, salt: secret)
+            return Params(input: input, relayURL: payload.relayURL, claimToken: payload.claimToken)
         case let .code(code, relayURL):
             let trimmed = code.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { throw PairingError.invalidCode }
-            // The 4-digit code IS the claim token; its UTF-8 bytes are the salt.
-            return Params(input: input, relayURL: relayURL, claimToken: trimmed, salt: Data(trimmed.utf8))
+            // The 4-digit code IS the claim token.
+            return Params(input: input, relayURL: relayURL, claimToken: trimmed)
         }
     }
 }

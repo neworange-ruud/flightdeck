@@ -12,11 +12,16 @@
 //
 //  Scheme (pinned in spec §7):
 //   1. IKM  = P-256 static-static ECDH shared-secret x-coordinate (32 bytes),
-//             between this device's identity key and the peer's identity key.
-//             (v1 uses the long-lived identity keys directly → NO forward
-//             secrecy; key rotation is a deferred item, PRD §13.)
-//   2. salt = the pairing bootstrap secret — the 32-byte QR `pairing_secret`,
-//             or the 4-digit code path's claim-token bytes.
+//             between this device's key-agreement key and the peer's
+//             key-agreement key (exchanged at pairing; the desktop reuses its
+//             identity key, the phone uses a separate software key because SE
+//             signing keys can't ECDH). (v1 uses long-lived keys directly →
+//             NO forward secrecy; key rotation is a deferred item, PRD §13.)
+//   2. salt = ALWAYS the claim-token UTF-8 bytes, on both the QR and the
+//             manual-code pairing paths (spec §7.1 — the desktop cannot
+//             observe which path the phone used, so the salt must be
+//             path-independent; the QR's `pairing_secret` is wire-compat
+//             only and is NOT used in derivation).
 //   3. KDF  = HKDF-SHA256(ikm, salt), expanded once per direction:
 //             info = "flightdeck-remote-e2e-v1:" + pairingID + ":d2p" | ":p2d".
 //   4. AEAD = ChaCha20-Poly1305, fresh random 12-byte nonce per message, AAD =

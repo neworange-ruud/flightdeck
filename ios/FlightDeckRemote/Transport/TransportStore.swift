@@ -212,3 +212,25 @@ final class TransportStore {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased()
     }
 }
+
+#if DEBUG
+extension TransportStore {
+    /// DEBUG-only seam: force-set `snapshot` (and optionally `linkState`)
+    /// directly, bypassing the real `TransportClient`/relay entirely.
+    ///
+    /// Exists so the Projects/Sessions screens can render deterministically
+    /// without a live desktop: `TransportStoreFactory` calls this to seed a
+    /// realistic fixture snapshot when the app launches with the
+    /// `-uitest-fixture-snapshot` argument (UI tests, scripted screenshots),
+    /// and SwiftUI previews can call it directly on a store built with a
+    /// never-started client. Compiled out of Release builds — there is no
+    /// way to reach this from production code.
+    func debugSeed(
+        snapshot: Wire.StateSnapshot,
+        linkState: RemoteLinkState = .connected(latencyMs: 8)
+    ) {
+        self.snapshot = snapshot
+        self.linkState = linkState
+    }
+}
+#endif

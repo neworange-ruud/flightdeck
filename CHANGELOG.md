@@ -14,6 +14,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   "Unpair Phone" action (with confirmation) forgets the pairing. The relay honors
   a 4-digit `claim_token_hint` (short TTL, single use, per-connection rate limit),
   and the E2E salt is pinned to the claim-token bytes on both pairing paths.
+- FlightDeck Remote agent chat transcript (iOS): the cleaned agent-conversation
+  surface (PRD §5.3) — readable prose, noisy tool calls collapsed into tappable
+  activity pills that expand inline to detail, inline permission-prompt cards,
+  sparse timestamps, "load earlier" pagination, and standard chat auto-scroll
+  with a "jump to latest" affordance. Includes the per-session `Agent · Shell`
+  surface switcher (Shell disabled for now) and an inert compose-bar placeholder.
 
 ### Improvements
 
