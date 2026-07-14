@@ -190,6 +190,15 @@ fn expand_tilde(p: &str) -> PathBuf {
 /// In container mode the agent binary lives *inside* the image, so instead of
 /// the agent command we require the container runtime to be ready
 /// ([`ContainerRuntime::available`]).
+/// The user's home directory, for locating agent session stores. `None` if
+/// neither `HOME` nor `USERPROFILE` is set.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 fn validate_launchable(
     agent: &AgentDef,
     exec: &ContainersConfig,
@@ -260,6 +269,11 @@ pub struct RuntimeTab {
     /// the agent's on-exit resume hint. Runtime-only; the captured result lives
     /// in `meta.resume_args`.
     resume_scan: String,
+    /// Session ids present in the agent's on-disk store for this worktree at the
+    /// moment a fresh agent was launched. Runtime-only. Used to detect and pin
+    /// the session this tab's agent creates (so multiple agents in one worktree
+    /// each resume their own). `None` once pinned or when not applicable.
+    session_snapshot: Option<std::collections::HashSet<String>>,
 }
 
 impl RuntimeTab {
@@ -276,6 +290,7 @@ impl RuntimeTab {
             status_file_seen: None,
             notify_armed: false,
             resume_scan: String::new(),
+            session_snapshot: None,
         }
     }
 
@@ -952,6 +967,7 @@ impl AppState {
             status_file_seen: None,
             notify_armed: false,
             resume_scan: String::new(),
+            session_snapshot: None,
         });
         // Focus the new (placeholder) tab so the user sees the progress.
         self.selected_tab = Some(self.tabs.len() - 1);
@@ -1826,20 +1842,6 @@ impl AppState {
             &self.repo_root,
         )?;
 
-        // Replay a captured resume command so the agent continues its previous
-        // session instead of starting fresh (e.g. `claude --resume <id>`). We set
-        // it as the agent's *base* args — replacing the configured base args —
-        // BEFORE building the spawn, so the status-integration flags that
-        // `build_primary_spawn` appends (e.g. `--plugin-dir`, codex hooks) are
-        // preserved on top. Local mode only; container resume is out of scope.
-        // Gated on the auto-continuation setting: off means never replay.
-        if self.config.ui.auto_continue && !self.config.containers.enabled {
-            let resume = self.tabs[idx].meta.resume_args.clone();
-            if !resume.is_empty() {
-                agent.args = resume;
-            }
-        }
-
         let cwd = to_absolute(
             &repo_root,
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
@@ -1854,6 +1856,37 @@ impl AppState {
                 cwd.display()
             )));
         }
+
+        // Resume continuation: launch so the agent continues its session rather
+        // than starting fresh. Prefer this tab's pinned session (`resume_args`,
+        // set by `pin_resumable_sessions` — correct even with multiple agents in
+        // one worktree); else fall back to the newest session in the agent's
+        // on-disk store for this worktree. Set as the agent's *base* args so
+        // `build_primary_spawn` still appends the status-integration flags on
+        // top. Local mode only; gated on the auto-continuation setting. When
+        // there is no session to resume, snapshot the store so the session this
+        // fresh agent creates can be pinned to the tab later.
+        if self.config.ui.auto_continue && !self.config.containers.enabled {
+            if let Some(home) = user_home() {
+                let resume = crate::agents::resume::resolve_resume_args(
+                    &agent.key,
+                    &cwd,
+                    &home,
+                    &self.tabs[idx].meta.resume_args,
+                );
+                if resume.is_empty() {
+                    let ids = crate::agents::resume::store_session_ids(&agent.key, &cwd, &home)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    self.tabs[idx].session_snapshot = Some(ids);
+                } else {
+                    agent.args = resume;
+                    self.tabs[idx].session_snapshot = None;
+                }
+            }
+        }
+
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
@@ -1950,6 +1983,42 @@ impl AppState {
             let _ = self.persist(services);
         }
         started
+    }
+
+    /// Pin the session each freshly-launched agent created, so a later restart
+    /// resumes that tab's own session even when multiple agents share one
+    /// worktree (SPECS: continuation). For every tab still holding a launch
+    /// snapshot, look up the agent's on-disk store for a session id that appeared
+    /// since launch; when found, record its replay args on the tab and clear the
+    /// snapshot. Persists if anything was pinned. Cheap when nothing is pending
+    /// (only tabs with a live snapshot read the store). No-op when
+    /// auto-continuation is off or in container mode.
+    pub fn pin_resumable_sessions(&mut self, home: &Path, services: &Services) {
+        if !self.config.ui.auto_continue || self.config.containers.enabled {
+            return;
+        }
+        let mut changed = false;
+        for idx in 0..self.tabs.len() {
+            let Some(snapshot) = self.tabs[idx].session_snapshot.clone() else {
+                continue;
+            };
+            let agent_key = self.tabs[idx].meta.agent.clone();
+            let cwd = to_absolute(
+                &self.repo_root,
+                Path::new(&self.tabs[idx].meta.worktree_path_relative),
+            );
+            let current = crate::agents::resume::store_session_ids(&agent_key, &cwd, home);
+            if let Some(id) = crate::agents::resume::newest_new_session(&snapshot, &current) {
+                if let Some(args) = crate::agents::resume::resume_args_for(&agent_key, &id) {
+                    self.tabs[idx].meta.resume_args = args;
+                }
+                self.tabs[idx].session_snapshot = None;
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.persist(services);
+        }
     }
 
     /// Show the git status panel for the selected tab (SPECS §21).
@@ -3941,6 +4010,54 @@ mod tests {
         assert!(
             app.tabs[0].meta.resume_args.is_empty(),
             "no resume hint should be captured when auto-continuation is off"
+        );
+    }
+
+    #[test]
+    fn pin_resumable_sessions_pins_new_store_session() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        // Simulate a fresh launch: the pre-launch snapshot was empty, and the
+        // agent has since written its session file.
+        app.tabs[0].session_snapshot = Some(std::collections::HashSet::new());
+
+        // Claude store fixture for the tab's cwd (/repo/.flightdeck/worktrees/r
+        // → mangled dir name).
+        let home = TempDir::new().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects/-repo--flightdeck-worktrees-r");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("3d74d44d-e9e7-407f-9938-c59ef4045e3f.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        app.pin_resumable_sessions(home.path(), &services(&git, &fs, &pty, &clock));
+
+        assert_eq!(
+            app.tabs[0].meta.resume_args,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "the newly-created session must be pinned to the tab"
+        );
+        assert!(
+            app.tabs[0].session_snapshot.is_none(),
+            "snapshot is cleared once pinned"
         );
     }
 

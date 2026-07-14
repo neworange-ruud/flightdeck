@@ -242,10 +242,14 @@ pub fn run() -> Result<()> {
     }
 
     // Resume: start the primary agent for every recovered/loaded tab whose
-    // worktree still exists (best effort), across every open project. Done here,
-    // after the viewport size is known, rather than in `recover`/`AppState::new`
-    // which never spawn.
-    for p in workspace.projects.iter_mut() {
+    // worktree still exists (best effort) — for the ACTIVE (launched) project
+    // ONLY. Other projects reopened from the workspace file are shown but their
+    // agents are not auto-resumed; switching/opening one resumes it on demand
+    // (see the open-project flow). Done here, after the viewport size is known,
+    // rather than in `recover`/`AppState::new` which never spawn.
+    {
+        let active = workspace.active;
+        let p = &mut workspace.projects[active];
         let services = env.services(&p.git);
         let _ = p.state.resume_agents(&services);
     }
@@ -1242,6 +1246,10 @@ fn event_loop(
         }
     });
 
+    // Home dir for locating agent session stores (used to pin each tab's resume
+    // session id). Resolved once; `None` disables pinning.
+    let store_home = crate::app::state::user_home();
+
     loop {
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
@@ -1277,6 +1285,11 @@ fn event_loop(
             {
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
+                // Pin each freshly-launched agent's session id for later resume
+                // (cheap unless a tab is still awaiting its session file).
+                if let Some(home) = &store_home {
+                    p.state.pin_resumable_sessions(home, &services);
+                }
             }
 
             // Prefix the project name so alerts read "project: tab" — useful
