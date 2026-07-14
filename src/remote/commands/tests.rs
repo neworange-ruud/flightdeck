@@ -472,51 +472,213 @@ fn manual_status_set_and_clear_translate_to_dispatch() {
     ));
 }
 
-// --- not-yet-implemented seams ----------------------------------------------------
+// --- git actions -----------------------------------------------------------------
 
 #[test]
-fn git_shell_and_mark_read_reject_honestly() {
-    let index = index_with(vec![entry("t1")]);
-    let sid = || SessionId::new("t1");
-    let bodies = vec![
-        CommandBody::GitPullBase { session_id: sid() },
-        CommandBody::GitMergeBack { session_id: sid() },
+fn git_actions_dispatch_the_guarded_commands() {
+    let mut e = entry("fix-login");
+    e.tab = 3;
+    let index = index_with(vec![e]);
+    // Pull base → the global PullBase command (routed through the session).
+    assert_eq!(
+        translate(
+            &CommandBody::GitPullBase {
+                session_id: SessionId::new("fix-login"),
+            },
+            &index,
+        ),
+        Translation::Dispatch {
+            project: 0,
+            tab: 3,
+            command: Command::PullBase,
+        }
+    );
+    // Merge back → the *confirmed* FinishLocalMerge (phone confirmed, PRD §8).
+    assert_eq!(
+        translate(
+            &CommandBody::GitMergeBack {
+                session_id: SessionId::new("fix-login"),
+            },
+            &index,
+        ),
+        Translation::Dispatch {
+            project: 0,
+            tab: 3,
+            command: Command::FinishLocalMerge { confirm: true },
+        }
+    );
+    // Abandon (matching confirm name) → the confirmed AbandonWorktree.
+    assert_eq!(
+        translate(
+            &CommandBody::GitAbandonWorktree {
+                session_id: SessionId::new("fix-login"),
+                confirm_name: "fix-login".to_string(),
+            },
+            &index,
+        ),
+        Translation::Dispatch {
+            project: 0,
+            tab: 3,
+            command: Command::AbandonWorktree { confirm: true },
+        }
+    );
+}
+
+#[test]
+fn git_abandon_rejects_on_confirm_name_mismatch() {
+    let index = index_with(vec![entry("fix-login")]);
+    assert!(matches!(
+        translate(
+            &CommandBody::GitAbandonWorktree {
+                session_id: SessionId::new("fix-login"),
+                confirm_name: "wrong-name".to_string(),
+            },
+            &index,
+        ),
+        Translation::Reject { reason }
+            if reason.contains("does not match") && reason.contains("fix-login")
+    ));
+}
+
+#[test]
+fn git_actions_reject_unknown_session() {
+    let index = index_with(vec![]);
+    for body in [
+        CommandBody::GitPullBase {
+            session_id: SessionId::new("ghost"),
+        },
+        CommandBody::GitMergeBack {
+            session_id: SessionId::new("ghost"),
+        },
         CommandBody::GitAbandonWorktree {
-            session_id: sid(),
-            confirm_name: "t1".to_string(),
+            session_id: SessionId::new("ghost"),
+            confirm_name: "ghost".to_string(),
         },
-        CommandBody::ShellOpen {
-            session_id: sid(),
-            shell_id: flightdeck_remote_protocol::ShellId::new("s1"),
-            cols: 80,
-            rows: 24,
-        },
-        CommandBody::ShellInput {
-            session_id: sid(),
-            shell_id: flightdeck_remote_protocol::ShellId::new("s1"),
-            data: "ls".to_string(),
-        },
-        CommandBody::ShellInterrupt {
-            session_id: sid(),
-            shell_id: flightdeck_remote_protocol::ShellId::new("s1"),
-        },
-        CommandBody::ShellClose {
-            session_id: sid(),
-            shell_id: flightdeck_remote_protocol::ShellId::new("s1"),
-        },
-        CommandBody::MarkRead {
-            event_ids: vec![flightdeck_remote_protocol::EventId::new("ev:1")],
-        },
-    ];
-    for body in bodies {
-        assert!(
-            matches!(
-                translate(&body, &index),
-                Translation::Reject { reason } if reason.contains("not implemented")
-            ),
-            "expected not-implemented rejection for {body:?}"
-        );
+    ] {
+        assert!(matches!(
+            translate(&body, &index),
+            Translation::Reject { reason } if reason.contains("unknown session")
+        ));
     }
+}
+
+// --- shell -----------------------------------------------------------------------
+
+#[test]
+fn shell_commands_resolve_to_shell_translations() {
+    use flightdeck_remote_protocol::ShellId;
+    let mut e = entry("t1");
+    e.tab = 2;
+    let index = index_with(vec![e]);
+    assert_eq!(
+        translate(
+            &CommandBody::ShellOpen {
+                session_id: SessionId::new("t1"),
+                shell_id: ShellId::new("s1"),
+                cols: 100,
+                rows: 40,
+            },
+            &index,
+        ),
+        Translation::Shell {
+            project: 0,
+            tab: 2,
+            session_id: SessionId::new("t1"),
+            action: ShellAction::Open {
+                shell_id: ShellId::new("s1"),
+                cols: 100,
+                rows: 40,
+            },
+        }
+    );
+    // Input carries the raw bytes of the UTF-8 string verbatim.
+    assert_eq!(
+        translate(
+            &CommandBody::ShellInput {
+                session_id: SessionId::new("t1"),
+                shell_id: ShellId::new("s1"),
+                data: "ls -la\n".to_string(),
+            },
+            &index,
+        ),
+        Translation::Shell {
+            project: 0,
+            tab: 2,
+            session_id: SessionId::new("t1"),
+            action: ShellAction::Input {
+                shell_id: ShellId::new("s1"),
+                bytes: b"ls -la\n".to_vec(),
+            },
+        }
+    );
+    assert_eq!(
+        translate(
+            &CommandBody::ShellInterrupt {
+                session_id: SessionId::new("t1"),
+                shell_id: ShellId::new("s1"),
+            },
+            &index,
+        ),
+        Translation::Shell {
+            project: 0,
+            tab: 2,
+            session_id: SessionId::new("t1"),
+            action: ShellAction::Interrupt {
+                shell_id: ShellId::new("s1"),
+            },
+        }
+    );
+    assert_eq!(
+        translate(
+            &CommandBody::ShellClose {
+                session_id: SessionId::new("t1"),
+                shell_id: ShellId::new("s1"),
+            },
+            &index,
+        ),
+        Translation::Shell {
+            project: 0,
+            tab: 2,
+            session_id: SessionId::new("t1"),
+            action: ShellAction::Close {
+                shell_id: ShellId::new("s1"),
+            },
+        }
+    );
+}
+
+#[test]
+fn shell_commands_reject_unknown_session() {
+    use flightdeck_remote_protocol::ShellId;
+    let index = index_with(vec![]);
+    assert!(matches!(
+        translate(
+            &CommandBody::ShellOpen {
+                session_id: SessionId::new("ghost"),
+                shell_id: ShellId::new("s1"),
+                cols: 80,
+                rows: 24,
+            },
+            &index,
+        ),
+        Translation::Reject { reason } if reason.contains("unknown session")
+    ));
+}
+
+// --- still-unimplemented seams ----------------------------------------------------
+
+#[test]
+fn mark_read_rejects_honestly() {
+    let index = index_with(vec![entry("t1")]);
+    assert!(matches!(
+        translate(
+            &CommandBody::MarkRead {
+                event_ids: vec![flightdeck_remote_protocol::EventId::new("ev:1")],
+            },
+            &index,
+        ),
+        Translation::Reject { reason } if reason.contains("not implemented")
+    ));
 }
 
 // --- first-task gating -------------------------------------------------------------

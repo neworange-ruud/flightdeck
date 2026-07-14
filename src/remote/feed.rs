@@ -28,8 +28,8 @@ use crate::git::status::WorktreeStatus;
 use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
-    AgentStatus, AgentType, GitIndicators, ProjectRollup, ProjectState, RollupDot, SessionState,
-    SessionStatusDelta, StateSnapshot, StatusRollup,
+    AgentStatus, AgentType, GitIndicators, GitStatusDetail, ProjectRollup, ProjectState, RollupDot,
+    SessionState, SessionStatusDelta, StateSnapshot, StatusRollup,
 };
 use flightdeck_remote_protocol::{ProjectId, SessionId};
 
@@ -118,6 +118,45 @@ pub fn git_indicators(ws: Option<&WorktreeStatus>, fallback_branch: &str) -> Git
             behind: 0,
             drift: 0,
             has_upstream: false,
+        },
+    }
+}
+
+/// Build the full read-only git status for a session's worktree (design §5.5)
+/// from the same cached [`WorktreeStatus`] the info bar reads.
+///
+/// The scalar fields (branch, base, upstream, ahead/behind, drift) come straight
+/// from the cache. The per-file list is **not** available from the cache — the
+/// desktop's status collection stores only per-category *counts*
+/// ([`crate::git::status::WorktreeChanges`]), not paths or line deltas — so
+/// `files` is left empty here. The compact per-category counts already travel on
+/// every session row as [`GitIndicators`]; populating `files` with real paths
+/// and line counts requires extending `WorktreeStatus`, tracked as follow-up.
+pub fn git_status_detail(
+    session_id: &SessionId,
+    ws: Option<&WorktreeStatus>,
+    fallback_branch: &str,
+) -> GitStatusDetail {
+    match ws {
+        Some(s) => GitStatusDetail {
+            session_id: session_id.clone(),
+            branch: Some(s.branch.clone()),
+            base_branch: Some(s.base_branch.clone()),
+            has_upstream: s.upstream.is_some(),
+            ahead: s.ahead,
+            behind: s.behind,
+            drift: s.base_drift,
+            files: Vec::new(),
+        },
+        None => GitStatusDetail {
+            session_id: session_id.clone(),
+            branch: (!fallback_branch.is_empty()).then(|| fallback_branch.to_string()),
+            base_branch: None,
+            has_upstream: false,
+            ahead: 0,
+            behind: 0,
+            drift: 0,
+            files: Vec::new(),
         },
     }
 }

@@ -30,7 +30,7 @@ use crate::remote::feed;
 
 use flightdeck_remote_protocol::{
     AgentStatus, AgentType, CommandAck, CommandBody, CommandId, CommandOutcome, PermissionChoice,
-    ProjectId, PromptId, SessionId,
+    ProjectId, PromptId, SessionId, ShellId,
 };
 
 // ===========================================================================
@@ -232,6 +232,40 @@ pub enum MainLoopAction {
     },
 }
 
+/// A remote-shell operation, already resolved to a concrete session/shell. The
+/// event loop applies it against the session's child-terminal machinery and the
+/// [`crate::remote::shell::ShellManager`] (the cap check and shell-id matching
+/// need that live state, so they happen at execution, not here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellAction {
+    /// Open the one remote shell for the session with the given geometry.
+    Open {
+        /// Client-generated shell id.
+        shell_id: ShellId,
+        /// Initial columns.
+        cols: u16,
+        /// Initial rows.
+        rows: u16,
+    },
+    /// Write bytes to the shell's child PTY.
+    Input {
+        /// Target shell.
+        shell_id: ShellId,
+        /// The exact bytes to write.
+        bytes: Vec<u8>,
+    },
+    /// Send Ctrl-C to the shell's foreground process.
+    Interrupt {
+        /// Target shell.
+        shell_id: ShellId,
+    },
+    /// Close the shell (terminate + remove the child terminal).
+    Close {
+        /// Target shell.
+        shell_id: ShellId,
+    },
+}
+
 /// What a phone command translates to on the desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Translation {
@@ -256,6 +290,17 @@ pub enum Translation {
     },
     /// Deferred to the event loop (async two-phase creation).
     NeedsMainLoop(MainLoopAction),
+    /// A remote-shell operation against a resolved session (see [`ShellAction`]).
+    Shell {
+        /// Workspace project index.
+        project: usize,
+        /// Tab index within the project.
+        tab: usize,
+        /// The session the shell belongs to.
+        session_id: SessionId,
+        /// The operation to apply.
+        action: ShellAction,
+    },
     /// Refused, with an honest reason for the ack.
     Reject {
         /// Why the command was refused.
@@ -266,6 +311,25 @@ pub enum Translation {
 fn reject(reason: impl Into<String>) -> Translation {
     Translation::Reject {
         reason: reason.into(),
+    }
+}
+
+/// Resolve a shell command's session to a [`Translation::Shell`], rejecting an
+/// unknown session honestly. The shell registry state (cap, shell-id match) is
+/// checked at execution, not here.
+fn shell_translation(
+    index: &SessionIndex,
+    session_id: &SessionId,
+    action: ShellAction,
+) -> Translation {
+    match index.session(session_id) {
+        Some(s) => Translation::Shell {
+            project: s.project,
+            tab: s.tab,
+            session_id: session_id.clone(),
+            action,
+        },
+        None => reject(format!("unknown session '{session_id}'")),
     }
 }
 
@@ -456,20 +520,107 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             None => reject(format!("unknown session '{session_id}'")),
         },
 
-        // --- Git actions: a separate task. The translations will dispatch the
-        //     existing guarded commands (PullBase / FinishLocalMerge /
-        //     AbandonWorktree with the confirm_name echo checked against the
-        //     session name) — never GitExecutor directly. ---
-        CommandBody::GitPullBase { .. } => reject("git pull-base is not implemented yet"),
-        CommandBody::GitMergeBack { .. } => reject("git merge-back is not implemented yet"),
-        CommandBody::GitAbandonWorktree { .. } => reject("abandon worktree is not implemented yet"),
+        // --- Git actions: dispatch the existing guarded commands so every
+        //     safety guard (no history rewrite, precondition checks, confirm
+        //     gates) is inherited — never GitExecutor directly. The phone has
+        //     already confirmed destructive actions (PRD §8), so the confirmed
+        //     path is dispatched (mirroring the TUI's post-confirm dispatch). ---
+        CommandBody::GitPullBase { session_id } => match index.session(session_id) {
+            // Pull base is a global (repo-root) action; it ignores the selected
+            // tab, but we route through the session so the ack targets a real
+            // project and unknown sessions are refused honestly.
+            Some(s) => Translation::Dispatch {
+                project: s.project,
+                tab: s.tab,
+                command: Command::PullBase,
+            },
+            None => reject(format!("unknown session '{session_id}'")),
+        },
 
-        // --- Remote shell: a separate task (ShellOpen/Input/Interrupt/Close
-        //     will manage a dedicated child terminal per session). ---
-        CommandBody::ShellOpen { .. }
-        | CommandBody::ShellInput { .. }
-        | CommandBody::ShellInterrupt { .. }
-        | CommandBody::ShellClose { .. } => reject("the remote shell is not implemented yet"),
+        CommandBody::GitMergeBack { session_id } => match index.session(session_id) {
+            // The phone confirmed already (PRD §8): dispatch the confirmed
+            // FinishLocalMerge, exactly as the TUI does after its MergeConfirm.
+            // Preconditions (dirty base/worktree, wrong branch, conflicts) are
+            // enforced inside dispatch and surface as honest ack outcomes.
+            Some(s) => Translation::Dispatch {
+                project: s.project,
+                tab: s.tab,
+                command: Command::FinishLocalMerge { confirm: true },
+            },
+            None => reject(format!("unknown session '{session_id}'")),
+        },
+
+        CommandBody::GitAbandonWorktree {
+            session_id,
+            confirm_name,
+        } => {
+            let Some(s) = index.session(session_id) else {
+                return reject(format!("unknown session '{session_id}'"));
+            };
+            // Destructive: the typed confirmation must match the session name
+            // exactly (the same type-to-confirm guard the desktop enforces).
+            if confirm_name != &s.name {
+                return reject(format!(
+                    "confirmation name '{confirm_name}' does not match the session name '{}'",
+                    s.name
+                ));
+            }
+            Translation::Dispatch {
+                project: s.project,
+                tab: s.tab,
+                command: Command::AbandonWorktree { confirm: true },
+            }
+        }
+
+        // --- Remote shell: resolve the session here (unknown → honest reject);
+        //     the cap check and shell-id matching need the live shell registry,
+        //     so they run at execution time. ---
+        CommandBody::ShellOpen {
+            session_id,
+            shell_id,
+            cols,
+            rows,
+        } => shell_translation(
+            index,
+            session_id,
+            ShellAction::Open {
+                shell_id: shell_id.clone(),
+                cols: *cols,
+                rows: *rows,
+            },
+        ),
+        CommandBody::ShellInput {
+            session_id,
+            shell_id,
+            data,
+        } => shell_translation(
+            index,
+            session_id,
+            ShellAction::Input {
+                shell_id: shell_id.clone(),
+                bytes: data.clone().into_bytes(),
+            },
+        ),
+        CommandBody::ShellInterrupt {
+            session_id,
+            shell_id,
+        } => shell_translation(
+            index,
+            session_id,
+            ShellAction::Interrupt {
+                shell_id: shell_id.clone(),
+            },
+        ),
+        CommandBody::ShellClose {
+            session_id,
+            shell_id,
+        } => shell_translation(
+            index,
+            session_id,
+            ShellAction::Close {
+                shell_id: shell_id.clone(),
+            },
+        ),
 
         // --- Activity feed read-state: a separate task. ---
         CommandBody::MarkRead { .. } => reject("mark_read is not implemented yet"),

@@ -78,10 +78,11 @@ use crate::persistence::workspace::{
 use crate::remote::client::RemoteHandle;
 use crate::remote::commands::{
     build_index, encode_reply, first_task_decision, translate, CommandLedger, FirstTaskDecision,
-    MainLoopAction, PendingFirstTask, Translation,
+    MainLoopAction, PendingFirstTask, ShellAction, Translation,
 };
 use crate::remote::identity::load_or_create_identity;
 use crate::remote::pairing::{build_channel, PairingSession};
+use crate::remote::shell::ShellManager;
 use crate::remote::state::remote_state_path;
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::terminal::pty::PortablePtyBackend;
@@ -93,7 +94,7 @@ use crate::tui::render::{
     ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
     HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, UiOverlay,
 };
-use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId};
+use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -1228,9 +1229,15 @@ fn event_loop(
             let is_active = idx == active;
             let p = &mut workspace.projects[idx];
 
-            drain_pty_output(&mut p.state, now_ms, |sid, bytes| {
+            drain_pty_output(&mut p.state, now_ms, |sid, which, bytes| {
                 if let Some(b) = remote_bridge.as_mut() {
-                    b.tee_primary(sid, bytes, now_ms as i64);
+                    match which {
+                        // Primary bytes build the transcript history.
+                        None => b.tee_primary(sid, bytes, now_ms as i64),
+                        // Child bytes stream to the phone iff that child backs
+                        // the session's live remote shell.
+                        Some(child_index) => b.shell_pump(sid, child_index, bytes),
+                    }
                 }
             });
 
@@ -1696,8 +1703,14 @@ fn service_remote_commands(
             build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
         };
         let translation = translate(&cmd.body, &index);
-        let (outcome, message) =
-            execute_remote_translation(translation, workspace, env, now_ms, first_tasks);
+        let (outcome, message) = execute_remote_translation(
+            translation,
+            workspace,
+            env,
+            now_ms,
+            first_tasks,
+            bridge.shells_mut(),
+        );
         ledger.record(cmd.command_id.clone(), outcome, message.clone());
         bridge.send_ack(
             CommandAck {
@@ -1710,6 +1723,40 @@ fn service_remote_commands(
         );
     }
     deliver_first_tasks(first_tasks, workspace, now_ms);
+    // Report any remote shell whose process has exited (flushed next tick).
+    poll_remote_shell_exits(bridge, workspace);
+}
+
+/// Poll each live remote shell's backing child terminal and report a one-shot
+/// `exited` event when its process has stopped. The event is queued on the
+/// shell manager and sealed/sent by the next [`RemoteBridge::tick`].
+fn poll_remote_shell_exits(bridge: &mut RemoteBridge, workspace: &Workspace) {
+    for (session_id, child_index) in bridge.shells().active_shells() {
+        // Resolve the session's tab across all open projects.
+        let child_state = workspace.projects.iter().find_map(|p| {
+            p.state
+                .tabs
+                .iter()
+                .find(|t| t.meta.id == session_id.as_str())
+                .and_then(|t| t.session.child(child_index))
+                .map(|c| c.process_state())
+        });
+        match child_state {
+            Some(ProcessState::Exited(code)) => {
+                bridge
+                    .shells_mut()
+                    .mark_exit(&session_id, child_index, Some(code));
+            }
+            // Stopped (or the child vanished): treat as an exit with no code so
+            // the phone learns the shell is dead rather than hanging forever.
+            Some(ProcessState::Stopped) | None => {
+                bridge
+                    .shells_mut()
+                    .mark_exit(&session_id, child_index, None);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The ack for a session/project that vanished between translation and
@@ -1722,15 +1769,24 @@ fn remote_target_gone() -> (CommandOutcome, Option<String>) {
 }
 
 /// Execute one [`Translation`] and report the honest ack outcome.
+#[allow(clippy::too_many_arguments)]
 fn execute_remote_translation(
     translation: Translation,
     workspace: &mut Workspace,
     env: &Env,
     now_ms: u64,
     first_tasks: &mut Vec<PendingFirstTask>,
+    shells: &mut ShellManager,
 ) -> (CommandOutcome, Option<String>) {
     match translation {
         Translation::Reject { reason } => (CommandOutcome::Rejected, Some(reason)),
+
+        Translation::Shell {
+            project,
+            tab,
+            session_id,
+            action,
+        } => execute_shell_action(shells, workspace, env, project, tab, &session_id, action),
 
         Translation::PtyInput {
             project,
@@ -1758,7 +1814,24 @@ fn execute_remote_translation(
             let Some(p) = workspace.projects.get_mut(project) else {
                 return remote_target_gone();
             };
-            dispatch_remote_command(p, env, tab, command)
+            match command {
+                // Merge-back mirrors the TUI's two-phase flow so the ack is
+                // honest: phase 1 (unconfirmed, read-only) surfaces the
+                // dirty-base warning / precondition refusals as rejections;
+                // only a MergeConfirm proceeds to the confirmed merge.
+                Command::FinishLocalMerge { .. } => dispatch_remote_merge_back(p, env, tab),
+                // A confirmed abandon that returns a Warning did NOT remove
+                // the worktree (the session could not be stopped) — that is a
+                // failure, not an applied-with-caveat.
+                Command::AbandonWorktree { confirm: true } => {
+                    match dispatch_remote_effect(p, env, tab, command) {
+                        None => remote_target_gone(),
+                        Some(Ok(Effect::Warning(w))) => (CommandOutcome::Failed, Some(w)),
+                        Some(result) => fold_remote_effect(result),
+                    }
+                }
+                _ => dispatch_remote_command(p, env, tab, command),
+            }
         }
 
         Translation::NeedsMainLoop(MainLoopAction::NewAgent {
@@ -1816,16 +1889,16 @@ fn execute_remote_translation(
 /// temporarily select the target (dispatch acts on the selection), run it
 /// through [`AppState::dispatch`] — inheriting every safety guard — then
 /// restore the user's selection by id (indices may have shifted if the
-/// command removed a tab). The returned [`Effect`] is folded into an honest
-/// ack outcome instead of being surfaced as desktop UI.
-fn dispatch_remote_command(
+/// command removed a tab). Returns the raw dispatch result for the caller to
+/// fold into an ack, or `None` when the tab is already gone.
+fn dispatch_remote_effect(
     p: &mut Project,
     env: &Env,
     tab: usize,
     command: Command,
-) -> (CommandOutcome, Option<String>) {
+) -> Option<Result<Effect>> {
     if tab >= p.state.tabs.len() {
-        return remote_target_gone();
+        return None;
     }
     let prev_selected = p.state.selected().map(|t| t.meta.id.clone());
     p.state.selected_tab = Some(tab);
@@ -1840,12 +1913,212 @@ fn dispatch_remote_command(
         // else: the previously selected tab is the one that was removed;
         // dispatch already fixed the selection to a sensible neighbour.
     }
+    Some(result)
+}
+
+/// Fold a dispatch result into an honest ack outcome instead of surfacing it
+/// as desktop UI. `Warning` maps to applied-with-caveat — callers whose
+/// command treats a warning as "nothing happened" (e.g. merge-back's
+/// dirty-base warning) must intercept it before folding.
+fn fold_remote_effect(result: Result<Effect>) -> (CommandOutcome, Option<String>) {
     match result {
         Ok(Effect::Refused(reason)) => (CommandOutcome::Rejected, Some(reason)),
         Ok(Effect::Message(m)) => (CommandOutcome::Applied, Some(m)),
         Ok(Effect::Warning(w)) => (CommandOutcome::Applied, Some(w)),
         Ok(_) => (CommandOutcome::Applied, None),
         Err(e) => (CommandOutcome::Failed, Some(e.to_string())),
+    }
+}
+
+/// [`dispatch_remote_effect`] + [`fold_remote_effect`], for commands whose
+/// effects need no special interpretation.
+fn dispatch_remote_command(
+    p: &mut Project,
+    env: &Env,
+    tab: usize,
+    command: Command,
+) -> (CommandOutcome, Option<String>) {
+    match dispatch_remote_effect(p, env, tab, command) {
+        None => remote_target_gone(),
+        Some(result) => fold_remote_effect(result),
+    }
+}
+
+/// Merge a session's branch back into its base on behalf of the phone,
+/// mirroring the TUI's two-phase `FinishLocalMerge` flow. Phase 1 dispatches
+/// `confirm: false` — a read-only pass that surfaces the §13 dirty-base
+/// warning and every §15 precondition refusal *without merging*; both ack as
+/// `Rejected` because nothing happened. Only the [`Effect::MergeConfirm`]
+/// go-ahead proceeds to the confirmed merge (the phone already confirmed per
+/// PRD §8), whose outcome is folded normally — a `Warning` there means the
+/// merge itself landed (only cleanup failed), so applied-with-caveat is honest.
+fn dispatch_remote_merge_back(
+    p: &mut Project,
+    env: &Env,
+    tab: usize,
+) -> (CommandOutcome, Option<String>) {
+    match dispatch_remote_effect(p, env, tab, Command::FinishLocalMerge { confirm: false }) {
+        None => remote_target_gone(),
+        Some(Ok(Effect::MergeConfirm { .. })) => {
+            match dispatch_remote_effect(p, env, tab, Command::FinishLocalMerge { confirm: true }) {
+                None => remote_target_gone(),
+                Some(result) => fold_remote_effect(result),
+            }
+        }
+        // Dirty base (§13) arrives as a Warning from the unconfirmed pass; no
+        // merge happened, so it is a rejection, not applied-with-caveat.
+        Some(Ok(Effect::Warning(w))) => (CommandOutcome::Rejected, Some(w)),
+        Some(Ok(Effect::Refused(reason))) => (CommandOutcome::Rejected, Some(reason)),
+        Some(Ok(other)) => (
+            CommandOutcome::Failed,
+            Some(format!("unexpected merge-back response: {other:?}")),
+        ),
+        Some(Err(e)) => (CommandOutcome::Failed, Some(e.to_string())),
+    }
+}
+
+/// The backing child terminal of a resolved (project, tab, index), if it exists.
+fn remote_shell_terminal(
+    workspace: &mut Workspace,
+    project: usize,
+    tab: usize,
+    child_index: usize,
+) -> Option<&mut crate::terminal::session::Terminal> {
+    workspace
+        .projects
+        .get_mut(project)?
+        .state
+        .tabs
+        .get_mut(tab)?
+        .session
+        .child_mut(child_index)
+}
+
+/// Apply a resolved remote-shell action against the session's child-terminal
+/// machinery and the [`ShellManager`], returning the honest ack outcome. The
+/// shell child is spawned through the guarded `OpenShell` command (so it is
+/// container-aware and shares every desktop guard); input/interrupt/close act on
+/// that child's PTY, and lifecycle events are queued for the outbound feed.
+fn execute_shell_action(
+    shells: &mut ShellManager,
+    workspace: &mut Workspace,
+    env: &Env,
+    project: usize,
+    tab: usize,
+    session_id: &SessionId,
+    action: ShellAction,
+) -> (CommandOutcome, Option<String>) {
+    match action {
+        ShellAction::Open {
+            shell_id,
+            cols,
+            rows,
+        } => {
+            // One remote shell per session (PRD §5.4): refuse a second before
+            // spawning anything.
+            if shells.has_shell(session_id) {
+                return (
+                    CommandOutcome::Rejected,
+                    Some("a shell is already open for this session".to_string()),
+                );
+            }
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            // Spawn the child through the guarded, container-aware OpenShell
+            // command, preserving the desktop user's on-screen selection.
+            let (outcome, message) = dispatch_remote_command(p, env, tab, Command::OpenShell);
+            if outcome != CommandOutcome::Applied {
+                return (outcome, message);
+            }
+            // The freshly spawned shell is the last child of the session.
+            let Some(t) = p.state.tabs.get_mut(tab) else {
+                return remote_target_gone();
+            };
+            let Some(child_index) = t.session.child_count().checked_sub(1) else {
+                return (
+                    CommandOutcome::Failed,
+                    Some("the shell terminal did not start".to_string()),
+                );
+            };
+            // Size it to the phone's geometry so the remote view matches.
+            if let Some(c) = t.session.child_mut(child_index) {
+                let _ = c.resize(PtySize { rows, cols });
+            }
+            shells.opened(session_id.clone(), shell_id, child_index, cols, rows);
+            (CommandOutcome::Applied, Some("shell opened".to_string()))
+        }
+
+        ShellAction::Input { shell_id, bytes } => {
+            if !shells.matches(session_id, &shell_id) {
+                return (
+                    CommandOutcome::Rejected,
+                    Some("no open shell with that id for this session".to_string()),
+                );
+            }
+            let Some(child_index) = shells.child_index(session_id) else {
+                return remote_target_gone();
+            };
+            match remote_shell_terminal(workspace, project, tab, child_index) {
+                Some(term) => {
+                    // Match desktop input behaviour: drop any selection, snap to
+                    // the live bottom, then write the raw bytes.
+                    term.clear_selection();
+                    term.scroll_to_bottom();
+                    if term.session_mut().write_input(&bytes).is_ok() {
+                        (CommandOutcome::Applied, None)
+                    } else {
+                        (
+                            CommandOutcome::Failed,
+                            Some("could not write to the shell".to_string()),
+                        )
+                    }
+                }
+                None => (
+                    CommandOutcome::Failed,
+                    Some("the shell terminal is gone".to_string()),
+                ),
+            }
+        }
+
+        ShellAction::Interrupt { shell_id } => {
+            if !shells.matches(session_id, &shell_id) {
+                return (
+                    CommandOutcome::Rejected,
+                    Some("no open shell with that id for this session".to_string()),
+                );
+            }
+            let Some(child_index) = shells.child_index(session_id) else {
+                return remote_target_gone();
+            };
+            match remote_shell_terminal(workspace, project, tab, child_index) {
+                Some(term) => {
+                    let _ = term.session_mut().send_ctrl_c();
+                    (CommandOutcome::Applied, None)
+                }
+                None => (
+                    CommandOutcome::Failed,
+                    Some("the shell terminal is gone".to_string()),
+                ),
+            }
+        }
+
+        ShellAction::Close { shell_id } => {
+            let Some(child_index) = shells.close(session_id, &shell_id) else {
+                return (
+                    CommandOutcome::Rejected,
+                    Some("no open shell with that id for this session".to_string()),
+                );
+            };
+            if let Some(p) = workspace.projects.get_mut(project) {
+                if let Some(t) = p.state.tabs.get_mut(tab) {
+                    // Terminate + remove the child terminal (best effort — the
+                    // Closed event has already been queued).
+                    let _ = t.session.close_child(child_index);
+                }
+            }
+            (CommandOutcome::Applied, None)
+        }
     }
 }
 
@@ -3991,7 +4264,11 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 /// Drain output from every terminal of every tab and feed each terminal's VT
 /// parser so it can be rendered. Lifecycle status is handled separately by
 /// backend hooks/plugins (SPECS §24).
-fn drain_pty_output(state: &mut AppState, _now_ms: u64, mut tee: impl FnMut(&str, &[u8])) {
+fn drain_pty_output(
+    state: &mut AppState,
+    _now_ms: u64,
+    mut tee: impl FnMut(&str, Option<usize>, &[u8]),
+) {
     for tab in state.tabs.iter_mut() {
         // Primary: drain into the VT parser. Lifecycle status comes only from
         // backend hooks/plugins; PTY output includes echoed user keystrokes and
@@ -4004,21 +4281,24 @@ fn drain_pty_output(state: &mut AppState, _now_ms: u64, mut tee: impl FnMut(&str
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
                     // Tee the raw primary bytes to the remote transcript builder
-                    // (a no-op when remote is disabled). `tab.meta` is a disjoint
-                    // field from `tab.session`, so this borrows cleanly.
-                    tee(&tab.meta.id, &bytes);
+                    // (`None` = primary; a no-op when remote is disabled).
+                    // `tab.meta` is a disjoint field from `tab.session`, so this
+                    // borrows cleanly.
+                    tee(&tab.meta.id, None, &bytes);
                 }
             }
         }
 
         // Child terminals: drain → VT parser (so they don't stall and so their
-        // screen renders when selected).
+        // screen renders when selected), teeing each child's raw bytes so a
+        // remote shell backed by that child (`Some(index)`) streams to the phone.
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
                 if let Ok(bytes) = child.session_mut().try_read_output() {
                     if !bytes.is_empty() {
                         child.process_output(&bytes);
                         child.answer_cursor_position_query(&bytes);
+                        tee(&tab.meta.id, Some(c), &bytes);
                     }
                 }
             }
@@ -4638,7 +4918,7 @@ mod tests {
             .unwrap();
 
         handle.push_output(b"echoed user keystrokes".to_vec());
-        drain_pty_output(&mut state, 1_000, |_, _| {});
+        drain_pty_output(&mut state, 1_000, |_, _, _| {});
 
         assert_eq!(
             state.tabs[0].display_status(1_000).interpreted,
@@ -4780,12 +5060,16 @@ mod tests {
         }
 
         fn workspace_with(app: AppState) -> Workspace {
+            workspace_rooted(app, PathBuf::from("/repo"))
+        }
+
+        fn workspace_rooted(app: AppState, root: PathBuf) -> Workspace {
             let (create_tx, create_rx) = std::sync::mpsc::channel();
             let (status_tx, status_rx) = std::sync::mpsc::channel();
             Workspace {
                 projects: vec![Project {
                     name: "proj".to_string(),
-                    git: GitCli::new(PathBuf::from("/repo")),
+                    git: GitCli::new(root),
                     state: app,
                     cache: GitStatusCache::new(),
                     create_tx,
@@ -5049,6 +5333,523 @@ mod tests {
             }];
             deliver_first_tasks(&mut gone, &mut workspace, 3_000);
             assert!(gone.is_empty());
+        }
+
+        // --- git action bridge ---------------------------------------------
+
+        /// Run one command envelope through the full drain path and return the
+        /// acks plus everything else that was sent.
+        fn run_command(
+            bridge: &mut RemoteBridge,
+            workspace: &mut Workspace,
+            env: &Env,
+            seq: u64,
+            cmd: &PhoneCommand,
+        ) -> Vec<flightdeck_remote_protocol::CommandAck> {
+            bridge.handle_inbound(RemoteInbound::Envelope(envelope(seq, cmd)));
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                bridge,
+                &mut ledger,
+                &mut first_tasks,
+                workspace,
+                env,
+                1_000,
+                &mut |o| sent.push(o),
+            );
+            decode_acks(&sent)
+        }
+
+        /// Abandon with a wrong type-to-confirm name is rejected before any
+        /// state is touched, with the session name echoed in the reason.
+        #[test]
+        fn git_abandon_confirm_name_mismatch_is_rejected() {
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-abandon"),
+                issued_at_ms: 0,
+                body: CommandBody::GitAbandonWorktree {
+                    session_id: SessionId::new("t1"),
+                    confirm_name: "wrong".to_string(),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &cmd);
+            assert_eq!(acks.len(), 1);
+            assert_eq!(acks[0].outcome, CommandOutcome::Rejected);
+            let msg = acks[0].message.as_deref().unwrap();
+            assert!(msg.contains("does not match"), "{msg}");
+            // The tab is untouched.
+            assert_eq!(workspace.projects[0].state.tabs.len(), 1);
+        }
+
+        /// Git commands against an unknown session are rejected honestly.
+        #[test]
+        fn git_commands_unknown_session_rejected() {
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-pull"),
+                issued_at_ms: 0,
+                body: CommandBody::GitPullBase {
+                    session_id: SessionId::new("ghost"),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &cmd);
+            assert_eq!(acks[0].outcome, CommandOutcome::Rejected);
+            assert!(acks[0]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("unknown session"));
+        }
+
+        /// Merge-back against a dirty base repo is REJECTED (nothing merged):
+        /// the §13 dirty-base warning from the unconfirmed phase must not ack
+        /// as applied. Uses a real `git init` repo so the actual GitCli
+        /// precondition path runs end to end.
+        #[test]
+        fn git_merge_back_dirty_base_is_rejected_not_applied() {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().to_path_buf();
+            // A fresh repo with an untracked file = a dirty base worktree.
+            let ok = std::process::Command::new("git")
+                .arg("init")
+                .current_dir(&root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git init failed");
+            std::fs::write(root.join("uncommitted.txt"), "dirty").unwrap();
+
+            let pty = FakePty::new();
+            let tabs = vec![tab_state("t1", "fix", "claude")];
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs,
+            };
+            let mut app = AppState::new(
+                Config::default(),
+                state,
+                &root,
+                root.join(".flightdeck/state.json"),
+            );
+            let _h = pty.queue_session();
+            app.tabs[0]
+                .session
+                .spawn_primary(&pty, "agent", &[], &root, PtySize::default())
+                .unwrap();
+            let mut workspace = workspace_rooted(app, root);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-merge"),
+                issued_at_ms: 0,
+                body: CommandBody::GitMergeBack {
+                    session_id: SessionId::new("t1"),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &cmd);
+            assert_eq!(acks.len(), 1);
+            assert_eq!(
+                acks[0].outcome,
+                CommandOutcome::Rejected,
+                "dirty base must reject, not apply: {:?}",
+                acks[0].message
+            );
+            let msg = acks[0].message.as_deref().unwrap();
+            assert!(msg.contains("Local merge is disabled"), "{msg}");
+            // The tab still exists — nothing was merged or torn down.
+            assert_eq!(workspace.projects[0].state.tabs.len(), 1);
+        }
+
+        /// Merge-back whose git backend errors outright (no repo at the root)
+        /// acks as failed — never silently applied.
+        #[test]
+        fn git_merge_back_git_error_acks_failed() {
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            // "/repo" does not exist, so every git call errors.
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-merge"),
+                issued_at_ms: 0,
+                body: CommandBody::GitMergeBack {
+                    session_id: SessionId::new("t1"),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &cmd);
+            assert_eq!(acks[0].outcome, CommandOutcome::Failed);
+        }
+
+        // --- remote shell bridge ---------------------------------------------
+
+        /// Decode every [`DesktopToPhone`] message out of the sent envelopes.
+        fn decode_msgs(sent: &[RemoteOutbound]) -> Vec<DesktopToPhone> {
+            sent.iter()
+                .filter_map(|o| match o {
+                    RemoteOutbound::SendEnvelope { ciphertext, .. } => {
+                        let bytes = STANDARD.decode(ciphertext).unwrap();
+                        serde_json::from_slice::<DesktopToPhone>(&bytes).ok()
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// End-to-endish shell round trip: sealed ShellOpen + ShellInput
+        /// envelopes through `handle_inbound` → drain → the FakePty received
+        /// the input bytes → scripted PTY output → drain tees it → `tick`
+        /// flushes sealed ShellOutput/ShellEvent envelopes. Then interrupt,
+        /// the one-shell cap, close, and input-after-close.
+        #[test]
+        fn shell_open_input_output_interrupt_close_round_trip() {
+            use flightdeck_remote_protocol::{ShellEventKind, ShellId};
+
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+            let mut bridge = RemoteBridge::passthrough(0);
+
+            // The child session the ShellOpen's spawn will consume.
+            let shell_pty = pty.queue_session();
+
+            // 1. ShellOpen — spawns a child shell in the worktree, sized to
+            //    the phone's geometry, and acks applied.
+            let open = PhoneCommand {
+                command_id: CommandId::new("c-open"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellOpen {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                    cols: 100,
+                    rows: 30,
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &open);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied, "{:?}", acks[0]);
+            assert_eq!(
+                workspace.projects[0].state.tabs[0].session.child_count(),
+                1,
+                "a child shell terminal was spawned"
+            );
+            assert!(shell_pty
+                .resizes()
+                .iter()
+                .any(|s| s.cols == 100 && s.rows == 30));
+
+            // 2. A second open for the same session hits the one-shell cap.
+            let open2 = PhoneCommand {
+                command_id: CommandId::new("c-open2"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellOpen {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s2"),
+                    cols: 80,
+                    rows: 24,
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 2, &open2);
+            assert_eq!(acks[0].outcome, CommandOutcome::Rejected);
+            assert!(acks[0].message.as_deref().unwrap().contains("already open"));
+            assert_eq!(
+                workspace.projects[0].state.tabs[0].session.child_count(),
+                1,
+                "the cap must refuse before spawning"
+            );
+
+            // 3. ShellInput — the exact bytes land on the child PTY.
+            let input = PhoneCommand {
+                command_id: CommandId::new("c-input"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellInput {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                    data: "echo hi\n".to_string(),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 3, &input);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+            assert_eq!(shell_pty.input(), b"echo hi\n".to_vec());
+
+            // 4. Scripted PTY output → drain tees it into the shell manager →
+            //    tick flushes it as a sealed ShellOutput envelope (plus the
+            //    queued `opened` lifecycle event).
+            shell_pty.push_output(b"hi\r\n".to_vec());
+            {
+                let p = &mut workspace.projects[0];
+                drain_pty_output(&mut p.state, 1_000, |sid, which, bytes| match which {
+                    None => bridge.tee_primary(sid, bytes, 1_000),
+                    Some(ci) => bridge.shell_pump(sid, ci, bytes),
+                });
+            }
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            {
+                let views: Vec<ProjectView> = workspace
+                    .projects
+                    .iter()
+                    .map(|p| ProjectView {
+                        id: ProjectId::new(p.name.clone()),
+                        name: &p.name,
+                        state: &p.state,
+                        cache: &p.cache,
+                    })
+                    .collect();
+                bridge.tick(&views, 1_000, &mut |o| sent.push(o));
+            }
+            let msgs = decode_msgs(&sent);
+            let opened = msgs.iter().any(|m| {
+                matches!(
+                    m,
+                    DesktopToPhone::ShellEvent(e)
+                        if e.shell_id == ShellId::new("s1")
+                            && matches!(e.kind, ShellEventKind::Opened { cols: 100, rows: 30 })
+                )
+            });
+            assert!(opened, "opened event flushed: {msgs:?}");
+            let output = msgs.iter().find_map(|m| match m {
+                DesktopToPhone::ShellOutput(o) => Some(o),
+                _ => None,
+            });
+            let output = output.expect("a ShellOutput envelope was flushed");
+            assert_eq!(output.session_id, SessionId::new("t1"));
+            assert_eq!(output.shell_id, ShellId::new("s1"));
+            assert_eq!(output.seq, 1);
+            assert_eq!(output.data, "hi\r\n");
+
+            // 5. ShellInterrupt → Ctrl-C on the child PTY.
+            let interrupt = PhoneCommand {
+                command_id: CommandId::new("c-int"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellInterrupt {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 4, &interrupt);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+            assert_eq!(shell_pty.ctrl_c_count(), 1);
+
+            // 6. ShellClose → the child is terminated and removed; the closed
+            //    event is flushed on the next tick.
+            let close = PhoneCommand {
+                command_id: CommandId::new("c-close"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellClose {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 5, &close);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+            assert!(shell_pty.terminated());
+            assert_eq!(workspace.projects[0].state.tabs[0].session.child_count(), 0);
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            {
+                let views: Vec<ProjectView> = workspace
+                    .projects
+                    .iter()
+                    .map(|p| ProjectView {
+                        id: ProjectId::new(p.name.clone()),
+                        name: &p.name,
+                        state: &p.state,
+                        cache: &p.cache,
+                    })
+                    .collect();
+                bridge.tick(&views, 2_000, &mut |o| sent.push(o));
+            }
+            let msgs = decode_msgs(&sent);
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    DesktopToPhone::ShellEvent(e) if matches!(e.kind, ShellEventKind::Closed)
+                )),
+                "closed event flushed: {msgs:?}"
+            );
+
+            // 7. Input to the closed shell is rejected honestly.
+            let stale = PhoneCommand {
+                command_id: CommandId::new("c-stale"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellInput {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                    data: "ls\n".to_string(),
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 6, &stale);
+            assert_eq!(acks[0].outcome, CommandOutcome::Rejected);
+            assert!(acks[0]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("no open shell"));
+
+            // 8. After close, the slot is free: a fresh open succeeds.
+            pty.queue_session();
+            let reopen = PhoneCommand {
+                command_id: CommandId::new("c-reopen"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellOpen {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s3"),
+                    cols: 80,
+                    rows: 24,
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 7, &reopen);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied, "{:?}", acks[0]);
+        }
+
+        /// A remote shell whose process exits is reported once as an `exited`
+        /// event; output stops but the slot stays until an explicit close.
+        #[test]
+        fn shell_exit_is_reported_via_poll() {
+            use flightdeck_remote_protocol::{ShellEventKind, ShellId};
+
+            let pty = FakePty::new();
+            let (app, _handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+            let mut bridge = RemoteBridge::passthrough(0);
+
+            let shell_pty = pty.queue_session();
+            let open = PhoneCommand {
+                command_id: CommandId::new("c-open"),
+                issued_at_ms: 0,
+                body: CommandBody::ShellOpen {
+                    session_id: SessionId::new("t1"),
+                    shell_id: ShellId::new("s1"),
+                    cols: 80,
+                    rows: 24,
+                },
+            };
+            let acks = run_command(&mut bridge, &mut workspace, &env, 1, &open);
+            assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+
+            // The shell process exits; the per-tick poll (inside the command
+            // service pass) detects it.
+            shell_pty.set_state(ProcessState::Exited(0));
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                &mut bridge,
+                &mut ledger,
+                &mut first_tasks,
+                &mut workspace,
+                &env,
+                2_000,
+                &mut |o| sent.push(o),
+            );
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            {
+                let views: Vec<ProjectView> = workspace
+                    .projects
+                    .iter()
+                    .map(|p| ProjectView {
+                        id: ProjectId::new(p.name.clone()),
+                        name: &p.name,
+                        state: &p.state,
+                        cache: &p.cache,
+                    })
+                    .collect();
+                bridge.tick(&views, 2_000, &mut |o| sent.push(o));
+            }
+            let msgs = decode_msgs(&sent);
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    DesktopToPhone::ShellEvent(e)
+                        if matches!(e.kind, ShellEventKind::Exited { code: Some(0) })
+                )),
+                "exited event flushed: {msgs:?}"
+            );
         }
     }
 }

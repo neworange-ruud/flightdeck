@@ -124,6 +124,50 @@ fn git_indicators_fallback_without_cache() {
     assert_eq!(git_indicators(None, "").branch, None);
 }
 
+// --- git status detail -----------------------------------------------------
+
+#[test]
+fn git_status_detail_from_cache() {
+    use crate::git::status::{WorktreeChanges, WorktreeStatus};
+    let ws = WorktreeStatus {
+        branch: "fix-login".to_string(),
+        base_branch: "main".to_string(),
+        dirty: true,
+        changes: WorktreeChanges {
+            added: 2,
+            modified: 3,
+            deleted: 1,
+        },
+        ahead: 4,
+        behind: 5,
+        upstream: Some("origin/fix-login".to_string()),
+        base_drift: 6,
+        worktree_path: std::path::PathBuf::from("/tmp/wt"),
+    };
+    let d = git_status_detail(&SessionId::new("t1"), Some(&ws), "ignored");
+    assert_eq!(d.session_id, SessionId::new("t1"));
+    assert_eq!(d.branch.as_deref(), Some("fix-login"));
+    assert_eq!(d.base_branch.as_deref(), Some("main"));
+    assert!(d.has_upstream);
+    assert_eq!((d.ahead, d.behind, d.drift), (4, 5, 6));
+    // Per-file detail is not available from the cache (counts only).
+    assert!(d.files.is_empty());
+}
+
+#[test]
+fn git_status_detail_fallback_without_cache() {
+    let d = git_status_detail(&SessionId::new("t1"), None, "my-branch");
+    assert_eq!(d.branch.as_deref(), Some("my-branch"));
+    assert_eq!(d.base_branch, None);
+    assert!(!d.has_upstream);
+    assert_eq!((d.ahead, d.behind, d.drift), (0, 0, 0));
+    assert!(d.files.is_empty());
+    assert_eq!(
+        git_status_detail(&SessionId::new("t1"), None, "").branch,
+        None
+    );
+}
+
 // --- rollup precedence + summary -------------------------------------------
 
 fn sess(status: AgentStatus) -> SessionState {

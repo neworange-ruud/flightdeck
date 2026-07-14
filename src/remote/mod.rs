@@ -37,6 +37,7 @@ pub mod feed;
 pub mod identity;
 pub mod notifier;
 pub mod pairing;
+pub mod shell;
 pub mod state;
 pub mod transcript;
 

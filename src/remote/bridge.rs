@@ -32,6 +32,7 @@ use base64::Engine;
 use crate::app::state::AppState;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
 use crate::remote::notifier::{build_event, EventArming, EventClass, EventContext};
+use crate::remote::shell::ShellManager;
 use crate::remote::transcript::TranscriptBuilder;
 use crate::remote::{RemoteInbound, RemoteOutbound};
 use crate::tui::render::GitStatusCache;
@@ -102,6 +103,9 @@ pub struct RemoteBridge {
     grace_until_ms: u64,
     pending_transcript_requests: Vec<(SessionId, Option<u64>)>,
     pending_commands: Vec<PhoneCommand>,
+    /// Remote-shell registry + outbound queue (PRD §5.4). Its messages are
+    /// flushed through the sealed envelope path in [`Self::tick`].
+    shells: ShellManager,
     seal: SealFn,
     open: OpenFn,
     /// Highest outbound envelope `seq` this bridge has assigned. The next
@@ -131,6 +135,7 @@ impl RemoteBridge {
             grace_until_ms,
             pending_transcript_requests: Vec::new(),
             pending_commands: Vec::new(),
+            shells: ShellManager::new(),
             seal,
             open,
             out_seq: 0,
@@ -163,6 +168,29 @@ impl RemoteBridge {
         self.open = passthrough_open();
         self.out_seq = 0;
         self.pairing = None;
+        // Forget remote shells; their backing child terminals stay as ordinary
+        // desktop shells (the phone is no longer trusted to drive them).
+        self.shells.clear();
+    }
+
+    /// The remote-shell registry (read-only), for the event loop's cap check.
+    pub fn shells(&self) -> &ShellManager {
+        &self.shells
+    }
+
+    /// Mutable access to the remote-shell registry so the event loop can open /
+    /// close shells and register the child terminal it spawned. Outbound shell
+    /// messages queued here are flushed (sealed) by [`Self::tick`].
+    pub fn shells_mut(&mut self) -> &mut ShellManager {
+        &mut self.shells
+    }
+
+    /// Tee a coalesced read of a child terminal's PTY bytes into the shell
+    /// manager (a no-op unless that child backs the session's live remote
+    /// shell). Called from the per-tick PTY drain; cheap and always safe.
+    pub fn shell_pump(&mut self, session_id: &str, child_index: usize, bytes: &[u8]) {
+        self.shells
+            .pump(&SessionId::new(session_id), child_index, bytes);
     }
 
     /// Tee a chunk of a session's primary-terminal PTY bytes into its transcript
@@ -320,6 +348,20 @@ impl RemoteBridge {
             self.feed.record_snapshot(&snap);
             self.snapshot_needed = false;
             self.send_msg(DesktopToPhone::Snapshot(snap), sent_at, send);
+            // Alongside a full snapshot, push each session's full git status
+            // detail (design §5.5) built from the cached worktree status. This
+            // is how the phone learns per-session git detail; there is no
+            // dedicated request command, so a `request_snapshot` refreshes it.
+            for pv in projects {
+                for tab in pv.state.tabs.iter() {
+                    let detail = feed::git_status_detail(
+                        &SessionId::new(&tab.meta.id),
+                        pv.cache.get(&tab.meta.id),
+                        &tab.meta.branch,
+                    );
+                    self.send_msg(DesktopToPhone::GitStatus(detail), sent_at, send);
+                }
+            }
         } else {
             if !delta.status.is_empty() {
                 self.send_msg(
@@ -362,6 +404,13 @@ impl RemoteBridge {
                     send,
                 );
             }
+        }
+
+        // Flush remote-shell output/lifecycle messages queued since the last
+        // tick (by the PTY drain and the command bridge) through the sealed
+        // envelope path — so shell traffic only leaves while paired.
+        for msg in self.shells.take_outbound() {
+            self.send_msg(msg, sent_at, send);
         }
     }
 
