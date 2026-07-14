@@ -69,8 +69,32 @@ final class SettingsUITests: XCTestCase {
         XCTAssertTrue(element(app, "settings-faceid-toggle").exists)
         XCTAssertTrue(element(app, "settings-unpair-button").exists)
 
-        XCTAssertTrue(element(app, "settings-notifications-placeholder").exists)
+        XCTAssertTrue(element(app, "settings-notifications-card").exists)
+        XCTAssertTrue(element(app, "settings-notif-needsinput").exists)
+        XCTAssertTrue(element(app, "settings-notif-finished").exists)
+        XCTAssertTrue(element(app, "settings-notif-chime").exists)
         XCTAssertTrue(element(app, "settings-about-card").exists)
+    }
+
+    // MARK: - Notification toggles + per-project mute (PRD §5.6/§9.2)
+
+    @MainActor
+    func testNotificationTogglesFlipAndMuteAppearsWithProjects() throws {
+        let app = XCUIApplication()
+        // The snapshot fixture gives the per-project mute list real rows.
+        launchAndPair(app, extraArguments: ["-uitest-fixture-snapshot"])
+        openSettingsTab(app)
+
+        let finished = element(app, "settings-notif-finished")
+        XCTAssertTrue(finished.waitForExistence(timeout: 5))
+        XCTAssertEqual(finished.value as? String, "1", "Toggles default on")
+
+        let innerSwitch = finished.switches.firstMatch
+        (innerSwitch.exists ? innerSwitch : finished).tap()
+        XCTAssertEqual(finished.value as? String, "0", "Expected the finished toggle to flip off")
+
+        // Per-project mute rows render from the fixture snapshot.
+        XCTAssertTrue(element(app, "settings-notif-mute-card").waitForExistence(timeout: 5))
     }
 
     // MARK: - Face ID toggle persistence

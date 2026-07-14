@@ -13,6 +13,7 @@
 //! [`store::RelayStore`] seam (in-memory for v1). The per-connection state
 //! machine lives in [`session`].
 
+pub mod apns;
 pub mod auth;
 pub mod claims;
 pub mod config;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use axum::{routing::get, Router};
 use tower_http::trace::TraceLayer;
 
+use apns::{NoopPushService, PushService};
 use config::Config;
 use router::Registry;
 use store::{InMemoryStore, RelayStore};
@@ -44,19 +46,54 @@ pub struct AppState {
     pub store: Arc<dyn RelayStore>,
     /// The live, ephemeral connection routing table.
     pub registry: Arc<Registry>,
+    /// Wakes an offline phone via APNs when an event is queued for it
+    /// (spec §5.5/§11). Behind a seam so it is a no-op when APNs is not
+    /// configured, the live sender under the `apns-live` feature, or a
+    /// recording double under test.
+    pub push: Arc<dyn PushService>,
 }
 
 impl AppState {
     /// Build application state from `config`, wiring up the default in-memory
-    /// store and an empty connection registry.
+    /// store, an empty connection registry, and a push service derived from the
+    /// config (the live APNs sender when both configured and built with the
+    /// `apns-live` feature; otherwise a no-op).
     pub fn new(config: Config) -> Self {
+        let push = default_push_service(&config);
+        Self::with_push(config, push)
+    }
+
+    /// Build application state with an explicitly-supplied push service.
+    /// Lets tests inject a recording [`PushService`] without touching the
+    /// connection state machine.
+    pub fn with_push(config: Config, push: Arc<dyn PushService>) -> Self {
         let store = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
         Self {
             config: Arc::new(config),
             store,
             registry: Arc::new(Registry::new()),
+            push,
         }
     }
+}
+
+/// Choose the push service for a config: the live APNs sender when APNs is
+/// configured *and* the `apns-live` feature is compiled in; a no-op otherwise
+/// (so the default build — and CI without Apple secrets — still runs).
+fn default_push_service(config: &Config) -> Arc<dyn PushService> {
+    #[cfg(feature = "apns-live")]
+    if let Some(apns) = config.apns.clone() {
+        match apns::live::HttpApnsTransport::new() {
+            Ok(transport) => {
+                return Arc::new(apns::ApnsPushService::new(apns, transport));
+            }
+            Err(err) => {
+                tracing::warn!(%err, "apns: could not build live transport; push disabled");
+            }
+        }
+    }
+    let _ = config; // silence unused warning when `apns-live` is off
+    Arc::new(NoopPushService)
 }
 
 /// Build the relay's Axum router.

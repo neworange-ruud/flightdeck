@@ -121,6 +121,10 @@ pub trait RelayStore: Send + Sync {
 
     /// Store/refresh a pairing's APNs push token (opaque; never encrypted).
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment);
+
+    /// The pairing's registered APNs token + environment, if any. Read by the
+    /// envelope path to wake an offline phone via push (spec §5.5/§11).
+    async fn push_token(&self, pairing: &PairingId) -> Option<(String, ApnsEnvironment)>;
 }
 
 /// A queue key. `Role` is not `Hash` in the protocol crate, so we index the
@@ -291,6 +295,10 @@ impl RelayStore for InMemoryStore {
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment) {
         self.lock().push_tokens.insert(pairing, (token, env));
     }
+
+    async fn push_token(&self, pairing: &PairingId) -> Option<(String, ApnsEnvironment)> {
+        self.lock().push_tokens.get(pairing).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +355,30 @@ mod tests {
                 .add_phone_to_pairing(&PairingId::new("nope"), DeviceId::new("p"))
                 .await,
             Err(StoreError::UnknownPairing)
+        );
+    }
+
+    #[tokio::test]
+    async fn push_token_round_trips_and_refreshes() {
+        let store = InMemoryStore::new(1000);
+        let pairing = PairingId::new("pair");
+        assert_eq!(store.push_token(&pairing).await, None);
+
+        store
+            .register_push_token(pairing.clone(), "tok_a".into(), ApnsEnvironment::Sandbox)
+            .await;
+        assert_eq!(
+            store.push_token(&pairing).await,
+            Some(("tok_a".into(), ApnsEnvironment::Sandbox))
+        );
+
+        // A refresh replaces the token + environment.
+        store
+            .register_push_token(pairing.clone(), "tok_b".into(), ApnsEnvironment::Production)
+            .await;
+        assert_eq!(
+            store.push_token(&pairing).await,
+            Some(("tok_b".into(), ApnsEnvironment::Production))
         );
     }
 
