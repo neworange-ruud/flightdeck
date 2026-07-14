@@ -51,14 +51,18 @@ pub enum KeyAction {
 /// Map a key event to a [`KeyAction`] based on the current input mode (SPECS §23).
 ///
 /// In [`InputMode::Terminal`] most keys produce `Passthrough`; the global
-/// shortcuts (`Ctrl-g`, `Ctrl-q`) and the leave-terminal-focus key (`Alt+Esc`,
-/// or `Shift+Esc` on Windows/Linux) are intercepted first. Bare `Esc` passes
-/// through to the PTY.
+/// shortcuts (`Ctrl-g`, `Ctrl-q`) and the configured leave-terminal-focus key
+/// are intercepted first. Bare `Esc` passes through to the PTY.
 ///
 /// In [`InputMode::App`] all keys are interpreted as FlightDeck commands.
 pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
+    map_key_with_f2(mode, key, false)
+}
+
+/// Map a key event with the optional F2 leave-focus binding enabled or disabled.
+pub fn map_key_with_f2(mode: InputMode, key: KeyEvent, use_f2: bool) -> KeyAction {
     match mode {
-        InputMode::Terminal => map_terminal_mode(key),
+        InputMode::Terminal => map_terminal_mode(key, use_f2),
         InputMode::App => map_app_mode(key),
     }
 }
@@ -67,29 +71,28 @@ pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
 // Terminal Focus mode (SPECS §23)
 // ---------------------------------------------------------------------------
 
-fn map_terminal_mode(key: KeyEvent) -> KeyAction {
+fn map_terminal_mode(key: KeyEvent, use_f2: bool) -> KeyAction {
     // Global intercepts work in both modes.
     if let Some(global) = map_global(key) {
         return global;
     }
-    // Alt+Esc: leave terminal focus (SPECS §23 "Leave terminal input focus").
+    // Leave terminal focus (SPECS §23). Bare Esc must still reach the PTY for
+    // hosted-agent gestures, vim/readline cancel, fzf dismiss, etc. The default
+    // is Alt+Esc on macOS and Shift+Esc on Windows/Linux; users whose terminal
+    // cannot distinguish modified Esc can opt into the unambiguous F2 binding.
+    let modified_esc = key.code == KeyCode::Esc
+        && key.modifiers
+            == if platform::LEAVE_FOCUS_USES_SHIFT {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::ALT
+            };
+    if (use_f2 && key.code == KeyCode::F(2)) || (!use_f2 && modified_esc) {
+        return KeyAction::FocusApp;
+    }
+
     // Bare Esc (and double-Esc) must pass through to the PTY so hosted agents
-    // like Claude Code / OpenCode can use it — e.g. their 2×Esc "abort prompt"
-    // gesture, vim/readline cancel, fzf dismiss, etc. We therefore require Alt
-    // to leave terminal focus rather than swallowing every Esc.
-    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::ALT {
-        return KeyAction::FocusApp;
-    }
-    // Windows and Linux: Alt+Esc is a reserved shortcut that cycles windows —
-    // the OS/window manager (e.g. GNOME) grabs it before FlightDeck ever sees
-    // it. Offer Shift+Esc as the leave-terminal-focus key on those platforms
-    // instead. Bare Esc (and 2×Esc) still pass through to hosted agents.
-    if platform::LEAVE_FOCUS_USES_SHIFT
-        && key.code == KeyCode::Esc
-        && key.modifiers == KeyModifiers::SHIFT
-    {
-        return KeyAction::FocusApp;
-    }
+    // like Claude Code / OpenCode can use their 2xEsc "abort prompt" gesture.
     // Ctrl-V / Cmd-V on macOS: paste. The wiring layer gives local Codex CLI
     // the literal key so it can read its native clipboard image; other agents,
     // and containerized Codex, receive a temporary file path instead. With no
@@ -630,12 +633,28 @@ mod tests {
     // --- Terminal mode passthrough ----------------------------------------
 
     #[test]
-    fn terminal_mode_alt_esc_focuses_app() {
-        // Alt+Esc leaves terminal focus → app-command mode (SPECS §23).
+    fn terminal_mode_f2_is_opt_in() {
         assert_eq!(
-            map_key(InputMode::Terminal, alt(KeyCode::Esc)),
+            map_key(InputMode::Terminal, key(KeyCode::F(2))),
+            KeyAction::Passthrough(encode_key(key(KeyCode::F(2))))
+        );
+        assert_eq!(
+            map_key_with_f2(InputMode::Terminal, key(KeyCode::F(2)), true),
             KeyAction::FocusApp
         );
+    }
+
+    #[test]
+    fn terminal_mode_alt_esc_focus_depends_on_platform() {
+        let action = map_key(InputMode::Terminal, alt(KeyCode::Esc));
+        if platform::LEAVE_FOCUS_USES_SHIFT {
+            assert_eq!(
+                action,
+                KeyAction::Passthrough(encode_key(alt(KeyCode::Esc)))
+            );
+        } else {
+            assert_eq!(action, KeyAction::FocusApp);
+        }
     }
 
     /// Construct a KeyEvent with Shift held.
@@ -652,11 +671,8 @@ mod tests {
     fn terminal_mode_shift_esc_focus_depends_on_platform() {
         let action = map_key(InputMode::Terminal, shift(KeyCode::Esc));
         if platform::LEAVE_FOCUS_USES_SHIFT {
-            // Windows and Linux reserve Alt+Esc (cycles windows), so Shift+Esc
-            // is the leave-terminal-focus key there.
             assert_eq!(action, KeyAction::FocusApp);
         } else {
-            // On macOS, Shift+Esc is not a focus key — it stays a PTY passthrough.
             assert_eq!(
                 action,
                 KeyAction::Passthrough(encode_key(shift(KeyCode::Esc)))
@@ -665,9 +681,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_mode_modified_esc_passes_through_when_f2_is_enabled() {
+        let leave_key = if platform::LEAVE_FOCUS_USES_SHIFT {
+            shift(KeyCode::Esc)
+        } else {
+            alt(KeyCode::Esc)
+        };
+        assert_eq!(
+            map_key_with_f2(InputMode::Terminal, leave_key, true),
+            KeyAction::Passthrough(encode_key(leave_key))
+        );
+    }
+
+    #[test]
     fn terminal_mode_bare_esc_passes_through() {
         // Bare Esc must reach the PTY so hosted agents can use it (e.g. Claude
-        // Code / OpenCode 2×Esc abort). Only Alt+Esc leaves terminal focus.
+        // Code / OpenCode 2×Esc abort).
         assert_eq!(
             map_key(InputMode::Terminal, key(KeyCode::Esc)),
             KeyAction::Passthrough(vec![0x1b])

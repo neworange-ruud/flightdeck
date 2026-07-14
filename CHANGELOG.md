@@ -12,11 +12,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Keep `Alt+Esc` (macOS) and `Shift+Esc` (Windows/Linux) as the default way to
+  leave terminal focus, with an optional **F2** binding for terminals that
+  cannot distinguish modified Esc. The F2 preference is available in the
+  configuration manager and can be set globally or per project.
 
 ### Bug fixes
 
-- None yet.
+- Size the configuration manager to its content instead of stretching it
+  vertically in tall terminals.
 
 ## [1.7.1] - 2026-07-13
 

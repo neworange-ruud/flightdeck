@@ -34,7 +34,6 @@ use crate::terminal::session::TerminalKind;
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
-use crate::tui::platform;
 use crate::tui::selection::Selection;
 
 // ---------------------------------------------------------------------------
@@ -530,7 +529,9 @@ pub fn draw(
         UiOverlay::None => {}
         UiOverlay::Dialog(dialog) => draw_dialog(frame, dialog, area),
         UiOverlay::Palette(palette) => draw_palette_overlay(frame, palette, area),
-        UiOverlay::Help => draw_help_overlay(frame, area),
+        UiOverlay::Help => {
+            draw_help_overlay(frame, area, state.config.ui.use_f2_to_leave_terminal_focus)
+        }
         UiOverlay::GitStatus { status, pr_url } => {
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
         }
@@ -1452,29 +1453,27 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 
 /// Draw the mode status bar (SPECS §23).
 ///
-/// Terminal mode: `MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: command palette`
-///                 (the leave-focus key is `Shift+Esc` on Windows/Linux — see [`LEAVE_FOCUS_KEY`])
+/// Terminal mode includes the configured leave-focus key and command palette.
 /// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let text = status_bar_text(state.mode(), state.update_available.as_deref());
+    let text = status_bar_text(
+        state.mode(),
+        state.update_available.as_deref(),
+        state.config.ui.use_f2_to_leave_terminal_focus,
+    );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
 }
-
-/// The key that leaves terminal focus, per platform. `Alt+Esc` on macOS; on
-/// Windows and Linux the OS/window manager reserves `Alt+Esc` (cycles windows)
-/// so the terminal app never receives it — those platforms use `Shift+Esc`.
-pub const LEAVE_FOCUS_KEY: &str = if platform::LEAVE_FOCUS_USES_SHIFT {
-    "Shift+Esc"
-} else {
-    "Alt+Esc"
-};
 
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
 /// optional trailing update hint when a newer release is available (SPECS §30).
 ///
 /// Exported for snapshot testing.
-pub fn status_bar_text(mode: InputMode, update_available: Option<&str>) -> Line<'static> {
+pub fn status_bar_text(
+    mode: InputMode,
+    update_available: Option<&str>,
+    use_f2: bool,
+) -> Line<'static> {
     let mut spans = match mode {
         InputMode::Terminal => vec![
             Span::raw(" "),
@@ -1486,7 +1485,10 @@ pub fn status_bar_text(mode: InputMode, update_available: Option<&str>) -> Line<
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
-            Span::styled(LEAVE_FOCUS_KEY, Style::default().fg(Color::Yellow)),
+            Span::styled(
+                crate::tui::platform::leave_focus_key(use_f2),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(": app commands | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
             Span::raw(": command palette"),
@@ -1748,9 +1750,17 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 // ---------------------------------------------------------------------------
 
 /// Draw the help / keybindings overlay (SPECS §23).
-pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
     let overlay_area = layout::centered_overlay(area, 64, 40);
     frame.render_widget(Clear, overlay_area);
+
+    let leave_focus_key = if use_f2 {
+        "  F2"
+    } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
+        "  Shift+Esc"
+    } else {
+        "  Alt+Esc"
+    };
 
     let help_text = vec![
         Line::from(Span::styled(
@@ -1805,14 +1815,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
-        shortcut_line(
-            if platform::LEAVE_FOCUS_USES_SHIFT {
-                "  Shift+Esc"
-            } else {
-                "  Alt+Esc"
-            },
-            "Leave terminal focus / focus app",
-        ),
+        shortcut_line(leave_focus_key, "Leave terminal focus / focus app"),
         shortcut_line("  Enter", "Focus active terminal"),
         Line::raw(""),
         Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
@@ -1838,9 +1841,6 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 /// file being edited, the curated toggles/choices, and the key legend.
 pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rect) {
     use crate::tui::config_manager::ConfigScope;
-
-    let overlay_area = layout::centered_overlay(area, 66, 60);
-    frame.render_widget(Clear, overlay_area);
 
     let scope = manager.scope();
     let accent = Color::Cyan;
@@ -1934,6 +1934,12 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
         "s save   e edit file in $EDITOR   Esc close",
         Style::default().fg(Color::DarkGray),
     )));
+
+    // Fit the box to its content instead of stretching it to a fixed height.
+    // centered_overlay still clamps it when the terminal is shorter.
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let overlay_area = layout::centered_overlay(area, 66, content_height.saturating_add(2));
+    frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
         .title(" Configuration ")
@@ -2826,18 +2832,28 @@ mod tests {
 
     #[test]
     fn status_bar_terminal_mode_text() {
-        let line = status_bar_text(InputMode::Terminal, None);
+        let line = status_bar_text(InputMode::Terminal, None, false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
-        assert!(flat.contains("Esc"), "must mention Esc");
+        assert!(
+            flat.contains(crate::tui::platform::leave_focus_key(false)),
+            "must mention the platform-default leave-focus key"
+        );
         assert!(flat.contains("app commands"), "must say app commands");
         assert!(flat.contains("Ctrl-g"), "must mention Ctrl-g");
         assert!(flat.contains("command palette"), "must mention palette");
     }
 
     #[test]
+    fn status_bar_shows_f2_when_enabled() {
+        let line = status_bar_text(InputMode::Terminal, None, true);
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flat.contains("F2"));
+    }
+
+    #[test]
     fn status_bar_app_mode_text() {
-        let line = status_bar_text(InputMode::App, None);
+        let line = status_bar_text(InputMode::App, None, false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -2850,7 +2866,7 @@ mod tests {
 
     #[test]
     fn status_bar_shows_update_hint_when_available() {
-        let line = status_bar_text(InputMode::App, Some("1.0.3"));
+        let line = status_bar_text(InputMode::App, Some("1.0.3"), false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -2861,7 +2877,7 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, None);
+        let none = status_bar_text(InputMode::App, None, false);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
     }
@@ -2983,6 +2999,12 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
         })
         .unwrap();
+
+        let buffer = term.backend().buffer();
+        // Nine settings plus headers, spacing, legend, and two border rows need
+        // 19 rows. The box should be centered rather than filling all 24 rows.
+        assert_eq!(buffer[(7, 2)].symbol(), "┌");
+        assert_eq!(buffer[(7, 20)].symbol(), "└");
     }
 
     #[test]
