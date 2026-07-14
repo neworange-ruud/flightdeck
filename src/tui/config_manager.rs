@@ -540,7 +540,10 @@ mod tests {
         assert!(labels.contains(&"Mode border"));
         assert!(labels.contains(&"Dim terminal in app mode"));
         // The dim field is a boolean toggle, defaulting on.
-        let dim = rows.iter().find(|r| r.label == "Dim terminal in app mode").unwrap();
+        let dim = rows
+            .iter()
+            .find(|r| r.label == "Dim terminal in app mode")
+            .unwrap();
         assert!(dim.is_bool);
         assert!(dim.bool_value);
     }

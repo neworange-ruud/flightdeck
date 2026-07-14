@@ -532,25 +532,27 @@ pub fn draw(
     let mode = state.mode();
     if mode == InputMode::App {
         if let Some(frame_rect) = ml.sidebar_frame {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(mode_style::pane_border_style(
-                    &state.config.ui,
-                    mode,
-                    mode_style::Pane::Sidebar,
-                ));
+            let block =
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(mode_style::pane_border_style(
+                        &state.config.ui,
+                        mode,
+                        mode_style::Pane::Sidebar,
+                    ));
             frame.render_widget(block, frame_rect);
         }
     }
     if mode == InputMode::Terminal {
         if let Some(frame_rect) = ml.terminal_frame {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(mode_style::pane_border_style(
-                    &state.config.ui,
-                    mode,
-                    mode_style::Pane::Terminal,
-                ));
+            let block =
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(mode_style::pane_border_style(
+                        &state.config.ui,
+                        mode,
+                        mode_style::Pane::Terminal,
+                    ));
             frame.render_widget(block, frame_rect);
         }
     }

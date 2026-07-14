@@ -4186,7 +4186,10 @@ mod tests {
 
             // Stale on purpose: sync_terminal_sizes must NOT rely on this
             // field in the non-split branch, or the bug would still pass.
-            state.pty_size = PtySize { rows: 999, cols: 999 };
+            state.pty_size = PtySize {
+                rows: 999,
+                cols: 999,
+            };
 
             let pty = FakePty::new();
             let _handle = pty.queue_session();
@@ -4203,7 +4206,10 @@ mod tests {
             state
         }
 
-        let full = PtySize { rows: 40, cols: 100 };
+        let full = PtySize {
+            rows: 40,
+            cols: 100,
+        };
 
         let mut off = build_state("off");
         sync_terminal_sizes(&mut off, full);
