@@ -105,7 +105,7 @@ final class ProjectsSessionsUITests: XCTestCase {
         let cta = element(app, "new-agent-session-cta")
         XCTAssertTrue(cta.waitForExistence(timeout: 5))
         cta.tap()
-        XCTAssertTrue(element(app, "NewAgentPlaceholderSheet").waitForExistence(timeout: 5))
+        XCTAssertTrue(element(app, "NewAgentView").waitForExistence(timeout: 5))
     }
 
     @MainActor

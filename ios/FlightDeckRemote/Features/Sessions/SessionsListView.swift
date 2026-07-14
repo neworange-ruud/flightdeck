@@ -132,6 +132,7 @@ struct SessionsListView: View {
                         .lineLimit(1)
                     Spacer(minLength: Theme.Spacing.sm)
                     statusTrailing(session.status)
+                    SessionActionsButton(session: session, store: transportStore) // Control feature hook (PRD §5.6)
                 }
 
                 HStack(spacing: Theme.Spacing.sm) {

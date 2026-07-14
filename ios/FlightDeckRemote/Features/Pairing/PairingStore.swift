@@ -89,6 +89,19 @@ final class PairingStore {
         isPaired = true
     }
 
+    /// Reverses `completePairing(with:)`: clears both the paired flag and
+    /// the in-memory device metadata (PRD §5.6/§8 "Unpair this device").
+    /// `AppRouter`/`RootView` react to `isPaired` flipping and swap back to
+    /// the Pairing screen. Called by `SettingsUnpairCoordinator`
+    /// (Features/Settings/) as one step of the full unpair sequence, which
+    /// also clears the Keychain-backed `PairingRecord`/`KeyAgreementKeys` —
+    /// this method only owns this store's own in-memory/`UserDefaults`
+    /// state.
+    func unpair() {
+        pairedDevice = nil
+        isPaired = false
+    }
+
     #if DEBUG
     /// DEBUG-only manual toggle (PRD navigation task): lets a developer
     /// cross the unpaired/paired boundary in the simulator without a real

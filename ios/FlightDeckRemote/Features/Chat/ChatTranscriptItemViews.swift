@@ -8,13 +8,13 @@
 //   - collapsed activity pills (icon by `ActivityKind` + summary + chevron)
 //     that expand inline to show detail in Geist Mono, animating height;
 //   - the inline permission-prompt card (orange border/glow, command in Geist
-//     Mono, Allow-once / Deny buttons rendered but *disabled* this task, plus
-//     the "or say 'approve' · hold mic below" voice hint);
+//     Mono, live Allow-once / Deny buttons that resolve inline with honest
+//     sending / resolved / stale / failed states, plus the "or say 'approve' ·
+//     hold mic below" voice hint);
 //   - sparse timestamp dividers.
 //
-//  The Allow/Deny buttons are visually complete but inert: the real decision
-//  wiring is the chat-permission task and flows through
-//  `AgentChatView.onPermissionDecision`.
+//  Decisions flow through the closures the row threads to `ChatViewModel`
+//  (`decidePermission` / `retryPermission` / `retryOutgoing`).
 //
 
 import SwiftUI
@@ -28,7 +28,15 @@ struct TranscriptRowView: View {
     let isExpanded: Bool
     let isPending: Bool
     let onToggle: () -> Void
-    let onPermissionDecision: ((Wire.PromptId, Bool) -> Void)?
+    /// Send state when this row is an optimistic outgoing user message.
+    let sendState: OutgoingState?
+    /// Inline permission-decision state for a permission row.
+    let permissionState: PermissionActionState
+    /// Whether this permission row's Allow/Deny buttons are live.
+    let permissionActionable: Bool
+    let onDecide: (Wire.PromptId, Wire.PermissionChoice) -> Void
+    let onRetryPermission: (Wire.PromptId) -> Void
+    let onRetryOutgoing: (Wire.ItemId) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
@@ -43,10 +51,11 @@ struct TranscriptRowView: View {
     @ViewBuilder
     private var content: some View {
         switch row.item {
-        case let .userMessage(_, text, _):
-            ProseBubble(text: text, sender: .user)
+        case let .userMessage(itemId, text, _):
+            ProseBubble(text: text, sender: .user, sendState: sendState,
+                        onRetry: { onRetryOutgoing(itemId) })
         case let .agentMessage(_, text, _):
-            ProseBubble(text: text, sender: .agent)
+            ProseBubble(text: text, sender: .agent, sendState: nil, onRetry: {})
         case let .activity(_, summary, detail, body, kind, _):
             ActivityPillView(index: row.index, summary: summary, detail: detail,
                              prose: body, kind: kind, isExpanded: isExpanded,
@@ -54,7 +63,10 @@ struct TranscriptRowView: View {
         case let .permissionPrompt(_, promptId, command, options, _):
             PermissionPromptCard(promptId: promptId, command: command,
                                  options: options, isPending: isPending,
-                                 onPermissionDecision: onPermissionDecision)
+                                 actionState: permissionState,
+                                 isActionable: permissionActionable,
+                                 onDecide: { onDecide(promptId, $0) },
+                                 onRetry: { onRetryPermission(promptId) })
         }
     }
 }
@@ -68,21 +80,60 @@ struct ProseBubble: View {
 
     let text: String
     let sender: Sender
+    /// Optimistic send state for a user message (nil = a settled/agent message).
+    var sendState: OutgoingState? = nil
+    /// Tap-to-retry for a failed outgoing message.
+    var onRetry: () -> Void = {}
+
+    private var isPending: Bool {
+        if case .sending = sendState { return true }
+        return false
+    }
+
+    private var failure: String? {
+        if case let .failed(reason, _) = sendState { return reason }
+        return nil
+    }
 
     var body: some View {
-        HStack {
-            if sender == .user { Spacer(minLength: Theme.Spacing.xxl) }
-            Text(text)
-                .typography(Typography.body)
-                .foregroundStyle(sender == .user ? Theme.bgDeep : Theme.textPrimary)
-                .multilineTextAlignment(.leading)
-                .padding(.horizontal, Theme.Spacing.md)
-                .padding(.vertical, Theme.Spacing.sm)
-                .background(bubbleBackground)
-                .frame(maxWidth: .infinity, alignment: sender == .user ? .trailing : .leading)
-            if sender == .agent { Spacer(minLength: Theme.Spacing.xxl) }
+        // Identifiers live on the leaf elements: an identifier on a plain
+        // container propagates onto every accessibility element inside it and
+        // would clobber the sending/retry markers' own identifiers (same trap
+        // documented on `MainTabView`/`CustomTabBar`).
+        VStack(alignment: .trailing, spacing: Theme.Spacing.xxs) {
+            HStack {
+                if sender == .user { Spacer(minLength: Theme.Spacing.xxl) }
+                Text(text)
+                    .typography(Typography.body)
+                    .foregroundStyle(sender == .user ? Theme.bgDeep : Theme.textPrimary)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, Theme.Spacing.md)
+                    .padding(.vertical, Theme.Spacing.sm)
+                    .background(bubbleBackground)
+                    .opacity(isPending ? 0.6 : 1)
+                    .frame(maxWidth: .infinity, alignment: sender == .user ? .trailing : .leading)
+                    .accessibilityIdentifier(sender == .user ? "prose-user" : "prose-agent")
+                if sender == .agent { Spacer(minLength: Theme.Spacing.xxl) }
+            }
+
+            if isPending {
+                Text("Sending…")
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.textDim)
+                    .accessibilityIdentifier("prose-user-sending")
+            } else if let failure {
+                Button(action: onRetry) {
+                    HStack(spacing: Theme.Spacing.xs) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                        Text("\(failure) — tap to retry")
+                    }
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.statusWorking)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("prose-user-retry")
+            }
         }
-        .accessibilityIdentifier(sender == .user ? "prose-user" : "prose-agent")
     }
 
     @ViewBuilder
@@ -180,14 +231,25 @@ struct ActivityPillView: View {
 // MARK: - Permission prompt
 
 /// Inline permission ask (PRD §5.3): orange border/glow, command in Geist
-/// Mono, Allow-once / Deny buttons (rendered but disabled this task) and the
-/// voice hint.
+/// Mono, live Allow-once / Deny buttons, and the voice hint. Once a decision is
+/// in flight the tapped button shows a spinner; on success the card collapses
+/// to a muted resolved line; a stale (already-answered-on-desktop) rejection or
+/// an undelivered failure surface honest inline notes (PRD §5.8).
 struct PermissionPromptCard: View {
     let promptId: Wire.PromptId
     let command: String
     let options: [Wire.PermissionOption]
     let isPending: Bool
-    let onPermissionDecision: ((Wire.PromptId, Bool) -> Void)?
+    let actionState: PermissionActionState
+    /// Whether the buttons are live (current prompt + link up + no decision yet).
+    let isActionable: Bool
+    let onDecide: (Wire.PermissionChoice) -> Void
+    let onRetry: () -> Void
+
+    private var inFlight: Wire.PermissionChoice? {
+        if case let .sending(choice) = actionState { return choice }
+        return nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.md) {
@@ -207,33 +269,7 @@ struct PermissionPromptCard: View {
                         .fill(Theme.bgField)
                 )
 
-            HStack(spacing: Theme.Spacing.sm) {
-                ForEach(Array(options.enumerated()), id: \.offset) { _, option in
-                    let isAllow = option.choice == .allowOnce
-                    Button {
-                        // Seam: wired by the chat-permission task.
-                        onPermissionDecision?(promptId, isAllow)
-                    } label: {
-                        Text(option.label)
-                            .typography(Typography.bodyMedium)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, Theme.Spacing.sm)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(isAllow ? Theme.bgDeep : Theme.textPrimary)
-                    .background(
-                        RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
-                            .fill(isAllow ? Theme.accent : Theme.bgRaised)
-                    )
-                    .disabled(true) // actions land in the chat-permission task
-                    .accessibilityIdentifier(isAllow ? "permission-allow" : "permission-deny")
-                }
-            }
-
-            Text("or say “approve” · hold mic below")
-                .typography(Typography.caption)
-                .foregroundStyle(Theme.textDim)
-                .accessibilityIdentifier("permission-voice-hint")
+            resolution
         }
         .padding(Theme.Spacing.lg)
         .background(
@@ -249,6 +285,82 @@ struct PermissionPromptCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("permission-prompt")
+    }
+
+    /// The lower half of the card, which swaps by decision state.
+    @ViewBuilder
+    private var resolution: some View {
+        switch actionState {
+        case let .resolved(choice):
+            resolvedLine(choice)
+        case .stale:
+            Text("This prompt was already answered on the desktop")
+                .typography(Typography.caption)
+                .foregroundStyle(Theme.textMuted)
+                .accessibilityIdentifier("permission-stale")
+        case let .failed(reason, _, _):
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                buttons
+                Button(action: onRetry) {
+                    HStack(spacing: Theme.Spacing.xs) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                        Text("\(reason) — tap to retry")
+                    }
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.statusWorking)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("permission-retry")
+            }
+        case .idle, .sending:
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                buttons
+                Text("or say “approve” · hold mic below")
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.textDim)
+                    .accessibilityIdentifier("permission-voice-hint")
+            }
+        }
+    }
+
+    private func resolvedLine(_ choice: Wire.PermissionChoice) -> some View {
+        let allowed = choice == .allowOnce
+        return Text(allowed ? "Allowed ✓" : "Denied ✕")
+            .typography(Typography.callout)
+            .foregroundStyle(Theme.textMuted)
+            .accessibilityIdentifier("permission-resolved")
+    }
+
+    private var buttons: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                let isAllow = option.choice == .allowOnce
+                Button {
+                    onDecide(option.choice)
+                } label: {
+                    ZStack {
+                        Text(option.label)
+                            .typography(Typography.bodyMedium)
+                            .opacity(inFlight == option.choice ? 0 : 1)
+                        if inFlight == option.choice {
+                            WorkingSpinner(size: 16, lineWidth: 2,
+                                           color: isAllow ? Theme.bgDeep : Theme.textPrimary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, Theme.Spacing.sm)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isAllow ? Theme.bgDeep : Theme.textPrimary)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                        .fill(isAllow ? Theme.accent : Theme.bgRaised)
+                )
+                .disabled(!isActionable)
+                .accessibilityIdentifier(isAllow ? "permission-allow" : "permission-deny")
+            }
+        }
     }
 }
 

@@ -12,6 +12,13 @@
 //  != .unlocked` while the gate is enabled, and `appLock.lockIfEnabled()`
 //  arms the lock on the scenePhase → `.background` transition.
 //
+//  `appLock` is also published into the SwiftUI environment (`.environment(appLock)`
+//  below) so the Settings screen's "Require Face ID to open" toggle
+//  (Features/Settings/SettingsView.swift) can bind straight to
+//  `AppLockController.isLockEnabled` via `@Environment(AppLockController.self)`,
+//  without MainTabView threading it through every tab case as an explicit
+//  parameter.
+//
 
 import SwiftUI
 
@@ -44,6 +51,7 @@ struct RootView: View {
                 appLock.lockIfEnabled()
             }
         }
+        .environment(appLock)
     }
 }
 

@@ -75,6 +75,12 @@ struct AppLockControllerTests {
         #expect(controller.lockState == .locked)
     }
 
+    // Note: `-uitest-reset-applock` (mirrors `-uitest-reset-pairing`) reads
+    // the real process's `ProcessInfo.processInfo.arguments`, so — like
+    // `-uitest-enable-applock` above it, which also has no unit test — it
+    // isn't unit-testable in isolation. It's exercised end-to-end by
+    // `SettingsUITests.testFaceIDTogglePersistsAcrossRelaunch`.
+
     @Test func disablingLockUnlocksImmediately() {
         let provider = InMemoryAppLockSettingsProvider(initial: true)
         let controller = AppLockController(settings: provider, authenticator: MockBiometricAuthenticator())

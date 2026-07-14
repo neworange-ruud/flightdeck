@@ -76,4 +76,19 @@ struct PairingStoreTests {
         #expect(store.pairedDevice == device)
         #expect(provider.loadIsPaired() == true)
     }
+
+    @Test func unpairClearsIsPairedAndPairedDevice() {
+        let provider = InMemoryPairingStateProvider()
+        let store = PairingStore(storage: provider)
+        store.completePairing(
+            with: PairedDevice(pairingId: "pairing-123", peerName: "Ruud's MacBook Pro", pairedAt: Date())
+        )
+        #expect(store.isPaired == true)
+
+        store.unpair()
+
+        #expect(store.isPaired == false)
+        #expect(store.pairedDevice == nil)
+        #expect(provider.loadIsPaired() == false, "unpair() should persist the cleared state, same as isPaired's own didSet")
+    }
 }

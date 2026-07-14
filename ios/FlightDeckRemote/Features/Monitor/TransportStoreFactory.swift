@@ -23,6 +23,17 @@
 //  factory uses to seed the `-uitest-fixture-snapshot` fixture
 //  (Features/Monitor/DebugFixtures.swift).
 //
+//  Offline cache (PRD §9.2): this factory also owns the app's single
+//  `SnapshotCache`, wiring it into the store (so live updates persist a
+//  debounced last-known-state) and seeding the store from any previously
+//  cached state via `TransportStore.seedFromCache` *before* `start()` is ever
+//  called (`MainTabView` calls `start()` later, in its own `.task`). Real
+//  on-disk cache loading is skipped for any `-uitest*` launch (mirrors
+//  `-uitest-reset-pairing`'s hermeticity goal — a UI test must never depend
+//  on whatever a previous simulator run happened to leave on disk); the
+//  dedicated `-uitest-fixture-snapshot-stale` arg seeds a known stale fixture
+//  instead, for the `StaleBanner` UI tests.
+//
 
 import Foundation
 
@@ -33,10 +44,16 @@ enum TransportStoreFactory {
     /// `-uitest-fixture-snapshot`, so previews and UI tests never depend on a
     /// live desktop.
     static func makeDefault(arguments: [String] = ProcessInfo.processInfo.arguments) -> TransportStore {
-        let store = TransportStore(client: makeClient())
+        let cache = SnapshotCache(fileURL: SnapshotCache.defaultFileURL())
+        let store = TransportStore(client: makeClient(), cache: cache)
         #if DEBUG
+        let isUITestLaunch = arguments.contains { $0.hasPrefix("-uitest") }
         if arguments.contains("-uitest-fixture-snapshot") {
             store.debugSeed(snapshot: .uiTestFixture)
+        } else if arguments.contains("-uitest-fixture-snapshot-stale") {
+            store.seedFromCache(SnapshotCache.CachedState(snapshot: .uiTestFixture, transcripts: [], cachedAtMs: 0))
+        } else if !isUITestLaunch, let cached = cache.load() {
+            store.seedFromCache(cached)
         }
         #endif
         return store

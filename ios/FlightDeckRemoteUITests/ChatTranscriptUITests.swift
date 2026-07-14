@@ -92,7 +92,7 @@ final class ChatTranscriptUITests: XCTestCase {
         XCTAssertTrue(element(app, "surface-agent").exists)
         let shell = element(app, "surface-shell")
         XCTAssertTrue(shell.exists)
-        XCTAssertFalse(shell.isEnabled, "Shell segment should be disabled (soon)")
+        XCTAssertTrue(shell.isEnabled, "Shell segment is live (PRD §5.4 minimal terminal)")
 
         XCTAssertTrue(element(app, "chat-compose-bar").exists, "Expected the inert compose bar")
     }

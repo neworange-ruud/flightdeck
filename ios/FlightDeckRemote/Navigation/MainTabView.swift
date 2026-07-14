@@ -12,9 +12,9 @@
 //    Projects tab's `NavigationStack` path, for pushing sessions/chat.
 //  - `activityStore.unreadCount` — the Activity tab's unread badge, cleared
 //    here when the tab is selected.
-//  - the FAB's sheet (`NewAgentPlaceholderSheet`) — the New-Agent feature
-//    task replaces its content with the real "type + name + base + first
-//    task" flow (PRD §5.5); the presentation plumbing (`isPresentingNewAgentSheet`)
+//  - the FAB's sheet (`NewAgentView`, Features/Control) — the real "type +
+//    name + base + first task" flow (PRD §5.5); the presentation plumbing
+//    (`isPresentingNewAgentSheet`)
 //    stays the same. The Sessions screen's "New agent session" CTA also
 //    presents this same sheet (via the binding passed down to it) rather
 //    than rebuilding its own.
@@ -24,6 +24,14 @@
 //    `transportStore` below — the app's single live `TransportStore`
 //    (`TransportStoreFactory`), which the Projects/Sessions screens also
 //    bind to.
+//  - `activityStore` also bridges `transportStore.agentEvents` in (see the
+//    `.onChange` below) so it stays the Activity tab's real, always-live data
+//    source regardless of which tab is currently showing (PRD §5.7).
+//  - the `StaleBanner` overlay (PRD §9.2) shows whenever the store's data is
+//    cache-seeded (`TransportStore.isCacheStale`) and the link isn't a live
+//    `.connected` session — mounted below the (louder) `ReconnectingBanner`.
+//    `isCacheStaleOffline` is also published into the environment so
+//    sibling screens can read it later without further plumbing.
 //
 
 import SwiftUI
@@ -33,7 +41,7 @@ struct MainTabView: View {
     var connectionSource: (any ConnectionStatusSource)?
 
     @State private var projectsNav = ProjectsNavModel()
-    @State private var activityStore = ActivityStore()
+    @State private var activityStore = ActivityStore.makeDefault()
     @State private var isPresentingNewAgentSheet = false
     @State private var connectionBanner: ReconnectingBannerModel
     @State private var transportStore: TransportStore
@@ -51,25 +59,35 @@ struct MainTabView: View {
             ZStack {
                 tabContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .environment(\.isCacheStaleOffline, isStaleBannerVisible)
 
-                VStack(spacing: 0) {
-                    Spacer()
-                    CustomTabBar(
-                        selectedTab: router.selectedTab,
-                        unreadActivityCount: activityStore.unreadCount,
-                        onSelectTab: { router.selectedTab = $0 },
-                        onTapFAB: { isPresentingNewAgentSheet = true }
-                    )
+                // Hide the tab bar while a chat conversation is open: the chat
+                // screen's compose bar (PRD §5.3) owns the bottom edge, and the
+                // overlaid bar would sit on top of (and swallow taps meant for)
+                // the compose field / send / mic.
+                if !isChatRouteActive {
+                    VStack(spacing: 0) {
+                        Spacer()
+                        CustomTabBar(
+                            selectedTab: router.selectedTab,
+                            unreadActivityCount: activityStore.unreadCount,
+                            onSelectTab: { router.selectedTab = $0 },
+                            onTapFAB: { isPresentingNewAgentSheet = true }
+                        )
+                    }
                 }
             }
             .background(Theme.bgDeep)
             .sheet(isPresented: $isPresentingNewAgentSheet) {
-                NewAgentPlaceholderSheet()
+                NewAgentView(store: transportStore)
             }
             .onChange(of: router.selectedTab) { _, newTab in
                 if newTab == .activity {
                     activityStore.markViewed()
                 }
+            }
+            .onChange(of: transportStore.agentEvents) { _, newEvents in
+                activityStore.ingest(newEvents, tabSelected: router.selectedTab == .activity)
             }
             // `.contain` first: an accessibility identifier applied to a plain
             // container view propagates onto every accessibility element inside
@@ -83,8 +101,42 @@ struct MainTabView: View {
                 await transportStore.start()
             }
 
-            ReconnectingBanner(model: connectionBanner, isPaired: router.pairingStore.isPaired)
+            VStack(spacing: 0) {
+                ReconnectingBanner(model: connectionBanner, isPaired: router.pairingStore.isPaired)
+                if isStaleBannerVisible {
+                    StaleBanner()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: isStaleBannerVisible)
         }
+    }
+
+    /// Whether the Projects tab currently has a chat route pushed (the tab bar
+    /// hides there — see the comment at the `CustomTabBar` mount).
+    private var isChatRouteActive: Bool {
+        router.selectedTab == .projects && projectsNav.path.contains {
+            if case .chat = $0 { return true }
+            return false
+        }
+    }
+
+    /// The link state driving the stale banner: the DEBUG `-uitest-linkstate`
+    /// forced state wins (mirrors `ReconnectingBannerModel`/`CommandsPausedGate`'s
+    /// own DEBUG seam), so UI tests can drive it deterministically without a
+    /// real relay connection.
+    private var effectiveLinkStateForStaleBanner: RemoteLinkState {
+        #if DEBUG
+        if let forced = ConnectionDebugSeam.forcedLinkState() { return forced }
+        #endif
+        return transportStore.linkState
+    }
+
+    /// PRD §9.2: cache-seeded data, shown only while the link isn't a live
+    /// `.connected` session — reuses `ReconnectingBannerModel.isDown` rather
+    /// than redefining "down".
+    private var isStaleBannerVisible: Bool {
+        transportStore.isCacheStale && ReconnectingBannerModel.isDown(effectiveLinkStateForStaleBanner)
     }
 
     @ViewBuilder
@@ -115,44 +167,12 @@ struct MainTabView: View {
                     .chatFixtureAutoPush(path: $projectsNav.path)
             }
         case .activity:
-            ActivityFeedView()
+            ActivityFeedView(transportStore: transportStore, activityStore: activityStore, router: router)
         case .shell:
-            ShellTerminalView()
+            ShellTabView(transportStore: transportStore)
         case .settings:
-            SettingsView()
+            SettingsView(router: router, transportStore: transportStore)
         }
-    }
-}
-
-/// Placeholder presented by the center FAB (PRD §5.5 "New agent" screen).
-/// The New-Agent feature task replaces this with the real flow (agent type,
-/// name, base branch, first task).
-private struct NewAgentPlaceholderSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: Theme.Spacing.lg) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 48))
-                    .foregroundStyle(Theme.accent)
-                Text("New agent session")
-                    .typography(Typography.title)
-                    .foregroundStyle(Theme.textPrimary)
-                Text("New-agent flow placeholder")
-                    .typography(Typography.body)
-                    .foregroundStyle(Theme.textMuted)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.bgDeep)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("NewAgentPlaceholderSheet")
     }
 }
 

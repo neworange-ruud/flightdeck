@@ -25,6 +25,11 @@ final class CommandHandle: Identifiable {
     let commandId: Wire.CommandId
     let body: Wire.CommandBody
     var delivery: CommandDeliveryState
+    /// Verbatim human-readable detail from the desktop's `command_ack`
+    /// (the exact reason for a reject/fail, or a result note such as
+    /// "Stopping agent…"). Additive: set by `TransportStore` when the ack
+    /// carries one; surfaces show it verbatim (PRD §5.6/§5.8 honesty).
+    var ackMessage: String?
 
     var id: String { commandId.rawValue }
 
@@ -58,22 +63,44 @@ final class TransportStore {
     private(set) var agentEvents: [Wire.AgentEvent] = []
     /// Per-shell accumulated output chunks (for the terminal surface later).
     private(set) var shellOutput: [Wire.ShellId: [Wire.ShellOutput]] = [:]
+    /// Per-session shell lifecycle events, in arrival order (the Shell surface
+    /// reads these to drive its open/exited/closed state machine). Additive,
+    /// see the "Shell surface (additive)" block below.
+    private(set) var shellEvents: [Wire.SessionId: [Wire.ShellEvent]] = [:]
 
     /// Live command handles, keyed by command id.
     private(set) var commandHandles: [Wire.CommandId: CommandHandle] = [:]
 
+    /// Whether `snapshot`/`transcripts` currently reflect cache-seeded,
+    /// offline "last-known state" (PRD §9.2) rather than a live desktop feed.
+    /// Set by `seedFromCache` at launch, before the transport connects;
+    /// cleared the moment a real `snapshot` message actually arrives from the
+    /// desktop — that's the definitive "we're live now" signal. Screens
+    /// combine this with `linkState` to decide whether to show a "showing
+    /// last-known state — offline" note (see `StaleBanner`,
+    /// Features/Activity).
+    private(set) var isCacheStale = false
+
     // MARK: - Dependencies
 
     private let client: TransportClient
+    /// Additive, optional: when set, persists a debounced last-known-state
+    /// snapshot on every meaningful update (PRD §9.2 offline cache). `nil` in
+    /// every existing/unit-test construction, so this never writes to disk
+    /// unless a real `TransportStoreFactory`-built store explicitly supplies
+    /// one.
+    private let cache: SnapshotCache?
     private let now: @Sendable () -> Int64
     private var started = false
     private var seenEventIds: Set<Wire.EventId> = []
 
     init(
         client: TransportClient,
+        cache: SnapshotCache? = nil,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
         self.client = client
+        self.cache = cache
         self.now = now
     }
 
@@ -102,7 +129,15 @@ final class TransportStore {
     /// state updates as the desktop acks (or the honesty timeout fires).
     @discardableResult
     func sendCommand(_ body: Wire.CommandBody) -> CommandHandle {
-        let commandId = Wire.CommandId("cmd_\(Self.token())")
+        sendCommand(body, commandId: Wire.CommandId("cmd_\(Self.token())"))
+    }
+
+    /// Seal and send a command under an explicit `commandId`. Reusing a prior
+    /// id makes a retry idempotent: the desktop dedups by `command_id` (PRD
+    /// §5.8), so a command that may already have applied is never double-applied.
+    /// Callers that don't need id reuse should use `sendCommand(_:)`.
+    @discardableResult
+    func sendCommand(_ body: Wire.CommandBody, commandId: Wire.CommandId) -> CommandHandle {
         let handle = CommandHandle(commandId: commandId, body: body)
         commandHandles[commandId] = handle
         let command = Wire.PhoneCommand(commandId: commandId, issuedAtMs: now(), body: body)
@@ -120,6 +155,43 @@ final class TransportStore {
     @discardableResult
     func requestSnapshot(projectId: Wire.ProjectId? = nil) -> CommandHandle {
         sendCommand(.requestSnapshot(projectId: projectId))
+    }
+
+    // MARK: - Shell surface (additive)
+    //
+    // Thin wrappers over `sendCommand` for the minimal shell terminal (PRD
+    // §5.4). They exist so the Shell feature talks to the transport through
+    // one named surface rather than hand-building `CommandBody.shell*` cases,
+    // and so `TransportStore` can satisfy `ShellCommandSending`. Output chunks
+    // land in `shellOutput` and lifecycle events in `shellEvents` (above).
+
+    /// Open a shell in the session's worktree with a fitted geometry.
+    @discardableResult
+    func openShell(sessionId: Wire.SessionId, shellId: Wire.ShellId,
+                   cols: UInt16, rows: UInt16) -> CommandHandle {
+        sendCommand(.shellOpen(sessionId: sessionId, shellId: shellId, cols: cols, rows: rows))
+    }
+
+    /// Send input (keystrokes/text, already encoded to the wire string) to a
+    /// live shell.
+    @discardableResult
+    func sendShellInput(sessionId: Wire.SessionId, shellId: Wire.ShellId,
+                        data: String) -> CommandHandle {
+        sendCommand(.shellInput(sessionId: sessionId, shellId: shellId, data: data))
+    }
+
+    /// Interrupt the shell's foreground process (Ctrl-C). Uses the protocol
+    /// command rather than a raw `0x03` byte so it works even when the PTY is
+    /// wedged (PRD §5.4 interrupt).
+    @discardableResult
+    func interruptShell(sessionId: Wire.SessionId, shellId: Wire.ShellId) -> CommandHandle {
+        sendCommand(.shellInterrupt(sessionId: sessionId, shellId: shellId))
+    }
+
+    /// Close the shell (releases the desktop-held slot).
+    @discardableResult
+    func closeShell(sessionId: Wire.SessionId, shellId: Wire.ShellId) -> CommandHandle {
+        sendCommand(.shellClose(sessionId: sessionId, shellId: shellId))
     }
 
     // MARK: - Event folding
@@ -142,14 +214,22 @@ final class TransportStore {
         switch message {
         case let .snapshot(snap):
             snapshot = snap
+            // A full snapshot from the desktop is the definitive "we're live
+            // now" signal — clears any cache-seeded staleness (PRD §9.2).
+            isCacheStale = false
+            cacheCurrentState()
         case let .statusUpdate(update):
             applyStatusUpdate(update)
+            cacheCurrentState()
         case let .rollup(update):
             applyRollup(update)
+            cacheCurrentState()
         case let .transcript(feed):
             applyTranscript(feed, replace: true)
+            cacheCurrentState()
         case let .transcriptAppend(feed):
             applyTranscript(feed, replace: false)
+            cacheCurrentState()
         case let .event(agentEvent):
             if seenEventIds.insert(agentEvent.eventId).inserted {
                 agentEvents.append(agentEvent)
@@ -158,10 +238,15 @@ final class TransportStore {
             gitStatus[detail.sessionId] = detail
         case let .shellOutput(output):
             shellOutput[output.shellId, default: []].append(output)
-        case .shellEvent:
-            break // lifecycle handled by the terminal surface later
-        case .commandAck:
-            break // delivery honesty is driven by the transport's delivery events
+        case let .shellEvent(event):
+            shellEvents[event.sessionId, default: []].append(event)
+        case let .commandAck(ack):
+            // Delivery honesty is driven by the transport's delivery events;
+            // the ack's human-readable message (verbatim reject/fail reason or
+            // result note) is kept on the handle for honest display.
+            if let message = ack.message {
+                commandHandles[ack.commandId]?.ackMessage = message
+            }
         }
     }
 
@@ -204,6 +289,27 @@ final class TransportStore {
         } else {
             transcripts[feed.sessionId, default: []].append(contentsOf: feed.items)
         }
+    }
+
+    // MARK: - Offline cache (PRD §9.2)
+
+    /// Seeds `snapshot`/`transcripts` from a previously-cached state and
+    /// marks it stale. Additive hook called by `TransportStoreFactory` before
+    /// `start()` — never by `TransportClient` itself, so this can never race
+    /// a live snapshot arriving.
+    func seedFromCache(_ cached: SnapshotCache.CachedState) {
+        snapshot = cached.snapshot
+        for entry in cached.transcripts {
+            transcripts[entry.sessionId] = entry.items
+        }
+        isCacheStale = true
+    }
+
+    /// Schedules a debounced cache write of the current `snapshot`/`transcripts`,
+    /// a no-op absent both a snapshot and a configured `cache`.
+    private func cacheCurrentState() {
+        guard let cache, let snapshot else { return }
+        cache.scheduleSave(snapshot: snapshot, transcripts: transcripts)
     }
 
     // MARK: - Helpers

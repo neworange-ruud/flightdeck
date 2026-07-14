@@ -178,6 +178,30 @@ final class AppLockController {
         var suppressInitialAutoUnlock = false
 
         #if DEBUG
+        // UI-test hook: `-uitest-reset-applock` clears the persisted
+        // "Require Face ID to open" toggle at launch, mirroring
+        // `-uitest-reset-pairing` (`PairingStore`) — so a Settings UI test
+        // that verifies the toggle persists across relaunch always starts
+        // from a known disabled state, regardless of what an earlier test
+        // run (or a previous launch in the same test) left behind.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-reset-applock") {
+            isLockEnabledResolved = false
+            settings.saveIsLockEnabled(false)
+        }
+
+        // UI-test hook: `-uitest-mock-biometrics` swaps in the
+        // always-succeeding mock WITHOUT forcing the gate on — for the
+        // Settings UI test that verifies the persisted toggle itself
+        // (`-uitest-enable-applock` would mask persistence by forcing
+        // `isLockEnabled = true`). Whether the lock screen appears at all is
+        // then decided purely by the persisted toggle; the initial
+        // auto-attempt is suppressed for the same determinism reason as
+        // `-uitest-enable-applock` below.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-mock-biometrics") {
+            resolvedAuthenticator = AlwaysSucceedingBiometricAuthenticator()
+            suppressInitialAutoUnlock = true
+        }
+
         // UI-test hook: `-uitest-enable-applock` forces the gate on and
         // swaps in a mock that always succeeds, so tests can drive the lock
         // screen deterministically without a real Face ID prompt. The

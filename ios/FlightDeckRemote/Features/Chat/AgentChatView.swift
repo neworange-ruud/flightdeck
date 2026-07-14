@@ -14,26 +14,31 @@
 //   - an inert `ChatComposeBar` seam at the bottom.
 //
 //  Seams left for sibling tasks:
-//   - `onPermissionDecision` — the chat-permission task wires the (disabled)
-//     Allow/Deny buttons to a real allow/deny command.
-//   - `ChatComposeBar` — the compose task replaces the inert bar.
 //   - `ChatSurface.shell` — the shell task enables the disabled Shell segment
 //     and renders the real terminal (PRD §5.4).
 //   - `store` — when the transport is injected into the view tree, live
 //     `transcript`/`transcript_append` deltas stream straight in via the
-//     view-model's store binding.
+//     view-model's store binding, and the store is the command sender + gate
+//     source.
+//   - `ChatComposeBar.onHoldToTalk` — the custom hold-to-talk voice task
+//     (`remote-control-chat-voice-dictation`) fills this in; v1 mic uses system
+//     keyboard dictation only (PRD §7).
 //
 
 import SwiftUI
 
 struct AgentChatView: View {
 
-    /// Decision seam for the inline permission prompt. Wired by the
-    /// chat-permission task; the buttons stay disabled until then.
-    var onPermissionDecision: ((Wire.PromptId, Bool) -> Void)?
-
     @State private var model: ChatViewModel
     private let store: TransportStore?
+
+    #if DEBUG
+    // Fixture / UI-test send path (no live store): a scripted sender whose
+    // handles stay `.sending` so the optimistic pending / spinner states are
+    // observable, and a paused gate whose `-uitest-linkstate` forced state wins.
+    @State private var scriptedSender = ScriptedChatCommandSender()
+    @State private var fixtureSource = FixtureConnectionSource()
+    #endif
 
     @Environment(\.dismiss) private var dismiss
 
@@ -46,10 +51,8 @@ struct AgentChatView: View {
 
     init(projectId: String,
          sessionId: String,
-         store: TransportStore? = nil,
-         onPermissionDecision: ((Wire.PromptId, Bool) -> Void)? = nil) {
+         store: TransportStore? = nil) {
         self.store = store
-        self.onPermissionDecision = onPermissionDecision
         _model = State(wrappedValue: ChatViewModel(
             projectId: Wire.ProjectId(projectId),
             sessionId: Wire.SessionId(sessionId)))
@@ -66,6 +69,10 @@ struct AgentChatView: View {
         let pendingID = model.pendingPromptItemId
         let needsInput = model.isNeedsInput
         let canLoadEarlier = model.canLoadEarlier
+        let sendStates = sendStateMap()
+        let permissionActions = model.permissionActions
+        let currentPending = model.currentPendingPromptId
+        let commandsPaused = model.commandsPaused
 
         return VStack(spacing: 0) {
             header
@@ -73,10 +80,23 @@ struct AgentChatView: View {
                 .padding(.horizontal, Theme.Spacing.lg)
                 .padding(.bottom, Theme.Spacing.sm)
 
-            transcript(rows: rows, expandedIDs: expandedIDs, pendingID: pendingID,
-                       needsInput: needsInput, canLoadEarlier: canLoadEarlier)
+            // The `.shell` segment mounts the minimal terminal (PRD §5.4);
+            // `.agent` keeps the cleaned transcript + compose bar.
+            if model.surface == .shell {
+                ShellView(sessionId: model.sessionId,
+                          sessionName: model.sessionName,
+                          store: store)
+            } else {
+                transcript(rows: rows, expandedIDs: expandedIDs, pendingID: pendingID,
+                           needsInput: needsInput, canLoadEarlier: canLoadEarlier,
+                           sendStates: sendStates, permissionActions: permissionActions,
+                           currentPending: currentPending, commandsPaused: commandsPaused)
 
-            ChatComposeBar(sessionName: model.sessionName)
+                ChatComposeBar(sessionName: model.sessionName,
+                               text: $model.draft,
+                               commandsPaused: commandsPaused,
+                               onSend: { model.send() })
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep)
@@ -84,11 +104,25 @@ struct AgentChatView: View {
         .task {
             // Fixture (DEBUG / preview) wins so UI tests are deterministic;
             // otherwise bind to the live store and stream deltas in.
-            if model.loadFixtureIfRequested() { return }
+            if model.loadFixtureIfRequested() {
+                #if DEBUG
+                model.configureSend(sender: scriptedSender,
+                                    pausedGate: CommandsPausedGate(source: fixtureSource))
+                #endif
+                return
+            }
             if let store { model.bind(to: store) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("AgentChatView")
+    }
+
+    /// A snapshot of outgoing send states keyed by their local render id, read
+    /// in `body`'s tracked scope so per-row lookups don't re-track lazily.
+    private func sendStateMap() -> [Wire.ItemId: OutgoingState] {
+        var map: [Wire.ItemId: OutgoingState] = [:]
+        for msg in model.outgoing { map[msg.localId] = msg.state }
+        return map
     }
 
     // MARK: - Header
@@ -119,6 +153,7 @@ struct AgentChatView: View {
                 }
             }
             Spacer(minLength: 0)
+            SessionActionsButton(sessionId: model.sessionId, sessionName: model.sessionName, status: model.status, store: store) // Control feature hook (PRD §5.6)
         }
         .padding(.horizontal, Theme.Spacing.lg)
         .padding(.vertical, Theme.Spacing.md)
@@ -129,7 +164,11 @@ struct AgentChatView: View {
 
     private func transcript(rows: [ChatRow], expandedIDs: Set<Wire.ItemId>,
                             pendingID: Wire.ItemId?, needsInput: Bool,
-                            canLoadEarlier: Bool) -> some View {
+                            canLoadEarlier: Bool,
+                            sendStates: [Wire.ItemId: OutgoingState],
+                            permissionActions: [Wire.PromptId: PermissionActionState],
+                            currentPending: Wire.PromptId?,
+                            commandsPaused: Bool) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Theme.Spacing.md) {
@@ -137,6 +176,15 @@ struct AgentChatView: View {
                         loadEarlierButton
                     }
                     ForEach(rows) { row in
+                        let promptId = row.item.permissionPromptId
+                        let actionState = promptId.map { permissionActions[$0] ?? .idle } ?? .idle
+                        let actionable: Bool = {
+                            guard let promptId, promptId == currentPending, !commandsPaused else { return false }
+                            switch actionState {
+                            case .idle, .failed: return true
+                            case .sending, .resolved, .stale: return false
+                            }
+                        }()
                         TranscriptRowView(
                             row: row,
                             isExpanded: expandedIDs.contains(row.item.itemId),
@@ -146,7 +194,14 @@ struct AgentChatView: View {
                                     model.toggleExpanded(row.item.itemId)
                                 }
                             },
-                            onPermissionDecision: onPermissionDecision)
+                            sendState: sendStates[row.item.itemId],
+                            permissionState: actionState,
+                            permissionActionable: actionable,
+                            onDecide: { pid, choice in
+                                model.decidePermission(promptId: pid, choice: choice)
+                            },
+                            onRetryPermission: { model.retryPermission($0) },
+                            onRetryOutgoing: { model.retryOutgoing($0) })
                         .id(row.id)
                     }
                     Color.clear

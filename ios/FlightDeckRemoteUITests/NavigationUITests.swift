@@ -71,7 +71,7 @@ final class NavigationUITests: XCTestCase {
         XCTAssertTrue(element(app, "ProjectsListView").waitForExistence(timeout: 5), "Expected Projects to be the default tab")
 
         element(app, "tab-shell").tap()
-        XCTAssertTrue(element(app, "ShellTerminalView").waitForExistence(timeout: 5))
+        XCTAssertTrue(element(app, "ShellTabView").waitForExistence(timeout: 5))
 
         element(app, "tab-settings").tap()
         XCTAssertTrue(element(app, "SettingsView").waitForExistence(timeout: 5))
@@ -89,15 +89,19 @@ final class NavigationUITests: XCTestCase {
         launchAndPair(app)
 
         element(app, "tab-fab-new-agent").tap()
-        XCTAssertTrue(element(app, "NewAgentPlaceholderSheet").waitForExistence(timeout: 5))
+        XCTAssertTrue(element(app, "NewAgentView").waitForExistence(timeout: 5))
     }
 
     @MainActor
     func testActivityBadgeVisibleThenClearsOnSelection() throws {
         let app = XCUIApplication()
+        // The badge is driven by real (persisted) events now — seed the
+        // deterministic all-unread fixture feed rather than relying on the
+        // old stub's hardcoded default of 1 unread.
+        app.launchArguments += ["-uitest-fixture-activity"]
         launchAndPair(app)
 
-        XCTAssertTrue(element(app, "tab-activity-unread-badge").waitForExistence(timeout: 5), "Expected the unread badge to be visible by default")
+        XCTAssertTrue(element(app, "tab-activity-unread-badge").waitForExistence(timeout: 5), "Expected the unread badge with unviewed fixture events")
 
         element(app, "tab-activity").tap()
         XCTAssertFalse(element(app, "tab-activity-unread-badge").waitForExistence(timeout: 2), "Expected the unread badge to clear once Activity is viewed")
