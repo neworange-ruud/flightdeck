@@ -33,6 +33,7 @@ use crate::git::status::WorktreeStatus;
 use crate::terminal::session::TerminalKind;
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
+use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
 
@@ -523,6 +524,31 @@ pub fn draw(
         draw_child_tab_bar(frame, state, ml.child_tabs);
         draw_terminal_viewport(frame, state, ml.terminal, now_ms);
     }
+
+    // Live-pane border (SPECS §23): frame whichever pane is receiving keys. The
+    // frame rects are present only when `mode_border != off`; geometry is fixed
+    // by layout::compute, so only the color changes with the mode.
+    if let Some(frame_rect) = ml.sidebar_frame {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(mode_style::pane_border_style(
+                &state.config.ui,
+                state.mode(),
+                mode_style::Pane::Sidebar,
+            ));
+        frame.render_widget(block, frame_rect);
+    }
+    if let Some(frame_rect) = ml.terminal_frame {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(mode_style::pane_border_style(
+                &state.config.ui,
+                state.mode(),
+                mode_style::Pane::Terminal,
+            ));
+        frame.render_widget(block, frame_rect);
+    }
+
     let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
     frame.render_widget(info_divider, ml.info_divider);
     draw_info_bar(frame, state, cache, ml.info_bar);
@@ -2936,6 +2962,39 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::None, 0);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn draw_renders_live_pane_border_when_enabled() {
+        // Default mode is APP, so the sidebar frame is the live one; we only
+        // need *a* border glyph to prove the frame is drawn when the setting
+        // is on. A selected tab with an active (spawned) terminal ensures the
+        // terminal frame is also present, mirroring a real session.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.config.ui.mode_border = "normal".to_string();
+        let mut term = test_terminal(120, 40);
+        let cache = GitStatusCache::new();
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        // Corner glyphs are unique to `Block::borders(ALL)` — unlike '─'/'│',
+        // nothing else in `draw` emits them (dividers are plain horizontal
+        // rules), so this only passes once the frame block is actually drawn.
+        assert!(
+            text.contains('┐') || text.contains('┌') || text.contains('└') || text.contains('┘'),
+            "expected a border corner glyph when mode_border = normal"
+        );
     }
 
     #[test]
