@@ -1095,6 +1095,12 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 // Terminal viewport (SPECS §20)
 // ---------------------------------------------------------------------------
 
+/// Whether the terminal viewport should render dimmed: only when it is not the
+/// focused pane (i.e. APP mode) and the user has left dimming enabled (SPECS §23).
+fn dim_terminal(focused: bool, ui: &crate::contracts::UiConfig) -> bool {
+    !focused && ui.dim_terminal_in_app_mode
+}
+
 /// Draw the active terminal viewport (SPECS §20): the VT100 screen of the
 /// selected tab's active terminal (primary agent, or the selected child shell),
 /// rendered cell-by-cell from its parser.
@@ -1140,7 +1146,8 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, n
     };
 
     let focused = state.mode() == InputMode::Terminal;
-    render_screen(frame, area, term.screen(), focused, term.selection());
+    let dim = dim_terminal(focused, &state.config.ui);
+    render_screen(frame, area, term.screen(), focused, term.selection(), dim);
 }
 
 /// Background colour used to highlight selected terminal cells (SPECS §20).
@@ -1155,6 +1162,7 @@ fn render_screen(
     screen: &vt100::Screen,
     focused: bool,
     selection: Option<&Selection>,
+    dim: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1201,6 +1209,9 @@ fn render_screen(
                         .bg(SELECTION_BG)
                         .fg(Color::White)
                         .remove_modifier(Modifier::REVERSED);
+                }
+                if dim {
+                    style = style.add_modifier(Modifier::DIM);
                 }
                 target.set_style(style);
             }
@@ -1268,6 +1279,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
     let cols = layout::split_columns(region, entries.len());
     let active = tab.session.selected_child(); // None = primary
     let focused = state.mode() == InputMode::Terminal;
+    let dim = dim_terminal(focused, &state.config.ui);
 
     for (i, ((target, label), col)) in entries.iter().zip(cols.iter()).enumerate() {
         let is_active = match target {
@@ -1307,6 +1319,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
                 term.screen(),
                 focused && is_active,
                 term.selection(),
+                dim,
             ),
             None => {
                 let p = Paragraph::new("  (starting…)").style(Style::default().fg(Color::DarkGray));
@@ -3216,5 +3229,23 @@ mod tests {
             !all_text.contains("proc:"),
             "sidebar must not show the 'proc:' prefix, got: {all_text:?}"
         );
+    }
+
+    #[test]
+    fn terminal_dims_in_app_mode_when_enabled() {
+        // A helper `dim_flag` mirrors the production rule so the test pins the
+        // policy: dim only when NOT focused (i.e. APP mode) and the setting is on.
+        let mut ui = crate::contracts::UiConfig {
+            dim_terminal_in_app_mode: true,
+            ..Default::default()
+        };
+
+        // Terminal mode (focused) never dims.
+        assert!(!super::dim_terminal(true, &ui));
+        // App mode (unfocused) + setting on → dim.
+        assert!(super::dim_terminal(false, &ui));
+        // App mode + setting off → no dim.
+        ui.dim_terminal_in_app_mode = false;
+        assert!(!super::dim_terminal(false, &ui));
     }
 }

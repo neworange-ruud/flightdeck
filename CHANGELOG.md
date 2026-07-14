@@ -12,7 +12,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- The terminal viewport now dims while in APP mode (configurable via
+  `UiConfig.dim_terminal_in_app_mode`), making it clearer at a glance which
+  mode has input focus.
 
 ### Bug fixes
 
