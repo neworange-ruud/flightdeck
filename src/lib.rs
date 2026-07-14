@@ -204,11 +204,12 @@ pub fn run() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
 
     // Enable the kitty keyboard protocol's "disambiguate escape codes" mode when
-    // the terminal supports it. Without it, terminals report Alt/Option+Esc as a
-    // bare Esc — indistinguishable from the agent's own Esc — so Alt+Esc can't be
-    // used to leave terminal focus, and Alt-navigation shortcuts are unreliable.
-    // With it, modified keys carry their real modifiers. Best effort; popped on
-    // teardown only if we pushed it.
+    // the terminal supports it. Without it, terminals report modified keys like
+    // Alt+Arrow as bare/ambiguous sequences, so the Alt-navigation shortcuts are
+    // unreliable; with it, modified keys carry their real modifiers. (Leaving
+    // terminal focus does not depend on this — it is F2, which every terminal
+    // encodes unambiguously.) Best effort; popped on teardown only if we pushed
+    // it.
     let keyboard_enhanced = matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)

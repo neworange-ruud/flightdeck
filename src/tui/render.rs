@@ -34,7 +34,6 @@ use crate::terminal::session::TerminalKind;
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
-use crate::tui::platform;
 use crate::tui::selection::Selection;
 
 // ---------------------------------------------------------------------------
@@ -1452,8 +1451,7 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 
 /// Draw the mode status bar (SPECS §23).
 ///
-/// Terminal mode: `MODE: TERMINAL | Alt+Esc: app commands | Ctrl-g: command palette`
-///                 (the leave-focus key is `Shift+Esc` on Windows/Linux — see [`LEAVE_FOCUS_KEY`])
+/// Terminal mode: `MODE: TERMINAL | F2: app commands | Ctrl-g: command palette`
 /// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(state.mode(), state.update_available.as_deref());
@@ -1461,14 +1459,11 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// The key that leaves terminal focus, per platform. `Alt+Esc` on macOS; on
-/// Windows and Linux the OS/window manager reserves `Alt+Esc` (cycles windows)
-/// so the terminal app never receives it — those platforms use `Shift+Esc`.
-pub const LEAVE_FOCUS_KEY: &str = if platform::LEAVE_FOCUS_USES_SHIFT {
-    "Shift+Esc"
-} else {
-    "Alt+Esc"
-};
+/// The key that leaves terminal focus. `F2` on every platform: unlike a
+/// modified `Esc`, it has an unambiguous encoding on all terminals (including
+/// those without the kitty keyboard protocol, e.g. Konsole) and does not
+/// collide with a bare `Esc` that must reach the hosted agent.
+pub const LEAVE_FOCUS_KEY: &str = "F2";
 
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
 /// optional trailing update hint when a newer release is available (SPECS §30).
@@ -1805,14 +1800,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
         Line::raw(""),
         Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
-        shortcut_line(
-            if platform::LEAVE_FOCUS_USES_SHIFT {
-                "  Shift+Esc"
-            } else {
-                "  Alt+Esc"
-            },
-            "Leave terminal focus / focus app",
-        ),
+        shortcut_line("  F2", "Leave terminal focus / focus app"),
         shortcut_line("  Enter", "Focus active terminal"),
         Line::raw(""),
         Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
@@ -2829,7 +2817,7 @@ mod tests {
         let line = status_bar_text(InputMode::Terminal, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
-        assert!(flat.contains("Esc"), "must mention Esc");
+        assert!(flat.contains("F2"), "must mention the leave-focus key");
         assert!(flat.contains("app commands"), "must say app commands");
         assert!(flat.contains("Ctrl-g"), "must mention Ctrl-g");
         assert!(flat.contains("command palette"), "must mention palette");
