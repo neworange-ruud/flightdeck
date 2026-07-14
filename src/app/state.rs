@@ -4013,6 +4013,12 @@ mod tests {
         );
     }
 
+    // Unix-only: the fixture builds the tab cwd via `to_absolute`, whose joined
+    // path uses the OS-native separator, and the claude-store dir mangling this
+    // asserts (`/` and `.` → `-`) is the layout verified on unix. Windows uses a
+    // different session-dir convention (not yet verified), where store-resume
+    // degrades to a fresh session rather than misbehaving.
+    #[cfg(unix)]
     #[test]
     fn pin_resumable_sessions_pins_new_store_session() {
         let dir = TempDir::new().unwrap();
