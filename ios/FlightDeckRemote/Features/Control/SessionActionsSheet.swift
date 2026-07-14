@@ -19,6 +19,13 @@
 //  `SessionActionsButton` is the tiny re-appliable entry point the session
 //  row and the chat header mount as a one-liner.
 //
+//  Git status (PRD §5.5): a "Git status" row above the safe group opens the
+//  read-only `GitStatusView` (Features/Git) — reads are frictionless, so it
+//  stays reachable even while commands are paused. Merge-back's confirmation
+//  is "guarded": when the session's latest known git status has uncommitted
+//  changes or drift, `GitMergeGuardText` (Features/Git) adds an extra warning
+//  line to the standard confirmation copy.
+//
 
 import SwiftUI
 
@@ -92,12 +99,14 @@ struct SessionActionsSheet: View {
         case manualStatus
         case abandon
         case shell
+        case gitStatus
         var id: String {
             switch self {
             case let .confirm(action): "confirm-\(action.rawValue)"
             case .manualStatus: "manualStatus"
             case .abandon: "abandon"
             case .shell: "shell"
+            case .gitStatus: "gitStatus"
             }
         }
     }
@@ -133,6 +142,18 @@ struct SessionActionsSheet: View {
 
     private var commandsPaused: Bool { gate.commandsPaused }
 
+    /// The session's latest known git status (frictionless read, PRD §5.5):
+    /// the DEBUG fixture seam wins under `-uitest-fixture-git-status` (no
+    /// relay in UI tests), else the live store's last `git_status` push.
+    private var gitDetail: Wire.GitStatusDetail? {
+        #if DEBUG
+        if GitDebugSeam.isFixtureGitStatus {
+            return GitDebugSeam.fixtureDetail(sessionId: sessionId)
+        }
+        #endif
+        return store?.gitStatus[sessionId]
+    }
+
     private var isManualOverride: Bool {
         if case .manual = status { return true }
         return false
@@ -145,6 +166,7 @@ struct SessionActionsSheet: View {
                 VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
                     if commandsPaused { pausedNote }
                     outcomeRow
+                    gitStatusRow
                     actionGroup(title: "Session", actions: SessionControlAction.safeGroup)
                     actionGroup(title: "Destructive", actions: SessionControlAction.destructiveGroup)
                 }
@@ -160,7 +182,8 @@ struct SessionActionsSheet: View {
             switch sheet {
             case let .confirm(action):
                 if let conf = action.confirmation(sessionName: sessionName) {
-                    ControlConfirmationSheet(confirmation: conf) {
+                    let guardNote = action == .mergeBack ? GitMergeGuardText.build(from: gitDetail) : nil
+                    ControlConfirmationSheet(confirmation: conf, guardNote: guardNote) {
                         perform(action)
                     }
                 }
@@ -184,6 +207,8 @@ struct SessionActionsSheet: View {
                     })
             case .shell:
                 shellSheet
+            case .gitStatus:
+                GitStatusView(sessionId: sessionId, sessionName: sessionName, store: store)
             }
         }
         .accessibilityElement(children: .contain)
@@ -271,6 +296,41 @@ struct SessionActionsSheet: View {
                     .accessibilityIdentifier("control-retry")
             }
             .accessibilityIdentifier("control-outcome-failed")
+        }
+    }
+
+    // MARK: Git status (read, frictionless — PRD §5.5/§8)
+
+    /// Always enabled (a read, not a state change) — opens the read-only
+    /// `GitStatusView` (Features/Git).
+    private var gitStatusRow: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Text("GIT")
+                .typography(Typography.captionBold)
+                .foregroundStyle(Theme.textDim)
+            Button {
+                activeSheet = .gitStatus
+            } label: {
+                HStack(spacing: Theme.Spacing.md) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(width: 22)
+                    Text("Git status")
+                        .typography(Typography.body)
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer(minLength: Theme.Spacing.sm)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textDim)
+                }
+                .padding(.horizontal, Theme.Spacing.lg)
+                .padding(.vertical, Theme.Spacing.md)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(Theme.bgCard, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .accessibilityIdentifier("control-action-git-status")
         }
     }
 
@@ -411,6 +471,11 @@ struct SessionActionsSheet: View {
 /// reliably when raised from within a themed bottom sheet on iOS 26.
 private struct ControlConfirmationSheet: View {
     let confirmation: ControlConfirmation
+    /// Merge-back's "guarded" extra warning line (PRD §5.5), built from the
+    /// session's latest known git status (`GitMergeGuardText`, Features/Git).
+    /// `nil` for every other action, and for merge-back when there's nothing
+    /// to warn about.
+    var guardNote: String? = nil
     let onConfirm: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -426,6 +491,14 @@ private struct ControlConfirmationSheet: View {
                 .typography(Typography.body)
                 .foregroundStyle(Theme.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let guardNote {
+                Text(guardNote)
+                    .typography(Typography.callout)
+                    .foregroundStyle(Theme.statusNeedsInput)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("control-confirm-guard-note")
+            }
 
             confirmButton
             cancelButton
