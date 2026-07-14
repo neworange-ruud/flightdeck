@@ -5,4 +5,3 @@
 {"source":"user-event","type":"click","text":"~\n    Close — one tweakTell me what to adjust (dim intensity, border thickness, drop the status strip, etc.).","choice":"tweak","id":null,"timestamp":1784020783595}
 {"source":"user-event","type":"click","text":"~\n    Close — one tweakTell me what to adjust (dim intensity, border thickness, drop the status strip, etc.).","choice":"tweak","id":null,"timestamp":1784020784190}
 {"type":"screen-added","file":"/home/sanderlanghorst/Repos/flightdeck/.flightdeck/worktrees/mode-clarification/.superpowers/brainstorm/485484-1784020249/content/waiting.html"}
-{"type":"server-stopped","reason":"idle timeout"}

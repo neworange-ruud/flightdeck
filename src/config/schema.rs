@@ -307,13 +307,14 @@ mod tests {
 
     #[test]
     fn ui_config_partial_table_fills_mode_defaults() {
-        // A config that only sets agent_tab_position must still get the new defaults.
-        let cfg: Config = "[ui]\nagent_tab_position = \"right\"\n"
+        // A config that includes the required fields must still get the new defaults.
+        let cfg: Config = "[ui]\nagent_tab_position = \"right\"\ndefault_agent = \"opencode\"\n"
             .parse::<toml::Table>()
             .unwrap()
             .try_into()
             .unwrap();
         assert_eq!(cfg.ui.agent_tab_position, "right");
+        assert_eq!(cfg.ui.default_agent, "opencode");
         assert_eq!(cfg.ui.terminal_mode_color, "green");
         assert_eq!(cfg.ui.mode_border, "off");
         assert!(cfg.ui.dim_terminal_in_app_mode);

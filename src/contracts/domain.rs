@@ -262,7 +262,6 @@ impl Default for GitConfig {
 
 /// `[ui]` config section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct UiConfig {
     pub agent_tab_position: String,
     pub default_agent: String,
