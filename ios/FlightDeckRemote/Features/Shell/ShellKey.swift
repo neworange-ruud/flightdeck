@@ -13,7 +13,7 @@ import Foundation
 /// One key on the shell accessory bar. Ordered roughly as laid out portrait:
 /// `Esc Tab Ctrl ← ↑ ↓ → | / - ~ \` ⌃C Paste`.
 enum ShellKey: String, CaseIterable, Hashable, Sendable {
-    case escape
+    case escape = "esc"   // id `shell-key-esc` (matches the label + UI tests)
     case tab
     case ctrl        // sticky modifier — toggles, doesn't emit on its own
     case left

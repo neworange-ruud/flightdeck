@@ -46,6 +46,13 @@ final class ShellSessionModel {
     /// Reassembled output chunks in seq order — the renderer feeds new tail.
     private(set) var orderedOutput: [String] = []
 
+    #if DEBUG
+    /// Bumped on every send (input / interrupt) so the DEBUG `shell-debug-last-sent`
+    /// UI-test label refreshes even for sends that change no other observable
+    /// state (the scripted sender itself isn't `@Observable`).
+    private(set) var debugSendVersion = 0
+    #endif
+
     /// `true` while the link isn't live — every send is blocked and the UI
     /// shows an honest paused note (PRD §8).
     var commandsPaused: Bool { gate?.commandsPaused ?? true }
@@ -166,6 +173,9 @@ final class ShellSessionModel {
         guard !commandsPaused, let id = shellId, isInteractive else { return }
         ctrlArmed = false
         sender?.interruptShell(sessionId: sessionId, shellId: id)
+        #if DEBUG
+        debugSendVersion &+= 1
+        #endif
     }
 
     /// Paste: read `UIPasteboard` text and send it as input (plain, v1 — see
@@ -231,6 +241,9 @@ final class ShellSessionModel {
         guard !commandsPaused, isInteractive, !bytes.isEmpty, let id = shellId else { return }
         sender?.sendShellInput(sessionId: sessionId, shellId: id,
                                data: ShellByteEncoding.wireString(bytes))
+        #if DEBUG
+        debugSendVersion &+= 1
+        #endif
     }
 
     /// Overridden by the view to read the real pasteboard; the default is a
@@ -260,9 +273,11 @@ extension ShellSessionModel {
     }
 
     /// DEBUG accessor for the scripted sender's last-send description (drives
-    /// the hidden `shell-debug-last-sent` UI-test label).
+    /// the hidden `shell-debug-last-sent` UI-test label). Reads `debugSendVersion`
+    /// first so the label refreshes on every send (see that property).
     var debugLastSentDescription: String {
-        (sender as? ScriptedShellCommandSender)?.lastSentDescription ?? "none"
+        _ = debugSendVersion
+        return (sender as? ScriptedShellCommandSender)?.lastSentDescription ?? "none"
     }
 }
 #endif

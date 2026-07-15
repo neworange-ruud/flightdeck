@@ -34,6 +34,13 @@ struct ShellKeyBar: View {
             .padding(.horizontal, Theme.Spacing.md)
             .padding(.vertical, Theme.Spacing.sm)
         }
+        // A horizontal ScrollView otherwise greedily fills the vertical space
+        // it's offered (e.g. the whole bottom safe-area inset in `ShellView`),
+        // ballooning to ~160pt with the keys pinned at the top and the empty
+        // lower half overlapping the tab bar — its center then lands in the tab
+        // bar, so taps/swipes on the bar don't reach the key row. Pin the bar to
+        // one key row's height: button (label + 2×sm) + the HStack's 2×sm.
+        .frame(height: 33 + Theme.Spacing.sm * 2)
         .background(Theme.bgRaised)
         .opacity(disabled ? 0.5 : 1)
         .allowsHitTesting(!disabled)
