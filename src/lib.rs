@@ -1211,6 +1211,14 @@ fn event_loop(
     // The desktop pairing surface (Settings → Remote overlay). `Some` only while
     // the QR/code overlay is on screen.
     let mut pairing_session: Option<PairingSession> = None;
+    // Test / E2E seam (read once at startup): when `FLIGHTDECK_REMOTE_AUTOPAIR`
+    // holds a 4-digit value and remote is enabled, the desktop offers pairing
+    // non-interactively on the first tick using that fixed code, so an automated
+    // harness gets a deterministic claim token instead of a random one plus a
+    // keypress. `None` in every normal run, so behaviour is unchanged.
+    let autopair_hint: Option<String> = std::env::var("FLIGHTDECK_REMOTE_AUTOPAIR")
+        .ok()
+        .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
     // Inbound command-bridge state: the idempotency ledger and the first tasks
     // of phone-created sessions awaiting a ready agent. Only ever touched when
     // the remote bridge exists, so disabled-remote behaviour is unchanged.
@@ -1358,6 +1366,13 @@ fn event_loop(
             while remote_in_rx.try_recv().is_ok() {}
         }
 
+        // --- Test / E2E seam: on the first tick, auto-offer pairing with the
+        //     fixed `FLIGHTDECK_REMOTE_AUTOPAIR` code when set and remote is
+        //     enabled. This just requests the same offer the palette action does. ---
+        if tick == 0 && autopair_hint.is_some() && remote_setup.is_some() {
+            ui.pending_pair = true;
+        }
+
         // --- Desktop pairing surface (Settings → Remote): start an offer, keep
         //     the overlay in sync with the pairing session, and handle unpair. ---
         drive_pairing_overlay(
@@ -1366,6 +1381,7 @@ fn event_loop(
             remote_bridge.as_mut(),
             remote_setup.as_ref(),
             &remote_out_tx,
+            autopair_hint.as_deref(),
             now_ms,
         );
 
@@ -1562,13 +1578,19 @@ fn drive_pairing_overlay(
     bridge: Option<&mut RemoteBridge>,
     setup: Option<&RemoteSetup>,
     out_tx: &Sender<RemoteOutbound>,
+    autopair_hint: Option<&str>,
     now_ms: u64,
 ) {
     if ui.pending_pair {
         ui.pending_pair = false;
         match setup {
             Some(s) => {
-                let session = PairingSession::begin(s.relay_url.clone());
+                // The test / E2E seam supplies a fixed code so the claim token is
+                // deterministic; interactive pairing uses a fresh random code.
+                let session = match autopair_hint {
+                    Some(hint) => PairingSession::begin_with_hint(s.relay_url.clone(), hint),
+                    None => PairingSession::begin(s.relay_url.clone()),
+                };
                 let _ = out_tx.send(RemoteOutbound::RequestPairing {
                     claim_token_hint: Some(session.hint().to_string()),
                 });

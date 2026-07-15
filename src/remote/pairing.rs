@@ -114,12 +114,25 @@ impl PairingSession {
     /// `pairing_secret`, entering [`PairingPhase::Offering`]. The caller sends
     /// [`crate::remote::RemoteOutbound::RequestPairing`] with [`Self::hint`].
     pub fn begin(relay_url: impl Into<String>) -> Self {
+        Self::begin_with_hint(relay_url, four_digit_code())
+    }
+
+    /// Start a fresh attempt with an explicit 4-digit code `hint` instead of a
+    /// random one, entering [`PairingPhase::Offering`]. Because the hint flows
+    /// through to the relay as the `claim_token_hint` (issued verbatim when
+    /// free), a fixed hint yields a **deterministic** claim token.
+    ///
+    /// This is a test / E2E seam: the interactive desktop always uses
+    /// [`Self::begin`] (random code); the fixed-hint path exists so an automated
+    /// harness can pair non-interactively with a known code (see the
+    /// `FLIGHTDECK_REMOTE_AUTOPAIR` startup seam in `lib.rs`).
+    pub fn begin_with_hint(relay_url: impl Into<String>, hint: impl Into<String>) -> Self {
         let mut secret = [0u8; PAIRING_SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
         PairingSession {
             phase: PairingPhase::Offering,
             relay_url: relay_url.into(),
-            hint: four_digit_code(),
+            hint: hint.into(),
             pairing_secret_b64url: URL_SAFE_NO_PAD.encode(secret),
             pairing_id: None,
             claim_token: None,
