@@ -81,8 +81,10 @@ final class SettingsUITests: XCTestCase {
     @MainActor
     func testNotificationTogglesFlipAndMuteAppearsWithProjects() throws {
         let app = XCUIApplication()
-        // The snapshot fixture gives the per-project mute list real rows.
-        launchAndPair(app, extraArguments: ["-uitest-fixture-snapshot"])
+        // The snapshot fixture gives the per-project mute list real rows;
+        // reset persisted prefs so the "defaults on" assertion is hermetic
+        // (this test flips a toggle, which would otherwise leak to later runs).
+        launchAndPair(app, extraArguments: ["-uitest-fixture-snapshot", "-uitest-reset-notif-prefs"])
         openSettingsTab(app)
 
         let finished = element(app, "settings-notif-finished")

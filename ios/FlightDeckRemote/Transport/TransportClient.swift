@@ -415,7 +415,7 @@ actor TransportClient {
         // Commit the cursor durably, then publish and ack contiguous receipt.
         record.lastReceivedSeq = env.seq
         self.record = record
-        try? recordStore.setLastReceivedSeq(env.seq)
+        _ = try? recordStore.setLastReceivedSeq(env.seq)
 
         if case let .commandAck(ack) = message {
             resolvePending(ack)
@@ -478,7 +478,7 @@ actor TransportClient {
         // Commit the outbound cursor only after a successful send (§6.1).
         record.lastSentSeq = next
         self.record = record
-        try? recordStore.setLastSentSeq(next)
+        _ = try? recordStore.setLastSentSeq(next)
 
         if track {
             emit(.delivery(commandId: commandId, state: .sending))

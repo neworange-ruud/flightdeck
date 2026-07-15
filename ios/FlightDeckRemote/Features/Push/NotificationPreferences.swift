@@ -90,7 +90,16 @@ struct UserDefaultsNotificationSettingsStore: NotificationSettingsStoring {
     }
 
     func load() -> NotificationSettings {
-        NotificationSettings(
+        #if DEBUG
+        // UI-test hook (mirrors `-uitest-reset-pairing` / `-uitest-reset-applock`):
+        // clear persisted prefs so a scenario that flips a toggle doesn't leak
+        // into the next launch. `load()` runs once at init, so this resets to
+        // the "everything on" defaults for the run.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-reset-notif-prefs") {
+            [Key.needsInput, Key.finished, Key.chime, Key.muted].forEach { defaults.removeObject(forKey: $0) }
+        }
+        #endif
+        return NotificationSettings(
             // Absent keys default to `true` (fresh install = everything on);
             // `object(forKey:)` distinguishes "unset" from an explicit `false`.
             agentNeedsInput: defaults.object(forKey: Key.needsInput) as? Bool ?? true,
