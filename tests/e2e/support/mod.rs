@@ -9,4 +9,6 @@
 //! Not every helper is exercised by every test binary that includes this
 //! module, so submodules are `dead_code`-tolerant individually.
 
+pub mod desktop;
+pub mod phone;
 pub mod relay;
