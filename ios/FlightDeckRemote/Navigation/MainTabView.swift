@@ -45,6 +45,13 @@ struct MainTabView: View {
     @State private var isPresentingNewAgentSheet = false
     @State private var connectionBanner: ReconnectingBannerModel
     @State private var transportStore: TransportStore
+    // Push wiring (PRD §5.2/§9.1): the notification prefs the Settings screen
+    // binds to (also gating presentation), the local-notification scheduler fed
+    // by the same `agentEvents` stream as the Activity feed, and the shared push
+    // coordinator whose APNs token we register with the transport.
+    @State private var notificationPreferences = NotificationPreferences()
+    @State private var notificationScheduler = NotificationScheduler()
+    @State private var pushCoordinator = PushCoordinator.shared
 
     init(router: AppRouter, connectionSource: (any ConnectionStatusSource)? = nil) {
         self.router = router
@@ -95,6 +102,14 @@ struct MainTabView: View {
             }
             .onChange(of: transportStore.agentEvents) { _, newEvents in
                 activityStore.ingest(newEvents, tabSelected: router.selectedTab == .activity)
+                // Same stream drives local notifications (deduped by event_id,
+                // gated by the user's toggles + per-project mute).
+                notificationScheduler.ingest(newEvents, settings: notificationPreferences.settings)
+            }
+            .onChange(of: pushCoordinator.deviceTokenHex) { _, token in
+                if let token {
+                    transportStore.registerPushToken(token, environment: pushCoordinator.environment)
+                }
             }
             // `.contain` first: an accessibility identifier applied to a plain
             // container view propagates onto every accessibility element inside
@@ -106,6 +121,11 @@ struct MainTabView: View {
             .accessibilityIdentifier("MainTabView")
             .task {
                 await transportStore.start()
+                // Register any token that already arrived before the transport
+                // started (onChange covers tokens that arrive afterwards).
+                if let token = pushCoordinator.deviceTokenHex {
+                    transportStore.registerPushToken(token, environment: pushCoordinator.environment)
+                }
             }
 
             VStack(spacing: 0) {
@@ -178,7 +198,10 @@ struct MainTabView: View {
         case .shell:
             ShellTabView(transportStore: transportStore)
         case .settings:
-            SettingsView(router: router, transportStore: transportStore)
+            SettingsView(
+                router: router,
+                transportStore: transportStore,
+                notificationPreferences: notificationPreferences)
         }
     }
 }

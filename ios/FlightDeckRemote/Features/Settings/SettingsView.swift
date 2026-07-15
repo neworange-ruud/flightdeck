@@ -55,6 +55,7 @@ struct SettingsView: View {
     var transportStore: TransportStore
     var pairingRecordStore: PairingRecordStore
     var biometricAuthenticator: BiometricAuthenticating
+    var notificationPreferences: NotificationPreferences
     private let unpairService: SettingsUnpairing
 
     @Environment(AppLockController.self) private var appLock
@@ -69,12 +70,14 @@ struct SettingsView: View {
         transportStore: TransportStore,
         pairingRecordStore: PairingRecordStore = PairingRecordStore(),
         biometricAuthenticator: BiometricAuthenticating = LAContextBiometricAuthenticator(),
+        notificationPreferences: NotificationPreferences,
         unpairService: SettingsUnpairing? = nil
     ) {
         self.router = router
         self.transportStore = transportStore
         self.pairingRecordStore = pairingRecordStore
         self.biometricAuthenticator = biometricAuthenticator
+        self.notificationPreferences = notificationPreferences
         self.unpairService = unpairService
             ?? DefaultSettingsUnpairService(transportStore: transportStore, pairingRecordStore: pairingRecordStore)
     }
@@ -203,20 +206,108 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Notifications (placeholder — separate push-dependent task)
+    // MARK: - Notifications (PRD §5.6/§9.2)
 
+    @ViewBuilder
     private var notificationsSection: some View {
+        @Bindable var prefs = notificationPreferences
+
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
             sectionHeader("Notifications")
 
-            Text("Notifications — available after push setup")
-                .typography(Typography.body)
-                .foregroundStyle(Theme.textMutedDark)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(Theme.Spacing.lg)
-                .cardStyle()
-                .accessibilityIdentifier("settings-notifications-placeholder")
+            // Three INDEPENDENT global toggles (PRD §5.6).
+            VStack(alignment: .leading, spacing: 0) {
+                notificationToggle(
+                    "Agent needs input",
+                    isOn: $prefs.agentNeedsInput,
+                    identifier: "settings-notif-needsinput")
+                rowDivider
+                notificationToggle(
+                    "Agent finished",
+                    isOn: $prefs.agentFinished,
+                    identifier: "settings-notif-finished")
+                rowDivider
+                notificationToggle(
+                    "Completion chime",
+                    isOn: $prefs.completionChime,
+                    identifier: "settings-notif-chime")
+            }
+            .cardStyle()
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("settings-notifications-card")
+
+            mutedProjectsCard
         }
+    }
+
+    /// Per-project mute (PRD §9.2). Shown only when we know the projects (from
+    /// the live/cached snapshot); otherwise an honest note.
+    @ViewBuilder
+    private var mutedProjectsCard: some View {
+        let projects = transportStore.snapshot?.projects ?? []
+
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            sectionHeader("Mute by project")
+
+            if projects.isEmpty {
+                Text("No projects yet — mute is available once your Mac is connected.")
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.textMutedDark)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(Theme.Spacing.lg)
+                    .cardStyle()
+                    .accessibilityIdentifier("settings-notif-mute-empty")
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(projects.enumerated()), id: \.element.projectId) { index, project in
+                        if index != 0 { rowDivider }
+                        muteRow(for: project)
+                    }
+                }
+                .cardStyle()
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("settings-notif-mute-card")
+            }
+        }
+    }
+
+    private func muteRow(for project: Wire.ProjectState) -> some View {
+        let projectId = project.projectId.rawValue
+        // A muted project suppresses its notifications; the toggle reads "muted",
+        // so it is ON when notifications are OFF for the project.
+        let binding = Binding(
+            get: { notificationPreferences.isMuted(projectId: projectId) },
+            set: { notificationPreferences.setMuted($0, projectId: projectId) })
+
+        return Toggle(isOn: binding) {
+            Text(project.name)
+                .typography(Typography.body)
+                .foregroundStyle(Theme.textPrimary)
+        }
+        .tint(Theme.accent)
+        .padding(Theme.Spacing.lg)
+        .accessibilityIdentifier("settings-notif-mute-\(projectId)")
+    }
+
+    private func notificationToggle(
+        _ title: String,
+        isOn: Binding<Bool>,
+        identifier: String
+    ) -> some View {
+        Toggle(isOn: isOn) {
+            Text(title)
+                .typography(Typography.body)
+                .foregroundStyle(Theme.textPrimary)
+        }
+        .tint(Theme.accent)
+        .padding(Theme.Spacing.lg)
+        .accessibilityIdentifier(identifier)
+    }
+
+    private var rowDivider: some View {
+        Rectangle()
+            .fill(Theme.text.opacity(0.08))
+            .frame(height: 1)
     }
 
     // MARK: - About
@@ -295,6 +386,9 @@ struct SettingsView: View {
     let transportStore = TransportStoreFactory.makeDefault()
     transportStore.debugSeed(snapshot: .uiTestFixture, linkState: .connected(latencyMs: 42))
 
-    return SettingsView(router: router, transportStore: transportStore)
+    return SettingsView(
+        router: router,
+        transportStore: transportStore,
+        notificationPreferences: NotificationPreferences())
         .environment(AppLockController())
 }

@@ -76,6 +76,13 @@ actor TransportClient {
     private var sessionAuthed = false
     private var peerConnected: Bool?
 
+    /// The latest APNs push token to register for this pairing (spec §5.5).
+    /// Held so it can be (re)sent the moment the session reaches `auth_ok` —
+    /// the token typically arrives from `AppDelegate` before the transport is
+    /// live, and must be re-sent after every reconnect since the relay's v1
+    /// in-memory store drops it on restart. `nil` until the app hands one over.
+    private var pushToken: (token: String, environment: Wire.ApnsEnvironment)?
+
     private var pending: [Wire.CommandId: PendingCommand] = [:]
 
     /// The pre-`auth_ok` handshake phase within one session.
@@ -156,6 +163,19 @@ actor TransportClient {
     /// event stream keyed by `command.commandId`.
     func send(_ command: Wire.PhoneCommand) async {
         await sendEnvelope(for: command, track: true)
+    }
+
+    /// Register (or refresh) the APNs push token for this pairing (spec §5.5).
+    /// The token is remembered and sent immediately if the session is already
+    /// live, and re-sent on every subsequent `auth_ok` (reconnect). Registering
+    /// the same token again is harmless — the relay just overwrites it. It is a
+    /// plaintext relay-plane frame (the token is opaque and outside E2E), not a
+    /// sealed command.
+    func registerPushToken(_ token: String, environment: Wire.ApnsEnvironment) {
+        pushToken = (token, environment)
+        if phase == .live, let ch = channel {
+            Task { await sendPushToken(on: ch) }
+        }
     }
 
     // MARK: - Supervisor
@@ -346,6 +366,21 @@ actor TransportClient {
             // A read: don't surface delivery honesty for the implicit refresh.
             await sendEnvelope(for: cmd, track: false)
         }
+        // Re-register any known push token (the relay's v1 store may have
+        // dropped it across a restart; spec §5.5 / store.rs module docs).
+        await sendPushToken(on: ch)
+    }
+
+    /// Send the `register_push_token` relay frame if a token is known. Plain
+    /// relay-plane frame (opaque token, outside E2E); a send failure is
+    /// swallowed — it will be retried on the next `auth_ok`.
+    private func sendPushToken(on ch: any WebSocketChannel) async {
+        guard let pushToken, let record else { return }
+        try? await ch.send(.registerPushToken(
+            pairingId: Wire.PairingId(record.pairingId),
+            token: pushToken.token,
+            environment: pushToken.environment
+        ))
     }
 
     private func handleEnvelope(_ env: Wire.EncryptedEnvelope, on ch: any WebSocketChannel) async {

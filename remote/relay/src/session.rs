@@ -748,10 +748,9 @@ impl Connection {
                     .await;
                 }
                 // Forward verbatim to the peer if connected (ciphertext never
-                // inspected). Offline peers pick it up via resume/replay.
-                if let Some(peer) = self.state.registry.peer(&pairing_id, role) {
-                    peer.send(RelayFrame::Envelope(env)).await;
-                }
+                // inspected). Offline phones pick it up via resume/replay — and
+                // are woken by an APNs push so they reconnect promptly.
+                deliver_or_push(&self.state, &env, role).await;
             }
         }
         Flow::Continue
@@ -853,5 +852,154 @@ impl Connection {
                 .await;
             }
         }
+    }
+}
+
+/// Deliver an accepted envelope to its peer, or — when the peer is an
+/// **offline phone** — fire an APNs wake push so the phone reconnects and
+/// `resume`s the queued envelope (spec §11 step 1).
+///
+/// Never inspects `ciphertext` (PRD §9.1): the peer receives the envelope
+/// verbatim, and the push carries no user content (see [`crate::apns`], which
+/// keeps the relay's zero-knowledge guarantee). Only a **phone** is ever
+/// push-addressed — the desktop holds its own persistent outbound connection
+/// and does not receive pushes.
+async fn deliver_or_push(state: &AppState, env: &EncryptedEnvelope, sender: Role) {
+    if let Some(peer) = state.registry.peer(&env.pairing_id, sender) {
+        peer.send(RelayFrame::Envelope(env.clone())).await;
+        return;
+    }
+    if sender == Role::Desktop {
+        if let Some((token, apns_env)) = state.store.push_token(&env.pairing_id).await {
+            state
+                .push
+                .notify_offline(&env.pairing_id, &token, apns_env)
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apns::PushService;
+    use crate::config::{Config, LogFormat};
+    use crate::router::ConnHandle;
+    use crate::AppState;
+    use async_trait::async_trait;
+    use flightdeck_remote_protocol::ApnsEnvironment;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    /// Records every offline-wake request so tests can assert whether — and for
+    /// which pairing/token/env — a push was fired.
+    #[derive(Default)]
+    struct RecordingPush {
+        fired: Mutex<Vec<(PairingId, String, ApnsEnvironment)>>,
+    }
+
+    #[async_trait]
+    impl PushService for RecordingPush {
+        async fn notify_offline(
+            &self,
+            pairing: &PairingId,
+            token: &str,
+            environment: ApnsEnvironment,
+        ) {
+            self.fired
+                .lock()
+                .unwrap()
+                .push((pairing.clone(), token.to_string(), environment));
+        }
+    }
+
+    fn state_with_push(push: Arc<RecordingPush>) -> AppState {
+        AppState::with_push(Config::new(0, LogFormat::Pretty, "test"), push)
+    }
+
+    fn envelope(pairing: &str, sender: Role, seq: u64) -> EncryptedEnvelope {
+        EncryptedEnvelope {
+            pairing_id: PairingId::new(pairing),
+            seq,
+            sender,
+            sent_at_ms: 0,
+            nonce: "bm9uY2U=".into(),
+            ciphertext: "opaque".into(),
+        }
+    }
+
+    fn conn_handle(id: &str) -> (ConnHandle, mpsc::Receiver<RelayFrame>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            ConnHandle {
+                connection_id: id.into(),
+                tx,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn offline_phone_with_token_is_woken() {
+        let push = Arc::new(RecordingPush::default());
+        let state = state_with_push(push.clone());
+        let pairing = PairingId::new("pair");
+        state
+            .store
+            .register_push_token(pairing.clone(), "tok".into(), ApnsEnvironment::Sandbox)
+            .await;
+
+        // Desktop sends; the phone leg is not attached (offline).
+        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+
+        let fired = push.fired.lock().unwrap();
+        assert_eq!(
+            *fired,
+            vec![(pairing, "tok".to_string(), ApnsEnvironment::Sandbox)]
+        );
+    }
+
+    #[tokio::test]
+    async fn online_phone_is_forwarded_not_pushed() {
+        let push = Arc::new(RecordingPush::default());
+        let state = state_with_push(push.clone());
+        let pairing = PairingId::new("pair");
+        state
+            .store
+            .register_push_token(pairing.clone(), "tok".into(), ApnsEnvironment::Sandbox)
+            .await;
+        // Attach the phone leg → it's online.
+        let (phone, mut rx) = conn_handle("conn_phone");
+        state.registry.attach(&pairing, Role::Phone, phone);
+
+        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+
+        // Forwarded to the phone, and no push fired.
+        assert!(matches!(rx.try_recv(), Ok(RelayFrame::Envelope(_))));
+        assert!(push.fired.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_phone_without_token_is_not_pushed() {
+        let push = Arc::new(RecordingPush::default());
+        let state = state_with_push(push.clone());
+        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+        assert!(push.fired.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_desktop_is_never_pushed() {
+        let push = Arc::new(RecordingPush::default());
+        let state = state_with_push(push.clone());
+        let pairing = PairingId::new("pair");
+        state
+            .store
+            .register_push_token(pairing.clone(), "tok".into(), ApnsEnvironment::Sandbox)
+            .await;
+        // A phone→desktop envelope with the desktop offline must NOT push (only
+        // phones are push-addressed).
+        deliver_or_push(&state, &envelope("pair", Role::Phone, 1), Role::Phone).await;
+        assert!(push.fired.lock().unwrap().is_empty());
     }
 }

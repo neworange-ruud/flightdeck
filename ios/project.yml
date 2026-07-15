@@ -38,6 +38,7 @@ targets:
       - path: FlightDeckRemote
         excludes:
           - "Info.plist"
+          - "FlightDeckRemote.entitlements"
     info:
       path: FlightDeckRemote/Info.plist
       properties:
@@ -46,6 +47,10 @@ targets:
         CFBundleVersion: "1"
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
+        # Wake the app on a silent APNs push to reconnect + resume queued events
+        # (spec §11); the relay's push is content-available (zero-knowledge).
+        UIBackgroundModes:
+          - remote-notification
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
@@ -80,6 +85,11 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_EMIT_LOC_STRINGS: YES
+        # APNs entitlement (aps-environment). Only consumed by the codesign step,
+        # which is skipped under CODE_SIGNING_ALLOWED=NO — so the unsigned
+        # simulator build stays green; a signed device build needs a
+        # DEVELOPMENT_TEAM (see ios/README / the report's manual-credential note).
+        CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
     dependencies:
       - package: SwiftTerm
     scheme:

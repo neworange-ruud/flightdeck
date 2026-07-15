@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "flightdeck-relay"
 path = "src/main.rs"
 
+[features]
+# The live APNs transport (HTTP/2 to api.push.apple.com). Off by default: it
+# pulls a TLS/HTTP2 client and can only be *exercised* with Apple credentials
+# + network egress, so it is the deployment's opt-in. Everything testable —
+# JWT/payload/request construction and the offline-delivery decision — is built
+# and unit-tested without this feature (see `apns` module docs).
+apns-live = ["dep:reqwest"]
+
 [dependencies]
 flightdeck-remote-protocol = { path = "../protocol" }
 
@@ -29,10 +37,16 @@ futures-util = "0.3"
 async-trait = "0.1"
 # Device auth: ECDSA P-256 / SHA-256 challenge-response (spec §5.1). p256's
 # `Verifier` impl hashes the message with SHA-256 internally, matching CryptoKit
-# on the phone; no separate digest step is needed on the relay.
-p256 = { version = "0.13", features = ["ecdsa"] }
+# on the phone; no separate digest step is needed on the relay. `pkcs8` + `pem`
+# additionally let the APNs sender (`apns` module) load the `.p8` ES256 auth key
+# and mint provider JWTs — all pure-Rust, no new C toolchain.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 base64 = "0.22"
 getrandom = "0.2"
+# Live APNs HTTP/2 transport only (feature `apns-live`); reqwest is already a
+# dev-dependency below. `http2` for APNs' required protocol, `rustls-tls` to
+# stay pure-Rust (no system OpenSSL).
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

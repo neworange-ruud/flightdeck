@@ -16,6 +16,10 @@ import SwiftUI
 
 @main
 struct FlightDeckRemoteApp: App {
+    // Adopt a UIKit delegate purely for the push-notification callbacks SwiftUI
+    // doesn't surface (registration, wake pushes, tap handling) — see
+    // `AppDelegate` / `PushCoordinator`.
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var router = AppRouter(pairingStore: PairingStore())
 
     var body: some Scene {
@@ -23,6 +27,12 @@ struct FlightDeckRemoteApp: App {
             RootView(router: router)
                 .preferredColorScheme(.dark)
                 .componentGalleryDebugEntry()
+                .task {
+                    // Give the push tap-router the live router as soon as the
+                    // scene mounts (safe before pairing; a tap can only arrive
+                    // once notifications exist).
+                    PushCoordinator.shared.attach(router: router)
+                }
         }
     }
 }

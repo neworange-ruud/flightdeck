@@ -7,6 +7,8 @@
 
 use std::env;
 
+use crate::apns::ApnsConfig;
+
 /// Log output format. Controlled by `LOG_FORMAT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -50,6 +52,13 @@ pub struct Config {
     /// Time-to-live of a pairing claim token, in seconds (spec §5.2 "short-TTL
     /// and single-use"). `CLAIM_TOKEN_TTL_SECS`, default `120`.
     pub claim_token_ttl_secs: u64,
+
+    /// APNs push credentials, if configured (spec §5.5). `None` disables push:
+    /// the relay still queues events for `resume`, it just can't wake a
+    /// backgrounded phone. Populated from `APNS_*` env vars by
+    /// [`ApnsConfig::from_env`]; never set by [`Config::new`] (test builds) so
+    /// tests never need Apple secrets.
+    pub apns: Option<ApnsConfig>,
 }
 
 impl Config {
@@ -65,6 +74,7 @@ impl Config {
             auth_timeout_secs: 10,
             queue_max_per_pairing: 1000,
             claim_token_ttl_secs: 120,
+            apns: None,
         }
     }
 
@@ -72,14 +82,18 @@ impl Config {
     /// unrecoverable input (none today); malformed optional values fall back
     /// to their defaults rather than failing startup.
     pub fn from_env() -> Self {
-        Self::from_vars(
+        let mut config = Self::from_vars(
             env::var("PORT").ok(),
             env::var("LOG_FORMAT").ok(),
             env::var("GIT_SHA").ok(),
             env::var("AUTH_TIMEOUT_SECS").ok(),
             env::var("QUEUE_MAX_PER_PAIRING").ok(),
             env::var("CLAIM_TOKEN_TTL_SECS").ok(),
-        )
+        );
+        // APNs is read separately (not through `from_vars`) so the pure-parser
+        // tests stay small and no test ever needs Apple credentials.
+        config.apns = ApnsConfig::from_env();
+        config
     }
 
     /// Pure parsing logic, factored out of [`Config::from_env`] so it can be
@@ -125,6 +139,7 @@ impl Config {
             auth_timeout_secs,
             queue_max_per_pairing,
             claim_token_ttl_secs,
+            apns: None,
         }
     }
 }

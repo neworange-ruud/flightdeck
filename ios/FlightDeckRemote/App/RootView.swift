@@ -51,6 +51,15 @@ struct RootView: View {
                 appLock.lockIfEnabled()
             }
         }
+        .task(id: router.route) {
+            // Request notification authorization + APNs registration once the
+            // device is paired (PRD §9: pairing is the trust step; asking for
+            // pushes before there's a Mac to hear from is premature). Idempotent
+            // — the system only prompts once per install.
+            if router.route == .main {
+                PushCoordinator.shared.requestAuthorizationAndRegister()
+            }
+        }
         .environment(appLock)
     }
 }

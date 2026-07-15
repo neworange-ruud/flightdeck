@@ -157,6 +157,17 @@ final class TransportStore {
         sendCommand(.requestSnapshot(projectId: projectId))
     }
 
+    // MARK: - Push-token registration (PRD §9.1, spec §5.5)
+
+    /// Hand the APNs device token (from `AppDelegate`) to the transport so it
+    /// registers it with the relay for this pairing. Safe to call before the
+    /// link is live and repeatedly (e.g. on token refresh): the client caches
+    /// it and (re-)sends on each `auth_ok`. Not a sealed command — the token is
+    /// opaque and travels on the relay plane (outside E2E).
+    func registerPushToken(_ token: String, environment: Wire.ApnsEnvironment) {
+        Task { await client.registerPushToken(token, environment: environment) }
+    }
+
     // MARK: - Shell surface (additive)
     //
     // Thin wrappers over `sendCommand` for the minimal shell terminal (PRD
