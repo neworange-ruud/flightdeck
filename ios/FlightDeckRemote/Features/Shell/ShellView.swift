@@ -11,13 +11,27 @@
 //   * no shell / closed → "Open shell in <worktree>" CTA (fits cols/rows, then
 //     `shell_open`);
 //   * opening → spinner;
-//   * live → the SwiftTerm renderer + a Copy/Close toolbar + our `ShellKeyBar`;
+//   * live → the SwiftTerm renderer + a Copy/Close/font-size toolbar + our
+//     `ShellKeyBar`;
 //   * exited(code) → the frozen output + a "process exited (code N)" banner
 //     with Close / Reopen;
 //   * rejectedAlreadyOpen → an honest message + Close existing / Reopen.
 //
 //  Connection honesty (PRD §8): while the link isn't live, a paused note shows
 //  and the key bar + open CTA are disabled — nothing is sent blind.
+//
+//  Key bar placement (PRD §5.4 landscape/hittability follow-up): the bar is
+//  mounted via `.safeAreaInset(edge: .bottom)` on the *whole* ShellView body
+//  rather than as a plain trailing child of the content `VStack`. A plain
+//  trailing child renders flush against whatever the view's own bottom edge
+//  happens to be, with no awareness of the device's bottom safe area (home
+//  indicator) or, when hosted in the Shell tab, the custom bottom tab bar
+//  that overlays on top of it (see `MainTabView`) — both of which can cover
+//  the bar's buttons and make them unhittable. `safeAreaInset` instead folds
+//  the bar into the ambient safe area the terminal content insets around, so
+//  it always ends up sitting just above whatever is really at the bottom
+//  (home indicator alone in the Chat `Agent · Shell` mount, home indicator +
+//  tab bar in the Shell tab mount) in both portrait and landscape.
 //
 
 import SwiftUI
@@ -30,6 +44,12 @@ struct ShellView: View {
     @State private var model: ShellSessionModel
     @State private var controller = ShellTerminalController()
     @State private var didConfigure = false
+
+    /// Persisted terminal font-size step (PRD §5.4 font-size control),
+    /// stored as its raw point size so `@AppStorage` can hold it directly.
+    /// Shared across every shell surface (Shell tab + Chat `Agent · Shell`) —
+    /// it's a per-device reading preference, not a per-session one.
+    @AppStorage("shell.fontSize") private var fontSizeRaw: Double = ShellFontSize.default.rawValue
 
     #if DEBUG
     @State private var scriptedSender = ScriptedShellCommandSender()
@@ -56,14 +76,19 @@ struct ShellView: View {
                 pausedNote
             }
             content(phase: phase, paused: paused)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.bgDeep)
+        // Folds the bar into the ambient bottom safe area instead of being a
+        // flush trailing child — see the type doc comment on "Key bar
+        // placement" for why that matters for hittability.
+        .safeAreaInset(edge: .bottom) {
             if case .live = phase {
                 ShellKeyBar(ctrlArmed: model.ctrlArmed, disabled: paused) { key in
                     model.tapKey(key)
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.bgDeep)
         .onAppear { configureIfNeeded() }
         .onChange(of: eventCount) { _, _ in model.ingestStoreEvents() }
         .onChange(of: outputCount) { _, _ in model.ingestStoreOutput() }
@@ -146,9 +171,19 @@ struct ShellView: View {
             // The renderer's UIKit view carries the "shell-terminal"
             // accessibility identifier itself (collapsed to one element —
             // see ShellTerminalRenderer.makeUIView).
-            ShellTerminalRenderer(model: model, controller: controller)
+            ShellTerminalRenderer(model: model, controller: controller, fontSize: CGFloat(fontSize.rawValue))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// The resolved font-size step, falling back to `.default` for a
+    /// corrupt/unrecognized persisted raw value.
+    private var fontSize: ShellFontSize { .resolved(rawValue: fontSizeRaw) }
+
+    /// Cycle to the next font-size step (PRD §5.4 font-size control) and
+    /// persist it immediately so every shell surface picks it up.
+    private func cycleFontSize() {
+        fontSizeRaw = fontSize.next.rawValue
     }
 
     private func terminalToolbar(exited: Bool) -> some View {
@@ -162,6 +197,16 @@ struct ShellView: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("shell-copy")
+
+            Button {
+                cycleFontSize()
+            } label: {
+                Label("Font", systemImage: "textformat.size")
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.textMuted)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("shell-font-size")
 
             Spacer(minLength: 0)
 

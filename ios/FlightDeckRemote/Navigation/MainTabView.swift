@@ -60,22 +60,29 @@ struct MainTabView: View {
                 tabContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .environment(\.isCacheStaleOffline, isStaleBannerVisible)
-
-                // Hide the tab bar while a chat conversation is open: the chat
-                // screen's compose bar (PRD §5.3) owns the bottom edge, and the
-                // overlaid bar would sit on top of (and swallow taps meant for)
-                // the compose field / send / mic.
-                if !isChatRouteActive {
-                    VStack(spacing: 0) {
-                        Spacer()
-                        CustomTabBar(
-                            selectedTab: router.selectedTab,
-                            unreadActivityCount: activityStore.unreadCount,
-                            onSelectTab: { router.selectedTab = $0 },
-                            onTapFAB: { isPresentingNewAgentSheet = true }
-                        )
+                    // `.safeAreaInset` (rather than overlaying the tab bar as a
+                    // ZStack sibling drawn on top) folds the bar's own height
+                    // into `tabContent`'s bottom safe area. That matters for
+                    // tabs with a fixed, non-scrolling bottom control — e.g.
+                    // the Shell tab's `ShellKeyBar` (mounted via its own
+                    // `.safeAreaInset(edge: .bottom)` in `ShellView`) — since
+                    // nested safe-area insets stack: without this, the tab
+                    // bar's opaque background + buttons render *on top of*
+                    // whatever sits at the bottom of `tabContent`, at the same
+                    // z-order priority a plain overlay would occupy, making
+                    // that control unhittable. Hide the inset entirely while a
+                    // chat conversation is open: the chat screen's compose bar
+                    // (PRD §5.3) owns the bottom edge there instead.
+                    .safeAreaInset(edge: .bottom) {
+                        if !isChatRouteActive {
+                            CustomTabBar(
+                                selectedTab: router.selectedTab,
+                                unreadActivityCount: activityStore.unreadCount,
+                                onSelectTab: { router.selectedTab = $0 },
+                                onTapFAB: { isPresentingNewAgentSheet = true }
+                            )
+                        }
                     }
-                }
             }
             .background(Theme.bgDeep)
             .sheet(isPresented: $isPresentingNewAgentSheet) {

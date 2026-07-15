@@ -23,6 +23,13 @@
 //  and reports the fitted `cols`/`rows` back to the model once, so `shell_open`
 //  can request a geometry that matches the phone screen.
 //
+//  Font size (PRD §5.4 font-size control): `fontSize` is owned by
+//  `ShellView` (persisted via `@AppStorage`, cycled by the toolbar's "font"
+//  button) and threaded down here. `updateUIView` re-applies it to the live
+//  `TerminalView.font` whenever it changes; SwiftTerm's `font` setter
+//  recomputes cell metrics and re-fits `cols`/`rows` itself (surfaced back to
+//  the model via `sizeChanged`), so a size change reflows like a real resize.
+//
 
 import SwiftUI
 import SwiftTerm
@@ -48,13 +55,12 @@ final class ShellTerminalController {
 struct ShellTerminalRenderer: UIViewRepresentable {
     let model: ShellSessionModel
     let controller: ShellTerminalController
+    var fontSize: CGFloat = ShellFontSize.default.rawValue
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
     func makeUIView(context: Context) -> TerminalView {
-        let font = UIFont(name: "GeistMono-Regular", size: 13)
-            ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
-        let terminal = TerminalView(frame: .zero, font: font)
+        let terminal = TerminalView(frame: .zero, font: terminalFont(ofSize: fontSize))
         terminal.terminalDelegate = context.coordinator
         terminal.backgroundColor = UIColor(Theme.bgField)
         terminal.isOpaque = true
@@ -79,8 +85,21 @@ struct ShellTerminalRenderer: UIViewRepresentable {
         // Report fitted geometry once (before the user opens the shell).
         let t = terminal.getTerminal()
         model.setGeometry(cols: UInt16(clamping: t.cols), rows: UInt16(clamping: t.rows))
+        // Re-apply the font only on an actual change — SwiftTerm's `font`
+        // setter always resets cell metrics, so setting it every render would
+        // needlessly reflow the terminal.
+        if abs(terminal.font.pointSize - fontSize) > 0.01 {
+            terminal.font = terminalFont(ofSize: fontSize)
+        }
         // Feed only the new tail of ordered output.
         context.coordinator.feed(terminal, chunks: model.orderedOutput)
+    }
+
+    /// The renderer's monospace font at a given point size, falling back to
+    /// the system monospace face when the bundled Geist Mono isn't available.
+    private func terminalFont(ofSize size: CGFloat) -> UIFont {
+        UIFont(name: "GeistMono-Regular", size: size)
+            ?? .monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
     @MainActor
