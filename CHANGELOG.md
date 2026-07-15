@@ -20,6 +20,45 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   sparse timestamps, "load earlier" pagination, and standard chat auto-scroll
   with a "jump to latest" affordance. Includes the per-session `Agent · Shell`
   surface switcher (Shell disabled for now) and an inert compose-bar placeholder.
+- FlightDeck Remote monitor surfaces (iOS): the Projects list with rolled-up
+  status dots + plain-language summaries, per-project Agent-sessions list with
+  git indicators / running time / needs-input previews, and the status roll-up
+  precedence model (needs-input › working › idle) shared across the hierarchy
+  (PRD §4, §5.2).
+- FlightDeck Remote connection honesty & offline (iOS): live connection/latency
+  indicator, a "Reconnecting…" banner that pauses commands (nothing sent blind),
+  delivery-failure marking ("not delivered — retry"), and a cached last-known
+  transcript/status shown read-only and clearly marked stale while disconnected
+  (PRD §8, §9.2).
+- FlightDeck Remote agent chat compose + voice (iOS): reply/follow-up send with
+  inline permission resolution (Allow once / Deny), hold-to-talk voice dictation
+  that drops an editable transcript into the field (never auto-sent), and an
+  eyes-free Focus mode pinning the pending question with large Approve/Deny and a
+  condensed timeline (PRD §5.3, §7; TTS read-aloud is a flagged fast-follow).
+- FlightDeck Remote light control (iOS): a session actions sheet (safe actions
+  grouped, destructive apart in red), New-agent screen (type + name + base +
+  first task), restart agent (fresh process, same worktree), close session
+  (confirmed), set manual cyan status override, and an Activity feed of status
+  events that deep-link to the agent (PRD §5.5–§5.7).
+- FlightDeck Remote minimal shell (iOS): a live terminal surface (streamed
+  stdout/stderr, ANSI colours, scrollback) with the accessory key bar
+  (`Esc Tab Ctrl ←↑↓→ | / - ~ \` ⌃C paste`, sticky Ctrl), Ctrl-C interrupt,
+  copy/paste, a font-size control, and a landscape layout — one shell per
+  session (PRD §5.4).
+- FlightDeck Remote git actions (iOS): a read-only git status view (branch,
+  base, ahead/behind, drift, changed files), plus confirmation-gated pull-base,
+  guarded merge-back, and type-to-confirm abandon-worktree — no push/PR (that
+  stays the agent's job) (PRD §5.5, §8).
+- FlightDeck Remote push notifications (iOS + relay): APNs registration on the
+  phone (token registered with the relay over the wire) and a relay-side APNs
+  sender (ES256 JWT, HTTP/2, behind the `apns-live` feature) that fires typed
+  notifications — *needs input* (urgent) and *finished* (green) — deep-linking to
+  the agent, deduplicated by `event_id`, with independent notification toggles
+  and per-project mute (PRD §5.2, §9.1–§9.2). Requires an Apple APNs auth key +
+  signing team to deliver on device (see below).
+- FlightDeck Remote settings (iOS): connected-device + connection card,
+  Require-Face-ID-to-open gate, unpair-device (confirmed), and the notification
+  preference toggles / per-project mute described above.
 
 ### Improvements
 
