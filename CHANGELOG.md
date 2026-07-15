@@ -59,6 +59,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - FlightDeck Remote settings (iOS): connected-device + connection card,
   Require-Face-ID-to-open gate, unpair-device (confirmed), and the notification
   preference toggles / per-project mute described above.
+- FlightDeck Remote end-to-end test harness (`tests/remote_e2e.rs`,
+  `scripts/e2e/`): a two-tier harness that stands up the *real* stack and
+  exercises it, self-setup and self-verifying. Tier A (the CI gate) runs a real
+  relay + a real desktop under a PTY + a Rust "phone" driver and asserts every
+  remote capability against real side effects — pairing, snapshot, new-agent
+  (worktree on disk), reply, permission decision, manual status, restart/close,
+  git pull/merge/abandon, shell, and transcript. Tier B
+  (`scripts/e2e/run-fullstack.sh`) drives the real iOS app in the simulator,
+  paired live to the local relay + real desktop, and confirms it reaches the main
+  tab. A single desktop test seam (`FLIGHTDECK_REMOTE_AUTOPAIR`) makes the pairing
+  offer deterministic; the iOS side needs no production change. See
+  `scripts/e2e/README.md`.
 
 ### Improvements
 
@@ -66,7 +78,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- FlightDeck Remote desktop first-pairing bootstrap: a fresh desktop with no
+  saved pairings sent `auth_response` before ever offering, so the relay rejected
+  it as an unknown device and a first pairing could never complete. The client
+  now, when a pairing is pending and it has no existing pairings, sends its
+  `pairing_offer` pre-auth (registering its device key) and then authenticates —
+  matching the relay's offer-first bootstrap. Returning desktops with saved
+  pairings authenticate first, unchanged. Surfaced by the new end-to-end harness.
 
 ## [1.7.1] - 2026-07-13
 
