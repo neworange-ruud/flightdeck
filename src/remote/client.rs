@@ -56,6 +56,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Overall budget for completing the auth handshake before giving up.
 const AUTH_DEADLINE: Duration = Duration::from_secs(15);
+/// How long a fresh desktop (no persisted pairings) waits after the
+/// `auth_challenge` for the app's pending `RequestPairing` to arrive on the
+/// outbound channel, so it can offer during the pre-auth window (see
+/// [`run_session`]). This closes the startup race where the app loop enqueues
+/// the pairing bootstrap a beat after the session thread connects. If nothing
+/// arrives in time the client falls back to a plain (offer-less) auth, so a
+/// desktop with nothing to offer is never stranded. Kept well under
+/// [`AUTH_DEADLINE`].
+const PENDING_OFFER_WAIT: Duration = Duration::from_secs(1);
 
 /// Backoff floor (first retry) in milliseconds.
 const BACKOFF_BASE_MS: u64 = 1_000;
@@ -479,9 +488,43 @@ fn run_session(
     }
 
     // Drive hello_ok → auth_challenge → auth_response → auth_ok under a deadline.
+    //
+    // ## Offer-first bootstrap (spec §5.2)
+    //
+    // The relay's designed desktop bootstrap is *offer-first*: a pre-auth
+    // `pairing_offer` self-registers this device's identity + key-agreement keys
+    // (remote/relay `session.rs::on_pre_auth` / `on_pairing_offer`), and only
+    // then will `on_auth_response` verify it — an unregistered device is
+    // rejected with `AuthFailed "unknown device"` (session.rs ~:583). So a fresh
+    // desktop (no persisted pairings) that the relay has never seen *cannot*
+    // authenticate until it has offered. The relay's own `TestClient` proves the
+    // sequence: `offer_pairing()` THEN `authenticate(vec![pairing_id])`.
+    //
+    // We therefore split the challenge response by whether a bootstrap is needed:
+    //   - **Returning desktop** (persisted pairings): answer the challenge
+    //     immediately with those pairing ids — auth-first, exactly as before, so
+    //     reconnects never mint a spurious offer.
+    //   - **Fresh desktop** (no pairings): defer the answer and watch the
+    //     outbound channel for the app's pending `RequestPairing`. When it
+    //     arrives, send the `pairing_offer` (registering the device), consume the
+    //     `pairing_offer_ok` (surfacing the overlay code via `PairingOffered` and
+    //     learning the new pairing id), and only then answer the challenge
+    //     including that id. If no request arrives within `PENDING_OFFER_WAIT`,
+    //     fall back to a plain auth so an idle desktop — and the offer-less
+    //     mock-relay tests — behave as before.
     let deadline = Instant::now() + AUTH_DEADLINE;
     let mut saw_hello_ok = false;
-    let mut challenged = false;
+    // The challenge nonce, captured until we decide to answer it.
+    let mut challenge_nonce: Option<String> = None;
+    // Whether we have already sent our `auth_response`.
+    let mut sent_auth = false;
+    // Fresh-desktop bootstrap bookkeeping.
+    let mut offer_sent = false;
+    let mut offer_wait_until: Option<Instant> = None;
+    // Outbound messages pulled off the queue while waiting to offer that are not
+    // the `RequestPairing` we want; replayed once we reach the pump. Normally
+    // empty — only `RequestPairing` is expected before a pairing exists.
+    let mut deferred: Vec<RemoteOutbound> = Vec::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -492,6 +535,38 @@ fn run_session(
         if Instant::now() > deadline {
             return SessionEnd::Ended { authed: false };
         }
+
+        // Fresh-desktop pre-auth window: watch for the pending pairing request so
+        // we can offer before authing (or fall back once the wait lapses).
+        if let (Some(nonce), Some(wait_until)) = (challenge_nonce.as_ref(), offer_wait_until) {
+            if !offer_sent && !sent_auth {
+                match outbound_rx.try_recv() {
+                    Ok(RemoteOutbound::RequestPairing { claim_token_hint }) => {
+                        let offer = build_pairing_offer(identity, claim_token_hint);
+                        if send_frame(&mut sock, &offer).is_err() {
+                            return SessionEnd::Ended { authed: false };
+                        }
+                        offer_sent = true;
+                    }
+                    Ok(other) => deferred.push(other),
+                    Err(TryRecvError::Empty) => {
+                        if Instant::now() >= wait_until {
+                            if !send_auth_response(&mut sock, identity, nonce, state) {
+                                return SessionEnd::Ended { authed: false };
+                            }
+                            sent_auth = true;
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        // The app dropped its sender (shutting down).
+                        let _ = send_frame(&mut sock, &RelayFrame::Bye { reason: None });
+                        sock.close();
+                        return SessionEnd::Stopped;
+                    }
+                }
+            }
+        }
+
         match read_frame(&mut sock) {
             Incoming::Idle => continue,
             Incoming::Closed => return SessionEnd::Ended { authed: false },
@@ -500,32 +575,63 @@ fn run_session(
                 RelayFrame::VersionIncompatible { .. } => {
                     return SessionEnd::Ended { authed: false };
                 }
-                RelayFrame::AuthChallenge { nonce, .. } if saw_hello_ok => {
-                    let signature = match identity.sign_nonce_base64(&nonce) {
-                        Ok(sig) => sig,
-                        Err(_) => return SessionEnd::Ended { authed: false },
-                    };
-                    let resp = RelayFrame::AuthResponse {
-                        device_id: DeviceId::new(identity.device_id()),
-                        signature,
-                        pairing_ids: state
-                            .pairing_ids()
-                            .into_iter()
-                            .map(PairingId::new)
-                            .collect(),
-                    };
-                    if send_frame(&mut sock, &resp).is_err() {
-                        return SessionEnd::Ended { authed: false };
+                RelayFrame::AuthChallenge { nonce, .. }
+                    if saw_hello_ok && challenge_nonce.is_none() =>
+                {
+                    if state.pairing_ids().is_empty() {
+                        // Fresh desktop: defer auth until we have offered (or the
+                        // pending-offer wait lapses above).
+                        offer_wait_until = Some(Instant::now() + PENDING_OFFER_WAIT);
+                        challenge_nonce = Some(nonce);
+                    } else {
+                        // Returning desktop: auth-first, exactly as before.
+                        if !send_auth_response(&mut sock, identity, &nonce, state) {
+                            return SessionEnd::Ended { authed: false };
+                        }
+                        sent_auth = true;
+                        challenge_nonce = Some(nonce);
                     }
-                    challenged = true;
                 }
-                RelayFrame::AuthOk { pairing_ids } if challenged => {
+                RelayFrame::PairingOfferOk {
+                    pairing_id,
+                    claim_token,
+                    expires_at_ms,
+                } if offer_sent && !sent_auth => {
+                    // The pre-auth offer registered our device and minted the
+                    // pairing; surface the code, then auth including the new id.
+                    persist_pairing_offer(
+                        state,
+                        store,
+                        inbound_tx,
+                        pairing_id,
+                        claim_token,
+                        expires_at_ms,
+                    );
+                    match challenge_nonce.as_ref() {
+                        Some(nonce) => {
+                            if !send_auth_response(&mut sock, identity, nonce, state) {
+                                return SessionEnd::Ended { authed: false };
+                            }
+                            sent_auth = true;
+                        }
+                        None => return SessionEnd::Ended { authed: false },
+                    }
+                }
+                RelayFrame::AuthOk { pairing_ids } if sent_auth => {
                     on_authenticated(&mut sock, state, inbound_tx, pairing_ids);
                     break;
                 }
                 RelayFrame::Error { .. } => return SessionEnd::Ended { authed: false },
                 _ => continue, // unexpected pre-auth frame; ignore
             },
+        }
+    }
+
+    // Replay anything the app queued during the pre-auth offer wait before the
+    // steady-state pump takes over (normally nothing).
+    for out in deferred {
+        if !handle_outbound(&mut sock, identity, state, store, out) {
+            return SessionEnd::Ended { authed: true };
         }
     }
 
@@ -539,6 +645,78 @@ fn run_session(
         outbound_rx,
         stop,
     )
+}
+
+/// Sign `nonce_b64` and send the `auth_response`, activating whatever pairings
+/// the persisted state currently holds (empty for an offer-less fresh desktop,
+/// or including a just-offered pairing once its `pairing_offer_ok` landed).
+/// Returns `false` if signing or the socket write failed.
+fn send_auth_response(
+    sock: &mut RelaySocket,
+    identity: &DeviceIdentity,
+    nonce_b64: &str,
+    state: &RemoteState,
+) -> bool {
+    let signature = match identity.sign_nonce_base64(nonce_b64) {
+        Ok(sig) => sig,
+        Err(_) => return false,
+    };
+    let resp = RelayFrame::AuthResponse {
+        device_id: DeviceId::new(identity.device_id()),
+        signature,
+        pairing_ids: state
+            .pairing_ids()
+            .into_iter()
+            .map(PairingId::new)
+            .collect(),
+    };
+    send_frame(sock, &resp).is_ok()
+}
+
+/// Build the desktop's `pairing_offer` (spec §5.2). The desktop reuses its
+/// identity key as its key-agreement key (its keystore key is usable for ECDH),
+/// so both public keys are the same X9.63 point — one less key to manage. The
+/// relay honors a free 4-digit `claim_token_hint`. Shared by the pre-auth
+/// bootstrap in [`run_session`] and the post-auth [`handle_outbound`] path.
+fn build_pairing_offer(identity: &DeviceIdentity, claim_token_hint: Option<String>) -> RelayFrame {
+    let public_key = identity.public_key_base64();
+    RelayFrame::PairingOffer {
+        device_id: DeviceId::new(identity.device_id()),
+        device_public_key: public_key.clone(),
+        key_agreement_public_key: public_key,
+        role: Role::Desktop,
+        claim_token_hint,
+    }
+}
+
+/// Record a `pairing_offer_ok`: persist the pairing so it is activated on the
+/// next connect and store the claim token (its bytes are the E2E salt, spec
+/// §7.1), then surface the code to the app via [`RemoteInbound::PairingOffered`]
+/// (drives the overlay). Shared by the pre-auth bootstrap in [`run_session`] and
+/// the post-auth [`handle_frame`] path.
+fn persist_pairing_offer(
+    state: &mut RemoteState,
+    store: &dyn RemoteStore,
+    inbound_tx: &Sender<RemoteInbound>,
+    pairing_id: PairingId,
+    claim_token: String,
+    expires_at_ms: i64,
+) {
+    let key = pairing_id.as_str().to_string();
+    if state.pairing(&key).is_none() {
+        state
+            .pairings
+            .push(crate::remote::Pairing::new(key.clone()));
+    }
+    if let Some(p) = state.pairing_mut(&key) {
+        p.claim_token = Some(claim_token.clone());
+    }
+    store.save(state);
+    let _ = inbound_tx.send(RemoteInbound::PairingOffered {
+        pairing_id,
+        claim_token,
+        expires_at_ms,
+    });
 }
 
 /// After `auth_ok`: report Connected, then `resume` each active pairing from the
@@ -562,14 +740,30 @@ fn on_authenticated(
                 from_seq,
             },
         );
-        let peer_device_id = state
+        // Only surface `Paired` — which drives the outbound bridge to send a
+        // fresh snapshot — for a pairing whose phone has already joined (i.e. an
+        // *established* one, so the E2E channel is live and the snapshot is
+        // sealed to the peer). A freshly-offered pairing (this happens right
+        // after the pre-auth bootstrap above, since the relay activates the new
+        // pairing in `auth_ok`) has no peer and only the passthrough sealer:
+        // snapshotting it now would enqueue an unopenable envelope and burn
+        // seq 1 before the real channel is derived on `pairing_claimed`, which
+        // the relay would then reject as a non-monotonic seq. Such a pairing
+        // reaches the bridge later via `PairingClaimed` instead.
+        if state
             .pairing(pid.as_str())
-            .and_then(|p| p.peer_device_id.clone())
-            .map(DeviceId::new);
-        let _ = inbound_tx.send(RemoteInbound::Paired {
-            pairing_id: pid,
-            peer_device_id,
-        });
+            .map(|p| p.established)
+            .unwrap_or(false)
+        {
+            let peer_device_id = state
+                .pairing(pid.as_str())
+                .and_then(|p| p.peer_device_id.clone())
+                .map(DeviceId::new);
+            let _ = inbound_tx.send(RemoteInbound::Paired {
+                pairing_id: pid,
+                peer_device_id,
+            });
+        }
     }
 }
 
@@ -682,18 +876,10 @@ fn handle_outbound(
             send_frame(sock, &RelayFrame::Ack { pairing_id, cursor }).is_ok()
         }
         RemoteOutbound::RequestPairing { claim_token_hint } => {
-            // Desktop-initiated pairing bootstrap (spec §5.2). The desktop reuses
-            // its identity key as its key-agreement key (its keystore key is
-            // usable for ECDH), so both public keys are the same X9.63 point —
-            // one less key to manage. The relay honors a free 4-digit hint.
-            let public_key = identity.public_key_base64();
-            let offer = RelayFrame::PairingOffer {
-                device_id: DeviceId::new(identity.device_id()),
-                device_public_key: public_key.clone(),
-                key_agreement_public_key: public_key,
-                role: Role::Desktop,
-                claim_token_hint,
-            };
+            // Desktop-initiated pairing bootstrap (spec §5.2). For a returning
+            // desktop this rides the post-auth pump; a fresh desktop offers
+            // pre-auth instead (see [`run_session`]). Same offer either way.
+            let offer = build_pairing_offer(identity, claim_token_hint);
             send_frame(sock, &offer).is_ok()
         }
         RemoteOutbound::Unpair { pairing_id } => {
@@ -784,23 +970,17 @@ fn handle_frame(
             claim_token,
             expires_at_ms,
         } => {
-            // Persist the pairing so it is activated on the next connect, and
-            // record the claim token (its bytes are the E2E salt, spec §7.1).
-            let key = pairing_id.as_str().to_string();
-            if state.pairing(&key).is_none() {
-                state
-                    .pairings
-                    .push(crate::remote::Pairing::new(key.clone()));
-            }
-            if let Some(p) = state.pairing_mut(&key) {
-                p.claim_token = Some(claim_token.clone());
-            }
-            store.save(state);
-            let _ = inbound_tx.send(RemoteInbound::PairingOffered {
+            // Post-auth offer (a returning desktop adding a pairing). A fresh
+            // desktop consumes this during the pre-auth bootstrap instead; both
+            // route through the same persist + surface helper.
+            persist_pairing_offer(
+                state,
+                store,
+                inbound_tx,
                 pairing_id,
                 claim_token,
                 expires_at_ms,
-            });
+            );
             true
         }
         RelayFrame::PairingClaimed {
