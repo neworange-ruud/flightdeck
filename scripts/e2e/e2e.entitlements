@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  E2E-ONLY entitlements (scripts/e2e/run-fullstack.sh).
+
+	  This file exists PURELY so the Tier B full-stack simulator build can be
+	  ad-hoc signed WITH a keychain-access-groups entitlement. The data-protection
+	  Keychain requires the calling app to carry that entitlement; without it,
+	  `SecItemCopyMatching`/`SecItemAdd` fail with errSecMissingEntitlement
+	  (-34018) — which is exactly what made RealPairingService.pair fail
+	  ("Couldn't access the device keys.") under the old CODE_SIGNING_ALLOWED=NO
+	  build. On the simulator, an ad-hoc signature (CODE_SIGN_IDENTITY="-") that
+	  CARRIES these entitlements is what unlocks SecItem — so the REAL keychain
+	  code path runs unchanged.
+
+	  This is NOT used by any production/device build. The production entitlements
+	  live in ios/FlightDeckRemote/FlightDeckRemote.entitlements (aps-environment
+	  only). The orchestrator overrides CODE_SIGN_ENTITLEMENTS to point here only
+	  for the E2E build.
+
+	  `application-identifier` seeds the app's default keychain access group; the
+	  `keychain-access-groups` array is the entitlement the Keychain actually
+	  checks. `aps-environment` is carried for parity with production (inert here).
+	-->
+	<key>application-identifier</key>
+	<string>agency.neworange.flightdeck.remote</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>agency.neworange.flightdeck.remote</string>
+	</array>
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>
