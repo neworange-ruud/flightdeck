@@ -182,13 +182,16 @@ struct MainTabView: View {
                                 isPresentingNewAgentSheet: $isPresentingNewAgentSheet
                             )
                         case let .chat(projectId, sessionId):
-                            // Not passing `store:` here (yet) is deliberate: Chat's
-                            // own `-uitest-fixture-transcript` UI tests rely on a
-                            // `nil` store to fall back to `loadFixtureIfRequested()`
-                            // (see `ChatViewModel.swift`/`ChatFixtureAutoPush.swift`).
-                            // Wiring the live `transportStore` through here is
-                            // Chat's own integration seam to complete.
-                            AgentChatView(projectId: projectId, sessionId: sessionId)
+                            // Thread the live store so Chat binds its commands-paused
+                            // gate + transcript to the real (connected) transport —
+                            // without it, `ChatViewModel.bind` never runs and the gate
+                            // defaults to paused, showing "paused — reconnecting" and
+                            // disabling send even while the link is up (remote-control-9yv).
+                            // The `-uitest-fixture-transcript` tests are unaffected:
+                            // `loadFixtureIfRequested()` wins and returns before the
+                            // store is bound (see `AgentChatView.task`).
+                            AgentChatView(projectId: projectId, sessionId: sessionId,
+                                          store: transportStore)
                         }
                     }
                     .chatFixtureAutoPush(path: $projectsNav.path)

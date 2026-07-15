@@ -78,6 +78,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- FlightDeck Remote iOS chat could not control the agent — the composer stayed
+  disabled showing "paused — reconnecting" even though the link was up (shell and
+  notifications worked). The chat screen was mounted without the live transport
+  store, so its commands-paused gate never bound and defaulted to paused; the
+  transcript never loaded either. `MainTabView` now threads the live store into
+  `AgentChatView`, so chat binds to the real connection and phone→agent control
+  (replies, permission decisions) works. Surfaced by the full-stack E2E harness.
 - FlightDeck Remote desktop first-pairing bootstrap: a fresh desktop with no
   saved pairings sent `auth_response` before ever offering, so the relay rejected
   it as an unknown device and a first pairing could never complete. The client

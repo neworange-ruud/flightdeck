@@ -135,12 +135,10 @@ E2E_KEEP_SIM="${E2E_KEEP_SIM:-0}"
 E2E_OFFER_TIMEOUT="${E2E_OFFER_TIMEOUT:-30}"
 
 # Whether to assert the desktop-side effects of the capability flows (worktree +
-# chat reply on disk). Default OFF: the capability flows are gated on
-# remote-control-9yv (the phone link drops after new-agent creation), so they are
-# XCTSkip'd in the XCUITest and produce no on-disk effects. Set this to 1 at the
-# same time as re-enabling the flows in
-# RemoteLiveE2EUITests.testLiveRemoteCapabilityFlows once 9yv is fixed.
-E2E_ASSERT_SIDE_EFFECTS="${E2E_ASSERT_SIDE_EFFECTS:-0}"
+# chat reply on disk). Default ON now that remote-control-9yv is fixed and the
+# capability flows run: a green XCUITest plus the matching on-disk effects together
+# prove a true phone -> desktop round trip.
+E2E_ASSERT_SIDE_EFFECTS="${E2E_ASSERT_SIDE_EFFECTS:-1}"
 
 # Desktop-side cross-check knobs (see assert_desktop_side_effects). These MUST
 # match the constants the XCUITest drives with
@@ -662,8 +660,13 @@ wait_until() {
 # field autocapitalizes its first character).
 # shellcheck disable=SC2329  # invoked indirectly via wait_until "$@"
 reply_logged() {
-    local log="${FIXTURE_DIR}/.flightdeck/agent-replies.log"
-    [[ -f "${log}" ]] && grep -qiF "${E2E_REPLY_TOKEN}" "${log}"
+    # The chat reply is delivered to the NEW agent's session, whose fake-agent
+    # runs with cwd = its worktree — so it appends to
+    # <fixture>/.flightdeck/worktrees/<slug>/.flightdeck/agent-replies.log, NOT
+    # the fixture root. Search every agent-replies.log under the fixture for the
+    # token (case-insensitive: the iOS composer autocapitalizes the first char).
+    grep -rqiF "${E2E_REPLY_TOKEN}" --include="agent-replies.log" \
+        "${FIXTURE_DIR}/.flightdeck" 2>/dev/null
 }
 
 # The phone's new-agent flow created a worktree on disk under the project's
