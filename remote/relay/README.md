@@ -86,13 +86,19 @@ manager, runs as uid `65532`). ~38 MB final image.
 
 ## Deploying
 
-Not automated from a developer machine. `.github/workflows/relay.yml` builds,
-tests, and clippy-checks on every push touching `remote/**`, builds the
-Docker image, and — only on `main`, and only once the relevant repository
-secrets exist — deploys to Azure Container Apps. See
-`deploy/README.md` for the one-time `az` setup (resource group, ACR,
-Container Apps environment) and `deploy/containerapp.yaml` for the full
-desired app configuration (ingress, health probes, scaling).
+Live on Azure Container Apps. The concrete URL and resource names aren't in this
+public repo — retrieve the ingress URL with
+`az containerapp show … --query properties.configuration.ingress.fqdn` (resource
+names are in the repo's Actions variables).
+
+CI (`.github/workflows/relay.yml`) formats, clippy-checks, tests, and
+build-checks the image on every push/PR touching `remote/**` — it does not
+deploy. **Deployment runs from `.github/workflows/relay-deploy.yml` when a
+GitHub Release is published** (or via manual dispatch): it builds + pushes the
+image and runs `az containerapp update`, authenticating via GitHub OIDC (no
+stored Azure secret). See `deploy/README.md` for the full runbook — live
+resource names, the reproducible `az` setup, and cost — and
+`deploy/containerapp.yaml` for the desired app configuration.
 
 ## What's not here yet
 

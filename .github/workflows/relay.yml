@@ -74,64 +74,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    name: deploy (Azure Container Apps)
-    needs: [docker]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      # Deploy secrets are provisioned once, by hand, following
-      # `remote/relay/deploy/README.md` — they don't exist on this repo yet.
-      # Every step below is gated on their presence so this job reports
-      # green (with a clear "skipped, no credentials" note) instead of
-      # failing until that one-time setup happens.
-      - name: Check for Azure deploy credentials
-        id: check
-        run: |
-          if [ -z "${{ secrets.AZURE_CREDENTIALS }}" ] || \
-             [ -z "${{ vars.AZURE_RESOURCE_GROUP }}" ] || \
-             [ -z "${{ vars.AZURE_ACR_NAME }}" ]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Skip (no Azure credentials configured)
-        if: steps.check.outputs.ready == 'false'
-        run: |
-          echo "::notice::AZURE_CREDENTIALS / AZURE_RESOURCE_GROUP / AZURE_ACR_NAME are not set on this repository yet. Skipping deploy — see remote/relay/deploy/README.md for one-time setup." \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Azure login
-        if: steps.check.outputs.ready == 'true'
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Build and push image
-        if: steps.check.outputs.ready == 'true'
-        run: |
-          az acr login --name "${{ vars.AZURE_ACR_NAME }}"
-          IMAGE="${{ vars.AZURE_ACR_NAME }}.azurecr.io/flightdeck-relay:${{ github.sha }}"
-          docker build -f relay/Dockerfile -t "$IMAGE" .
-          docker push "$IMAGE"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-
-      # GIT_SHA is a runtime Container Apps env var (see
-      # relay/deploy/containerapp.yaml and Config::git_sha), not baked into
-      # the image at build time — set it here alongside the new image so
-      # `/version` reports the revision actually running.
-      - name: Deploy revision
-        if: steps.check.outputs.ready == 'true'
-        run: |
-          az containerapp update \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name flightdeck-relay \
-            --image "$IMAGE" \
-            --set-env-vars "GIT_SHA=${{ github.sha }}"
+  # Deployment to Azure Container Apps is NOT here — it runs from
+  # `.github/workflows/relay-deploy.yml` when a GitHub Release is published
+  # (OIDC auth, no stored secret). This workflow is CI only: it proves the
+  # relay formats, tests, and builds on every push/PR touching `remote/**`.

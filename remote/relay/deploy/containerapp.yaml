@@ -61,10 +61,12 @@ properties:
           # override per-environment if more verbosity is needed.
 
         resources:
-          # Smallest Container Apps allows; the relay is a thin ciphertext
-          # forwarder with no heavy compute, revisit once routing/auth land.
-          cpu: 0.5
-          memory: 1Gi
+          # Smallest valid Container Apps combo (Consumption profile requires
+          # memory Gi == 2 × vCPU). The relay is a thin ciphertext forwarder
+          # with negligible compute; this is what the live app runs. Revisit
+          # only if a persistent store / higher pairing volume lands.
+          cpu: 0.25
+          memory: 0.5Gi
 
         # Liveness/readiness probes wired to the scaffold's health surface
         # (see `src/handlers.rs`). Startup uses the liveness path with a more
@@ -92,11 +94,12 @@ properties:
 
     # Per PRD §9.1: desktop keeps a long-lived outbound connection and phones
     # connect in, so the relay is never truly idle while any pairing is
-    # active. minReplicas: 1 avoids cold-start on every reconnect;
-    # maxReplicas: 2 is a conservative ceiling until the routing task's
-    # connection-affinity story (a pairing's two legs must land on the same
-    # replica, or state must be shared/externalized) is designed — scaling
-    # out further before that is designed would silently break routing.
+    # active. minReplicas: 1 avoids cold-start on every reconnect.
+    # maxReplicas: 1 is REQUIRED, not conservative: routing state lives in
+    # process memory (store::InMemoryStore), so a pairing's two legs must land
+    # on the same replica. A second replica would silently break routing for
+    # any pairing split across them. Lifting this needs a shared/externalized
+    # RelayStore (Redis / Azure Table) first — see store.rs and the README.
     scale:
       minReplicas: 1
-      maxReplicas: 2
+      maxReplicas: 1

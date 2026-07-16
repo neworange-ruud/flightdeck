@@ -74,6 +74,16 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- FlightDeck Remote relay is now hosted on Azure Container Apps: a single small
+  always-on instance (0.25 vCPU / 0.5 GiB,
+  `maxReplicas: 1` because routing state is in-process) pulling from Azure
+  Container Registry via a managed identity, reachable at a stable
+  `*.azurecontainerapps.io` HTTPS URL. Deployment is automated in a new
+  `relay-deploy.yml` workflow that builds, pushes, and rolls out a new revision
+  when a GitHub Release is published, authenticating with GitHub OIDC (no
+  long-lived Azure secret in the repo); `relay.yml` is now CI-only. One relay
+  serves all pairings, so additional users just pair their own desktop + phone.
+  See `remote/relay/deploy/README.md` for the runbook and cost (~$17–20/mo).
 - FlightDeck Remote iOS transport hardening (follow-ups to the chat "paused —
   reconnecting" fix): `TransportStore` now bridges the transport's events onto
   the main actor through a single FIFO stream drained by one serial loop, so

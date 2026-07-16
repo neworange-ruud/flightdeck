@@ -1,0 +1,129 @@
+name: Relay deploy
+
+# Deploy the FlightDeck Remote relay to Azure Container Apps when a GitHub
+# Release is published (or on manual dispatch).
+#
+# Auth is GitHub OIDC → an Azure *user-assigned managed identity* whose
+# federated credential is scoped to this repo's `production` environment. No
+# long-lived Azure secret is stored in the repo: `azure/login` exchanges the
+# short-lived GitHub OIDC token for an Azure token at run time. The identity is
+# granted only what it needs — AcrPush on the registry and Contributor on the
+# single container app (see remote/relay/deploy/README.md).
+#
+# NOTE: `release` events always run the workflow file as it exists on the
+# repository's DEFAULT branch — this file must be on `main` for release
+# publishes to trigger it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to build & deploy (defaults to the commit SHA)"
+        required: false
+
+concurrency:
+  # Never cancel an in-flight deploy; queue instead.
+  group: relay-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: remote
+
+jobs:
+  deploy:
+    name: build + deploy (Azure Container Apps)
+    runs-on: ubuntu-latest
+    # Binds the run to the `production` environment, which is what the Azure
+    # federated credential's subject (`repo:<owner>/<repo>:environment:production`)
+    # matches — the OIDC login fails for any run not bound to this environment.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # required for OIDC token issuance
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail early and clearly if the one-time Azure wiring (see deploy/README)
+      # isn't present — e.g. on a fork — instead of a confusing login error.
+      - name: Check Azure wiring
+        run: |
+          missing=
+          [ -n "${{ secrets.AZURE_CLIENT_ID }}" ]        || missing="$missing AZURE_CLIENT_ID"
+          [ -n "${{ secrets.AZURE_TENANT_ID }}" ]        || missing="$missing AZURE_TENANT_ID"
+          [ -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]  || missing="$missing AZURE_SUBSCRIPTION_ID"
+          [ -n "${{ vars.AZURE_RESOURCE_GROUP }}" ]      || missing="$missing AZURE_RESOURCE_GROUP"
+          [ -n "${{ vars.AZURE_ACR_NAME }}" ]            || missing="$missing AZURE_ACR_NAME"
+          [ -n "${{ vars.AZURE_CONTAINERAPP_NAME }}" ]   || missing="$missing AZURE_CONTAINERAPP_NAME"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing Azure deploy config:$missing — see remote/relay/deploy/README.md"
+            exit 1
+          fi
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          [ -n "$TAG" ] || TAG="${{ inputs.image_tag }}"
+          [ -n "$TAG" ] || TAG="${GITHUB_SHA::7}"
+          # Sanitize to a valid Docker tag (anything else → '-').
+          TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Build context is `remote/` (this crate path-depends on ../protocol);
+      # see relay/Dockerfile's header. Tag with both the release tag and the
+      # short SHA so the registry keeps a SHA-addressable image too.
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          ACR="${{ vars.AZURE_ACR_NAME }}"
+          az acr login --name "$ACR"
+          IMAGE="$ACR.azurecr.io/flightdeck-relay:${{ steps.meta.outputs.tag }}"
+          IMAGE_SHA="$ACR.azurecr.io/flightdeck-relay:${{ steps.meta.outputs.sha }}"
+          docker build -f relay/Dockerfile -t "$IMAGE" -t "$IMAGE_SHA" .
+          docker push "$IMAGE"
+          docker push "$IMAGE_SHA"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # GIT_SHA is a runtime env var (Config::git_sha → /version), set alongside
+      # the new image so /version reports the revision actually running.
+      - name: Deploy revision
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_CONTAINERAPP_NAME }}" \
+            --image "$IMAGE" \
+            --set-env-vars "GIT_SHA=${{ github.sha }}"
+
+      - name: Verify /version reports the new revision
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show \
+            -g "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            -n "${{ vars.AZURE_CONTAINERAPP_NAME }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "relay: https://$FQDN"
+          want="${GITHUB_SHA::7}"
+          for i in $(seq 1 30); do
+            out="$(curl -fsS "https://$FQDN/version" || true)"
+            echo "attempt $i: $out"
+            case "$out" in *"$want"*) echo "✓ new revision live"; exit 0;; esac
+            sleep 5
+          done
+          echo "::error::/version did not report git_sha $want after ~150s"
+          exit 1
