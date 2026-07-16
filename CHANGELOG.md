@@ -95,6 +95,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   DEBUG assertion at the view's setup site, so a missing store binding fails
   visibly instead of masquerading as a permanent "reconnecting" (remote-control-qbj,
   remote-control-7wu).
+- FlightDeck Remote iOS relay URL now lives in a committed `Info.plist` key
+  (`FlightDeckRelayURL`, sourced from `ios/project.yml`) and is read at runtime
+  via `Bundle.main`, so moving the relay is a one-line plist edit instead of a
+  Swift source change. A safe in-code fallback covers a missing/malformed key;
+  QR pairing (which carries `relay_url` in the payload) is unaffected
+  (remote-control-2mk).
+- FlightDeck Remote iOS pairing no longer silently mocks the handshake on a real
+  device: `MockPairingService` was the DEBUG default on every build, so a
+  developer testing pairing on-device against a real relay got a faked handshake
+  that never opened a socket (then hung on "reconnecting" with zero connections
+  in the relay logs). The DEBUG default is now the mock on the *simulator* only —
+  a physical DEBUG device uses the live relay — and whenever the mock is active
+  outside a UI test the app logs loudly and shows an unmistakable "MOCK PAIRING"
+  badge on the pairing screen. UI tests (`-uitest`) stay hermetic on the mock
+  (remote-control-lae).
 
 ### Bug fixes
 
@@ -119,6 +134,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   `pairing_offer` pre-auth (registering its device key) and then authenticates —
   matching the relay's offer-first bootstrap. Returning desktops with saved
   pairings authenticate first, unchanged. Surfaced by the new end-to-end harness.
+- FlightDeck Remote desktop no longer loops forever when the relay has forgotten
+  its pairing: a returning desktop whose persisted pairing the relay no longer
+  recognizes (e.g. after a relay restart wiped the in-memory store) took the
+  auth-first path, got `auth_failed`/`unknown_pairing`, and reconnected on the
+  dead pairing indefinitely — the only fix was manually deleting
+  `~/.flightdeck/remote.json`. After a few consecutive relay rejections the
+  client now self-heals: it drops the stale pairing from persisted state (so the
+  next connect bootstraps a fresh offer) and surfaces a clear "pair again"
+  prompt instead of a silent, endless "reconnecting". Only explicit relay
+  rejections count toward the threshold, so a transient outage is never mistaken
+  for a wiped pairing (remote-control-1jy).
 
 ## [1.7.1] - 2026-07-13
 

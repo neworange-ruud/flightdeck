@@ -1328,6 +1328,20 @@ fn event_loop(
                             }
                         }
                     }
+                    RemoteInbound::PairingRejected { .. } => {
+                        // The relay no longer recognizes our pairing; the client
+                        // dropped the stale record and will re-offer. Give the
+                        // user a clear, actionable state instead of a silent,
+                        // endless "reconnecting" (remote-control-1jy).
+                        pairing_session = None;
+                        if matches!(ui.overlay, UiOverlay::Remote(_)) {
+                            ui.overlay = UiOverlay::None;
+                        }
+                        ui.message(
+                            "Phone pairing is no longer recognized by the relay. \
+                             Open Settings → Remote to pair again.",
+                        );
+                    }
                     _ => {}
                 }
                 b.handle_inbound(msg);

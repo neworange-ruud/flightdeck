@@ -347,3 +347,115 @@ fn reconnects_after_socket_drop() {
     handle.stop();
     let _ = mock.join();
 }
+
+// --- Self-heal on a pairing the relay no longer recognizes (1jy) ------------
+
+/// A [`RemoteStore`] over a shared `Arc<Mutex<_>>` so the test can inspect what
+/// the client persisted after it self-heals.
+#[derive(Clone)]
+struct SharedStore(std::sync::Arc<Mutex<RemoteState>>);
+
+impl RemoteStore for SharedStore {
+    fn load(&self) -> RemoteState {
+        self.0.lock().unwrap().clone()
+    }
+    fn save(&self, state: &RemoteState) {
+        *self.0.lock().unwrap() = state.clone();
+    }
+}
+
+#[test]
+fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
+    // A returning desktop with a persisted pairing connects to a relay that no
+    // longer knows it (e.g. its store was wiped). Each auth-first attempt is
+    // rejected with `auth_failed`. After AUTH_REJECT_REOFFER_THRESHOLD
+    // consecutive rejections the client must self-heal: drop the stale pairing
+    // from persisted state and emit `PairingRejected` — instead of looping
+    // forever (remote-control-1jy).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+
+    let mock = std::thread::spawn(move || {
+        // Reject every connect. More accepts than the threshold so timing/
+        // jitter can never starve the test of a rejection.
+        for _ in 0..(AUTH_REJECT_REOFFER_THRESHOLD + 3) {
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut ws = match tungstenite::accept(stream) {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+            if !matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })) {
+                return;
+            }
+            ws_send(
+                &mut ws,
+                &RelayFrame::HelloOk {
+                    protocol_version: 1,
+                    server_time_ms: 0,
+                    connection_id: "conn".to_string(),
+                },
+            );
+            ws_send(
+                &mut ws,
+                &RelayFrame::AuthChallenge {
+                    nonce: STANDARD.encode([1u8; 16]),
+                    server_time_ms: 0,
+                },
+            );
+            let _ = ws_recv(&mut ws); // consume auth_response
+            ws_send(
+                &mut ws,
+                &RelayFrame::Error {
+                    code: RelayErrorCode::AuthFailed,
+                    message: "unknown device".to_string(),
+                    pairing_id: None,
+                },
+            );
+        }
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    // Seed a persisted pairing so the client takes the auth-first path.
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_stale"));
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    // Wait for the self-heal signal. Threshold rejections each incur backoff, so
+    // allow generous wall-clock time.
+    let mut rejected: Option<Vec<PairingId>> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && rejected.is_none() {
+        if let Ok(RemoteInbound::PairingRejected { pairing_ids }) =
+            in_rx.recv_timeout(Duration::from_millis(500))
+        {
+            rejected = Some(pairing_ids);
+        }
+    }
+
+    let dropped = rejected.expect("client should emit PairingRejected after repeated rejections");
+    assert_eq!(
+        dropped,
+        vec![PairingId::new("pair_stale")],
+        "the dropped pairing id should be reported"
+    );
+    assert!(
+        shared.lock().unwrap().pairings.is_empty(),
+        "the stale pairing must be cleared from persisted state so the next connect re-offers"
+    );
+
+    handle.stop();
+    let _ = mock.join();
+}

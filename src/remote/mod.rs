@@ -100,6 +100,17 @@ pub enum RemoteInbound {
         /// it (then the channel cannot be derived and pairing has not completed).
         peer_key_agreement_public_key: Option<String>,
     },
+    /// The relay repeatedly rejected authentication for a persisted pairing on
+    /// the auth-first reconnect path — it no longer recognizes this device /
+    /// pairing (e.g. its store was wiped by a restart/redeploy). The client has
+    /// already dropped the stale pairing(s) from its persisted state, so the
+    /// next connect bootstraps a fresh offer instead of looping forever on a
+    /// dead pairing. The UI should surface a clear "re-pair needed" state rather
+    /// than a silent, endless "reconnecting" (remote-control-1jy).
+    PairingRejected {
+        /// The pairing ids that were dropped from persisted state.
+        pairing_ids: Vec<PairingId>,
+    },
 }
 
 /// A message from the app to the relay-client thread.

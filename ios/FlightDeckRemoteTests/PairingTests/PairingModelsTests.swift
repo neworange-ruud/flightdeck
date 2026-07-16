@@ -79,4 +79,44 @@ struct PairingModelsTests {
     @Test func decodeRejectsCompletelyUnrelatedString() throws {
         try expectMalformed("https://example.com/not-a-pairing-code")
     }
+
+    // MARK: - Relay URL from Info.plist (remote-control-2mk)
+
+    @Test func relayURLIsReadFromInfoPlistAtRuntime() throws {
+        // Acceptance: the endpoint lives in a committed Info.plist key and is
+        // read via Bundle.main — not hardcoded in Swift. The unit-test bundle
+        // is hosted in the app, so Bundle.main is the app carrying the key.
+        let raw = try #require(
+            Bundle.main.object(forInfoDictionaryKey: PairingDefaults.relayURLInfoPlistKey) as? String,
+            "Info.plist is missing \(PairingDefaults.relayURLInfoPlistKey)"
+        )
+        let fromPlist = try #require(URL(string: raw))
+        #expect(PairingDefaults.relayURL == fromPlist)
+        #expect(PairingDefaults.relayURL.scheme == "wss")
+    }
+
+    @Test func resolveRelayURLAcceptsValidWebSocketURLs() {
+        #expect(
+            PairingDefaults.resolveRelayURL("wss://relay.example/ws")
+                == URL(string: "wss://relay.example/ws")
+        )
+        #expect(
+            PairingDefaults.resolveRelayURL("ws://127.0.0.1:8080/ws")
+                == URL(string: "ws://127.0.0.1:8080/ws")
+        )
+    }
+
+    @Test func resolveRelayURLTrimsSurroundingWhitespace() {
+        #expect(
+            PairingDefaults.resolveRelayURL("  wss://relay.example/ws\n")
+                == URL(string: "wss://relay.example/ws")
+        )
+    }
+
+    @Test func resolveRelayURLFallsBackWhenAbsentOrMalformed() {
+        // nil / empty / whitespace-only / wrong scheme / no host → fallback.
+        for bad in [nil, "", "   ", "https://relay.example/ws", "relay.example", "wss://"] as [String?] {
+            #expect(PairingDefaults.resolveRelayURL(bad) == PairingDefaults.fallbackRelayURL)
+        }
+    }
 }

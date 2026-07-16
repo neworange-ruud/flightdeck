@@ -237,6 +237,13 @@ impl RemoteBridge {
                 }
             }
             RemoteInbound::Presence { .. } | RemoteInbound::Link(_) => {}
+            // The relay no longer knows our pairing; the client dropped it and
+            // will re-offer. Forget it here too and revert to the passthrough
+            // sealer so we stop sealing to a dead channel (remote-control-1jy).
+            RemoteInbound::PairingRejected { .. } => {
+                self.pairing = None;
+                self.reset_to_passthrough();
+            }
         }
     }
 

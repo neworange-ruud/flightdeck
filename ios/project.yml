@@ -45,6 +45,12 @@ targets:
         CFBundleDisplayName: "FlightDeck Remote"
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
+        # Hosted relay endpoint (remote-control-2mk). Committed here so the relay
+        # address is a one-line plist edit, not a Swift source change. Read at
+        # runtime via PairingDefaults.relayURL (Bundle.main). Tied to the current
+        # Azure Container Apps app/env names until the stable custom domain
+        # (relay.flightdeck.app, remote-control-edn) lands.
+        FlightDeckRelayURL: "wss://ca-neworange-flightdeck-dev-neu.niceground-5e920aa9.northeurope.azurecontainerapps.io/ws"
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
         # Wake the app on a silent APNs push to reconnect + resume queued events

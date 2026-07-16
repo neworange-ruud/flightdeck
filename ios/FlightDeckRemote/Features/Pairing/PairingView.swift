@@ -33,6 +33,16 @@ struct PairingView: View {
 
     private var isCodeComplete: Bool { code.count == 4 }
 
+    // Show an unmistakable badge whenever pairing is mocked outside a UI test
+    // (remote-control-lae): a mocked handshake never opens a socket to the
+    // relay, so without this a developer sees a "successful" pair that the
+    // relay never saw. UI tests (`-uitest`) intentionally use the mock and are
+    // kept visually unperturbed.
+    private var showsMockBadge: Bool {
+        service is MockPairingService
+            && !ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("-uitest") }
+    }
+
     // The root is a plain VStack with `.accessibilityElement(children:
     // .contain)` — the same shape as the original placeholder — so the
     // "PairingView" identifier keeps mapping to an `XCUIElementTypeOther`;
@@ -44,6 +54,10 @@ struct PairingView: View {
             ScrollView {
                 VStack(spacing: Theme.Spacing.xl) {
                     header
+
+                    if showsMockBadge {
+                        mockPairingBadge
+                    }
 
                     codeEntrySection
                         .padding(.top, Theme.Spacing.sm)
@@ -130,6 +144,27 @@ struct PairingView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, Theme.Spacing.xxl)
         }
+    }
+
+    /// Loud warning shown by `showsMockBadge` when pairing is mocked outside a
+    /// UI test — the mock never opens a socket, so this makes the faked
+    /// handshake impossible to mistake for a real relay connection
+    /// (remote-control-lae).
+    private var mockPairingBadge: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            Text("MOCK PAIRING — not connecting to the relay")
+                .typography(Typography.callout)
+                .multilineTextAlignment(.center)
+        }
+        .foregroundStyle(Theme.statusOrange)
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.vertical, Theme.Spacing.sm)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Theme.statusOrange, lineWidth: 1)
+        )
+        .accessibilityIdentifier("pairing-mock-badge")
     }
 
     /// Four decorative digit boxes over one real (visually hidden) numeric

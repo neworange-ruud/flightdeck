@@ -71,6 +71,15 @@ const BACKOFF_BASE_MS: u64 = 1_000;
 /// Backoff ceiling in milliseconds.
 const BACKOFF_CAP_MS: u64 = 60_000;
 
+/// How many *consecutive* auth rejections of a persisted pairing (the relay
+/// answering our auth-first `auth_response` with `auth_failed`/`unknown_pairing`)
+/// the supervisor tolerates before self-healing: dropping the stale pairing so
+/// the next connect bootstraps a fresh offer instead of looping forever
+/// (remote-control-1jy). Only explicit relay rejections count — a transient
+/// outage ends the session some other way and resets the streak, so a flapping
+/// relay is never mistaken for a wiped one.
+const AUTH_REJECT_REOFFER_THRESHOLD: u32 = 3;
+
 // --- Public link state -----------------------------------------------------
 
 /// The relay connection state, pushed to the app over `RemoteInbound::Link`.
@@ -394,6 +403,12 @@ enum SessionEnd {
     /// The session ended; reconnect. `authed` is whether we ever reached
     /// `auth_ok` (a good session that merely dropped resets the backoff).
     Ended { authed: bool },
+    /// The relay explicitly rejected our auth-first `auth_response` for a
+    /// persisted pairing (`auth_failed`/`unknown_pairing`) — it no longer knows
+    /// this device/pairing. Distinct from a transient [`Self::Ended`] drop so
+    /// the supervisor can self-heal after repeated rejections rather than loop
+    /// forever on a dead pairing (remote-control-1jy).
+    AuthRejected,
 }
 
 fn report(inbound_tx: &Sender<RemoteInbound>, state: RemoteLinkState) {
@@ -410,6 +425,9 @@ fn run(
     stop: Arc<AtomicBool>,
 ) {
     let mut attempt: u32 = 0;
+    // Consecutive auth rejections of our persisted pairing (see
+    // [`AUTH_REJECT_REOFFER_THRESHOLD`]). Any non-rejection outcome resets it.
+    let mut auth_reject_streak: u32 = 0;
     // Keep persisted state authoritative for the private key regardless of what
     // was on disk when the thread started.
     let mut state = store.load();
@@ -431,7 +449,40 @@ fn run(
         match end {
             SessionEnd::Stopped => break,
             SessionEnd::Ended { authed } => {
+                // A successful (or merely dropped) session breaks any rejection
+                // streak — the relay is not persistently rejecting us.
+                auth_reject_streak = 0;
                 attempt = if authed { 0 } else { attempt.saturating_add(1) };
+            }
+            SessionEnd::AuthRejected => {
+                auth_reject_streak = auth_reject_streak.saturating_add(1);
+                attempt = attempt.saturating_add(1);
+                if auth_reject_streak >= AUTH_REJECT_REOFFER_THRESHOLD {
+                    // The relay has rejected our persisted pairing on every one
+                    // of the last N connects — it no longer knows it (its store
+                    // was almost certainly wiped). Self-heal: drop the stale
+                    // pairing(s) so the next connect is a clean offer-first
+                    // bootstrap, and tell the app so it can surface a re-pair
+                    // prompt instead of an endless "reconnecting" (1jy).
+                    let dropped: Vec<PairingId> = state
+                        .pairing_ids()
+                        .into_iter()
+                        .map(PairingId::new)
+                        .collect();
+                    state.pairings.clear();
+                    store.save(&state);
+                    eprintln!(
+                        "flightdeck-remote: relay rejected our pairing \
+                         {AUTH_REJECT_REOFFER_THRESHOLD}x (no longer recognized); \
+                         dropped {} stale pairing(s), will re-offer on next connect",
+                        dropped.len()
+                    );
+                    let _ = inbound_tx.send(RemoteInbound::PairingRejected {
+                        pairing_ids: dropped,
+                    });
+                    auth_reject_streak = 0;
+                    attempt = 0;
+                }
             }
         }
         if stop.load(Ordering::Relaxed) {
@@ -521,6 +572,11 @@ fn run_session(
     // Fresh-desktop bootstrap bookkeeping.
     let mut offer_sent = false;
     let mut offer_wait_until: Option<Instant> = None;
+    // Whether we answered the challenge auth-first as a returning desktop (i.e.
+    // with persisted pairing ids, no pre-auth offer). Gates treating a relay
+    // `auth_failed` as a pairing rejection worth self-healing (1jy) — a fresh
+    // desktop's offer path is not a "stale pairing the relay forgot".
+    let mut auth_first = false;
     // Outbound messages pulled off the queue while waiting to offer that are not
     // the `RequestPairing` we want; replayed once we reach the pump. Normally
     // empty — only `RequestPairing` is expected before a pairing exists.
@@ -589,6 +645,7 @@ fn run_session(
                             return SessionEnd::Ended { authed: false };
                         }
                         sent_auth = true;
+                        auth_first = true;
                         challenge_nonce = Some(nonce);
                     }
                 }
@@ -621,7 +678,23 @@ fn run_session(
                     on_authenticated(&mut sock, state, inbound_tx, pairing_ids);
                     break;
                 }
-                RelayFrame::Error { .. } => return SessionEnd::Ended { authed: false },
+                RelayFrame::Error { code, .. } => {
+                    // A returning desktop that authed-first and got rejected: the
+                    // relay does not recognize our device/pairing (its store was
+                    // likely wiped). Surface it as a distinct end so the
+                    // supervisor can self-heal after repeated rejections instead
+                    // of reconnecting on a dead pairing forever (1jy). Any other
+                    // error (or a fresh-desktop offer failure) stays a plain end.
+                    if auth_first
+                        && matches!(
+                            code,
+                            RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
+                        )
+                    {
+                        return SessionEnd::AuthRejected;
+                    }
+                    return SessionEnd::Ended { authed: false };
+                }
                 _ => continue, // unexpected pre-auth frame; ignore
             },
         }

@@ -247,6 +247,7 @@ impl Connection {
             return Flow::Close;
         };
 
+        tracing::info!(conn = %self.connection_id, ?role, ?device_id, version, "hello accepted");
         self.role = Some(role);
         let _ = &client as &ClientInfo; // build metadata is diagnostic only
 
@@ -482,8 +483,12 @@ impl Connection {
         }
 
         let claim = match self.state.store.redeem_claim(&claim_token, now_ms()).await {
-            Ok(c) => c,
+            Ok(c) => {
+                tracing::info!(conn = %self.connection_id, token = %claim_token, pairing = ?c.pairing_id, "pairing_claim OK (token redeemed)");
+                c
+            }
             Err(ClaimError::Unknown | ClaimError::Expired) => {
+                tracing::info!(conn = %self.connection_id, token = %claim_token, "pairing_claim REJECTED (token unknown or expired)");
                 // Advisory, non-fatal: the user can re-enter a fresh code.
                 self.send_error(
                     RelayErrorCode::PairingClaimRejected,
@@ -581,11 +586,13 @@ impl Connection {
 
         // Verify possession of the registered private key.
         let Some(public_key) = self.state.store.device_public_key(&device_id).await else {
+            tracing::info!(conn = %self.connection_id, ?device_id, "auth FAILED: unknown device (no offer/claim ever registered this key)");
             self.send_error(RelayErrorCode::AuthFailed, "unknown device", None)
                 .await;
             return Flow::Close;
         };
         if auth::verify_challenge(&public_key, nonce, &signature).is_err() {
+            tracing::info!(conn = %self.connection_id, ?device_id, "auth FAILED: signature verification failed");
             self.send_error(
                 RelayErrorCode::AuthFailed,
                 "signature verification failed",
@@ -605,6 +612,7 @@ impl Connection {
             }
         }
 
+        tracing::info!(conn = %self.connection_id, ?device_id, activated = activated.len(), "auth OK (auth_ok sent)");
         self.send(RelayFrame::AuthOk {
             pairing_ids: activated.clone(),
         })

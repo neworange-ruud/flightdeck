@@ -118,19 +118,50 @@ extension PairingError: LocalizedError {
 
 /// Fixed configuration for the relay transport.
 enum PairingDefaults {
+    /// Info.plist key carrying the relay endpoint. The value is committed to
+    /// the repo via `ios/project.yml` (`info.properties.FlightDeckRelayURL`),
+    /// from which XcodeGen writes `Info.plist`. Changing the relay address is a
+    /// one-line plist edit — no Swift source change (remote-control-2mk).
+    static let relayURLInfoPlistKey = "FlightDeckRelayURL"
+
+    /// Last-resort fallback, used only if the Info.plist key is absent or
+    /// malformed (should never happen in a correctly built app — the plist
+    /// carries the canonical value). Mirrors the committed plist value so the
+    /// app still reaches the relay even if the key is somehow lost.
+    static let fallbackRelayURL = URL(
+        string: "wss://ca-neworange-flightdeck-dev-neu.niceground-5e920aa9.northeurope.azurecontainerapps.io/ws"
+    )!
+
     /// The hosted relay endpoint (PRD §9.1: operated by New Orange on Azure
-    /// Container Apps). Manual 4-digit-code pairing has no other way to learn
-    /// the relay address — only the QR payload carries `relay_url` explicitly
-    /// (forward-compatible with a future self-hosted relay picker).
+    /// Container Apps), read at runtime from the committed Info.plist key
+    /// `FlightDeckRelayURL`. Manual 4-digit-code pairing has no other way to
+    /// learn the relay address — only the QR payload carries `relay_url`
+    /// explicitly (forward-compatible with a future self-hosted relay picker).
     ///
     /// This is the LIVE deployed relay's URL. It is tied to the current Azure
     /// Container Apps environment/app names, so it changes if the relay is
-    /// recreated/renamed — update it here (and the desktop's `relay_url`
-    /// config) on any such move. The stable end state is a custom domain
-    /// (`relay.flightdeck.app`) that would make this constant permanent.
-    static let relayURL = URL(
-        string: "wss://ca-neworange-flightdeck-dev-neu.niceground-5e920aa9.northeurope.azurecontainerapps.io/ws"
-    )!
+    /// recreated/renamed — update the plist value on any such move. The stable
+    /// end state is a custom domain (`relay.flightdeck.app`, remote-control-edn)
+    /// that would make the value permanent.
+    static let relayURL: URL = resolveRelayURL(
+        Bundle.main.object(forInfoDictionaryKey: relayURLInfoPlistKey) as? String
+    )
+
+    /// Resolve a raw relay-URL string to a `URL`, falling back to
+    /// `fallbackRelayURL` when it is absent, empty, or not a valid `ws`/`wss`
+    /// URL with a host. Pure + `internal` so tests can exercise every branch
+    /// without constructing a custom bundle.
+    static func resolveRelayURL(_ raw: String?) -> URL {
+        guard
+            let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !trimmed.isEmpty,
+            let url = URL(string: trimmed),
+            let scheme = url.scheme?.lowercased(),
+            scheme == "wss" || scheme == "ws",
+            url.host != nil
+        else { return fallbackRelayURL }
+        return url
+    }
 }
 
 /// Encodes/decodes the `"fdr1:" + base64url(JSON)` QR payload format
