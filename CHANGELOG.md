@@ -12,7 +12,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Add agent-harness project skills under `.agents/skills/` capturing FlightDeck's
+  recurring conventions (shipping/definition-of-done, cross-platform parity,
+  the trait-seam architecture and git safety boundary, and config conventions),
+  plus a fast-check `Stop` hook that runs `cargo fmt --check` and `cargo clippy`
+  when Rust files change. Developer tooling only — no change to the shipped app.
 
 ### Bug fixes
 
