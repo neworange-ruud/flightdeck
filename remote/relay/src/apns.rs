@@ -80,8 +80,12 @@ impl ApnsConfig {
     /// `APNS_AUTH_KEY_PATH`. Optional: `APNS_ENVIRONMENT`
     /// (`sandbox` | `production`, default `production`).
     pub fn from_env() -> Option<Self> {
-        let team_id = std::env::var("APNS_TEAM_ID").ok().filter(|s| !s.is_empty())?;
-        let key_id = std::env::var("APNS_KEY_ID").ok().filter(|s| !s.is_empty())?;
+        let team_id = std::env::var("APNS_TEAM_ID")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let key_id = std::env::var("APNS_KEY_ID")
+            .ok()
+            .filter(|s| !s.is_empty())?;
         let topic = std::env::var("APNS_TOPIC").ok().filter(|s| !s.is_empty())?;
         let path = std::env::var("APNS_AUTH_KEY_PATH")
             .ok()
@@ -200,7 +204,11 @@ pub fn notification_content(event: &AgentEvent) -> NotificationContent {
                 "{files_changed} file{} changed",
                 if *files_changed == 1 { "" } else { "s" }
             );
-            let ready = if *ready_to_push { " · ready to push" } else { "" };
+            let ready = if *ready_to_push {
+                " · ready to push"
+            } else {
+                ""
+            };
             let body = if summary.is_empty() {
                 format!("{files}{ready}")
             } else {
@@ -306,7 +314,12 @@ impl ApnsRequest {
 
 /// The headers common to every APNs request: bearer auth, topic, push type,
 /// priority, and a zero expiration (deliver-once, don't store).
-fn base_headers(config: &ApnsConfig, jwt: &str, push_type: &str, priority: &str) -> Vec<(String, String)> {
+fn base_headers(
+    config: &ApnsConfig,
+    jwt: &str,
+    push_type: &str,
+    priority: &str,
+) -> Vec<(String, String)> {
     vec![
         ("authorization".to_string(), format!("bearer {jwt}")),
         ("apns-topic".to_string(), config.topic.clone()),
@@ -346,7 +359,13 @@ pub struct NoopPushService;
 
 #[async_trait]
 impl PushService for NoopPushService {
-    async fn notify_offline(&self, _pairing: &PairingId, _token: &str, _environment: ApnsEnvironment) {}
+    async fn notify_offline(
+        &self,
+        _pairing: &PairingId,
+        _token: &str,
+        _environment: ApnsEnvironment,
+    ) {
+    }
 }
 
 /// The live [`PushService`]: mints a JWT and sends a background-wake push
@@ -447,6 +466,15 @@ pub mod live {
     }
 }
 
+// `ApnsTransport` is object-safe and used behind `Arc<dyn ...>`; provide the
+// impl so an `Arc<T: ApnsTransport>` satisfies the trait in wiring/tests.
+#[async_trait]
+impl<T: ApnsTransport + ?Sized> ApnsTransport for std::sync::Arc<T> {
+    async fn send(&self, request: ApnsRequest) -> Result<(), String> {
+        (**self).send(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,7 +541,9 @@ mod tests {
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let signature = Signature::from_slice(&sig_bytes).unwrap();
-        assert!(verifying.verify(signing_input.as_bytes(), &signature).is_ok());
+        assert!(verifying
+            .verify(signing_input.as_bytes(), &signature)
+            .is_ok());
     }
 
     #[test]
@@ -550,7 +580,10 @@ mod tests {
             title: "add-tests finished its turn".into(),
         };
         let content = notification_content(&event);
-        assert_eq!(content.body, "18 files changed · ready to push · SpecAssistant");
+        assert_eq!(
+            content.body,
+            "18 files changed · ready to push · SpecAssistant"
+        );
         assert_eq!(content.sound, DEFAULT_SOUND);
         assert_eq!(content.interruption_level, InterruptionLevel::Active);
     }
@@ -615,19 +648,18 @@ mod tests {
     #[test]
     fn background_wake_carries_no_content() {
         let (config, _) = test_config();
-        let req = ApnsRequest::background_wake(
-            &config,
-            "jwt-xyz",
-            "tok",
-            ApnsEnvironment::Production,
-        );
+        let req =
+            ApnsRequest::background_wake(&config, "jwt-xyz", "tok", ApnsEnvironment::Production);
         assert_eq!(req.authority, "api.push.apple.com");
         let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
         assert_eq!(headers["apns-push-type"], "background");
         assert_eq!(headers["apns-priority"], "5");
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(body["aps"]["content-available"], 1);
-        assert!(body.get("deep_link").is_none(), "zero-knowledge: no content");
+        assert!(
+            body.get("deep_link").is_none(),
+            "zero-knowledge: no content"
+        );
     }
 
     /// Recording transport: captures every request so tests can assert on the
@@ -661,14 +693,5 @@ mod tests {
         let headers: std::collections::HashMap<_, _> = sent[0].headers.iter().cloned().collect();
         assert_eq!(headers["apns-push-type"], "background");
         assert!(headers["authorization"].starts_with("bearer "));
-    }
-}
-
-// `ApnsTransport` is object-safe and used behind `Arc<dyn ...>`; provide the
-// impl so an `Arc<T: ApnsTransport>` satisfies the trait in wiring/tests.
-#[async_trait]
-impl<T: ApnsTransport + ?Sized> ApnsTransport for std::sync::Arc<T> {
-    async fn send(&self, request: ApnsRequest) -> Result<(), String> {
-        (**self).send(request).await
     }
 }
