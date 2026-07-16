@@ -127,10 +127,16 @@ struct AgentChatView: View {
                 #if DEBUG
                 model.configureSend(sender: scriptedSender,
                                     pausedGate: CommandsPausedGate(source: fixtureSource))
+                model.assertCommandPathConfigured()
                 #endif
                 return
             }
             if let store { model.bind(to: store) }
+            // A missing binding here (no store, not a fixture) leaves the gate
+            // unbound, which reads as a permanent "paused — reconnecting" — a
+            // wiring bug, not a down link. Trap it loudly in DEBUG rather than
+            // let it masquerade as a connection problem (remote-control-9yv).
+            model.assertCommandPathConfigured()
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("AgentChatView")

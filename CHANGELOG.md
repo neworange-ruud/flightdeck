@@ -74,7 +74,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- FlightDeck Remote iOS transport hardening (follow-ups to the chat "paused —
+  reconnecting" fix): `TransportStore` now bridges the transport's events onto
+  the main actor through a single FIFO stream drained by one serial loop, so
+  link-state and data events apply strictly in emit order (the previous
+  per-event `Task { @MainActor … }` bridge gave no cross-event ordering
+  guarantee — a stale `linkState` could land after a newer one). Chat's
+  commands-paused gate now distinguishes a genuinely down link from a never-wired
+  gate: an unbound gate still fails safe (paused, nothing sent blind) but trips a
+  DEBUG assertion at the view's setup site, so a missing store binding fails
+  visibly instead of masquerading as a permanent "reconnecting" (remote-control-qbj,
+  remote-control-7wu).
 
 ### Bug fixes
 

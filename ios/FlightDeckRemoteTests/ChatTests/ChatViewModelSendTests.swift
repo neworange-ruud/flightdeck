@@ -26,6 +26,27 @@ import Foundation
         return (model, sender, source)
     }
 
+    // MARK: - Command-path wiring (remote-control-7wu / -9yv)
+
+    @Test func unboundGateIsDistinguishableFromADownLink() {
+        // A fresh model has no command path wired: it reads as paused (safe —
+        // never send blind) but is explicitly *not configured*, so a missing
+        // binding can be told apart from a genuinely down link instead of
+        // masquerading as a permanent "reconnecting".
+        let model = ChatViewModel(projectId: Wire.ProjectId("p1"),
+                                  sessionId: Wire.SessionId("s1"))
+        #expect(model.isCommandPathConfigured == false)
+        #expect(model.commandsPaused == true)
+    }
+
+    @Test func configureSendMarksTheCommandPathWired() {
+        let (model, _, _) = makeModel(link: .disconnected)
+        // Even with a down link the path is now configured — paused, but for a
+        // real connection reason rather than a wiring bug.
+        #expect(model.isCommandPathConfigured == true)
+        #expect(model.commandsPaused == true)
+    }
+
     // MARK: - Optimistic append + delivery
 
     @Test func sendAppendsOptimisticPendingAndSendsReply() {

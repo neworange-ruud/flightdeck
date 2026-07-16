@@ -94,6 +94,11 @@ final class TransportStore {
     private var started = false
     private var seenEventIds: Set<Wire.EventId> = []
 
+    /// The serial loop draining the transport's events onto the main actor in
+    /// FIFO order, and the continuation the `@Sendable` sink feeds. See `start()`.
+    private var eventLoop: Task<Void, Never>?
+    private var eventContinuation: AsyncStream<TransportEvent>.Continuation?
+
     init(
         client: TransportClient,
         cache: SnapshotCache? = nil,
@@ -107,19 +112,39 @@ final class TransportStore {
     // MARK: - Lifecycle
 
     /// Wire the event bridge and start the transport. Idempotent.
+    ///
+    /// Events cross from the transport (an actor, emitting in order) to the main
+    /// actor through a single FIFO `AsyncStream` drained by one serial loop.
+    /// The previous bridge wrapped each event in its own `Task { @MainActor … }`,
+    /// which gave no cross-event ordering guarantee — a newer `linkState` or
+    /// delta could be applied before an older one (remote-control-qbj). One
+    /// ordered stream + one consumer keeps delivery strictly in emit order.
     func start() async {
         guard !started else { return }
         started = true
-        let sink: @Sendable (TransportEvent) -> Void = { [weak self] event in
-            Task { @MainActor in self?.apply(event) }
+        let (stream, continuation) = AsyncStream.makeStream(of: TransportEvent.self)
+        eventContinuation = continuation
+        let sink: @Sendable (TransportEvent) -> Void = { event in
+            continuation.yield(event)
+        }
+        eventLoop = Task { @MainActor [weak self] in
+            for await event in stream {
+                self?.apply(event)
+            }
         }
         await client.setEventHandler(sink)
         await client.start()
     }
 
-    /// Stop the transport.
+    /// Stop the transport and tear down the event bridge.
     func stop() async {
         await client.stop()
+        // Finish so the loop drains any already-buffered events before exiting;
+        // cancel is a backstop.
+        eventContinuation?.finish()
+        eventContinuation = nil
+        eventLoop?.cancel()
+        eventLoop = nil
         started = false
     }
 

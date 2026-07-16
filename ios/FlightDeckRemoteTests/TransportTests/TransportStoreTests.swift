@@ -113,6 +113,38 @@ import Foundation
         await client.stop()
     }
 
+    @Test func appliesABurstOfEventsInFIFOOrder() async throws {
+        // A rapid burst pushed with no intermediate awaits exercises the event
+        // bridge's ordering: the store must fold transcript appends in emit
+        // order (remote-control-qbj). The old per-event `Task { @MainActor }`
+        // bridge gave no such guarantee.
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let (store, client) = try makeStore(keychain: keychain, channel: channel, peer: peer, ka: ka)
+        await store.start()
+        await handshake(channel, store: store)
+
+        try await channel.push(peer.envelopeFrame(.snapshot(snapshot()), seq: 1))
+        _ = await waitUntilMain { store.snapshot != nil }
+
+        // Replace with i0, then append i1…i20 back-to-back.
+        let s1 = Wire.SessionId("s1")
+        try await channel.push(peer.envelopeFrame(
+            .transcript(Wire.TranscriptFeed(sessionId: s1, fromIndex: 0, replace: true,
+                items: [.userMessage(itemId: Wire.ItemId("i0"), text: "0", atMs: 0)])), seq: 2))
+        for n in 1...20 {
+            try await channel.push(peer.envelopeFrame(
+                .transcriptAppend(Wire.TranscriptFeed(sessionId: s1, fromIndex: UInt64(n), replace: false,
+                    items: [.userMessage(itemId: Wire.ItemId("i\(n)"), text: "\(n)", atMs: Int64(n))])), seq: UInt64(n + 2)))
+        }
+
+        _ = await waitUntilMain { store.transcripts[s1]?.count == 21 }
+        let ids = store.transcripts[s1]?.map(\.itemId.rawValue) ?? []
+        #expect(ids == (0...20).map { "i\($0)" })
+        await client.stop()
+    }
+
     @Test func sendCommandTracksDeliveryHonestyThroughAck() async throws {
         let keychain = InMemoryKeychainStore()
         let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)

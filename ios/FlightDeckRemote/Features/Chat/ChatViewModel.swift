@@ -174,10 +174,35 @@ final class ChatViewModel {
         items.last(where: { $0.permissionPromptId != nil })?.permissionPromptId
     }
 
-    /// Whether commands are currently paused (link down, PRD §8). Defaults to
-    /// paused (safe) until a gate is configured.
+    /// Whether commands are currently paused (link down, PRD §8). Blocks sends
+    /// (safe) both when the link is genuinely down *and* when no gate is bound —
+    /// but the two are not the same thing: an unbound gate is a wiring mistake,
+    /// not a connection problem (remote-control-9yv, where a missing store
+    /// binding masqueraded as a permanent "paused — reconnecting"). Production
+    /// still fails safe; DEBUG traps the unbound case loudly via
+    /// `assertCommandPathConfigured()`, called by the view once setup has run.
     var commandsPaused: Bool {
         pausedGate?.commandsPaused ?? true
+    }
+
+    /// Whether a real command path (live store or scripted sender) has been
+    /// wired. `false` here after the view's setup means the "paused" state above
+    /// is a wiring bug, not a down link.
+    var isCommandPathConfigured: Bool {
+        pausedGate != nil
+    }
+
+    /// DEBUG guard: a chat surface MUST wire a command path — a live store via
+    /// `bind(to:)` or a scripted sender via `configureSend(sender:pausedGate:)`.
+    /// The view calls this once its setup `.task` has run; a still-unbound gate
+    /// then is the remote-control-9yv failure (a missing binding that shows as a
+    /// permanently paused link), so we trap it loudly instead of letting it
+    /// masquerade as a connection problem. No-op in Release (fails safe).
+    func assertCommandPathConfigured() {
+        assert(isCommandPathConfigured,
+               "ChatViewModel has no CommandsPausedGate after setup — a missing "
+             + "store binding will masquerade as a permanently paused link "
+             + "(remote-control-9yv). Call bind(to:) or configureSend(sender:pausedGate:).")
     }
 
     private var liveSession: Wire.SessionState? {
