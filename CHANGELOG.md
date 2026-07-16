@@ -84,6 +84,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   long-lived Azure secret in the repo); `relay.yml` is now CI-only. One relay
   serves all pairings, so additional users just pair their own desktop + phone.
   See `remote/relay/deploy/README.md` for the runbook and cost (~$17–20/mo).
+- FlightDeck Remote relay now has a stable custom domain: the desktop and iOS
+  apps connect via `wss://relay.flightdeckai.app/ws` instead of the
+  Azure-generated `*.azurecontainerapps.io` hostname, so recreating/renaming the
+  underlying Azure resources no longer changes the URL or orphans existing
+  pairings (an ACA-managed TLS cert is issued for the domain via CNAME
+  validation; `remote/relay/deploy/bind-custom-domain.sh` rebinds it). The relay
+  ingress is also now IP-restricted to a deny-by-default allowlist, so only
+  approved source networks can reach it (remote-control-edn).
 - FlightDeck Remote iOS transport hardening (follow-ups to the chat "paused —
   reconnecting" fix): `TransportStore` now bridges the transport's events onto
   the main actor through a single FIFO stream drained by one serial loop, so

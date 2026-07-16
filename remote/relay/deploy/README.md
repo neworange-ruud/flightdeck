@@ -22,11 +22,26 @@ process memory (`store::InMemoryStore`), so both legs of a pairing must land on
 the same replica. Scaling out needs a shared `RelayStore` (Redis / Azure Table)
 first. See `../src/store.rs`.
 
-The Container Apps ingress serves a managed TLS cert on a stable
+The Container Apps ingress serves a managed TLS cert on both the
 `*.azurecontainerapps.io` hostname (retrieve with
-`az containerapp show … --query properties.configuration.ingress.fqdn`). A
-pinned custom domain (the apps reference `relay.flightdeck.app`) is a later
-step — it needs DNS on `flightdeck.app` plus an ACA managed certificate.
+`az containerapp show … --query properties.configuration.ingress.fqdn`) and the
+**pinned custom domain `relay.flightdeckai.app`** (remote-control-edn) — the
+stable endpoint the desktop + iOS apps use, so a rename/recreate of the Azure
+resources no longer orphans pairings. Rebinding the custom domain after such a
+move is `bind-custom-domain.sh` (it re-issues the ACA managed cert via CNAME
+validation); the two DNS records it needs on `flightdeckai.app` are:
+
+```
+CNAME  relay        -> <app>.<env-suffix>.northeurope.azurecontainerapps.io
+TXT    asuid.relay  -> <customDomainVerificationId>   # az containerapp show … --query properties.customDomainVerificationId
+```
+
+**Ingress is IP-restricted (deny-by-default allowlist)** — only a fixed set of
+source IPs may reach the relay. Manage the list with
+`az containerapp ingress access-restriction {set,remove,list} -g <rg> -n <app>`.
+All rules must share one action (`Allow`); adding any `Allow` rule denies every
+other source. Note this means clients (including phones) can only connect from
+an allowlisted network.
 
 ## Health
 

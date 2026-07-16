@@ -129,7 +129,7 @@ enum PairingDefaults {
     /// carries the canonical value). Mirrors the committed plist value so the
     /// app still reaches the relay even if the key is somehow lost.
     static let fallbackRelayURL = URL(
-        string: "wss://ca-neworange-flightdeck-dev-neu.niceground-5e920aa9.northeurope.azurecontainerapps.io/ws"
+        string: "wss://relay.flightdeckai.app/ws"
     )!
 
     /// The hosted relay endpoint (PRD §9.1: operated by New Orange on Azure
@@ -138,11 +138,11 @@ enum PairingDefaults {
     /// learn the relay address — only the QR payload carries `relay_url`
     /// explicitly (forward-compatible with a future self-hosted relay picker).
     ///
-    /// This is the LIVE deployed relay's URL. It is tied to the current Azure
-    /// Container Apps environment/app names, so it changes if the relay is
-    /// recreated/renamed — update the plist value on any such move. The stable
-    /// end state is a custom domain (`relay.flightdeck.app`, remote-control-edn)
-    /// that would make the value permanent.
+    /// Points at the stable custom domain (`relay.flightdeckai.app`,
+    /// remote-control-edn) fronting the Azure Container Apps relay, so it
+    /// survives any rename/recreate of the underlying Azure resources — no more
+    /// chasing `*.azurecontainerapps.io` hostname churn. Change it (if ever) by
+    /// editing the plist value in `ios/project.yml`, not Swift source.
     static let relayURL: URL = resolveRelayURL(
         Bundle.main.object(forInfoDictionaryKey: relayURLInfoPlistKey) as? String
     )

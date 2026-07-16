@@ -341,12 +341,14 @@ impl Default for UpdateConfig {
     }
 }
 
-/// Placeholder default relay endpoint for FlightDeck Remote. Overridable in
-/// `config.toml` (or per-device in `~/.flightdeck/remote.json`). An empty
-/// `relay_url` is treated as "no relay configured" and disables the client even
-/// when `enabled = true`.
+/// Default relay endpoint for FlightDeck Remote: the stable custom domain
+/// (`relay.flightdeckai.app`, remote-control-edn) fronting the hosted relay on
+/// Azure Container Apps, so the URL survives any rename/recreate of the
+/// underlying Azure resources. Overridable in `config.toml` (or per-device in
+/// `~/.flightdeck/remote.json`). An empty `relay_url` is treated as "no relay
+/// configured" and disables the client even when `enabled = true`.
 fn default_relay_url() -> String {
-    "wss://relay.flightdeck.invalid/ws".to_string()
+    "wss://relay.flightdeckai.app/ws".to_string()
 }
 
 /// `[remote]` config section: FlightDeck Remote, the phone <-> desktop link over
