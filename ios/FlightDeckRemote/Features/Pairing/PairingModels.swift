@@ -116,15 +116,21 @@ extension PairingError: LocalizedError {
     }
 }
 
-/// Fixed configuration for the (not-yet-implemented) relay transport.
+/// Fixed configuration for the relay transport.
 enum PairingDefaults {
     /// The hosted relay endpoint (PRD §9.1: operated by New Orange on Azure
-    /// Container Apps). Manual 4-digit-code pairing has no other way to
-    /// learn the relay address — only the QR payload carries `relay_url`
-    /// explicitly (forward-compatible with a future self-hosted relay
-    /// picker). Placeholder until the transport task wires up real
-    /// endpoint configuration/discovery.
-    static let relayURL = URL(string: "wss://relay.flightdeck.app/v1")!
+    /// Container Apps). Manual 4-digit-code pairing has no other way to learn
+    /// the relay address — only the QR payload carries `relay_url` explicitly
+    /// (forward-compatible with a future self-hosted relay picker).
+    ///
+    /// This is the LIVE deployed relay's URL. It is tied to the current Azure
+    /// Container Apps environment/app names, so it changes if the relay is
+    /// recreated/renamed — update it here (and the desktop's `relay_url`
+    /// config) on any such move. The stable end state is a custom domain
+    /// (`relay.flightdeck.app`) that would make this constant permanent.
+    static let relayURL = URL(
+        string: "wss://ca-neworange-flightdeck-dev-neu.niceground-5e920aa9.northeurope.azurecontainerapps.io/ws"
+    )!
 }
 
 /// Encodes/decodes the `"fdr1:" + base64url(JSON)` QR payload format

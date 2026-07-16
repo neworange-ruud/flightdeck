@@ -98,6 +98,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- FlightDeck Remote iOS `PairingDefaults.relayURL` pointed at a placeholder
+  domain (`wss://relay.flightdeck.app/v1`) that does not resolve (NXDOMAIN), so
+  manual 4-digit-code pairing (and any reconnect using that default) could never
+  reach the relay. Baked in the live Azure Container Apps relay URL (with the
+  correct `/ws` path). QR pairing was unaffected (the URL travels in the QR
+  payload); a stable custom domain remains the end goal so this constant needn't
+  track relay renames.
 - FlightDeck Remote iOS chat could not control the agent — the composer stayed
   disabled showing "paused — reconnecting" even though the link was up (shell and
   notifications worked). The chat screen was mounted without the live transport
