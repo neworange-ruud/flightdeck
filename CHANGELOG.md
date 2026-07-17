@@ -121,6 +121,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   triggered the on-demand resume. Switching to a project — via keyboard, the
   command palette, or clicking its tab — now resumes its recovered agents
   (remote-control-4by).
+- Release deploys now actually fire and verify correctly. The relay and web
+  Azure Container Apps deploy workflows were wired only to `release: published`,
+  but cargo-dist creates the GitHub Release with `GITHUB_TOKEN`, which by design
+  never fires that event — so no deploy ran on a release. Both workflows now also
+  trigger on the release tag push (`push: tags`), resolving the image tag from
+  the tag name. Separately, the relay deploy's post-deploy check curled
+  `/version` through the deny-by-default ingress IP allowlist and always got a
+  403 (a GitHub runner isn't allowlisted); it now verifies the new revision via
+  the control plane (latest active revision `Healthy` with the deployed
+  `GIT_SHA`), matching how the web check already tolerated the allowlist. Also
+  granted the deploy identity `Container Registry Tasks Contributor` on the ACR,
+  which `az acr build` (web) requires beyond `AcrPush` (remote-control-35t).
 
 ## [1.7.2] - 2026-07-14
 

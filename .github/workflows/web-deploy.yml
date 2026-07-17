@@ -14,6 +14,14 @@ name: Web deploy
 # publishes to trigger it.
 
 on:
+  # A release published by cargo-dist is created with GITHUB_TOKEN, which by
+  # design does NOT fire `release: published` — so the tag push is what actually
+  # triggers the deploy on a real release. Same pattern as release.yml. The
+  # `release`/`workflow_dispatch` triggers stay as fallbacks (manual UI release,
+  # ad-hoc redeploy).
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
   release:
     types: [published]
   workflow_dispatch:
@@ -64,6 +72,8 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           [ -n "$TAG" ] || TAG="${{ inputs.image_tag }}"
+          # On a tag push there's no release payload — use the tag itself.
+          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then TAG="${{ github.ref_name }}"; fi
           [ -n "$TAG" ] || TAG="${GITHUB_SHA::7}"
           TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
           echo "tag=$TAG"             >> "$GITHUB_OUTPUT"
