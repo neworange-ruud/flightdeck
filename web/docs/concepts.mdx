@@ -1,0 +1,32 @@
+---
+label: Core Concepts
+order: 3
+icon: layers
+---
+
+# Core Concepts
+
+## Project
+
+A project is a Git repository open in Flightdeck. Multiple projects can remain
+open at once, and each keeps its own agent sessions and configuration.
+
+## Agent Tab
+
+An agent tab combines one task branch, one Git worktree, and one primary AI
+agent process. The agent works in the worktree while the original checkout stays
+available as the project base.
+
+## Child Terminal
+
+Open a child terminal with `Ctrl-t` when you need to inspect or run commands in
+the selected agent's worktree. It shares the worktree but is independent of the
+primary agent process.
+
+## Safety Boundary
+
+<Badge tone="success">Explicit control</Badge>
+
+Flightdeck may create branches and worktrees, report Git status, and push only
+after confirmation. It does not stage files, create commits, rewrite history, or
+automatically resolve merge conflicts.

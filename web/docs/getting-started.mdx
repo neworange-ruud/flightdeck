@@ -1,0 +1,42 @@
+---
+label: Get Started
+order: 2
+icon: rocket
+---
+
+# Get Started
+
+Install Flightdeck with Homebrew:
+
+```bash
+brew install neworange-ruud/tap/flightdeck
+```
+
+Or download the latest release for macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
+```
+
+## Start A Project
+
+Run Flightdeck from inside a Git repository:
+
+```bash
+cd path/to/your-repository
+flightdeck
+```
+
+On its first run, Flightdeck creates a `.flightdeck/` directory with project
+configuration and its runtime state. Create an agent tab with `Ctrl-n`, choose
+an available agent, and give the task a name.
+
+<Callout type="success">
+  Each agent tab receives its own branch and worktree, keeping simultaneous tasks
+  separate by default.
+</Callout>
+
+## Next Steps
+
+Read [Core Concepts](/concepts) to understand the workspace model and the safety
+boundaries Flightdeck maintains.

@@ -4,3 +4,6 @@
 .flightdeck/agent-status
 .flightdeck/runtime/
 .reference-developer-agent-container/
+/web/.next/
+/web/**/node_modules/
+/web/*.tsbuildinfo
