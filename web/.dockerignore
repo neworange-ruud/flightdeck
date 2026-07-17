@@ -1,0 +1,12 @@
+# Build context hygiene for web/Dockerfile. Keep the context small and never
+# ship host-built artifacts into the image — everything is rebuilt inside.
+node_modules
+docs-platform/node_modules
+.next
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+.git
+Dockerfile
+.dockerignore
+deploy

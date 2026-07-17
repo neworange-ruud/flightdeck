@@ -1,0 +1,86 @@
+---
+label: Notifications
+section: Desktop Guide
+order: 26
+---
+
+# Notifications
+
+FlightDeck posts a native OS notification the moment an agent finishes a task or
+needs your attention — so you can look away from a background tab and still get
+pinged when it's done.
+
+## When they fire
+
+A notification fires on the **edge** from an active state (working / starting) to
+a settled one:
+
+- **finished** — the agent went idle or completed its turn,
+- **waiting** — the agent needs input or attention,
+- **failed** — the agent errored out.
+
+Each transition notifies **once** (a quiet agent won't re-notify until it
+resumes work), and notifications are briefly suppressed at startup so resuming
+agents settling to idle don't produce a burst. Only explicit lifecycle
+transitions arm an alert — never terminal output.
+
+<Callout type="info">
+  The notification title is prefixed with the project name, e.g.
+  `myproject: fix-login`, so alerts stay unambiguous when several projects are
+  open.
+</Callout>
+
+## Settings
+
+Notifications are **on by default**. The master switch plus three per-category
+toggles and the alert sounds all default to `true`:
+
+```toml
+[notifications]
+enabled = true     # master switch
+on_finish = true   # agent went idle / completed
+on_waiting = true  # agent needs input / attention
+on_failed = true   # agent errored out
+sound = true       # distinct completion and input-required sounds
+```
+
+Change these from the [configuration manager](/desktop/configuration) or by
+editing `config.toml` in the global or a project scope. To re-enable them for a
+project that turned them off:
+
+```bash
+flightdeck setup-notifications
+```
+
+FlightDeck plays **two distinct sounds** — a completion chime and an
+input-required alert — so you can tell "done" from "needs you" without looking.
+
+## Delivery
+
+### macOS
+
+If [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) is
+installed (`brew install terminal-notifier`), FlightDeck uses it — the most
+reliable option, since it registers as a real app and prompts for permission on
+first use.
+
+Otherwise FlightDeck falls back to `osascript`, whose notifications are
+attributed to **Script Editor**. In that case, enable **System Settings →
+Notifications → Script Editor** and make sure no Focus / Do Not Disturb mode is
+active, or the banners are silently dropped.
+
+### Linux
+
+FlightDeck posts via `notify-send` (libnotify). On Debian/Ubuntu, install it
+with `sudo apt install libnotify-bin`. If `notify-send` isn't on `PATH`,
+notifications are silently dropped.
+
+### Windows
+
+Desktop notifications are a no-op on Windows.
+
+<Callout type="note">
+  Prefer to get pinged on your phone instead? The
+  [FlightDeck Remote](/remote/activity) app delivers the same finished / needs-input
+  / error events as push notifications, wherever you are.
+</Callout>

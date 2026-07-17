@@ -1,0 +1,8 @@
+{
+  "command_id": "cmd_00000002",
+  "issued_at_ms": 1752412811000,
+  "type": "permission_decision",
+  "session_id": "sess_fix_login",
+  "prompt_id": "prompt_ab12",
+  "choice": "deny"
+}

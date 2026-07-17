@@ -1,0 +1,90 @@
+---
+label: Keyboard Shortcuts
+section: Reference
+order: 60
+---
+
+# Keyboard Shortcuts
+
+The complete FlightDeck desktop shortcut reference. FlightDeck has two input
+modes — see [The Interface](/interface) for how they work. The **Mode** column
+below shows where each binding applies. When in doubt, `Ctrl-g` opens the command
+palette, which can run every action.
+
+## Global & app
+
+| Shortcut | Action | Mode |
+| --- | --- | --- |
+| `Ctrl-g` | Command palette | both |
+| `Ctrl-q` | Quit | both |
+| `?` | Help / keybindings | app |
+| `Enter` | Focus terminal | app |
+
+## Agent tabs
+
+| Shortcut | Action | Mode |
+| --- | --- | --- |
+| `Ctrl-n` | New agent session tab | app |
+| `Ctrl-k` | Close agent session tab | app |
+| `Ctrl-r` | Restart primary agent | app |
+| `Ctrl-s` | Set manual status | app |
+| `Alt-↑` / `Alt-↓` | Previous / next agent tab | both |
+| `Alt-1` … `Alt-9` | Jump to agent tab by index | both |
+| bare `↑` / `↓` | Previous / next agent tab | app |
+
+## Terminals
+
+| Shortcut | Action | Mode |
+| --- | --- | --- |
+| `Ctrl-t` | New child terminal | app |
+| `Ctrl-w` | Close child terminal | app |
+| `Ctrl-b` | Toggle split view | app |
+| `Alt-←` / `Alt-→` | Previous / next child terminal | both |
+| bare `←` / `→` | Previous / next child terminal | app |
+| `Ctrl-V` / `Cmd-V` | Paste (image-aware) | terminal |
+
+## Projects
+
+| Shortcut | Action | Mode |
+| --- | --- | --- |
+| `Shift-←` / `Shift-→` | Previous / next project | both |
+
+## Git
+
+| Shortcut | Action | Mode |
+| --- | --- | --- |
+| `Ctrl-p` | Push branch | app |
+| `Ctrl-u` | Pull base | app |
+| `Ctrl-f` | Finish / local merge | app |
+
+## Leaving terminal focus
+
+| Shortcut | Action |
+| --- | --- |
+| `Alt+Esc` (macOS) | Leave terminal focus → app mode |
+| `Shift+Esc` (Windows / Linux) | Leave terminal focus → app mode |
+| `F2` (opt-in) | Leave terminal focus, if `ui.use_f2_to_leave_terminal_focus = true` |
+
+<Callout type="note">
+  In terminal mode, `Ctrl-C` passes `0x03` to the agent (it does **not** close a
+  tab), and bare `Esc` passes through to the hosted agent. `Shift+Tab` is
+  forwarded as BackTab.
+</Callout>
+
+## Palette-only actions
+
+These have no default shortcut — run them from the command palette (`Ctrl-g`):
+
+- **Rebase Worktree**, **Abandon Worktree**
+- **Show Git Status**
+- **Open Configuration**
+- **Open Project**, **Close Project**, **Next / Previous Project**
+- **Rename Agent Session Tab**, **New Agent**, **Close Agent**, **Open Shell**
+- **Pair Phone**, **Unpair Phone**
+
+<Callout type="info">
+  Where terminals support it, FlightDeck enables the Kitty keyboard protocol so
+  modified `Esc` and `Alt`+arrow combinations are reliable. If your terminal
+  can't distinguish them, enable the **F2** binding in the
+  [configuration manager](/desktop/configuration).
+</Callout>

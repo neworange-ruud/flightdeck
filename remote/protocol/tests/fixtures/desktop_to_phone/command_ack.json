@@ -1,0 +1,6 @@
+{
+  "type": "command_ack",
+  "command_id": "cmd_c0ffee01",
+  "outcome": "applied",
+  "message": "reply delivered to fix-login"
+}

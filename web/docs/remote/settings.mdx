@@ -1,0 +1,71 @@
+---
+label: Settings & Security
+section: FlightDeck Remote
+order: 47
+---
+
+# Settings, Security & Offline
+
+The **Settings** tab is where you check the connection, lock the app, tune
+notifications, and unpair. This page also covers the security model and how the
+app behaves offline.
+
+![The Settings screen: connection card, security (Face ID, unpair), and notification toggles.](/screenshots/mobile/11-settings.png)
+
+*Settings — connection status, security, and notification controls in one place.*
+
+## Connection
+
+The **Connection** card names your paired Mac and shows the live link status with
+honest latency — *"Connected · 8ms · low latency"*, *"Connecting…"*, or
+*"Offline."* It also shows when you paired.
+
+When the link drops, a **Reconnecting** banner appears at the top of the app with
+*"Commands are paused until the link is back. Nothing is sent blind."* After a
+sustained outage it adds *"Still trying — is FlightDeck running on your Mac?"*
+
+## App lock (Face ID)
+
+Turn on **Require Face ID to open** in the Security section to gate the whole app
+behind biometrics. When enabled, a lock screen covers everything on launch and
+after the app has been backgrounded.
+
+![The app lock screen requiring Face ID before revealing the app.](/screenshots/mobile/12-app-lock.png)
+
+*Optional Face ID lock — an extra gate on top of pairing.*
+
+<Callout type="note">
+  App lock uses device authentication with a **passcode fallback**, and it
+  **fails open** if your device has no passcode set at all — so it can never
+  brick you out of the app. It's independent of pairing.
+</Callout>
+
+## Notifications
+
+The Security card is followed by the notification controls covered in
+[Activity & Notifications](/remote/activity): the three independent toggles
+(**Agent needs input**, **Agent finished**, **Completion chime**) and the
+per-project **Mute by project** list.
+
+## Unpair
+
+**Unpair this device** (in red) disconnects the phone from your Mac after a
+confirmation. You'll return to the [pairing screen](/remote/pairing) and need to
+pair again to reconnect.
+
+## The security model
+
+- Your device holds an **identity keypair** whose private key lives in the iOS
+  Keychain / Secure Enclave and never leaves the phone.
+- All traffic between phone and Mac is **end-to-end encrypted**; the hosted relay
+  routes opaque ciphertext by pairing ID and cannot read it.
+- **Pairing** is the moment of trust — after it, your phone can send commands
+  that run on your Mac, so only pair with a code/QR you can see on your own
+  machine.
+
+## Offline behavior
+
+When disconnected, the app shows your **cached last-known snapshot and
+transcripts, read-only**, behind a muted *"Showing last-known state — offline"*
+banner (distinct from the louder Reconnecting banner). No commands are sent while
+offline — reads stay available, but every action waits for the link to return.

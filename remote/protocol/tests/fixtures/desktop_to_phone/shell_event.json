@@ -1,0 +1,10 @@
+{
+  "type": "shell_event",
+  "session_id": "sess_fix_login",
+  "shell_id": "shell_01",
+  "kind": {
+    "type": "opened",
+    "cols": 80,
+    "rows": 24
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "type": "hello",
+  "protocol_version": 1,
+  "role": "phone",
+  "device_id": "dev_9f3a1c",
+  "client": {
+    "app_version": "1.0.0",
+    "platform": "ios",
+    "os_version": "18.2"
+  }
+}

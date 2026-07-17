@@ -16,10 +16,60 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   terminal window closed). Each agent's session is pinned per tab, so multiple
   agents in one worktree each resume their own. Controlled by `ui.auto_continue`
   (default on); set it to `false` to always start fresh.
+- **FlightDeck Remote** — pair a phone to your desktop over an end-to-end-encrypted
+  relay to monitor and control your agent sessions from anywhere. Pair from
+  Settings → Remote by scanning a QR code or entering a 4-digit code; from the
+  iOS app you can then:
+  - **Monitor** your projects and agent sessions with rolled-up status and
+    plain-language summaries.
+  - **Chat with agents** through a cleaned-up transcript — reply, follow up, and
+    approve or deny permission prompts inline, with hold-to-talk voice dictation
+    and an eyes-free Focus mode for hands-free approvals.
+  - **Open a live shell** into a session, with ANSI colours, scrollback, and an
+    accessory key bar.
+  - **Run guarded git actions** — pull base, merge back, and abandon worktree
+    (push/PR stay the agent's job).
+  - **Control sessions** — start, restart, or close agents and set a manual
+    status override.
+  - **Get push notifications** when an agent needs input or finishes, deep-linking
+    straight to the agent.
+
+  Connection state is shown honestly: commands pause while reconnecting (nothing
+  is sent blind), and a cached read-only view stays available offline, clearly
+  marked stale. The relay runs on Azure Container Apps behind a stable custom
+  domain (`wss://relay.flightdeckai.app/ws`). Push notifications on device require
+  an Apple APNs auth key + signing team.
+- Add a Next.js documentation site under `web/`, including a Flightdeck landing
+  page and MDX documentation at `/docs`.
+- Write the full documentation content for the site: an Overview and Core
+  Concepts, a Get Started section (install, first run, interface tour), an
+  in-depth Desktop Guide (agent tabs & worktrees, agents, terminals & split
+  view, the Git workflow, multiple projects, configuration, notifications,
+  containers, and the CLI), a FlightDeck Remote (iOS) guide (pairing, monitoring,
+  chat/focus/voice, session control, shell, activity & notifications, settings &
+  security), and a Reference section (keyboard shortcuts, configuration
+  reference, troubleshooting). Every page is illustrated: iOS screenshots are
+  generated from the app in the Simulator, and desktop screenshots use the main
+  layout capture plus branded placeholders for shots that still need to be taken.
 
 ### Improvements
 
-- None yet.
+- Rebuild the `web/` landing page into a full marketing home page: hero, a real
+  desktop screenshot, the "one tab = one worktree = one branch = one agent"
+  mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
+  and Windows.
+- Docs site: the sidebar navigation now groups pages into labelled sections
+  (via a `section` frontmatter field), and Previous/Next links follow the
+  navigation order rather than filesystem order.
+- Deploy the `web/` app (landing page + docs) to Azure Container Apps as a
+  separate Container App sharing the relay's resource group, registry, and
+  environment, behind the same deny-by-default IP allowlist as the relay.
+  Served on `https://www.flightdeckai.app` (a subdomain gets an auto-renewing
+  managed TLS cert via CNAME validation, which works behind the allowlist); the
+  apex `flightdeckai.app` 301-redirects to www at the registrar. Added
+  `web/Dockerfile` (Next.js standalone), `web/deploy/{setup,bind-custom-domain}.sh`,
+  and a release-triggered `web-deploy.yml` GitHub Actions workflow (GitHub-OIDC,
+  no stored Azure secret).
 
 ### Bug fixes
 
@@ -40,6 +90,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   a dedicated thread so the loop always notices the shutdown signal instead of
   hanging on crossterm's EOF busy-loop; state is persisted before the terminal is
   restored; and the cursor-restore is made panic-safe on a dead tty.
+- CI ran the entire cross-platform matrix twice per commit on feature branches:
+  the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
+  commit under different refs, so their concurrency groups never collided and both
+  full runs proceeded in parallel — doubling runner minutes and PR check entries.
+  `push` is now scoped to `main` only (PRs own feature-branch CI) and the
+  concurrency key uses `head_ref`; the Relay workflow got the same fix
+  (remote-control-dwb).
 
 ## [1.7.2] - 2026-07-14
 

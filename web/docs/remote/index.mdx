@@ -1,0 +1,76 @@
+---
+label: Remote Overview
+section: FlightDeck Remote
+order: 40
+---
+
+# FlightDeck Remote
+
+**FlightDeck Remote** is the companion iOS app for FlightDeck. Pair it to your
+Mac and you can watch every agent, answer their questions, run a shell, and
+drive guarded Git actions — from your phone, wherever you are.
+
+![The FlightDeck Remote projects screen and an agent conversation on iPhone.](/screenshots/mobile/02-projects-list.png) ![An agent conversation with a live permission prompt.](/screenshots/mobile/07-agent-chat.png)
+
+*FlightDeck Remote — your agent fleet in your pocket.*
+
+<Callout type="info">
+  FlightDeck Remote is **iPhone-only** and requires **iOS 18 or later**. It has
+  a dark, mission-control look throughout.
+</Callout>
+
+## What you can do from your phone
+
+- **Monitor** — see every project and agent, their status, and Git state at a
+  glance; get [push notifications](/remote/activity) when an agent finishes or
+  needs you.
+- **Chat** — read a cleaned-up transcript, reply, and approve or deny permission
+  prompts inline — including hands-free in [Focus mode](/remote/chat).
+- **Control** — [start new agents](/remote/control), restart them, set a manual
+  status, and run guarded Git actions (pull base, merge back, abandon).
+- **Shell** — open a [live terminal](/remote/shell) in any worktree with an
+  on-screen key bar.
+
+## How it connects
+
+Your phone never talks to your Mac directly. Both connect to a **hosted relay**,
+and everything between them is **end-to-end encrypted**: the relay only routes
+opaque ciphertext by pairing ID and never holds the keys to read it.
+
+<Callout type="success">
+  Pairing is the trust step — it establishes the encrypted channel between your
+  phone and your Mac. Your device's private key lives in the iOS Keychain /
+  Secure Enclave and never leaves the phone.
+</Callout>
+
+To use it you'll:
+
+1. **Enable Remote on the desktop** — it's off by default. Set `enabled = true`
+   under `[remote]` in your FlightDeck config, or run *Pair Phone* from the
+   command palette.
+2. **[Pair your phone](/remote/pairing)** — scan a QR code or type a 4-digit
+   code.
+
+## Start here
+
+<CardGrid>
+  <Card href="/remote/pairing" title="Pair Your Phone">
+    Connect the app to your Mac over the encrypted relay.
+  </Card>
+  <Card href="/remote/monitoring" title="Monitor Projects & Sessions">
+    Read the projects list, session rows, status pills, and Git indicators.
+  </Card>
+  <Card href="/remote/chat" title="Chat, Focus & Voice">
+    Reply to agents, resolve permission prompts, and go hands-free.
+  </Card>
+  <Card href="/remote/control" title="Control Sessions">
+    Start, restart, and manage agents and their worktrees.
+  </Card>
+</CardGrid>
+
+## What's not on the phone (v1)
+
+Pushing branches and opening PRs stay on the desktop / your agent (the app holds
+no GitHub token). Also out of scope for v1: multiple Macs from one phone,
+several side-by-side shells, and full-screen terminal UIs (vim, top). Agents only
+run while FlightDeck is running on your Mac.

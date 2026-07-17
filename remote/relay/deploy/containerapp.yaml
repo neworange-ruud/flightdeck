@@ -1,0 +1,105 @@
+# Azure Container Apps deployment descriptor for the FlightDeck Remote relay.
+#
+# This is a reference/documentation artifact for the scaffold task — nothing
+# in this repo runs `az` against it. See `deploy/README.md` for the one-time
+# `az` commands that create the surrounding resources (resource group, ACR,
+# Container Apps environment) and the deploy command that applies this file:
+#
+#   az containerapp create \
+#     --resource-group <RESOURCE_GROUP> \
+#     --name flightdeck-relay \
+#     --yaml deploy/containerapp.yaml
+#
+# (or `az containerapp update --yaml ...` for subsequent revisions).
+#
+# Placeholders (angle-bracket UPPER_CASE) must be filled in before use; see
+# the README for what each one is.
+
+location: <AZURE_REGION>
+name: flightdeck-relay
+resourceGroup: <RESOURCE_GROUP>
+type: Microsoft.App/containerApps
+properties:
+  managedEnvironmentId: <MANAGED_ENVIRONMENT_RESOURCE_ID>
+
+  configuration:
+    activeRevisionsMode: Single
+
+    # HTTP ingress; `auto` transport negotiates HTTP/1.1 or HTTP/2 and
+    # supports WebSocket upgrades over either, so `/ws` works without any
+    # extra ingress configuration. TLS termination happens at the ingress
+    # point — the app itself only ever speaks plain HTTP/WS on targetPort.
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: auto
+      allowInsecure: false
+
+    # Pulls from the ACR created in the README's one-time setup. Container
+    # Apps' managed identity + ACR integration (configured at environment
+    # creation, or via `az containerapp registry set`) is the intended auth
+    # path — no registry password lives in this file.
+    registries:
+      - server: <ACR_LOGIN_SERVER>
+        identity: system
+
+  template:
+    containers:
+      - name: flightdeck-relay
+        image: <ACR_LOGIN_SERVER>/flightdeck-relay:<TAG>
+        env:
+          # PORT must match `configuration.ingress.targetPort` above.
+          - name: PORT
+            value: "8080"
+          - name: LOG_FORMAT
+            value: json
+          # Set per-revision by CI (e.g. from `github.sha`); see
+          # .github/workflows/relay.yml. Falls back to "unknown" if absent.
+          - name: GIT_SHA
+            value: <GIT_SHA>
+          # RUST_LOG is left unset here to take the crate's `info` default;
+          # override per-environment if more verbosity is needed.
+
+        resources:
+          # Smallest valid Container Apps combo (Consumption profile requires
+          # memory Gi == 2 × vCPU). The relay is a thin ciphertext forwarder
+          # with negligible compute; this is what the live app runs. Revisit
+          # only if a persistent store / higher pairing volume lands.
+          cpu: 0.25
+          memory: 0.5Gi
+
+        # Liveness/readiness probes wired to the scaffold's health surface
+        # (see `src/handlers.rs`). Startup uses the liveness path with a more
+        # patient schedule so a slow cold start isn't mistaken for a crash.
+        probes:
+          - type: Startup
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 10
+          - type: Liveness
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 3
+          - type: Readiness
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+
+    # Per PRD §9.1: desktop keeps a long-lived outbound connection and phones
+    # connect in, so the relay is never truly idle while any pairing is
+    # active. minReplicas: 1 avoids cold-start on every reconnect.
+    # maxReplicas: 1 is REQUIRED, not conservative: routing state lives in
+    # process memory (store::InMemoryStore), so a pairing's two legs must land
+    # on the same replica. A second replica would silently break routing for
+    # any pairing split across them. Lifting this needs a shared/externalized
+    # RelayStore (Redis / Azure Table) first — see store.rs and the README.
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
