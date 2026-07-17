@@ -81,6 +81,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- Add agent-harness project skills under `.agents/skills/` capturing FlightDeck's
+  recurring conventions (shipping/definition-of-done, cross-platform parity,
+  the trait-seam architecture and git safety boundary, and config conventions),
+  plus a fast-check `Stop` hook that runs `cargo fmt --check` and `cargo clippy`
+  when Rust files change. Developer tooling only — no change to the shipped app.
 - Keep `Alt+Esc` (macOS) and `Shift+Esc` (Windows/Linux) as the default way to
   leave terminal focus, with an optional **F2** binding for terminals that
   cannot distinguish modified Esc. The F2 preference is available in the
