@@ -294,6 +294,27 @@ impl RelaySocket {
             }
         }
     }
+
+    /// Set the read timeout on the *actual* TCP socket tungstenite reads from.
+    ///
+    /// This must go through the live stream handle rather than a `try_clone()`d
+    /// descriptor: `SO_RCVTIMEO` is shared across dup'd descriptors on Unix but
+    /// not across a Windows `WSADuplicateSocket` handle, so retiming a clone left
+    /// the pump reading at the 10s handshake timeout on Windows — making dropped
+    /// connections take ~10s to notice and reconnects miss their deadline.
+    fn set_read_timeout(&self, dur: Duration) {
+        let _ = match self {
+            RelaySocket::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
+            #[cfg(not(windows))]
+            RelaySocket::Tls(ws) => match ws.get_ref() {
+                tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(dur)),
+                tungstenite::stream::MaybeTlsStream::Rustls(s) => {
+                    s.sock.set_read_timeout(Some(dur))
+                }
+                _ => Ok(()),
+            },
+        };
+    }
 }
 
 /// Serialize a relay frame and write it as a WebSocket text message.
@@ -364,14 +385,10 @@ fn connect(url: &str) -> Result<RelaySocket, String> {
 
     let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("tcp connect failed: {e}"))?;
+    // Generous read timeout for the (blocking) WebSocket upgrade; tightened to
+    // the pump's poll cadence on the live socket once the handshake completes.
     tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
     tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-    // A second handle onto the same socket: SO_RCVTIMEO is a socket-level option
-    // shared by dup'd descriptors, so tightening it here retimes tungstenite's
-    // reads after we hand it the original stream.
-    let ctl = tcp
-        .try_clone()
-        .map_err(|e| format!("socket clone failed: {e}"))?;
 
     let sock = if secure {
         #[cfg(not(windows))]
@@ -390,7 +407,7 @@ fn connect(url: &str) -> Result<RelaySocket, String> {
         RelaySocket::Plain(Box::new(ws))
     };
 
-    ctl.set_read_timeout(Some(READ_POLL)).ok();
+    sock.set_read_timeout(READ_POLL);
     Ok(sock)
 }
 

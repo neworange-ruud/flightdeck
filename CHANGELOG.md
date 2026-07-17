@@ -137,6 +137,19 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   reads under bounded timeouts (`accept_within`), so a client that stops
   reconnecting can never hang the worker, and both the CI `test` and `fmt` jobs
   carry an explicit `timeout-minutes` backstop (remote-control-942).
+- Windows CI is green again: three remote tests failed only on `windows-latest`
+  (previously hidden behind the 6-hour hang above). (1) The e2e crypto
+  vectors-lock test compared a file read verbatim against `\n`-joined output, but
+  GitHub's Windows runners set `core.autocrlf=true` and rewrote the LF fixture to
+  CRLF on checkout — a `.gitattributes` now pins the fixtures to their exact
+  bytes. (2) The relay client set its 100 ms pump read-timeout on a `try_clone()`d
+  socket handle; `SO_RCVTIMEO` is shared across dup'd descriptors on Unix but not
+  across a Windows duplicated socket, so the pump read at the 10 s handshake
+  timeout and dropped connections took ~10 s to notice — the timeout is now set on
+  the live socket tungstenite owns, so reconnects are prompt on every platform.
+  (3) The auth-failure test's 2 s deadline didn't allow for the fresh-desktop
+  `PENDING_OFFER_WAIT` (~1 s) plus Windows connect latency; widened to 5 s
+  (remote-control-n55).
 - CI ran the entire cross-platform matrix twice per commit on feature branches:
   the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
   commit under different refs, so their concurrency groups never collided and both

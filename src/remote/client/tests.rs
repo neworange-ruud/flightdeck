@@ -324,7 +324,10 @@ fn auth_failure_reports_disconnected_and_never_connected() {
 
     let mut connected = false;
     let mut disconnected = false;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The empty store makes this a fresh-desktop connect, which waits
+    // PENDING_OFFER_WAIT (~1s) for a pairing request before it sends auth; add
+    // headroom for that plus connect/handshake latency on slower (Windows) CI.
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(msg) = in_rx.recv_timeout(Duration::from_millis(250)) {
             match msg {
