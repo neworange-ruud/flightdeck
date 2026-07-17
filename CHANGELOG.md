@@ -74,6 +74,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- FlightDeck Remote command palette now gates the two pairing actions by the
+  live pairing state: "Pair Phone" is hidden once a phone is paired, and "Unpair
+  Phone" only appears when a pairing actually exists (persisted at startup or
+  established this session) — so you can never try to pair an already-paired
+  desktop or unpair nothing (remote-control-x9o).
 - FlightDeck Remote relay is now hosted on Azure Container Apps: a single small
   always-on instance (0.25 vCPU / 0.5 GiB,
   `maxReplicas: 1` because routing state is in-process) pulling from Azure

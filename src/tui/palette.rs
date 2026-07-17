@@ -221,12 +221,37 @@ pub struct CommandPalette {
     filter: String,
     /// The selected index within the current filtered results.
     selected: usize,
+    /// Whether a phone is currently paired (FlightDeck Remote). Gates the two
+    /// Remote entries: "Pair Phone" is hidden while paired, and "Unpair Phone"
+    /// is hidden while unpaired (there is nothing to forget). Defaults to
+    /// `false` (unpaired) so an un-configured palette offers pairing.
+    is_paired: bool,
 }
 
 impl CommandPalette {
-    /// Create an empty, unfiltered palette with no selection.
+    /// Create an empty, unfiltered palette with no selection (unpaired).
     pub fn new() -> Self {
         CommandPalette::default()
+    }
+
+    /// Set whether a phone is paired, which decides the visibility of the two
+    /// Remote entries (see [`CommandPalette::is_paired`]). Resets the selection
+    /// so it can never point past the (possibly shorter) filtered list.
+    pub fn set_paired(&mut self, is_paired: bool) {
+        self.is_paired = is_paired;
+        self.selected = 0;
+    }
+
+    /// Whether an entry is visible given the current pairing state. Only the
+    /// two Remote entries are state-dependent; everything else is always shown.
+    fn entry_visible(&self, entry: &PaletteEntry) -> bool {
+        match entry.action {
+            // Cannot pair a phone that is already paired.
+            PaletteAction::PairPhone => !self.is_paired,
+            // Nothing to unpair unless a pairing exists.
+            PaletteAction::UnpairPhone => self.is_paired,
+            _ => true,
+        }
     }
 
     /// The current filter text.
@@ -258,11 +283,14 @@ impl CommandPalette {
         self.selected = 0;
     }
 
-    /// The filtered list of matching entries (case-insensitive substring match).
+    /// The filtered list of matching entries (case-insensitive substring
+    /// match), with the state-gated Remote entries (Pair/Unpair) hidden when
+    /// they do not apply to the current pairing state.
     pub fn filtered(&self) -> Vec<&'static PaletteEntry> {
         let needle = self.filter.to_lowercase();
         ALL_ENTRIES
             .iter()
+            .filter(|e| self.entry_visible(e))
             .filter(|e| needle.is_empty() || e.label.to_lowercase().contains(&needle))
             .collect()
     }
@@ -411,8 +439,60 @@ mod tests {
 
     #[test]
     fn filter_empty_shows_all() {
+        // A fresh (unpaired) palette shows every action except "Unpair Phone",
+        // which is gated behind an existing pairing.
         let palette = CommandPalette::new();
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT);
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+    }
+
+    #[test]
+    fn unpaired_hides_unpair_shows_pair() {
+        let palette = CommandPalette::new(); // default: not paired
+        let labels: Vec<&str> = palette.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Pair Phone"), "pairing must be offered");
+        assert!(
+            !labels.contains(&"Unpair Phone"),
+            "nothing to unpair when unpaired"
+        );
+    }
+
+    #[test]
+    fn paired_hides_pair_shows_unpair() {
+        let mut palette = CommandPalette::new();
+        palette.set_paired(true);
+        let labels: Vec<&str> = palette.filtered().iter().map(|e| e.label).collect();
+        assert!(
+            !labels.contains(&"Pair Phone"),
+            "cannot pair when already paired"
+        );
+        assert!(labels.contains(&"Unpair Phone"), "unpair must be offered");
+        // Exactly one of the two Remote entries is visible in either state.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+    }
+
+    #[test]
+    fn set_paired_resets_selection() {
+        let mut palette = CommandPalette::new();
+        palette.select_next();
+        palette.select_next();
+        assert_eq!(palette.selected_index(), 2);
+        palette.set_paired(true);
+        assert_eq!(palette.selected_index(), 0);
+    }
+
+    #[test]
+    fn selecting_unpair_while_paired_dispatches_unpair() {
+        let mut palette = CommandPalette::new();
+        palette.set_paired(true);
+        palette.set_filter("Unpair Phone");
+        assert_eq!(palette.selected_action(), Some(&PaletteAction::UnpairPhone));
+        // While paired, "Pair Phone" is never among the selectable entries
+        // (note: the "pair phone" substring also matches "Unpair Phone").
+        palette.set_filter("Pair Phone");
+        assert!(palette
+            .filtered()
+            .iter()
+            .all(|e| e.action != PaletteAction::PairPhone));
     }
 
     #[test]
@@ -435,14 +515,15 @@ mod tests {
     #[test]
     fn navigation_wraps() {
         let mut palette = CommandPalette::new();
+        let last = palette.filtered().len() - 1;
         // At end, next wraps to 0.
-        palette.selected = REQUIRED_ACTION_COUNT - 1;
+        palette.selected = last;
         palette.select_next();
         assert_eq!(palette.selected_index(), 0);
 
         // At start, prev wraps to last.
         palette.select_prev();
-        assert_eq!(palette.selected_index(), REQUIRED_ACTION_COUNT - 1);
+        assert_eq!(palette.selected_index(), last);
     }
 
     #[test]
@@ -482,7 +563,8 @@ mod tests {
 
         palette.clear_filter();
         assert_eq!(palette.filter(), "");
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT);
+        // Unpaired: all actions except the pairing-gated "Unpair Phone".
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
     }
 
     #[test]

@@ -906,6 +906,12 @@ struct Ui {
     pending_pair: bool,
     /// Set by confirming "Remote: Unpair"; the event loop forgets the pairing.
     pending_unpair: bool,
+    /// Whether a phone is currently paired (FlightDeck Remote). Refreshed each
+    /// tick from the live relay bridge + the persisted startup pairing, and read
+    /// when opening the command palette so "Pair Phone" / "Unpair Phone" are
+    /// gated by the actual pairing state (a `RemoteBridge` this UI cannot borrow
+    /// directly). `false` whenever remote is disabled.
+    remote_paired: bool,
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -1224,6 +1230,15 @@ fn event_loop(
     // the remote bridge exists, so disabled-remote behaviour is unchanged.
     let mut remote_ledger = CommandLedger::new();
     let mut remote_first_tasks: Vec<PendingFirstTask> = Vec::new();
+    // Whether a phone pairing was persisted at startup and has not been
+    // forgotten this session. `RemoteBridge::is_paired()` only turns true once
+    // the phone reconnects, so this keeps "Unpair Phone" available (and "Pair
+    // Phone" gated) for a configured-but-currently-absent phone. Cleared on
+    // unpair and on a relay-side pairing rejection.
+    let mut remote_has_persisted_pairing = remote_setup
+        .as_ref()
+        .map(|s| s.established.is_some())
+        .unwrap_or(false);
 
     loop {
         let now_ms = env.clock.now_millis();
@@ -1334,6 +1349,7 @@ fn event_loop(
                         // user a clear, actionable state instead of a silent,
                         // endless "reconnecting" (remote-control-1jy).
                         pairing_session = None;
+                        remote_has_persisted_pairing = false;
                         if matches!(ui.overlay, UiOverlay::Remote(_)) {
                             ui.overlay = UiOverlay::None;
                         }
@@ -1386,6 +1402,19 @@ fn event_loop(
         if tick == 0 && autopair_hint.is_some() && remote_setup.is_some() {
             ui.pending_pair = true;
         }
+
+        // A confirmed unpair (handled by `drive_pairing_overlay` below) forgets
+        // the pairing, so drop the persisted flag before it is consumed.
+        if ui.pending_unpair {
+            remote_has_persisted_pairing = false;
+        }
+        // Refresh the palette's pairing gate: paired iff the live bridge has an
+        // active pairing or a persisted one is still configured this session.
+        ui.remote_paired = remote_bridge
+            .as_ref()
+            .map(|b| b.is_paired())
+            .unwrap_or(false)
+            || remote_has_persisted_pairing;
 
         // --- Desktop pairing surface (Settings → Remote): start an offer, keep
         //     the overlay in sync with the pairing session, and handle unpair. ---
@@ -2908,7 +2937,12 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             Ok(false)
         }
         KeyAction::OpenPalette => {
-            ui.palette = Some(CommandPalette::new());
+            let mut palette = CommandPalette::new();
+            // Gate the Remote entries by the live pairing state: hide "Pair
+            // Phone" when already paired and "Unpair Phone" when there is no
+            // pairing to forget.
+            palette.set_paired(ui.remote_paired);
+            ui.palette = Some(palette);
             Ok(false)
         }
         KeyAction::OpenHelp => {
