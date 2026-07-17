@@ -13,6 +13,13 @@
 //! and drives the capabilities. See `tests/e2e/support/*` for the building
 //! blocks and their own module tests.
 
+// The Tier A E2E suite stands up the real desktop against a bash-built fixture
+// repo (scripts/e2e/make-fixture-project.sh + fake-agent.sh) driven under a PTY.
+// GitHub's windows-latest runners have no bash/WSL, so the whole suite — and the
+// support module it pulls in — is Unix-only; ubuntu + macos provide the coverage
+// (the relay itself is Linux-deployed, exercised further by the Relay workflow).
+#![cfg(not(windows))]
+
 #[path = "e2e/support/mod.rs"]
 mod support;
 

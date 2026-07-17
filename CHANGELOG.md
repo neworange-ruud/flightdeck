@@ -148,8 +148,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   timeout and dropped connections took ~10 s to notice — the timeout is now set on
   the live socket tungstenite owns, so reconnects are prompt on every platform.
   (3) The auth-failure test's 2 s deadline didn't allow for the fresh-desktop
-  `PENDING_OFFER_WAIT` (~1 s) plus Windows connect latency; widened to 5 s
-  (remote-control-n55).
+  `PENDING_OFFER_WAIT` (~1 s) plus Windows connect latency; widened to 5 s.
+  (4) The Tier A remote E2E suite (`tests/remote_e2e.rs`) builds its fixture repo
+  with a bash script and drives the real desktop under a PTY; `windows-latest`
+  has no bash/WSL, so the suite is now gated `#![cfg(not(windows))]` — ubuntu and
+  macos provide its coverage (remote-control-n55).
 - CI ran the entire cross-platform matrix twice per commit on feature branches:
   the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
   commit under different refs, so their concurrency groups never collided and both
