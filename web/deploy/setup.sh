@@ -49,15 +49,24 @@ echo "==> Building $IMAGE via ACR cloud build"
 
 PULL_ID_RID=$(az identity show -g "$RG" -n "$PULL_ID" --query id -o tsv)
 
+# Resolve the freshly-built tag to its immutable digest and always deploy BY
+# DIGEST. Deploying by a moving tag like :latest lets Container Apps reuse a
+# cached image for a new revision (the tag string is unchanged), so a rebuild
+# silently keeps serving the old bits. The digest changes every build => a real
+# pull every time.
+DIGEST=$(az acr repository show -n "$ACR" --image "$IMAGE_REPO:$TAG" --query digest -o tsv)
+IMAGE_PINNED="$ACR.azurecr.io/$IMAGE_REPO@$DIGEST"
+echo "==> Deploying by digest: $IMAGE_PINNED"
+
 # 2. Create the app if absent, else update its image. Stateless => it may scale
 #    out; min 1 keeps the public page warm (no cold start), max 3 gives headroom.
 if az containerapp show -g "$RG" -n "$APP" >/dev/null 2>&1; then
-  echo "==> Updating existing app $APP to $IMAGE"
-  az containerapp update -g "$RG" -n "$APP" --image "$IMAGE" -o none
+  echo "==> Updating existing app $APP"
+  az containerapp update -g "$RG" -n "$APP" --image "$IMAGE_PINNED" -o none
 else
   echo "==> Creating app $APP"
   az containerapp create -g "$RG" -n "$APP" --environment "$ENVNAME" \
-    --image "$IMAGE" \
+    --image "$IMAGE_PINNED" \
     --user-assigned "$PULL_ID_RID" \
     --registry-server "$ACR.azurecr.io" --registry-identity "$PULL_ID_RID" \
     --target-port 8080 --ingress external --transport auto \

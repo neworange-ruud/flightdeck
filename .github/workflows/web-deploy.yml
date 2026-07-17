@@ -89,7 +89,11 @@ jobs:
             --image "flightdeck-web:${{ steps.meta.outputs.tag }}" \
             --image "flightdeck-web:${{ steps.meta.outputs.sha }}" \
             --file Dockerfile .
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          # Deploy BY DIGEST: a moving tag lets Container Apps reuse a cached
+          # image for the new revision, silently serving stale bits.
+          DIGEST=$(az acr repository show -n "$ACR" \
+            --image "flightdeck-web:${{ steps.meta.outputs.tag }}" --query digest -o tsv)
+          echo "IMAGE=$ACR.azurecr.io/flightdeck-web@$DIGEST" >> "$GITHUB_ENV"
 
       - name: Deploy revision
         run: |
