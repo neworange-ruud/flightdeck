@@ -3,9 +3,12 @@ name: Relay
 # The relay lives in its own Cargo workspace (`remote/`), independent of the
 # root `flightdeck` crate — only run this workflow when something under
 # `remote/` (or this workflow file itself) actually changed.
+# Push on main only (post-merge); PRs own feature-branch CI. Running push on
+# `flightdeck/**` too would double every run (push ref vs pull_request ref never
+# share a concurrency group). See ci.yml for the same rationale.
 on:
   push:
-    branches: ["main", "flightdeck/**"]
+    branches: ["main"]
     paths:
       - "remote/**"
       - ".github/workflows/relay.yml"
@@ -15,7 +18,7 @@ on:
       - ".github/workflows/relay.yml"
 
 concurrency:
-  group: relay-${{ github.workflow }}-${{ github.ref }}
+  group: relay-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:

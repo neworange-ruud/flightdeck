@@ -66,6 +66,48 @@ impl RemoteStore for MemStore {
 
 type Ws = WebSocket<TcpStream>;
 
+/// How long a mock worker waits for the next client connection before giving up.
+/// A test that self-heals (or otherwise stops the client) connects fewer times
+/// than a reject/accept loop offers; the surplus `accept()` calls must time out
+/// rather than park `mock.join()` forever. Comfortably longer than the client's
+/// pre-self-heal backoff gaps (≤~3s) so it never fires mid-test.
+const MOCK_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read timeout applied to every accepted mock socket, so a `ws.read()` against
+/// a connected-but-silent client can never block forever either.
+const MOCK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Accept one connection within [`MOCK_ACCEPT_TIMEOUT`], returning `None` if none
+/// arrives (the client has stopped reconnecting). The accepted stream is put back
+/// into blocking mode with [`MOCK_READ_TIMEOUT`] so no downstream read can hang.
+fn accept_within(listener: &TcpListener) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on mock listener");
+    let deadline = Instant::now() + MOCK_ACCEPT_TIMEOUT;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    };
+    // Accepted sockets don't inherit the listener's nonblocking flag on any
+    // supported platform, but set it explicitly so the read timeout applies.
+    stream
+        .set_nonblocking(false)
+        .expect("clear nonblocking on accepted mock stream");
+    stream
+        .set_read_timeout(Some(MOCK_READ_TIMEOUT))
+        .expect("set read timeout on accepted mock stream");
+    Some(stream)
+}
+
 /// Blocking read of the next relay frame from the mock's socket.
 fn ws_recv(ws: &mut Ws) -> Option<RelayFrame> {
     loop {
@@ -135,7 +177,7 @@ fn happy_path_auth_resume_ack_and_echo() {
     let pubkey = identity.public_key_x963().to_vec();
 
     let mock = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_within(&listener).expect("client should connect");
         let mut ws = tungstenite::accept(stream).unwrap();
         assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
 
@@ -236,7 +278,10 @@ fn auth_failure_reports_disconnected_and_never_connected() {
     let identity = DeviceIdentity::generate();
 
     let mock = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let stream = match accept_within(&listener) {
+            Some(s) => s,
+            None => return,
+        };
         let mut ws = tungstenite::accept(stream).unwrap();
         if !matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })) {
             return;
@@ -309,9 +354,9 @@ fn reconnects_after_socket_drop() {
     let mock = std::thread::spawn(move || {
         // Accept twice: authenticate, then drop the socket to force a reconnect.
         for _ in 0..2 {
-            let (stream, _) = match listener.accept() {
-                Ok(s) => s,
-                Err(_) => return,
+            let stream = match accept_within(&listener) {
+                Some(s) => s,
+                None => return,
             };
             let mut ws = tungstenite::accept(stream).unwrap();
             if !mock_authenticate(&mut ws, &pubkey, &[]) {
@@ -379,11 +424,13 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
 
     let mock = std::thread::spawn(move || {
         // Reject every connect. More accepts than the threshold so timing/
-        // jitter can never starve the test of a rejection.
+        // jitter can never starve the test of a rejection; the client self-heals
+        // after THRESHOLD rejections and stops, so the surplus accepts simply
+        // time out via `accept_within` rather than parking `mock.join()` forever.
         for _ in 0..(AUTH_REJECT_REOFFER_THRESHOLD + 3) {
-            let (stream, _) = match listener.accept() {
-                Ok(s) => s,
-                Err(_) => return,
+            let stream = match accept_within(&listener) {
+                Some(s) => s,
+                None => return,
             };
             let mut ws = match tungstenite::accept(stream) {
                 Ok(ws) => ws,

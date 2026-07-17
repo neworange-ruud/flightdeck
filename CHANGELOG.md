@@ -128,6 +128,22 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- CI no longer stalls a runner for hours on a hung test. The remote client's
+  mock-relay test `repeated_auth_rejection_drops_stale_pairing_and_signals_repair`
+  looped `accept()` more times than the client connects (it self-heals after
+  `AUTH_REJECT_REOFFER_THRESHOLD` rejections, then stops), so the surplus blocking
+  `accept()` calls — and the final `mock.join()` — parked forever, running the
+  `test` job to GitHub's 360-minute default. The mock harness now accepts and
+  reads under bounded timeouts (`accept_within`), so a client that stops
+  reconnecting can never hang the worker, and both the CI `test` and `fmt` jobs
+  carry an explicit `timeout-minutes` backstop (remote-control-942).
+- CI ran the entire cross-platform matrix twice per commit on feature branches:
+  the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
+  commit under different refs, so their concurrency groups never collided and both
+  full runs proceeded in parallel — doubling runner minutes and PR check entries.
+  `push` is now scoped to `main` only (PRs own feature-branch CI) and the
+  concurrency key uses `head_ref`; the Relay workflow got the same fix
+  (remote-control-dwb).
 - FlightDeck Remote iOS `PairingDefaults.relayURL` pointed at a placeholder
   domain (`wss://relay.flightdeck.app/v1`) that does not resolve (NXDOMAIN), so
   manual 4-digit-code pairing (and any reconnect using that default) could never
