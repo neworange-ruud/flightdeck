@@ -33,10 +33,26 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   an Apple APNs auth key + signing team.
 - Add a Next.js documentation site under `web/`, including a Flightdeck landing
   page and MDX documentation at `/docs`.
+- Write the full documentation content for the site: an Overview and Core
+  Concepts, a Get Started section (install, first run, interface tour), an
+  in-depth Desktop Guide (agent tabs & worktrees, agents, terminals & split
+  view, the Git workflow, multiple projects, configuration, notifications,
+  containers, and the CLI), a FlightDeck Remote (iOS) guide (pairing, monitoring,
+  chat/focus/voice, session control, shell, activity & notifications, settings &
+  security), and a Reference section (keyboard shortcuts, configuration
+  reference, troubleshooting). Every page is illustrated: iOS screenshots are
+  generated from the app in the Simulator, and desktop screenshots use the main
+  layout capture plus branded placeholders for shots that still need to be taken.
 
 ### Improvements
 
-- None yet.
+- Rebuild the `web/` landing page into a full marketing home page: hero, a real
+  desktop screenshot, the "one tab = one worktree = one branch = one agent"
+  mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
+  and Windows.
+- Docs site: the sidebar navigation now groups pages into labelled sections
+  (via a `section` frontmatter field), and Previous/Next links follow the
+  navigation order rather than filesystem order.
 
 ### Bug fixes
 

@@ -1,0 +1,99 @@
+---
+label: Agents in Containers
+section: Desktop Guide
+order: 27
+---
+
+# Running Agents in Containers
+
+FlightDeck can run each agent inside an isolated, rootless **Podman** container
+instead of directly on your host. The agent's worktree is bind-mounted into the
+container, so your host keeps owning the files and all Git operations while the
+agent process is sandboxed.
+
+<Callout type="info">
+  Containers are **off by default**, giving you bit-for-bit local behavior. When
+  you turn them on, it's a **project-wide** switch: every agent in that project
+  runs in a container.
+</Callout>
+
+## Enable it
+
+Add a `[containers]` block to `.flightdeck/config.toml`, build an image, then
+verify readiness:
+
+```toml
+[containers]
+enabled = true
+runtime = "podman"
+# forward_ports = [3000]        # publish dev-server ports to 127.0.0.1 only
+```
+
+```bash
+flightdeck image build claude   # builds a self-contained image, installs the agent CLI
+flightdeck doctor               # verifies podman + images are ready
+```
+
+## How it works
+
+- The worktree is bind-mounted at `/workspace`, with user-namespace mapping so
+  the host keeps owning the files — there's no diff or sync layer.
+- Each tab gets its own container named `flightdeck-<tab-id>`. New tabs
+  `podman run`; child shells (`Ctrl-t`) `podman exec` into the **same**
+  container.
+- A running container **survives FlightDeck quitting** and is reattached on the
+  next launch. A container that has gone away is recreated; an exited one shows
+  as "session lost."
+
+## Credentials and ports
+
+With no `[containers.auth]` block and the default base image, your host agent
+credentials pass through automatically (the agent's config directory is mounted,
+and known API-key environment variables are injected when present). Override
+this with `auth.mounts` and `auth.env_allow`.
+
+Ports declared in `forward_ports` are published to **`127.0.0.1` only** — never
+to your whole network.
+
+## Building images
+
+```bash
+flightdeck image build [agent]   # defaults to your configured default agent
+```
+
+This builds a self-contained image from a trusted public base, installs the
+agent's CLI, and creates a UID-mappable user. Customize it with `packages` and a
+`setup_script`, override the `base_image`, or supply a full `containerfile` of
+your own. A launch **never** builds implicitly — a missing image is refused with
+guidance to run `image build`.
+
+## Checking readiness
+
+```bash
+flightdeck doctor
+```
+
+`doctor` is read-only. It reports whether container execution is enabled,
+whether Podman is installed and ready (with platform-specific guidance if not),
+and whether each agent's image is present.
+
+## Security guardrails
+
+Every container launch is checked by guardrails that **cannot be relaxed** by
+config:
+
+- no `--privileged`,
+- no Docker/Podman socket mount,
+- no `--env-host`,
+- no home-directory mount,
+- ports publish to `127.0.0.1` only.
+
+Containers also run with `--cap-drop all` and `--security-opt
+no-new-privileges`.
+
+<Callout type="warning">
+  Network egress is unrestricted in v1 — containerized agents have full outbound
+  access. An egress-allowlist proxy is planned. See `containers/README.md` in
+  the repository for the complete configuration surface (resource limits,
+  credential mounts, custom base images and Containerfiles).
+</Callout>

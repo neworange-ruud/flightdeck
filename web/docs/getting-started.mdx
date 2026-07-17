@@ -1,42 +1,103 @@
 ---
-label: Get Started
-order: 2
+label: Install & First Run
+section: Get Started
+order: 10
 icon: rocket
 ---
 
-# Get Started
+# Install & First Run
 
-Install Flightdeck with Homebrew:
+Get FlightDeck installed and launch your first agent in a couple of minutes.
+
+## Install
+
+### macOS (Homebrew)
 
 ```bash
 brew install neworange-ruud/tap/flightdeck
 ```
 
-Or download the latest release for macOS or Linux:
+### macOS / Linux (installer script)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
 ```
 
-## Start A Project
+### Windows (PowerShell)
 
-Run Flightdeck from inside a Git repository:
+```powershell
+irm https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.ps1 | iex
+```
+
+<Callout type="note">
+  FlightDeck needs Git on your `PATH`. The agents themselves (OpenCode, Claude
+  Code, Codex CLI, …) are separate tools — install whichever ones you plan to
+  use so FlightDeck can launch them.
+</Callout>
+
+## Launch
+
+Run FlightDeck from inside any Git repository:
 
 ```bash
 cd path/to/your-repository
 flightdeck
 ```
 
-On its first run, Flightdeck creates a `.flightdeck/` directory with project
-configuration and its runtime state. Create an agent tab with `Ctrl-n`, choose
-an available agent, and give the task a name.
+On its **first run in a repo**, FlightDeck initializes itself automatically —
+there is no `flightdeck init` step. It creates a `.flightdeck/` directory and
+appends a few entries to your `.gitignore` (append-only; your existing content
+is preserved):
+
+```text
+your-repo/
+  .flightdeck/
+    config.toml        # committed, human-editable
+    state.json         # ignored (runtime state)
+    worktrees/         # ignored (managed worktrees)
+```
+
+## Create your first agent
+
+1. Press **`Ctrl-n`** to create a new agent session tab.
+2. **Pick an agent** from the menu (for example, Claude Code). The menu is
+   skipped if only one agent is configured.
+3. **Name the task** — something like `fix-login`. FlightDeck turns it into a
+   branch, `flightdeck/fix-login`.
+
+FlightDeck then creates the branch and a worktree under
+`.flightdeck/worktrees/fix-login`, launches your chosen agent inside it, and
+focuses the terminal so you can start prompting.
 
 <Callout type="success">
-  Each agent tab receives its own branch and worktree, keeping simultaneous tasks
-  separate by default.
+  Each agent tab gets its own branch and worktree, so you can press `Ctrl-n`
+  again and start a second task immediately — the two agents never share files.
 </Callout>
 
-## Next Steps
+## A first lap around the app
 
-Read [Core Concepts](/concepts) to understand the workspace model and the safety
-boundaries Flightdeck maintains.
+- **Switch agents** — `Alt-↑` / `Alt-↓`, or `Alt-1..9` to jump by number.
+- **Open a shell** in the current worktree — `Ctrl-t`.
+- **See Git status** — open the command palette (`Ctrl-g`) and choose *Show Git
+  Status*.
+- **Push a branch** — `Ctrl-p` (you'll get a PR compare URL if your remote is
+  GitHub).
+- **Everything else** — press `Ctrl-g` for the command palette, or `?` for the
+  keybindings help.
+
+## Next steps
+
+<CardGrid>
+  <Card href="/interface" title="The Interface">
+    Learn the screen layout and the terminal-vs-app keyboard model.
+  </Card>
+  <Card href="/desktop/agent-tabs" title="Agent Tabs & Worktrees">
+    Go deeper on creating, switching, and closing agent sessions.
+  </Card>
+  <Card href="/desktop/git" title="Git Workflow">
+    Push, pull base, merge back, rebase — and the safety boundary behind them.
+  </Card>
+  <Card href="/desktop/cli" title="CLI & Updating">
+    Keep FlightDeck current and explore the command-line subcommands.
+  </Card>
+</CardGrid>

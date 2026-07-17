@@ -31,16 +31,23 @@ export interface DocsPage {
   slugSegments: string[];
   textContent: string;
   title: string;
-  frontmatter: { label?: string; order?: number; icon?: string; hidden: boolean };
+  frontmatter: { label?: string; order?: number; icon?: string; section?: string; hidden: boolean };
 }
 
 export interface DocsNavigationItem {
   label: string;
   route: string;
+  section?: string;
+}
+
+export interface DocsNavigationSection {
+  section?: string;
+  items: DocsNavigationItem[];
 }
 
 export interface DocsSiteData {
   navigation: DocsNavigationItem[];
+  navigationSections: DocsNavigationSection[];
   pages: DocsPage[];
   pagesByRoute: Map<string, DocsPage>;
   siteConfig: DocsSiteConfig;

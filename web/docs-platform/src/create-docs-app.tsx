@@ -20,12 +20,15 @@ export function createDocsApp(site: DocsSiteDefinition) {
     const page = siteData.pagesByRoute.get(route);
     if (!page) notFound();
     const content = await renderDocsMdx(page, siteData.siteConfig);
-    const visiblePages = siteData.pages.filter((candidate) => !candidate.frontmatter.hidden);
-    const pageIndex = visiblePages.findIndex((candidate) => candidate.route === page.route);
-    const previous = visiblePages[pageIndex - 1];
-    const next = visiblePages[pageIndex + 1];
+    // Previous/next follow the sidebar navigation order (grouped by section),
+    // not filesystem order, so they match what the reader sees in the nav.
+    const navIndex = siteData.navigation.findIndex((item) => item.route === page.route);
+    const previousItem = navIndex > 0 ? siteData.navigation[navIndex - 1] : undefined;
+    const nextItem = navIndex >= 0 ? siteData.navigation[navIndex + 1] : undefined;
+    const previous = previousItem ? siteData.pagesByRoute.get(previousItem.route) : undefined;
+    const next = nextItem ? siteData.pagesByRoute.get(nextItem.route) : undefined;
 
-    return <DocsLayout currentRoute={page.route} navigation={siteData.navigation} siteConfig={siteData.siteConfig}><article>{content}<nav className="mt-12 flex justify-between gap-4 border-t border-[color:var(--docs-border)] pt-6">{previous ? <Link href={previous.route}>Previous: {previous.frontmatter.label ?? previous.title}</Link> : <span />}{next ? <Link href={next.route}>Next: {next.frontmatter.label ?? next.title}</Link> : null}</nav></article></DocsLayout>;
+    return <DocsLayout currentRoute={page.route} navigationSections={siteData.navigationSections} siteConfig={siteData.siteConfig}><article>{content}<nav className="mt-12 flex justify-between gap-4 border-t border-[color:var(--docs-border)] pt-6">{previous ? <Link href={previous.route}>Previous: {previous.frontmatter.label ?? previous.title}</Link> : <span />}{next ? <Link href={next.route}>Next: {next.frontmatter.label ?? next.title}</Link> : null}</nav></article></DocsLayout>;
   }
 
   async function generateStaticParams() {
