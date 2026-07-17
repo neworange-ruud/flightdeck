@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.8.0] - 2026-07-17
+
+### New features
+
 - Resume agent sessions across restarts: FlightDeck reads the session id from
   the agent's own on-disk session store (Claude `~/.claude/projects/<cwd>`,
   Codex `~/.codex/sessions`) for the tab's worktree and relaunches with
