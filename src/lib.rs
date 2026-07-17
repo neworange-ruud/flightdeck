@@ -1150,6 +1150,19 @@ impl Workspace {
     }
 }
 
+/// Resume the *active* project's recovered agents on demand (idempotent —
+/// [`AppState::resume_agents`] only starts tabs whose primary isn't already
+/// running). Called after every project switch: startup resumes only the
+/// launched project's agents, so a background project reopened from the
+/// workspace file has unspawned tabs until the user first switches to it —
+/// without this, switching to one shows "(terminal starting…)" forever.
+fn resume_active_project_agents(workspace: &mut Workspace, env: &Env) {
+    let active = workspace.active;
+    let p = &mut workspace.projects[active];
+    let services = env.services(&p.git);
+    let _ = p.state.resume_agents(&services);
+}
+
 /// Collapse agent lifecycle states into the two indicators shown on a project
 /// tab. Because callers pass display-ready states, project progress follows the
 /// same explicit backend events as each agent tab.
@@ -2543,7 +2556,10 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
         if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
             ui.drag = None;
             match hit {
-                ProjectHit::Tab(i) => workspace.set_active(i),
+                ProjectHit::Tab(i) => {
+                    workspace.set_active(i);
+                    resume_active_project_agents(workspace, env);
+                }
                 ProjectHit::Close(i) => {
                     workspace.set_active(i);
                     start_close_project_flow(workspace, ui, i);
@@ -3050,6 +3066,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         // Project switching is workspace-level, not an AppState command.
         KeyAction::SwitchProject(sel) => {
             workspace.switch(sel);
+            resume_active_project_agents(workspace, env);
             Ok(false)
         }
         KeyAction::Passthrough(bytes) => {
@@ -3453,6 +3470,7 @@ fn handle_open_project_key(
                     let root = proj.git.root().to_path_buf();
                     if let Some(i) = workspace.projects.iter().position(|p| p.git.root() == root) {
                         workspace.set_active(i);
+                        resume_active_project_agents(workspace, env);
                     }
                     ui.message("Project already open — switched to it.");
                 } else {
@@ -4208,10 +4226,12 @@ fn run_palette_action(
         }
         PaletteAction::SwitchProjectNext => {
             workspace.switch(Selector::Next);
+            resume_active_project_agents(workspace, env);
             return Ok(());
         }
         PaletteAction::SwitchProjectPrev => {
             workspace.switch(Selector::Prev);
+            resume_active_project_agents(workspace, env);
             return Ok(());
         }
         PaletteAction::OpenConfig => {
@@ -6236,6 +6256,145 @@ mod tests {
                         if matches!(e.kind, ShellEventKind::Exited { code: Some(0) })
                 )),
                 "exited event flushed: {msgs:?}"
+            );
+        }
+    }
+
+    /// Switching to a background project must resume its recovered agents on
+    /// demand. Regression guard for #26: startup resumes only the active
+    /// project, so without a resume on switch a background project's tabs stay
+    /// unspawned and the pane hangs on "(terminal starting…)".
+    mod project_switch_resume {
+        use super::*;
+        use crate::contracts::{
+            AgentDef, ProjectState as CoreProjectState, StatusPatterns, TabState, STATE_VERSION,
+        };
+
+        /// A launchable agent backed by a real executable in `dir` (spawning
+        /// goes through `validate_agent`, which checks the binary exists).
+        fn real_agent(dir: &TempDir, key: &str) -> AgentDef {
+            let path = dir.path().join(key);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+            AgentDef {
+                key: key.to_string(),
+                display_name: key.to_string(),
+                command: path.to_str().unwrap().to_string(),
+                args: vec![],
+                status_patterns: StatusPatterns::default(),
+            }
+        }
+
+        fn config_with(agent: AgentDef) -> Config {
+            let mut config = Config::default();
+            config.ui.default_agent = agent.key.clone();
+            config.agents.insert(agent.key.clone(), agent);
+            config
+        }
+
+        fn tab(id: &str, name: &str, agent: &str) -> TabState {
+            TabState {
+                id: id.to_string(),
+                name: name.to_string(),
+                slug: name.to_string(),
+                agent: agent.to_string(),
+                branch: format!("{name}-branch"),
+                worktree_path_relative: format!("worktrees/{name}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: true,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                resume_args: Vec::new(),
+            }
+        }
+
+        /// A project whose single recovered tab has an unspawned (NotStarted)
+        /// primary — exactly the state of a background project loaded from the
+        /// workspace file before it is first switched to.
+        fn recovered_project(name: &str, root: &str, config: Config) -> Project {
+            let agent = config.ui.default_agent.clone();
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs: vec![tab(&format!("{name}-t1"), name, &agent)],
+            };
+            let mut app = AppState::new(
+                config,
+                state,
+                root,
+                format!("{root}/.flightdeck/state.json"),
+            );
+            app.set_pty_size(PtySize { rows: 24, cols: 80 });
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            Project {
+                name: name.to_string(),
+                git: GitCli::new(PathBuf::from(root)),
+                state: app,
+                cache: GitStatusCache::new(),
+                create_tx,
+                create_rx,
+                status_tx,
+                status_rx,
+                status_in_flight: false,
+                git_lock: Arc::new(Mutex::new(())),
+            }
+        }
+
+        #[test]
+        fn shift_right_resumes_background_projects_agents() {
+            use crate::contracts::ProcessState;
+            let dir = TempDir::new().unwrap();
+            let pty = FakePty::new();
+            // Both projects' worktrees exist on disk so resume can spawn.
+            let fs = FakeFs::new()
+                .with_dir("/repo0/worktrees/proj0")
+                .with_dir("/repo1/worktrees/proj1");
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+            };
+
+            let mut workspace = Workspace {
+                projects: vec![
+                    recovered_project("proj0", "/repo0", config_with(real_agent(&dir, "claude"))),
+                    recovered_project("proj1", "/repo1", config_with(real_agent(&dir, "claude"))),
+                ],
+                active: 0,
+            };
+
+            // Mirror startup: only the active project's agents are resumed.
+            resume_active_project_agents(&mut workspace, &env);
+            assert_eq!(
+                workspace.projects[1].state.tabs[0].session.primary_state(),
+                ProcessState::NotStarted,
+                "background project must start unspawned",
+            );
+
+            // Shift+Right switches to project 1 — this must resume its agent.
+            let key = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+            let mut ui = Ui::default();
+            handle_key(key, &mut workspace, &env, &mut ui).unwrap();
+
+            assert_eq!(workspace.active, 1, "switched to the background project");
+            assert!(
+                workspace.projects[1].state.tabs[0].session.active().is_some(),
+                "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
             );
         }
     }
