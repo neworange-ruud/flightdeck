@@ -20,6 +20,7 @@ const frontmatterSchema = z.object({
   label: z.string().min(1).optional(),
   order: z.number().int().optional(),
   icon: z.string().min(1).optional(),
+  section: z.string().min(1).optional(),
   hidden: z.boolean().optional(),
 }).strict();
 
@@ -84,12 +85,47 @@ export async function loadDocsTree(site: DocsSiteDefinition | string): Promise<D
     } satisfies DocsPage;
   }));
   const visiblePages = pages.filter((page) => !page.frontmatter.hidden);
-  const navigation = visiblePages
-    .map((page) => ({ label: page.frontmatter.label ?? page.title, route: page.route, order: page.frontmatter.order }))
-    .sort((left, right) => (left.order ?? Infinity) - (right.order ?? Infinity) || left.label.localeCompare(right.label));
+  const entries = visiblePages.map((page) => ({
+    label: page.frontmatter.label ?? page.title,
+    route: page.route,
+    section: page.frontmatter.section,
+    order: page.frontmatter.order,
+  }));
+
+  // Sections are ordered by the smallest `order` of the pages they contain, so
+  // authors control section sequence with the same `order` field used within a
+  // section. Pages without a `section` fall into a single leading group.
+  const sectionKeys: string[] = [];
+  const sectionOrder = new Map<string, number>();
+  for (const entry of entries) {
+    const key = entry.section ?? "";
+    if (!sectionOrder.has(key)) {
+      sectionKeys.push(key);
+      sectionOrder.set(key, entry.order ?? Infinity);
+    } else {
+      sectionOrder.set(key, Math.min(sectionOrder.get(key)!, entry.order ?? Infinity));
+    }
+  }
+  sectionKeys.sort((left, right) =>
+    (sectionOrder.get(left)! - sectionOrder.get(right)!) || left.localeCompare(right));
+
+  const byOrderThenLabel = (
+    left: { order?: number; label: string },
+    right: { order?: number; label: string },
+  ) => (left.order ?? Infinity) - (right.order ?? Infinity) || left.label.localeCompare(right.label);
+
+  const navigationSections = sectionKeys.map((key) => ({
+    section: key === "" ? undefined : key,
+    items: entries
+      .filter((entry) => (entry.section ?? "") === key)
+      .sort(byOrderThenLabel)
+      .map(({ label, route, section }) => ({ label, route, section })),
+  }));
+  const navigation = navigationSections.flatMap((group) => group.items);
 
   return {
-    navigation: navigation.map(({ label, route }) => ({ label, route })),
+    navigation,
+    navigationSections,
     pages,
     pagesByRoute: new Map(pages.map((page) => [page.route, page])),
     siteConfig,

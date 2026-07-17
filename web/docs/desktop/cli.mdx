@@ -1,0 +1,82 @@
+---
+label: CLI & Updating
+section: Desktop Guide
+order: 28
+---
+
+# CLI & Updating
+
+FlightDeck is mostly a full-screen app, but it also has a handful of
+command-line subcommands for setup, maintenance, and updates.
+
+## Subcommands
+
+| Command | What it does | In a repo? |
+| --- | --- | --- |
+| `flightdeck` | Launch the TUI | required |
+| `flightdeck --version` / `-V` | Print the version | no |
+| `flightdeck --help` / `-h` | Print usage | no |
+| `flightdeck update` | Self-update from the latest GitHub Release | no |
+| `flightdeck setup-update` | Ensure `update.check = true` | required |
+| `flightdeck setup-status` | Write reusable status integrations to `.flightdeck/integrations/` | required |
+| `flightdeck setup-notifications` | Ensure notifications are enabled; print tuning guidance | required |
+| `flightdeck doctor` | Verify Podman and agent images are ready | required |
+| `flightdeck image build [agent]` | Build/rebuild an agent's container image | required |
+
+<Callout type="note">
+  There is no `flightdeck init` — initialization happens automatically the first
+  time you run `flightdeck` inside a repository.
+</Callout>
+
+## Updating FlightDeck
+
+### Update notice
+
+FlightDeck tells you when a newer release is out. It's **on by default**, checks
+GitHub Releases at most **once a day** in the background (cached per user, never
+blocking startup), and only ever shows an unobtrusive status-bar hint — it never
+auto-updates. Ensure it's enabled with:
+
+```bash
+flightdeck setup-update      # sets update.check = true
+```
+
+Disable it any time by setting `check = false` under `[update]`.
+
+### Applying an update
+
+How you update depends on how you installed:
+
+```bash
+flightdeck update            # installer-script installs, self-replace in place
+```
+
+`flightdeck update` checks the latest GitHub Release and replaces the binary if
+a newer version exists. It works from any directory and does not require a repo.
+
+<Callout type="info">
+  Self-update is **receipt-gated**: it only replaces binaries installed via the
+  installer script. For **Homebrew** installs it defers to the package manager
+  (this is expected, not an error):
+
+  ```bash
+  brew update && brew upgrade flightdeck
+  ```
+</Callout>
+
+### Windows
+
+The Windows build is pure-Rust and ships **without** the self-updater, so
+`flightdeck update` is a no-op there. Upgrade by re-running the PowerShell
+installer, which fetches the latest release.
+
+## Setup helpers
+
+The `setup-*` subcommands are convenience helpers that write config or
+integration files and print guidance:
+
+- **`setup-status`** — generates standalone lifecycle hooks for agent sessions
+  launched outside FlightDeck (see [Working with Agents](/desktop/agents)).
+- **`setup-notifications`** — re-enables notifications for a project and explains
+  delivery per platform (see [Notifications](/desktop/notifications)).
+- **`setup-update`** — turns the daily update check back on.

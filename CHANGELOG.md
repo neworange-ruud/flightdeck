@@ -33,10 +33,35 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   an Apple APNs auth key + signing team.
 - Add a Next.js documentation site under `web/`, including a Flightdeck landing
   page and MDX documentation at `/docs`.
+- Write the full documentation content for the site: an Overview and Core
+  Concepts, a Get Started section (install, first run, interface tour), an
+  in-depth Desktop Guide (agent tabs & worktrees, agents, terminals & split
+  view, the Git workflow, multiple projects, configuration, notifications,
+  containers, and the CLI), a FlightDeck Remote (iOS) guide (pairing, monitoring,
+  chat/focus/voice, session control, shell, activity & notifications, settings &
+  security), and a Reference section (keyboard shortcuts, configuration
+  reference, troubleshooting). Every page is illustrated: iOS screenshots are
+  generated from the app in the Simulator, and desktop screenshots use the main
+  layout capture plus branded placeholders for shots that still need to be taken.
 
 ### Improvements
 
-- None yet.
+- Rebuild the `web/` landing page into a full marketing home page: hero, a real
+  desktop screenshot, the "one tab = one worktree = one branch = one agent"
+  mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
+  and Windows.
+- Docs site: the sidebar navigation now groups pages into labelled sections
+  (via a `section` frontmatter field), and Previous/Next links follow the
+  navigation order rather than filesystem order.
+- Deploy the `web/` app (landing page + docs) to Azure Container Apps as a
+  separate Container App sharing the relay's resource group, registry, and
+  environment, behind the same deny-by-default IP allowlist as the relay.
+  Served on `https://www.flightdeckai.app` (a subdomain gets an auto-renewing
+  managed TLS cert via CNAME validation, which works behind the allowlist); the
+  apex `flightdeckai.app` 301-redirects to www at the registrar. Added
+  `web/Dockerfile` (Next.js standalone), `web/deploy/{setup,bind-custom-domain}.sh`,
+  and a release-triggered `web-deploy.yml` GitHub Actions workflow (GitHub-OIDC,
+  no stored Azure secret).
 
 ### Bug fixes
 

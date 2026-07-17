@@ -39,3 +39,20 @@
 .docs-prose ol { list-style: decimal; }
 .docs-prose code { border-radius: 0.35rem; background: color-mix(in srgb, var(--docs-surface) 70%, var(--docs-border)); padding: 0.15rem 0.35rem; font-size: 0.875em; }
 .docs-prose pre code { background: transparent; padding: 0; }
+
+.docs-prose table { width: 100%; border-collapse: collapse; margin: 1.75rem 0; font-size: 0.9rem; display: block; overflow-x: auto; }
+.docs-prose th, .docs-prose td { border: 1px solid var(--docs-border); padding: 0.5rem 0.75rem; text-align: left; vertical-align: top; }
+.docs-prose th { background: var(--docs-surface); font-weight: 600; }
+
+.docs-prose blockquote { margin: 1.5rem 0; padding: 0.25rem 1.15rem; border-left: 3px solid var(--docs-accent); color: var(--docs-muted); }
+
+/* Screenshots. A single max-height rule keeps wide desktop captures full-width
+   while shrinking tall portrait phone captures to a sane size; a paragraph that
+   holds only images becomes a centered, wrapping gallery so two phone shots can
+   sit side by side and reflow on narrow screens. */
+.docs-prose p:has(> img) { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; align-items: flex-start; }
+.docs-prose img { max-width: 100%; max-height: 640px; height: auto; border-radius: 0.9rem; border: 1px solid var(--docs-border); box-shadow: 0 12px 34px -14px rgba(2, 8, 20, 0.65); background: var(--docs-surface); }
+
+/* A standalone italic line directly under an image reads as its caption. */
+.docs-prose p:has(> em:only-child) { margin-top: -0.6rem; text-align: center; }
+.docs-prose p:has(> em:only-child) em { color: var(--docs-muted); font-size: 0.85rem; font-style: normal; }

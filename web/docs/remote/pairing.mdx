@@ -1,0 +1,69 @@
+---
+label: Pair Your Phone
+section: FlightDeck Remote
+order: 41
+---
+
+# Pair Your Phone
+
+Pairing establishes the end-to-end-encrypted link between FlightDeck Remote and
+your Mac. You only do it once per device; the pairing persists across app
+launches until you unpair.
+
+![The pairing screen: 'Pair with your Mac', a 4-digit code entry, and 'Scan QR instead'.](/screenshots/mobile/01-pairing.png)
+
+*The pairing screen — scan the QR shown on your Mac, or type the 4-digit code.*
+
+## On your Mac
+
+1. Make sure FlightDeck Remote is enabled on the desktop. It's **off by
+   default** — set `enabled = true` under `[remote]` in your config, or just run
+   the next step, which turns it on.
+2. Open the command palette (`Ctrl-g`) and run **Pair Phone**. FlightDeck shows
+   a pairing overlay with a **QR code**, a **4-digit code**, and a live expiry
+   countdown.
+
+## On your phone
+
+Open FlightDeck Remote. While unpaired, it opens on the **Pair with your Mac**
+screen. Choose either path:
+
+- **Scan QR** — tap **Scan QR instead** and point the camera at the QR code on
+  your Mac.
+- **Enter the code** — type the 4-digit code into the four boxes and tap
+  **Pair**.
+
+When pairing succeeds, the desktop overlay shows **Paired ✓** and the phone
+moves straight to the [Projects](/remote/monitoring) screen.
+
+<Callout type="success">
+  Everything after pairing is end-to-end encrypted. The footer on the pairing
+  screen says it plainly: **"End-to-end encrypted · unlocked by Face ID."**
+</Callout>
+
+## Why pairing matters
+
+Pairing is the real trust decision: once paired, your phone can send commands
+that run on your Mac. The QR/code carries the secret that bootstraps the
+encrypted channel, and your device registers an identity keypair whose private
+half stays in the iOS Keychain / Secure Enclave. The relay authenticates devices
+by key and routes only by pairing ID — it can never read your traffic.
+
+<Callout type="note">
+  If the camera isn't available (for example in the Simulator) or permission is
+  denied, the app shows **"Camera unavailable — enter the code instead"** with a
+  button to switch to code entry.
+</Callout>
+
+## Bad codes and errors
+
+Entering the wrong code shows an inline error and a brief shake, and keeps you on
+the pairing screen so you can try again. The **Pair** button stays disabled until
+you've entered all four digits.
+
+## Unpairing
+
+To disconnect a phone, open **Settings** in the app and tap **Unpair this
+device** (see [Settings & Security](/remote/settings)). On the desktop, run
+**Unpair Phone** from the command palette. After unpairing you'll need to pair
+again to reconnect.
