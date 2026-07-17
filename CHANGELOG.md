@@ -54,6 +54,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- The input mode (APP / TERMINAL) is now more visible at a glance: a
+  mode-colored status chip, an opt-in colored border around the pane that has
+  keyboard focus (`ui.mode_border`, off by default), and terminal dimming in
+  APP mode (`ui.dim_terminal_in_app_mode`, on by default). New `[ui]` settings:
+  `terminal_mode_color`, `app_mode_color`, `mode_border`,
+  `dim_terminal_in_app_mode`.
 - Rebuild the `web/` landing page into a full marketing home page: hero, a real
   desktop screenshot, the "one tab = one worktree = one branch = one agent"
   mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
@@ -90,6 +96,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   a dedicated thread so the loop always notices the shutdown signal instead of
   hanging on crossterm's EOF busy-loop; state is persisted before the terminal is
   restored; and the cursor-restore is made panic-safe on a dead tty.
+- Fixed the terminal being clipped by 2 columns/rows after enabling
+  `ui.mode_border` until the next window resize: the terminal PTY is now
+  resized immediately when the border setting changes, instead of using a
+  stale cached size.
 - CI ran the entire cross-platform matrix twice per commit on feature branches:
   the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
   commit under different refs, so their concurrency groups never collided and both
@@ -106,6 +116,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- Add agent-harness project skills under `.agents/skills/` capturing FlightDeck's
+  recurring conventions (shipping/definition-of-done, cross-platform parity,
+  the trait-seam architecture and git safety boundary, and config conventions),
+  plus a fast-check `Stop` hook that runs `cargo fmt --check` and `cargo clippy`
+  when Rust files change. Developer tooling only — no change to the shipped app.
 - Keep `Alt+Esc` (macOS) and `Shift+Esc` (Windows/Linux) as the default way to
   leave terminal focus, with an optional **F2** binding for terminals that
   cannot distinguish modified Esc. The F2 preference is available in the

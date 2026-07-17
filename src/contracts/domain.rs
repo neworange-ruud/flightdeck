@@ -276,6 +276,29 @@ pub struct UiConfig {
     /// simply start fresh. Agent termination on shutdown is unaffected.
     #[serde(default = "default_true")]
     pub auto_continue: bool,
+    /// Color of the TERMINAL-mode cue (chip + live-pane border). One of:
+    /// green, cyan, blue, magenta, yellow, red, white.
+    #[serde(default = "default_terminal_mode_color")]
+    pub terminal_mode_color: String,
+    /// Color of the APP-mode cue (chip + live-pane border). Same value set.
+    #[serde(default = "default_app_mode_color")]
+    pub app_mode_color: String,
+    /// Live-pane border brightness: off, dim, normal, bright.
+    #[serde(default = "default_mode_border")]
+    pub mode_border: String,
+    /// Dim the terminal viewport while in APP mode (it is not receiving keys).
+    #[serde(default = "default_true")]
+    pub dim_terminal_in_app_mode: bool,
+}
+
+fn default_terminal_mode_color() -> String {
+    "green".to_string()
+}
+fn default_app_mode_color() -> String {
+    "cyan".to_string()
+}
+fn default_mode_border() -> String {
+    "off".to_string()
 }
 
 impl Default for UiConfig {
@@ -285,6 +308,10 @@ impl Default for UiConfig {
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
             auto_continue: true,
+            terminal_mode_color: default_terminal_mode_color(),
+            app_mode_color: default_app_mode_color(),
+            mode_border: default_mode_border(),
+            dim_terminal_in_app_mode: true,
         }
     }
 }

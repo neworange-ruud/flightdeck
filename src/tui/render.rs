@@ -33,6 +33,7 @@ use crate::git::status::WorktreeStatus;
 use crate::terminal::session::TerminalKind;
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
+use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
 
@@ -318,7 +319,10 @@ pub enum HitTarget {
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
-    let ml = layout::compute(area);
+    let ml = layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
     if rect_contains(ml.sidebar, col, row) {
         // A click on the `✕` on a tab's name row closes it; elsewhere on a tab
         // row selects it; anywhere else in the sidebar (logo header, "Agents"
@@ -527,7 +531,10 @@ pub fn draw(
     now_ms: u64,
 ) {
     let area = frame.area();
-    let ml = layout::compute(area);
+    let ml = layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
@@ -541,6 +548,39 @@ pub fn draw(
         draw_child_tab_bar(frame, state, ml.child_tabs);
         draw_terminal_viewport(frame, state, ml.terminal, now_ms);
     }
+
+    // Live-pane border (SPECS §23): frame ONLY the pane receiving keys. The
+    // frame rects are present only when `mode_border != off`; geometry is fixed
+    // by layout::compute. The non-focused pane's frame is not drawn at all —
+    // previously it was rendered dark gray, which read as visual clutter.
+    let mode = state.mode();
+    if mode == InputMode::App {
+        if let Some(frame_rect) = ml.sidebar_frame {
+            let block =
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(mode_style::pane_border_style(
+                        &state.config.ui,
+                        mode,
+                        mode_style::Pane::Sidebar,
+                    ));
+            frame.render_widget(block, frame_rect);
+        }
+    }
+    if mode == InputMode::Terminal {
+        if let Some(frame_rect) = ml.terminal_frame {
+            let block =
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(mode_style::pane_border_style(
+                        &state.config.ui,
+                        mode,
+                        mode_style::Pane::Terminal,
+                    ));
+            frame.render_widget(block, frame_rect);
+        }
+    }
+
     let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
     frame.render_widget(info_divider, ml.info_divider);
     draw_info_bar(frame, state, cache, ml.info_bar);
@@ -781,7 +821,15 @@ pub fn draw_sidebar(
     area: Rect,
     now_ms: u64,
 ) {
-    let block = Block::default().borders(Borders::RIGHT);
+    // When the live-pane border feature is on, the focused pane's frame
+    // already supplies the separating vertical line, so the sidebar's own
+    // right divider is suppressed here — otherwise two adjacent vertical
+    // lines would be drawn (SPECS §23).
+    let block = if mode_style::border_enabled(&state.config.ui) {
+        Block::default()
+    } else {
+        Block::default().borders(Borders::RIGHT)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1120,6 +1168,12 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 // Terminal viewport (SPECS §20)
 // ---------------------------------------------------------------------------
 
+/// Whether the terminal viewport should render dimmed: only when it is not the
+/// focused pane (i.e. APP mode) and the user has left dimming enabled (SPECS §23).
+fn dim_terminal(focused: bool, ui: &crate::contracts::UiConfig) -> bool {
+    !focused && ui.dim_terminal_in_app_mode
+}
+
 /// Draw the active terminal viewport (SPECS §20): the VT100 screen of the
 /// selected tab's active terminal (primary agent, or the selected child shell),
 /// rendered cell-by-cell from its parser.
@@ -1165,7 +1219,8 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, n
     };
 
     let focused = state.mode() == InputMode::Terminal;
-    render_screen(frame, area, term.screen(), focused, term.selection());
+    let dim = dim_terminal(focused, &state.config.ui);
+    render_screen(frame, area, term.screen(), focused, term.selection(), dim);
 }
 
 /// Background colour used to highlight selected terminal cells (SPECS §20).
@@ -1180,6 +1235,7 @@ fn render_screen(
     screen: &vt100::Screen,
     focused: bool,
     selection: Option<&Selection>,
+    dim: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1218,6 +1274,16 @@ fn render_screen(
                 }
                 if cell.inverse() {
                     style = style.add_modifier(Modifier::REVERSED);
+                }
+                // Gray out dimmed (unfocused) terminal text: force a muted gray
+                // foreground and drop bold, so inactive terminal content reads
+                // clearly as "asleep". Applied BEFORE the selection override
+                // below so a selected cell's highlight always wins.
+                if dim {
+                    style = style
+                        .fg(Color::DarkGray)
+                        .remove_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::DIM);
                 }
                 // Selection highlight overrides the cell background and drops any
                 // inverse so the highlight reads consistently.
@@ -1293,6 +1359,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
     let cols = layout::split_columns(region, entries.len());
     let active = tab.session.selected_child(); // None = primary
     let focused = state.mode() == InputMode::Terminal;
+    let dim = dim_terminal(focused, &state.config.ui);
 
     for (i, ((target, label), col)) in entries.iter().zip(cols.iter()).enumerate() {
         let is_active = match target {
@@ -1332,6 +1399,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
                 term.screen(),
                 focused && is_active,
                 term.selection(),
+                dim,
             ),
             None => {
                 let p = Paragraph::new("  (starting…)").style(Style::default().fg(Color::DarkGray));
@@ -1483,8 +1551,8 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(
         state.mode(),
+        &state.config.ui,
         state.update_available.as_deref(),
-        state.config.ui.use_f2_to_leave_terminal_focus,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
@@ -1496,9 +1564,11 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Exported for snapshot testing.
 pub fn status_bar_text(
     mode: InputMode,
+    ui: &crate::contracts::UiConfig,
     update_available: Option<&str>,
-    use_f2: bool,
 ) -> Line<'static> {
+    let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
+    let use_f2 = ui.use_f2_to_leave_terminal_focus;
     let mut spans = match mode {
         InputMode::Terminal => vec![
             Span::raw(" "),
@@ -1506,7 +1576,7 @@ pub fn status_bar_text(
                 "MODE: TERMINAL",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Green)
+                    .bg(chip_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
@@ -1524,7 +1594,7 @@ pub fn status_bar_text(
                 "MODE: APP",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(chip_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
@@ -2712,7 +2782,7 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area));
+        let region = layout::split_region(&layout::compute(area, false));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
@@ -2935,7 +3005,8 @@ mod tests {
 
     #[test]
     fn status_bar_terminal_mode_text() {
-        let line = status_bar_text(InputMode::Terminal, None, false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(
@@ -2949,14 +3020,19 @@ mod tests {
 
     #[test]
     fn status_bar_shows_f2_when_enabled() {
-        let line = status_bar_text(InputMode::Terminal, None, true);
+        let ui = crate::contracts::UiConfig {
+            use_f2_to_leave_terminal_focus: true,
+            ..crate::contracts::UiConfig::default()
+        };
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("F2"));
     }
 
     #[test]
     fn status_bar_app_mode_text() {
-        let line = status_bar_text(InputMode::App, None, false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -2969,7 +3045,8 @@ mod tests {
 
     #[test]
     fn status_bar_shows_update_hint_when_available() {
-        let line = status_bar_text(InputMode::App, Some("1.0.3"), false);
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"));
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -2980,9 +3057,24 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, None, false);
+        let none = status_bar_text(InputMode::App, &ui, None);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
+    }
+
+    #[test]
+    fn status_bar_chip_uses_configured_color() {
+        let ui = crate::contracts::UiConfig {
+            terminal_mode_color: "magenta".to_string(),
+            ..crate::contracts::UiConfig::default()
+        };
+        let line = status_bar_text(InputMode::Terminal, &ui, None);
+        let chip = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("MODE: TERMINAL"))
+            .expect("chip span present");
+        assert_eq!(chip.style.bg, Some(ratatui::style::Color::Magenta));
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------
@@ -2996,6 +3088,162 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::None, 0);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn draw_renders_live_pane_border_when_enabled() {
+        // Default mode is APP, so the sidebar frame is the live one; we only
+        // need *a* border glyph to prove the frame is drawn when the setting
+        // is on. A selected tab with an active (spawned) terminal ensures the
+        // terminal frame is also present, mirroring a real session.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.config.ui.mode_border = "normal".to_string();
+        let mut term = test_terminal(120, 40);
+        let cache = GitStatusCache::new();
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        // Corner glyphs are unique to `Block::borders(ALL)` — unlike '─'/'│',
+        // nothing else in `draw` emits them (dividers are plain horizontal
+        // rules), so this only passes once the frame block is actually drawn.
+        assert!(
+            text.contains('┐') || text.contains('┌') || text.contains('└') || text.contains('┘'),
+            "expected a border corner glyph when mode_border = normal"
+        );
+    }
+
+    #[test]
+    fn draw_renders_only_focused_pane_border_in_terminal_mode() {
+        // Change 1: only the live pane gets a frame. In TERMINAL mode the
+        // terminal frame is drawn (a corner glyph appears inside its rect);
+        // the sidebar frame must NOT be drawn at all (no corner glyph inside
+        // its rect), since the inactive pane no longer gets a DarkGray frame.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.config.ui.mode_border = "normal".to_string();
+        state.focus_terminal();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let ml = layout::compute(area, mode_style::border_enabled(&state.config.ui));
+        let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
+        let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
+
+        let mut term = test_terminal(120, 40);
+        let cache = GitStatusCache::new();
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let is_corner = |r: Rect| -> bool {
+            let mut found = false;
+            for y in r.y..r.y.saturating_add(r.height) {
+                for x in r.x..r.x.saturating_add(r.width) {
+                    let sym = buf[(x, y)].symbol();
+                    if matches!(sym, "┐" | "┌" | "└" | "┘") {
+                        found = true;
+                    }
+                }
+            }
+            found
+        };
+
+        assert!(
+            is_corner(terminal_frame),
+            "expected a border corner glyph in the terminal frame when live in TERMINAL mode"
+        );
+        assert!(
+            !is_corner(sidebar_frame),
+            "sidebar frame must not be drawn when it is not the live pane"
+        );
+    }
+
+    #[test]
+    fn render_screen_dim_grays_out_non_selected_cells() {
+        // Change 3: dimming must strongly gray out inactive terminal text
+        // (fg forced to DarkGray), not just apply a subtle DIM modifier, and
+        // must not corrupt the selection highlight for selected cells.
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"HELLO");
+        let screen = parser.screen().clone();
+
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 10, 4);
+        term.draw(|f| {
+            render_screen(f, area, &screen, false, None, true);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let cell = &buf[(0, 0)];
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::DarkGray),
+            "dimmed non-selected cell should be forced to DarkGray fg"
+        );
+    }
+
+    #[test]
+    fn render_screen_dim_preserves_selection_highlight() {
+        // The selection override must win over the dim gray-out: a selected
+        // cell keeps White fg / SELECTION_BG bg even when `dim` is true.
+        use crate::tui::selection::{Point, Selection};
+
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"HELLO");
+        let screen = parser.screen().clone();
+
+        // Screen row 0 (top of a 4-row screen at offset 0) is rows-from-bottom
+        // 3; select columns 0..=4 on that row so cell (0, 0) is covered.
+        let selection = Selection {
+            anchor: Point {
+                rows_from_bottom: 3,
+                col: 0,
+            },
+            head: Point {
+                rows_from_bottom: 3,
+                col: 4,
+            },
+        };
+
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 10, 4);
+        term.draw(|f| {
+            render_screen(f, area, &screen, false, Some(&selection), true);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let cell = &buf[(0, 0)];
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::White),
+            "selected cell must keep white fg even while dimmed"
+        );
+        assert_eq!(
+            cell.style().bg,
+            Some(SELECTION_BG),
+            "selected cell must keep the selection background even while dimmed"
+        );
     }
 
     #[test]
@@ -3104,10 +3352,11 @@ mod tests {
         .unwrap();
 
         let buffer = term.backend().buffer();
-        // Nine settings plus headers, spacing, legend, and two border rows need
-        // 19 rows. The box should be centered rather than filling all 24 rows.
-        assert_eq!(buffer[(7, 2)].symbol(), "┌");
-        assert_eq!(buffer[(7, 20)].symbol(), "└");
+        // Thirteen settings plus headers, spacing, legend, and two border rows
+        // fit the box to its content (23 of 24 rows) rather than stretching to a
+        // fixed height; centered_overlay places its top-left corner at column 7.
+        assert_eq!(buffer[(7, 0)].symbol(), "┌");
+        assert_eq!(buffer[(7, 22)].symbol(), "└");
     }
 
     #[test]
@@ -3295,5 +3544,23 @@ mod tests {
             !all_text.contains("proc:"),
             "sidebar must not show the 'proc:' prefix, got: {all_text:?}"
         );
+    }
+
+    #[test]
+    fn terminal_dims_in_app_mode_when_enabled() {
+        // Calls `dim_terminal` directly to pin the production policy: dim only
+        // when NOT focused (i.e. APP mode) and the setting is on.
+        let mut ui = crate::contracts::UiConfig {
+            dim_terminal_in_app_mode: true,
+            ..Default::default()
+        };
+
+        // Terminal mode (focused) never dims.
+        assert!(!super::dim_terminal(true, &ui));
+        // App mode (unfocused) + setting on → dim.
+        assert!(super::dim_terminal(false, &ui));
+        // App mode + setting off → no dim.
+        ui.dim_terminal_in_app_mode = false;
+        assert!(!super::dim_terminal(false, &ui));
     }
 }
