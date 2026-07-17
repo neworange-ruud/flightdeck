@@ -8,151 +8,38 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- FlightDeck Remote desktop pairing (Settings → Remote): a "Pair Phone" command
-  palette action shows a scannable QR code and a 4-digit code, then completes
-  pairing over the relay and brings the end-to-end-encrypted channel live. A
-  "Unpair Phone" action (with confirmation) forgets the pairing. The relay honors
-  a 4-digit `claim_token_hint` (short TTL, single use, per-connection rate limit),
-  and the E2E salt is pinned to the claim-token bytes on both pairing paths.
-- FlightDeck Remote agent chat transcript (iOS): the cleaned agent-conversation
-  surface (PRD §5.3) — readable prose, noisy tool calls collapsed into tappable
-  activity pills that expand inline to detail, inline permission-prompt cards,
-  sparse timestamps, "load earlier" pagination, and standard chat auto-scroll
-  with a "jump to latest" affordance. Includes the per-session `Agent · Shell`
-  surface switcher (Shell disabled for now) and an inert compose-bar placeholder.
-- FlightDeck Remote monitor surfaces (iOS): the Projects list with rolled-up
-  status dots + plain-language summaries, per-project Agent-sessions list with
-  git indicators / running time / needs-input previews, and the status roll-up
-  precedence model (needs-input › working › idle) shared across the hierarchy
-  (PRD §4, §5.2).
-- FlightDeck Remote connection honesty & offline (iOS): live connection/latency
-  indicator, a "Reconnecting…" banner that pauses commands (nothing sent blind),
-  delivery-failure marking ("not delivered — retry"), and a cached last-known
-  transcript/status shown read-only and clearly marked stale while disconnected
-  (PRD §8, §9.2).
-- FlightDeck Remote agent chat compose + voice (iOS): reply/follow-up send with
-  inline permission resolution (Allow once / Deny), hold-to-talk voice dictation
-  that drops an editable transcript into the field (never auto-sent), and an
-  eyes-free Focus mode pinning the pending question with large Approve/Deny and a
-  condensed timeline (PRD §5.3, §7; TTS read-aloud is a flagged fast-follow).
-- FlightDeck Remote light control (iOS): a session actions sheet (safe actions
-  grouped, destructive apart in red), New-agent screen (type + name + base +
-  first task), restart agent (fresh process, same worktree), close session
-  (confirmed), set manual cyan status override, and an Activity feed of status
-  events that deep-link to the agent (PRD §5.5–§5.7).
-- FlightDeck Remote minimal shell (iOS): a live terminal surface (streamed
-  stdout/stderr, ANSI colours, scrollback) with the accessory key bar
-  (`Esc Tab Ctrl ←↑↓→ | / - ~ \` ⌃C paste`, sticky Ctrl), Ctrl-C interrupt,
-  copy/paste, a font-size control, and a landscape layout — one shell per
-  session (PRD §5.4).
-- FlightDeck Remote git actions (iOS): a read-only git status view (branch,
-  base, ahead/behind, drift, changed files), plus confirmation-gated pull-base,
-  guarded merge-back, and type-to-confirm abandon-worktree — no push/PR (that
-  stays the agent's job) (PRD §5.5, §8).
-- FlightDeck Remote push notifications (iOS + relay): APNs registration on the
-  phone (token registered with the relay over the wire) and a relay-side APNs
-  sender (ES256 JWT, HTTP/2, behind the `apns-live` feature) that fires typed
-  notifications — *needs input* (urgent) and *finished* (green) — deep-linking to
-  the agent, deduplicated by `event_id`, with independent notification toggles
-  and per-project mute (PRD §5.2, §9.1–§9.2). Requires an Apple APNs auth key +
-  signing team to deliver on device (see below).
-- FlightDeck Remote settings (iOS): connected-device + connection card,
-  Require-Face-ID-to-open gate, unpair-device (confirmed), and the notification
-  preference toggles / per-project mute described above.
-- FlightDeck Remote end-to-end test harness (`tests/remote_e2e.rs`,
-  `scripts/e2e/`): a two-tier harness that stands up the *real* stack and
-  exercises it, self-setup and self-verifying. Tier A (the CI gate) runs a real
-  relay + a real desktop under a PTY + a Rust "phone" driver and asserts every
-  remote capability against real side effects — pairing, snapshot, new-agent
-  (worktree on disk), reply, permission decision, manual status, restart/close,
-  git pull/merge/abandon, shell, and transcript. Tier B
-  (`scripts/e2e/run-fullstack.sh`) drives the real iOS app in the simulator,
-  paired live to the local relay + real desktop, and confirms it reaches the main
-  tab. A single desktop test seam (`FLIGHTDECK_REMOTE_AUTOPAIR`) makes the pairing
-  offer deterministic; the iOS side needs no production change. See
-  `scripts/e2e/README.md`.
+- **FlightDeck Remote** — pair a phone to your desktop over an end-to-end-encrypted
+  relay to monitor and control your agent sessions from anywhere. Pair from
+  Settings → Remote by scanning a QR code or entering a 4-digit code; from the
+  iOS app you can then:
+  - **Monitor** your projects and agent sessions with rolled-up status and
+    plain-language summaries.
+  - **Chat with agents** through a cleaned-up transcript — reply, follow up, and
+    approve or deny permission prompts inline, with hold-to-talk voice dictation
+    and an eyes-free Focus mode for hands-free approvals.
+  - **Open a live shell** into a session, with ANSI colours, scrollback, and an
+    accessory key bar.
+  - **Run guarded git actions** — pull base, merge back, and abandon worktree
+    (push/PR stay the agent's job).
+  - **Control sessions** — start, restart, or close agents and set a manual
+    status override.
+  - **Get push notifications** when an agent needs input or finishes, deep-linking
+    straight to the agent.
+
+  Connection state is shown honestly: commands pause while reconnecting (nothing
+  is sent blind), and a cached read-only view stays available offline, clearly
+  marked stale. The relay runs on Azure Container Apps behind a stable custom
+  domain (`wss://relay.flightdeckai.app/ws`). Push notifications on device require
+  an Apple APNs auth key + signing team.
 - Add a Next.js documentation site under `web/`, including a Flightdeck landing
   page and MDX documentation at `/docs`.
 
 ### Improvements
 
-- FlightDeck Remote command palette now gates the two pairing actions by the
-  live pairing state: "Pair Phone" is hidden once a phone is paired, and "Unpair
-  Phone" only appears when a pairing actually exists (persisted at startup or
-  established this session) — so you can never try to pair an already-paired
-  desktop or unpair nothing (remote-control-x9o).
-- FlightDeck Remote relay is now hosted on Azure Container Apps: a single small
-  always-on instance (0.25 vCPU / 0.5 GiB,
-  `maxReplicas: 1` because routing state is in-process) pulling from Azure
-  Container Registry via a managed identity, reachable at a stable
-  `*.azurecontainerapps.io` HTTPS URL. Deployment is automated in a new
-  `relay-deploy.yml` workflow that builds, pushes, and rolls out a new revision
-  when a GitHub Release is published, authenticating with GitHub OIDC (no
-  long-lived Azure secret in the repo); `relay.yml` is now CI-only. One relay
-  serves all pairings, so additional users just pair their own desktop + phone.
-  See `remote/relay/deploy/README.md` for the runbook and cost (~$17–20/mo).
-- FlightDeck Remote relay now has a stable custom domain: the desktop and iOS
-  apps connect via `wss://relay.flightdeckai.app/ws` instead of the
-  Azure-generated `*.azurecontainerapps.io` hostname, so recreating/renaming the
-  underlying Azure resources no longer changes the URL or orphans existing
-  pairings (an ACA-managed TLS cert is issued for the domain via CNAME
-  validation; `remote/relay/deploy/bind-custom-domain.sh` rebinds it). The relay
-  ingress is also now IP-restricted to a deny-by-default allowlist, so only
-  approved source networks can reach it (remote-control-edn).
-- FlightDeck Remote iOS transport hardening (follow-ups to the chat "paused —
-  reconnecting" fix): `TransportStore` now bridges the transport's events onto
-  the main actor through a single FIFO stream drained by one serial loop, so
-  link-state and data events apply strictly in emit order (the previous
-  per-event `Task { @MainActor … }` bridge gave no cross-event ordering
-  guarantee — a stale `linkState` could land after a newer one). Chat's
-  commands-paused gate now distinguishes a genuinely down link from a never-wired
-  gate: an unbound gate still fails safe (paused, nothing sent blind) but trips a
-  DEBUG assertion at the view's setup site, so a missing store binding fails
-  visibly instead of masquerading as a permanent "reconnecting" (remote-control-qbj,
-  remote-control-7wu).
-- FlightDeck Remote iOS relay URL now lives in a committed `Info.plist` key
-  (`FlightDeckRelayURL`, sourced from `ios/project.yml`) and is read at runtime
-  via `Bundle.main`, so moving the relay is a one-line plist edit instead of a
-  Swift source change. A safe in-code fallback covers a missing/malformed key;
-  QR pairing (which carries `relay_url` in the payload) is unaffected
-  (remote-control-2mk).
-- FlightDeck Remote iOS pairing no longer silently mocks the handshake on a real
-  device: `MockPairingService` was the DEBUG default on every build, so a
-  developer testing pairing on-device against a real relay got a faked handshake
-  that never opened a socket (then hung on "reconnecting" with zero connections
-  in the relay logs). The DEBUG default is now the mock on the *simulator* only —
-  a physical DEBUG device uses the live relay — and whenever the mock is active
-  outside a UI test the app logs loudly and shows an unmistakable "MOCK PAIRING"
-  badge on the pairing screen. UI tests (`-uitest`) stay hermetic on the mock
-  (remote-control-lae).
+- None yet.
 
 ### Bug fixes
 
-- CI no longer stalls a runner for hours on a hung test. The remote client's
-  mock-relay test `repeated_auth_rejection_drops_stale_pairing_and_signals_repair`
-  looped `accept()` more times than the client connects (it self-heals after
-  `AUTH_REJECT_REOFFER_THRESHOLD` rejections, then stops), so the surplus blocking
-  `accept()` calls — and the final `mock.join()` — parked forever, running the
-  `test` job to GitHub's 360-minute default. The mock harness now accepts and
-  reads under bounded timeouts (`accept_within`), so a client that stops
-  reconnecting can never hang the worker, and both the CI `test` and `fmt` jobs
-  carry an explicit `timeout-minutes` backstop (remote-control-942).
-- Windows CI is green again: three remote tests failed only on `windows-latest`
-  (previously hidden behind the 6-hour hang above). (1) The e2e crypto
-  vectors-lock test compared a file read verbatim against `\n`-joined output, but
-  GitHub's Windows runners set `core.autocrlf=true` and rewrote the LF fixture to
-  CRLF on checkout — a `.gitattributes` now pins the fixtures to their exact
-  bytes. (2) The relay client set its 100 ms pump read-timeout on a `try_clone()`d
-  socket handle; `SO_RCVTIMEO` is shared across dup'd descriptors on Unix but not
-  across a Windows duplicated socket, so the pump read at the 10 s handshake
-  timeout and dropped connections took ~10 s to notice — the timeout is now set on
-  the live socket tungstenite owns, so reconnects are prompt on every platform.
-  (3) The auth-failure test's 2 s deadline didn't allow for the fresh-desktop
-  `PENDING_OFFER_WAIT` (~1 s) plus Windows connect latency; widened to 5 s.
-  (4) The Tier A remote E2E suite (`tests/remote_e2e.rs`) builds its fixture repo
-  with a bash script and drives the real desktop under a PTY; `windows-latest`
-  has no bash/WSL, so the suite is now gated `#![cfg(not(windows))]` — ubuntu and
-  macos provide its coverage (remote-control-n55).
 - CI ran the entire cross-platform matrix twice per commit on feature branches:
   the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
   commit under different refs, so their concurrency groups never collided and both
@@ -160,38 +47,6 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   `push` is now scoped to `main` only (PRs own feature-branch CI) and the
   concurrency key uses `head_ref`; the Relay workflow got the same fix
   (remote-control-dwb).
-- FlightDeck Remote iOS `PairingDefaults.relayURL` pointed at a placeholder
-  domain (`wss://relay.flightdeck.app/v1`) that does not resolve (NXDOMAIN), so
-  manual 4-digit-code pairing (and any reconnect using that default) could never
-  reach the relay. Baked in the live Azure Container Apps relay URL (with the
-  correct `/ws` path). QR pairing was unaffected (the URL travels in the QR
-  payload); a stable custom domain remains the end goal so this constant needn't
-  track relay renames.
-- FlightDeck Remote iOS chat could not control the agent — the composer stayed
-  disabled showing "paused — reconnecting" even though the link was up (shell and
-  notifications worked). The chat screen was mounted without the live transport
-  store, so its commands-paused gate never bound and defaulted to paused; the
-  transcript never loaded either. `MainTabView` now threads the live store into
-  `AgentChatView`, so chat binds to the real connection and phone→agent control
-  (replies, permission decisions) works. Surfaced by the full-stack E2E harness.
-- FlightDeck Remote desktop first-pairing bootstrap: a fresh desktop with no
-  saved pairings sent `auth_response` before ever offering, so the relay rejected
-  it as an unknown device and a first pairing could never complete. The client
-  now, when a pairing is pending and it has no existing pairings, sends its
-  `pairing_offer` pre-auth (registering its device key) and then authenticates —
-  matching the relay's offer-first bootstrap. Returning desktops with saved
-  pairings authenticate first, unchanged. Surfaced by the new end-to-end harness.
-- FlightDeck Remote desktop no longer loops forever when the relay has forgotten
-  its pairing: a returning desktop whose persisted pairing the relay no longer
-  recognizes (e.g. after a relay restart wiped the in-memory store) took the
-  auth-first path, got `auth_failed`/`unknown_pairing`, and reconnected on the
-  dead pairing indefinitely — the only fix was manually deleting
-  `~/.flightdeck/remote.json`. After a few consecutive relay rejections the
-  client now self-heals: it drops the stale pairing from persisted state (so the
-  next connect bootstraps a fresh offer) and surfaces a clear "pair again"
-  prompt instead of a silent, endless "reconnecting". Only explicit relay
-  rejections count toward the threshold, so a transient outage is never mistaken
-  for a wiped pairing (remote-control-1jy).
 
 ## [1.7.2] - 2026-07-14
 
