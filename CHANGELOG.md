@@ -79,6 +79,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- Restore the marketing site favicon: `web/src/app/favicon.ico` and `icon.svg`
+  were never committed, so browsers showed no icon. Both are now checked in.
 - Continue a recovered worktree that has no stored agent by falling back to the
   configured default agent, so restarting/resuming actually launches a terminal.
 - Refuse to start an agent when its worktree directory is missing instead of
