@@ -1,0 +1,24 @@
+@import "tailwindcss";
+@import "@flightdeck/docs-platform/styles.css";
+
+@source "../**/*.{ts,tsx,mdx}";
+@source "../../docs-platform/src/**/*.{ts,tsx}";
+
+:root {
+  --landing-bg: #07111f;
+  --landing-fg: #edf4ff;
+  --landing-muted: #a9b8cf;
+  --landing-accent: #61dafb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+}
+
+body {
+  margin: 0;
+}

@@ -71,6 +71,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   tab. A single desktop test seam (`FLIGHTDECK_REMOTE_AUTOPAIR`) makes the pairing
   offer deterministic; the iOS side needs no production change. See
   `scripts/e2e/README.md`.
+- Add a Next.js documentation site under `web/`, including a Flightdeck landing
+  page and MDX documentation at `/docs`.
 
 ### Improvements
 
@@ -158,6 +160,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   prompt instead of a silent, endless "reconnecting". Only explicit relay
   rejections count toward the threshold, so a transient outage is never mistaken
   for a wiped pairing (remote-control-1jy).
+
+## [1.7.2] - 2026-07-14
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- Keep `Alt+Esc` (macOS) and `Shift+Esc` (Windows/Linux) as the default way to
+  leave terminal focus, with an optional **F2** binding for terminals that
+  cannot distinguish modified Esc. The F2 preference is available in the
+  configuration manager and can be set globally or per project.
+
+### Bug fixes
+
+- Size the configuration manager to its content instead of stretching it
+  vertically in tall terminals.
 
 ## [1.7.1] - 2026-07-13
 

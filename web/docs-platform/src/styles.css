@@ -1,0 +1,41 @@
+:root {
+  --docs-bg: #f8fafc;
+  --docs-surface: #ffffff;
+  --docs-fg: #172033;
+  --docs-muted: #60708a;
+  --docs-border: #dbe3ef;
+  --docs-accent: #0d6e9d;
+}
+
+[data-theme="dark"] {
+  --docs-bg: #0b1220;
+  --docs-surface: #111c2e;
+  --docs-fg: #e8eef8;
+  --docs-muted: #a7b4c8;
+  --docs-border: #263650;
+  --docs-accent: #67d4ff;
+}
+
+.docs-prose {
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.docs-prose h1,
+.docs-prose h2,
+.docs-prose h3 {
+  color: var(--docs-fg);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+}
+
+.docs-prose h1 { margin: 0 0 2rem; font-size: clamp(2.25rem, 5vw, 3.5rem); }
+.docs-prose h2 { margin-top: 3rem; font-size: 1.6rem; }
+.docs-prose h3 { margin-top: 2rem; font-size: 1.25rem; }
+.docs-prose p, .docs-prose ul, .docs-prose ol { margin: 1.25rem 0; }
+.docs-prose ul, .docs-prose ol { padding-left: 1.5rem; }
+.docs-prose ul { list-style: disc; }
+.docs-prose ol { list-style: decimal; }
+.docs-prose code { border-radius: 0.35rem; background: color-mix(in srgb, var(--docs-surface) 70%, var(--docs-border)); padding: 0.15rem 0.35rem; font-size: 0.875em; }
+.docs-prose pre code { background: transparent; padding: 0; }
