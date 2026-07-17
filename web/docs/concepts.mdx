@@ -1,0 +1,99 @@
+---
+label: Core Concepts
+section: Introduction
+order: 2
+icon: layers
+---
+
+# Core Concepts
+
+FlightDeck has a small number of concepts. Once they click, everything else in
+the app follows from them.
+
+## Project
+
+A **project** is a Git repository you have open in FlightDeck. You launch
+FlightDeck from inside a repo, and that repo becomes your first project. You can
+[open several projects at once](/desktop/projects) — each keeps its own agent
+sessions, worktrees, Git state, and base branch, and each runs in parallel in
+the background.
+
+## Agent tab (session)
+
+An **agent tab** is the core unit of work. Each one bundles together:
+
+- **one task branch** — named `flightdeck/<your-task-slug>` by default,
+- **one Git worktree** — a checkout of that branch under
+  `.flightdeck/worktrees/`, separate from your main checkout,
+- **one primary agent process** — the AI coding agent (OpenCode, Claude Code,
+  Codex, …) running in that worktree,
+- **optional child shells** — extra terminals in the same worktree.
+
+Because every tab has its own worktree and branch, agents work at the same time
+without ever sharing a working directory. Your original checkout at the repo
+root stays untouched and serves as the **base**.
+
+<Callout type="info">
+  **1 agent tab = 1 worktree = 1 branch = 1 primary agent process + optional
+  shells.** This equation is the heart of FlightDeck.
+</Callout>
+
+## Worktree
+
+A **worktree** is a Git feature that lets one repository have multiple working
+directories checked out at once, each on a different branch. FlightDeck creates
+one worktree per agent tab under `.flightdeck/worktrees/<slug>`, so each agent
+edits files in isolation. When you finish or abandon a tab, FlightDeck removes
+its worktree (the branch itself is kept unless you delete it).
+
+## Base branch
+
+The **base branch** is the branch your task branches start from and merge back
+into — usually `main`. FlightDeck detects it automatically and tracks how far
+each agent branch has drifted from it, so you can see when a worktree needs a
+[rebase or a base pull](/desktop/git).
+
+## Child terminal
+
+A **child terminal** is an extra shell you open inside an agent's worktree
+(`Ctrl-t`). It shares the worktree with the primary agent but runs
+independently — handy for running tests, inspecting output, or making a manual
+commit. See [Terminals & Split View](/desktop/terminals).
+
+## Agent status
+
+Every agent reports a live **status** — at minimum *idle* vs *in progress* —
+shown as a colored indicator next to its tab:
+
+- 🔴 **working** — the agent is mid-turn,
+- 🟢 **idle** — the agent is waiting for a prompt,
+- 🔵 **manual** — a status label you set yourself (`Ctrl-s`), which never hides
+  the real process state.
+
+FlightDeck reads these from the agent's own lifecycle events, never from
+terminal output — so typing a prompt can't fool it. See
+[Working with Agents](/desktop/agents).
+
+## The Git safety boundary
+
+This is the guarantee that makes FlightDeck safe to point at real repositories.
+
+<Callout type="success">
+  FlightDeck **never mutates commit history on its own.** It cannot stage files,
+  create or amend commits, squash, auto-rebase, force-push, or open pull
+  requests — those operations are not even available to it.
+</Callout>
+
+What FlightDeck **may** do (all reversible or explicitly confirmed):
+
+- detect the repo root, base branch, and dirty state,
+- create the `.flightdeck/` directory and append to `.gitignore`,
+- create and attach branches, create and recover worktrees,
+- **push** a branch — only after you confirm — and show you a PR compare URL,
+- remove a managed worktree (a dirty one only after you confirm discarding
+  changes),
+- run a guarded **local merge-back**, a confirmed **rebase**, and a **base
+  pull** after a PR merges.
+
+You — or your agent — make every commit. The [Git Workflow](/desktop/git) page
+covers each of these operations in detail.

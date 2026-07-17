@@ -265,6 +265,10 @@ impl Default for GitConfig {
 pub struct UiConfig {
     pub agent_tab_position: String,
     pub default_agent: String,
+    /// Use F2 instead of the platform-default modified-Esc shortcut to leave
+    /// terminal focus. Off by default.
+    #[serde(default)]
+    pub use_f2_to_leave_terminal_focus: bool,
 }
 
 impl Default for UiConfig {
@@ -272,6 +276,7 @@ impl Default for UiConfig {
         UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
+            use_f2_to_leave_terminal_focus: false,
         }
     }
 }
@@ -338,6 +343,41 @@ pub struct UpdateConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         UpdateConfig { check: true }
+    }
+}
+
+/// Default relay endpoint for FlightDeck Remote: the stable custom domain
+/// (`relay.flightdeckai.app`, remote-control-edn) fronting the hosted relay on
+/// Azure Container Apps, so the URL survives any rename/recreate of the
+/// underlying Azure resources. Overridable in `config.toml` (or per-device in
+/// `~/.flightdeck/remote.json`). An empty `relay_url` is treated as "no relay
+/// configured" and disables the client even when `enabled = true`.
+fn default_relay_url() -> String {
+    "wss://relay.flightdeckai.app/ws".to_string()
+}
+
+/// `[remote]` config section: FlightDeck Remote, the phone <-> desktop link over
+/// a hosted relay. **Off by default** — the desktop opens no outbound connection
+/// and behaves bit-for-bit as before until `enabled = true`. When enabled, a
+/// background thread (see `src/remote/`) maintains one WebSocket to `relay_url`,
+/// authenticates with the per-device key, and reports link state to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Master switch for the relay client. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay WebSocket URL (`wss://…`, or `ws://…` for local dev). Empty means
+    /// "not configured" and keeps the client dormant even if `enabled`.
+    #[serde(default = "default_relay_url")]
+    pub relay_url: String,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        RemoteConfig {
+            enabled: false,
+            relay_url: default_relay_url(),
+        }
     }
 }
 
@@ -475,6 +515,9 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// FlightDeck Remote (phone link). Absent table → disabled → no relay.
+    #[serde(default)]
+    pub remote: RemoteConfig,
     /// Container execution (SPECS §31). Absent table → disabled → local model.
     /// Accepts the legacy `[execution]` section name as a deprecated alias.
     #[serde(default, alias = "execution")]

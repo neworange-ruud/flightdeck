@@ -1,0 +1,79 @@
+---
+label: Overview
+section: Introduction
+order: 1
+icon: book-open
+---
+
+# FlightDeck
+
+FlightDeck is a terminal workspace for running several local AI coding agents in
+parallel — each in its own Git worktree, on its own branch, in its own terminal
+session. You supervise the whole fleet from one keyboard-driven screen and stay
+in control of every commit, merge, and pull request.
+
+![The FlightDeck desktop app: branded header, the project tabs row, the Agents sidebar with live status, the active agent terminal, and the Git info bar.](/screenshots/desktop/main-layout.png)
+
+*The FlightDeck desktop app — project tabs across the top to switch between repositories, one row per agent in the sidebar, the active agent's terminal in the main pane, and a live Git summary along the bottom.*
+
+<Callout type="info">
+  The mental model in one line: **one agent tab = one worktree = one branch =
+  one primary agent process (plus optional shells).** Nothing is shared between
+  tabs, so parallel tasks never step on each other.
+</Callout>
+
+## Why FlightDeck
+
+Running one AI agent is easy. Running five without them clobbering each other's
+files, branches, and commits is not. FlightDeck gives every task an isolated
+Git worktree so agents can work at the same time, and it surfaces each agent's
+live status so you always know which one needs you.
+
+- **True parallelism** — every agent works in a separate worktree and branch.
+- **You own history** — FlightDeck never commits, amends, squashes, or
+  force-pushes. It creates branches and worktrees, and pushes only after you
+  confirm.
+- **Any agent** — OpenCode, Claude Code, and Codex CLI ship pre-configured, and
+  agents are just config, so you can add your own.
+- **Know at a glance** — per-agent status indicators and native OS
+  notifications tell you the moment an agent finishes or needs input.
+- **Take it with you** — pair the [FlightDeck Remote](/remote) iOS app to
+  monitor and steer your agents from your phone over an end-to-end-encrypted
+  link.
+
+## Start here
+
+<CardGrid>
+  <Card href="/getting-started" title="Get Started">
+    Install FlightDeck, open a repository, and launch your first agent in a
+    couple of minutes.
+  </Card>
+  <Card href="/concepts" title="Core Concepts">
+    Understand projects, worktrees, agent tabs, and the Git safety boundary
+    before you dive in.
+  </Card>
+  <Card href="/interface" title="The Interface">
+    Take a guided tour of the screen layout and the two-mode keyboard model.
+  </Card>
+  <Card href="/remote" title="FlightDeck Remote">
+    Pair the iOS companion app to watch and control your agents from anywhere.
+  </Card>
+</CardGrid>
+
+## What FlightDeck does — and doesn't
+
+FlightDeck **may** detect your repo, create `.flightdeck/`, create and attach
+branches, create and recover worktrees, push branches after you confirm, run a
+guarded local merge-back, rebase a worktree onto its base, and pull the base
+branch after a PR merges.
+
+It **never** stages files, creates or amends commits, rewrites history
+automatically, force-pushes, or opens pull requests for you. You and your agents
+make the commits; FlightDeck shows you a GitHub compare URL after a push so you
+open the PR yourself. See [the Git safety boundary](/concepts#the-git-safety-boundary).
+
+## Platform support
+
+FlightDeck runs on **macOS**, **Linux**, and **Windows**. The FlightDeck Remote
+companion app is **iOS 18+** (iPhone). Head to [Get Started](/getting-started)
+to install.

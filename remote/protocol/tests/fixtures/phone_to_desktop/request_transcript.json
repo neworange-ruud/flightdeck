@@ -1,0 +1,7 @@
+{
+  "command_id": "cmd_00000010",
+  "issued_at_ms": 1752412825000,
+  "type": "request_transcript",
+  "session_id": "sess_fix_login",
+  "from_index": null
+}

@@ -1,0 +1,119 @@
+//! HTTP and WebSocket handlers.
+//!
+//! No business logic lives here yet — just the surface: liveness/readiness
+//! probes, a version endpoint, and a WebSocket endpoint that accepts a
+//! connection and closes cleanly. Pairing-ID routing plugs into
+//! [`ws_handler`] later; see the [`crate::router`] module doc comment.
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    Json,
+};
+use flightdeck_remote_protocol::RelayFrame;
+use futures_util::{
+    stream::{SplitSink, StreamExt},
+    SinkExt,
+};
+use serde::Serialize;
+use tokio::sync::mpsc;
+
+use crate::session::Connection;
+use crate::AppState;
+
+/// Bound on a connection's outbound frame channel. Small: the queue's job is to
+/// smooth momentary write bursts, not to buffer without limit — a peer that
+/// cannot keep up applies back-pressure to whoever is forwarding to it (spec
+/// §12 "treat delivery as at-least-once", correctness via receiver dedup).
+const OUTBOUND_CHANNEL_BOUND: usize = 256;
+
+/// Liveness probe: "is the process up and able to handle a request at all."
+/// Container Apps restarts the replica if this fails repeatedly. Deliberately
+/// has no dependencies on anything else being healthy.
+pub async fn healthz() -> &'static str {
+    "ok"
+}
+
+/// Readiness probe: "should traffic be routed to this replica right now."
+/// Identical to `healthz` today because the scaffold has no external
+/// dependencies (DB, queue, etc) to be un-ready for. Once the relay gains
+/// dependencies, this is the handler to wire a real check into — Container
+/// Apps stops sending new traffic (but doesn't restart) on failure here.
+pub async fn readyz() -> &'static str {
+    "ok"
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionInfo {
+    /// The crate version (`CARGO_PKG_VERSION`), i.e. `Cargo.toml`'s
+    /// `[package].version`.
+    pub version: &'static str,
+    /// Git commit SHA of the running build; see [`crate::config::Config::git_sha`]
+    /// for how it's sourced.
+    pub git_sha: String,
+}
+
+/// Reports the running build's crate version and git SHA. Useful for
+/// confirming which revision a Container Apps replica is actually running.
+pub async fn version(State(state): State<AppState>) -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        git_sha: state.config.git_sha.clone(),
+    })
+}
+
+/// Upgrades an HTTP connection to a WebSocket and hands it to
+/// [`handle_socket`], carrying the shared [`AppState`] in.
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+/// Services a single WebSocket connection.
+///
+/// Splits the socket into a read half (driven by the [`Connection`] state
+/// machine, spec §5) and a write half (drained by a dedicated writer task from
+/// a bounded outbound channel). Keeping writes on their own task lets the relay
+/// push to a connection from anywhere — its own state machine *and* the peer
+/// leg forwarding envelopes — through one serialized sink, while the bounded
+/// channel supplies back-pressure.
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (sink, stream) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<RelayFrame>(OUTBOUND_CHANNEL_BOUND);
+
+    // Writer task owns the sink; it exits when the channel closes (all senders
+    // dropped once the state machine returns and the registry handle is
+    // detached), then completes the close handshake.
+    let writer = tokio::spawn(writer_task(sink, out_rx));
+
+    // Run the state machine to completion (this also cleans up the registry).
+    Connection::new(state, out_tx).run(stream).await;
+
+    // Dropping the last sender lets the writer drain and close.
+    let _ = writer.await;
+}
+
+/// Drains outbound [`RelayFrame`]s to the WebSocket sink as JSON text, then
+/// sends a Close frame to finish the RFC 6455 handshake cleanly.
+async fn writer_task(mut sink: SplitSink<WebSocket, Message>, mut rx: mpsc::Receiver<RelayFrame>) {
+    while let Some(frame) = rx.recv().await {
+        // Serialization of these small, well-typed frames does not fail in
+        // practice; if the socket write fails the peer is gone, so stop.
+        match serde_json::to_string(&frame) {
+            Ok(text) => {
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize outbound frame");
+            }
+        }
+    }
+    // Drive the RFC 6455 close handshake: `close()` emits a Close frame (if one
+    // has not already gone out) and flushes, so the peer sees a clean shutdown
+    // rather than a TCP reset.
+    let _ = sink.close().await;
+}

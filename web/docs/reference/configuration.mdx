@@ -1,0 +1,138 @@
+---
+label: Configuration Reference
+section: Reference
+order: 61
+---
+
+# Configuration Reference
+
+Every FlightDeck configuration key, its default, and what it does. For how the
+global and project files layer together and the in-app editor, see
+[Configuration](/desktop/configuration).
+
+```text
+~/.flightdeck/config.toml       # per-user GLOBAL base (all keys, documented)
+<repo>/.flightdeck/config.toml  # per-project OVERRIDE (only changed values)
+```
+
+## `[project]`
+
+Project identity — lives in the **project** file only.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `name` | repo folder name | Project display name |
+| `default_base_branch` | detected / `main` | Base branch for new tabs |
+
+## `[worktrees]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `root` | `.flightdeck/worktrees` | Where managed worktrees are created |
+
+## `[git]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `default_remote` | `origin` | Remote to push to |
+| `primary_host` | `github` | Host used to build the PR compare URL |
+| `branch_prefix` | `flightdeck/` | Prefix for generated branch names |
+
+## `[ui]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `agent_tab_position` | `left` | Sidebar on the `left` or `right` |
+| `default_agent` | `opencode` | Agent key selected by default for new tabs |
+| `use_f2_to_leave_terminal_focus` | `false` | Use `F2` instead of modified `Esc` to leave terminal focus |
+
+## `[notifications]`
+
+See [Notifications](/desktop/notifications).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch |
+| `on_finish` | `true` | Notify when an agent goes idle / completes |
+| `on_waiting` | `true` | Notify when an agent needs input |
+| `on_failed` | `true` | Notify when an agent errors |
+| `sound` | `true` | Play alert sounds |
+
+## `[update]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `check` | `true` | Daily background update-availability check |
+
+## `[remote]`
+
+FlightDeck Remote (phone pairing). See [FlightDeck Remote](/remote).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch for phone pairing |
+| `relay_url` | `wss://relay.flightdeckai.app/ws` | Relay WebSocket URL (empty disables) |
+
+## `[containers]`
+
+Run agents in Podman containers. See [Agents in Containers](/desktop/containers).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Run all of the project's agents in containers |
+| `runtime` | `podman` | Container runtime (only Podman is supported) |
+| `image` | — | Fully-resolved image override |
+| `base_image` | — | Override the generated base image |
+| `packages` | `[]` | OS packages to install into the image |
+| `setup_script` | — | Repo-relative build script |
+| `containerfile` | — | Bring-your-own Containerfile (mutually exclusive with `packages` / `setup_script`) |
+| `forward_ports` | `[]` | Ports published to `127.0.0.1` only |
+
+### `[containers.limits]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cpu` | `4` | `--cpus` |
+| `memory` | `8g` | `--memory` |
+| `pids` | `512` | `--pids-limit` |
+
+### `[containers.auth]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `env_allow` | `[]` | Host environment variables injected into the container |
+
+### `[[containers.auth.mounts]]`
+
+An array of credential mounts, each with:
+
+| Key | Meaning |
+| --- | --- |
+| `host_path` | Path on the host to mount |
+| `container_path` | Where it appears in the container |
+| `writable` | Whether the mount is writable |
+
+## `[agents.<key>]`
+
+One table per agent. A project that defines **any** agent replaces the agents
+table wholesale (see [Configuration](/desktop/configuration)).
+
+| Key | Meaning |
+| --- | --- |
+| `display_name` | Name shown in menus |
+| `command` | Executable to launch (must be on `PATH`) |
+| `args` | Arguments passed to the command |
+
+```toml
+[agents.claude]
+display_name = "Claude Code"
+command = "claude"
+args = []
+```
+
+## Validation
+
+FlightDeck rejects invalid configs at load time: an empty agents map, a
+`default_agent` that isn't a defined agent, an agent with an empty command, an
+unsupported container runtime (when containers are enabled), a `containerfile`
+combined with `packages`/`setup_script`, and zero or duplicate `forward_ports`.

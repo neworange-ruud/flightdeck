@@ -1,9 +1,10 @@
 //! Compile-time OS detection for platform-specific key bindings.
 //!
-//! Key bindings differ per platform (e.g. the leave-terminal-focus key), and
-//! expressing that with scattered `#[cfg(...)]` attributes makes the binding
-//! logic hard to read. Instead we expose one boolean constant per OS so the
-//! bindings read as ordinary checks (`IS_LINUX`) rather than attribute gates.
+//! Key bindings differ per platform (e.g. the default leave-terminal-focus key,
+//! and macOS terminals report Command as `SUPER` for the paste shortcut).
+//! Expressing that with scattered `#[cfg(...)]` attributes makes the logic hard
+//! to read, so we expose one boolean constant per OS and branch on it as an
+//! ordinary check (`IS_MACOS`) rather than an attribute gate.
 //!
 //! These are `cfg!(...)` constants folded at compile time, so branching on
 //! them costs nothing at runtime and the dead arm is optimized away.
@@ -17,10 +18,17 @@ pub const IS_LINUX: bool = cfg!(target_os = "linux");
 /// Whether the target OS is macOS.
 pub const IS_MACOS: bool = cfg!(target_os = "macos");
 
-/// Whether `Shift+Esc` (rather than `Alt+Esc`) is the leave-terminal-focus key.
-///
-/// True on Windows and Linux, where the OS/window manager reserves `Alt+Esc`
-/// for cycling windows so FlightDeck never receives it. This is the single
-/// source of truth for the platform split: the input mapping, the
-/// `LEAVE_FOCUS_KEY` label, and the help overlay all derive from it.
+/// Whether the default leave-terminal-focus binding is `Shift+Esc` rather than
+/// `Alt+Esc`. Windows and Linux reserve `Alt+Esc` for cycling windows.
 pub const LEAVE_FOCUS_USES_SHIFT: bool = IS_WINDOWS || IS_LINUX;
+
+/// User-facing label for the configured leave-terminal-focus binding.
+pub fn leave_focus_key(use_f2: bool) -> &'static str {
+    if use_f2 {
+        "F2"
+    } else if LEAVE_FOCUS_USES_SHIFT {
+        "Shift+Esc"
+    } else {
+        "Alt+Esc"
+    }
+}

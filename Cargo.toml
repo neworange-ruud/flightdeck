@@ -1,6 +1,6 @@
 [package]
 name = "flightdeck"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 description = "A cross-platform terminal UI for orchestrating multiple local AI coding agents in isolated Git worktrees."
 repository = "https://github.com/neworange-ruud/flightdeck"
@@ -39,6 +39,49 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 vt100 = "0.16.2"
 
+# --- FlightDeck Remote (relay client, src/remote/) -------------------------
+# Shared phone<->desktop wire types. Path dep into the sibling `remote/`
+# workspace; the desktop and the relay build the exact same frames from it and
+# the iOS app mirrors them in Swift. JSON wire format via serde/serde_json above.
+flightdeck-remote-protocol = { path = "remote/protocol" }
+# Blocking WebSocket client for the long-lived relay connection. tungstenite
+# (NOT tokio-tungstenite) is used deliberately: the desktop TUI has no async
+# runtime, so the relay client is a plain std::thread owning a blocking socket,
+# mirroring the update-check thread. `handshake` gives the client upgrade; TLS
+# (wss) is added per-platform below. Base build carries no TLS so a plain-Rust
+# Windows target keeps building (see the target table).
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# Per-device identity: ECDSA over NIST P-256 with SHA-256 (spec §5.1). P-256 is
+# mandated by the protocol because the iPhone key is Secure-Enclave-resident and
+# the Enclave only speaks P-256; the desktop must use the same curve to be
+# verifiable by the relay. `ecdsa` enables sign/verify; `ecdh` enables the
+# static-static P-256 key agreement that seeds the E2E channel (spec §7, src/remote/crypto.rs).
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+# E2E channel key derivation: HKDF-SHA256 over the P-256 ECDH shared secret
+# (spec §7). Pure-Rust RustCrypto crate, same family/versions as p256+sha2, so
+# it adds no C toolchain and keeps the Windows build pure-Rust. sha2 above is the
+# hash; hkdf provides extract+expand.
+hkdf = "0.12"
+# E2E authenticated encryption: ChaCha20-Poly1305 AEAD (spec §7). Pure-Rust
+# RustCrypto crate; chosen over AES-GCM because it needs no hardware AES and is
+# constant-time in software, matching CryptoKit's `ChaChaPoly` on the iOS side so
+# the two platforms produce byte-identical ciphertext. 12-byte nonce per message.
+chacha20poly1305 = "0.10"
+# Device id = SHA-256 of the X9.63 public key (matches the iOS convention).
+sha2 = "0.10"
+# QR code generation for the desktop pairing overlay (Settings → Remote). The
+# `fdr1:` payload is encoded and rendered as terminal half-block cells (spec
+# §5.2, src/remote/pairing.rs). `default-features = false` drops the optional
+# `image`/`svg` renderers we do not use, keeping the graph pure-Rust with no C
+# toolchain (matching the rest of the remote crypto stack).
+qrcode = { version = "0.14", default-features = false }
+# Wire encodings: standard-padded base64 for keys/signatures/nonces/ciphertext
+# (spec §2/§5.1) and url-safe-no-pad for the device id.
+base64 = "0.22"
+# CSPRNG for P-256 key generation (OsRng) and backoff jitter. rand_core 0.6 is
+# the version p256/ecdsa expect, so one dependency serves both.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
 # Self-update deps, built on every platform EXCEPT Windows. Target-gating them
 # here (rather than only behind the `self-update` feature) keeps the Windows
 # build pure-Rust even when that default feature is enabled: axoupdater's graph
@@ -55,6 +98,12 @@ axoupdater = { version = "0.10", features = ["blocking"], optional = true }
 # thread (the once-a-day notice). A current-thread runtime; tokio is
 # already in the graph via axoupdater's `blocking` feature.
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
+# TLS (wss) for the relay client on every platform except Windows, mirroring how
+# the self-update crypto deps are target-gated so the released windows-msvc
+# binary stays pure-Rust (no aws-lc C toolchain). Feature-unified with the base
+# `tungstenite` above: on non-Windows the socket gains rustls with the webpki
+# root store; on Windows only plain `ws://` is available (localhost dev + tests).
+tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 insta = "1.48.0"

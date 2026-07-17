@@ -1,0 +1,61 @@
+---
+label: Multiple Projects
+section: Desktop Guide
+order: 24
+---
+
+# Multiple Projects
+
+FlightDeck can run several project folders at once. The folder you launch from
+is your first project; the **project tab row** at the top switches between them.
+Every open project stays live in the background.
+
+![The project tab row with several repositories open, each showing a status dot.](/screenshots/desktop/multiple-projects.png)
+
+*Several projects open at once — each tab shows a rolled-up status dot.*
+
+## Open a project
+
+Click **`+ project`** on the tab row, or run the **Open Project** command from
+the palette (`Ctrl-g`). The picker lets you **type a folder path** or **browse**:
+
+- `↑` / `↓` — select a subfolder,
+- `→` (or `Tab`) — open the highlighted folder,
+- `←` — go to the parent,
+- `Enter` — open the highlighted (or typed) folder as a project.
+
+The folder must be a Git repository.
+
+## Switch projects
+
+- **`Shift+←` / `Shift+→`** — previous / next project (works in both modes, so
+  you don't have to leave terminal focus),
+- click a project tab,
+- or use the **Next Project** / **Previous Project** palette commands.
+
+Each project tab shows a status dot — **red** = needs attention, **cyan** = an
+agent is working, **dim** = idle — and the active project is highlighted.
+
+## Close a project
+
+Click a project tab's `✕`, or run **Close Project**. Closing is confirmed first
+and **stops that project's agents**. You can't close the only remaining
+project — use `Ctrl-q` to quit instead.
+
+## Everything runs in parallel
+
+<Callout type="info">
+  Every open project stays live in the background. Its agents keep running and
+  still fire OS notifications when they finish or need input — even while you're
+  looking at a different project.
+</Callout>
+
+Each project keeps its own agent tabs, worktrees, Git status, and base branch,
+entirely independent of the others.
+
+## Remembered across restarts
+
+The set of open projects is saved to `~/.flightdeck/workspace.json`, so
+relaunching reopens the same project tabs. Each project's own agent tabs are
+recovered from its `state.json`, and agents are **never auto-relaunched** into a
+project you didn't reopen — restart any recovered agent with `Ctrl-r`.

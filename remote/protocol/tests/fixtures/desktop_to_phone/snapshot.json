@@ -1,0 +1,63 @@
+{
+  "type": "snapshot",
+  "server_time_ms": 1752412800000,
+  "projects": [
+    {
+      "project_id": "proj_flightdeck",
+      "name": "flightdeck",
+      "rollup": {
+        "dot": "needs_input",
+        "summary": "1 needs input · 1 working · 3 agents",
+        "working": 1,
+        "idle": 1,
+        "needs_input": 1,
+        "manual": 0,
+        "agent_count": 3
+      },
+      "sessions": [
+        {
+          "session_id": "sess_fix_login",
+          "project_id": "proj_flightdeck",
+          "name": "fix-login",
+          "agent_type": "claude_code",
+          "status": {
+            "state": "needs_input"
+          },
+          "git": {
+            "branch": "flightdeck/fix-login",
+            "added": 0,
+            "modified": 3,
+            "removed": 0,
+            "ahead": 0,
+            "behind": 0,
+            "drift": 2,
+            "has_upstream": true
+          },
+          "running_time_secs": 512,
+          "pending_question": "Allow rm -rf dist/ ?"
+        },
+        {
+          "session_id": "sess_add_tests",
+          "project_id": "proj_flightdeck",
+          "name": "add-tests",
+          "agent_type": "opencode",
+          "status": {
+            "state": "working"
+          },
+          "git": {
+            "branch": "flightdeck/add-tests",
+            "added": 12,
+            "modified": 4,
+            "removed": 0,
+            "ahead": 0,
+            "behind": 0,
+            "drift": 0,
+            "has_upstream": false
+          },
+          "running_time_secs": 73,
+          "pending_question": null
+        }
+      ]
+    }
+  ]
+}
