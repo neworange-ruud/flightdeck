@@ -1,0 +1,37 @@
+---
+label: Overview
+order: 1
+icon: book-open
+---
+
+# Flightdeck Documentation
+
+<Callout type="info">
+  Flightdeck runs local AI coding agents in parallel without asking them to share a
+  working directory or Git branch.
+</Callout>
+
+Flightdeck creates one Git worktree per agent tab, so each task has an isolated
+branch and terminal session. Use it to supervise parallel work without giving up
+control of commits, merges, or pull requests.
+
+<CardGrid>
+  <Card href="/getting-started" title="Get Started">
+    Install Flightdeck, open a repository, and create your first agent tab.
+  </Card>
+  <Card href="/concepts" title="Core Concepts">
+    Learn how projects, worktrees, agent tabs, and terminal sessions fit together.
+  </Card>
+</CardGrid>
+
+## What Flightdeck Manages
+
+- Git worktrees and task branches for agent sessions
+- Terminal processes for OpenCode, Claude Code, Codex, and custom agents
+- Per-agent Git state and lifecycle status
+- Safe push and local merge workflows that require explicit confirmation
+
+## What Remains Yours
+
+Flightdeck never creates commits, rewrites history, or resolves conflicts. You
+and your agents retain ownership of every change.

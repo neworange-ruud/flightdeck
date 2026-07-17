@@ -1,0 +1,29 @@
+{
+  "name": "flightdeck-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "check-types": "tsc --noEmit",
+    "dev": "next dev",
+    "lint": "eslint .",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@flightdeck/docs-platform": "file:./docs-platform",
+    "@tailwindcss/postcss": "4.2.2",
+    "next": "16.2.9",
+    "next-themes": "0.4.6",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "tailwindcss": "4.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "eslint": "9.39.3",
+    "eslint-config-next": "16.2.9",
+    "typescript": "6.0.3"
+  }
+}

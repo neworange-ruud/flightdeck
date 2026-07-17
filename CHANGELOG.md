@@ -8,7 +8,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Add a Next.js documentation site under `web/`, including a Flightdeck landing
+  page and MDX documentation at `/docs`.
 
 ### Improvements
 
