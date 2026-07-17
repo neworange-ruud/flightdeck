@@ -334,7 +334,12 @@ actor TransportClient {
             setLink(.connected(latencyMs: latencyMs))
             return true
 
-        case let .error(code, _, _):
+        case let .error(code, _, pairingId):
+            // A `seq_violation` is recoverable, not fatal: the relay lost its
+            // outbound watermark for us (restart) and our command seq ran ahead.
+            // Re-sync our outbound cursor so the next command restarts at seq 1
+            // rather than reconnecting into the same rejection forever (bbf).
+            if code == .seqViolation { await handleSeqViolation(pairingId) }
             return !isFatal(code)
 
         case .bye:
@@ -387,8 +392,14 @@ actor TransportClient {
         guard var record, env.pairingId.rawValue == record.pairingId else { return }
         // The phone only consumes desktop→phone traffic.
         guard env.sender == .desktop else { return }
-        // Dedup: ignore anything at/below the durable inbound cursor (§6.4).
-        guard env.seq > record.lastReceivedSeq else { return }
+        // Accept a strictly-newer seq (normal, §6.4 dedup), OR an explicit stream
+        // reset: a seq of 1 while we already hold a higher cursor is the desktop
+        // restarting its outbound stream after the relay lost its seq state
+        // (remote-control-bbf). Steady state never re-emits seq 1 (it is
+        // monotonic), so this can only be a genuine reset — accept it instead of
+        // dropping it as a duplicate, or the recovered feed would stall forever.
+        let isReset = env.seq == 1 && record.lastReceivedSeq >= 1
+        guard env.seq > record.lastReceivedSeq || isReset else { return }
         guard let e2e else { return }
 
         // Open + decode BEFORE advancing the cursor: a failed open / AAD
@@ -412,10 +423,16 @@ actor TransportClient {
             return
         }
 
-        // Commit the cursor durably, then publish and ack contiguous receipt.
+        // Commit the cursor durably, then publish and ack contiguous receipt. A
+        // reset moves the cursor *backwards* to the new stream epoch, so it uses
+        // the non-monotonic setter; the normal path stays monotonic.
         record.lastReceivedSeq = env.seq
         self.record = record
-        _ = try? recordStore.setLastReceivedSeq(env.seq)
+        if isReset {
+            _ = try? recordStore.resetInboundCursor(to: env.seq)
+        } else {
+            _ = try? recordStore.setLastReceivedSeq(env.seq)
+        }
 
         if case let .commandAck(ack) = message {
             resolvePending(ack)
@@ -535,9 +552,26 @@ actor TransportClient {
         switch code {
         case .authFailed, .unsupportedVersion, .notAuthenticated, .badFrame, .internalError:
             return true
-        case .unknownPairing, .pairingClaimRejected, .peerUnavailable, .rateLimited:
+        case .unknownPairing, .pairingClaimRejected, .peerUnavailable, .rateLimited,
+             .seqViolation, .unknown:
+            // `seqViolation` is handled by re-syncing (see `handleSeqViolation`);
+            // `unknown` is a forward-compat advisory we don't understand — never
+            // tear the link down for either.
             return false
         }
+    }
+
+    /// The relay rejected one of our outbound command envelopes as non-monotonic:
+    /// it lost its in-memory seq watermark (restart/redeploy) while we kept our
+    /// persisted outbound cursor (remote-control-bbf). Rewind the cursor to 0 so
+    /// the next command restarts at seq 1, which a fresh relay accepts. In-flight
+    /// commands time out to "not delivered — retry"; a retry re-sends at the new
+    /// low seq under the same command id (the desktop dedups idempotently).
+    private func handleSeqViolation(_ pairingId: Wire.PairingId?) async {
+        guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
+        record.lastSentSeq = 0
+        self.record = record
+        _ = try? recordStore.resetOutboundCursor()
     }
 
     private func shortToken() -> String {

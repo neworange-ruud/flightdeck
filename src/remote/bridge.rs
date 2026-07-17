@@ -157,7 +157,15 @@ impl RemoteBridge {
     pub fn install_channel(&mut self, seal: SealFn, open: OpenFn, resume_from_seq: u64) {
         self.seal = seal;
         self.open = open;
-        self.out_seq = resume_from_seq;
+        // Floor, never regress: installing a channel for an *already-active*
+        // pairing (a repeat `pairing_claimed`, or a mid-session re-derivation)
+        // must not rewind the outbound counter below what we have already sent,
+        // or the phone — which only reset its receive cursor on a genuine first
+        // claim, not on a resume — would silently drop every "duplicate" seq and
+        // the feed would stall (remote-control-bbf). A genuinely new pairing
+        // resets `out_seq` to 0 in `handle_inbound` (on the pairing-id change) or
+        // via `reset_to_passthrough` (on unpair), so the max here is 0-vs-0 there.
+        self.out_seq = self.out_seq.max(resume_from_seq);
     }
 
     /// Revert to the no-crypto passthrough and forget the active pairing — used
@@ -213,8 +221,26 @@ impl RemoteBridge {
         match msg {
             RemoteInbound::Paired { pairing_id, .. }
             | RemoteInbound::PairingClaimed { pairing_id, .. } => {
+                // Switching to a *different* pairing than the one we were feeding
+                // means a new peer with a fresh receive cursor at 0 — restart the
+                // outbound stream from seq 1. Re-confirming the SAME pairing (a
+                // resume, or a repeat claim) must NOT rewind `out_seq`, so the
+                // phone's resumed cursor keeps matching (remote-control-bbf).
+                if self.pairing.is_some() && self.pairing.as_ref() != Some(&pairing_id) {
+                    self.out_seq = 0;
+                }
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
+            }
+            // The relay lost our outbound seq watermark (restart/redeploy) and
+            // rejected an envelope as non-monotonic. Restart this pairing's
+            // outbound stream from seq 1 with a fresh full snapshot so a fresh
+            // relay accepts it and the phone re-syncs (remote-control-bbf).
+            RemoteInbound::SeqResync { pairing_id } => {
+                if self.pairing.as_ref() == Some(&pairing_id) {
+                    self.out_seq = 0;
+                    self.snapshot_needed = true;
+                }
             }
             // The offer (code shown) does not itself activate a pairing for the
             // outbound feed — the phone has not joined yet. Handled by the

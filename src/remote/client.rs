@@ -1098,6 +1098,28 @@ fn handle_frame(
             });
             true
         }
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            pairing_id,
+            ..
+        } => {
+            // The relay is ahead-of-us on this pairing's outbound seq — it lost
+            // its in-memory watermark (restart/redeploy) while we kept ours. Do
+            // NOT tear the connection down (that just reconnects into the same
+            // rejection forever). Re-sync: zero this pairing's persisted outbound
+            // cursor and tell the bridge to restart its stream from seq 1 with a
+            // fresh snapshot (remote-control-bbf). A `seq_violation` without a
+            // pairing id can't be targeted, so it is ignored (non-fatal).
+            if let Some(pid) = pairing_id {
+                if let Some(p) = state.pairing_mut(pid.as_str()) {
+                    p.last_sent_seq = 0;
+                    p.last_acked_by_peer = 0;
+                    store.save(state);
+                }
+                let _ = inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
+            }
+            true
+        }
         RelayFrame::Error { code, .. } => !is_fatal_error(code),
         RelayFrame::Bye { .. } => false,
         // Post-auth restatements of handshake frames or unused directions: ignore.

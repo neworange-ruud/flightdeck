@@ -735,8 +735,12 @@ impl Connection {
         let pairing_id = env.pairing_id.clone();
         match self.state.store.enqueue(env.clone()).await {
             Err(QueueError::SeqViolation { .. }) => {
+                // Recoverable, not a client bug: the endpoint's outbound cursor
+                // is ahead of our (possibly restart-reset, in-memory) watermark.
+                // Signal `SeqViolation` so the sender re-syncs instead of looping
+                // on a fatal reconnect (remote-control-bbf).
                 self.send_error(
-                    RelayErrorCode::BadFrame,
+                    RelayErrorCode::SeqViolation,
                     "envelope seq is not gapless/monotonic",
                     Some(pairing_id),
                 )

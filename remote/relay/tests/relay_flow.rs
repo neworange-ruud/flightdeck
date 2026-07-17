@@ -473,7 +473,7 @@ async fn envelope_seq_gap_is_rejected() {
     assert!(matches!(
         err,
         RelayFrame::Error {
-            code: RelayErrorCode::BadFrame,
+            code: RelayErrorCode::SeqViolation,
             ..
         }
     ));

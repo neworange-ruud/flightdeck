@@ -509,3 +509,173 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
     handle.stop();
     let _ = mock.join();
 }
+
+// --- Recover from a relay seq-violation (relay restart) without a fatal loop (bbf) --
+
+/// Read frames until an [`EncryptedEnvelope`] arrives (skipping pings/acks etc.),
+/// bounded so a misbehaving client can never hang the mock forever.
+fn ws_recv_envelope(ws: &mut Ws) -> EncryptedEnvelope {
+    for _ in 0..20 {
+        match ws_recv(ws) {
+            Some(RelayFrame::Envelope(e)) => return e,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    panic!("expected an envelope frame from the client");
+}
+
+/// Block until the client reports [`RemoteLinkState::Connected`].
+fn wait_for_connected(in_rx: &std::sync::mpsc::Receiver<RemoteInbound>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(RemoteInbound::Link(RemoteLinkState::Connected { .. })) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            return;
+        }
+    }
+    panic!("client never reported Connected");
+}
+
+/// A restarted relay loses its in-memory per-pairing seq watermark while the
+/// desktop keeps its persisted outbound cursor. The desktop's next envelope
+/// (seq ahead of the fresh relay's 0) is rejected with `seq_violation`. The
+/// client must NOT tear the connection down and reconnect into the same
+/// rejection forever (remote-control-bbf); it must re-sync — zero the persisted
+/// outbound cursor and emit `SeqResync` — so the bridge restarts the stream from
+/// seq 1, which the fresh relay accepts. This is the desktop→phone
+/// "delivery resumes across a relay restart mid-pairing" acceptance: the mock
+/// only ever accepts ONE connection, so a fatal-reconnect regression could never
+/// deliver the resynced envelope and this test would fail.
+#[test]
+fn seq_violation_triggers_resync_and_delivery_resumes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+
+        // Returning desktop resumes the known pairing.
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { pairing_id, .. }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+            }
+            other => panic!("expected resume, got {other:?}"),
+        }
+
+        // The desktop sends its next outbound envelope at seq 6 (it persisted
+        // last_sent_seq = 5). A freshly-restarted relay expects seq 1 → reject.
+        let first = ws_recv_envelope(&mut ws);
+        assert_eq!(first.seq, 6, "desktop resumes from its persisted cursor");
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::SeqViolation,
+                message: "envelope seq is not gapless/monotonic".to_string(),
+                pairing_id: Some(PairingId::new("pair_test")),
+            },
+        );
+
+        // After re-syncing, the desktop restarts the stream from seq 1 on the
+        // SAME connection — a fresh relay accepts it; delivery has resumed.
+        let resynced = ws_recv_envelope(&mut ws);
+        assert_eq!(resynced.seq, 1, "stream restarts gaplessly from seq 1");
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 1,
+            },
+        );
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    let mut seed = RemoteState::default();
+    let mut pairing = Pairing::new("pair_test");
+    pairing.last_sent_seq = 5; // desktop already sent 5 envelopes before the restart
+    seed.pairings.push(pairing);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    // Once connected, act as the bridge and send the next outbound envelope.
+    wait_for_connected(&in_rx);
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_test"),
+            seq: 6,
+            sent_at_ms: 1_000,
+            nonce: "bg==".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+        })
+        .unwrap();
+
+    // The client must surface a resync (not a disconnect/reconnect loop).
+    let mut resynced = false;
+    let mut disconnected = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !resynced {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::SeqResync { pairing_id }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+                resynced = true;
+            }
+            Ok(RemoteInbound::Link(RemoteLinkState::Disconnected)) => disconnected = true,
+            _ => {}
+        }
+    }
+    assert!(
+        resynced,
+        "client must emit SeqResync on a relay seq_violation"
+    );
+    assert!(!disconnected, "recovery must not tear the connection down");
+
+    // Play the bridge's resync response: restart the stream from seq 1.
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_test"),
+            seq: 1,
+            sent_at_ms: 2_000,
+            nonce: "bg==".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+        })
+        .unwrap();
+
+    mock.join().unwrap();
+
+    // The persisted outbound cursor was zeroed on resync, then advanced to 1 as
+    // the fresh stream's first envelope was sent (the bridge owns the live
+    // counter; this is the client's persisted mirror for the next launch).
+    let mut settled = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        settled = shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_sent_seq)
+            .unwrap_or(0);
+        if settled == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        settled, 1,
+        "outbound cursor resets on resync then advances from seq 1"
+    );
+
+    handle.stop();
+}

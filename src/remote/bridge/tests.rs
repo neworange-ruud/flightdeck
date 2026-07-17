@@ -374,3 +374,142 @@ fn seal_open_round_trip_preserves_message() {
     let round: DesktopToPhone = serde_json::from_slice(&plain).unwrap();
     assert_eq!(round, msg);
 }
+
+// --- outbound seq continuity across channel re-derivation (bbf) -------------
+
+/// Collect the raw outbound envelopes a tick produces (seq intact).
+fn collect_raw<'a>(
+    b: &mut RemoteBridge,
+    views: &[ProjectView<'a>],
+    now_ms: u64,
+) -> Vec<RemoteOutbound> {
+    let mut raw = Vec::new();
+    b.tick(views, now_ms, &mut |o| raw.push(o));
+    raw
+}
+
+fn seq_of(o: &RemoteOutbound) -> u64 {
+    match o {
+        RemoteOutbound::SendEnvelope { seq, .. } => *seq,
+        other => panic!("expected SendEnvelope, got {other:?}"),
+    }
+}
+
+/// Re-deriving the E2E channel for the SAME, already-active pairing (a repeat
+/// `pairing_claimed`, or the startup go-live) must NOT rewind the outbound seq:
+/// the phone only reset its receive cursor on a genuine first claim, so a rewind
+/// would make it drop every "duplicate" seq and stall the feed (remote-control-bbf).
+#[test]
+fn install_channel_floors_outbound_seq() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    let high = first.iter().map(seq_of).max().expect("first tick emits");
+    assert!(high >= 1);
+
+    // Re-derive the channel for the same pairing, passing a stale resume-from of
+    // 0 (as the runtime `pairing_claimed` path does). The floor must hold.
+    b.install_channel(passthrough_seal(), passthrough_open(), 0);
+    // Re-confirming the same pairing asks for a fresh snapshot without rewinding.
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let second = collect_raw(&mut b, &views, 2_000);
+    let next = second.iter().map(seq_of).min().expect("second tick emits");
+    assert_eq!(
+        next,
+        high + 1,
+        "outbound seq must keep ascending across a same-pairing re-derivation, not reset"
+    );
+}
+
+/// Switching to a genuinely DIFFERENT pairing (a new peer with a fresh receive
+/// cursor at 0) restarts the outbound stream from seq 1.
+#[test]
+fn switching_pairing_restarts_outbound_seq() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    assert!(first.iter().map(seq_of).max().unwrap() >= 1);
+
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-2"),
+        peer_device_id: None,
+    });
+    let second = collect_raw(&mut b, &views, 2_000);
+    assert_eq!(
+        seq_of(&second[0]),
+        1,
+        "a new pairing's first envelope must be seq 1"
+    );
+}
+
+/// A `SeqResync` (the relay rejected our outbound seq after losing its watermark)
+/// restarts the active pairing's outbound stream from seq 1 with a fresh full
+/// snapshot, so a restarted relay accepts it and the phone re-syncs.
+#[test]
+fn seq_resync_restarts_stream_from_seq_1_with_snapshot() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    assert!(first.iter().map(seq_of).max().unwrap() >= 1);
+
+    b.handle_inbound(RemoteInbound::SeqResync {
+        pairing_id: PairingId::new("pair-1"),
+    });
+    let after = collect_raw(&mut b, &views, 2_000);
+    assert_eq!(
+        seq_of(&after[0]),
+        1,
+        "resynced stream restarts gaplessly from seq 1"
+    );
+    assert!(
+        matches!(decode(&after[0]), DesktopToPhone::Snapshot(_)),
+        "the resynced stream must lead with a fresh full snapshot"
+    );
+}
+
+/// A `SeqResync` for a *different* pairing than the active one is ignored (no
+/// spurious rewind of the live stream).
+#[test]
+fn seq_resync_for_other_pairing_is_ignored() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let high = collect_raw(&mut b, &views, 1_000)
+        .iter()
+        .map(seq_of)
+        .max()
+        .unwrap();
+
+    b.handle_inbound(RemoteInbound::SeqResync {
+        pairing_id: PairingId::new("other-pairing"),
+    });
+    // Trigger another send; seq must keep ascending (no reset).
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let next = collect_raw(&mut b, &views, 2_000)
+        .iter()
+        .map(seq_of)
+        .min()
+        .unwrap();
+    assert_eq!(
+        next,
+        high + 1,
+        "an unrelated resync must not rewind the stream"
+    );
+}

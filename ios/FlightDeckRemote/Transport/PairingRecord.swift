@@ -137,4 +137,29 @@ final class PairingRecordStore {
         }
         return record
     }
+
+    /// Force the outbound cursor back to 0 after the relay rejected our stream as
+    /// non-monotonic — it lost its in-memory watermark (restart/redeploy) while
+    /// we kept ours (remote-control-bbf). Unlike `setLastSentSeq` this is NOT
+    /// monotonic: it deliberately rewinds so the next command restarts at seq 1,
+    /// which a fresh relay accepts.
+    @discardableResult
+    func resetOutboundCursor() throws -> PairingRecord? {
+        guard var record = try load() else { return nil }
+        record.lastSentSeq = 0
+        try save(record)
+        return record
+    }
+
+    /// Force the inbound cursor to `seq`, rewinding it if necessary, when the
+    /// desktop restarts its outbound stream after a relay seq reset. Unlike
+    /// `setLastReceivedSeq` this is NOT monotonic — the new epoch legitimately
+    /// begins below the old cursor (remote-control-bbf).
+    @discardableResult
+    func resetInboundCursor(to seq: UInt64) throws -> PairingRecord? {
+        guard var record = try load() else { return nil }
+        record.lastReceivedSeq = seq
+        try save(record)
+        return record
+    }
 }

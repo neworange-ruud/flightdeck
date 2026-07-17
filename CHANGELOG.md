@@ -16,9 +16,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
-
-## [1.8.0] - 2026-07-17
+- **FlightDeck Remote: agent feedback now keeps reaching the phone across relay
+  restarts.** The hosted relay tracks a per-pairing message sequence number in
+  memory only, so a restart/redeploy reset it while the desktop and phone kept
+  their persisted cursors. The desktop's next message was then rejected as
+  out-of-sequence and the desktop reconnected into the same rejection forever —
+  the phone would send a prompt, watch the agent run on the desktop, but never
+  receive any of the agent's replies. The relay now reports this divergence with
+  a dedicated, recoverable `seq_violation` (instead of a fatal error), and both
+  ends re-sync automatically: the desktop restarts its outbound stream with a
+  fresh snapshot, and the phone accepts the reset instead of discarding it as a
+  duplicate. Re-deriving the encrypted channel for an already-paired phone also
+  no longer rewinds the sequence number, which could stall delivery the same way.
 
 ### New features
 
