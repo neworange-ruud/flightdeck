@@ -107,6 +107,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   `push` is now scoped to `main` only (PRs own feature-branch CI) and the
   concurrency key uses `head_ref`; the Relay workflow got the same fix
   (remote-control-dwb).
+- Fixed the `remote_e2e` suite hanging until the CI timeout on macOS: now that
+  the desktop traps `SIGHUP`, the harness's portable-pty `kill()` (which sends
+  `SIGHUP`) no longer terminates it, and a session-leader desktop that began a
+  graceful exit while the harness still held the PTY master open wedged
+  permanently in the kernel exit path. The harness now tears the desktop down
+  with `SIGKILL` directly.
 
 ## [1.7.2] - 2026-07-14
 
