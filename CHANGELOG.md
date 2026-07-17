@@ -115,6 +115,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   graceful exit while the harness still held the PTY master open wedged
   permanently in the kernel exit path. The harness now tears the desktop down
   with `SIGKILL` directly.
+- Fixed background projects hanging on "(terminal starting…)" after startup:
+  resuming agents only for the active project (a follow-up to the session-resume
+  work) left other open projects' tabs unspawned, and switching to them never
+  triggered the on-demand resume. Switching to a project — via keyboard, the
+  command palette, or clicking its tab — now resumes its recovered agents
+  (remote-control-4by).
 
 ## [1.7.2] - 2026-07-14
 
