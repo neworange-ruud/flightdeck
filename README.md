@@ -10,7 +10,7 @@ workflows.
 
 > Each Agent Tab = 1 Worktree = 1 Branch = 1 Primary Agent Process + Optional Shell Processes
 
-![FlightDeck screenshot](specs/screenshot.png)
+![FlightDeck: project tabs across the top to switch between repositories, one row per agent in the sidebar, the active agent's terminal in the main pane, and a live Git summary along the bottom](specs/screenshot.png)
 
 ## Quick start
 

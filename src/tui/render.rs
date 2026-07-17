@@ -69,6 +69,30 @@ pub enum UiOverlay {
     /// The configuration manager: curated toggles for the global/project config
     /// (SPECS §8).
     Config(ConfigManager),
+    /// The desktop pairing surface (Settings → Remote): the QR + 4-digit code
+    /// and pairing status (spec §5.2).
+    Remote(RemotePairing),
+}
+
+/// Render-ready snapshot of a pairing attempt for [`UiOverlay::Remote`]. Rebuilt
+/// each tick from the event loop's `PairingSession` so the countdown and status
+/// stay live without the renderer touching any pairing logic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemotePairing {
+    /// The one-line status ("Waiting for phone…", "Paired ✓", an error).
+    pub status_line: String,
+    /// The 4-digit (or relay-minted) code to type on the phone, if displaying.
+    pub code: Option<String>,
+    /// QR half-block art rows (black-on-white), empty when not displaying.
+    pub qr_rows: Vec<String>,
+    /// Width of the QR art in terminal cells (each row's char count).
+    pub qr_width: usize,
+    /// Seconds until the code expires, if displaying.
+    pub seconds_remaining: Option<i64>,
+    /// Pairing completed (show the success accent).
+    pub done: bool,
+    /// Pairing failed (show the error accent).
+    pub failed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +600,7 @@ pub fn draw(
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
         }
         UiOverlay::Config(manager) => draw_config_overlay(frame, manager, area),
+        UiOverlay::Remote(pairing) => draw_remote_overlay(frame, pairing, area),
     }
 }
 
@@ -1905,6 +1930,83 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
 
     let para = Paragraph::new(help_text).block(block);
     frame.render_widget(para, overlay_area);
+}
+
+/// Draw the desktop pairing overlay (Settings → Remote, spec §5.2): the QR code
+/// (rendered as black-on-white half-block cells so a phone camera can scan it),
+/// the 4-digit code, an expiry countdown, and the pairing status. When the
+/// terminal is too small for the QR it honestly shows the code plus a note.
+pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rect) {
+    let qr_w = pairing.qr_width as u16;
+    let qr_h = pairing.qr_rows.len() as u16;
+    // Non-QR chrome: title border + code + countdown + blank lines + status +
+    // footer. A generous fixed budget so the fit test is conservative.
+    const CHROME_H: u16 = 10;
+    let qr_fits =
+        !pairing.qr_rows.is_empty() && qr_w + 4 <= area.width && qr_h + CHROME_H <= area.height;
+
+    let content_w = if qr_fits { qr_w.max(44) } else { 44 };
+    let box_w = (content_w + 4).min(area.width);
+    let box_h = if qr_fits { qr_h + CHROME_H } else { CHROME_H }.min(area.height);
+    let overlay = layout::centered_overlay(area, box_w, box_h);
+    frame.render_widget(Clear, overlay);
+
+    let accent = if pairing.failed {
+        Color::Red
+    } else if pairing.done {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(" Pair Phone ");
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if qr_fits {
+        // Each row: black modules (foreground) on a white background.
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        for row in &pairing.qr_rows {
+            lines.push(Line::from(Span::styled(row.clone(), style)));
+        }
+        lines.push(Line::raw(""));
+    } else if !pairing.qr_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Terminal too small for the QR — enter the code below.",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::raw(""));
+    }
+    if let Some(code) = &pairing.code {
+        lines.push(Line::from(Span::styled(
+            format!("Code  {code}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(secs) = pairing.seconds_remaining {
+        lines.push(Line::from(Span::styled(
+            format!("expires in {secs}s"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        pairing.status_line.clone(),
+        Style::default().fg(accent),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(para, inner);
 }
 
 /// Draw the configuration manager overlay (SPECS §8): a scope selector, the

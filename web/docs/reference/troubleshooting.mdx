@@ -1,0 +1,100 @@
+---
+label: Troubleshooting
+section: Reference
+order: 62
+---
+
+# Troubleshooting
+
+Common issues and how to resolve them, for both the desktop app and FlightDeck
+Remote.
+
+## Desktop
+
+### "Agent not found" when creating a tab
+
+FlightDeck checks that an agent's `command` is on your `PATH` **before** creating
+a branch or worktree. If it's missing, tab creation fails cleanly and nothing is
+left behind. Install the agent's CLI (or fix `command` in
+[config](/reference/configuration)) and try again.
+
+### An agent shows no status / never notifies
+
+Status comes from lifecycle events, not terminal output. For **Codex**, you must
+review its hooks once: run `/hooks` inside Codex and trust the FlightDeck
+lifecycle hooks. Until then FlightDeck stays idle and emits no completion alert.
+Custom/unknown agents intentionally stay neutral. See
+[Working with Agents](/desktop/agents).
+
+### No OS notifications on macOS
+
+If you don't have `terminal-notifier`, FlightDeck falls back to `osascript`,
+whose banners are attributed to **Script Editor**. Enable **System Settings →
+Notifications → Script Editor** and turn off Focus / Do Not Disturb — or install
+`terminal-notifier` (`brew install terminal-notifier`) for the most reliable
+delivery. See [Notifications](/desktop/notifications).
+
+### No OS notifications on Linux
+
+Install libnotify: `sudo apt install libnotify-bin`. If `notify-send` isn't on
+`PATH`, notifications are silently dropped. (Windows desktop notifications are a
+no-op — use [FlightDeck Remote](/remote/activity) for push instead.)
+
+### "Base repo dirty: local merge disabled"
+
+Finish / local merge requires a clean base checkout. Commit or stash the changes
+in your repo root, then retry. Pull base likewise refuses to run on a dirty base
+folder. See [Git Workflow](/desktop/git).
+
+### `flightdeck update` says it can't self-update
+
+Self-update only replaces binaries installed via the installer script. If you
+installed with Homebrew, update with `brew update && brew upgrade flightdeck`; on
+Windows, re-run the PowerShell installer. This is expected behavior, not an
+error. See [CLI & Updating](/desktop/cli).
+
+### Containers won't start
+
+Run `flightdeck doctor` — it reports whether Podman is installed and ready and
+whether each agent image is built. Build a missing image with
+`flightdeck image build <agent>`. A launch never builds implicitly. See
+[Agents in Containers](/desktop/containers).
+
+### Modified `Esc` / `Alt`+arrows don't work in my terminal
+
+Some terminals can't distinguish a modified `Esc`. Enable **Use F2 to leave
+terminal focus** in the [configuration manager](/desktop/configuration) and use
+`F2` instead.
+
+## FlightDeck Remote
+
+### The app won't pair
+
+Make sure Remote is enabled on the desktop (`[remote] enabled = true`, or run
+*Pair Phone* from the palette, which turns it on) and that the pairing code
+hasn't expired — the desktop overlay shows a countdown. Re-run *Pair Phone* for a
+fresh code. See [Pair Your Phone](/remote/pairing).
+
+### The camera won't scan the QR
+
+If the camera is unavailable or permission is denied, tap **Enter code instead**
+and type the 4-digit code shown on your Mac.
+
+### Actions are greyed out / "commands are paused"
+
+That means the link to your Mac is down — FlightDeck Remote never sends commands
+blind. Reads (like Git status) stay available. Check that FlightDeck is running
+on your Mac; the app keeps retrying and will re-enable actions when the link
+returns. See [Settings & Security](/remote/settings).
+
+### It says "Showing last-known state — offline"
+
+You're seeing the cached snapshot because the phone can't reach the relay. It's
+read-only until the connection comes back.
+
+### I'm not getting push notifications
+
+Notification permission is requested only **after** pairing. Check the toggles in
+the app's Settings (**Agent needs input**, **Agent finished**), make sure the
+project isn't muted under **Mute by project**, and confirm iOS notifications are
+allowed for FlightDeck Remote. See [Activity & Notifications](/remote/activity).

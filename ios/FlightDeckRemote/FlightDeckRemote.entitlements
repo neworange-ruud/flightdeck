@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  APNs entitlement (PRD §9.1). `development` targets the sandbox APNs; a
+	  Release/App Store build's provisioning profile overrides this to
+	  production. This entitlement only takes effect in a SIGNED build (needs an
+	  Apple Developer team); the unsigned simulator build
+	  (CODE_SIGNING_ALLOWED=NO) skips the codesign step entirely, so it is inert
+	  there and does not break that build.
+	-->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

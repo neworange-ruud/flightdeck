@@ -1,0 +1,131 @@
+name: FlightDeckRemote
+options:
+  bundleIdPrefix: agency.neworange.flightdeck
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    TARGETED_DEVICE_FAMILY: "1" # iPhone only, v1
+    SWIFT_VERSION: "5.0" # see ios/README.md "Swift language mode" note
+    SUPPORTS_MACCATALYST: NO
+    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    ENABLE_PREVIEWS: YES
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: YES
+    CODE_SIGN_IDENTITY: ""
+
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: 1.14.0
+
+targets:
+  FlightDeckRemote:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemote
+        excludes:
+          - "Info.plist"
+          - "FlightDeckRemote.entitlements"
+    info:
+      path: FlightDeckRemote/Info.plist
+      properties:
+        CFBundleDisplayName: "FlightDeck Remote"
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        # Hosted relay endpoint (remote-control-2mk). Committed here so the relay
+        # address is a one-line plist edit, not a Swift source change. Read at
+        # runtime via PairingDefaults.relayURL (Bundle.main). Points at the stable
+        # custom domain (remote-control-edn) fronting the Azure Container Apps
+        # relay, so it survives any rename/recreate of the Azure resources.
+        FlightDeckRelayURL: "wss://relay.flightdeckai.app/ws"
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        # Wake the app on a silent APNs push to reconnect + resume queued events
+        # (spec §11); the relay's push is content-available (zero-knowledge).
+        UIBackgroundModes:
+          - remote-notification
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          # Permit ws:// to localhost / 127.0.0.1 for local relay dev and the
+          # transport integration test. Does not relax ATS for any real host.
+          NSAllowsLocalNetworking: true
+        NSFaceIDUsageDescription: "Unlock FlightDeck Remote"
+        NSCameraUsageDescription: "FlightDeck Remote uses the camera to scan the pairing QR code shown on your Mac."
+        NSMicrophoneUsageDescription: "FlightDeck Remote uses the microphone so you can reply to agents by voice."
+        NSSpeechRecognitionUsageDescription: "FlightDeck Remote uses speech recognition to turn your voice into a reply you can review before sending."
+        UIAppFonts:
+          - Geist-Regular.ttf
+          - Geist-Medium.ttf
+          - Geist-SemiBold.ttf
+          - Geist-Bold.ttf
+          - GeistMono-Regular.ttf
+          - GeistMono-Medium.ttf
+        CFBundleURLTypes:
+          - CFBundleURLName: agency.neworange.flightdeck.remote
+            CFBundleURLSchemes:
+              - flightdeck-remote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_EMIT_LOC_STRINGS: YES
+        # APNs entitlement (aps-environment). Only consumed by the codesign step,
+        # which is skipped under CODE_SIGNING_ALLOWED=NO — so the unsigned
+        # simulator build stays green; a signed device build needs a
+        # DEVELOPMENT_TEAM (see ios/README / the report's manual-credential note).
+        CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
+    dependencies:
+      - package: SwiftTerm
+    scheme:
+      testTargets:
+        - FlightDeckRemoteTests
+        - FlightDeckRemoteUITests
+      gatherCoverageData: true
+
+  FlightDeckRemoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemoteTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: FlightDeckRemote
+
+  FlightDeckRemoteUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemoteUITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote.uitests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: FlightDeckRemote

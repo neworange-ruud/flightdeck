@@ -1,0 +1,17 @@
+{
+  "type": "rollup",
+  "projects": [
+    {
+      "project_id": "proj_flightdeck",
+      "rollup": {
+        "dot": "working",
+        "summary": "1 needs input · 1 working · 3 agents",
+        "working": 1,
+        "idle": 1,
+        "needs_input": 1,
+        "manual": 0,
+        "agent_count": 3
+      }
+    }
+  ]
+}

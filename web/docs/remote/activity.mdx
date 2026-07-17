@@ -1,0 +1,63 @@
+---
+label: Activity & Notifications
+section: FlightDeck Remote
+order: 46
+---
+
+# Activity & Notifications
+
+FlightDeck Remote keeps you in the loop two ways: a persistent **Activity feed**
+inside the app, and **push notifications** that reach you even when the app is
+closed.
+
+## The Activity feed
+
+The **Activity** tab is a newest-first feed of status events from your paired
+Mac: an agent **needs input** (orange), **finished** (green), or hit an **error**
+(red).
+
+![The Activity feed: needs-input, finished, and error event cells.](/screenshots/mobile/10-activity.png)
+
+*Every needs-input, finished, and error event, newest first — each deep-links to its agent.*
+
+Each cell shows the event, a short message, and the project it belongs to. Tap a
+cell to jump straight to that agent's [chat](/remote/chat). (Tapping an event for
+a session that no longer exists tells you so and stays put.)
+
+The Activity tab carries an **unread dot** when there are new events; it clears
+as soon as you open the tab.
+
+## Push notifications
+
+The same events arrive as push notifications when you're away from the app,
+delivered through Apple Push Notification service via the relay.
+
+- **Needs input** — a time-sensitive, distinctly urgent alert,
+- **Finished** — e.g. *"18 files changed · ready to push"* with a standard chime,
+- **Error** — a chime.
+
+Tapping any notification deep-links straight to the agent. Your **home-screen
+badge** shows the number of agents currently waiting for input.
+
+<Callout type="note">
+  Notification permission is requested only **after pairing** — pairing is the
+  trust step. The relay's push is zero-knowledge: it carries only routing
+  metadata, never your content.
+</Callout>
+
+## Choosing what notifies you
+
+In [Settings](/remote/settings) you control notifications with three independent
+toggles — **Agent needs input**, **Agent finished**, and **Completion chime**
+(all on by default; the chime is independent, so you can be notified silently).
+
+You can also **mute individual projects**: a *"Mute by project"* card lists your
+projects, each with its own toggle, so a noisy project can be silenced without
+affecting the rest.
+
+## Staying honest offline
+
+When your phone can't reach the relay, the app shows your **last-known state**,
+clearly marked stale with a *"Showing last-known state — offline"* banner, and
+disables actions until the link returns. See [Settings & Security](/remote/settings)
+for more on the offline cache and connection status.
