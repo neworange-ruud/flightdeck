@@ -15,6 +15,14 @@ name: Relay deploy
 # publishes to trigger it.
 
 on:
+  # A release published by cargo-dist is created with GITHUB_TOKEN, which by
+  # design does NOT fire `release: published` — so the tag push is what actually
+  # triggers the deploy on a real release. Same pattern as release.yml. The
+  # `release`/`workflow_dispatch` triggers stay as fallbacks (manual UI release,
+  # ad-hoc redeploy).
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
   release:
     types: [published]
   workflow_dispatch:
@@ -71,6 +79,8 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           [ -n "$TAG" ] || TAG="${{ inputs.image_tag }}"
+          # On a tag push there's no release payload — use the tag itself.
+          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then TAG="${{ github.ref_name }}"; fi
           [ -n "$TAG" ] || TAG="${GITHUB_SHA::7}"
           # Sanitize to a valid Docker tag (anything else → '-').
           TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
@@ -110,20 +120,37 @@ jobs:
             --image "$IMAGE" \
             --set-env-vars "GIT_SHA=${{ github.sha }}"
 
-      - name: Verify /version reports the new revision
+      - name: Verify the new revision is live and healthy
         run: |
           set -euo pipefail
-          FQDN=$(az containerapp show \
-            -g "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            -n "${{ vars.AZURE_CONTAINERAPP_NAME }}" \
+          RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          APP="${{ vars.AZURE_CONTAINERAPP_NAME }}"
+          FQDN=$(az containerapp show -g "$RG" -n "$APP" \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "relay: https://$FQDN"
-          want="${GITHUB_SHA::7}"
+          # Ingress is deny-by-default IP-restricted (see deploy/README), so a
+          # GitHub runner can't curl /version — it always gets 403. Verify via
+          # the control plane instead (the deploy identity has Contributor on the
+          # app): the latest active revision must be Healthy, running, and carry
+          # the GIT_SHA we just deployed. This confirms the exact revision, which
+          # the old curl couldn't do through the allowlist anyway.
+          want="$GITHUB_SHA"
           for i in $(seq 1 30); do
-            out="$(curl -fsS "https://$FQDN/version" || true)"
-            echo "attempt $i: $out"
-            case "$out" in *"$want"*) echo "✓ new revision live"; exit 0;; esac
+            rev="$(az containerapp revision list -g "$RG" -n "$APP" -o json \
+              | jq -c 'map(select(.properties.active))
+                       | sort_by(.properties.createdTime) | last
+                       | {health: .properties.healthState,
+                          running: .properties.runningState,
+                          sha: (.properties.template.containers[0].env // []
+                                | map(select(.name=="GIT_SHA"))[0].value)}')"
+            echo "attempt $i: $rev"
+            if [ "$(echo "$rev" | jq -r '.health')"  = "Healthy" ] \
+               && [ "$(echo "$rev" | jq -r '.sha')"  = "$want" ] \
+               && [ "$(echo "$rev" | jq -r '.running')" != "Stopped" ]; then
+              echo "✓ new revision live and healthy (git_sha=$want)"
+              exit 0
+            fi
             sleep 5
           done
-          echo "::error::/version did not report git_sha $want after ~150s"
+          echo "::error::relay's latest active revision did not become Healthy with git_sha $want after ~150s"
           exit 1
