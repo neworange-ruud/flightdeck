@@ -106,16 +106,21 @@ cat <<EOF
 
 ==> Deployed.
     App FQDN         : https://$FQDN
-    Env static IP    : $ENV_STATIC_IP     (for the apex A record)
-    Domain verify id : $VERIFY_ID         (for the asuid TXT records)
+    Domain verify id : $VERIFY_ID         (for the asuid.www TXT record)
 
-Next: create the DNS records below, wait for propagation, then run
-  web/deploy/bind-custom-domain.sh
-to attach flightdeckai.app + www.flightdeckai.app and issue managed TLS certs.
+www is the PRIMARY host (subdomain -> CNAME validation works behind the IP
+allowlist and auto-renews). The apex can't get a managed cert behind the
+allowlist, so apex -> www is a TransIP registrar redirect, not an ACA binding.
 
-DNS records on flightdeckai.app:
-  A      @            -> $ENV_STATIC_IP
-  TXT    asuid        -> $VERIFY_ID
-  CNAME  www          -> $FQDN
-  TXT    asuid.www    -> $VERIFY_ID
+1. DNS records on flightdeckai.app (TransIP DNS panel):
+     CNAME  www          -> $FQDN
+     TXT    asuid.www    -> $VERIFY_ID
+
+2. TransIP registrar redirect (TransIP control panel, not the DNS tab):
+     Redirect  flightdeckai.app  ->  https://www.flightdeckai.app  (301, "with www"/keep-path)
+   This also manages the apex A record for you — do NOT add a manual apex A
+   record pointing at the ACA static IP ($ENV_STATIC_IP).
+
+3. Once the www records propagate, issue the cert:
+     web/deploy/bind-custom-domain.sh
 EOF

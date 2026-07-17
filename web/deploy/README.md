@@ -39,30 +39,46 @@ other source. Manage with
 
 ## Domains
 
-- **`flightdeckai.app`** (apex) → the web app. An apex domain can't be a CNAME,
-  so it uses an **A record to the environment's static IP** plus an `asuid` TXT
-  for ownership.
-- **`www.flightdeckai.app`** → bound to the same app; `next.config.ts` issues a
-  **301 redirect to the apex**. www uses a normal CNAME + `asuid.www` TXT.
+**`www.flightdeckai.app` is the primary host.** The site is served on www; the
+apex redirects to it.
 
-Managed TLS certs are issued via **TXT validation (apex)** and **CNAME
-validation (www)** so the ACME challenge never has to reach the IP-blocked
-ingress — the allowlist stays on throughout.
+Why not the apex? Azure's *free managed certificate* for an **apex** domain
+validates via an **HTTP-01 challenge from DigiCert** (it must reach
+`http://flightdeckai.app/.well-known/…` on port 80). Our deny-by-default IP
+allowlist blocks DigiCert, so an apex managed cert never issues (and couldn't
+renew). A **subdomain** validates over **CNAME** — pure DNS — which works behind
+the allowlist and auto-renews. That's why `relay.flightdeckai.app` works, and
+why we serve on `www` here.
 
-### DNS records to create on `flightdeckai.app`
+- **`www.flightdeckai.app`** → bound to the app; ACA-managed cert via **CNAME
+  validation**. This is the canonical host.
+- **`flightdeckai.app`** (apex) → **301 → www**, done at the **TransIP
+  registrar** (registrar URL-forwarding, which brings its own TLS on the apex).
+  Not an ACA binding. `next.config.ts` also has a defence-in-depth apex→www
+  redirect for the case where the apex ever hits the ingress directly — it must
+  never redirect www (that would loop against the registrar redirect).
 
-`setup.sh` prints the exact values (static IP + verification id) at the end.
-The `relay` records from the relay setup stay as they are; add:
+### DNS + registrar config on `flightdeckai.app`
+
+`setup.sh` prints the exact values at the end. The `relay` records stay as they
+are. In the **TransIP DNS panel**, add:
 
 ```
-A      @            -> <ENV_STATIC_IP>            # az containerapp env show … --query properties.staticIp
-TXT    asuid        -> <customDomainVerificationId>
 CNAME  www          -> <APP_FQDN>                 # az containerapp show … --query properties.configuration.ingress.fqdn
 TXT    asuid.www    -> <customDomainVerificationId>
 ```
 
-The `customDomainVerificationId` is the same for both records:
+`customDomainVerificationId`:
 `az containerapp show -g <rg> -n ca-neworange-web-dev-neu --query properties.customDomainVerificationId -o tsv`.
+
+In the **TransIP control panel** (redirect/forwarding, *not* the DNS tab), set:
+
+```
+flightdeckai.app  ->  https://www.flightdeckai.app   (301, keep path)
+```
+
+Let TransIP manage the apex A record for the redirect — do **not** add a manual
+apex A record pointing at the ACA static IP.
 
 ## Deploying
 

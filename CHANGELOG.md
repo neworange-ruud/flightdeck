@@ -55,11 +55,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   navigation order rather than filesystem order.
 - Deploy the `web/` app (landing page + docs) to Azure Container Apps as a
   separate Container App sharing the relay's resource group, registry, and
-  environment. Served at `https://flightdeckai.app` (with `www` → apex 301) on
-  the same deny-by-default IP allowlist as the relay. Added `web/Dockerfile`
-  (Next.js standalone), `web/deploy/{setup,bind-custom-domain}.sh`, and a
-  release-triggered `web-deploy.yml` GitHub Actions workflow (GitHub-OIDC, no
-  stored Azure secret).
+  environment, behind the same deny-by-default IP allowlist as the relay.
+  Served on `https://www.flightdeckai.app` (a subdomain gets an auto-renewing
+  managed TLS cert via CNAME validation, which works behind the allowlist); the
+  apex `flightdeckai.app` 301-redirects to www at the registrar. Added
+  `web/Dockerfile` (Next.js standalone), `web/deploy/{setup,bind-custom-domain}.sh`,
+  and a release-triggered `web-deploy.yml` GitHub Actions workflow (GitHub-OIDC,
+  no stored Azure secret).
 
 ### Bug fixes
 
