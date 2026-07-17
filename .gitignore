@@ -7,3 +7,5 @@
 /web/.next/
 /web/**/node_modules/
 /web/*.tsbuildinfo
+
+.claude/worktrees
