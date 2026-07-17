@@ -1,0 +1,10 @@
+{
+  "command_id": "cmd_00000003",
+  "issued_at_ms": 1752412812000,
+  "type": "new_agent",
+  "project_id": "proj_flightdeck",
+  "agent_type": "codex",
+  "name": "add-rate-limit",
+  "base_branch": "main",
+  "first_task": "Add a rate limiter to the login endpoint."
+}

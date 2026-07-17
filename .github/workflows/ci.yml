@@ -1,13 +1,18 @@
 name: CI
 
+# Run on pushes to main (post-merge) and on every pull request. Deliberately NOT
+# on pushes to feature branches: a `flightdeck/**` push and its `pull_request`
+# fire for the same commit under different refs (refs/heads/... vs refs/pull/N),
+# so their concurrency groups never collide and the whole matrix ran twice in
+# parallel. PRs are where checks matter, so let the PR event own feature-branch CI.
 on:
   push:
-    branches: ["main", "flightdeck/**"]
+    branches: ["main"]
   pull_request:
 
-# Cancel superseded runs on the same ref to save runner minutes.
+# Cancel superseded runs on the same PR/branch to save runner minutes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -21,6 +26,7 @@ jobs:
   # Formatting is platform-independent — check it once.
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +46,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # Backstop against a hung test (a blocking mock socket, a deadlock): fail in
+    # minutes instead of parking a runner for GitHub's 360-minute default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

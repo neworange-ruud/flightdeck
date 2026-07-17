@@ -1,0 +1,6 @@
+{
+  "type": "pairing_claimed",
+  "pairing_id": "pair_ruud_mbp",
+  "peer_device_id": "dev_mac_7b21",
+  "peer_key_agreement_public_key": "BExampleDesktopKeyAgreementSec1PubKeyBase64Would65BytesTt3Uu5Vv7Ww9Xx1Yy3Zz5Aa7Bb9Cc1Dd3Ee5Ff7g=="
+}

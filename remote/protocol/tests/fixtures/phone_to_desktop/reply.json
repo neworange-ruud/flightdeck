@@ -1,0 +1,7 @@
+{
+  "command_id": "cmd_00000001",
+  "issued_at_ms": 1752412810000,
+  "type": "reply",
+  "session_id": "sess_fix_login",
+  "text": "Yes, run it. Then rebuild."
+}
