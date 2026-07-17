@@ -18,6 +18,7 @@ pub mod notify;
 pub mod persistence;
 pub mod remote;
 pub mod runtime;
+pub mod signals;
 pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
@@ -258,10 +259,14 @@ pub fn run() -> Result<()> {
     }
 
     // Resume: start the primary agent for every recovered/loaded tab whose
-    // worktree still exists (best effort), across every open project. Done here,
-    // after the viewport size is known, rather than in `recover`/`AppState::new`
-    // which never spawn.
-    for p in workspace.projects.iter_mut() {
+    // worktree still exists (best effort) — for the ACTIVE (launched) project
+    // ONLY. Other projects reopened from the workspace file are shown but their
+    // agents are not auto-resumed; switching/opening one resumes it on demand
+    // (see the open-project flow). Done here, after the viewport size is known,
+    // rather than in `recover`/`AppState::new` which never spawn.
+    {
+        let active = workspace.active;
+        let p = &mut workspace.projects[active];
         let services = env.services(&p.git);
         let _ = p.state.resume_agents(&services);
     }
@@ -269,20 +274,11 @@ pub fn run() -> Result<()> {
     let notifier = SystemNotifier;
     let loop_result = event_loop(&mut terminal, &mut workspace, &env, &notifier);
 
-    // CLEAN TEARDOWN (SPECS §25): always restore the terminal, then terminate
-    // every session so no orphaned child processes remain. Persist on the way
-    // out (best effort) regardless of how the loop ended.
-    if keyboard_enhanced {
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    let _ = restore_terminal_title();
-    ratatui::restore();
-
-    // Persist every project's own state.json (SPECS §9), then the workspace file
-    // recording which projects were open + the active one (best effort — a save
-    // failure never overrides the loop result).
+    // CLEAN TEARDOWN (SPECS §25). Persist FIRST, before touching the terminal:
+    // on a severed terminal (Konsole/window close closes stdin+stdout+stderr) the
+    // terminal-restore step is worthless anyway, and it must never run ahead of
+    // the save — otherwise a failed restore that writes to the dead stderr can
+    // take the process down before the state is written.
     let mut persist_result = Ok(());
     for p in workspace.projects.iter() {
         let services = env.services(&p.git);
@@ -303,6 +299,27 @@ pub fn run() -> Result<()> {
         let _ = save_workspace(&fs, wp, &ws_state);
     }
 
+    // Restore the terminal (best effort). Use `try_restore` — NOT `restore` —
+    // because `ratatui::restore` `eprintln!`s on failure, and `eprintln!` itself
+    // panics when stderr is gone (the exact Konsole-close case), which would
+    // abort the process. `try_restore` just returns the error for us to ignore.
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = restore_terminal_title();
+    let _ = ratatui::try_restore();
+    // Show the cursor ourselves, then skip the `Terminal`'s own `Drop`. ratatui's
+    // Drop `eprintln!`s when showing the cursor fails, and `eprintln!` panics when
+    // stderr is also gone (Konsole close severs stdin+stdout+stderr) — which would
+    // abort the process here, after we've already persisted. Our explicit call
+    // restores the cursor on a live terminal; on a dead one the doomed write is
+    // simply dropped, and `forget` prevents the aborting Drop.
+    let _ = terminal.show_cursor();
+    std::mem::forget(terminal);
+
+    // Terminate every session so no orphaned child processes remain.
     for p in workspace.projects.iter_mut() {
         terminate_all_sessions(&mut p.state);
     }
@@ -1156,6 +1173,52 @@ fn project_status_flags(
 // Event loop (SPECS §23)
 // ---------------------------------------------------------------------------
 
+/// One decision of the main loop's input step: what to do next.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopStep {
+    /// Shut down cleanly (a shutdown signal fired, or the input source is gone).
+    Shutdown,
+    /// Handle this input event.
+    Input(Event),
+    /// Nothing happened this tick; run the per-tick work and loop again.
+    Idle,
+}
+
+/// Decide the next loop step from the shutdown flag and the input channel,
+/// waiting at most `timeout` for an event.
+///
+/// Crucially, this NEVER blocks longer than `timeout`, so the shutdown flag is
+/// always observed promptly — even when the controlling terminal has been
+/// severed (Konsole/window close), where crossterm's own `event::poll`/`read`
+/// busy-loops on EOF and never returns. The blocking `event::read` runs on a
+/// separate thread feeding `rx`; if that thread ends (channel disconnected) we
+/// also shut down. The flag is checked both before and after the wait so a
+/// signal that arrives *during* the wait is caught on this same tick.
+fn next_loop_step(
+    shutdown: &std::sync::atomic::AtomicBool,
+    rx: &Receiver<Event>,
+    timeout: Duration,
+) -> LoopStep {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    if shutdown.load(Ordering::Relaxed) {
+        return LoopStep::Shutdown;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(event) => LoopStep::Input(event),
+        Err(RecvTimeoutError::Timeout) => {
+            if shutdown.load(Ordering::Relaxed) {
+                LoopStep::Shutdown
+            } else {
+                LoopStep::Idle
+            }
+        }
+        // The input reader thread exited (e.g. terminal gone) → shut down.
+        Err(RecvTimeoutError::Disconnected) => LoopStep::Shutdown,
+    }
+}
+
 /// The main event loop. Services every open project's PTYs/status/notifications
 /// each tick (so background projects stay live), renders the active project plus
 /// the project tab row, and routes input until the user quits or a fatal error
@@ -1188,6 +1251,35 @@ fn event_loop(
             p.state.update_available = Some(latest.clone());
         }
     }
+
+    // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
+    // so the caller's clean teardown (persist `state.json` + terminate agents)
+    // runs, instead of the process dying without saving or cleaning up.
+    let shutdown = crate::signals::install_shutdown_flag();
+
+    // Read terminal input on a dedicated thread that feeds a channel. The main
+    // loop then waits on the channel with a timeout (`next_loop_step`) instead of
+    // calling crossterm's `event::poll`/`read` directly. This decouples the loop
+    // from crossterm's blocking behaviour: when the controlling terminal is
+    // severed (Konsole/window close) crossterm busy-loops on EOF and never
+    // returns, but the main loop still wakes every `POLL_TIMEOUT`, sees the
+    // shutdown flag (SIGHUP), and exits cleanly so teardown can persist + stop
+    // agents. The reader thread is detached; it ends with the process.
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<Event>();
+    std::thread::spawn(move || {
+        // `event::read` blocks until an event (or busy-loops on a dead tty); the
+        // main loop no longer depends on it returning. Stop if the receiver is
+        // gone or crossterm reports a hard error.
+        while let Ok(event) = event::read() {
+            if input_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Home dir for locating agent session stores (used to pin each tab's resume
+    // session id). Resolved once; `None` disables pinning.
+    let store_home = crate::app::state::user_home();
 
     // FlightDeck Remote (optional): a long-lived relay-client thread, mirroring
     // the update-check thread idiom above. Off by default — when disabled this
@@ -1290,6 +1382,11 @@ fn event_loop(
             {
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
+                // Pin each freshly-launched agent's session id for later resume
+                // (cheap unless a tab is still awaiting its session file).
+                if let Some(home) = &store_home {
+                    p.state.pin_resumable_sessions(home, &services);
+                }
             }
 
             // Prefix the project name so alerts read "project: tab" — useful
@@ -1484,14 +1581,15 @@ fn event_loop(
             })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
-        // --- Poll for input (short timeout so PTY output keeps flowing). ---
-        let has_event = event::poll(POLL_TIMEOUT)
-            .map_err(|e| FlightDeckError::Io(format!("event poll failed: {e}")))?;
-        if !has_event {
-            continue;
-        }
+        // --- Wait for input via the reader thread (short timeout so PTY output
+        //     keeps flowing and the shutdown flag is observed promptly). ---
+        let event = match next_loop_step(&shutdown, &input_rx, POLL_TIMEOUT) {
+            LoopStep::Shutdown => break,
+            LoopStep::Idle => continue,
+            LoopStep::Input(event) => event,
+        };
 
-        match event::read().map_err(|e| FlightDeckError::Io(format!("event read failed: {e}")))? {
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if handle_key(key, workspace, env, &mut ui)? {
                     break; // Quit requested via the Ctrl-q key action.
@@ -4365,13 +4463,16 @@ fn drain_pty_output(
     _now_ms: u64,
     mut tee: impl FnMut(&str, Option<usize>, &[u8]),
 ) {
+    // Read once before the loop: auto-continuation gates resume-hint capture,
+    // and the per-tab borrow below would otherwise conflict with reading config.
+    let auto_continue = state.config.ui.auto_continue;
     for tab in state.tabs.iter_mut() {
         // Primary: drain into the VT parser. Lifecycle status comes only from
         // backend hooks/plugins; PTY output includes echoed user keystrokes and
         // is deliberately not treated as agent activity.
-        if let Some(primary) = tab.session.primary_mut() {
-            if let Ok(bytes) = primary.session_mut().try_read_output() {
-                if !bytes.is_empty() {
+        let primary_bytes = tab.session.primary_mut().and_then(|primary| {
+            match primary.session_mut().try_read_output() {
+                Ok(bytes) if !bytes.is_empty() => {
                     primary.process_output(&bytes);
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
@@ -4381,8 +4482,15 @@ fn drain_pty_output(
                     // `tab.meta` is a disjoint field from `tab.session`, so this
                     // borrows cleanly.
                     tee(&tab.meta.id, None, &bytes);
+                    Some(bytes)
                 }
+                _ => None,
             }
+        });
+        // Capture the agent's on-exit resume hint from that output (borrow of
+        // `tab.session` has ended, so we can touch the rest of the tab).
+        if let Some(bytes) = primary_bytes {
+            tab.capture_resume_hint(&bytes, auto_continue);
         }
 
         // Child terminals: drain → VT parser (so they don't stall and so their
@@ -4649,6 +4757,58 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    // --- next_loop_step: the shutdown-flag / input decision --------------
+
+    #[test]
+    fn loop_step_shuts_down_when_flag_set_without_touching_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(true);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        // An event is available, but the shutdown flag must win — and we must
+        // not consume the event.
+        tx.send(Event::Resize(80, 24)).unwrap();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Shutdown
+        );
+        assert!(rx.try_recv().is_ok(), "input event must not be consumed");
+    }
+
+    #[test]
+    fn loop_step_returns_queued_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        tx.send(Event::Resize(120, 40)).unwrap();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Input(Event::Resize(120, 40))
+        );
+    }
+
+    #[test]
+    fn loop_step_is_idle_on_timeout_with_no_input() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel::<Event>();
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Idle
+        );
+    }
+
+    #[test]
+    fn loop_step_shuts_down_when_input_source_disconnected() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        drop(tx); // reader thread gone (e.g. terminal severed)
+        assert_eq!(
+            next_loop_step(&flag, &rx, Duration::from_millis(10)),
+            LoopStep::Shutdown
+        );
+    }
+
     fn make_real_agent(dir: &TempDir, key: &str) -> AgentDef {
         let path = dir.path().join(key);
         std::fs::write(&path, "#!/bin/sh\n").unwrap();
@@ -4717,6 +4877,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
+                auto_continue: true,
                 ..UiConfig::default()
             },
             worktrees: WorktreesConfig {
@@ -4773,6 +4934,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
+                auto_continue: true,
                 ..UiConfig::default()
             },
             ..Config::default()
@@ -5148,6 +5310,7 @@ mod tests {
                 manual_status: None,
                 containerized: false,
                 container_image: None,
+                resume_args: Vec::new(),
             }
         }
 
@@ -5255,6 +5418,7 @@ mod tests {
                 manual_status: None,
                 containerized: false,
                 container_image: None,
+                resume_args: Vec::new(),
             }
         }
 

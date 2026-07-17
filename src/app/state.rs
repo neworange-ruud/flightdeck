@@ -190,6 +190,15 @@ fn expand_tilde(p: &str) -> PathBuf {
 /// In container mode the agent binary lives *inside* the image, so instead of
 /// the agent command we require the container runtime to be ready
 /// ([`ContainerRuntime::available`]).
+/// The user's home directory, for locating agent session stores. `None` if
+/// neither `HOME` nor `USERPROFILE` is set.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 fn validate_launchable(
     agent: &AgentDef,
     exec: &ContainersConfig,
@@ -256,6 +265,15 @@ pub struct RuntimeTab {
     /// single OS notification fires and this is cleared, so a quiet agent never
     /// re-notifies until it resumes working (SPECS §24).
     pub notify_armed: bool,
+    /// Rolling tail of recent primary output (ANSI-stripped, bounded) scanned for
+    /// the agent's on-exit resume hint. Runtime-only; the captured result lives
+    /// in `meta.resume_args`.
+    resume_scan: String,
+    /// Session ids present in the agent's on-disk store for this worktree at the
+    /// moment a fresh agent was launched. Runtime-only. Used to detect and pin
+    /// the session this tab's agent creates (so multiple agents in one worktree
+    /// each resume their own). `None` once pinned or when not applicable.
+    session_snapshot: Option<std::collections::HashSet<String>>,
 }
 
 impl RuntimeTab {
@@ -271,12 +289,47 @@ impl RuntimeTab {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            resume_scan: String::new(),
+            session_snapshot: None,
         }
     }
 
     /// Stable id of this tab.
     pub fn id(&self) -> TabId {
         TabId(self.meta.id.clone())
+    }
+
+    /// Scan primary output for the agent's on-exit resume hint (e.g.
+    /// `claude --resume <id>`) and, when found, record the replay args on the tab
+    /// so a later restart continues the same session. Keeps a bounded rolling
+    /// tail so a hint split across output chunks is still matched. Called from
+    /// `drain_pty_output`; the captured value persists via the normal paths.
+    pub fn capture_resume_hint(&mut self, bytes: &[u8], enabled: bool) {
+        /// Retained tail bound: big enough for a multi-line hint, cheap to rescan.
+        const RESUME_SCAN_CAP: usize = 8192;
+
+        // Auto-continuation off (or no agent yet): don't fetch a resume hint.
+        if !enabled || self.meta.agent.is_empty() {
+            return;
+        }
+        self.resume_scan.push_str(&String::from_utf8_lossy(bytes));
+        if self.resume_scan.len() > RESUME_SCAN_CAP {
+            let mut cut = self.resume_scan.len() - RESUME_SCAN_CAP;
+            while cut < self.resume_scan.len() && !self.resume_scan.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.resume_scan = self.resume_scan.split_off(cut);
+        }
+        // Cheap reject before the (rarely-needed) strip + parse.
+        if !self.resume_scan.contains("resume") {
+            return;
+        }
+        let clean = crate::agents::resume::strip_ansi(&self.resume_scan);
+        if let Some(args) = crate::agents::resume::parse_resume_args(&self.meta.agent, &clean) {
+            if self.meta.resume_args != args {
+                self.meta.resume_args = args;
+            }
+        }
     }
 
     /// The combined, display-ready status (SPECS §24): live process state +
@@ -903,6 +956,7 @@ impl AppState {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -912,6 +966,8 @@ impl AppState {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            resume_scan: String::new(),
+            session_snapshot: None,
         });
         // Focus the new (placeholder) tab so the user sees the progress.
         self.selected_tab = Some(self.tabs.len() - 1);
@@ -1765,12 +1821,20 @@ impl AppState {
     ) -> Result<()> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
+        // A recovered tab reconstructed from an on-disk worktree carries no
+        // stored agent (recovery cannot know which one ran), so fall back to the
+        // configured default so it can still be continued.
         let agent_key = self.tabs[idx].meta.agent.clone();
-        let agent = self
-            .registry
-            .get(&agent_key)
-            .cloned()
-            .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
+        let mut agent =
+            if agent_key.is_empty() {
+                self.registry.default_agent().cloned().ok_or_else(|| {
+                    FlightDeckError::Config("no default agent configured".to_string())
+                })?
+            } else {
+                self.registry.get(&agent_key).cloned().ok_or_else(|| {
+                    FlightDeckError::Config(format!("unknown agent '{agent_key}'"))
+                })?
+            };
         validate_launchable(
             &agent,
             &self.config.containers,
@@ -1782,6 +1846,47 @@ impl AppState {
             &repo_root,
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
         );
+        // Never spawn into a missing worktree: portable-pty silently falls back
+        // to the user's home directory for a cwd that is not an existing
+        // directory (this is how a restart could leave the agent running in
+        // `~/`). Refuse loudly instead so the tab can be recovered/removed.
+        if !services.fs.exists(&cwd) {
+            return Err(FlightDeckError::Refused(format!(
+                "worktree directory {} is missing; not starting the agent (it would launch in your home directory)",
+                cwd.display()
+            )));
+        }
+
+        // Resume continuation: launch so the agent continues its session rather
+        // than starting fresh. Prefer this tab's pinned session (`resume_args`,
+        // set by `pin_resumable_sessions` — correct even with multiple agents in
+        // one worktree); else fall back to the newest session in the agent's
+        // on-disk store for this worktree. Set as the agent's *base* args so
+        // `build_primary_spawn` still appends the status-integration flags on
+        // top. Local mode only; gated on the auto-continuation setting. When
+        // there is no session to resume, snapshot the store so the session this
+        // fresh agent creates can be pinned to the tab later.
+        if self.config.ui.auto_continue && !self.config.containers.enabled {
+            if let Some(home) = user_home() {
+                let resume = crate::agents::resume::resolve_resume_args(
+                    &agent.key,
+                    &cwd,
+                    &home,
+                    &self.tabs[idx].meta.resume_args,
+                );
+                if resume.is_empty() {
+                    let ids = crate::agents::resume::store_session_ids(&agent.key, &cwd, &home)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    self.tabs[idx].session_snapshot = Some(ids);
+                } else {
+                    agent.args = resume;
+                    self.tabs[idx].session_snapshot = None;
+                }
+            }
+        }
+
         let status_file = agent_status_file(&cwd);
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
@@ -1827,6 +1932,9 @@ impl AppState {
         if let Some(image) = spawn.image {
             tab.meta.container_image = Some(image);
         }
+        // Persist the resolved agent so a recovered tab (which had none) keeps
+        // the default on subsequent restarts/persists.
+        tab.meta.agent = agent.key.clone();
         tab.meta.recovered = false;
         Ok(())
     }
@@ -1875,6 +1983,42 @@ impl AppState {
             let _ = self.persist(services);
         }
         started
+    }
+
+    /// Pin the session each freshly-launched agent created, so a later restart
+    /// resumes that tab's own session even when multiple agents share one
+    /// worktree (SPECS: continuation). For every tab still holding a launch
+    /// snapshot, look up the agent's on-disk store for a session id that appeared
+    /// since launch; when found, record its replay args on the tab and clear the
+    /// snapshot. Persists if anything was pinned. Cheap when nothing is pending
+    /// (only tabs with a live snapshot read the store). No-op when
+    /// auto-continuation is off or in container mode.
+    pub fn pin_resumable_sessions(&mut self, home: &Path, services: &Services) {
+        if !self.config.ui.auto_continue || self.config.containers.enabled {
+            return;
+        }
+        let mut changed = false;
+        for idx in 0..self.tabs.len() {
+            let Some(snapshot) = self.tabs[idx].session_snapshot.clone() else {
+                continue;
+            };
+            let agent_key = self.tabs[idx].meta.agent.clone();
+            let cwd = to_absolute(
+                &self.repo_root,
+                Path::new(&self.tabs[idx].meta.worktree_path_relative),
+            );
+            let current = crate::agents::resume::store_session_ids(&agent_key, &cwd, home);
+            if let Some(id) = crate::agents::resume::newest_new_session(&snapshot, &current) {
+                if let Some(args) = crate::agents::resume::resume_args_for(&agent_key, &id) {
+                    self.tabs[idx].meta.resume_args = args;
+                }
+                self.tabs[idx].session_snapshot = None;
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.persist(services);
+        }
     }
 
     /// Show the git status panel for the selected tab (SPECS §21).
@@ -1971,6 +2115,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
+                auto_continue: true,
                 ..UiConfig::default()
             },
             worktrees: WorktreesConfig {
@@ -3692,6 +3837,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
         assert_eq!(app.tabs.len(), 1);
@@ -3770,6 +3916,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            resume_args: Vec::new(),
         }
     }
 
@@ -3798,6 +3945,258 @@ mod tests {
     }
 
     #[test]
+    fn capture_resume_hint_records_resume_args_from_exit_line() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        app.tabs[0].capture_resume_hint(
+            b"Resume this session with:\n  claude --resume 3d74d44d-e9e7-407f-9938-c59ef4045e3f\n",
+            true,
+        );
+        assert_eq!(
+            app.tabs[0].meta.resume_args,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "the agent's on-exit resume hint should be captured onto the tab"
+        );
+    }
+
+    #[test]
+    fn capture_resume_hint_is_skipped_when_auto_continue_disabled() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        // enabled = false → the resume hint must NOT be captured.
+        app.tabs[0].capture_resume_hint(
+            b"Resume this session with:\n  claude --resume 3d74d44d-e9e7-407f-9938-c59ef4045e3f\n",
+            false,
+        );
+        assert!(
+            app.tabs[0].meta.resume_args.is_empty(),
+            "no resume hint should be captured when auto-continuation is off"
+        );
+    }
+
+    // Unix-only: the fixture builds the tab cwd via `to_absolute`, whose joined
+    // path uses the OS-native separator, and the claude-store dir mangling this
+    // asserts (`/` and `.` → `-`) is the layout verified on unix. Windows uses a
+    // different session-dir convention (not yet verified), where store-resume
+    // degrades to a fresh session rather than misbehaving.
+    #[cfg(unix)]
+    #[test]
+    fn pin_resumable_sessions_pins_new_store_session() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        // Simulate a fresh launch: the pre-launch snapshot was empty, and the
+        // agent has since written its session file.
+        app.tabs[0].session_snapshot = Some(std::collections::HashSet::new());
+
+        // Claude store fixture for the tab's cwd (/repo/.flightdeck/worktrees/r
+        // → mangled dir name).
+        let home = TempDir::new().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects/-repo--flightdeck-worktrees-r");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("3d74d44d-e9e7-407f-9938-c59ef4045e3f.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        app.pin_resumable_sessions(home.path(), &services(&git, &fs, &pty, &clock));
+
+        assert_eq!(
+            app.tabs[0].meta.resume_args,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "the newly-created session must be pinned to the tab"
+        );
+        assert!(
+            app.tabs[0].session_snapshot.is_none(),
+            "snapshot is cleared once pinned"
+        );
+    }
+
+    #[test]
+    fn resume_replays_captured_resume_args_instead_of_base_args() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "claude"); // base args = []
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        tab.resume_args = vec![
+            "--resume".to_string(),
+            "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd, "launches the agent binary");
+        let args = &spawns[0].1;
+        // Resume args replace the configured base args...
+        assert_eq!(
+            &args[0..2],
+            &[
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "resume args must replace the configured base args, and come first"
+        );
+        // ...but the status-integration flags must still be appended on top, so a
+        // resumed tab keeps live lifecycle status (regression guard).
+        assert!(
+            args.iter().any(|a| a == "--plugin-dir"),
+            "status-integration flags must survive a resume, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resume_preserves_codex_status_integration_flags() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "codex"); // classified as Codex
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "codex".to_string();
+        tab.resume_args = vec![
+            "resume".to_string(),
+            "019f378e-76e9-7de3-a1db-41a027b7b719".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd);
+        let args = &spawns[0].1;
+        // `codex resume <id>` must come first (resume is a subcommand)...
+        assert_eq!(
+            &args[0..2],
+            &[
+                "resume".to_string(),
+                "019f378e-76e9-7de3-a1db-41a027b7b719".to_string()
+            ],
+            "the `resume <id>` subcommand must lead the args"
+        );
+        // ...and Codex's hook integration flags must still be appended after it.
+        assert!(
+            args.iter().any(|a| a == "--enable") && args.iter().any(|a| a == "hooks"),
+            "codex hook integration flags must survive a resume, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resume_is_not_replayed_when_auto_continue_disabled() {
+        let dir = TempDir::new().unwrap();
+        let (agent, cmd) = make_real_agent(&dir, "claude");
+        let mut config = config_with_agent(agent);
+        config.ui.auto_continue = false; // disable auto-continuation
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        tab.resume_args = vec![
+            "--resume".to_string(),
+            "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string(),
+        ];
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(started, 1);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, cmd);
+        // With auto-continuation off, the stored resume args must NOT be replayed
+        // — the tab starts fresh (only the status-integration flags, no --resume).
+        assert!(
+            !spawns[0].1.iter().any(|a| a == "--resume"),
+            "resume args must not be replayed when auto-continuation is off, got: {:?}",
+            spawns[0].1
+        );
+    }
+
+    #[test]
     fn resume_agents_skips_tab_with_missing_worktree() {
         let dir = TempDir::new().unwrap();
         let (agent, _) = make_real_agent(&dir, "opencode");
@@ -3817,6 +4216,77 @@ mod tests {
         let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
         assert_eq!(started, 0);
         assert_eq!(pty.spawns().len(), 0);
+        assert_eq!(
+            app.tabs[0].session.primary_state(),
+            ProcessState::NotStarted
+        );
+    }
+
+    // Fix #2: a recovered tab whose stored agent is empty (as real recovery
+    // leaves it) must resume on the configured default agent, and the resolved
+    // key must be persisted onto the tab.
+    #[test]
+    fn resume_starts_recovered_tab_with_empty_agent_using_default() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent); // ui.default_agent == "opencode"
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = String::new(); // real recovery stores no agent
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let started = app.resume_agents(&services(&git, &fs, &pty, &clock));
+        assert_eq!(
+            started, 1,
+            "recovered tab with empty agent should resume on the default agent"
+        );
+        assert_eq!(pty.spawns().len(), 1);
+        assert_eq!(
+            app.tabs[0].meta.agent, "opencode",
+            "resolved default agent must be persisted onto the tab"
+        );
+    }
+
+    // Fix #1: restarting a tab whose worktree directory is gone must refuse
+    // rather than spawn — otherwise the underlying PTY silently launches the
+    // agent in $HOME (portable-pty falls back to the home dir for a cwd that is
+    // not an existing directory).
+    #[test]
+    fn restart_refuses_when_worktree_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("gone")); // agent set, worktree .../gone
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new(); // worktree dir does NOT exist
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let result = app.dispatch(Command::RestartAgent, &services(&git, &fs, &pty, &clock));
+        assert!(
+            result.is_err(),
+            "restart must refuse when the worktree directory is missing"
+        );
+        assert_eq!(
+            pty.spawns().len(),
+            0,
+            "no agent may be spawned into a non-existent worktree"
+        );
         assert_eq!(
             app.tabs[0].session.primary_state(),
             ProcessState::NotStarted

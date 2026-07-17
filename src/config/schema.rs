@@ -56,6 +56,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         git: GitConfig::default(),
         ui: UiConfig {
             agent_tab_position: "left".to_string(),
+            auto_continue: true,
             default_agent: "opencode".to_string(),
             ..UiConfig::default()
         },

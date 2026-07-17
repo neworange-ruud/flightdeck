@@ -261,12 +261,26 @@ impl DesktopHandle {
 
 impl Drop for DesktopHandle {
     fn drop(&mut self) {
-        // Signal the reader to stop, then kill the child. Killing the child
-        // closes the last slave fd, so the reader's cloned master reader hits
-        // EOF and the thread returns on its own; `child.wait()` reaps it first
-        // so that EOF is guaranteed before we join (no hang). All best-effort:
-        // a failure here must never panic mid-unwind.
+        // Tear the desktop down with SIGKILL, NOT portable-pty's `killer.kill()`
+        // (which sends SIGHUP). The desktop now TRAPS SIGHUP/SIGTERM/SIGINT and
+        // runs a graceful shutdown on them, so SIGHUP no longer terminates it —
+        // and on macOS a session-leader desktop that begins a graceful exit
+        // while this harness still holds the PTY master open (its own input
+        // reader thread blocked reading the slave) wedges permanently in the
+        // kernel exit path, so `child.wait()` would hang forever. SIGKILL is
+        // uncatchable and kills it outright, closing the slave fds so the reader
+        // thread EOFs and joins cleanly. All best-effort: never panic mid-unwind.
         self.reader_stop.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child.as_ref().and_then(|c| c.process_id()) {
+                // SAFETY: a bare kill(2); an already-dead pid just yields ESRCH.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
         let _ = self.killer.kill();
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();

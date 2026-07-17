@@ -269,6 +269,13 @@ pub struct UiConfig {
     /// terminal focus. Off by default.
     #[serde(default)]
     pub use_f2_to_leave_terminal_focus: bool,
+    /// Auto-continuation: capture an agent's on-exit resume command and replay
+    /// it on restart/recovery so a tab continues its previous session. On by
+    /// default. Turn it off (`auto_continue = false`) to disable both halves —
+    /// nothing is captured from output and nothing is replayed on start; tabs
+    /// simply start fresh. Agent termination on shutdown is unaffected.
+    #[serde(default = "default_true")]
+    pub auto_continue: bool,
     /// Color of the TERMINAL-mode cue (chip + live-pane border). One of:
     /// green, cyan, blue, magenta, yellow, red, white.
     #[serde(default = "default_terminal_mode_color")]
@@ -300,6 +307,7 @@ impl Default for UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            auto_continue: true,
             terminal_mode_color: default_terminal_mode_color(),
             app_mode_color: default_app_mode_color(),
             mode_border: default_mode_border(),
@@ -585,6 +593,12 @@ pub struct TabState {
     /// The image the container was launched from, for provenance (SPECS §31).
     #[serde(default)]
     pub container_image: Option<String>,
+    /// Args to relaunch the agent so it resumes its previous session, captured
+    /// from the agent's on-exit resume hint (e.g. `["--resume", "<uuid>"]` for
+    /// Claude, `["resume", "<uuid>"]` for Codex). Empty = start fresh. Replayed
+    /// in place of the configured base args on resume/restart.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
 }
 
 fn default_last_known_status() -> String {

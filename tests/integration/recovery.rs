@@ -125,6 +125,7 @@ fn flags_stale_state_entry_when_worktree_dir_removed() {
         manual_status: None,
         containerized: false,
         container_image: None,
+        resume_args: Vec::new(),
     });
 
     let report = recover(&fs, &git_cli, &root, &worktrees_root, &mut state).expect("recover");

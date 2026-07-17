@@ -2470,6 +2470,7 @@ mod tests {
                 manual_status: None,
                 containerized: false,
                 container_image: None,
+                resume_args: Vec::new(),
             });
         }
         AppState::new(Config::default(), ps, "/repo", "/repo/state.json")

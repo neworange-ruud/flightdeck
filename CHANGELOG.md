@@ -8,6 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- Resume agent sessions across restarts: FlightDeck reads the session id from
+  the agent's own on-disk session store (Claude `~/.claude/projects/<cwd>`,
+  Codex `~/.codex/sessions`) for the tab's worktree and relaunches with
+  `claude --resume <id>` / `codex resume <id>`, so a tab continues its previous
+  conversation however it was closed (clean exit, killed on shutdown, or the
+  terminal window closed). Each agent's session is pinned per tab, so multiple
+  agents in one worktree each resume their own. Controlled by `ui.auto_continue`
+  (default on); set it to `false` to always start fresh.
 - **FlightDeck Remote** — pair a phone to your desktop over an end-to-end-encrypted
   relay to monitor and control your agent sessions from anywhere. Pair from
   Settings → Remote by scanning a QR code or entering a 4-digit code; from the
@@ -71,6 +79,23 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- Continue a recovered worktree that has no stored agent by falling back to the
+  configured default agent, so restarting/resuming actually launches a terminal.
+- Refuse to start an agent when its worktree directory is missing instead of
+  silently launching it in the user's home directory (a case-sensitive-filesystem
+  path mismatch could otherwise drop the agent in `~/` on Linux).
+- Write `state.json` atomically (temp file + rename) so an abrupt shutdown
+  mid-write can no longer corrupt or truncate it.
+- Persist state and terminate agents on `SIGTERM`/`SIGINT`/`SIGHUP` (terminal
+  closed, `kill`, service stop) instead of dying without cleanup.
+- Terminate agents gracefully on shutdown: send `SIGTERM` to the whole process
+  group, allow a short grace period, then `SIGKILL` — so agents can exit cleanly
+  and child processes are no longer orphaned.
+- Exit cleanly and still save `state.json` when the terminal window is closed
+  (e.g. Konsole), where stdin/stdout/stderr are all severed. Input is now read on
+  a dedicated thread so the loop always notices the shutdown signal instead of
+  hanging on crossterm's EOF busy-loop; state is persisted before the terminal is
+  restored; and the cursor-restore is made panic-safe on a dead tty.
 - Fixed the terminal being clipped by 2 columns/rows after enabling
   `ui.mode_border` until the next window resize: the terminal PTY is now
   resized immediately when the border setting changes, instead of using a
@@ -82,6 +107,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   `push` is now scoped to `main` only (PRs own feature-branch CI) and the
   concurrency key uses `head_ref`; the Relay workflow got the same fix
   (remote-control-dwb).
+- Fixed the `remote_e2e` suite hanging until the CI timeout on macOS: now that
+  the desktop traps `SIGHUP`, the harness's portable-pty `kill()` (which sends
+  `SIGHUP`) no longer terminates it, and a session-leader desktop that began a
+  graceful exit while the harness still held the PTY master open wedged
+  permanently in the kernel exit path. The harness now tears the desktop down
+  with `SIGKILL` directly.
 
 ## [1.7.2] - 2026-07-14
 
@@ -332,6 +363,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 - Restore mouse text selection in Split View and make wheel scrolling target
   the column under the pointer.
+- Continue a recovered worktree that has no stored agent by falling back to the
+  configured default agent, so restarting/resuming actually launches a terminal.
+- Refuse to start an agent when its worktree directory is missing instead of
+  silently launching it in the user's home directory (a case-sensitive-filesystem
+  path mismatch could otherwise drop the agent in `~/` on Linux).
+- Write `state.json` atomically (temp file + rename) so an abrupt shutdown
+  mid-write can no longer corrupt or truncate it.
+- Persist state and terminate agents on `SIGTERM`/`SIGINT`/`SIGHUP` (terminal
+  closed, `kill`, service stop) instead of dying without cleanup.
+- Terminate agents gracefully on shutdown: send `SIGTERM` to the whole process
+  group, allow a short grace period, then `SIGKILL` — so agents can exit cleanly
+  and child processes are no longer orphaned.
 
 ## [1.2.0] - 2026-06-29
 

@@ -730,6 +730,7 @@ fn tab_state(id: &str, name: &str, agent: &str) -> TabState {
         manual_status: None,
         containerized: false,
         container_image: None,
+        resume_args: Vec::new(),
     }
 }
 
