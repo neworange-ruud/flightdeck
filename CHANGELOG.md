@@ -46,6 +46,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- The input mode (APP / TERMINAL) is now more visible at a glance: a
+  mode-colored status chip, an opt-in colored border around the pane that has
+  keyboard focus (`ui.mode_border`, off by default), and terminal dimming in
+  APP mode (`ui.dim_terminal_in_app_mode`, on by default). New `[ui]` settings:
+  `terminal_mode_color`, `app_mode_color`, `mode_border`,
+  `dim_terminal_in_app_mode`.
 - Rebuild the `web/` landing page into a full marketing home page: hero, a real
   desktop screenshot, the "one tab = one worktree = one branch = one agent"
   mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
@@ -65,6 +71,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- Fixed the terminal being clipped by 2 columns/rows after enabling
+  `ui.mode_border` until the next window resize: the terminal PTY is now
+  resized immediately when the border setting changes, instead of using a
+  stale cached size.
 - CI ran the entire cross-platform matrix twice per commit on feature branches:
   the `push` (on `flightdeck/**`) and `pull_request` events fired for the same
   commit under different refs, so their concurrency groups never collided and both

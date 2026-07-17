@@ -353,6 +353,40 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             key: "default_agent",
             kind: FieldKind::Choice(agent_keys),
         },
+        CuratedField {
+            label: "Terminal mode color",
+            section: "ui",
+            key: "terminal_mode_color",
+            kind: FieldKind::Choice(
+                ["green", "cyan", "blue", "magenta", "yellow", "red", "white"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        },
+        CuratedField {
+            label: "App mode color",
+            section: "ui",
+            key: "app_mode_color",
+            kind: FieldKind::Choice(
+                ["green", "cyan", "blue", "magenta", "yellow", "red", "white"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        },
+        CuratedField {
+            label: "Mode border",
+            section: "ui",
+            key: "mode_border",
+            kind: FieldKind::Choice(
+                ["off", "dim", "normal", "bright"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        },
+        b("Dim terminal in app mode", "ui", "dim_terminal_in_app_mode"),
     ]
 }
 
@@ -494,5 +528,23 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].0.ends_with("config.toml"));
         assert!(outputs[0].0.to_string_lossy().contains(".flightdeck"));
+    }
+
+    #[test]
+    fn exposes_mode_cue_fields() {
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let rows = m.rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"Terminal mode color"));
+        assert!(labels.contains(&"App mode color"));
+        assert!(labels.contains(&"Mode border"));
+        assert!(labels.contains(&"Dim terminal in app mode"));
+        // The dim field is a boolean toggle, defaulting on.
+        let dim = rows
+            .iter()
+            .find(|r| r.label == "Dim terminal in app mode")
+            .unwrap();
+        assert!(dim.is_bool);
+        assert!(dim.bool_value);
     }
 }

@@ -243,10 +243,15 @@ pub fn run() -> Result<()> {
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width — for every open project.
     if let Ok(size) = terminal.size() {
-        let vp = viewport_pty_size(PtySize {
-            rows: size.height,
-            cols: size.width,
-        });
+        let reserve =
+            crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui);
+        let vp = viewport_pty_size(
+            PtySize {
+                rows: size.height,
+                cols: size.width,
+            },
+            reserve,
+        );
         for p in workspace.projects.iter_mut() {
             p.state.set_pty_size(vp);
         }
@@ -1470,7 +1475,10 @@ fn event_loop(
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let ml = crate::tui::layout::compute(area);
+                let ml = crate::tui::layout::compute(
+                    area,
+                    crate::tui::mode_style::border_enabled(&p.state.config.ui),
+                );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
                 draw(frame, &p.state, &p.cache, &overlay, now_ms);
             })
@@ -1500,7 +1508,10 @@ fn event_loop(
                 handle_paste(data, workspace, env, &mut ui)?;
             }
             Event::Resize(cols, rows) => {
-                let size = viewport_pty_size(PtySize { rows, cols });
+                let reserve = crate::tui::mode_style::border_enabled(
+                    &workspace.active_project().state.config.ui,
+                );
+                let size = viewport_pty_size(PtySize { rows, cols }, reserve);
                 // Resize every project's sessions so a background agent's output
                 // wraps correctly the moment the user switches back to it.
                 for p in workspace.projects.iter_mut() {
@@ -2376,8 +2387,8 @@ fn spawn_status_refresh(
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents
 /// must wrap at the viewport width (total minus the sidebar/borders), not the
 /// whole screen.
-fn viewport_pty_size(full: PtySize) -> PtySize {
-    let ml = crate::tui::layout::compute(Rect::new(0, 0, full.cols, full.rows));
+fn viewport_pty_size(full: PtySize, reserve_border: bool) -> PtySize {
+    let ml = crate::tui::layout::compute(Rect::new(0, 0, full.cols, full.rows), reserve_border);
     PtySize {
         rows: ml.terminal.height.max(1),
         cols: ml.terminal.width.max(1),
@@ -2426,7 +2437,10 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
     // The project tab row (workspace-level) is checked before the active
     // project's own layout: a click switches/opens/closes a project.
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
-        let ml = crate::tui::layout::compute(area);
+        let ml = crate::tui::layout::compute(
+            area,
+            crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
+        );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
         if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
             ui.drag = None;
@@ -2683,7 +2697,10 @@ fn active_target(state: &AppState) -> ChildTarget {
 /// targeting whichever terminal is active. Returns `None` if the pointer is over
 /// no terminal viewport (sidebar, tab bar, gutter, status bar, …).
 fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(ChildTarget, Rect)> {
-    let ml = crate::tui::layout::compute(area);
+    let ml = crate::tui::layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
     if state.split_view {
         let region = crate::tui::layout::split_region(&ml);
         let targets = target_order(state);
@@ -2703,7 +2720,10 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
 /// the matching split-view column body, or the single terminal pane. `None` if
 /// the target's column is not present (e.g. layout too small).
 fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Option<Rect> {
-    let ml = crate::tui::layout::compute(area);
+    let ml = crate::tui::layout::compute(
+        area,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
     if !state.split_view {
         return Some(ml.terminal);
     }
@@ -4546,7 +4566,10 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
 
     if state.split_view {
         let area = Rect::new(0, 0, full.cols, full.rows);
-        let ml = crate::tui::layout::compute(area);
+        let ml = crate::tui::layout::compute(
+            area,
+            crate::tui::mode_style::border_enabled(&state.config.ui),
+        );
         let region = crate::tui::layout::split_region(&ml);
         let n = state.tabs[idx].session.child_count() + 1;
         let cols = crate::tui::layout::split_columns(region, n);
@@ -4573,7 +4596,19 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         }
     } else {
         // Normal view: every terminal of the selected tab fills the viewport.
-        let size = state.pty_size;
+        // Derive the size from the current terminal size AND this project's
+        // border setting (mirroring the split branch) so enabling/disabling the
+        // border — or switching to a project with a different mode_border —
+        // reflows immediately instead of waiting for the next window resize.
+        let area = Rect::new(0, 0, full.cols, full.rows);
+        let ml = crate::tui::layout::compute(
+            area,
+            crate::tui::mode_style::border_enabled(&state.config.ui),
+        );
+        let size = PtySize {
+            rows: ml.terminal.height.max(1),
+            cols: ml.terminal.width.max(1),
+        };
         if let Some(primary) = state.tabs[idx].session.primary_mut() {
             resize_if_changed(primary, size);
         }
@@ -4682,7 +4717,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
-                use_f2_to_leave_terminal_focus: false,
+                ..UiConfig::default()
             },
             worktrees: WorktreesConfig {
                 root: ".flightdeck/worktrees".to_string(),
@@ -4738,7 +4773,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
-                use_f2_to_leave_terminal_focus: false,
+                ..UiConfig::default()
             },
             ..Config::default()
         };
@@ -4943,10 +4978,22 @@ mod tests {
             rows: 40,
             cols: 120,
         };
-        let vp = viewport_pty_size(full);
+        let vp = viewport_pty_size(full, false);
         assert!(vp.cols < full.cols, "viewport narrower than full screen");
         assert!(vp.rows < full.rows, "viewport shorter than full screen");
         assert!(vp.cols >= 1 && vp.rows >= 1);
+    }
+
+    #[test]
+    fn viewport_pty_size_shrinks_further_with_border() {
+        let full = PtySize {
+            rows: 40,
+            cols: 120,
+        };
+        let plain = viewport_pty_size(full, false);
+        let framed = viewport_pty_size(full, true);
+        assert_eq!(framed.cols, plain.cols - 2);
+        assert_eq!(framed.rows, plain.rows - 2);
     }
 
     #[test]
@@ -5073,6 +5120,104 @@ mod tests {
     #[test]
     fn derive_project_name_uses_dir_name() {
         assert_eq!(derive_project_name(Path::new("/a/b/myproj")), "myproj");
+    }
+
+    /// Regression test for the stale-`pty_size` bug: the non-split branch of
+    /// `sync_terminal_sizes` must derive the viewport from `full` + the
+    /// project's own border setting (like the split branch already does),
+    /// not from `state.pty_size`, so toggling `mode_border` reflows the
+    /// terminal immediately instead of waiting for the next window resize.
+    #[test]
+    fn sync_terminal_sizes_reflows_on_border_toggle_without_window_resize() {
+        use crate::contracts::TabState;
+
+        fn tab_state() -> TabState {
+            TabState {
+                id: "tab-1".to_string(),
+                name: "Task".to_string(),
+                slug: "task".to_string(),
+                agent: "opencode".to_string(),
+                branch: "flightdeck/task".to_string(),
+                worktree_path_relative: ".flightdeck/worktrees/task".to_string(),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "running".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+            }
+        }
+
+        fn build_state(border: &str) -> AppState {
+            let config = Config {
+                ui: UiConfig {
+                    mode_border: border.to_string(),
+                    ..UiConfig::default()
+                },
+                ..Config::default()
+            };
+            let mut project_state = default_state("main");
+            project_state.tabs.push(tab_state());
+            let mut state = AppState::new(config, project_state, "/repo", "/repo/state.json");
+
+            // Stale on purpose: sync_terminal_sizes must NOT rely on this
+            // field in the non-split branch, or the bug would still pass.
+            state.pty_size = PtySize {
+                rows: 999,
+                cols: 999,
+            };
+
+            let pty = FakePty::new();
+            let _handle = pty.queue_session();
+            state.tabs[0]
+                .session
+                .spawn_primary(
+                    &pty,
+                    "opencode",
+                    &[],
+                    Path::new("/repo/.flightdeck/worktrees/task"),
+                    PtySize { rows: 24, cols: 80 },
+                )
+                .expect("spawn_primary should succeed against FakePty");
+            state
+        }
+
+        let full = PtySize {
+            rows: 40,
+            cols: 100,
+        };
+
+        let mut off = build_state("off");
+        sync_terminal_sizes(&mut off, full);
+        let (off_rows, off_cols) = off.tabs[0]
+            .session
+            .primary()
+            .expect("primary terminal spawned")
+            .screen()
+            .size();
+
+        let mut normal = build_state("normal");
+        sync_terminal_sizes(&mut normal, full);
+        let (on_rows, on_cols) = normal.tabs[0]
+            .session
+            .primary()
+            .expect("primary terminal spawned")
+            .screen()
+            .size();
+
+        assert_eq!(
+            off_cols - on_cols,
+            2,
+            "border on should be exactly 2 cols narrower than border off"
+        );
+        assert_eq!(
+            off_rows - on_rows,
+            2,
+            "border on should be exactly 2 rows shorter than border off"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod config_manager;
 pub mod input;
 pub mod layout;
+pub mod mode_style;
 pub mod palette;
 pub mod platform;
 pub mod render;

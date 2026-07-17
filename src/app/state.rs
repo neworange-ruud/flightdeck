@@ -1971,7 +1971,7 @@ mod tests {
             ui: UiConfig {
                 default_agent: agent.key.clone(),
                 agent_tab_position: "left".to_string(),
-                use_f2_to_leave_terminal_focus: false,
+                ..UiConfig::default()
             },
             worktrees: WorktreesConfig {
                 root: ".flightdeck/worktrees".to_string(),
