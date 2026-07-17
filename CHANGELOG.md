@@ -56,6 +56,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   desktop screenshot, the "one tab = one worktree = one branch = one agent"
   mental model, a six-feature grid, and install commands for Homebrew, macOS/Linux,
   and Windows.
+- Add a FlightDeck app icon and favicon to the `web/` site, extracted from the
+  brand logo mark (the gradient double-chevron): a scalable `icon.svg` favicon,
+  a full-bleed 180×180 `apple-icon.png` for iOS home-screen / web-app installs,
+  and a legacy multi-size `favicon.ico`. Picked up automatically via Next.js
+  App Router file-based metadata conventions.
 - Docs site: the sidebar navigation now groups pages into labelled sections
   (via a `section` frontmatter field), and Previous/Next links follow the
   navigation order rather than filesystem order.
