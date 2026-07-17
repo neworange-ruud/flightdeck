@@ -53,6 +53,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - Docs site: the sidebar navigation now groups pages into labelled sections
   (via a `section` frontmatter field), and Previous/Next links follow the
   navigation order rather than filesystem order.
+- Deploy the `web/` app (landing page + docs) to Azure Container Apps as a
+  separate Container App sharing the relay's resource group, registry, and
+  environment. Served at `https://flightdeckai.app` (with `www` → apex 301) on
+  the same deny-by-default IP allowlist as the relay. Added `web/Dockerfile`
+  (Next.js standalone), `web/deploy/{setup,bind-custom-domain}.sh`, and a
+  release-triggered `web-deploy.yml` GitHub Actions workflow (GitHub-OIDC, no
+  stored Azure secret).
 
 ### Bug fixes
 
