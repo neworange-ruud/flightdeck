@@ -8,7 +8,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **FlightDeck Remote: Codex chats now reconstruct on the phone.** The remote
+  transcript understood only Claude Code's session format, so a Codex agent's
+  mobile chat stayed empty. It now parses Codex's rollout session log — user
+  prompts and assistant replies (from its `event_msg` stream) and tool activity
+  like shell commands and patches (from its `response_item` stream) — and streams
+  new turns live, mirroring the Claude experience. (OpenCode, which moved its
+  conversation into a live SQLite database, is a separate follow-up.)
 
 ### Improvements
 
@@ -25,7 +31,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   transcript is now rebuilt from the agent's own structured session log (the
   same file FlightDeck already uses to resume a session), so user prompts,
   assistant prose, and tool activity stream to the phone as they happen.
-  (Claude Code in this release; Codex/OpenCode session formats are a follow-up.)
+  (Claude Code and Codex are supported; OpenCode's session format is a follow-up.)
 - **FlightDeck Remote: agent feedback now keeps reaching the phone across relay
   restarts.** The hosted relay tracks a per-pairing message sequence number in
   memory only, so a restart/redeploy reset it while the desktop and phone kept

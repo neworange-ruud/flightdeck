@@ -226,14 +226,16 @@ impl RemoteBridge {
         let Some(home) = self.home.clone() else {
             return;
         };
-        let Some(path) = crate::agents::resume::newest_session_path(agent, worktree, &home) else {
+        let Some((path, format)) =
+            crate::agents::resume::newest_session_path(agent, worktree, &home)
+        else {
             return;
         };
         let sid = SessionId::new(session_id);
         self.transcripts
             .entry(sid.clone())
             .or_insert_with(|| TranscriptBuilder::new(sid))
-            .sync_jsonl(&path, now_ms);
+            .sync_jsonl(&path, format, now_ms);
     }
 
     /// Handle one inbound relay event. Link/presence changes that mark a pairing

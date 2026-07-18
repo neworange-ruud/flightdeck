@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::agents::resume::SessionFormat;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -43,7 +44,7 @@ fn reconstructs_user_assistant_and_activity() {
     append(&f, &[USER, ASSISTANT_TEXT, ASSISTANT_TOOL]);
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
 
     assert_eq!(b.total(), 3);
     assert_eq!(
@@ -74,7 +75,7 @@ fn skips_tool_results_meta_and_sidechain() {
     );
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 0, "none of these are conversation prose");
 }
 
@@ -84,14 +85,14 @@ fn tails_newly_appended_records() {
     append(&f, &[USER]);
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     let first = b.take_appended().expect("first item");
     assert_eq!(labels(&first), vec!["user:Fix the login bug"]);
     assert_eq!(first.from_index, 0);
 
     // The agent writes its reply; a later sync picks up only the new record.
     append(&f, &[ASSISTANT_TEXT]);
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     let second = b.take_appended().expect("appended item");
     assert_eq!(labels(&second), vec!["agent:On it — reading the code."]);
     assert_eq!(
@@ -106,12 +107,12 @@ fn resync_without_growth_adds_nothing() {
     append(&f, &[USER, ASSISTANT_TEXT]);
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 2);
     let _ = b.take_appended();
 
     // Re-syncing the unchanged file is a no-op (offset + uuid dedup).
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 2);
     assert!(b.take_appended().is_none());
 }
@@ -134,7 +135,7 @@ fn ignores_a_half_written_trailing_line() {
     }
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 1, "only the complete first line is consumed");
 
     // Once the record is completed, the next sync ingests it.
@@ -145,7 +146,7 @@ fn ignores_a_half_written_trailing_line() {
             .unwrap();
         writeln!(h, r#""text":"done"}}]}}}}"#).unwrap();
     }
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 2);
     assert_eq!(labels(&b.load(None))[1], "agent:done");
 }
@@ -161,7 +162,7 @@ fn needs_input_preview_is_the_last_agent_prose() {
     );
 
     let mut b = builder();
-    b.sync_jsonl(f.path(), 0);
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
     let preview = b.on_needs_input(0);
     assert_eq!(preview.as_deref(), Some("Should I delete the file?"));
 
@@ -179,13 +180,13 @@ fn a_new_session_file_replaces_the_transcript() {
     let f1 = NamedTempFile::new().unwrap();
     append(&f1, &[USER]);
     let mut b = builder();
-    b.sync_jsonl(f1.path(), 0);
+    b.sync_jsonl(f1.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 1);
 
     // A different path (a fresh session) resets and re-reads from scratch.
     let f2 = NamedTempFile::new().unwrap();
     append(&f2, &[ASSISTANT_TEXT]);
-    b.sync_jsonl(f2.path(), 0);
+    b.sync_jsonl(f2.path(), SessionFormat::Claude, 0);
     assert_eq!(b.total(), 1);
     assert_eq!(
         labels(&b.load(None)),
@@ -214,7 +215,7 @@ fn timestamp_from_the_record_stamps_the_item() {
     let f = NamedTempFile::new().unwrap();
     append(&f, &[USER]);
     let mut b = builder();
-    b.sync_jsonl(f.path(), 999); // fallback that must NOT be used
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 999); // fallback that must NOT be used
     if let Some(TranscriptItem::UserMessage { at_ms, .. }) = b.load(None).items.first() {
         assert_eq!(
             *at_ms,
@@ -228,6 +229,152 @@ fn timestamp_from_the_record_stamps_the_item() {
 #[test]
 fn missing_file_is_a_safe_noop() {
     let mut b = builder();
-    b.sync_jsonl(std::path::Path::new("/no/such/session.jsonl"), 0);
+    b.sync_jsonl(
+        std::path::Path::new("/no/such/session.jsonl"),
+        SessionFormat::Claude,
+        0,
+    );
     assert_eq!(b.total(), 0);
+}
+
+// --- Codex rollout format ---------------------------------------------------
+//
+// Record shapes below mirror real `~/.codex/sessions/**/rollout-*.jsonl` files:
+// prose lives in `event_msg` (`user_message` / `agent_message`), tool activity
+// in `response_item` (`function_call` with a JSON-string `arguments`, or
+// `custom_tool_call` with a raw `input`). See `ingest_codex`.
+
+/// The leading session_meta line (carries cwd; must be skipped as non-prose).
+const CX_META: &str = r#"{"timestamp":"2026-07-18T18:00:00.000Z","type":"session_meta","payload":{"session_id":"019f6f70-388c-7c33-98da-da1f5c43856d","cwd":"/repo/wt"}}"#;
+const CX_USER: &str = r#"{"timestamp":"2026-07-18T18:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Explain this codebase"}}"#;
+const CX_AGENT: &str = r#"{"timestamp":"2026-07-18T18:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Here is the overview.","phase":"final_answer"}}"#;
+const CX_SHELL: &str = r#"{"timestamp":"2026-07-18T18:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"cargo test\"],\"workdir\":\".\"}","call_id":"call_1"}}"#;
+
+fn codex(f: &NamedTempFile) -> TranscriptBuilder {
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Codex, 0);
+    b
+}
+
+#[test]
+fn codex_reconstructs_prose_and_shell_activity() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[CX_META, CX_USER, CX_AGENT, CX_SHELL]);
+
+    let b = codex(&f);
+    assert_eq!(
+        labels(&b.load(None)),
+        vec![
+            "user:Explain this codebase",
+            "agent:Here is the overview.",
+            // `["bash","-lc","cargo test"]` summarises as its script.
+            "act[Command]:Ran cargo test",
+        ],
+        "session_meta is skipped; prose + tool pill reconstructed in order"
+    );
+}
+
+#[test]
+fn codex_shell_body_carries_the_command() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[CX_SHELL]);
+    let b = codex(&f);
+    match b.load(None).items.first() {
+        Some(TranscriptItem::Activity { body, kind, .. }) => {
+            assert_eq!(body.as_deref(), Some("cargo test"));
+            assert_eq!(*kind, ActivityKind::Command);
+        }
+        other => panic!("expected a Command activity, got {other:?}"),
+    }
+}
+
+#[test]
+fn codex_apply_patch_names_the_edited_file() {
+    let f = NamedTempFile::new().unwrap();
+    // `arguments` is JSON-in-JSON: the patch's newlines are `\n`-escaped inside
+    // the inner object, i.e. `\\n` in this outer string literal (as on disk).
+    let rec = r#"{"type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/main.rs\\n@@\\n-old\\n+new\\n*** End Patch\"}","call_id":"call_2"}}"#;
+    append(&f, &[rec]);
+    let b = codex(&f);
+    assert_eq!(labels(&b.load(None)), vec!["act[Edit]:Edited main.rs"]);
+}
+
+#[test]
+fn codex_update_plan_is_a_plain_pill() {
+    let f = NamedTempFile::new().unwrap();
+    let rec = r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[]}","call_id":"call_3"}}"#;
+    append(&f, &[rec]);
+    let b = codex(&f);
+    assert_eq!(labels(&b.load(None)), vec!["act[Other]:Updated the plan"]);
+}
+
+#[test]
+fn codex_custom_tool_call_uses_raw_input_as_body() {
+    let f = NamedTempFile::new().unwrap();
+    let rec = r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(await tools.web__run({search_query:[{q:\"rust\"}]}))","call_id":"call_4"}}"#;
+    append(&f, &[rec]);
+    let b = codex(&f);
+    match b.load(None).items.first() {
+        Some(TranscriptItem::Activity {
+            summary,
+            body,
+            kind,
+            ..
+        }) => {
+            assert_eq!(summary, "Ran exec");
+            assert!(body.as_deref().unwrap().contains("web__run"));
+            assert_eq!(*kind, ActivityKind::Command);
+        }
+        other => panic!("expected a Command activity, got {other:?}"),
+    }
+}
+
+#[test]
+fn codex_skips_reasoning_output_and_duplicate_message_records() {
+    let f = NamedTempFile::new().unwrap();
+    append(
+        &f,
+        &[
+            // encrypted reasoning — never shown
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"…"}}"#,
+            // the duplicate `message` mirror of agent prose — prose comes from event_msg
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is the overview."}]}}"#,
+            // injected developer/context message — not user prose
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions>"}]}}"#,
+            // tool output — not an activity
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"done"}}"#,
+            // token accounting
+            r#"{"type":"event_msg","payload":{"type":"token_count","total":42}}"#,
+        ],
+    );
+    let b = codex(&f);
+    assert_eq!(b.total(), 0, "none of these are conversation items");
+}
+
+#[test]
+fn codex_agent_message_becomes_needs_input_preview() {
+    let f = NamedTempFile::new().unwrap();
+    let rec =
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Shall I proceed?"}}"#;
+    append(&f, &[rec]);
+    let mut b = codex(&f);
+    assert_eq!(b.on_needs_input(0).as_deref(), Some("Shall I proceed?"));
+}
+
+#[test]
+fn codex_tails_new_records_and_switching_format_resets() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[CX_USER]);
+    let mut b = codex(&f);
+    assert_eq!(
+        labels(&b.take_appended().unwrap()),
+        vec!["user:Explain this codebase"]
+    );
+
+    append(&f, &[CX_AGENT]);
+    b.sync_jsonl(f.path(), SessionFormat::Codex, 0);
+    assert_eq!(
+        labels(&b.take_appended().unwrap()),
+        vec!["agent:Here is the overview."]
+    );
 }

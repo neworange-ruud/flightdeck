@@ -26,9 +26,13 @@
 //! stopped for input, and we synthesize an inline
 //! [`TranscriptItem::PermissionPrompt`] whose preview is the agent's last prose.
 //!
-//! v1 understands **Claude Code's** schema; [`crate::agents::resume`] returns no
-//! session path for other agents yet, so those simply show no reconstructed
-//! transcript (a follow-up, not a wrong transcript).
+//! Two record schemas are understood, dispatched by [`SessionFormat`]:
+//! **Claude Code** (`type=user|assistant`, `message.content` blocks) and
+//! **Codex** (`event_msg` prose + `response_item` `function_call` tool activity).
+//! OpenCode keeps its conversation in a live SQLite DB rather than a tailable
+//! file, so [`crate::agents::resume`] returns no path for it and its chat shows
+//! no reconstructed transcript (a follow-up, remote-control-fyj — not a wrong
+//! transcript).
 //!
 //! Memory is capped to [`MAX_ITEMS`] most-recent items (a ring); pagination
 //! honours the protocol's `from_index`.
@@ -44,6 +48,8 @@ use flightdeck_remote_protocol::{
 };
 use flightdeck_remote_protocol::{ItemId, PromptId, SessionId};
 
+use crate::agents::resume::SessionFormat;
+
 /// Most-recent transcript items retained per session (ring buffer bound).
 pub const MAX_ITEMS: usize = 500;
 /// Max characters in a needs-input preview.
@@ -53,6 +59,9 @@ const PREVIEW_CAP: usize = 280;
 /// JSONL and translating each record into a [`TranscriptItem`].
 pub struct TranscriptBuilder {
     session_id: SessionId,
+    /// Which record schema `source` is parsed as (set each sync; stable per
+    /// session). Defaults to Claude until the first sync sets it.
+    format: SessionFormat,
     /// The session file currently being tailed (set on first successful sync).
     source: Option<PathBuf>,
     /// Byte offset up to which `source` has been consumed (only whole lines).
@@ -77,6 +86,7 @@ impl TranscriptBuilder {
     pub fn new(session_id: SessionId) -> Self {
         TranscriptBuilder {
             session_id,
+            format: SessionFormat::Claude,
             source: None,
             read_offset: 0,
             seen: HashSet::new(),
@@ -94,7 +104,10 @@ impl TranscriptBuilder {
     /// reads bytes past the last consumed offset, and only consumes whole
     /// (newline-terminated) lines so a half-written record is never parsed.
     /// `now_ms` stamps items whose record carries no parseable timestamp.
-    pub fn sync_jsonl(&mut self, path: &Path, now_ms: i64) {
+    /// `format` selects the record parser (Claude vs Codex); it is stable for a
+    /// given session file.
+    pub fn sync_jsonl(&mut self, path: &Path, format: SessionFormat, now_ms: i64) {
+        self.format = format;
         // A different path means a different session (a resume reuses the same
         // file) — start the transcript over so `load` replaces cleanly.
         if self.source.as_deref() != Some(path) {
@@ -148,8 +161,17 @@ impl TranscriptBuilder {
         // `prompt_seq` intentionally keeps advancing so PromptIds stay unique.
     }
 
-    /// Translate one session-file record into 0+ transcript items.
+    /// Translate one session-file record into 0+ transcript items, dispatching
+    /// on the session's [`SessionFormat`].
     fn ingest(&mut self, o: &Value, now_ms: i64) {
+        match self.format {
+            SessionFormat::Claude => self.ingest_claude(o, now_ms),
+            SessionFormat::Codex => self.ingest_codex(o, now_ms),
+        }
+    }
+
+    /// Translate one **Claude Code** record into 0+ transcript items.
+    fn ingest_claude(&mut self, o: &Value, now_ms: i64) {
         let uuid = o
             .get("uuid")
             .and_then(Value::as_str)
@@ -234,6 +256,90 @@ impl TranscriptBuilder {
                     }
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Translate one **Codex** rollout record into 0+ transcript items.
+    ///
+    /// Codex writes two interleaved streams (in file/timestamp order):
+    /// * `event_msg` — the display stream: `user_message` / `agent_message` carry
+    ///   the user's and the agent's prose (`payload.message`, a string). We take
+    ///   prose from here (not the duplicate `response_item` `message` records).
+    /// * `response_item` — model I/O: `function_call` / `custom_tool_call` carry
+    ///   tool activity. We take tool pills from here.
+    ///
+    /// Everything else (`reasoning`, developer/injected `message`s, tool output,
+    /// `session_meta`, `world_state`, token counts, task lifecycle) is skipped.
+    /// Records carry no per-record uuid, so tool items key off the tool `call_id`
+    /// and prose falls back to the running ordinal (see [`Self::item_id`]); the
+    /// byte-offset tail never re-reads a line, so no uuid dedup is needed.
+    fn ingest_codex(&mut self, o: &Value, now_ms: i64) {
+        let at_ms = o
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms)
+            .unwrap_or(now_ms);
+        let Some(payload) = o.get("payload") else {
+            return;
+        };
+        let payload_type = payload.get("type").and_then(Value::as_str);
+
+        match o.get("type").and_then(Value::as_str) {
+            Some("event_msg") => match payload_type {
+                Some("user_message") => {
+                    if let Some(text) = payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
+                        let item_id = self.item_id("", 0);
+                        self.push_item(TranscriptItem::UserMessage {
+                            item_id,
+                            text: text.to_string(),
+                            at_ms,
+                        });
+                    }
+                }
+                Some("agent_message") => {
+                    if let Some(text) = payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
+                        self.last_agent_text = Some(text.to_string());
+                        let item_id = self.item_id("", 0);
+                        self.push_item(TranscriptItem::AgentMessage {
+                            item_id,
+                            text: text.to_string(),
+                            at_ms,
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Some("response_item") => match payload_type {
+                Some("function_call") | Some("custom_tool_call") => {
+                    let name = payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                    let (summary, detail, body, kind) = codex_tool_activity(name, payload);
+                    let item_id = self.item_id(call_id, 0);
+                    self.push_item(TranscriptItem::Activity {
+                        item_id,
+                        summary,
+                        detail,
+                        body,
+                        kind,
+                        at_ms,
+                    });
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -434,6 +540,103 @@ fn tool_activity(
         ),
         other => (other.to_string(), None, None, ActivityKind::Other),
     }
+}
+
+/// Summarise a Codex tool record into `(summary, detail, body, kind)` for a
+/// collapsed activity pill. Handles `function_call` (whose `arguments` is a
+/// JSON *string*) and `custom_tool_call` (whose `input` is a raw code string).
+fn codex_tool_activity(
+    name: &str,
+    payload: &Value,
+) -> (String, Option<String>, Option<String>, ActivityKind) {
+    // `function_call.arguments` is a JSON-encoded string; parse it if present.
+    let args = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let a = args.as_ref();
+    match name {
+        // Codex's exec tool: `command` is an argv array; `["bash","-lc", SCRIPT]`
+        // carries the real script in its last element.
+        "shell" | "local_shell" | "container.exec" => {
+            let cmd = a.and_then(codex_command_string).unwrap_or_default();
+            let summary = if cmd.is_empty() {
+                "Ran a command".to_string()
+            } else {
+                format!("Ran {}", first_line(&cmd))
+            };
+            let body = (!cmd.is_empty()).then_some(cmd);
+            (summary, None, body, ActivityKind::Command)
+        }
+        "apply_patch" => {
+            let patch = a
+                .and_then(|v| v.get("input").or_else(|| v.get("patch")))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let summary = match codex_patch_file(patch) {
+                Some(f) => format!("Edited {}", basename(&f)),
+                None => "Applied a patch".to_string(),
+            };
+            (summary, None, None, ActivityKind::Edit)
+        }
+        "update_plan" => (
+            "Updated the plan".to_string(),
+            None,
+            None,
+            ActivityKind::Other,
+        ),
+        "view_image" => (
+            "Viewed an image".to_string(),
+            None,
+            None,
+            ActivityKind::Other,
+        ),
+        // `custom_tool_call` (e.g. `exec`): the payload carries a raw `input`
+        // string rather than JSON `arguments`.
+        _ => {
+            if let Some(input) = payload.get("input").and_then(Value::as_str) {
+                let input = input.trim();
+                let summary = format!("Ran {name}");
+                let body = (!input.is_empty()).then(|| input.to_string());
+                (summary, None, body, ActivityKind::Command)
+            } else {
+                (name.to_string(), None, None, ActivityKind::Other)
+            }
+        }
+    }
+}
+
+/// The command string from a Codex `shell` call's parsed `arguments`: the
+/// `["bash","-lc", SCRIPT]` script when present, else the argv joined by spaces.
+fn codex_command_string(args: &Value) -> Option<String> {
+    let arr = args.get("command")?.as_array()?;
+    let parts: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if let [shell, flag, script] = parts.as_slice() {
+        if (*shell == "bash" || *shell == "sh" || *shell == "zsh") && flag.starts_with('-') {
+            return Some(script.to_string());
+        }
+    }
+    Some(parts.join(" "))
+}
+
+/// The first file path named in a Codex `apply_patch` body (`*** Add File: p`,
+/// `*** Update File: p`, `*** Delete File: p`), if any.
+fn codex_patch_file(patch: &str) -> Option<String> {
+    patch.lines().find_map(|line| {
+        let line = line.trim();
+        for tag in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+            if let Some(rest) = line.strip_prefix(tag) {
+                let p = rest.trim();
+                if !p.is_empty() {
+                    return Some(p.to_string());
+                }
+            }
+        }
+        None
+    })
 }
 
 /// The first non-empty line of `s`, trimmed (for a one-line command summary).
