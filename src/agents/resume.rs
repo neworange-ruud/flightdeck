@@ -120,13 +120,21 @@ pub fn newest_new_session(
         .map(|(id, _)| id.clone())
 }
 
-/// Claude's project directory for `cwd`: the absolute path with every `/` and
-/// `.` replaced by `-`, under `<home>/.claude/projects/`.
+/// Claude's project directory for `cwd`: the absolute path with every path
+/// separator (`/` or, on Windows, `\`) and `.` replaced by `-`, under
+/// `<home>/.claude/projects/`. Both separators are folded so the mangling
+/// matches Claude Code's own encoding regardless of the host platform.
 fn claude_project_dir(cwd: &Path, home: &Path) -> PathBuf {
     let mangled: String = cwd
         .to_string_lossy()
         .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '.' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     home.join(".claude").join("projects").join(mangled)
 }

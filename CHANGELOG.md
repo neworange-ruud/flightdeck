@@ -48,6 +48,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   fresh snapshot, and the phone accepts the reset instead of discarding it as a
   duplicate. Re-deriving the encrypted channel for an already-paired phone also
   no longer rewinds the sequence number, which could stall delivery the same way.
+- **FlightDeck Remote: transcript requests always get an answer.** When the
+  phone asked for a session's transcript before the agent's session file existed,
+  the desktop silently dropped the request and the phone waited forever; it now
+  replies with an empty transcript so the phone can render and catch up as
+  history streams in. Claude session-file lookup also folds Windows path
+  separators, so reconstruction resolves the right project directory on Windows
+  as well as macOS/Linux.
 
 ### New features
 

@@ -458,16 +458,22 @@ impl RemoteBridge {
             self.send_msg(DesktopToPhone::TranscriptAppend(feed), sent_at, send);
         }
 
-        // Answer transcript requests.
+        // Answer transcript requests. Always reply so the phone is never left
+        // hanging: when no session file has been reconstructed for this session
+        // (e.g. the agent has not written its log yet), send an empty full-load
+        // feed rather than silently dropping the request.
         let requests = std::mem::take(&mut self.pending_transcript_requests);
         for (sid, from_index) in requests {
-            if let Some(builder) = self.transcripts.get(&sid) {
-                self.send_msg(
-                    DesktopToPhone::Transcript(builder.load(from_index)),
-                    sent_at,
-                    send,
-                );
-            }
+            let feed = match self.transcripts.get(&sid) {
+                Some(builder) => builder.load(from_index),
+                None => flightdeck_remote_protocol::TranscriptFeed {
+                    session_id: sid.clone(),
+                    from_index: from_index.unwrap_or(0),
+                    replace: true,
+                    items: Vec::new(),
+                },
+            };
+            self.send_msg(DesktopToPhone::Transcript(feed), sent_at, send);
         }
 
         // Flush remote-shell output/lifecycle messages queued since the last
