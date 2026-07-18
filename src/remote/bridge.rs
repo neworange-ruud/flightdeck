@@ -534,6 +534,12 @@ impl RemoteBridge {
         let seq = self.out_seq + 1;
         if let Some((nonce, ciphertext)) = (self.seal)(&bytes, seq, now_ms) {
             self.out_seq = seq;
+            crate::remote::debuglog::log(&format!(
+                "bridge SEAL {} pairing={} seq={}",
+                msg_kind(&msg),
+                pairing_id.as_str(),
+                seq
+            ));
             send(RemoteOutbound::SendEnvelope {
                 pairing_id,
                 seq,
@@ -542,6 +548,22 @@ impl RemoteBridge {
                 ciphertext,
             });
         }
+    }
+}
+
+/// A short label for a [`DesktopToPhone`] variant, for the diagnostic log.
+fn msg_kind(msg: &DesktopToPhone) -> &'static str {
+    match msg {
+        DesktopToPhone::Snapshot(_) => "snapshot",
+        DesktopToPhone::StatusUpdate(_) => "status_update",
+        DesktopToPhone::Rollup(_) => "rollup",
+        DesktopToPhone::Transcript(_) => "transcript",
+        DesktopToPhone::TranscriptAppend(_) => "transcript_append",
+        DesktopToPhone::Event(_) => "event",
+        DesktopToPhone::GitStatus(_) => "git_status",
+        DesktopToPhone::ShellOutput(_) => "shell_output",
+        DesktopToPhone::ShellEvent(_) => "shell_event",
+        DesktopToPhone::CommandAck(_) => "command_ack",
     }
 }
 

@@ -33,6 +33,7 @@ pub mod bridge;
 pub mod client;
 pub mod commands;
 pub mod crypto;
+pub mod debuglog;
 pub mod feed;
 pub mod identity;
 pub mod notifier;

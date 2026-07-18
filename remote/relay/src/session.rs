@@ -626,7 +626,12 @@ impl Connection {
             tx: self.out_tx.clone(),
         };
         for pairing in &activated {
-            if let Some(peer) = self.state.registry.attach(pairing, role, handle.clone()) {
+            let peer = self.state.registry.attach(pairing, role, handle.clone());
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?pairing, role = ?role,
+                peer_present = peer.is_some(), "DIAG leg ATTACHED (auth_ok)"
+            );
+            if let Some(peer) = peer {
                 // We can see the peer …
                 self.send(RelayFrame::PeerPresence {
                     pairing_id: pairing.clone(),
@@ -734,7 +739,11 @@ impl Connection {
 
         let pairing_id = env.pairing_id.clone();
         match self.state.store.enqueue(env.clone()).await {
-            Err(QueueError::SeqViolation { .. }) => {
+            Err(QueueError::SeqViolation { expected, got }) => {
+                tracing::info!(
+                    conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                    expected, got, "DIAG envelope REJECTED (seq_violation)"
+                );
                 // Recoverable, not a client bug: the endpoint's outbound cursor
                 // is ahead of our (possibly restart-reset, in-memory) watermark.
                 // Signal `SeqViolation` so the sender re-syncs instead of looping
@@ -850,6 +859,10 @@ impl Connection {
             _ => return, // never authenticated → nothing attached
         };
         for pairing in &activated {
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?pairing, role = ?role,
+                "DIAG leg DETACHED (connection closed)"
+            );
             if let Some(peer) = self
                 .state
                 .registry
@@ -878,9 +891,18 @@ impl Connection {
 /// and does not receive pushes.
 async fn deliver_or_push(state: &AppState, env: &EncryptedEnvelope, sender: Role) {
     if let Some(peer) = state.registry.peer(&env.pairing_id, sender) {
-        peer.send(RelayFrame::Envelope(env.clone())).await;
+        let ok = peer.send(RelayFrame::Envelope(env.clone())).await;
+        tracing::info!(
+            pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
+            peer_conn = %peer.connection_id, sent = ok,
+            "DIAG deliver -> peer connected"
+        );
         return;
     }
+    tracing::info!(
+        pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
+        "DIAG deliver -> NO PEER attached (envelope queued; push if desktop)"
+    );
     if sender == Role::Desktop {
         if let Some((token, apns_env)) = state.store.push_token(&env.pairing_id).await {
             state
