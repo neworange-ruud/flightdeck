@@ -1312,6 +1312,11 @@ fn event_loop(
     let mut remote_bridge: Option<RemoteBridge> = remote_setup
         .as_ref()
         .map(|_| RemoteBridge::passthrough(now0 + crate::app::state::NOTIFY_STARTUP_GRACE_MS));
+    // Locate agent session files (per worktree) for transcript reconstruction
+    // (remote-control-72k). Uses the same home the resume machinery uses.
+    if let Some(b) = remote_bridge.as_mut() {
+        b.set_transcript_home(store_home.clone());
+    }
     if let (Some(b), Some(setup)) = (remote_bridge.as_mut(), remote_setup.as_ref()) {
         if let Some(est) = &setup.established {
             if let Ok((seal, open)) = build_channel(
@@ -1364,12 +1369,14 @@ fn event_loop(
 
             drain_pty_output(&mut p.state, now_ms, |sid, which, bytes| {
                 if let Some(b) = remote_bridge.as_mut() {
-                    match which {
-                        // Primary bytes build the transcript history.
-                        None => b.tee_primary(sid, bytes, now_ms as i64),
-                        // Child bytes stream to the phone iff that child backs
-                        // the session's live remote shell.
-                        Some(child_index) => b.shell_pump(sid, child_index, bytes),
+                    // Primary (None) bytes no longer build the transcript — it is
+                    // reconstructed from the agent's session file each tick (see
+                    // `RemoteBridge::sync_transcript`, remote-control-72k), because
+                    // full-screen agents paint the alt-screen and emit no lines.
+                    // Child bytes still stream to the phone iff that child backs
+                    // the session's live remote shell.
+                    if let Some(child_index) = which {
+                        b.shell_pump(sid, child_index, bytes);
                     }
                 }
             });
@@ -6058,9 +6065,10 @@ mod tests {
             shell_pty.push_output(b"hi\r\n".to_vec());
             {
                 let p = &mut workspace.projects[0];
-                drain_pty_output(&mut p.state, 1_000, |sid, which, bytes| match which {
-                    None => bridge.tee_primary(sid, bytes, 1_000),
-                    Some(ci) => bridge.shell_pump(sid, ci, bytes),
+                drain_pty_output(&mut p.state, 1_000, |sid, which, bytes| {
+                    if let Some(ci) = which {
+                        bridge.shell_pump(sid, ci, bytes);
+                    }
                 });
             }
             let mut sent: Vec<RemoteOutbound> = Vec::new();

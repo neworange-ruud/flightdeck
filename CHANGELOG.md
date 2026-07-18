@@ -16,6 +16,16 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **FlightDeck Remote: the agent's replies now actually appear in the phone
+  chat.** The remote transcript was reconstructed by scraping the agent's raw
+  terminal output, but the coding agents (Claude Code, Codex, OpenCode) paint a
+  full-screen UI on the alternate screen and almost never emit plain lines — so
+  the reconstruction produced nothing and the chat stayed empty even though the
+  agent was replying and every message was being delivered to the phone. The
+  transcript is now rebuilt from the agent's own structured session log (the
+  same file FlightDeck already uses to resume a session), so user prompts,
+  assistant prose, and tool activity stream to the phone as they happen.
+  (Claude Code in this release; Codex/OpenCode session formats are a follow-up.)
 - **FlightDeck Remote: agent feedback now keeps reaching the phone across relay
   restarts.** The hosted relay tracks a per-pairing message sequence number in
   memory only, so a restart/redeploy reset it while the desktop and phone kept

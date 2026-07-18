@@ -28,6 +28,27 @@ pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(Strin
     }
 }
 
+/// Absolute path to the **newest** session transcript file for `agent_key`
+/// running in `cwd` (store rooted at `home`), or `None` if none exists. This is
+/// the structured JSONL the remote transcript is reconstructed from — the agent
+/// CLIs paint their UI on the alt-screen, so scraping the PTY yields nothing;
+/// the session file is the authoritative conversation (remote-control-72k).
+///
+/// v1 understands **Claude Code's** schema only; Codex/OpenCode use different
+/// JSONL layouts and are a follow-up, so this returns `None` for them (the
+/// remote simply shows no reconstructed transcript rather than a wrong one).
+pub fn newest_session_path(agent_key: &str, cwd: &Path, home: &Path) -> Option<PathBuf> {
+    match agent_key {
+        "claude" => {
+            let mut ids = claude_session_ids(cwd, home);
+            ids.sort_by_key(|(_, mtime)| *mtime);
+            let (id, _) = ids.pop()?;
+            Some(claude_project_dir(cwd, home).join(format!("{id}.jsonl")))
+        }
+        _ => None,
+    }
+}
+
 /// The args to relaunch `agent_key` continuing session `id`, or `None` if the
 /// agent has no known resume interface.
 pub fn resume_args_for(agent_key: &str, id: &str) -> Option<Vec<String>> {

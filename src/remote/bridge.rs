@@ -21,10 +21,12 @@
 //! be tested end to end. Sealed bytes leave as [`RemoteOutbound::SendEnvelope`].
 //!
 //! When no pairing is active the bridge does no sending and produces no
-//! messages — but PTY bytes teed via [`RemoteBridge::tee_primary`] still build
-//! the transcript, so a phone that pairs later gets a populated history.
+//! messages — but the transcript is still reconstructed each tick from the
+//! agent's session file via [`RemoteBridge::sync_transcript`], so a phone that
+//! pairs later gets a populated history.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -108,6 +110,11 @@ pub struct RemoteBridge {
     shells: ShellManager,
     seal: SealFn,
     open: OpenFn,
+    /// The user's home directory, used to locate each session's agent JSONL for
+    /// transcript reconstruction (remote-control-72k). `None` disables it (tests
+    /// and any environment where the home dir is unknown), so the transcript
+    /// simply stays empty rather than the bridge guessing a path.
+    home: Option<std::path::PathBuf>,
     /// Highest outbound envelope `seq` this bridge has assigned. The next
     /// envelope uses `out_seq + 1` (envelopes start at 1). The bridge is the
     /// sole producer of outbound envelopes for a pairing, so it owns the counter
@@ -138,8 +145,16 @@ impl RemoteBridge {
             shells: ShellManager::new(),
             seal,
             open,
+            home: None,
             out_seq: 0,
         }
+    }
+
+    /// Set the home directory used to locate agent session files for transcript
+    /// reconstruction (remote-control-72k). Called once at startup from `lib.rs`
+    /// with the resolved user home; unset leaves transcripts empty.
+    pub fn set_transcript_home(&mut self, home: Option<std::path::PathBuf>) {
+        self.home = home;
     }
 
     /// A bridge using the no-crypto [`passthrough_seal`]/[`passthrough_open`].
@@ -201,15 +216,24 @@ impl RemoteBridge {
             .pump(&SessionId::new(session_id), child_index, bytes);
     }
 
-    /// Tee a chunk of a session's primary-terminal PTY bytes into its transcript
-    /// builder. Cheap and always safe to call; builds history even before a
-    /// phone pairs.
-    pub fn tee_primary(&mut self, session_id: &str, bytes: &[u8], at_ms: i64) {
+    /// Reconstruct a session's transcript from its agent session file, tailing
+    /// any records written since the last call. Cheap and always safe; builds
+    /// history even before a phone pairs. A no-op when the home dir is unset or
+    /// the agent has no locatable session file (e.g. non-Claude agents in v1, or
+    /// before the agent has written its first record). Called each tick with the
+    /// session's `agent` kind and absolute `worktree` path.
+    pub fn sync_transcript(&mut self, session_id: &str, agent: &str, worktree: &Path, now_ms: i64) {
+        let Some(home) = self.home.clone() else {
+            return;
+        };
+        let Some(path) = crate::agents::resume::newest_session_path(agent, worktree, &home) else {
+            return;
+        };
         let sid = SessionId::new(session_id);
         self.transcripts
             .entry(sid.clone())
             .or_insert_with(|| TranscriptBuilder::new(sid))
-            .push_bytes(bytes, at_ms);
+            .sync_jsonl(&path, now_ms);
     }
 
     /// Handle one inbound relay event. Link/presence changes that mark a pairing
@@ -332,6 +356,13 @@ impl RemoteBridge {
         for pv in projects {
             for tab in pv.state.tabs.iter() {
                 let sid = SessionId::new(&tab.meta.id);
+
+                // Reconstruct the transcript from the agent's session file. Done
+                // here, before the pairing gate below, so a phone that pairs
+                // later still receives the accumulated history (remote-control-72k).
+                let worktree = pv.state.repo_root.join(&tab.meta.worktree_path_relative);
+                self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_ms as i64);
+
                 let ds = tab.display_status(now_ms);
                 let interpreted = ds.interpreted;
                 let status = feed::agent_status(ds);

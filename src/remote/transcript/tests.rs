@@ -1,276 +1,233 @@
+//! Tests for the session-file (JSONL) transcript reconstruction.
+
 use super::*;
 
+use std::io::Write;
+use tempfile::NamedTempFile;
+
 fn builder() -> TranscriptBuilder {
-    TranscriptBuilder::new(SessionId::new("sess-1"))
+    TranscriptBuilder::new(SessionId::new("s1"))
 }
 
-/// Collect the current full transcript items.
-fn items(b: &TranscriptBuilder) -> Vec<TranscriptItem> {
-    b.load(None).items
-}
-
-// --- ANSI stripping --------------------------------------------------------
-
-#[test]
-fn strips_ansi_color_codes() {
-    let mut b = builder();
-    // Red "Hello", reset, then " world", flushed by a blank line.
-    b.push_bytes(b"\x1b[31mHello\x1b[0m world\n\n", 0);
-    let it = items(&b);
-    assert_eq!(it.len(), 1);
-    match &it[0] {
-        TranscriptItem::AgentMessage { text, .. } => assert_eq!(text, "Hello world"),
-        other => panic!("expected prose, got {other:?}"),
+/// Append JSONL lines to `f`.
+fn append(f: &NamedTempFile, lines: &[&str]) {
+    let mut h = std::fs::OpenOptions::new()
+        .append(true)
+        .open(f.path())
+        .unwrap();
+    for l in lines {
+        writeln!(h, "{l}").unwrap();
     }
 }
 
+/// A compact label per item, for order-sensitive assertions.
+fn labels(feed: &TranscriptFeed) -> Vec<String> {
+    feed.items
+        .iter()
+        .map(|i| match i {
+            TranscriptItem::UserMessage { text, .. } => format!("user:{text}"),
+            TranscriptItem::AgentMessage { text, .. } => format!("agent:{text}"),
+            TranscriptItem::Activity { summary, kind, .. } => format!("act[{kind:?}]:{summary}"),
+            TranscriptItem::PermissionPrompt { command, .. } => format!("prompt:{command}"),
+        })
+        .collect()
+}
+
+const USER: &str = r#"{"type":"user","uuid":"u1","timestamp":"2026-07-18T18:00:00.000Z","message":{"content":"Fix the login bug"}}"#;
+const ASSISTANT_TEXT: &str = r#"{"type":"assistant","uuid":"a1","timestamp":"2026-07-18T18:00:01.000Z","message":{"content":[{"type":"text","text":"On it — reading the code."}]}}"#;
+const ASSISTANT_TOOL: &str = r#"{"type":"assistant","uuid":"a2","timestamp":"2026-07-18T18:00:02.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test","description":"Run the tests"}}]}}"#;
+
 #[test]
-fn strips_cursor_movement_and_osc() {
+fn reconstructs_user_assistant_and_activity() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[USER, ASSISTANT_TEXT, ASSISTANT_TOOL]);
+
     let mut b = builder();
-    // Cursor move (CSI), an OSC title set (BEL-terminated), then prose.
-    b.push_bytes(
-        b"\x1b[2J\x1b[H\x1b]0;window title\x07plain text here\n\n",
-        0,
+    b.sync_jsonl(f.path(), 0);
+
+    assert_eq!(b.total(), 3);
+    assert_eq!(
+        labels(&b.load(None)),
+        vec![
+            "user:Fix the login bug",
+            "agent:On it — reading the code.",
+            "act[Command]:Run the tests",
+        ]
     );
-    match &items(&b)[0] {
-        TranscriptItem::AgentMessage { text, .. } => assert_eq!(text, "plain text here"),
-        other => panic!("expected prose, got {other:?}"),
-    }
-}
-
-// --- carriage-return redraw + dedupe ---------------------------------------
-
-#[test]
-fn carriage_return_keeps_only_final_paint() {
-    let mut b = builder();
-    // A spinner overwriting itself, ending on the final frame.
-    b.push_bytes("Loading 10%\rLoading 50%\rLoading done\n\n".as_bytes(), 0);
-    match &items(&b)[0] {
-        TranscriptItem::AgentMessage { text, .. } => assert_eq!(text, "Loading done"),
-        other => panic!("expected prose, got {other:?}"),
-    }
 }
 
 #[test]
-fn deduplicates_repeated_redraw_frames() {
-    let mut b = builder();
-    // A full-screen TUI repaints the same three lines several times.
-    let frame = "The quick brown fox\njumps over the lazy dog\nand keeps on running\n";
-    for _ in 0..5 {
-        b.push_bytes(frame.as_bytes(), 0);
-    }
-    b.push_bytes(b"\n", 0); // flush
-                            // Only one copy of the prose survives (three lines in one block).
-    let it = items(&b);
-    assert_eq!(it.len(), 1);
-    match &it[0] {
-        TranscriptItem::AgentMessage { text, .. } => {
-            assert_eq!(text.matches("quick brown fox").count(), 1);
-            assert_eq!(text.lines().count(), 3);
-        }
-        other => panic!("expected prose, got {other:?}"),
-    }
-}
-
-// --- pill collapsing -------------------------------------------------------
-
-#[test]
-fn collapses_tool_call_into_activity_pill() {
-    let mut b = builder();
-    // Claude-Code-style: a ⏺ tool header and a ⎿ result continuation.
-    b.push_bytes(
-        "\u{23fa} Bash(npm test)\n\u{23bf} 42 passed\n\n".as_bytes(),
-        0,
+fn skips_tool_results_meta_and_sidechain() {
+    let f = NamedTempFile::new().unwrap();
+    append(
+        &f,
+        &[
+            // a tool_result-only user record → not user prose
+            r#"{"type":"user","uuid":"r1","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+            // an injected meta record
+            r#"{"type":"user","uuid":"m1","isMeta":true,"message":{"content":[{"type":"text","text":"<system>"}]}}"#,
+            // a subagent (sidechain) turn
+            r#"{"type":"assistant","uuid":"s1","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent thinking"}]}}"#,
+            // an unrelated record type
+            r#"{"type":"file-history-snapshot","uuid":"x1"}"#,
+        ],
     );
-    let it = items(&b);
-    assert_eq!(it.len(), 1);
-    match &it[0] {
-        TranscriptItem::Activity {
-            summary,
-            body,
-            kind,
-            ..
-        } => {
-            assert_eq!(summary, "Bash(npm test)");
-            assert_eq!(body.as_deref(), Some("42 passed"));
-            assert_eq!(*kind, ActivityKind::Test);
-        }
-        other => panic!("expected activity, got {other:?}"),
-    }
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), 0);
+    assert_eq!(b.total(), 0, "none of these are conversation prose");
 }
 
 #[test]
-fn ran_line_splits_summary_and_detail() {
+fn tails_newly_appended_records() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[USER]);
+
     let mut b = builder();
-    b.push_bytes(b"Ran npm test \xc2\xb7 42 passed\n\n", 0); // "·" is C2 B7
-    match &items(&b)[0] {
-        TranscriptItem::Activity {
-            summary,
-            detail,
-            kind,
-            ..
-        } => {
-            assert_eq!(summary, "Ran npm test");
-            assert_eq!(detail.as_deref(), Some("42 passed"));
-            assert_eq!(*kind, ActivityKind::Test);
-        }
-        other => panic!("expected activity, got {other:?}"),
-    }
-}
-
-#[test]
-fn edit_line_classified_as_edit() {
-    let mut b = builder();
-    b.push_bytes("Edited auth.ts +18 -4\n\n".as_bytes(), 0);
-    match &items(&b)[0] {
-        TranscriptItem::Activity { summary, kind, .. } => {
-            assert_eq!(summary, "Edited auth.ts +18 -4");
-            assert_eq!(*kind, ActivityKind::Edit);
-        }
-        other => panic!("expected activity, got {other:?}"),
-    }
-}
-
-#[test]
-fn shell_prompt_line_is_command_pill() {
-    let mut b = builder();
-    b.push_bytes(b"$ ls -la\n\n", 0);
-    match &items(&b)[0] {
-        TranscriptItem::Activity { summary, kind, .. } => {
-            assert_eq!(summary, "$ ls -la");
-            assert_eq!(*kind, ActivityKind::Command);
-        }
-        other => panic!("expected activity, got {other:?}"),
-    }
-}
-
-#[test]
-fn ambiguous_line_stays_prose() {
-    let mut b = builder();
-    // A dashed list item is NOT a strong tool marker: honest -> prose.
-    b.push_bytes(b"- some bullet point that is really prose\n\n", 0);
-    match &items(&b)[0] {
-        TranscriptItem::AgentMessage { .. } => {}
-        other => panic!("expected prose, got {other:?}"),
-    }
-}
-
-// --- prose chunking --------------------------------------------------------
-
-#[test]
-fn prose_blocks_split_on_blank_lines() {
-    let mut b = builder();
-    b.push_bytes(
-        b"First paragraph line one.\nFirst paragraph line two.\n\nSecond paragraph here.\n\n",
-        0,
-    );
-    let it = items(&b);
-    assert_eq!(it.len(), 2);
-    match (&it[0], &it[1]) {
-        (
-            TranscriptItem::AgentMessage { text: a, .. },
-            TranscriptItem::AgentMessage { text: c, .. },
-        ) => {
-            assert_eq!(a, "First paragraph line one.\nFirst paragraph line two.");
-            assert_eq!(c, "Second paragraph here.");
-        }
-        _ => panic!("expected two prose blocks"),
-    }
-}
-
-#[test]
-fn prose_then_pill_flushes_prose_first() {
-    let mut b = builder();
-    b.push_bytes(
-        "Let me check the tests.\n\u{23fa} Read(config.toml)\n\n".as_bytes(),
-        0,
-    );
-    let it = items(&b);
-    assert_eq!(it.len(), 2);
-    assert!(matches!(it[0], TranscriptItem::AgentMessage { .. }));
-    assert!(matches!(it[1], TranscriptItem::Activity { .. }));
-}
-
-// --- permission preview capture --------------------------------------------
-
-#[test]
-fn needs_input_captures_preview_and_emits_prompt() {
-    let mut b = builder();
-    b.push_bytes(
-        b"I want to run a shell command to install packages.\nProceed with the installation?\n",
-        1_000,
-    );
-    let preview = b.on_needs_input(2_000).expect("preview");
-    assert!(preview.contains("Proceed with the installation?"));
-    // The last item is the inline permission prompt with both options.
-    let it = items(&b);
-    match it.last().unwrap() {
-        TranscriptItem::PermissionPrompt {
-            prompt_id,
-            command,
-            options,
-            ..
-        } => {
-            assert_eq!(prompt_id.as_str(), "sess-1:p1");
-            assert!(command.contains("Proceed with the installation?"));
-            assert_eq!(options.len(), 2);
-            assert_eq!(options[0].choice, PermissionChoice::AllowOnce);
-            assert_eq!(options[1].choice, PermissionChoice::Deny);
-        }
-        other => panic!("expected permission prompt, got {other:?}"),
-    }
-}
-
-#[test]
-fn needs_input_folds_trailing_partial_line() {
-    let mut b = builder();
-    // No trailing newline — the prompt is a partial line.
-    b.push_bytes(b"Allow write to /etc/hosts?", 0);
-    let preview = b.on_needs_input(0).expect("preview");
-    assert!(preview.contains("Allow write to /etc/hosts?"));
-}
-
-// --- pagination + incremental appends --------------------------------------
-
-#[test]
-fn take_appended_is_incremental() {
-    let mut b = builder();
-    b.push_bytes(b"one\n\n", 0);
-    let first = b.take_appended().expect("first batch");
+    b.sync_jsonl(f.path(), 0);
+    let first = b.take_appended().expect("first item");
+    assert_eq!(labels(&first), vec!["user:Fix the login bug"]);
     assert_eq!(first.from_index, 0);
-    assert!(!first.replace);
-    assert_eq!(first.items.len(), 1);
-    // Nothing new yet.
+
+    // The agent writes its reply; a later sync picks up only the new record.
+    append(&f, &[ASSISTANT_TEXT]);
+    b.sync_jsonl(f.path(), 0);
+    let second = b.take_appended().expect("appended item");
+    assert_eq!(labels(&second), vec!["agent:On it — reading the code."]);
+    assert_eq!(
+        second.from_index, 1,
+        "append continues from the running ordinal"
+    );
+}
+
+#[test]
+fn resync_without_growth_adds_nothing() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[USER, ASSISTANT_TEXT]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), 0);
+    assert_eq!(b.total(), 2);
+    let _ = b.take_appended();
+
+    // Re-syncing the unchanged file is a no-op (offset + uuid dedup).
+    b.sync_jsonl(f.path(), 0);
+    assert_eq!(b.total(), 2);
     assert!(b.take_appended().is_none());
-    // Add more.
-    b.push_bytes(b"two\n\n", 0);
-    let second = b.take_appended().expect("second batch");
-    assert_eq!(second.from_index, 1);
-    assert_eq!(second.items.len(), 1);
 }
 
 #[test]
-fn load_honours_from_index() {
-    let mut b = builder();
-    for i in 0..5 {
-        b.push_bytes(format!("line {i}\n\n").as_bytes(), 0);
+fn ignores_a_half_written_trailing_line() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[USER]);
+    // A partial record with no trailing newline (mid-write).
+    {
+        let mut h = std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.path())
+            .unwrap();
+        write!(
+            h,
+            r#"{{"type":"assistant","uuid":"a1","message":{{"content":[{{"type":"text","#
+        )
+        .unwrap();
     }
-    assert_eq!(b.total(), 5);
-    let feed = b.load(Some(2));
-    assert_eq!(feed.from_index, 2);
-    assert!(feed.replace);
-    assert_eq!(feed.items.len(), 3);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), 0);
+    assert_eq!(b.total(), 1, "only the complete first line is consumed");
+
+    // Once the record is completed, the next sync ingests it.
+    {
+        let mut h = std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.path())
+            .unwrap();
+        writeln!(h, r#""text":"done"}}]}}}}"#).unwrap();
+    }
+    b.sync_jsonl(f.path(), 0);
+    assert_eq!(b.total(), 2);
+    assert_eq!(labels(&b.load(None))[1], "agent:done");
 }
 
 #[test]
-fn ring_buffer_caps_memory() {
+fn needs_input_preview_is_the_last_agent_prose() {
+    let f = NamedTempFile::new().unwrap();
+    append(
+        &f,
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Should I delete the file?"}]}}"#,
+        ],
+    );
+
     let mut b = builder();
-    for i in 0..(MAX_ITEMS + 50) {
-        b.push_bytes(format!("m{i}\n\n").as_bytes(), 0);
+    b.sync_jsonl(f.path(), 0);
+    let preview = b.on_needs_input(0);
+    assert_eq!(preview.as_deref(), Some("Should I delete the file?"));
+
+    // The inline prompt item is appended and becomes the pending prompt id.
+    let items = b.load(None);
+    assert!(matches!(
+        items.items.last(),
+        Some(TranscriptItem::PermissionPrompt { .. })
+    ));
+    assert!(b.last_prompt_id().is_some());
+}
+
+#[test]
+fn a_new_session_file_replaces_the_transcript() {
+    let f1 = NamedTempFile::new().unwrap();
+    append(&f1, &[USER]);
+    let mut b = builder();
+    b.sync_jsonl(f1.path(), 0);
+    assert_eq!(b.total(), 1);
+
+    // A different path (a fresh session) resets and re-reads from scratch.
+    let f2 = NamedTempFile::new().unwrap();
+    append(&f2, &[ASSISTANT_TEXT]);
+    b.sync_jsonl(f2.path(), 0);
+    assert_eq!(b.total(), 1);
+    assert_eq!(
+        labels(&b.load(None)),
+        vec!["agent:On it — reading the code."]
+    );
+}
+
+#[test]
+fn iso8601_parses_to_unix_millis() {
+    assert_eq!(parse_iso8601_ms("1970-01-01T00:00:00.000Z"), Some(0));
+    assert_eq!(
+        parse_iso8601_ms("1970-01-02T00:00:00.000Z"),
+        Some(86_400_000)
+    );
+    // Fractional seconds are milliseconds (right-padded).
+    assert_eq!(parse_iso8601_ms("1970-01-01T00:00:00.5Z"), Some(500));
+    assert_eq!(parse_iso8601_ms("1970-01-01T00:00:01Z"), Some(1000));
+    // A recent, plausible instant is far in the future of the epoch.
+    assert!(parse_iso8601_ms("2026-07-18T18:00:00.000Z").unwrap() > 1_700_000_000_000);
+    // Garbage is rejected so the caller falls back to wall-clock.
+    assert_eq!(parse_iso8601_ms("not-a-timestamp"), None);
+}
+
+#[test]
+fn timestamp_from_the_record_stamps_the_item() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[USER]);
+    let mut b = builder();
+    b.sync_jsonl(f.path(), 999); // fallback that must NOT be used
+    if let Some(TranscriptItem::UserMessage { at_ms, .. }) = b.load(None).items.first() {
+        assert_eq!(
+            *at_ms,
+            parse_iso8601_ms("2026-07-18T18:00:00.000Z").unwrap()
+        );
+    } else {
+        panic!("expected a user message");
     }
-    assert_eq!(b.total() as usize, MAX_ITEMS + 50);
-    // Only the most recent MAX_ITEMS are retained.
-    let feed = b.load(None);
-    assert_eq!(feed.items.len(), MAX_ITEMS);
-    assert_eq!(feed.from_index, 50);
+}
+
+#[test]
+fn missing_file_is_a_safe_noop() {
+    let mut b = builder();
+    b.sync_jsonl(std::path::Path::new("/no/such/session.jsonl"), 0);
+    assert_eq!(b.total(), 0);
 }

@@ -5,7 +5,29 @@ use crate::testing::FakePty;
 use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::relay::EncryptedEnvelope;
-use flightdeck_remote_protocol::{CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role};
+use flightdeck_remote_protocol::{
+    CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role, TranscriptItem,
+};
+
+use std::io::Write as _;
+
+/// Seed a Claude session JSONL for a tab whose worktree resolves to
+/// `worktree_abs` (`<repo_root>/worktrees/<name>`; `repo_root` is `/repo` in
+/// `app_with_tabs`), placed under a temp `home` at the path
+/// `newest_session_path` locates. Hand `home` to `set_transcript_home`.
+fn seed_claude_session(home: &std::path::Path, worktree_abs: &str, lines: &[&str]) {
+    let mangled: String = worktree_abs
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let dir = home.join(".claude").join("projects").join(mangled);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f =
+        std::fs::File::create(dir.join("11111111-1111-1111-1111-111111111111.jsonl")).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
 
 // --- fixtures --------------------------------------------------------------
 
@@ -220,12 +242,20 @@ fn grace_window_suppresses_events() {
 
 #[test]
 fn needs_input_populates_pending_question() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"May I run the installer script?"}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
     let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     set_status(&mut app, 0, InterpretedStatus::Working);
     let cache = GitStatusCache::new();
-    // Tee some agent output that will become the preview.
-    b.tee_primary("t1", b"May I run the installer script?\n", 1_000);
+    // Sync the session file so the agent's last prose becomes the preview.
     {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
@@ -250,14 +280,22 @@ fn needs_input_populates_pending_question() {
         .contains("installer script"));
 }
 
-// --- transcript tee + append -----------------------------------------------
+// --- transcript reconstruction from the session file -----------------------
 
 #[test]
-fn teed_bytes_flush_as_transcript_append() {
+fn session_file_flushes_as_transcript_append() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Hello from the agent."}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
-    let app = app_with_tabs(vec![]);
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     let cache = GitStatusCache::new();
-    b.tee_primary("t1", b"Hello from the agent.\n\n", 1_000);
     let views = vec![view("proj", &app, &cache)];
     let msgs = collect(&mut b, &views, 1_000);
     let feed = msgs
@@ -268,7 +306,10 @@ fn teed_bytes_flush_as_transcript_append() {
         })
         .expect("transcript append");
     assert_eq!(feed.session_id.as_str(), "t1");
-    assert!(!feed.items.is_empty());
+    assert!(feed
+        .items
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::AgentMessage { text, .. } if text == "Hello from the agent.")));
 }
 
 // --- inbound request handling ----------------------------------------------
@@ -312,10 +353,18 @@ fn request_snapshot_command_forces_snapshot() {
 
 #[test]
 fn request_transcript_command_returns_feed() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"some prior output"}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
-    let app = app_with_tabs(vec![]);
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     let cache = GitStatusCache::new();
-    b.tee_primary("t1", b"some prior output line\n\n", 1_000);
     {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
