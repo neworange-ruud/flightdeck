@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.8.1] - 2026-07-18
+
+### New features
+
 - **FlightDeck Remote: Codex and OpenCode chats now reconstruct on the phone.**
   The remote transcript understood only Claude Code's session format, so Codex
   and OpenCode agents' mobile chats stayed empty. Codex is now parsed from its
