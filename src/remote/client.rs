@@ -949,7 +949,16 @@ fn handle_outbound(
                 nonce,
                 ciphertext,
             };
+            crate::remote::debuglog::log(&format!(
+                "client SEND envelope pairing={} seq={} bytes={}",
+                key,
+                seq,
+                envelope.ciphertext.len()
+            ));
             if send_frame(sock, &RelayFrame::Envelope(envelope)).is_err() {
+                crate::remote::debuglog::log(&format!(
+                    "client SEND envelope FAILED (socket) pairing={key} seq={seq}"
+                ));
                 return false;
             }
             // Commit the high-water mark only once the send succeeded so a failed
@@ -994,6 +1003,10 @@ fn handle_frame(
     match frame {
         RelayFrame::Envelope(env) => {
             let key = env.pairing_id.as_str().to_string();
+            crate::remote::debuglog::log(&format!(
+                "client RECV envelope pairing={} seq={} sender={:?}",
+                key, env.seq, env.sender
+            ));
             if state.pairing(&key).is_none() {
                 state
                     .pairings
@@ -1024,6 +1037,11 @@ fn handle_frame(
             true
         }
         RelayFrame::Ack { pairing_id, cursor } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV ack pairing={} cursor={}",
+                pairing_id.as_str(),
+                cursor
+            ));
             if let Some(p) = state.pairing_mut(pairing_id.as_str()) {
                 if cursor > p.last_acked_by_peer {
                     p.last_acked_by_peer = cursor;
@@ -1048,6 +1066,12 @@ fn handle_frame(
             state: presence,
             ..
         } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV presence pairing={} peer={:?} state={:?}",
+                pairing_id.as_str(),
+                peer,
+                presence
+            ));
             let _ = inbound_tx.send(RemoteInbound::Presence {
                 pairing_id,
                 peer,
@@ -1098,7 +1122,46 @@ fn handle_frame(
             });
             true
         }
-        RelayFrame::Error { code, .. } => !is_fatal_error(code),
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            pairing_id,
+            ..
+        } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV error seq_violation pairing={:?}",
+                pairing_id.as_ref().map(|p| p.as_str())
+            ));
+            // The relay is ahead-of-us on this pairing's outbound seq — it lost
+            // its in-memory watermark (restart/redeploy) while we kept ours. Do
+            // NOT tear the connection down (that just reconnects into the same
+            // rejection forever). Re-sync: zero this pairing's persisted outbound
+            // cursor and tell the bridge to restart its stream from seq 1 with a
+            // fresh snapshot (remote-control-bbf). A `seq_violation` without a
+            // pairing id can't be targeted, so it is ignored (non-fatal).
+            if let Some(pid) = pairing_id {
+                if let Some(p) = state.pairing_mut(pid.as_str()) {
+                    p.last_sent_seq = 0;
+                    p.last_acked_by_peer = 0;
+                    store.save(state);
+                }
+                let _ = inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
+            }
+            true
+        }
+        RelayFrame::Error {
+            code,
+            ref message,
+            ref pairing_id,
+        } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV error code={:?} pairing={:?} fatal={} msg={}",
+                code,
+                pairing_id.as_ref().map(|p| p.as_str()),
+                is_fatal_error(code),
+                message
+            ));
+            !is_fatal_error(code)
+        }
         RelayFrame::Bye { .. } => false,
         // Post-auth restatements of handshake frames or unused directions: ignore.
         _ => true,

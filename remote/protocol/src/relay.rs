@@ -53,6 +53,15 @@ pub enum RelayErrorCode {
     RateLimited,
     /// A frame could not be parsed or violated the protocol.
     BadFrame,
+    /// The sender's envelope `seq` diverged from the relay's expected next value
+    /// (not `high_water + 1`, and not an idempotent re-send of the head). Unlike
+    /// [`Self::BadFrame`] this is **recoverable**, not a client bug: the usual
+    /// cause is the relay losing its in-memory per-pairing seq watermark across a
+    /// restart/redeploy while the endpoint kept its persisted cursor. The
+    /// endpoint should re-sync by resetting its outbound stream (restart at
+    /// `seq = 1` with a fresh full snapshot) rather than tearing the connection
+    /// down and reconnecting into the same rejection forever (remote-control-bbf).
+    SeqViolation,
     /// An unexpected relay-side failure.
     Internal,
 }

@@ -18,6 +18,19 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// The on-disk record schema of an agent's session file. The remote transcript
+/// builder parses each format's records differently (see
+/// [`crate::remote::transcript`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFormat {
+    /// Claude Code: one record per line, `type=user|assistant`, `message.content`
+    /// text / `tool_use` blocks, with `isMeta` / `isSidechain` filters.
+    Claude,
+    /// Codex: `session_meta` first, then `event_msg` (user/agent prose) and
+    /// `response_item` (`function_call` tool activity) records.
+    Codex,
+}
+
 /// Session ids in `agent_key`'s on-disk store for `cwd` (store rooted at `home`),
 /// each with its file mtime. Empty for unknown agents or a missing store.
 pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(String, SystemTime)> {
@@ -25,6 +38,40 @@ pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(Strin
         "claude" => claude_session_ids(cwd, home),
         "codex" => codex_session_ids(cwd, home),
         _ => Vec::new(),
+    }
+}
+
+/// Absolute path to the **newest** session transcript file for `agent_key`
+/// running in `cwd` (store rooted at `home`) together with its record
+/// [`SessionFormat`], or `None` if none exists. This is the structured JSONL the
+/// remote transcript is reconstructed from — the agent CLIs paint their UI on
+/// the alt-screen, so scraping the PTY yields nothing; the session file is the
+/// authoritative conversation (remote-control-72k).
+///
+/// Understands **Claude Code** and **Codex**, both of which append a JSONL
+/// file. OpenCode keeps its conversation in a live SQLite DB (no tailable file),
+/// so it returns `None` here and is resolved separately by
+/// [`crate::remote::transcript::resolve_source`].
+pub fn newest_session_path(
+    agent_key: &str,
+    cwd: &Path,
+    home: &Path,
+) -> Option<(PathBuf, SessionFormat)> {
+    match agent_key {
+        "claude" => {
+            let mut ids = claude_session_ids(cwd, home);
+            ids.sort_by_key(|(_, mtime)| *mtime);
+            let (id, _) = ids.pop()?;
+            let path = claude_project_dir(cwd, home).join(format!("{id}.jsonl"));
+            Some((path, SessionFormat::Claude))
+        }
+        "codex" => {
+            let mut files = codex_session_files(cwd, home);
+            files.sort_by_key(|(_, mtime)| *mtime);
+            let (path, _) = files.pop()?;
+            Some((path, SessionFormat::Codex))
+        }
+        _ => None,
     }
 }
 
@@ -73,13 +120,21 @@ pub fn newest_new_session(
         .map(|(id, _)| id.clone())
 }
 
-/// Claude's project directory for `cwd`: the absolute path with every `/` and
-/// `.` replaced by `-`, under `<home>/.claude/projects/`.
+/// Claude's project directory for `cwd`: the absolute path with every path
+/// separator (`/` or, on Windows, `\`) and `.` replaced by `-`, under
+/// `<home>/.claude/projects/`. Both separators are folded so the mangling
+/// matches Claude Code's own encoding regardless of the host platform.
 fn claude_project_dir(cwd: &Path, home: &Path) -> PathBuf {
     let mangled: String = cwd
         .to_string_lossy()
         .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '.' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     home.join(".claude").join("projects").join(mangled)
 }
@@ -110,6 +165,17 @@ fn claude_session_ids(cwd: &Path, home: &Path) -> Vec<(String, SystemTime)> {
 }
 
 fn codex_session_ids(cwd: &Path, home: &Path) -> Vec<(String, SystemTime)> {
+    codex_session_files(cwd, home)
+        .into_iter()
+        .filter_map(|(path, mtime)| codex_session_meta(&path).map(|(id, _)| (id, mtime)))
+        .collect()
+}
+
+/// Every Codex rollout file whose `session_meta.cwd` matches `cwd`, with its
+/// mtime. Codex nests rollouts under `~/.codex/sessions/<Y>/<M>/<D>/` and stamps
+/// the worktree in the leading `session_meta` line, so we walk the tree and read
+/// each file's first line to match (mirrors [`codex_session_meta`]).
+fn codex_session_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, SystemTime)> {
     let root = home.join(".codex").join("sessions");
     let target = cwd.to_string_lossy();
     let mut out = Vec::new();
@@ -130,10 +196,10 @@ fn codex_session_ids(cwd: &Path, home: &Path) -> Vec<(String, SystemTime)> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some((id, session_cwd)) = codex_session_meta(&path) {
+            if let Some((_, session_cwd)) = codex_session_meta(&path) {
                 if session_cwd == target {
                     if let Ok(mtime) = meta.modified() {
-                        out.push((id, mtime));
+                        out.push((path, mtime));
                     }
                 }
             }
@@ -341,6 +407,44 @@ mod tests {
             ids,
             vec!["019f378e-76e9-7de3-a1db-41a027b7b719".to_string()]
         );
+    }
+
+    #[test]
+    fn newest_session_path_locates_claude_and_codex() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/home/u/wt");
+
+        // Claude: newest .jsonl under the mangled project dir.
+        let claude_dir = home.path().join(".claude/projects/-home-u-wt");
+        touch(
+            &claude_dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+            "{}\n",
+        );
+        let (path, fmt) = newest_session_path("claude", cwd, home.path()).unwrap();
+        assert_eq!(fmt, SessionFormat::Claude);
+        assert!(path.ends_with("11111111-1111-1111-1111-111111111111.jsonl"));
+
+        // Codex: the rollout file whose session_meta.cwd matches, newest wins.
+        let sessions = home.path().join(".codex/sessions/2026/07/18");
+        touch(
+            &sessions.join("rollout-old-019f378e-76e9-7de3-a1db-41a027b7b719.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"019f378e-76e9-7de3-a1db-41a027b7b719\",\"cwd\":\"/home/u/wt\"}}\n",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        touch(
+            &sessions.join("rollout-new-019f4ce2-7973-73c1-add9-840090982b86.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"019f4ce2-7973-73c1-add9-840090982b86\",\"cwd\":\"/home/u/wt\"}}\n",
+        );
+        let (path, fmt) = newest_session_path("codex", cwd, home.path()).unwrap();
+        assert_eq!(fmt, SessionFormat::Codex);
+        assert!(
+            path.ends_with("rollout-new-019f4ce2-7973-73c1-add9-840090982b86.jsonl"),
+            "newest rollout by mtime, got {path:?}"
+        );
+
+        // OpenCode (and unknown agents) have no tailable file → None.
+        assert!(newest_session_path("opencode", cwd, home.path()).is_none());
+        assert!(newest_session_path("codex", std::path::Path::new("/nope"), home.path()).is_none());
     }
 
     #[test]

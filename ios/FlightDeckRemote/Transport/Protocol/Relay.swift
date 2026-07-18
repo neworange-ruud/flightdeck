@@ -42,7 +42,22 @@ extension Wire {
         case peerUnavailable = "peer_unavailable"
         case rateLimited = "rate_limited"
         case badFrame = "bad_frame"
+        /// The sender's envelope `seq` diverged from the relay's expected next
+        /// value — usually the relay lost its in-memory watermark across a
+        /// restart while we kept our persisted cursor. Unlike `badFrame` this is
+        /// recoverable: the endpoint re-syncs its stream (restart from seq 1)
+        /// instead of tearing the link down (remote-control-bbf).
+        case seqViolation = "seq_violation"
         case internalError = "internal"
+        /// A code this build does not recognize — a newer relay sent a code added
+        /// after this app shipped. Decoding maps unknown wire values here so an
+        /// error frame never fails to parse; treated as a non-fatal advisory.
+        case unknown
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = RelayErrorCode(rawValue: raw) ?? .unknown
+        }
     }
 
     // MARK: - Structs

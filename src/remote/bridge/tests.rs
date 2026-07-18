@@ -5,7 +5,29 @@ use crate::testing::FakePty;
 use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::relay::EncryptedEnvelope;
-use flightdeck_remote_protocol::{CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role};
+use flightdeck_remote_protocol::{
+    CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role, TranscriptItem,
+};
+
+use std::io::Write as _;
+
+/// Seed a Claude session JSONL for a tab whose worktree resolves to
+/// `worktree_abs` (`<repo_root>/worktrees/<name>`; `repo_root` is `/repo` in
+/// `app_with_tabs`), placed under a temp `home` at the path
+/// `newest_session_path` locates. Hand `home` to `set_transcript_home`.
+fn seed_claude_session(home: &std::path::Path, worktree_abs: &str, lines: &[&str]) {
+    let mangled: String = worktree_abs
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let dir = home.join(".claude").join("projects").join(mangled);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f =
+        std::fs::File::create(dir.join("11111111-1111-1111-1111-111111111111.jsonl")).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
 
 // --- fixtures --------------------------------------------------------------
 
@@ -220,12 +242,20 @@ fn grace_window_suppresses_events() {
 
 #[test]
 fn needs_input_populates_pending_question() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"May I run the installer script?"}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
     let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     set_status(&mut app, 0, InterpretedStatus::Working);
     let cache = GitStatusCache::new();
-    // Tee some agent output that will become the preview.
-    b.tee_primary("t1", b"May I run the installer script?\n", 1_000);
+    // Sync the session file so the agent's last prose becomes the preview.
     {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
@@ -250,14 +280,22 @@ fn needs_input_populates_pending_question() {
         .contains("installer script"));
 }
 
-// --- transcript tee + append -----------------------------------------------
+// --- transcript reconstruction from the session file -----------------------
 
 #[test]
-fn teed_bytes_flush_as_transcript_append() {
+fn session_file_flushes_as_transcript_append() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Hello from the agent."}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
-    let app = app_with_tabs(vec![]);
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     let cache = GitStatusCache::new();
-    b.tee_primary("t1", b"Hello from the agent.\n\n", 1_000);
     let views = vec![view("proj", &app, &cache)];
     let msgs = collect(&mut b, &views, 1_000);
     let feed = msgs
@@ -268,7 +306,10 @@ fn teed_bytes_flush_as_transcript_append() {
         })
         .expect("transcript append");
     assert_eq!(feed.session_id.as_str(), "t1");
-    assert!(!feed.items.is_empty());
+    assert!(feed
+        .items
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::AgentMessage { text, .. } if text == "Hello from the agent.")));
 }
 
 // --- inbound request handling ----------------------------------------------
@@ -312,10 +353,18 @@ fn request_snapshot_command_forces_snapshot() {
 
 #[test]
 fn request_transcript_command_returns_feed() {
+    let home = tempfile::tempdir().unwrap();
+    seed_claude_session(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"some prior output"}]}}"#,
+        ],
+    );
     let mut b = paired_bridge();
-    let app = app_with_tabs(vec![]);
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     let cache = GitStatusCache::new();
-    b.tee_primary("t1", b"some prior output line\n\n", 1_000);
     {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
@@ -373,4 +422,143 @@ fn seal_open_round_trip_preserves_message() {
     let plain = open(1, Role::Desktop, 0, &nonce, &ciphertext).unwrap();
     let round: DesktopToPhone = serde_json::from_slice(&plain).unwrap();
     assert_eq!(round, msg);
+}
+
+// --- outbound seq continuity across channel re-derivation (bbf) -------------
+
+/// Collect the raw outbound envelopes a tick produces (seq intact).
+fn collect_raw<'a>(
+    b: &mut RemoteBridge,
+    views: &[ProjectView<'a>],
+    now_ms: u64,
+) -> Vec<RemoteOutbound> {
+    let mut raw = Vec::new();
+    b.tick(views, now_ms, &mut |o| raw.push(o));
+    raw
+}
+
+fn seq_of(o: &RemoteOutbound) -> u64 {
+    match o {
+        RemoteOutbound::SendEnvelope { seq, .. } => *seq,
+        other => panic!("expected SendEnvelope, got {other:?}"),
+    }
+}
+
+/// Re-deriving the E2E channel for the SAME, already-active pairing (a repeat
+/// `pairing_claimed`, or the startup go-live) must NOT rewind the outbound seq:
+/// the phone only reset its receive cursor on a genuine first claim, so a rewind
+/// would make it drop every "duplicate" seq and stall the feed (remote-control-bbf).
+#[test]
+fn install_channel_floors_outbound_seq() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    let high = first.iter().map(seq_of).max().expect("first tick emits");
+    assert!(high >= 1);
+
+    // Re-derive the channel for the same pairing, passing a stale resume-from of
+    // 0 (as the runtime `pairing_claimed` path does). The floor must hold.
+    b.install_channel(passthrough_seal(), passthrough_open(), 0);
+    // Re-confirming the same pairing asks for a fresh snapshot without rewinding.
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let second = collect_raw(&mut b, &views, 2_000);
+    let next = second.iter().map(seq_of).min().expect("second tick emits");
+    assert_eq!(
+        next,
+        high + 1,
+        "outbound seq must keep ascending across a same-pairing re-derivation, not reset"
+    );
+}
+
+/// Switching to a genuinely DIFFERENT pairing (a new peer with a fresh receive
+/// cursor at 0) restarts the outbound stream from seq 1.
+#[test]
+fn switching_pairing_restarts_outbound_seq() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    assert!(first.iter().map(seq_of).max().unwrap() >= 1);
+
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-2"),
+        peer_device_id: None,
+    });
+    let second = collect_raw(&mut b, &views, 2_000);
+    assert_eq!(
+        seq_of(&second[0]),
+        1,
+        "a new pairing's first envelope must be seq 1"
+    );
+}
+
+/// A `SeqResync` (the relay rejected our outbound seq after losing its watermark)
+/// restarts the active pairing's outbound stream from seq 1 with a fresh full
+/// snapshot, so a restarted relay accepts it and the phone re-syncs.
+#[test]
+fn seq_resync_restarts_stream_from_seq_1_with_snapshot() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let first = collect_raw(&mut b, &views, 1_000);
+    assert!(first.iter().map(seq_of).max().unwrap() >= 1);
+
+    b.handle_inbound(RemoteInbound::SeqResync {
+        pairing_id: PairingId::new("pair-1"),
+    });
+    let after = collect_raw(&mut b, &views, 2_000);
+    assert_eq!(
+        seq_of(&after[0]),
+        1,
+        "resynced stream restarts gaplessly from seq 1"
+    );
+    assert!(
+        matches!(decode(&after[0]), DesktopToPhone::Snapshot(_)),
+        "the resynced stream must lead with a fresh full snapshot"
+    );
+}
+
+/// A `SeqResync` for a *different* pairing than the active one is ignored (no
+/// spurious rewind of the live stream).
+#[test]
+fn seq_resync_for_other_pairing_is_ignored() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let high = collect_raw(&mut b, &views, 1_000)
+        .iter()
+        .map(seq_of)
+        .max()
+        .unwrap();
+
+    b.handle_inbound(RemoteInbound::SeqResync {
+        pairing_id: PairingId::new("other-pairing"),
+    });
+    // Trigger another send; seq must keep ascending (no reset).
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let next = collect_raw(&mut b, &views, 2_000)
+        .iter()
+        .map(seq_of)
+        .min()
+        .unwrap();
+    assert_eq!(
+        next,
+        high + 1,
+        "an unrelated resync must not rewind the stream"
+    );
 }

@@ -21,10 +21,12 @@
 //! be tested end to end. Sealed bytes leave as [`RemoteOutbound::SendEnvelope`].
 //!
 //! When no pairing is active the bridge does no sending and produces no
-//! messages — but PTY bytes teed via [`RemoteBridge::tee_primary`] still build
-//! the transcript, so a phone that pairs later gets a populated history.
+//! messages — but the transcript is still reconstructed each tick from the
+//! agent's session file via [`RemoteBridge::sync_transcript`], so a phone that
+//! pairs later gets a populated history.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -108,6 +110,11 @@ pub struct RemoteBridge {
     shells: ShellManager,
     seal: SealFn,
     open: OpenFn,
+    /// The user's home directory, used to locate each session's agent JSONL for
+    /// transcript reconstruction (remote-control-72k). `None` disables it (tests
+    /// and any environment where the home dir is unknown), so the transcript
+    /// simply stays empty rather than the bridge guessing a path.
+    home: Option<std::path::PathBuf>,
     /// Highest outbound envelope `seq` this bridge has assigned. The next
     /// envelope uses `out_seq + 1` (envelopes start at 1). The bridge is the
     /// sole producer of outbound envelopes for a pairing, so it owns the counter
@@ -138,8 +145,16 @@ impl RemoteBridge {
             shells: ShellManager::new(),
             seal,
             open,
+            home: None,
             out_seq: 0,
         }
+    }
+
+    /// Set the home directory used to locate agent session files for transcript
+    /// reconstruction (remote-control-72k). Called once at startup from `lib.rs`
+    /// with the resolved user home; unset leaves transcripts empty.
+    pub fn set_transcript_home(&mut self, home: Option<std::path::PathBuf>) {
+        self.home = home;
     }
 
     /// A bridge using the no-crypto [`passthrough_seal`]/[`passthrough_open`].
@@ -157,7 +172,15 @@ impl RemoteBridge {
     pub fn install_channel(&mut self, seal: SealFn, open: OpenFn, resume_from_seq: u64) {
         self.seal = seal;
         self.open = open;
-        self.out_seq = resume_from_seq;
+        // Floor, never regress: installing a channel for an *already-active*
+        // pairing (a repeat `pairing_claimed`, or a mid-session re-derivation)
+        // must not rewind the outbound counter below what we have already sent,
+        // or the phone — which only reset its receive cursor on a genuine first
+        // claim, not on a resume — would silently drop every "duplicate" seq and
+        // the feed would stall (remote-control-bbf). A genuinely new pairing
+        // resets `out_seq` to 0 in `handle_inbound` (on the pairing-id change) or
+        // via `reset_to_passthrough` (on unpair), so the max here is 0-vs-0 there.
+        self.out_seq = self.out_seq.max(resume_from_seq);
     }
 
     /// Revert to the no-crypto passthrough and forget the active pairing — used
@@ -193,15 +216,24 @@ impl RemoteBridge {
             .pump(&SessionId::new(session_id), child_index, bytes);
     }
 
-    /// Tee a chunk of a session's primary-terminal PTY bytes into its transcript
-    /// builder. Cheap and always safe to call; builds history even before a
-    /// phone pairs.
-    pub fn tee_primary(&mut self, session_id: &str, bytes: &[u8], at_ms: i64) {
+    /// Reconstruct a session's transcript from the agent's own conversation
+    /// store, ingesting anything written since the last call. Cheap and always
+    /// safe; builds history even before a phone pairs. A no-op when the home dir
+    /// is unset or the agent has no locatable store (an OpenCode agent on Windows,
+    /// an unknown agent, or before the agent has written its first record).
+    /// Called each tick with the session's `agent` kind and absolute `worktree`.
+    pub fn sync_transcript(&mut self, session_id: &str, agent: &str, worktree: &Path, now_ms: i64) {
+        let Some(home) = self.home.clone() else {
+            return;
+        };
+        let Some(source) = crate::remote::transcript::resolve_source(agent, worktree, &home) else {
+            return;
+        };
         let sid = SessionId::new(session_id);
         self.transcripts
             .entry(sid.clone())
             .or_insert_with(|| TranscriptBuilder::new(sid))
-            .push_bytes(bytes, at_ms);
+            .sync(&source, now_ms);
     }
 
     /// Handle one inbound relay event. Link/presence changes that mark a pairing
@@ -213,8 +245,26 @@ impl RemoteBridge {
         match msg {
             RemoteInbound::Paired { pairing_id, .. }
             | RemoteInbound::PairingClaimed { pairing_id, .. } => {
+                // Switching to a *different* pairing than the one we were feeding
+                // means a new peer with a fresh receive cursor at 0 — restart the
+                // outbound stream from seq 1. Re-confirming the SAME pairing (a
+                // resume, or a repeat claim) must NOT rewind `out_seq`, so the
+                // phone's resumed cursor keeps matching (remote-control-bbf).
+                if self.pairing.is_some() && self.pairing.as_ref() != Some(&pairing_id) {
+                    self.out_seq = 0;
+                }
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
+            }
+            // The relay lost our outbound seq watermark (restart/redeploy) and
+            // rejected an envelope as non-monotonic. Restart this pairing's
+            // outbound stream from seq 1 with a fresh full snapshot so a fresh
+            // relay accepts it and the phone re-syncs (remote-control-bbf).
+            RemoteInbound::SeqResync { pairing_id } => {
+                if self.pairing.as_ref() == Some(&pairing_id) {
+                    self.out_seq = 0;
+                    self.snapshot_needed = true;
+                }
             }
             // The offer (code shown) does not itself activate a pairing for the
             // outbound feed — the phone has not joined yet. Handled by the
@@ -306,6 +356,13 @@ impl RemoteBridge {
         for pv in projects {
             for tab in pv.state.tabs.iter() {
                 let sid = SessionId::new(&tab.meta.id);
+
+                // Reconstruct the transcript from the agent's session file. Done
+                // here, before the pairing gate below, so a phone that pairs
+                // later still receives the accumulated history (remote-control-72k).
+                let worktree = pv.state.repo_root.join(&tab.meta.worktree_path_relative);
+                self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_ms as i64);
+
                 let ds = tab.display_status(now_ms);
                 let interpreted = ds.interpreted;
                 let status = feed::agent_status(ds);
@@ -401,16 +458,22 @@ impl RemoteBridge {
             self.send_msg(DesktopToPhone::TranscriptAppend(feed), sent_at, send);
         }
 
-        // Answer transcript requests.
+        // Answer transcript requests. Always reply so the phone is never left
+        // hanging: when no session file has been reconstructed for this session
+        // (e.g. the agent has not written its log yet), send an empty full-load
+        // feed rather than silently dropping the request.
         let requests = std::mem::take(&mut self.pending_transcript_requests);
         for (sid, from_index) in requests {
-            if let Some(builder) = self.transcripts.get(&sid) {
-                self.send_msg(
-                    DesktopToPhone::Transcript(builder.load(from_index)),
-                    sent_at,
-                    send,
-                );
-            }
+            let feed = match self.transcripts.get(&sid) {
+                Some(builder) => builder.load(from_index),
+                None => flightdeck_remote_protocol::TranscriptFeed {
+                    session_id: sid.clone(),
+                    from_index: from_index.unwrap_or(0),
+                    replace: true,
+                    items: Vec::new(),
+                },
+            };
+            self.send_msg(DesktopToPhone::Transcript(feed), sent_at, send);
         }
 
         // Flush remote-shell output/lifecycle messages queued since the last
@@ -508,6 +571,12 @@ impl RemoteBridge {
         let seq = self.out_seq + 1;
         if let Some((nonce, ciphertext)) = (self.seal)(&bytes, seq, now_ms) {
             self.out_seq = seq;
+            crate::remote::debuglog::log(&format!(
+                "bridge SEAL {} pairing={} seq={}",
+                msg_kind(&msg),
+                pairing_id.as_str(),
+                seq
+            ));
             send(RemoteOutbound::SendEnvelope {
                 pairing_id,
                 seq,
@@ -516,6 +585,22 @@ impl RemoteBridge {
                 ciphertext,
             });
         }
+    }
+}
+
+/// A short label for a [`DesktopToPhone`] variant, for the diagnostic log.
+fn msg_kind(msg: &DesktopToPhone) -> &'static str {
+    match msg {
+        DesktopToPhone::Snapshot(_) => "snapshot",
+        DesktopToPhone::StatusUpdate(_) => "status_update",
+        DesktopToPhone::Rollup(_) => "rollup",
+        DesktopToPhone::Transcript(_) => "transcript",
+        DesktopToPhone::TranscriptAppend(_) => "transcript_append",
+        DesktopToPhone::Event(_) => "event",
+        DesktopToPhone::GitStatus(_) => "git_status",
+        DesktopToPhone::ShellOutput(_) => "shell_output",
+        DesktopToPhone::ShellEvent(_) => "shell_event",
+        DesktopToPhone::CommandAck(_) => "command_ack",
     }
 }
 

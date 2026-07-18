@@ -8,7 +8,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **FlightDeck Remote: Codex and OpenCode chats now reconstruct on the phone.**
+  The remote transcript understood only Claude Code's session format, so Codex
+  and OpenCode agents' mobile chats stayed empty. Codex is now parsed from its
+  rollout session log (user prompts and assistant replies from its `event_msg`
+  stream, tool activity like shell commands and patches from its `response_item`
+  stream). OpenCode — which moved its conversation into a live SQLite database —
+  is now read directly from that database, streaming user prompts, assistant
+  prose, and tool activity (reads, edits, searches, commands, skills, and MCP
+  tools) as they happen. Both mirror the Claude experience. (OpenCode
+  reconstruction is a macOS/Linux desktop feature; on Windows its chat stays
+  empty, matching how the relay's secure connection is already non-Windows.)
 
 ### Improvements
 
@@ -16,9 +26,35 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
-
-## [1.8.0] - 2026-07-17
+- **FlightDeck Remote: the agent's replies now actually appear in the phone
+  chat.** The remote transcript was reconstructed by scraping the agent's raw
+  terminal output, but the coding agents (Claude Code, Codex, OpenCode) paint a
+  full-screen UI on the alternate screen and almost never emit plain lines — so
+  the reconstruction produced nothing and the chat stayed empty even though the
+  agent was replying and every message was being delivered to the phone. The
+  transcript is now rebuilt from the agent's own structured session log (the
+  same file FlightDeck already uses to resume a session), so user prompts,
+  assistant prose, and tool activity stream to the phone as they happen.
+  (Claude Code, Codex, and OpenCode are all supported.)
+- **FlightDeck Remote: agent feedback now keeps reaching the phone across relay
+  restarts.** The hosted relay tracks a per-pairing message sequence number in
+  memory only, so a restart/redeploy reset it while the desktop and phone kept
+  their persisted cursors. The desktop's next message was then rejected as
+  out-of-sequence and the desktop reconnected into the same rejection forever —
+  the phone would send a prompt, watch the agent run on the desktop, but never
+  receive any of the agent's replies. The relay now reports this divergence with
+  a dedicated, recoverable `seq_violation` (instead of a fatal error), and both
+  ends re-sync automatically: the desktop restarts its outbound stream with a
+  fresh snapshot, and the phone accepts the reset instead of discarding it as a
+  duplicate. Re-deriving the encrypted channel for an already-paired phone also
+  no longer rewinds the sequence number, which could stall delivery the same way.
+- **FlightDeck Remote: transcript requests always get an answer.** When the
+  phone asked for a session's transcript before the agent's session file existed,
+  the desktop silently dropped the request and the phone waited forever; it now
+  replies with an empty transcript so the phone can render and catch up as
+  history streams in. Claude session-file lookup also folds Windows path
+  separators, so reconstruction resolves the right project directory on Windows
+  as well as macOS/Linux.
 
 ### New features
 

@@ -33,9 +33,11 @@ pub mod bridge;
 pub mod client;
 pub mod commands;
 pub mod crypto;
+pub mod debuglog;
 pub mod feed;
 pub mod identity;
 pub mod notifier;
+pub mod opencode;
 pub mod pairing;
 pub mod shell;
 pub mod state;
@@ -110,6 +112,19 @@ pub enum RemoteInbound {
     PairingRejected {
         /// The pairing ids that were dropped from persisted state.
         pairing_ids: Vec<PairingId>,
+    },
+    /// The relay rejected an outbound envelope with `seq_violation`: our outbound
+    /// cursor is ahead of the relay's expected next `seq`, almost always because
+    /// the relay lost its in-memory per-pairing watermark across a restart while
+    /// we kept our persisted one (remote-control-bbf). The client has already
+    /// reset this pairing's persisted `last_sent_seq` to 0; the outbound bridge
+    /// must reset its live `out_seq` to 0 and re-send a full snapshot so the
+    /// stream restarts gaplessly from `seq = 1` (which a fresh relay accepts, and
+    /// which the phone treats as an explicit stream reset). Recovering this way
+    /// avoids the infinite fatal-reconnect loop the rejection used to cause.
+    SeqResync {
+        /// The pairing whose outbound stream must restart from `seq = 1`.
+        pairing_id: PairingId,
     },
 }
 

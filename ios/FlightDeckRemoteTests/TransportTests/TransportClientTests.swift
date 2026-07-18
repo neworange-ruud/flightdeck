@@ -249,6 +249,117 @@ import CryptoKit
         await client.stop()
     }
 
+    // MARK: - Relay-restart seq recovery (remote-control-bbf)
+
+    /// The relay lost its per-pairing seq state (restart/redeploy) and the desktop
+    /// restarts its outbound stream from seq 1. The phone already holds a higher
+    /// receive cursor, but must accept the reset instead of dropping seq 1 as a
+    /// duplicate — otherwise the recovered agent feed never reaches the screen.
+    @Test func acceptsDesktopStreamResetAfterRelayRestart() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain, lastReceivedSeq: 5)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Desktop restarts its stream from seq 1 while our cursor is 5.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await channel.push(peer.envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntil { collector.messages.contains { if case .snapshot = $0 { return true }; return false } }
+        #expect(collector.messages.contains { if case .snapshot = $0 { return true }; return false })
+
+        // The following seq 2 continues normally — proving the cursor reset to 1.
+        let event = Wire.AgentEvent(
+            eventId: Wire.EventId("e1"),
+            kind: .finished(summary: "done", filesChanged: 0, readyToPush: false),
+            deepLink: Wire.DeepLink(projectId: Wire.ProjectId("p"), sessionId: Wire.SessionId("s"), itemId: nil),
+            occurredAtMs: 1,
+            title: "t"
+        )
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 2))
+        _ = await waitUntil { collector.messages.count == 2 }
+        #expect(collector.messages.count == 2)
+
+        // It acked the reset stream at cursor 1.
+        let acks = await channel.sentFrames().compactMap { f -> UInt64? in
+            if case let .ack(_, c) = f { return c }; return nil
+        }
+        #expect(acks.contains(1))
+        await client.stop()
+    }
+
+    /// After a relay restart the phone's own outbound command seq is ahead of the
+    /// fresh relay, which rejects it with `seq_violation`. The client must NOT
+    /// tear the link down; it re-syncs its outbound cursor so the next command
+    /// restarts at seq 1 (which a fresh relay accepts).
+    @Test func resyncsOutboundCursorOnSeqViolation() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain, lastSentSeq: 5)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .seconds(30)
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // First command goes out at seq 6 (persisted lastSentSeq 5). The fresh
+        // relay rejects it as non-monotonic.
+        let id1 = Wire.CommandId("cmd_1")
+        await client.send(Wire.PhoneCommand(commandId: id1, issuedAtMs: 1,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "a")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 6 }; return false
+            }
+        }
+        try await channel.push(.error(code: .seqViolation,
+                                      message: "envelope seq is not gapless/monotonic",
+                                      pairingId: Wire.PairingId("pair_test_1")))
+
+        // The cursor re-syncs to 0 (recovery), and the link stays up.
+        _ = await waitUntil { (try? recordStore.load())?.lastSentSeq == 0 }
+        #expect((try? recordStore.load())?.lastSentSeq == 0)
+        #expect(await client.currentLinkState() != .disconnected)
+
+        // The next command restarts the outbound stream at seq 1.
+        let id2 = Wire.CommandId("cmd_2")
+        await client.send(Wire.PhoneCommand(commandId: id2, issuedAtMs: 2,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "b")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
+            }
+        }
+        let restarted = await channel.sentFrames().contains {
+            if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
+        }
+        #expect(restarted)
+        await client.stop()
+    }
+
     // MARK: - No pairing → stays disconnected
 
     @Test func withNoPairingRecordStaysDisconnected() async throws {
