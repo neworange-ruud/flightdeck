@@ -104,6 +104,17 @@ tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 # `tungstenite` above: on non-Windows the socket gains rustls with the webpki
 # root store; on Windows only plain `ws://` is available (localhost dev + tests).
 tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# OpenCode moved its conversation store from per-message JSON files to a single
+# live SQLite DB (`~/.local/share/opencode/opencode.db`, WAL mode). Rebuilding an
+# OpenCode agent's remote chat means reading that DB (remote-control-fyj), and
+# correct reads of a *live WAL* database need real SQLite (recent writes live in
+# the `-wal` sidecar, which a naive file reader would miss). `bundled` compiles
+# SQLite from source (JSON1 included) — no system libsqlite3 requirement. Windows
+# is excluded, like the TLS/self-update C stack above, to keep the released
+# windows-msvc binary pure-Rust; OpenCode transcript reconstruction is therefore
+# a non-Windows desktop feature (on Windows the chat stays empty, as before). We
+# open the DB READ-ONLY and never write to it (see src/remote/opencode.rs).
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # POSIX-only: shutdown-signal handling (run teardown on SIGTERM/SIGINT) and the
 # raw kill(2)/killpg used for graceful, process-group agent termination.

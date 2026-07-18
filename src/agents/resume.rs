@@ -48,10 +48,10 @@ pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(Strin
 /// the alt-screen, so scraping the PTY yields nothing; the session file is the
 /// authoritative conversation (remote-control-72k).
 ///
-/// Understands **Claude Code** and **Codex**. OpenCode moved its conversation
-/// into a live SQLite DB (no longer a tailable file), so it returns `None` and
-/// is a follow-up (remote-control-fyj) — the remote simply shows no
-/// reconstructed transcript rather than a wrong one.
+/// Understands **Claude Code** and **Codex**, both of which append a JSONL
+/// file. OpenCode keeps its conversation in a live SQLite DB (no tailable file),
+/// so it returns `None` here and is resolved separately by
+/// [`crate::remote::transcript::resolve_source`].
 pub fn newest_session_path(
     agent_key: &str,
     cwd: &Path,

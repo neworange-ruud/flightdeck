@@ -8,13 +8,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- **FlightDeck Remote: Codex chats now reconstruct on the phone.** The remote
-  transcript understood only Claude Code's session format, so a Codex agent's
-  mobile chat stayed empty. It now parses Codex's rollout session log — user
-  prompts and assistant replies (from its `event_msg` stream) and tool activity
-  like shell commands and patches (from its `response_item` stream) — and streams
-  new turns live, mirroring the Claude experience. (OpenCode, which moved its
-  conversation into a live SQLite database, is a separate follow-up.)
+- **FlightDeck Remote: Codex and OpenCode chats now reconstruct on the phone.**
+  The remote transcript understood only Claude Code's session format, so Codex
+  and OpenCode agents' mobile chats stayed empty. Codex is now parsed from its
+  rollout session log (user prompts and assistant replies from its `event_msg`
+  stream, tool activity like shell commands and patches from its `response_item`
+  stream). OpenCode — which moved its conversation into a live SQLite database —
+  is now read directly from that database, streaming user prompts, assistant
+  prose, and tool activity (reads, edits, searches, commands, skills, and MCP
+  tools) as they happen. Both mirror the Claude experience. (OpenCode
+  reconstruction is a macOS/Linux desktop feature; on Windows its chat stays
+  empty, matching how the relay's secure connection is already non-Windows.)
 
 ### Improvements
 
@@ -31,7 +35,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   transcript is now rebuilt from the agent's own structured session log (the
   same file FlightDeck already uses to resume a session), so user prompts,
   assistant prose, and tool activity stream to the phone as they happen.
-  (Claude Code and Codex are supported; OpenCode's session format is a follow-up.)
+  (Claude Code, Codex, and OpenCode are all supported.)
 - **FlightDeck Remote: agent feedback now keeps reaching the phone across relay
   restarts.** The hosted relay tracks a per-pairing message sequence number in
   memory only, so a restart/redeploy reset it while the desktop and phone kept

@@ -26,13 +26,16 @@
 //! stopped for input, and we synthesize an inline
 //! [`TranscriptItem::PermissionPrompt`] whose preview is the agent's last prose.
 //!
-//! Two record schemas are understood, dispatched by [`SessionFormat`]:
-//! **Claude Code** (`type=user|assistant`, `message.content` blocks) and
-//! **Codex** (`event_msg` prose + `response_item` `function_call` tool activity).
-//! OpenCode keeps its conversation in a live SQLite DB rather than a tailable
-//! file, so [`crate::agents::resume`] returns no path for it and its chat shows
-//! no reconstructed transcript (a follow-up, remote-control-fyj — not a wrong
-//! transcript).
+//! Three agents are supported, resolved by [`resolve_source`]:
+//! * **Claude Code** — JSONL file, `type=user|assistant`, `message.content`
+//!   blocks (tailed by byte offset, [`SessionFormat::Claude`]).
+//! * **Codex** — JSONL file, `event_msg` prose + `response_item` tool activity
+//!   ([`SessionFormat::Codex`]).
+//! * **OpenCode** — a live SQLite DB rather than a tailable file, polled by
+//!   session id ([`crate::remote::opencode`]); its rows mutate as the assistant
+//!   streams, so a part is emitted only once final. The DB layer is compiled off
+//!   Windows only, so on Windows an OpenCode chat shows no reconstructed
+//!   transcript (as before).
 //!
 //! Memory is capped to [`MAX_ITEMS`] most-recent items (a ring); pagination
 //! honours the protocol's `from_index`.
@@ -55,6 +58,40 @@ pub const MAX_ITEMS: usize = 500;
 /// Max characters in a needs-input preview.
 const PREVIEW_CAP: usize = 280;
 
+/// Where an agent's conversation is read from. Claude and Codex append a JSONL
+/// session *file* that is tailed by byte offset; OpenCode keeps its conversation
+/// in a live SQLite DB that is polled by session id.
+#[derive(Debug, Clone)]
+pub enum TranscriptSource {
+    /// A tailable JSONL session file and the schema to parse it as.
+    Jsonl {
+        path: PathBuf,
+        format: SessionFormat,
+    },
+    /// OpenCode's SQLite DB and the tab's worktree (its session's `directory`).
+    OpenCode { db: PathBuf, directory: String },
+}
+
+/// Resolve where `agent`'s conversation for `cwd` lives (store rooted at
+/// `home`), or `None` if there is nothing to read yet. Claude/Codex resolve to a
+/// JSONL file via [`crate::agents::resume`]; OpenCode resolves to its SQLite DB
+/// (remote-control-fyj) when that DB exists.
+pub fn resolve_source(agent: &str, cwd: &Path, home: &Path) -> Option<TranscriptSource> {
+    if let Some((path, format)) = crate::agents::resume::newest_session_path(agent, cwd, home) {
+        return Some(TranscriptSource::Jsonl { path, format });
+    }
+    if agent == "opencode" {
+        let db = crate::remote::opencode::db_path(home);
+        if db.exists() {
+            return Some(TranscriptSource::OpenCode {
+                db,
+                directory: cwd.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    None
+}
+
 /// Reconstructs one session's cleaned transcript by tailing its agent session
 /// JSONL and translating each record into a [`TranscriptItem`].
 pub struct TranscriptBuilder {
@@ -64,6 +101,9 @@ pub struct TranscriptBuilder {
     format: SessionFormat,
     /// The session file currently being tailed (set on first successful sync).
     source: Option<PathBuf>,
+    /// For OpenCode sessions (DB-backed, no tailable file): the session id
+    /// currently being polled, so a new conversation in the worktree resets.
+    oc_session: Option<String>,
     /// Byte offset up to which `source` has been consumed (only whole lines).
     read_offset: u64,
     /// Record uuids already ingested, so a re-read never double-appends.
@@ -88,6 +128,7 @@ impl TranscriptBuilder {
             session_id,
             format: SessionFormat::Claude,
             source: None,
+            oc_session: None,
             read_offset: 0,
             seen: HashSet::new(),
             last_agent_text: None,
@@ -96,6 +137,42 @@ impl TranscriptBuilder {
             total: 0,
             sent_upto: 0,
             prompt_seq: 0,
+        }
+    }
+
+    /// Ingest any new conversation from `source`, dispatching to the file-tail
+    /// (Claude/Codex) or DB-poll (OpenCode) path. Cheap and safe to call every
+    /// tick.
+    pub fn sync(&mut self, source: &TranscriptSource, now_ms: i64) {
+        match source {
+            TranscriptSource::Jsonl { path, format } => self.sync_jsonl(path, *format, now_ms),
+            TranscriptSource::OpenCode { db, directory } => {
+                self.sync_opencode(db, directory, now_ms)
+            }
+        }
+    }
+
+    /// Poll OpenCode's SQLite DB for the newest session in `directory` and ingest
+    /// any parts not yet seen. Unlike the append-only JSONL tail, OpenCode
+    /// mutates rows as the assistant streams, so a part is emitted only once it
+    /// is *final* (an assistant text part has `time.end`; a tool part has reached
+    /// `completed`/`error`) — an in-flight part is left unseen and retried next
+    /// tick. Dedup is by part id (rows are re-read every poll).
+    pub fn sync_opencode(&mut self, db: &Path, directory: &str, now_ms: i64) {
+        let Some(sid) = crate::remote::opencode::latest_session_id(db, directory) else {
+            return;
+        };
+        // A different session id means a new conversation in this worktree —
+        // start over so `load` replaces cleanly (mirrors the file-switch reset).
+        if self.oc_session.as_deref() != Some(sid.as_str()) {
+            self.oc_session = Some(sid.clone());
+            self.reset();
+        }
+        for part in crate::remote::opencode::fetch_parts(db, &sid) {
+            if self.seen.contains(&part.id) {
+                continue;
+            }
+            self.ingest_opencode(&part, now_ms);
         }
     }
 
@@ -341,6 +418,95 @@ impl TranscriptBuilder {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Translate one **OpenCode** `part` (already joined to its message role)
+    /// into 0+ transcript items. Marks the part `seen` once it is handled —
+    /// either emitted or permanently skipped — but leaves a not-yet-final part
+    /// unseen so a later poll re-checks it.
+    fn ingest_opencode(&mut self, part: &crate::remote::opencode::Part, now_ms: i64) {
+        let at_ms = if part.at_ms > 0 { part.at_ms } else { now_ms };
+        match part.data.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = part
+                    .data
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if part.role == "user" {
+                    // User prose is written whole (not streamed) — always final.
+                    if !text.is_empty() {
+                        let item_id = self.item_id(&part.id, 0);
+                        self.push_item(TranscriptItem::UserMessage {
+                            item_id,
+                            text,
+                            at_ms,
+                        });
+                    }
+                    self.seen.insert(part.id.clone());
+                } else {
+                    // Assistant prose streams token-by-token; wait for `time.end`.
+                    let finished = part
+                        .data
+                        .get("time")
+                        .and_then(|t| t.get("end"))
+                        .is_some_and(|v| !v.is_null());
+                    if !finished {
+                        return; // in-flight — retry on the next poll
+                    }
+                    if !text.is_empty() {
+                        self.last_agent_text = Some(text.clone());
+                        let item_id = self.item_id(&part.id, 0);
+                        self.push_item(TranscriptItem::AgentMessage {
+                            item_id,
+                            text,
+                            at_ms,
+                        });
+                    }
+                    self.seen.insert(part.id.clone());
+                }
+            }
+            Some("tool") => {
+                let status = part
+                    .data
+                    .get("state")
+                    .and_then(|s| s.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if status != "completed" && status != "error" {
+                    return; // pending/running — retry once the call settles
+                }
+                let tool = part
+                    .data
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let null = Value::Null;
+                let input = part
+                    .data
+                    .get("state")
+                    .and_then(|s| s.get("input"))
+                    .unwrap_or(&null);
+                let (summary, detail, body, kind) = opencode_tool_activity(tool, input);
+                let item_id = self.item_id(&part.id, 0);
+                self.push_item(TranscriptItem::Activity {
+                    item_id,
+                    summary,
+                    detail,
+                    body,
+                    kind,
+                    at_ms,
+                });
+                self.seen.insert(part.id.clone());
+            }
+            // reasoning, step-start/step-finish, patch, file, compaction, subtask
+            // and any future part type are not conversation items.
+            _ => {
+                self.seen.insert(part.id.clone());
+            }
         }
     }
 
@@ -637,6 +803,70 @@ fn codex_patch_file(patch: &str) -> Option<String> {
         }
         None
     })
+}
+
+/// Summarise an OpenCode `tool` part into `(summary, detail, body, kind)` for a
+/// collapsed activity pill. `input` is the tool's `state.input` object; OpenCode
+/// tool names are lowercase and MCP tools are `server_tool`-prefixed.
+fn opencode_tool_activity(
+    tool: &str,
+    input: &Value,
+) -> (String, Option<String>, Option<String>, ActivityKind) {
+    let s = |k: &str| input.get(k).and_then(Value::as_str);
+    match tool {
+        "bash" => {
+            let cmd = s("command").unwrap_or("");
+            let summary = s("description")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Ran {}", first_line(cmd)));
+            let body = (!cmd.is_empty()).then(|| cmd.to_string());
+            (summary, None, body, ActivityKind::Command)
+        }
+        "edit" | "write" | "patch" => (
+            format!("Edited {}", basename(s("filePath").unwrap_or(""))),
+            None,
+            None,
+            ActivityKind::Edit,
+        ),
+        "read" => (
+            format!("Read {}", basename(s("filePath").unwrap_or(""))),
+            None,
+            None,
+            ActivityKind::Search,
+        ),
+        "grep" | "glob" => (
+            format!("Searched {}", s("pattern").unwrap_or("")),
+            None,
+            None,
+            ActivityKind::Search,
+        ),
+        "webfetch" => (
+            format!("Fetched {}", s("url").unwrap_or("")),
+            None,
+            None,
+            ActivityKind::Search,
+        ),
+        "task" => (
+            format!("Task: {}", s("description").unwrap_or("subtask")),
+            None,
+            None,
+            ActivityKind::Other,
+        ),
+        "todowrite" => (
+            "Updated the task list".to_string(),
+            None,
+            None,
+            ActivityKind::Other,
+        ),
+        "skill" => (
+            format!("Skill: {}", s("name").unwrap_or("")),
+            None,
+            None,
+            ActivityKind::Other,
+        ),
+        // Built-in fallbacks and MCP tools (`server_tool`) show the tool name.
+        other => (other.to_string(), None, None, ActivityKind::Other),
+    }
 }
 
 /// The first non-empty line of `s`, trimmed (for a one-line command summary).

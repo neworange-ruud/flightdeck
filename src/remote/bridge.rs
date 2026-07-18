@@ -216,26 +216,24 @@ impl RemoteBridge {
             .pump(&SessionId::new(session_id), child_index, bytes);
     }
 
-    /// Reconstruct a session's transcript from its agent session file, tailing
-    /// any records written since the last call. Cheap and always safe; builds
-    /// history even before a phone pairs. A no-op when the home dir is unset or
-    /// the agent has no locatable session file (e.g. non-Claude agents in v1, or
-    /// before the agent has written its first record). Called each tick with the
-    /// session's `agent` kind and absolute `worktree` path.
+    /// Reconstruct a session's transcript from the agent's own conversation
+    /// store, ingesting anything written since the last call. Cheap and always
+    /// safe; builds history even before a phone pairs. A no-op when the home dir
+    /// is unset or the agent has no locatable store (an OpenCode agent on Windows,
+    /// an unknown agent, or before the agent has written its first record).
+    /// Called each tick with the session's `agent` kind and absolute `worktree`.
     pub fn sync_transcript(&mut self, session_id: &str, agent: &str, worktree: &Path, now_ms: i64) {
         let Some(home) = self.home.clone() else {
             return;
         };
-        let Some((path, format)) =
-            crate::agents::resume::newest_session_path(agent, worktree, &home)
-        else {
+        let Some(source) = crate::remote::transcript::resolve_source(agent, worktree, &home) else {
             return;
         };
         let sid = SessionId::new(session_id);
         self.transcripts
             .entry(sid.clone())
             .or_insert_with(|| TranscriptBuilder::new(sid))
-            .sync_jsonl(&path, format, now_ms);
+            .sync(&source, now_ms);
     }
 
     /// Handle one inbound relay event. Link/presence changes that mark a pairing

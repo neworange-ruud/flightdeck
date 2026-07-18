@@ -378,3 +378,199 @@ fn codex_tails_new_records_and_switching_format_resets() {
         vec!["agent:Here is the overview."]
     );
 }
+
+// --- OpenCode (SQLite-backed) format ----------------------------------------
+//
+// OpenCode's conversation lives in a live SQLite DB, joined into `Part` rows
+// (id, role, at_ms, data JSON). The DB/SQL layer is tested in
+// `remote::opencode::tests`; here we test the translation + streaming gating of
+// `ingest_opencode` directly with hand-built parts, and one end-to-end
+// `sync_opencode` against a temp DB.
+
+use crate::remote::opencode::Part;
+
+/// A `Part` with a fixed timestamp, `data` parsed from `json`.
+fn oc(id: &str, role: &str, json: &str) -> Part {
+    Part {
+        id: id.to_string(),
+        role: role.to_string(),
+        at_ms: 1000,
+        data: serde_json::from_str(json).unwrap(),
+    }
+}
+
+#[test]
+fn opencode_user_prose_and_final_assistant_prose() {
+    let mut b = builder();
+    b.ingest_opencode(
+        &oc(
+            "p1",
+            "user",
+            r#"{"type":"text","text":"Explain this repo"}"#,
+        ),
+        0,
+    );
+    b.ingest_opencode(
+        &oc(
+            "p2",
+            "assistant",
+            r#"{"type":"text","text":"Sure — here goes.","time":{"start":1,"end":2}}"#,
+        ),
+        0,
+    );
+    assert_eq!(
+        labels(&b.load(None)),
+        vec!["user:Explain this repo", "agent:Sure — here goes."]
+    );
+}
+
+#[test]
+fn opencode_defers_streaming_assistant_text_until_final() {
+    let mut b = builder();
+    let streaming = oc(
+        "p1",
+        "assistant",
+        r#"{"type":"text","text":"Read","time":{"start":1}}"#,
+    );
+    b.ingest_opencode(&streaming, 0);
+    assert_eq!(b.total(), 0, "no time.end yet → not emitted, left unseen");
+
+    // The same part, now finalized, is emitted on the next poll.
+    let done = oc(
+        "p1",
+        "assistant",
+        r#"{"type":"text","text":"Reading the code.","time":{"start":1,"end":9}}"#,
+    );
+    b.ingest_opencode(&done, 0);
+    assert_eq!(labels(&b.load(None)), vec!["agent:Reading the code."]);
+}
+
+#[test]
+fn opencode_tool_parts_map_to_pills() {
+    let mut b = builder();
+    let tool = |tool: &str, input: &str| {
+        format!(
+            r#"{{"type":"tool","tool":"{tool}","state":{{"status":"completed","input":{input}}}}}"#
+        )
+    };
+    let parts = [
+        (
+            "t1",
+            tool(
+                "bash",
+                r#"{"command":"cargo test","description":"Run the tests"}"#,
+            ),
+        ),
+        ("t2", tool("edit", r#"{"filePath":"/repo/src/main.rs"}"#)),
+        ("t3", tool("read", r#"{"filePath":"/repo/README.md"}"#)),
+        ("t4", tool("grep", r#"{"pattern":"TODO"}"#)),
+        ("t5", tool("webfetch", r#"{"url":"https://example.com"}"#)),
+        ("t6", tool("todowrite", r#"{"todos":[]}"#)),
+        ("t7", tool("skill", r#"{"name":"graphify"}"#)),
+        // An MCP tool (`server_tool`) has no special case → shows its name.
+        ("t8", tool("linear_get_issue", r#"{"id":"ENG-1"}"#)),
+    ];
+    for (id, data) in &parts {
+        b.ingest_opencode(&oc(id, "assistant", data), 0);
+    }
+    assert_eq!(
+        labels(&b.load(None)),
+        vec![
+            "act[Command]:Run the tests",
+            "act[Edit]:Edited main.rs",
+            "act[Search]:Read README.md",
+            "act[Search]:Searched TODO",
+            "act[Search]:Fetched https://example.com",
+            "act[Other]:Updated the task list",
+            "act[Other]:Skill: graphify",
+            "act[Other]:linear_get_issue",
+        ]
+    );
+}
+
+#[test]
+fn opencode_pending_tool_is_deferred_until_settled() {
+    let mut b = builder();
+    let running = oc(
+        "t1",
+        "assistant",
+        r#"{"type":"tool","tool":"bash","state":{"status":"running","input":{"command":"sleep 1"}}}"#,
+    );
+    b.ingest_opencode(&running, 0);
+    assert_eq!(b.total(), 0, "a running tool call is not shown yet");
+
+    let done = oc(
+        "t1",
+        "assistant",
+        r#"{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"sleep 1"}}}"#,
+    );
+    b.ingest_opencode(&done, 0);
+    assert_eq!(labels(&b.load(None)), vec!["act[Command]:Ran sleep 1"]);
+}
+
+#[test]
+fn opencode_skips_reasoning_steps_and_patches() {
+    let mut b = builder();
+    for json in [
+        r#"{"type":"reasoning","text":"thinking"}"#,
+        r#"{"type":"step-start"}"#,
+        r#"{"type":"step-finish"}"#,
+        r#"{"type":"patch","hash":"abc"}"#,
+        r#"{"type":"file","filename":"img.png"}"#,
+    ] {
+        b.ingest_opencode(&oc("x", "assistant", json), 0);
+    }
+    assert_eq!(b.total(), 0, "none of these are conversation items");
+}
+
+#[test]
+fn opencode_agent_prose_becomes_needs_input_preview() {
+    let mut b = builder();
+    b.ingest_opencode(
+        &oc(
+            "p1",
+            "assistant",
+            r#"{"type":"text","text":"Delete the file?","time":{"start":1,"end":2}}"#,
+        ),
+        0,
+    );
+    assert_eq!(b.on_needs_input(0).as_deref(), Some("Delete the file?"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn opencode_sync_reads_db_and_resets_on_session_switch() {
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                            time_created INTEGER, data TEXT);
+         INSERT INTO session VALUES ('ses_a','/repo/wt',100);
+         INSERT INTO message VALUES ('ma','ses_a','{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('pa','ma','ses_a',10,'{\"type\":\"text\",\"text\":\"first\"}');",
+    )
+    .unwrap();
+
+    let mut b = builder();
+    b.sync_opencode(&db, "/repo/wt", 0);
+    assert_eq!(labels(&b.load(None)), vec!["user:first"]);
+
+    // A newer session in the same worktree replaces the transcript.
+    conn.execute_batch(
+        "INSERT INTO session VALUES ('ses_b','/repo/wt',200);
+         INSERT INTO message VALUES ('mb','ses_b','{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('pb','mb','ses_b',10,'{\"type\":\"text\",\"text\":\"second\"}');",
+    )
+    .unwrap();
+    b.sync_opencode(&db, "/repo/wt", 0);
+    assert_eq!(
+        labels(&b.load(None)),
+        vec!["user:second"],
+        "switching to the newer session id resets the transcript"
+    );
+}
