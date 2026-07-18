@@ -56,6 +56,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   separators, so reconstruction resolves the right project directory on Windows
   as well as macOS/Linux.
 
+## [1.8.0] - 2026-07-17
+
 ### New features
 
 - Resume agent sessions across restarts: FlightDeck reads the session id from
