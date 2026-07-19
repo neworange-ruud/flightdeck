@@ -110,6 +110,10 @@ pub enum DialogAccel {
     Enter,
     /// The Esc key (cancel/dismiss).
     Esc,
+    /// The Tab key (toggle a checkbox-style option, e.g. "run from base branch"
+    /// in the New Agent form — chosen because it never collides with the text
+    /// being typed into an adjacent input field).
+    Tab,
 }
 
 impl DialogAccel {
@@ -119,6 +123,7 @@ impl DialogAccel {
             DialogAccel::Char(c) => c.to_string(),
             DialogAccel::Enter => "Enter".to_string(),
             DialogAccel::Esc => "Esc".to_string(),
+            DialogAccel::Tab => "Tab".to_string(),
         }
     }
 }
@@ -2470,6 +2475,7 @@ mod tests {
                 manual_status: None,
                 containerized: false,
                 container_image: None,
+                runs_on_base: false,
                 resume_args: Vec::new(),
             });
         }
