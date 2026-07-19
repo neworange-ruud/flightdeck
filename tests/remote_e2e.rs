@@ -612,8 +612,11 @@ fn remote_capabilities_end_to_end() {
     );
 
     // -------------------------------------------------------------------
-    // git_pull_base: the fixture base folder is dirty (untracked .gitignore /
-    // config.toml), so `git pull --rebase` is honestly refused.
+    // git_pull_base: the fixture base folder is dirty only with untracked files
+    // (.gitignore / config.toml / state.json), which do not block a rebase, so
+    // nothing is stashed. The fixture has no configured upstream, so the
+    // underlying `git pull --rebase` cannot proceed and is honestly refused
+    // (rather than raising a hard error — no rebase is left mid-flight to abort).
     // -------------------------------------------------------------------
     let pull = h.phone.command(CommandBody::GitPullBase {
         session_id: session_a_id.clone(),
@@ -622,14 +625,12 @@ fn remote_capabilities_end_to_end() {
     assert_eq!(
         ack.outcome,
         CommandOutcome::Rejected,
-        "git_pull_base should be rejected on a dirty base folder; message: {:?}",
+        "git_pull_base should be rejected when the base has no upstream to pull; message: {:?}",
         ack.message
     );
     assert!(
-        ack.message
-            .as_deref()
-            .is_some_and(|m| m.to_lowercase().contains("uncommitted")),
-        "pull_base reject should cite uncommitted changes; got {:?}",
+        ack.message.as_deref().is_some_and(|m| !m.trim().is_empty()),
+        "pull_base reject should carry git's reason; got {:?}",
         ack.message
     );
 

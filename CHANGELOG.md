@@ -18,6 +18,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- **Pull base now stashes uncommitted changes instead of refusing.** When the
+  base folder has uncommitted (tracked) changes, "Pull base" used to refuse and
+  ask you to commit or stash first. It now stashes those changes automatically,
+  runs `git pull --rebase`, and re-applies them on top — so you can pull merged
+  PRs into the base without interrupting your work. If the changes can't be
+  re-applied cleanly (they conflict with what was pulled), the stash is kept and
+  you're told how to recover it by hand. Untracked-only changes don't block a
+  rebase, so they're left in place and the pull just proceeds.
 - **The New Agent dialog is now a single combined form.** Picking the agent and
   naming the branch used to be two sequential prompts; they are now one dialog
   with a radio list of agents (↑/↓ to choose), a branch-name field, and a
