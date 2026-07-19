@@ -8,11 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Run an agent directly on the base branch, in the project root.** The New
+  Agent flow now offers a "run from base branch" option that starts the agent —
+  and any child shells you open in that tab — in the repository root on the base
+  branch, with no dedicated worktree. Handy for quick base-branch tasks (pulls,
+  chores, exploration) without spinning up a worktree. Only one base-branch tab
+  runs at a time, and the worktree-only actions (Abandon / Local merge / Rebase)
+  are refused for it so the project root is never touched.
 
 ### Improvements
 
-- None yet.
+- **The New Agent dialog is now a single combined form.** Picking the agent and
+  naming the branch used to be two sequential prompts; they are now one dialog
+  with a radio list of agents (↑/↓ to choose), a branch-name field, and a
+  "run from base branch" toggle (Tab) that disables the branch field when on.
 
 ### Bug fixes
 

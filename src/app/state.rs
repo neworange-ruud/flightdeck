@@ -868,6 +868,21 @@ impl AppState {
         agent_key: Option<&str>,
         services: &Services,
     ) -> Result<WorktreeJob> {
+        self.begin_new_agent_tab_ex(name, agent_key, false, services)
+    }
+
+    /// As [`AppState::begin_new_agent_tab`], but `run_on_base` selects whether
+    /// the tab runs in a dedicated worktree (`false`, the default) or directly
+    /// on the base branch in the project root (`true`). A base-branch tab needs
+    /// no `git worktree add` — its agent and any child shells run in the repo
+    /// root — so worktree planning is skipped and no worktree job is materialized.
+    pub fn begin_new_agent_tab_ex(
+        &mut self,
+        name: &str,
+        agent_key: Option<&str>,
+        run_on_base: bool,
+        services: &Services,
+    ) -> Result<WorktreeJob> {
         // (a) look up the agent in the registry.
         let key = agent_key
             .map(|k| k.to_string())
@@ -886,6 +901,12 @@ impl AppState {
             services.container,
             &self.repo_root,
         )?;
+
+        // Base-branch tabs run in the project root and never get their own
+        // worktree, so branch/slug/worktree planning is bypassed entirely.
+        if run_on_base {
+            return self.begin_base_agent_tab(name, key, services);
+        }
 
         // (c) slug + branch name with the configured prefix.
         let slug = slugify(name);
@@ -956,6 +977,7 @@ impl AppState {
             manual_status: None,
             containerized: false,
             container_image: None,
+            runs_on_base: false,
             resume_args: Vec::new(),
         };
         self.tabs.push(RuntimeTab {
@@ -979,6 +1001,91 @@ impl AppState {
             worktree_abs,
             needs_create,
             create_branch,
+        })
+    }
+
+    /// Reserve a placeholder tab that runs directly on the base branch in the
+    /// project root (no worktree). The agent must already be validated by the
+    /// caller. Only one base-branch tab is allowed at a time — running two
+    /// agents in the same folder on the same branch would let them stomp each
+    /// other's uncommitted work. The returned [`WorktreeJob`] has
+    /// `needs_create == false`, so [`materialize_worktree`] is a no-op.
+    fn begin_base_agent_tab(
+        &mut self,
+        name: &str,
+        key: String,
+        services: &Services,
+    ) -> Result<WorktreeJob> {
+        let base = self.base_branch.clone();
+
+        // Only one base-branch tab: a second agent sharing the root folder and
+        // branch would race the first on the same working tree.
+        if self.tabs.iter().any(|t| t.meta.runs_on_base) {
+            return Err(FlightDeckError::Refused(format!(
+                "an Agent Tab already runs on the base branch '{base}'"
+            )));
+        }
+
+        // The tab name falls back to the base branch when the field was left
+        // blank (the branch textbox is disabled in base mode).
+        let display_name = if name.trim().is_empty() {
+            base.clone()
+        } else {
+            name.trim().to_string()
+        };
+        let slug = {
+            let s = slugify(&display_name);
+            if s.is_empty() {
+                slugify(&base)
+            } else {
+                s
+            }
+        };
+
+        let base_commit_sha = services.git.rev_parse(&base)?;
+        let created_at = services.clock.now_iso8601();
+        let id = format!("{slug}-{created_at}");
+        let meta = TabState {
+            id: id.clone(),
+            name: display_name,
+            slug,
+            agent: key,
+            branch: base.clone(),
+            // The project root, relative to itself.
+            worktree_path_relative: ".".to_string(),
+            base_branch: base.clone(),
+            base_commit_sha,
+            created_at,
+            attached_existing_branch: true,
+            recovered: false,
+            last_known_status: InterpretedStatus::Starting.as_str().to_string(),
+            manual_status: None,
+            containerized: false,
+            container_image: None,
+            runs_on_base: true,
+            resume_args: Vec::new(),
+        };
+        self.tabs.push(RuntimeTab {
+            meta,
+            phase: TabPhase::Creating,
+            session: Session::new(),
+            interpreted: None,
+            status_file: None,
+            status_file_seen: None,
+            notify_armed: false,
+            resume_scan: String::new(),
+            session_snapshot: None,
+        });
+        self.selected_tab = Some(self.tabs.len() - 1);
+
+        Ok(WorktreeJob {
+            tab_id: id,
+            branch: base.clone(),
+            base_branch: base,
+            worktree_abs: self.repo_root.clone(),
+            // Nothing to materialize — the root worktree already exists.
+            needs_create: false,
+            create_branch: false,
         })
     }
 
@@ -1066,6 +1173,11 @@ impl AppState {
     /// worktree, or fails to link is silently skipped — a missing `.env` must
     /// never bother the user or fail session creation.
     fn link_env_files(&self, worktree: &Path, services: &Services) {
+        // A base-branch tab's "worktree" is the repo root itself, so the source
+        // and destination would be the same file — nothing to link.
+        if worktree == self.repo_root {
+            return;
+        }
         for name in [".env", ".env.local"] {
             let source = self.repo_root.join(name);
             let destination = worktree.join(name);
@@ -1186,6 +1298,12 @@ impl AppState {
         let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
+        if self.tabs[idx].meta.runs_on_base {
+            return Ok(Effect::Refused(
+                "This tab already runs on the base branch — there is nothing to merge back."
+                    .to_string(),
+            ));
+        }
         let tab = &self.tabs[idx];
         let agent_branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
@@ -1278,6 +1396,11 @@ impl AppState {
         let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
+        if self.tabs[idx].meta.runs_on_base {
+            return Ok(Effect::Refused(
+                "This tab runs on the base branch — there is nothing to rebase onto.".to_string(),
+            ));
+        }
         let tab = &self.tabs[idx];
         let agent_branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
@@ -1373,6 +1496,11 @@ impl AppState {
         let Some(idx) = self.selected_tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
+        if self.tabs[idx].meta.runs_on_base {
+            return Ok(Effect::Refused(
+                "This tab runs on the base branch in the project root — it has no worktree to abandon. Close the tab instead.".to_string(),
+            ));
+        }
         let worktree = to_absolute(
             &self.repo_root,
             Path::new(&self.tabs[idx].meta.worktree_path_relative),
@@ -2356,6 +2484,116 @@ mod tests {
             .file_contents(Path::new(STATE))
             .expect("state.json written")
             .contains("flightdeck/fix-login-bug"));
+    }
+
+    #[test]
+    fn base_branch_tab_runs_in_project_root_without_a_worktree() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        // An empty name is allowed in base mode; the branch is fixed to base.
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        // The placeholder targets the base branch in the repo root, with no
+        // worktree to materialize.
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].meta.runs_on_base);
+        assert_eq!(app.tabs[0].meta.branch, "main");
+        assert_eq!(app.tabs[0].meta.base_branch, "main");
+        assert_eq!(app.tabs[0].meta.worktree_path_relative, ".");
+        assert!(!job.needs_create);
+        assert!(!job.create_branch);
+        assert_eq!(job.worktree_abs, PathBuf::from(REPO));
+
+        // Materialize is a no-op — no `git worktree add` ever runs.
+        materialize_worktree(&git, &job).unwrap();
+        assert!(git.added_worktrees().is_empty());
+        assert!(git.created_branches().is_empty());
+
+        // Finalize spawns the primary agent in the project root itself.
+        app.finalize_new_tab(&job.tab_id, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert_eq!(app.tabs[0].phase, TabPhase::Ready);
+        let spawns = pty.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert!(
+            spawns[0].2.starts_with(REPO),
+            "primary agent runs in the project root, got {:?}",
+            spawns[0].2
+        );
+    }
+
+    #[test]
+    fn only_one_base_branch_tab_is_allowed() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        // A second base-branch tab would race the first on the same working tree.
+        let err = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap_err();
+        assert!(matches!(err, FlightDeckError::Refused(_)));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn worktree_destructive_commands_refused_on_a_base_branch_tab() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        materialize_worktree(&git, &job).unwrap();
+        app.finalize_new_tab(&job.tab_id, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        // Abandon / merge / rebase all refuse: the base tab has no worktree of
+        // its own and must never touch the project root.
+        for cmd in [
+            Command::AbandonWorktree { confirm: true },
+            Command::FinishLocalMerge { confirm: true },
+            Command::RebaseWorktree { confirm: true },
+        ] {
+            let effect = app
+                .dispatch(cmd.clone(), &services(&git, &fs, &pty, &clock))
+                .unwrap();
+            assert!(
+                matches!(effect, Effect::Refused(_)),
+                "{cmd:?} should be refused on a base-branch tab, got {effect:?}"
+            );
+        }
+        // The tab and the repo root survive untouched.
+        assert_eq!(app.tabs.len(), 1);
+        assert!(git.removed_worktrees().is_empty());
     }
 
     #[test]
@@ -3837,6 +4075,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            runs_on_base: false,
             resume_args: Vec::new(),
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
@@ -3916,6 +4155,7 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            runs_on_base: false,
             resume_args: Vec::new(),
         }
     }

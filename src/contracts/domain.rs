@@ -593,6 +593,12 @@ pub struct TabState {
     /// The image the container was launched from, for provenance (SPECS §31).
     #[serde(default)]
     pub container_image: Option<String>,
+    /// Whether this tab runs directly on the base branch in the project root
+    /// (no dedicated worktree). Such a tab shares the repo root with FlightDeck
+    /// itself, so worktree-destructive ops (abandon/merge/rebase) are refused
+    /// and no `git worktree add`/`remove` is ever run for it.
+    #[serde(default)]
+    pub runs_on_base: bool,
     /// Args to relaunch the agent so it resumes its previous session, captured
     /// from the agent's on-exit resume hint (e.g. `["--resume", "<uuid>"]` for
     /// Claude, `["resume", "<uuid>"]` for Codex). Empty = start fresh. Replayed
