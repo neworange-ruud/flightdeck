@@ -128,6 +128,14 @@ impl Registry {
         peer
     }
 
+    /// Remove a pairing's slot entirely, dropping **both** legs' routing handles
+    /// (spec §10.2, revoke). The underlying connections stay alive for their
+    /// other pairings; they simply can no longer route this one, which no longer
+    /// exists in the store. A no-op when the pairing is not in the table.
+    pub fn remove(&self, pairing: &PairingId) {
+        self.lock().remove(pairing);
+    }
+
     /// The peer leg's handle for `pairing`, if the peer of `role` is connected.
     pub fn peer(&self, pairing: &PairingId, role: Role) -> Option<ConnHandle> {
         self.lock()
@@ -211,5 +219,22 @@ mod tests {
         // The current connection's cleanup does evict, and empties the slot.
         reg.detach(&pairing, Role::Desktop, "conn_d2");
         assert!(reg.peer(&pairing, Role::Phone).is_none());
+    }
+
+    #[test]
+    fn remove_drops_both_legs() {
+        let reg = Registry::new();
+        let pairing = PairingId::new("pair");
+        let (desktop, _dr) = handle("conn_d");
+        let (phone, _pr) = handle("conn_p");
+        reg.attach(&pairing, Role::Desktop, desktop);
+        reg.attach(&pairing, Role::Phone, phone);
+
+        reg.remove(&pairing);
+        assert!(reg.peer(&pairing, Role::Desktop).is_none());
+        assert!(reg.peer(&pairing, Role::Phone).is_none());
+
+        // Removing an absent pairing is a harmless no-op.
+        reg.remove(&PairingId::new("gone"));
     }
 }

@@ -38,6 +38,12 @@ pub struct PairingMembers {
     pub desktop: DeviceId,
     /// The phone device, once it has claimed the pairing.
     pub phone: Option<DeviceId>,
+    /// The desktop's last-announced, human-readable machine name (spec §10.1),
+    /// re-sent on every desktop connect via `auth_response.machine_name` and
+    /// forwarded to the phone. **Untrusted display text**, already length-bounded
+    /// by the session layer. `None` until the desktop announces one; a relay
+    /// restart clears it and the desktop repopulates it on its next connect.
+    pub machine_name: Option<String>,
 }
 
 impl PairingMembers {
@@ -45,6 +51,19 @@ impl PairingMembers {
     pub fn contains(&self, device: &DeviceId) -> bool {
         self.desktop == *device || self.phone.as_ref() == Some(device)
     }
+}
+
+/// The result of a [`RelayStore::revoke_pairing`] attempt (spec §10.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// The pairing was removed. Carries the membership as it was **before**
+    /// removal, so the caller can notify the (now former) peer.
+    Removed(PairingMembers),
+    /// The requester authenticated but is **not** a member of the pairing — the
+    /// revoke is refused and nothing changed (security check, spec §10.2).
+    NotMember,
+    /// The pairing was already gone — an idempotent success no-op.
+    AlreadyGone,
 }
 
 /// Why a store mutation failed.
@@ -86,6 +105,23 @@ pub trait RelayStore: Send + Sync {
 
     /// The members of a pairing, if it exists.
     async fn pairing_members(&self, pairing: &PairingId) -> Option<PairingMembers>;
+
+    /// Record the desktop's announced machine name for `pairing` (spec §10.1).
+    /// No-op if the pairing does not exist. The name is display-only and already
+    /// length-bounded by the session layer.
+    async fn set_machine_name(&self, pairing: &PairingId, machine_name: String);
+
+    /// The desktop's last-announced machine name for `pairing`, if any.
+    async fn machine_name(&self, pairing: &PairingId) -> Option<String>;
+
+    /// Revoke a pairing on behalf of `requester` (spec §10.2). Verifies
+    /// membership, then atomically removes the pairing **and** all of its state
+    /// (membership, live claim tokens, both `(pairing, sender)` queues, and the
+    /// push token). See [`RevokeOutcome`] for the three outcomes: removed,
+    /// refused (non-member), or an idempotent no-op (already gone). The
+    /// membership check and removal happen under one lock so there is no
+    /// check-then-remove race.
+    async fn revoke_pairing(&self, pairing: &PairingId, requester: &DeviceId) -> RevokeOutcome;
 
     /// Issue a single-use claim token bound to `pairing` / `desktop`.
     async fn issue_claim(
@@ -215,6 +251,7 @@ impl RelayStore for InMemoryStore {
             PairingMembers {
                 desktop,
                 phone: None,
+                machine_name: None,
             },
         );
         id
@@ -236,6 +273,47 @@ impl RelayStore for InMemoryStore {
 
     async fn pairing_members(&self, pairing: &PairingId) -> Option<PairingMembers> {
         self.lock().pairings.get(pairing).cloned()
+    }
+
+    async fn set_machine_name(&self, pairing: &PairingId, machine_name: String) {
+        if let Some(members) = self.lock().pairings.get_mut(pairing) {
+            members.machine_name = Some(machine_name);
+        }
+    }
+
+    async fn machine_name(&self, pairing: &PairingId) -> Option<String> {
+        self.lock()
+            .pairings
+            .get(pairing)
+            .and_then(|m| m.machine_name.clone())
+    }
+
+    async fn revoke_pairing(&self, pairing: &PairingId, requester: &DeviceId) -> RevokeOutcome {
+        let mut inner = self.lock();
+        let Some(members) = inner.pairings.get(pairing) else {
+            // Idempotent: revoking an already-gone pairing is a success no-op.
+            return RevokeOutcome::AlreadyGone;
+        };
+        if !members.contains(requester) {
+            // Security (spec §10.2): only a member may revoke; refuse and leave
+            // all state untouched.
+            return RevokeOutcome::NotMember;
+        }
+        // Authorized: remove the pairing and every trace of it. Cloned members
+        // are returned so the caller can notify the (now former) peer.
+        let removed = inner
+            .pairings
+            .remove(pairing)
+            .expect("pairing present under lock");
+        inner.claims.remove_pairing(pairing);
+        inner
+            .queues
+            .remove(&QueueKey::new(pairing.clone(), Role::Desktop));
+        inner
+            .queues
+            .remove(&QueueKey::new(pairing.clone(), Role::Phone));
+        inner.push_tokens.remove(pairing);
+        RevokeOutcome::Removed(removed)
     }
 
     async fn issue_claim(
@@ -379,6 +457,151 @@ mod tests {
         assert_eq!(
             store.push_token(&pairing).await,
             Some(("tok_b".into(), ApnsEnvironment::Production))
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_name_set_and_get_round_trips() {
+        let store = InMemoryStore::new(1000);
+        let pairing = store.create_pairing(DeviceId::new("dev_mac")).await;
+
+        // Absent until announced.
+        assert_eq!(store.machine_name(&pairing).await, None);
+        assert_eq!(
+            store.pairing_members(&pairing).await.unwrap().machine_name,
+            None
+        );
+
+        store
+            .set_machine_name(&pairing, "Ruud's MacBook Pro".into())
+            .await;
+        assert_eq!(
+            store.machine_name(&pairing).await,
+            Some("Ruud's MacBook Pro".into())
+        );
+
+        // A re-announce (e.g. a rename on reconnect) replaces the stored value.
+        store.set_machine_name(&pairing, "Work Mac".into()).await;
+        assert_eq!(store.machine_name(&pairing).await, Some("Work Mac".into()));
+
+        // Setting a name on an unknown pairing is a silent no-op.
+        store
+            .set_machine_name(&PairingId::new("nope"), "x".into())
+            .await;
+        assert_eq!(store.machine_name(&PairingId::new("nope")).await, None);
+    }
+
+    /// Build a fully-populated pairing (phone joined, a live claim, both queues,
+    /// a push token) so revoke-cleanup can be asserted end to end.
+    async fn populated_pairing(store: &InMemoryStore) -> (PairingId, DeviceId, DeviceId) {
+        let desktop = DeviceId::new("dev_mac");
+        let phone = DeviceId::new("dev_phone");
+        let pairing = store.create_pairing(desktop.clone()).await;
+        store
+            .add_phone_to_pairing(&pairing, phone.clone())
+            .await
+            .unwrap();
+        store
+            .issue_claim("tok_live".into(), pairing.clone(), desktop.clone(), 10_000)
+            .await;
+        // Populate this pairing's own queues (env() uses a fixed pairing id, so
+        // enqueue against the real pairing id directly).
+        store
+            .enqueue(EncryptedEnvelope {
+                pairing_id: pairing.clone(),
+                seq: 1,
+                sender: Role::Desktop,
+                sent_at_ms: 0,
+                nonce: "bm9uY2U=".into(),
+                ciphertext: "opaque".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .enqueue(EncryptedEnvelope {
+                pairing_id: pairing.clone(),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 0,
+                nonce: "bm9uY2U=".into(),
+                ciphertext: "opaque".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .register_push_token(pairing.clone(), "apns".into(), ApnsEnvironment::Sandbox)
+            .await;
+        (pairing, desktop, phone)
+    }
+
+    #[tokio::test]
+    async fn revoke_by_member_removes_pairing_and_all_state() {
+        let store = InMemoryStore::new(1000);
+        let (pairing, _desktop, phone) = populated_pairing(&store).await;
+
+        let outcome = store.revoke_pairing(&pairing, &phone).await;
+        match outcome {
+            RevokeOutcome::Removed(members) => {
+                assert_eq!(members.desktop, DeviceId::new("dev_mac"));
+                assert_eq!(members.phone, Some(phone.clone()));
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+
+        // Pairing and every trace of it are gone.
+        assert_eq!(store.pairing_members(&pairing).await, None);
+        assert!(store.claim_token_is_free("tok_live").await);
+        assert!(store.replay(&pairing, Role::Desktop, 0).await.is_empty());
+        assert!(store.replay(&pairing, Role::Phone, 0).await.is_empty());
+        assert_eq!(store.push_token(&pairing).await, None);
+    }
+
+    #[tokio::test]
+    async fn revoke_by_desktop_member_also_allowed() {
+        // Revocation is role-agnostic: any member may revoke.
+        let store = InMemoryStore::new(1000);
+        let (pairing, desktop, _phone) = populated_pairing(&store).await;
+        assert!(matches!(
+            store.revoke_pairing(&pairing, &desktop).await,
+            RevokeOutcome::Removed(_)
+        ));
+        assert_eq!(store.pairing_members(&pairing).await, None);
+    }
+
+    #[tokio::test]
+    async fn revoke_by_non_member_is_refused_and_changes_nothing() {
+        let store = InMemoryStore::new(1000);
+        let (pairing, _desktop, _phone) = populated_pairing(&store).await;
+
+        let stranger = DeviceId::new("dev_stranger");
+        assert_eq!(
+            store.revoke_pairing(&pairing, &stranger).await,
+            RevokeOutcome::NotMember
+        );
+
+        // Nothing was removed.
+        assert!(store.pairing_members(&pairing).await.is_some());
+        assert!(!store.claim_token_is_free("tok_live").await);
+        assert_eq!(
+            store.replay(&pairing, Role::Desktop, 0).await.len(),
+            1,
+            "queue must survive a refused revoke"
+        );
+        assert!(store.push_token(&pairing).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_is_idempotent_for_a_gone_pairing() {
+        let store = InMemoryStore::new(1000);
+        let (pairing, _desktop, phone) = populated_pairing(&store).await;
+        assert!(matches!(
+            store.revoke_pairing(&pairing, &phone).await,
+            RevokeOutcome::Removed(_)
+        ));
+        // A second revoke of the same (now-gone) pairing is a success no-op.
+        assert_eq!(
+            store.revoke_pairing(&pairing, &phone).await,
+            RevokeOutcome::AlreadyGone
         );
     }
 

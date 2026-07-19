@@ -759,8 +759,52 @@ fn send_auth_response(
             .into_iter()
             .map(PairingId::new)
             .collect(),
+        // Announce this Mac's display name on every connect so the phone's
+        // per-pairing default auto-updates when the machine is renamed
+        // (spec §10.1). Computed fresh each connect — never cached — so a rename
+        // propagates on the next reconnect.
+        machine_name: machine_name(),
     };
     send_frame(sock, &resp).is_ok()
+}
+
+/// This desktop's human-readable machine name for the phone's feed (spec §10.1).
+///
+/// Source order: an explicit `FLIGHTDECK_MACHINE_NAME` override (the "configured
+/// display name" escape hatch), then the system hostname (via the `hostname`
+/// command, which exists on macOS/Linux/Windows), then the `HOSTNAME` /
+/// `COMPUTERNAME` env vars. Returns `None` if nothing is resolvable, in which
+/// case the frame carries `null` and the phone keeps its previous/fallback name.
+/// The result is length-bounded to 64 characters; the relay bounds it again and
+/// the phone sanitizes it before display.
+fn machine_name() -> Option<String> {
+    fn clean(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.chars().take(64).collect())
+        }
+    }
+
+    if let Some(name) =
+        std::env::var_os("FLIGHTDECK_MACHINE_NAME").and_then(|v| clean(&v.to_string_lossy()))
+    {
+        return Some(name);
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            if let Some(name) = clean(&String::from_utf8_lossy(&out.stdout)) {
+                return Some(name);
+            }
+        }
+    }
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Some(name) = std::env::var_os(var).and_then(|v| clean(&v.to_string_lossy())) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Build the desktop's `pairing_offer` (spec §5.2). The desktop reuses its
@@ -1120,6 +1164,22 @@ fn handle_frame(
                 peer_device_id,
                 peer_key_agreement_public_key,
             });
+            true
+        }
+        RelayFrame::PairingRevoked { pairing_id } => {
+            // The phone unpaired this Mac (spec §10.2). Drop the pairing locally
+            // so it is never resumed/activated again — mirroring the local
+            // `Unpair` clear — then tell the app so it tears down that pairing's
+            // E2E channel and returns to an unpaired, re-pairable state. Other
+            // pairings are untouched.
+            crate::remote::debuglog::log(&format!(
+                "client RECV pairing_revoked pairing={}",
+                pairing_id.as_str()
+            ));
+            let key = pairing_id.as_str().to_string();
+            state.pairings.retain(|p| p.pairing_id != key);
+            store.save(state);
+            let _ = inbound_tx.send(RemoteInbound::PairingRevoked { pairing_id });
             true
         }
         RelayFrame::Error {

@@ -679,3 +679,147 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
 
     handle.stop();
 }
+
+// --- Machine name (spec §10.1) ---------------------------------------------
+
+/// The desktop announces its machine name on `auth_response`, sent on every
+/// connect. The mock captures the field and asserts it is present and bounded.
+#[test]
+fn desktop_announces_machine_name_on_auth() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || -> Option<String> {
+        let stream = accept_within(&listener)?;
+        let mut ws = tungstenite::accept(stream).unwrap();
+        if !matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })) {
+            return None;
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 1,
+                server_time_ms: 0,
+                connection_id: "conn".to_string(),
+            },
+        );
+        let nonce_raw = [7u8; 32];
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode(nonce_raw),
+                server_time_ms: 0,
+            },
+        );
+        let captured = match ws_recv(&mut ws) {
+            Some(RelayFrame::AuthResponse {
+                signature,
+                machine_name,
+                ..
+            }) => {
+                let vk = VerifyingKey::from_sec1_bytes(&pubkey).unwrap();
+                let sig = Signature::from_slice(&STANDARD.decode(&signature).unwrap()).unwrap();
+                assert!(vk.verify(&nonce_raw, &sig).is_ok(), "signature must verify");
+                machine_name
+            }
+            other => panic!("expected auth_response, got {other:?}"),
+        };
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![],
+            },
+        );
+        captured
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, _in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    let captured = mock.join().unwrap();
+    handle.stop();
+
+    let name = captured.expect("desktop must announce a machine name (system hostname)");
+    assert!(!name.is_empty(), "machine name must not be empty");
+    assert!(
+        name.chars().count() <= 64,
+        "machine name must be length-bounded to 64 chars, got {}",
+        name.chars().count()
+    );
+}
+
+// --- Phone-initiated revoke (spec §10.2) -----------------------------------
+
+/// On receiving `pairing_revoked`, the desktop drops the pairing from persisted
+/// state and surfaces `RemoteInbound::PairingRevoked` so the app can tear down.
+#[test]
+fn pairing_revoked_drops_pairing_and_notifies_app() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        // The client resumes; then the relay tells it the phone unpaired.
+        let _ = ws_recv(&mut ws); // resume
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingRevoked {
+                pairing_id: PairingId::new("pair_test"),
+            },
+        );
+        // Keep the socket open briefly so the client processes the frame.
+        std::thread::sleep(Duration::from_millis(300));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    let mut revoked = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !revoked {
+        if let Ok(RemoteInbound::PairingRevoked { pairing_id }) =
+            in_rx.recv_timeout(Duration::from_millis(200))
+        {
+            assert_eq!(pairing_id.as_str(), "pair_test");
+            revoked = true;
+        }
+    }
+
+    assert!(revoked, "client must surface PairingRevoked to the app");
+    // The pairing was dropped from persisted state.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !shared.lock().unwrap().pairings.is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        shared.lock().unwrap().pairings.is_empty(),
+        "revoked pairing must be removed from persisted state"
+    );
+
+    let _ = mock.join();
+    handle.stop();
+}

@@ -294,6 +294,15 @@ impl RemoteBridge {
                 self.pairing = None;
                 self.reset_to_passthrough();
             }
+            // The phone unpaired this Mac (spec §10.2). If it was the pairing we
+            // were feeding, forget it and revert to the passthrough sealer so we
+            // stop sealing to a dead channel; a different pairing is unaffected.
+            RemoteInbound::PairingRevoked { pairing_id } => {
+                if self.pairing.as_ref() == Some(&pairing_id) {
+                    self.pairing = None;
+                    self.reset_to_passthrough();
+                }
+            }
         }
     }
 

@@ -91,6 +91,7 @@ async fn auth_before_hello_is_rejected() {
         device_id: DeviceId::new("dev_x"),
         signature: bogus_signature(),
         pairing_ids: vec![],
+        machine_name: None,
     };
     ws.send(WsMessage::Text(serde_json::to_string(&bad).unwrap().into()))
         .await
@@ -122,6 +123,7 @@ async fn auth_for_unregistered_device_fails() {
             device_id: DeviceId::new("dev_unknown"),
             signature: bogus_signature(),
             pairing_ids: vec![],
+            machine_name: None,
         })
         .await;
     assert!(matches!(
@@ -144,6 +146,7 @@ async fn bad_signature_from_registered_device_fails() {
             device_id: DeviceId::new("dev_mac"),
             signature: bogus_signature(),
             pairing_ids: vec![],
+            machine_name: None,
         })
         .await;
     assert!(matches!(
@@ -544,4 +547,211 @@ async fn queue_overflow_emits_advisory_and_keeps_newest() {
     }
     assert_eq!(got, vec![3, 4, 5]);
     phone.expect_idle(300).await;
+}
+
+// ── machine name (spec §10.1) ───────────────────────────────────────────────
+
+/// A desktop announces its machine name on `auth_response`; the relay forwards
+/// it to the phone both when the phone connects and again when the desktop
+/// reconnects under a new name (a Mac rename propagates on reconnect).
+#[tokio::test]
+async fn machine_name_is_forwarded_to_phone_on_connect_and_updated_on_rename() {
+    let base = spawn_app().await;
+
+    // Desktop pairs and authenticates announcing its name.
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let desktop_key = desktop.key();
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop
+        .authenticate_named(vec![pairing.clone()], Some("Ruud's MacBook Pro"))
+        .await;
+
+    // Phone claims + authenticates → it receives the stored machine name.
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    let phone_key = phone.key();
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    let name = phone
+        .recv_until(|f| matches!(f, RelayFrame::MachineName { .. }))
+        .await;
+    match name {
+        RelayFrame::MachineName {
+            pairing_id,
+            machine_name,
+        } => {
+            assert_eq!(pairing_id, pairing);
+            assert_eq!(machine_name, "Ruud's MacBook Pro");
+        }
+        other => panic!("expected machine_name, got {other:?}"),
+    }
+
+    // The Mac is renamed and the desktop reconnects while the phone is online;
+    // the phone receives the new name.
+    desktop.close().await;
+    let mut desktop =
+        TestClient::connect_with_key(&base, Role::Desktop, "dev_mac", desktop_key).await;
+    desktop
+        .authenticate_named(vec![pairing.clone()], Some("Work Mac"))
+        .await;
+
+    let renamed = phone
+        .recv_until(|f| matches!(f, RelayFrame::MachineName { .. }))
+        .await;
+    match renamed {
+        RelayFrame::MachineName { machine_name, .. } => assert_eq!(machine_name, "Work Mac"),
+        other => panic!("expected updated machine_name, got {other:?}"),
+    }
+
+    // An older desktop that omits the field (None) breaks nothing: no new
+    // machine_name frame is emitted, and routing continues.
+    let _ = phone_key;
+}
+
+/// A desktop that announces no name (older build / `None`) must not break the
+/// phone's connect — no `machine_name` frame is sent.
+#[tokio::test]
+async fn absent_machine_name_sends_no_frame() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await; // machine_name: None
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // The phone must NOT receive a machine_name frame (only presence, etc.).
+    // Give the relay a moment; assert no machine_name arrives.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), phone.recv()).await {
+            Ok(RelayFrame::MachineName { .. }) => panic!("unexpected machine_name frame"),
+            Ok(_) => {}  // presence / other — ignore
+            Err(_) => {} // idle
+        }
+    }
+}
+
+// ── phone-initiated unpair / revoke (spec §10.2) ────────────────────────────
+
+/// The phone revokes a pairing: the relay verifies membership, removes it,
+/// notifies the desktop peer, and confirms to the phone. The pairing is gone.
+#[tokio::test]
+async fn phone_revoke_removes_pairing_and_notifies_desktop() {
+    let base = spawn_app().await;
+
+    // Full pair.
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // Phone revokes.
+    phone.revoke(&pairing).await;
+
+    // Desktop is notified its phone unpaired it.
+    let desk = desktop
+        .recv_until(|f| matches!(f, RelayFrame::PairingRevoked { .. }))
+        .await;
+    assert!(matches!(
+        desk,
+        RelayFrame::PairingRevoked { pairing_id } if pairing_id == pairing
+    ));
+
+    // Phone gets an idempotent-success confirmation.
+    let conf = phone
+        .recv_until(|f| matches!(f, RelayFrame::PairingRevoked { .. }))
+        .await;
+    assert!(matches!(
+        conf,
+        RelayFrame::PairingRevoked { pairing_id } if pairing_id == pairing
+    ));
+
+    // The pairing is gone: an envelope for it is now rejected as unknown.
+    phone
+        .send(envelope(&pairing, Role::Phone, 1, "after-revoke"))
+        .await;
+    let err = phone
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    assert!(matches!(
+        err,
+        RelayFrame::Error {
+            code: RelayErrorCode::UnknownPairing,
+            ..
+        }
+    ));
+}
+
+/// A non-member device that knows a pairing id cannot revoke it: the relay
+/// refuses with `unknown_pairing` and the pairing survives.
+#[tokio::test]
+async fn non_member_cannot_revoke() {
+    let base = spawn_app().await;
+
+    // Victim pairing (desktop + phone).
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // A stranger authenticates via its OWN pairing, then tries to revoke the
+    // victim pairing it is not a member of.
+    let mut stranger = TestClient::connect(&base, Role::Desktop, "dev_stranger").await;
+    let (stranger_pairing, _tok) = stranger.offer_pairing().await;
+    stranger.authenticate(vec![stranger_pairing.clone()]).await;
+    stranger.revoke(&pairing).await;
+
+    let err = stranger
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    assert!(matches!(
+        err,
+        RelayFrame::Error {
+            code: RelayErrorCode::UnknownPairing,
+            ..
+        }
+    ));
+
+    // The victim pairing still routes: desktop→phone envelope arrives.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 1, "still-alive"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 1);
+}
+
+/// Revoking a pairing that is already gone is an idempotent success: the relay
+/// still confirms with `pairing_revoked` and never errors.
+#[tokio::test]
+async fn revoke_is_idempotent() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    phone.revoke(&pairing).await;
+    let _ = phone
+        .recv_until(|f| matches!(f, RelayFrame::PairingRevoked { .. }))
+        .await;
+
+    // A second revoke of the same (now-gone) pairing still confirms success.
+    phone.revoke(&pairing).await;
+    let again = phone
+        .recv_until(|f| matches!(f, RelayFrame::PairingRevoked { .. }))
+        .await;
+    assert!(matches!(
+        again,
+        RelayFrame::PairingRevoked { pairing_id } if pairing_id == pairing
+    ));
 }

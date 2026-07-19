@@ -37,6 +37,7 @@ use crate::claims::ClaimError;
 use crate::ids;
 use crate::queue::{AppendOutcome, QueueError};
 use crate::router::{peer_role, ConnHandle};
+use crate::store::RevokeOutcome;
 use crate::AppState;
 
 /// Current wall-clock time in unix milliseconds.
@@ -63,6 +64,24 @@ fn is_valid_claim_hint(hint: &str) -> bool {
     !hint.is_empty()
         && hint.len() <= 32
         && hint.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Maximum number of characters the relay will store/forward for a machine name
+/// (spec §10.1). The name is untrusted display text; length-bounding it keeps a
+/// misbehaving desktop from smuggling an oversized string through the relay to
+/// the phone. The phone additionally sanitizes it before display.
+const MAX_MACHINE_NAME_CHARS: usize = 64;
+
+/// Length-bound and normalize an announced machine name: trim surrounding
+/// whitespace, truncate to [`MAX_MACHINE_NAME_CHARS`] **characters** (never
+/// splitting a UTF-8 scalar), and treat an empty result as "no name" (`None`).
+/// Content sanitation for display is the phone's responsibility.
+fn bound_machine_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_MACHINE_NAME_CHARS).collect())
 }
 
 /// What to do after handling one inbound frame.
@@ -312,8 +331,9 @@ impl Connection {
                 device_id,
                 signature,
                 pairing_ids,
+                machine_name,
             } => {
-                self.on_auth_response(device_id, signature, pairing_ids)
+                self.on_auth_response(device_id, signature, pairing_ids, machine_name)
                     .await
             }
             _ => {
@@ -565,6 +585,7 @@ impl Connection {
         device_id: DeviceId,
         signature: String,
         pairing_ids: Vec<PairingId>,
+        machine_name: Option<String>,
     ) -> Flow {
         let Phase::AwaitingAuth {
             device_id: hello_device,
@@ -651,6 +672,43 @@ impl Connection {
             }
         }
 
+        // Machine-name exchange (spec §10.1). A desktop announces its name on
+        // *every* connect; the relay stores it per activated pairing and forwards
+        // it to a connected phone (so a Mac rename propagates on reconnect). When
+        // a phone authenticates, it receives each activated pairing's last-known
+        // name so its per-pairing default is fresh.
+        match role {
+            Role::Desktop => {
+                if let Some(name) = machine_name.as_deref().and_then(bound_machine_name) {
+                    for pairing in &activated {
+                        self.state
+                            .store
+                            .set_machine_name(pairing, name.clone())
+                            .await;
+                        if let Some(phone) = self.state.registry.peer(pairing, Role::Desktop) {
+                            phone
+                                .send(RelayFrame::MachineName {
+                                    pairing_id: pairing.clone(),
+                                    machine_name: name.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            Role::Phone => {
+                for pairing in &activated {
+                    if let Some(name) = self.state.store.machine_name(pairing).await {
+                        self.send(RelayFrame::MachineName {
+                            pairing_id: pairing.clone(),
+                            machine_name: name,
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+
         self.phase = Phase::Authed {
             device_id,
             activated,
@@ -707,10 +765,70 @@ impl Connection {
                 )
                 .await
             }
+            RelayFrame::Revoke { pairing_id } => self.on_revoke(pairing_id).await,
             RelayFrame::Bye { .. } => Flow::Close,
             _ => {
                 self.send_error(RelayErrorCode::BadFrame, "unexpected frame", None)
                     .await;
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Handle a phone-initiated (or member-initiated) unpair (spec §10.2).
+    ///
+    /// The store verifies membership and removes the pairing + all its state
+    /// atomically. Only a member may revoke; a non-member is refused. Revocation
+    /// is idempotent. On success the relay drops the pairing from the live
+    /// routing table, notifies the former peer, confirms to the requester, and
+    /// deactivates it on this connection — leaving the device's other pairings
+    /// untouched.
+    async fn on_revoke(&mut self, pairing_id: PairingId) -> Flow {
+        let device_id = match &self.phase {
+            Phase::Authed { device_id, .. } => device_id.clone(),
+            _ => unreachable!("on_revoke only called in Authed"),
+        };
+        let role = self.role.expect("role set at hello");
+
+        match self
+            .state
+            .store
+            .revoke_pairing(&pairing_id, &device_id)
+            .await
+        {
+            RevokeOutcome::Removed(_members) => {
+                // Notify the former peer (if connected) before tearing the slot
+                // down, so a desktop learns its phone unpaired it.
+                if let Some(peer) = self.state.registry.peer(&pairing_id, role) {
+                    peer.send(RelayFrame::PairingRevoked {
+                        pairing_id: pairing_id.clone(),
+                    })
+                    .await;
+                }
+                self.state.registry.remove(&pairing_id);
+                // Deactivate on this connection so later frames for it are
+                // rejected as unknown.
+                if let Phase::Authed { activated, .. } = &mut self.phase {
+                    activated.retain(|p| p != &pairing_id);
+                }
+                // Confirm back to the requester (idempotent success).
+                self.send(RelayFrame::PairingRevoked { pairing_id }).await;
+                Flow::Continue
+            }
+            RevokeOutcome::AlreadyGone => {
+                // Idempotent no-op success: still confirm to the requester.
+                self.send(RelayFrame::PairingRevoked { pairing_id }).await;
+                Flow::Continue
+            }
+            RevokeOutcome::NotMember => {
+                // Security refusal (spec §10.2): the authenticated device is not
+                // a member of this pairing. Advisory, non-fatal.
+                self.send_error(
+                    RelayErrorCode::UnknownPairing,
+                    "not a member of this pairing",
+                    Some(pairing_id),
+                )
+                .await;
                 Flow::Continue
             }
         }
@@ -972,6 +1090,29 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn bound_machine_name_trims_bounds_and_empties() {
+        // Trims surrounding whitespace.
+        assert_eq!(
+            bound_machine_name("  Ruud's Mac  ").as_deref(),
+            Some("Ruud's Mac")
+        );
+        // Empty / whitespace-only → None.
+        assert_eq!(bound_machine_name(""), None);
+        assert_eq!(bound_machine_name("   "), None);
+        // Truncates to MAX_MACHINE_NAME_CHARS characters (not bytes).
+        let long = "a".repeat(MAX_MACHINE_NAME_CHARS + 20);
+        assert_eq!(
+            bound_machine_name(&long).unwrap().chars().count(),
+            MAX_MACHINE_NAME_CHARS
+        );
+        // Multi-byte scalars are counted as characters and never split.
+        let emoji = "🦀".repeat(MAX_MACHINE_NAME_CHARS + 5);
+        let bounded = bound_machine_name(&emoji).unwrap();
+        assert_eq!(bounded.chars().count(), MAX_MACHINE_NAME_CHARS);
+        assert!(bounded.chars().all(|c| c == '🦀'));
     }
 
     #[tokio::test]
