@@ -106,6 +106,23 @@ final class SnapshotCache {
     /// disposable last-known-state, not user data worth backing up (and
     /// backing up transcript content would be a privacy surprise).
     static func defaultFileURL(fileManager: FileManager = .default) -> URL {
+        fileURL(named: "snapshot-cache.json", fileManager: fileManager)
+    }
+
+    /// A per-pairing cache file, so each `TransportStore` the multi-pairing
+    /// `TransportCoordinator` owns (remote-control-b8d.5) persists its own
+    /// last-known-state without clobbering another pairing's. The `pairingId`
+    /// is sanitized to a filesystem-safe token; distinct ids never collide.
+    static func fileURL(forPairingId pairingId: String, fileManager: FileManager = .default) -> URL {
+        let safe = pairingId.unicodeScalars.map { scalar -> Character in
+            let ok = CharacterSet.alphanumerics.contains(scalar)
+                || scalar == "-" || scalar == "_"
+            return ok ? Character(scalar) : "_"
+        }
+        return fileURL(named: "snapshot-cache.\(String(safe)).json", fileManager: fileManager)
+    }
+
+    private static func fileURL(named name: String, fileManager: FileManager) -> URL {
         let base = (try? fileManager.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
@@ -114,7 +131,7 @@ final class SnapshotCache {
         if !fileManager.fileExists(atPath: dir.path) {
             try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        var url = dir.appendingPathComponent("snapshot-cache.json")
+        var url = dir.appendingPathComponent(name)
         var resourceValues = URLResourceValues()
         resourceValues.isExcludedFromBackup = true
         try? url.setResourceValues(resourceValues)

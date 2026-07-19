@@ -44,7 +44,16 @@ struct MainTabView: View {
     @State private var activityStore = ActivityStore.makeDefault()
     @State private var isPresentingNewAgentSheet = false
     @State private var connectionBanner: ReconnectingBannerModel
+    // Multi-pairing transport (remote-control-b8d.5): the coordinator owns one
+    // live client+store per paired machine and is driven foreground→connect-all
+    // / background→teardown by the `scenePhase` observer below. `transportStore`
+    // is the transitional single-store bridge (`coordinator.primaryStore` — the
+    // first paired instance, or a recordless fallback when unpaired) that the
+    // existing Projects/Activity/Shell/Settings tabs still bind to until
+    // remote-control-b8d.12 parameterizes them per-pairingId via the coordinator.
+    @State private var coordinator: TransportCoordinator
     @State private var transportStore: TransportStore
+    @Environment(\.scenePhase) private var scenePhase
     // Push wiring (PRD §5.2/§9.1): the notification prefs the Settings screen
     // binds to (also gating presentation), the local-notification scheduler fed
     // by the same `agentEvents` stream as the Activity feed, and the shared push
@@ -56,7 +65,9 @@ struct MainTabView: View {
     init(router: AppRouter, connectionSource: (any ConnectionStatusSource)? = nil) {
         self.router = router
         self.connectionSource = connectionSource
-        let store = TransportStoreFactory.makeDefault()
+        let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: router.pairingStore)
+        _coordinator = State(initialValue: coordinator)
+        let store = coordinator.primaryStore
         _transportStore = State(initialValue: store)
         _connectionBanner = State(initialValue: ReconnectingBannerModel(source: connectionSource ?? store))
     }
@@ -108,8 +119,19 @@ struct MainTabView: View {
             }
             .onChange(of: pushCoordinator.deviceTokenHex) { _, token in
                 if let token {
-                    transportStore.registerPushToken(token, environment: pushCoordinator.environment)
+                    registerPushTokenEverywhere(token)
                 }
+            }
+            // Foreground → connect every paired machine; background → tear them
+            // all down (cancel supervisors, close sockets). APNs push takes over
+            // while backgrounded (remote-control-b8d.5 / epic connectivity model).
+            .onChange(of: scenePhase) { _, phase in
+                Task { await coordinator.setForeground(phase == .active) }
+            }
+            // Runtime add/remove: pairing a new machine spins up only its client;
+            // unpairing one stops+disposes only that client (remote-control-b8d.7/.11).
+            .onChange(of: router.pairingStore.instances) { _, instances in
+                Task { await coordinator.reconcile(with: instances) }
             }
             // `.contain` first: an accessibility identifier applied to a plain
             // container view propagates onto every accessibility element inside
@@ -120,11 +142,13 @@ struct MainTabView: View {
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("MainTabView")
             .task {
-                await transportStore.start()
+                // Connect every paired machine on mount (scenePhase is `.active`
+                // here); the `scenePhase` observer drives subsequent transitions.
+                await coordinator.setForeground(true)
                 // Register any token that already arrived before the transport
                 // started (onChange covers tokens that arrive afterwards).
                 if let token = pushCoordinator.deviceTokenHex {
-                    transportStore.registerPushToken(token, environment: pushCoordinator.environment)
+                    registerPushTokenEverywhere(token)
                 }
             }
 
@@ -136,6 +160,16 @@ struct MainTabView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.25), value: isStaleBannerVisible)
+        }
+    }
+
+    /// Register the APNs token with every live per-machine client. Per-machine
+    /// mute + pairingId deep-link is remote-control-b8d.10's refinement; here we
+    /// simply make sure each active pairing has the token (idempotent — the relay
+    /// overwrites). No-op when nothing is paired.
+    private func registerPushTokenEverywhere(_ token: String) {
+        for store in coordinator.stores {
+            store.registerPushToken(token, environment: pushCoordinator.environment)
         }
     }
 

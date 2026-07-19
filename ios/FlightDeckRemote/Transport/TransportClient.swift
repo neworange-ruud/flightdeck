@@ -66,6 +66,15 @@ actor TransportClient {
     private let identity: DeviceIdentity
     private let keyAgreement: KeyAgreementKeys
     private let recordStore: PairingRecordStore
+    /// The specific pairing this client drives, when the (multi-pairing)
+    /// `TransportCoordinator` instantiates one client per `PairedInstance`
+    /// (remote-control-b8d.5). `nil` keeps the transitional single-pairing
+    /// behavior — the client binds to the first stored record — so existing
+    /// single-store call sites and their tests are unchanged. When set, the
+    /// client loads and persists cursors against *only* that pairing's keyed
+    /// record, so N clients sharing one `PairingRecordStore` never rewrite each
+    /// other's watermarks.
+    private let targetPairingId: String?
     private let connector: any WebSocketConnecting
     private let clientInfo: Wire.ClientInfo
     private let config: Config
@@ -117,6 +126,7 @@ actor TransportClient {
         identity: DeviceIdentity,
         keyAgreement: KeyAgreementKeys,
         recordStore: PairingRecordStore,
+        pairingId: String? = nil,
         connector: any WebSocketConnecting,
         clientInfo: Wire.ClientInfo? = nil,
         config: Config = Config(),
@@ -126,6 +136,7 @@ actor TransportClient {
         self.identity = identity
         self.keyAgreement = keyAgreement
         self.recordStore = recordStore
+        self.targetPairingId = pairingId
         self.connector = connector
         self.clientInfo = clientInfo ?? Wire.ClientInfo(
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
@@ -169,6 +180,20 @@ actor TransportClient {
     /// The current link state (test/inspection convenience).
     func currentLinkState() -> RemoteLinkState { linkState }
 
+    /// The pairing this client is bound to, when instantiated per-`PairedInstance`
+    /// by the coordinator (`nil` for the transitional single-pairing wiring).
+    nonisolated var pairingId: String? { targetPairingId }
+
+    /// Load this client's record: the keyed record for `targetPairingId` when
+    /// the coordinator scoped this client to one pairing, else the transitional
+    /// first-record shim.
+    private func loadRecord() throws -> PairingRecord? {
+        if let targetPairingId {
+            return try recordStore.load(pairingId: targetPairingId)
+        }
+        return try recordStore.load()
+    }
+
     // MARK: - Public command API
 
     /// Seal and send a phone command. Delivery honesty is reported through the
@@ -193,7 +218,7 @@ actor TransportClient {
     // MARK: - Supervisor
 
     private func runSupervisor() async {
-        record = (try? recordStore.load()) ?? nil
+        record = (try? loadRecord()) ?? nil
         guard record != nil else {
             setLink(.disconnected)
             return
@@ -463,9 +488,9 @@ actor TransportClient {
         record.lastReceivedSeq = env.seq
         self.record = record
         if isReset {
-            _ = try? recordStore.resetInboundCursor(to: env.seq)
+            _ = try? recordStore.resetInboundCursor(to: env.seq, pairingId: record.pairingId)
         } else {
-            _ = try? recordStore.setLastReceivedSeq(env.seq)
+            _ = try? recordStore.setLastReceivedSeq(env.seq, pairingId: record.pairingId)
         }
 
         if case let .commandAck(ack) = message {
@@ -529,7 +554,7 @@ actor TransportClient {
         // Commit the outbound cursor only after a successful send (§6.1).
         record.lastSentSeq = next
         self.record = record
-        _ = try? recordStore.setLastSentSeq(next)
+        _ = try? recordStore.setLastSentSeq(next, pairingId: record.pairingId)
 
         if track {
             emit(.delivery(commandId: commandId, state: .sending))
@@ -605,7 +630,7 @@ actor TransportClient {
         guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
         record.lastSentSeq = 0
         self.record = record
-        _ = try? recordStore.resetOutboundCursor()
+        _ = try? recordStore.resetOutboundCursor(pairingId: record.pairingId)
     }
 
     private func shortToken() -> String {

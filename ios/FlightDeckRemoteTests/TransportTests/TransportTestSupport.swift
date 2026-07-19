@@ -66,6 +66,10 @@ actor ScriptedChannel: WebSocketChannel {
 
     /// The outbound frames captured so far.
     func sentFrames() -> [Wire.RelayFrame] { sent }
+
+    /// Whether `close()` has been called (teardown assertion — no lingering
+    /// socket after `stop`/`stopAll`).
+    func isClosed() -> Bool { closed }
 }
 
 /// A `WebSocketConnecting` that hands out scripted channels. By default it
