@@ -146,6 +146,15 @@ extension Wire {
         /// relay -> endpoint. The peer connected or disconnected.
         case peerPresence(pairingId: PairingId, peer: Role,
                           state: PresenceState, atMs: Int64)
+        /// relay -> endpoint (phone only, §5.7 v1 amendment). The desktop's
+        /// human-readable name for this pairing — sent right after the phone
+        /// authenticates (once per activated pairing whose desktop has
+        /// already announced a name) and again whenever the desktop
+        /// (re)connects and announces a name, so a Mac rename propagates on
+        /// its next connect. Untrusted display text: sanitize before display
+        /// (`sanitizeMachineName(_:)`) and treat as the pairing's new
+        /// DEFAULT name — a user override always wins (remote-control-b8d.9).
+        case machineName(pairingId: PairingId, machineName: String)
         /// Both directions. Carries an opaque E2E payload (fields flattened).
         case envelope(EncryptedEnvelope)
         /// Both directions. Cumulative ack up to and including `cursor`.
@@ -169,6 +178,7 @@ extension Wire {
         private enum CodingKeys: String, CodingKey {
             case type, role, client, nonce, signature, peer, state, cursor
             case token, environment, code, message, reason
+            case machineName = "machine_name"
             case protocolVersion = "protocol_version"
             case deviceId = "device_id"
             case serverTimeMs = "server_time_ms"
@@ -251,6 +261,10 @@ extension Wire {
                     peer: try c.decode(Role.self, forKey: .peer),
                     state: try c.decode(PresenceState.self, forKey: .state),
                     atMs: try c.decode(Int64.self, forKey: .atMs))
+            case "machine_name":
+                self = .machineName(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId),
+                    machineName: try c.decode(String.self, forKey: .machineName))
             case "envelope":
                 self = .envelope(try EncryptedEnvelope(from: decoder)) // flattened
             case "ack":
@@ -352,6 +366,10 @@ extension Wire {
                 try c.encode(peer, forKey: .peer)
                 try c.encode(state, forKey: .state)
                 try c.encode(atMs, forKey: .atMs)
+            case let .machineName(pairingId, machineName):
+                try c.encode("machine_name", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+                try c.encode(machineName, forKey: .machineName)
             case let .envelope(envelope):
                 try c.encode("envelope", forKey: .type)
                 try envelope.encode(to: encoder) // flattened
@@ -388,5 +406,28 @@ extension Wire {
                 try c.encode(reason, forKey: .reason) // explicit null
             }
         }
+    }
+
+    // MARK: - Machine name sanitization (§5.7)
+
+    /// Maximum machine-name length (REMOTE_PROTOCOL §5.7) — matches the
+    /// relay's own bound (`remote/relay/src/session.rs::MAX_MACHINE_NAME_CHARS`).
+    static let maxMachineNameLength = 64
+
+    /// Trim and length-bound a `machine_name` frame's value before it is ever
+    /// stored or displayed. The value is untrusted display text from the
+    /// desktop; the relay already trims + bounds it to
+    /// `maxMachineNameLength` characters, but the phone re-applies the same
+    /// rule (belt-and-suspenders — never trust the wire further than the
+    /// contract promises). Mirrors the relay's `bound_machine_name`.
+    ///
+    /// An all-whitespace/empty result is treated as "no name" (`nil`) — the
+    /// relay's own `bound_machine_name` never forwards one, but a caller that
+    /// keeps `nil` here simply falls back to the previous/fallback name
+    /// rather than overwriting it with blank text.
+    static func sanitizeMachineName(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(maxMachineNameLength))
     }
 }

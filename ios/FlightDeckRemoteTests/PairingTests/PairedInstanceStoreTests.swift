@@ -185,6 +185,27 @@ struct PairedInstanceStoreTests {
         #expect(store.list.first?.userOverrideName == nil)
     }
 
+    /// remote-control-b8d.9 acceptance criterion: clearing an override on a
+    /// pairing that already has a desktop-reported name must fall BACK to
+    /// that name, not to the generic fallback — `userOverrideName` and
+    /// `machineNameFromDesktop` are independent fields, so clearing one must
+    /// never disturb the other.
+    @Test func clearingOverrideFallsBackToTheDesktopNameRatherThanTheGenericFallback() {
+        let store = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        store.add(makeInstance(
+            pairingId: "pair-1",
+            machineNameFromDesktop: "Ruud's MacBook Pro",
+            userOverrideName: "Home Studio Mac"
+        ))
+        #expect(store.list.first?.displayName == "Home Studio Mac")
+
+        store.setOverrideName(pairingId: "pair-1", nil)
+
+        #expect(store.list.first?.userOverrideName == nil)
+        #expect(store.list.first?.machineNameFromDesktop == "Ruud's MacBook Pro", "clearing the override must not touch the desktop name")
+        #expect(store.list.first?.displayName == "Ruud's MacBook Pro")
+    }
+
     @Test func setMutePushPersists() {
         let provider = InMemoryPairedInstancesProvider()
         let store = PairingStore(instancesStorage: provider)

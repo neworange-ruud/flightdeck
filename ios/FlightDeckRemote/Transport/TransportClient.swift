@@ -363,6 +363,18 @@ actor TransportClient {
             emit(.presence(peer: peer, connected: connected))
             return true
 
+        case let .machineName(pairingId, name):
+            // Defensive: only apply a name announced for OUR pairing (this
+            // client is scoped to exactly one pairing/record — b8d.5).
+            guard record?.pairingId == pairingId.rawValue else { return true }
+            // Sanitize/bound before it ever reaches the store (§5.7): an
+            // all-whitespace result reads as "no name" and is dropped rather
+            // than clobbering the previous/fallback display name.
+            if let sanitized = Wire.sanitizeMachineName(name) {
+                emit(.machineName(sanitized))
+            }
+            return true
+
         case let .envelope(env):
             await handleEnvelope(env, on: ch)
             return true

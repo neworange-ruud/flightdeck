@@ -141,6 +141,41 @@ struct ProtocolFixtureConformanceTests {
             text: "Yes, run it. Then rebuild."))
     }
 
+    @Test func machineNameFrameDecodesPairingIdAndName() throws {
+        let data = try fixture("relay", "machine_name")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .machineName(pairingId, machineName) = frame else {
+            Issue.record("expected .machineName, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+        #expect(machineName == "Ruud's MacBook Pro")
+    }
+
+    // MARK: - Machine-name sanitization (§5.7, remote-control-b8d.9)
+
+    @Test func sanitizeMachineNameTrimsSurroundingWhitespace() {
+        #expect(Wire.sanitizeMachineName("  Ruud's Mac  ") == "Ruud's Mac")
+    }
+
+    @Test func sanitizeMachineNameTreatsEmptyOrWhitespaceAsNoName() {
+        #expect(Wire.sanitizeMachineName("") == nil)
+        #expect(Wire.sanitizeMachineName("   ") == nil)
+        #expect(Wire.sanitizeMachineName("\n\t ") == nil)
+    }
+
+    @Test func sanitizeMachineNameBoundsToSixtyFourCharacters() throws {
+        let long = String(repeating: "a", count: 200)
+        let bounded = try #require(Wire.sanitizeMachineName(long))
+        #expect(bounded.count == 64)
+        #expect(bounded == String(repeating: "a", count: 64))
+    }
+
+    @Test func sanitizeMachineNameLeavesAShortNameUntouched() {
+        #expect(Wire.sanitizeMachineName("Work Mac") == "Work Mac")
+    }
+
     @Test func envelopeFrameFlattensEncryptedEnvelope() throws {
         let data = try fixture("relay", "envelope")
         let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)

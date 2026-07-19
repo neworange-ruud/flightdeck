@@ -88,7 +88,12 @@ enum TransportStoreFactory {
                 isUITestLaunch
                     ? nil
                     : SnapshotCache(fileURL: SnapshotCache.fileURL(forPairingId: pairingId))
-            }
+            },
+            // Desktop-announced machine names write back into the SAME
+            // `pairingStore` the caller passed in, so a Mac rename +
+            // reconnect auto-updates `PairedInstance.machineNameFromDesktop`
+            // app-wide (remote-control-b8d.9).
+            pairingStore: pairingStore
         )
         if !isUITestLaunch {
             seedLegacyInstanceIfNeeded(into: pairingStore, recordStore: recordStore)

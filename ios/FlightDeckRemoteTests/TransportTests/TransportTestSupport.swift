@@ -124,6 +124,10 @@ final class EventCollector: @unchecked Sendable {
         events.compactMap { if case let .link(s) = $0 { return s }; return nil }
     }
 
+    var machineNames: [String] {
+        events.compactMap { if case let .machineName(name) = $0 { return name }; return nil }
+    }
+
     func deliveries(for id: Wire.CommandId) -> [CommandDeliveryState] {
         events.compactMap {
             if case let .delivery(cid, state) = $0, cid == id { return state }

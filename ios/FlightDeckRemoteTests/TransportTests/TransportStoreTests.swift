@@ -167,4 +167,44 @@ import Foundation
         #expect(handle.delivery == .delivered(.applied))
         await client.stop()
     }
+
+    // MARK: - Machine name (REMOTE_PROTOCOL §5.7, remote-control-b8d.9)
+
+    @Test func foldsMachineNameEventIntoObservableProperty() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let (store, client) = try makeStore(keychain: keychain, channel: channel, peer: peer, ka: ka)
+        await store.start()
+        await handshake(channel, store: store)
+
+        #expect(store.machineName == nil)
+
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: "Ruud's MacBook Pro"))
+        _ = await waitUntilMain { store.machineName != nil }
+
+        #expect(store.machineName == "Ruud's MacBook Pro")
+        await client.stop()
+    }
+
+    @Test func aRenameOnTheDesktopUpdatesTheFoldedMachineName() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let (store, client) = try makeStore(keychain: keychain, channel: channel, peer: peer, ka: ka)
+        await store.start()
+        await handshake(channel, store: store)
+
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: "Old Name"))
+        _ = await waitUntilMain { store.machineName == "Old Name" }
+
+        // The desktop renamed and re-announced on the SAME live session (or a
+        // reconnect would send it again post-auth_ok either way) — the folded
+        // property must move to the new value, not stick with the first one.
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: "New Name"))
+        _ = await waitUntilMain { store.machineName == "New Name" }
+
+        #expect(store.machineName == "New Name")
+        await client.stop()
+    }
 }

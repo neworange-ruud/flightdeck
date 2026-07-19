@@ -52,6 +52,13 @@ final class TransportStore {
     private(set) var latencyMs: Int = 0
     /// Whether the peer (desktop) is currently present (nil = unknown).
     private(set) var peerConnected: Bool?
+    /// The desktop's most recently announced machine name for this pairing
+    /// (REMOTE_PROTOCOL §5.7, remote-control-b8d.9) — already sanitized/
+    /// bounded by `TransportClient`. `nil` until the first post-auth
+    /// `machine_name` frame arrives. Consumers write this back into
+    /// `PairedInstance.machineNameFromDesktop` via `PairingStore.setMachineName`
+    /// (see `TransportCoordinator`'s machine-name write-back).
+    private(set) var machineName: String?
 
     /// The current full state, folded from `snapshot` + incremental deltas.
     private(set) var snapshot: Wire.StateSnapshot?
@@ -239,6 +246,8 @@ final class TransportStore {
             if case let .connected(latency) = state { latencyMs = latency }
         case let .presence(_, connected):
             peerConnected = connected
+        case let .machineName(name):
+            machineName = name
         case let .delivery(commandId, state):
             commandHandles[commandId]?.delivery = state
         case let .message(message):

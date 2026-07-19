@@ -47,6 +47,11 @@ enum TransportEvent: Sendable {
     case delivery(commandId: Wire.CommandId, state: CommandDeliveryState)
     /// The peer's presence changed (drives the paused-command / reconnecting UI).
     case presence(peer: Wire.Role, connected: Bool)
+    /// The desktop announced (or re-announced) this pairing's machine name
+    /// (REMOTE_PROTOCOL §5.7, remote-control-b8d.9). Already sanitized/bounded
+    /// by the time it's emitted — see `TransportClient`'s `machine_name`
+    /// handling. The new DEFAULT display name; a user override still wins.
+    case machineName(String)
 }
 
 /// The reconnect backoff schedule (REMOTE_PROTOCOL §5.3): exponential from a 1s

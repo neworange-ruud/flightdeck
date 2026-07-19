@@ -54,8 +54,10 @@ import CryptoKit
 
     /// Build a coordinator over an in-memory keychain with one saved
     /// `PairingRecord` + `PairedInstance` per id, all sharing the phone's single
-    /// identity + KA key.
-    private func makeHarness(pairingIds: [String], cap: Int = 4) throws -> Harness {
+    /// identity + KA key. `pairingStore`, when supplied, arms the machine-name
+    /// write-back (remote-control-b8d.9) — omitted by every OTHER test in this
+    /// file so their assertions are unaffected.
+    private func makeHarness(pairingIds: [String], cap: Int = 4, pairingStore: PairingStore? = nil) throws -> Harness {
         let keychain = InMemoryKeychainStore()
         let identity = try DeviceIdentity.loadOrCreate(store: keychain)
         let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
@@ -89,6 +91,7 @@ import CryptoKit
             connectorFactory: { book.connector() },
             cap: cap,
             clientConfig: config,
+            pairingStore: pairingStore,
             now: { 1_752_000_100_000 }
         )
         return Harness(
@@ -283,5 +286,102 @@ import CryptoKit
         )
 
         #expect(coordinator.cap == PairingLimits.maxPairedInstances)
+    }
+
+    // MARK: - Machine-name write-back into PairingStore (remote-control-b8d.9)
+
+    @Test func desktopAnnouncedNameWritesBackIntoPairingStoreAsTheDefault() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(
+            pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Ruud's MacBook Pro"
+        }
+        let instance = try #require(pairingStore.list.first { $0.pairingId == "pair_a" })
+        #expect(instance.machineNameFromDesktop == "Ruud's MacBook Pro")
+        #expect(instance.displayName == "Ruud's MacBook Pro")
+    }
+
+    @Test func reconnectWithANewDesktopNameUpdatesTheDefaultAgain() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "Old Name"))
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Old Name"
+        }
+
+        // The Mac was renamed and re-announces on its next connect (§5.7)
+        // simulated here on the SAME live session for brevity — the client
+        // handles it identically whether it arrives on this session or a
+        // fresh one after a real reconnect.
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "New Name"))
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "New Name"
+        }
+
+        #expect(pairingStore.list.first { $0.pairingId == "pair_a" }?.displayName == "New Name")
+    }
+
+    @Test func userOverridePersistsAndWinsEvenAfterADesktopRename() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        pairingStore.setOverrideName(pairingId: "pair_a", "Home Studio Mac")
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(
+            pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+        // The desktop default DOES still update underneath (it's a separate
+        // field) — wait for that write, then assert the override still wins.
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Ruud's MacBook Pro"
+        }
+
+        let instance = try #require(pairingStore.list.first { $0.pairingId == "pair_a" })
+        #expect(instance.userOverrideName == "Home Studio Mac")
+        #expect(instance.displayName == "Home Studio Mac", "a user override must always win over the desktop name")
+
+        // Clearing the override falls back to the (already-updated) desktop name.
+        pairingStore.setOverrideName(pairingId: "pair_a", nil)
+        #expect(pairingStore.list.first { $0.pairingId == "pair_a" }?.displayName == "Ruud's MacBook Pro")
+    }
+
+    @Test func withNoPairingStoreSuppliedMachineNameIsNeverWrittenBack() async throws {
+        // Every other test in this file omits `pairingStore:` — this just
+        // makes the "opt-in, no-op otherwise" contract explicit and exercises
+        // it against a live machine_name frame instead of only by omission.
+        let h = try makeHarness(pairingIds: ["pair_a"]) // no pairingStore
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_a")?.machineName == "Ruud's MacBook Pro" }
+
+        // The per-instance store still folds it locally...
+        #expect(h.coordinator.store(for: "pair_a")?.machineName == "Ruud's MacBook Pro")
+        // ...but with no `PairingStore` to write back into, nothing crashes
+        // and there's simply nowhere for it to persist (verified indirectly:
+        // the coordinator's own `handles[0].instance` snapshot, refreshed only
+        // by `reconcile`, is untouched).
+        #expect(h.coordinator.handles.first?.instance.machineNameFromDesktop == nil)
     }
 }

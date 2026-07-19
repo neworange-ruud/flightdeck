@@ -30,6 +30,14 @@
 import SwiftUI
 import LocalAuthentication
 
+/// Identifies which paired machine's row requested `MachineRenameSheet`
+/// (remote-control-b8d.9). Exists purely so `.sheet(item:)` — which requires
+/// `Identifiable` — can present it; `id` is just the pairing id itself.
+struct RenamingMachine: Identifiable, Equatable {
+    let pairingId: String
+    var id: String { pairingId }
+}
+
 /// Pure presentation logic for the "Require Face ID to open" row, factored
 /// out so it's unit-testable without instantiating the view (mirrors
 /// `ConnectionLatencyPhrase` in ConnectionIndicator.swift).
@@ -69,6 +77,11 @@ struct SettingsView: View {
     // so a completed add is visible here immediately (e.g. `machinesSection`'s
     // count).
     @State private var isPresentingAddMachine = false
+    // Per-machine rename affordance (remote-control-b8d.9): the pairingId of
+    // the row currently presenting `MachineRenameSheet`, or `nil` when none.
+    // Wrapped in `RenamingMachine` (rather than a bare `String`) purely so
+    // `.sheet(item:)` has the `Identifiable` conformance it requires.
+    @State private var renamingMachine: RenamingMachine?
 
     init(
         router: AppRouter,
@@ -105,21 +118,38 @@ struct SettingsView: View {
         .sheet(isPresented: $isPresentingAddMachine) {
             AddMachineSheet(pairingStore: router.pairingStore)
         }
+        .sheet(item: $renamingMachine) { machine in
+            MachineRenameSheet(pairingStore: router.pairingStore, pairingId: machine.pairingId)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("SettingsView")
     }
 
-    // MARK: - Machines (remote-control-b8d.7 Add-machine entry point)
+    // MARK: - Machines (remote-control-b8d.7 Add-machine entry point + b8d.9 rename)
 
-    /// "Add machine" reachable from Settings while already paired — the
-    /// other entry point is the feed toolbar (today `ProjectsListView`'s
-    /// header, until remote-control-b8d.8's unified feed owns its own).
-    /// Shows the live count against the shared cap (`PairingLimits.maxPairedInstances`)
-    /// so "why is Add machine greyed out" is self-explanatory without opening
+    /// Every paired machine (remote-control-b8d.9), each tappable to rename,
+    /// plus the "Add machine" row (remote-control-b8d.7) reachable from
+    /// Settings while already paired — the other Add-machine entry point is
+    /// the feed toolbar (today `ProjectsListView`'s header, until remote-
+    /// control-b8d.8's unified feed owns its own). The Add row shows the live
+    /// count against the shared cap (`PairingLimits.maxPairedInstances`) so
+    /// "why is Add machine greyed out" is self-explanatory without opening
     /// the sheet.
     private var machinesSection: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
             sectionHeader("Machines")
+
+            if !router.pairingStore.list.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(router.pairingStore.list.enumerated()), id: \.element.pairingId) { index, instance in
+                        if index != 0 { rowDivider }
+                        machineRow(for: instance)
+                    }
+                }
+                .cardStyle()
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("settings-machines-card")
+            }
 
             Button {
                 isPresentingAddMachine = true
@@ -140,6 +170,32 @@ struct SettingsView: View {
             .cardStyle()
             .accessibilityIdentifier("settings-add-machine-button")
         }
+    }
+
+    /// One row per paired machine: its resolved display name (override >
+    /// desktop-reported > generic fallback, `PairedInstance.displayName`) plus
+    /// an online/offline dot, tappable to open `MachineRenameSheet`.
+    private func machineRow(for instance: PairedInstance) -> some View {
+        Button {
+            renamingMachine = RenamingMachine(pairingId: instance.pairingId)
+        } label: {
+            HStack(spacing: Theme.Spacing.md) {
+                Circle()
+                    .fill(instance.lastKnownOnline ? Theme.statusIdle : Theme.textMutedDark)
+                    .frame(width: 8, height: 8)
+                Text(instance.displayName)
+                    .typography(Typography.body)
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(Theme.textMutedDark)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .padding(Theme.Spacing.lg)
+        .accessibilityIdentifier("settings-machine-row-\(instance.pairingId)")
     }
 
     // MARK: - Connection

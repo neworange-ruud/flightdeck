@@ -41,6 +41,18 @@
 //  coordinator via `store(for:)`), `primaryStore` exposes the first active
 //  instance's store so `MainTabView` keeps working unchanged.
 //
+//  Machine-name write-back (remote-control-b8d.9): each `TransportStore`
+//  folds its client's `machine_name` frames into `TransportStore.machineName`
+//  (REMOTE_PROTOCOL §5.7). When constructed with a `pairingStore`, this
+//  coordinator mirrors that value into `PairedInstance.machineNameFromDesktop`
+//  the moment it changes — on the initial post-auth announcement, and again
+//  on every reconnect/rename — via `armMachineNameObservation()`, the same
+//  self-perpetuating `withObservationTracking` shape `FeedStore` uses to
+//  write `lastKnownOnline` back (b8d.6). `PairingStore.setMachineName` only
+//  ever touches `machineNameFromDesktop`; a user's `userOverrideName` is a
+//  separate field untouched by this path, so it keeps winning in
+//  `displayName` regardless of what the desktop announces.
+//
 
 import Foundation
 import Observation
@@ -83,6 +95,16 @@ final class TransportCoordinator {
     private let identity: DeviceIdentity
     private let keyAgreement: KeyAgreementKeys
     private let recordStore: PairingRecordStore
+    /// Optional write-back target for the desktop-announced machine name
+    /// (REMOTE_PROTOCOL §5.7, remote-control-b8d.9): `nil` in every existing/
+    /// unit-test construction that doesn't pass one, so this coordinator's
+    /// core connectivity behavior is unaffected either way. When set, every
+    /// handle's `TransportStore.machineName` is mirrored into
+    /// `PairedInstance.machineNameFromDesktop` via `PairingStore.setMachineName`
+    /// the moment it changes — see `armMachineNameObservation()`. Mirrors
+    /// `FeedStore.armOnlineObservation`'s write-back shape (b8d.6) for the
+    /// *online* flag; this is the same pattern for the *name*.
+    private let pairingStore: PairingStore?
     /// A fresh `WebSocketConnecting` per client, so each pairing owns an
     /// independent socket. A closure (not a shared instance) keeps the clients
     /// from contending on one connector.
@@ -115,6 +137,7 @@ final class TransportCoordinator {
         cacheFactory: @escaping @MainActor @Sendable (String) -> SnapshotCache? = { _ in nil },
         cap: Int = PairingLimits.maxPairedInstances,
         clientConfig: TransportClient.Config = TransportClient.Config(),
+        pairingStore: PairingStore? = nil,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
         self.identity = identity
@@ -124,6 +147,7 @@ final class TransportCoordinator {
         self.cacheFactory = cacheFactory
         self.cap = cap
         self.clientConfig = clientConfig
+        self.pairingStore = pairingStore
         self.now = now
         // A recordless store (pairingId that can never match a stored record):
         // its client's supervisor loads nothing and stays disconnected.
@@ -140,6 +164,47 @@ final class TransportCoordinator {
             cache: nil,
             now: now
         )
+        if pairingStore != nil {
+            armMachineNameObservation()
+        }
+    }
+
+    // MARK: - Machine-name write-back (remote-control-b8d.9)
+
+    /// Arm a one-shot observation over every handle's `machineName` (and the
+    /// handle set itself, so machines added/removed by `reconcile` are picked
+    /// up too). On any change it writes the fresh names back into
+    /// `pairingStore` and re-arms — the same self-perpetuating reactive shape
+    /// as `FeedStore.armOnlineObservation` (b8d.6), applied to the desktop-
+    /// announced name instead of the online flag. No-op (never armed) when no
+    /// `pairingStore` was supplied.
+    private func armMachineNameObservation() {
+        withObservationTracking {
+            for handle in handles {
+                _ = handle.store.machineName
+            }
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.writeBackMachineNames()
+                self.armMachineNameObservation()
+            }
+        }
+    }
+
+    /// Mirror each handle's live `TransportStore.machineName` into
+    /// `PairedInstance.machineNameFromDesktop` (never overwriting a user
+    /// override — `PairingStore.setMachineName` only ever touches
+    /// `machineNameFromDesktop`, and `displayName`'s precedence keeps the
+    /// override winning regardless). `nil` (no name announced yet) is left
+    /// alone rather than clobbering whatever the store already has.
+    private func writeBackMachineNames() {
+        guard let pairingStore else { return }
+        for handle in handles {
+            if let name = handle.store.machineName {
+                pairingStore.setMachineName(pairingId: handle.pairingId, name)
+            }
+        }
     }
 
     // MARK: - Lookup (downstream API: b8d.6 feed, b8d.12 detail views)
