@@ -747,6 +747,9 @@ impl Connection {
                 self.send(RelayFrame::PushTokenAck { pairing_id }).await;
                 Flow::Continue
             }
+            RelayFrame::UnregisterPushToken { pairing_id } => {
+                self.on_unregister_push_token(pairing_id).await
+            }
             // A desktop already authed may offer additional pairings (e.g. to
             // pair another phone) without reconnecting.
             RelayFrame::PairingOffer {
@@ -832,6 +835,45 @@ impl Connection {
                 Flow::Continue
             }
         }
+    }
+
+    /// Handle a phone-initiated push-token deregistration (spec §5.5).
+    ///
+    /// Removes the pairing's APNs token **without** unpairing, so a phone can mute
+    /// this pairing's pushes and keep the pairing. Mirrors [`Self::on_revoke`]'s
+    /// membership invariant: only a member of `pairing_id` may unregister its
+    /// token; a non-member (or an unknown pairing) is refused with
+    /// `unknown_pairing` and nothing changes. Removal is idempotent — a member
+    /// unregistering when no token is stored still succeeds with `push_token_ack`.
+    async fn on_unregister_push_token(&mut self, pairing_id: PairingId) -> Flow {
+        let device_id = match &self.phase {
+            Phase::Authed { device_id, .. } => device_id.clone(),
+            _ => unreachable!("on_unregister_push_token only called in Authed"),
+        };
+
+        // Membership check (same invariant the revoke path enforces): only a
+        // member of the pairing may touch its push token. An unknown pairing has
+        // no members, so it is refused the same way.
+        let is_member = self
+            .state
+            .store
+            .pairing_members(&pairing_id)
+            .await
+            .is_some_and(|m| m.contains(&device_id));
+        if !is_member {
+            self.send_error(
+                RelayErrorCode::UnknownPairing,
+                "not a member of this pairing",
+                Some(pairing_id),
+            )
+            .await;
+            return Flow::Continue;
+        }
+
+        // Idempotent: removing an absent token is a success no-op.
+        self.state.store.unregister_push_token(&pairing_id).await;
+        self.send(RelayFrame::PushTokenAck { pairing_id }).await;
+        Flow::Continue
     }
 
     async fn on_envelope(&mut self, env: EncryptedEnvelope) -> Flow {

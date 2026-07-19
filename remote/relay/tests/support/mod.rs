@@ -14,7 +14,7 @@ use flightdeck_relay::{
     config::{Config, LogFormat},
 };
 use flightdeck_remote_protocol::{
-    ClientInfo, DeviceId, PairingId, RelayFrame, Role, PROTOCOL_VERSION,
+    ApnsEnvironment, ClientInfo, DeviceId, PairingId, RelayFrame, Role, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
@@ -291,6 +291,29 @@ impl TestClient {
     /// Send a phone-initiated revoke for `pairing` (spec §10.2).
     pub async fn revoke(&mut self, pairing: &PairingId) {
         self.send(RelayFrame::Revoke {
+            pairing_id: pairing.clone(),
+        })
+        .await;
+    }
+
+    /// Register/refresh an APNs push token for `pairing` (spec §5.5).
+    pub async fn register_push_token(
+        &mut self,
+        pairing: &PairingId,
+        token: &str,
+        environment: ApnsEnvironment,
+    ) {
+        self.send(RelayFrame::RegisterPushToken {
+            pairing_id: pairing.clone(),
+            token: token.to_string(),
+            environment,
+        })
+        .await;
+    }
+
+    /// Deregister the APNs push token for `pairing` without unpairing (spec §5.5).
+    pub async fn unregister_push_token(&mut self, pairing: &PairingId) {
+        self.send(RelayFrame::UnregisterPushToken {
             pairing_id: pairing.clone(),
         })
         .await;

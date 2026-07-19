@@ -6,8 +6,8 @@
 mod support;
 
 use flightdeck_remote_protocol::{
-    ClientInfo, DeviceId, EncryptedEnvelope, PairingId, PresenceState, RelayErrorCode, RelayFrame,
-    Role,
+    ApnsEnvironment, ClientInfo, DeviceId, EncryptedEnvelope, PairingId, PresenceState,
+    RelayErrorCode, RelayFrame, Role,
 };
 use futures_util::{SinkExt, StreamExt};
 use support::{bogus_signature, spawn_app, spawn_app_with, TestClient};
@@ -753,5 +753,122 @@ async fn revoke_is_idempotent() {
     assert!(matches!(
         again,
         RelayFrame::PairingRevoked { pairing_id } if pairing_id == pairing
+    ));
+}
+
+// ── push-token deregistration / per-machine mute (spec §5.5) ─────────────────
+
+/// A member phone registers then unregisters a pairing's push token: the relay
+/// acks both, the pairing survives (unlike revoke), and the token is gone — so an
+/// offline-phone envelope no longer wakes it via push.
+#[tokio::test]
+async fn member_unregisters_push_token_without_unpairing() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // Register, then unregister — both confirmed with push_token_ack.
+    phone
+        .register_push_token(&pairing, "apns-tok", ApnsEnvironment::Production)
+        .await;
+    let ack = phone
+        .recv_until(|f| matches!(f, RelayFrame::PushTokenAck { .. }))
+        .await;
+    assert!(matches!(
+        ack,
+        RelayFrame::PushTokenAck { pairing_id } if pairing_id == pairing
+    ));
+
+    phone.unregister_push_token(&pairing).await;
+    let ack = phone
+        .recv_until(|f| matches!(f, RelayFrame::PushTokenAck { .. }))
+        .await;
+    assert!(matches!(
+        ack,
+        RelayFrame::PushTokenAck { pairing_id } if pairing_id == pairing
+    ));
+
+    // The pairing still routes: a desktop→phone envelope arrives (not unpaired).
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 1, "still-paired"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 1);
+}
+
+/// Unregistering a pairing that has no token stored is an idempotent success:
+/// the relay still confirms with push_token_ack and never errors.
+#[tokio::test]
+async fn unregister_push_token_is_idempotent() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // No token was ever registered → still a success ack.
+    phone.unregister_push_token(&pairing).await;
+    let ack = phone
+        .recv_until(|f| matches!(f, RelayFrame::PushTokenAck { .. }))
+        .await;
+    assert!(matches!(
+        ack,
+        RelayFrame::PushTokenAck { pairing_id } if pairing_id == pairing
+    ));
+
+    // A second unregister of the still-absent token also succeeds.
+    phone.unregister_push_token(&pairing).await;
+    let ack = phone
+        .recv_until(|f| matches!(f, RelayFrame::PushTokenAck { .. }))
+        .await;
+    assert!(matches!(
+        ack,
+        RelayFrame::PushTokenAck { pairing_id } if pairing_id == pairing
+    ));
+}
+
+/// A non-member device cannot unregister a pairing's push token: the relay
+/// refuses with `unknown_pairing` (mirroring revoke) and the token survives.
+#[tokio::test]
+async fn non_member_cannot_unregister_push_token() {
+    let base = spawn_app().await;
+
+    // Victim pairing with a registered token.
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+    phone
+        .register_push_token(&pairing, "apns-tok", ApnsEnvironment::Sandbox)
+        .await;
+    let _ = phone
+        .recv_until(|f| matches!(f, RelayFrame::PushTokenAck { .. }))
+        .await;
+
+    // A stranger authenticates via its OWN pairing, then tries to unregister the
+    // victim pairing's token.
+    let mut stranger = TestClient::connect(&base, Role::Desktop, "dev_stranger").await;
+    let (stranger_pairing, _tok) = stranger.offer_pairing().await;
+    stranger.authenticate(vec![stranger_pairing.clone()]).await;
+    stranger.unregister_push_token(&pairing).await;
+
+    let err = stranger
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    assert!(matches!(
+        err,
+        RelayFrame::Error {
+            code: RelayErrorCode::UnknownPairing,
+            ..
+        }
     ));
 }

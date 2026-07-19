@@ -158,6 +158,14 @@ pub trait RelayStore: Send + Sync {
     /// Store/refresh a pairing's APNs push token (opaque; never encrypted).
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment);
 
+    /// Remove a pairing's APNs push token, if any, **without** touching the
+    /// pairing itself (spec §5.5). Backs [`crate::session`]'s
+    /// `unregister_push_token` handling so a phone can mute this pairing's pushes
+    /// while staying paired. **Idempotent**: removing an absent token is a no-op.
+    /// Membership is verified by the session before this is called (this method
+    /// only mutates the token slot).
+    async fn unregister_push_token(&self, pairing: &PairingId);
+
     /// The pairing's registered APNs token + environment, if any. Read by the
     /// envelope path to wake an offline phone via push (spec §5.5/§11).
     async fn push_token(&self, pairing: &PairingId) -> Option<(String, ApnsEnvironment)>;
@@ -374,6 +382,11 @@ impl RelayStore for InMemoryStore {
         self.lock().push_tokens.insert(pairing, (token, env));
     }
 
+    async fn unregister_push_token(&self, pairing: &PairingId) {
+        // Idempotent: `HashMap::remove` on an absent key is a no-op.
+        self.lock().push_tokens.remove(pairing);
+    }
+
     async fn push_token(&self, pairing: &PairingId) -> Option<(String, ApnsEnvironment)> {
         self.lock().push_tokens.get(pairing).cloned()
     }
@@ -458,6 +471,28 @@ mod tests {
             store.push_token(&pairing).await,
             Some(("tok_b".into(), ApnsEnvironment::Production))
         );
+    }
+
+    #[tokio::test]
+    async fn unregister_push_token_removes_and_is_idempotent() {
+        let store = InMemoryStore::new(1000);
+        let pairing = PairingId::new("pair");
+
+        // Unregistering when nothing is stored is a success no-op.
+        store.unregister_push_token(&pairing).await;
+        assert_eq!(store.push_token(&pairing).await, None);
+
+        // Register, then remove.
+        store
+            .register_push_token(pairing.clone(), "tok".into(), ApnsEnvironment::Production)
+            .await;
+        assert!(store.push_token(&pairing).await.is_some());
+        store.unregister_push_token(&pairing).await;
+        assert_eq!(store.push_token(&pairing).await, None);
+
+        // A second removal of the now-absent token is still a no-op.
+        store.unregister_push_token(&pairing).await;
+        assert_eq!(store.push_token(&pairing).await, None);
     }
 
     #[tokio::test]

@@ -390,9 +390,28 @@ pub enum RelayFrame {
         environment: ApnsEnvironment,
     },
 
-    /// relay -> endpoint. Confirms a push token was stored.
+    /// relay -> endpoint. Confirms a push token was stored **or removed** — the
+    /// shared confirmation for both [`Self::RegisterPushToken`] and
+    /// [`Self::UnregisterPushToken`] (both act on the same per-pairing token
+    /// slot, so one ack keeps the wire minimal and symmetric).
     PushTokenAck {
-        /// Pairing the token was stored for.
+        /// Pairing the token was stored/removed for.
+        pairing_id: PairingId,
+    },
+
+    /// phone -> relay. Deregisters the pairing's APNs token **without unpairing**
+    /// (spec §5.5), so a phone can stop this pairing's pushes (e.g. a per-machine
+    /// push mute) while keeping the pairing itself intact. The relay **must**
+    /// verify the authenticated device is a member of `pairing_id` before
+    /// removing anything — a non-member's request is refused with
+    /// `error { code: unknown_pairing }` and changes nothing, mirroring
+    /// [`Self::Revoke`]'s membership invariant. Removal is **idempotent**:
+    /// unregistering when no token is stored is a success no-op. On success the
+    /// relay drops the token and confirms with [`Self::PushTokenAck`]. Only this
+    /// pairing's token is affected; the device's other pairings are untouched and
+    /// the pairing stays paired (unlike [`Self::Revoke`]).
+    UnregisterPushToken {
+        /// Pairing whose push token should be removed.
         pairing_id: PairingId,
     },
 

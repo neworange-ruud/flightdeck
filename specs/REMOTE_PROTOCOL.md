@@ -252,6 +252,26 @@ The APNs token is **opaque and outside E2E** — the relay/desktop use it to dri
 notifications when an agent finishes or needs input (PRD §9.1). `environment` is
 `sandbox` | `production`.
 
+**Deregistration (per-machine push mute).** A phone can drop a pairing's token
+**without unpairing** so it stops that pairing's pushes while keeping the pairing:
+
+```
+phone → relay : unregister_push_token { pairing_id }
+relay → phone : push_token_ack { pairing_id }   // shared ack, confirms removal
+```
+
+- **Membership check (mandatory).** The relay **must** verify the authenticated
+  `device_id` is a member of `pairing_id` before removing anything. A
+  **non-member** (or an unknown pairing, which has no members) is refused with
+  `error { code: unknown_pairing, pairing_id }` and changes nothing — the same
+  invariant `revoke` (§5.8) enforces.
+- **Idempotent.** Unregistering when no token is stored is a **success no-op**:
+  the relay still replies `push_token_ack { pairing_id }` and never errors.
+- **Scope.** Only this pairing's token is cleared; the pairing itself and the
+  device's other pairings are untouched (unlike `revoke`, which deletes the
+  pairing). `push_token_ack` is reused as the confirmation for both
+  `register_push_token` and `unregister_push_token`.
+
 ### 5.6 Errors & shutdown
 
 - `error { code, message, pairing_id? }` — machine-readable `RelayErrorCode`
