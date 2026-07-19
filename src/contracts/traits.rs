@@ -82,6 +82,24 @@ pub trait GitExecutor {
     /// Must only be reached after the clean-tree precondition check in the git
     /// workflow layer.
     fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome>;
+    /// Stash the working tree's *tracked* uncommitted changes (`git stash push`)
+    /// so a subsequent [`pull_base`](GitExecutor::pull_base) can run on a clean
+    /// tree, then be restored with [`stash_apply`](GitExecutor::stash_apply).
+    /// Returns `true` if a stash entry was actually created, `false` if there
+    /// was nothing to stash (e.g. the tree was dirty only with untracked files,
+    /// which do not block a rebase). Stashing does not touch commit history, so
+    /// it is not a SPECS §5 history-rewriting op — it only ever preserves and
+    /// restores the user's own uncommitted changes around Pull base (§5.2).
+    fn stash_push(&self, cwd: &Path) -> Result<bool>;
+    /// Re-apply the most recent stash entry (`git stash apply`, keeping the
+    /// entry) after a [`pull_base`](GitExecutor::pull_base). Returns `true` if
+    /// it applied cleanly, `false` on conflict — in which case the caller leaves
+    /// the entry in place so the user can recover their changes by hand.
+    fn stash_apply(&self, cwd: &Path) -> Result<bool>;
+    /// Drop the most recent stash entry (`git stash drop`). Called only after a
+    /// clean [`stash_apply`](GitExecutor::stash_apply) to remove the now-restored
+    /// entry.
+    fn stash_drop(&self, cwd: &Path) -> Result<()>;
 }
 
 /// Abstraction over filesystem operations (SPECS §26).

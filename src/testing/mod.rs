@@ -214,6 +214,13 @@ struct FakeGitState {
     merge_outcome: Option<MergeOutcome>,
     rebase_outcome: Option<RebaseOutcome>,
     pull_base_outcome: Option<RebaseOutcome>,
+    /// Whether [`GitExecutor::stash_push`] reports it created an entry. Defaults
+    /// to `true`; set `false` to simulate an untracked-only dirty tree where
+    /// there is nothing tracked to stash.
+    stash_created: bool,
+    /// Whether [`GitExecutor::stash_apply`] applies cleanly. Defaults to `true`;
+    /// set `false` to simulate a conflict re-applying the stash after a pull.
+    stash_apply_ok: bool,
     /// When set, [`GitExecutor::remove_worktree`] fails with this `Git` message
     /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
     remove_worktree_error: Option<String>,
@@ -226,6 +233,9 @@ struct FakeGitState {
     merges: Vec<(String, PathBuf)>,
     rebases: Vec<(String, PathBuf)>,
     pull_bases: Vec<PathBuf>,
+    stash_pushes: Vec<PathBuf>,
+    stash_applies: Vec<PathBuf>,
+    stash_drops: Vec<PathBuf>,
 }
 
 impl Default for FakeGit {
@@ -246,6 +256,8 @@ impl Default for FakeGit {
                 merge_outcome: None,
                 rebase_outcome: None,
                 pull_base_outcome: None,
+                stash_created: true,
+                stash_apply_ok: true,
                 remove_worktree_error: None,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
@@ -255,6 +267,9 @@ impl Default for FakeGit {
                 merges: Vec::new(),
                 rebases: Vec::new(),
                 pull_bases: Vec::new(),
+                stash_pushes: Vec::new(),
+                stash_applies: Vec::new(),
+                stash_drops: Vec::new(),
             }),
         }
     }
@@ -382,6 +397,18 @@ impl FakeGit {
         self.inner.lock().unwrap().pull_base_outcome = Some(outcome);
     }
 
+    /// Set whether [`GitExecutor::stash_push`] reports it created a stash entry
+    /// (`false` simulates an untracked-only dirty tree with nothing to stash).
+    pub fn set_stash_created(&self, created: bool) {
+        self.inner.lock().unwrap().stash_created = created;
+    }
+
+    /// Set whether [`GitExecutor::stash_apply`] applies cleanly (`false`
+    /// simulates a conflict re-applying the stash after a pull).
+    pub fn set_stash_apply_ok(&self, ok: bool) {
+        self.inner.lock().unwrap().stash_apply_ok = ok;
+    }
+
     /// Make [`GitExecutor::remove_worktree`] fail with the given `Git` message,
     /// simulating git refusing a path it does not track as a worktree.
     pub fn set_remove_worktree_error(&self, message: impl Into<String>) {
@@ -428,6 +455,21 @@ impl FakeGit {
     /// Base-folder pulls performed via [`GitExecutor::pull_base`], as `cwd`.
     pub fn pull_bases(&self) -> Vec<PathBuf> {
         self.inner.lock().unwrap().pull_bases.clone()
+    }
+
+    /// Stashes pushed via [`GitExecutor::stash_push`], as `cwd`.
+    pub fn stash_pushes(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_pushes.clone()
+    }
+
+    /// Stashes re-applied via [`GitExecutor::stash_apply`], as `cwd`.
+    pub fn stash_applies(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_applies.clone()
+    }
+
+    /// Stashes dropped via [`GitExecutor::stash_drop`], as `cwd`.
+    pub fn stash_drops(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_drops.clone()
     }
 }
 
@@ -575,6 +617,24 @@ impl GitExecutor for FakeGit {
             conflicted: false,
             message: "pulled base".to_string(),
         }))
+    }
+
+    fn stash_push(&self, cwd: &Path) -> Result<bool> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_pushes.push(cwd.to_path_buf());
+        Ok(st.stash_created)
+    }
+
+    fn stash_apply(&self, cwd: &Path) -> Result<bool> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_applies.push(cwd.to_path_buf());
+        Ok(st.stash_apply_ok)
+    }
+
+    fn stash_drop(&self, cwd: &Path) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_drops.push(cwd.to_path_buf());
+        Ok(())
     }
 }
 
