@@ -14,6 +14,10 @@
 //  path push once the linked project/session is known, then cleared either
 //  way — see that file's doc comment for the unknown-id behavior.
 //
+//  This screen is ALSO today's stand-in for the unified feed's toolbar
+//  (remote-control-b8d.8 owns the real one): its header's "+" presents
+//  `AddMachineSheet` (remote-control-b8d.7), reachable while already paired.
+//
 
 import SwiftUI
 
@@ -25,6 +29,12 @@ struct ProjectsListView: View {
     @State private var isSearching = false
     @State private var searchQuery = ""
     @FocusState private var searchFieldFocused: Bool
+    // "+" add-machine entry point (remote-control-b8d.7): this header is
+    // today's stand-in for the unified feed's toolbar (remote-control-b8d.8
+    // owns the real one) — presents the existing pairing handshake as a
+    // sheet over the SAME shared `router.pairingStore` so a completed add is
+    // reflected app-wide immediately.
+    @State private var isPresentingAddMachine = false
 
     private var allProjects: [Wire.ProjectState] {
         transportStore.snapshot?.projects ?? []
@@ -62,6 +72,7 @@ struct ProjectsListView: View {
                     .typography(Typography.largeTitle)
                     .foregroundStyle(Theme.textPrimary)
                 Spacer()
+                addMachineButton
                 searchToggleButton
             }
 
@@ -77,6 +88,27 @@ struct ProjectsListView: View {
         .padding(.horizontal, Theme.Spacing.lg)
         .padding(.top, Theme.Spacing.lg)
         .padding(.bottom, Theme.Spacing.md)
+    }
+
+    /// Minimal "+" affordance (remote-control-b8d.7): the real feed toolbar
+    /// is remote-control-b8d.8's to own — this just provides a working
+    /// presentation path today. Always tappable even at the cap: the sheet
+    /// itself (`PairingView.isBlockedByCap`) shows the blocked state with a
+    /// clear message rather than this button silently doing nothing.
+    private var addMachineButton: some View {
+        Button {
+            isPresentingAddMachine = true
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Theme.textPrimary)
+                .frame(width: 36, height: 36)
+        }
+        .accessibilityIdentifier("projects-add-machine-button")
+        .accessibilityLabel("Add machine")
+        .sheet(isPresented: $isPresentingAddMachine) {
+            AddMachineSheet(pairingStore: router.pairingStore)
+        }
     }
 
     private var searchToggleButton: some View {

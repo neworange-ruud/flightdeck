@@ -15,14 +15,16 @@
 //  `completePairing(with:)`, `unpair()`, and (DEBUG) `debugTogglePaired()`
 //  are the pre-multi-pairing single-device API. They are kept, UNCHANGED in
 //  behavior and persisted independently via `PairingStateProviding`, so
-//  `AppRouter`/`PairingView`/`SettingsView`/`SettingsUnpairCoordinator` and
-//  their existing tests keep compiling and passing without modification.
-//  The binary router (`AppRouter.route` derived from `isPaired`) is rewritten
-//  against the `[PairedInstance]` list in remote-control-b8d.7; until then,
-//  both the boolean bridge and the persisted list are updated independently
-//  by their respective call sites (see `RealPairingService.pair`, which
-//  appends a `PairedInstance` in addition to the `PairedDevice` handed back
-//  for `completePairing(with:)`).
+//  `PairingView`/`SettingsView`/`SettingsUnpairCoordinator` and their existing
+//  tests keep compiling and passing without modification. `AppRouter.route`
+//  (remote-control-b8d.7) now reads `hasAnyPairing` — count-based off `list`,
+//  OR'd with the legacy `isPaired` flag purely so a device paired before
+//  multi-pairing (which set `isPaired` but has no `PairedInstance` yet, until
+//  `TransportStoreFactory`'s legacy-migration seed runs) still routes to the
+//  main tab container. Both the boolean bridge and the persisted list are
+//  otherwise updated independently by their respective call sites (see
+//  `RealPairingService.pair`, which appends a `PairedInstance` in addition to
+//  the `PairedDevice` handed back for `completePairing(with:)`).
 //
 
 import Foundation
@@ -114,6 +116,13 @@ final class PairingStore {
     /// (until b8d.7 rewires the router) if the legacy `isPaired` flag is set.
     var hasAnyPairing: Bool { isPaired || !instances.isEmpty }
 
+    /// Whether the multi-pairing hard cap (`PairingLimits.maxPairedInstances`,
+    /// the SINGLE shared constant — also referenced by `TransportCoordinator`)
+    /// has been reached. `PairingView`/`AddMachineSheet` (remote-control-b8d.7)
+    /// check this to block STARTING a new pairing rather than letting the
+    /// handshake run and only rejecting after the fact.
+    var isAtPairingCap: Bool { instances.count >= PairingLimits.maxPairedInstances }
+
     /// Records a successful pairing transaction: appends a new
     /// `PairedInstance` (or replaces the existing entry for the same
     /// `pairingId`, making a re-pair against an already-known machine
@@ -170,9 +179,10 @@ final class PairingStore {
 
     // MARK: - Transitional single-device bridge
 
-    /// `AppRouter` reads `isPaired` to decide between the Pairing screen and
-    /// the main tab container (PRD §5.8 entry flow) until the router is
-    /// rewritten against `list` in remote-control-b8d.7.
+    /// Legacy single-device paired flag. `AppRouter` no longer reads this
+    /// directly (remote-control-b8d.7: it reads `hasAnyPairing`, which still
+    /// ORs this in) — kept for `PairingView.pair(with:)`/`SettingsUnpairCoordinator`,
+    /// which still flip it via `completePairing(with:)`/`unpair()`.
     var isPaired: Bool {
         didSet {
             guard isPaired != oldValue else { return }

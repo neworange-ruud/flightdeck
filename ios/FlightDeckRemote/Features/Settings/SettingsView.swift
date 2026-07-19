@@ -64,6 +64,11 @@ struct SettingsView: View {
     @State private var pairedAt: Date?
     @State private var canEvaluateBiometrics = true
     @State private var isPresentingUnpairConfirmation = false
+    // Add-machine entry point (remote-control-b8d.7): presents the existing
+    // pairing handshake as a sheet over this SAME shared `router.pairingStore`,
+    // so a completed add is visible here immediately (e.g. `machinesSection`'s
+    // count).
+    @State private var isPresentingAddMachine = false
 
     init(
         router: AppRouter,
@@ -86,6 +91,7 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.xxl) {
                 connectionSection
+                machinesSection
                 securitySection
                 notificationsSection
                 aboutSection
@@ -96,8 +102,44 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep.ignoresSafeArea())
         .onAppear(perform: loadDeviceInfo)
+        .sheet(isPresented: $isPresentingAddMachine) {
+            AddMachineSheet(pairingStore: router.pairingStore)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("SettingsView")
+    }
+
+    // MARK: - Machines (remote-control-b8d.7 Add-machine entry point)
+
+    /// "Add machine" reachable from Settings while already paired — the
+    /// other entry point is the feed toolbar (today `ProjectsListView`'s
+    /// header, until remote-control-b8d.8's unified feed owns its own).
+    /// Shows the live count against the shared cap (`PairingLimits.maxPairedInstances`)
+    /// so "why is Add machine greyed out" is self-explanatory without opening
+    /// the sheet.
+    private var machinesSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            sectionHeader("Machines")
+
+            Button {
+                isPresentingAddMachine = true
+            } label: {
+                HStack {
+                    Text("Add machine")
+                        .typography(Typography.body)
+                        .foregroundStyle(router.pairingStore.isAtPairingCap ? Theme.textMutedDark : Theme.textPrimary)
+                    Spacer()
+                    Text("\(router.pairingStore.list.count)/\(PairingLimits.maxPairedInstances)")
+                        .typography(Typography.caption)
+                        .foregroundStyle(Theme.textMutedDark)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(router.pairingStore.isAtPairingCap)
+            .padding(Theme.Spacing.lg)
+            .cardStyle()
+            .accessibilityIdentifier("settings-add-machine-button")
+        }
     }
 
     // MARK: - Connection

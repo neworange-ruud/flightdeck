@@ -263,4 +263,25 @@ import CryptoKit
         #expect(h.coordinator.handles.count == 3)
         #expect(h.coordinator.activePairingIds == ["p1", "p2", "p3"])
     }
+
+    /// remote-control-b8d.7: the cap is a SINGLE shared constant
+    /// (`PairingLimits.maxPairedInstances`) — `TransportCoordinator`'s default
+    /// `cap` must read it rather than hardcoding its own literal, so this and
+    /// `PairingStore.isAtPairingCap` can never drift out of sync.
+    @Test func defaultCapReadsTheSharedPairingLimit() throws {
+        let keychain = InMemoryKeychainStore()
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
+        let recordStore = PairingRecordStore(store: keychain)
+        let book = ChannelBook()
+
+        let coordinator = TransportCoordinator(
+            identity: identity,
+            keyAgreement: keyAgreement,
+            recordStore: recordStore,
+            connectorFactory: { book.connector() }
+        )
+
+        #expect(coordinator.cap == PairingLimits.maxPairedInstances)
+    }
 }

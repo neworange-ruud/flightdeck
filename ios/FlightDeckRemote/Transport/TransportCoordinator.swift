@@ -64,8 +64,12 @@ final class TransportCoordinator {
     // MARK: - Configuration
 
     /// Hard fan-out cap (PRD: ~3–4 paired instances). `reconcile` bounds the
-    /// live set to this many even if `PairingStore` somehow holds more; full
-    /// cap *enforcement at the add site* is remote-control-b8d.7's job.
+    /// live set to this many even if `PairingStore` somehow holds more. Full
+    /// cap enforcement *at the add site* — blocking a new pairing before it
+    /// starts — lives in `PairingStore.isAtPairingCap`/`PairingView`
+    /// (remote-control-b8d.7); the default below reads `PairingLimits.maxPairedInstances`,
+    /// the SAME single shared constant, so the two enforcement points can
+    /// never drift out of sync.
     let cap: Int
 
     // MARK: - Observable state
@@ -109,7 +113,7 @@ final class TransportCoordinator {
         recordStore: PairingRecordStore,
         connectorFactory: @escaping @Sendable () -> any WebSocketConnecting,
         cacheFactory: @escaping @MainActor @Sendable (String) -> SnapshotCache? = { _ in nil },
-        cap: Int = 4,
+        cap: Int = PairingLimits.maxPairedInstances,
         clientConfig: TransportClient.Config = TransportClient.Config(),
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {

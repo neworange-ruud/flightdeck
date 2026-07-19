@@ -119,4 +119,18 @@ struct PairingModelsTests {
             #expect(PairingDefaults.resolveRelayURL(bad) == PairingDefaults.fallbackRelayURL)
         }
     }
+
+    // MARK: - Multi-pairing cap (remote-control-b8d.7)
+
+    /// `PairingError.pairingCapReached`'s displayed text must come from the
+    /// SAME single shared constant (`PairingLimits.capReachedMessage`) that
+    /// every other cap check in the app references — not a copy that could
+    /// drift out of sync.
+    @Test func pairingCapReachedErrorDescriptionMatchesSharedMessage() {
+        #expect(PairingError.pairingCapReached.errorDescription == PairingLimits.capReachedMessage)
+    }
+
+    @Test func capReachedMessageMentionsTheActualLimit() {
+        #expect(PairingLimits.capReachedMessage.contains("\(PairingLimits.maxPairedInstances)"))
+    }
 }

@@ -244,4 +244,42 @@ struct PairedInstanceStoreTests {
         store.add(makeInstance(pairingId: "pair-1"))
         #expect(store.hasAnyPairing == true)
     }
+
+    // MARK: - isAtPairingCap (remote-control-b8d.7 cap enforcement)
+
+    /// Below the shared cap (`PairingLimits.maxPairedInstances`), starting a
+    /// new pairing must NOT be blocked.
+    @Test func isAtPairingCapIsFalseBelowTheSharedLimit() {
+        let store = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        for i in 0..<(PairingLimits.maxPairedInstances - 1) {
+            store.add(makeInstance(pairingId: "pair-\(i)"))
+        }
+        #expect(store.list.count == PairingLimits.maxPairedInstances - 1)
+        #expect(store.isAtPairingCap == false)
+    }
+
+    /// Exactly at the shared cap, attempting to add ONE MORE (the
+    /// `(cap + 1)`th pairing) must be blocked — this is the boundary
+    /// `PairingView.pair(with:)` checks before ever starting a new handshake.
+    @Test func isAtPairingCapIsTrueAtTheSharedLimit() {
+        let store = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        for i in 0..<PairingLimits.maxPairedInstances {
+            store.add(makeInstance(pairingId: "pair-\(i)"))
+        }
+        #expect(store.list.count == PairingLimits.maxPairedInstances)
+        #expect(store.isAtPairingCap == true)
+    }
+
+    /// Unpairing one machine while at the cap must free up a slot again.
+    @Test func isAtPairingCapClearsAfterRemovingOneAtTheLimit() {
+        let store = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        for i in 0..<PairingLimits.maxPairedInstances {
+            store.add(makeInstance(pairingId: "pair-\(i)"))
+        }
+        #expect(store.isAtPairingCap == true)
+
+        store.remove(pairingId: "pair-0")
+
+        #expect(store.isAtPairingCap == false)
+    }
 }
