@@ -95,4 +95,5 @@ private final class InMemoryFallbackKeychainStore: KeychainStoring {
     func get(account: String) throws -> Data? { storage[account] }
     func set(_ data: Data, account: String) throws { storage[account] = data }
     func delete(account: String) throws { storage.removeValue(forKey: account) }
+    func accounts() throws -> [String] { Array(storage.keys) }
 }
