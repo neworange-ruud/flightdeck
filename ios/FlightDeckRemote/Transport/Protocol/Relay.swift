@@ -168,7 +168,12 @@ extension Wire {
         /// phone -> relay. Registers/refreshes the APNs token for a pairing.
         case registerPushToken(pairingId: PairingId, token: String,
                                environment: ApnsEnvironment)
-        /// relay -> endpoint. Confirms a push token was stored.
+        /// phone -> relay. Drops this pairing's APNs token WITHOUT unpairing —
+        /// per-machine push mute (spec §5.5). Membership-verified + idempotent
+        /// on the relay; confirmed by the SAME `pushTokenAck` as register.
+        case unregisterPushToken(pairingId: PairingId)
+        /// relay -> endpoint. Confirms a push token was stored (register) or
+        /// removed (unregister — the ack is shared, spec §5.5).
         case pushTokenAck(pairingId: PairingId)
         /// relay -> endpoint. A relay-plane error.
         case error(code: RelayErrorCode, message: String, pairingId: PairingId?)
@@ -287,6 +292,9 @@ extension Wire {
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId),
                     token: try c.decode(String.self, forKey: .token),
                     environment: try c.decode(ApnsEnvironment.self, forKey: .environment))
+            case "unregister_push_token":
+                self = .unregisterPushToken(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
             case "push_token_ack":
                 self = .pushTokenAck(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId))
@@ -393,6 +401,9 @@ extension Wire {
                 try c.encode(pairingId, forKey: .pairingId)
                 try c.encode(token, forKey: .token)
                 try c.encode(environment, forKey: .environment)
+            case let .unregisterPushToken(pairingId):
+                try c.encode("unregister_push_token", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
             case let .pushTokenAck(pairingId):
                 try c.encode("push_token_ack", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)

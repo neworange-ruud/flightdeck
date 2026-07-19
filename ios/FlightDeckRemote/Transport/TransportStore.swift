@@ -200,6 +200,16 @@ final class TransportStore {
         Task { await client.registerPushToken(token, environment: environment) }
     }
 
+    /// Apply the APNs token AND this pairing's mute preference atomically
+    /// (per-machine mute, remote-control-b8d.10) — one client hop, so exactly
+    /// one register / unregister / no-op frame results. Muting a live pairing
+    /// actively deregisters its token so the relay stops pushing immediately;
+    /// unmuting re-registers the held token. `token == nil` keeps the held
+    /// token. Safe before the link is live (applied on the next `auth_ok`).
+    func applyPush(token: (token: String, environment: Wire.ApnsEnvironment)?, muted: Bool) {
+        Task { await client.applyPush(token: token, muted: muted) }
+    }
+
     // MARK: - Shell surface (additive)
     //
     // Thin wrappers over `sendCommand` for the minimal shell terminal (PRD

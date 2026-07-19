@@ -120,6 +120,12 @@ final class TransportCoordinator {
     /// client starts immediately (`reconcile`) or waits for the next foreground.
     private var isForeground = false
 
+    /// The most recent APNs device token handed over by `PushCoordinator`
+    /// (remote-control-b8d.10), remembered so a machine added at runtime
+    /// (`reconcile`) still gets registered without waiting for the next token
+    /// refresh. `nil` until APNs delivers one (never does on the Simulator).
+    private var pushToken: (token: String, environment: Wire.ApnsEnvironment)?
+
     /// A never-connecting store handed to `primaryStore` when there are zero
     /// paired instances, so the transitional single-store consumers always have
     /// a non-`nil` store to bind to (it binds to a bogus pairingId, finds no
@@ -270,6 +276,9 @@ final class TransportCoordinator {
         for instance in capped where !handles.contains(where: { $0.pairingId == instance.pairingId }) {
             let handle = makeHandle(for: instance)
             handles.append(handle)
+            // Register the remembered token + apply this machine's mute (a
+            // machine added mid-session must not wait for the next refresh).
+            applyPush(to: handle)
             if isForeground {
                 await handle.store.start()
             }
@@ -281,6 +290,10 @@ final class TransportCoordinator {
         for index in handles.indices {
             if let updated = byId[handles[index].pairingId] {
                 handles[index].instance = updated
+                // A toggled `mutePush` (Settings) arrives here as a fresh
+                // instance — apply it so muting a live machine deregisters it
+                // and unmuting re-registers, without disturbing the others.
+                applyPush(to: handles[index])
             }
         }
         handles.sort { (order[$0.pairingId] ?? .max) < (order[$1.pairingId] ?? .max) }
@@ -328,6 +341,31 @@ final class TransportCoordinator {
     /// its socket, leaving the others live (no-op if not active).
     func stop(pairingId: String) async {
         await store(for: pairingId)?.stop()
+    }
+
+    // MARK: - Per-machine push (remote-control-b8d.10)
+
+    /// Hand the APNs device token to every live client and apply each machine's
+    /// mute preference (per-pairing tokens, spec §5.5): an unmuted machine
+    /// registers its own token against its own `pairingId`; a muted one stays
+    /// (or becomes) deregistered. Remembered so a machine added later
+    /// (`reconcile`) is registered too. Idempotent — the client suppresses a
+    /// repeat register of the same token and a redundant mute change, so
+    /// calling this on every token refresh / reconcile never double-registers.
+    func registerPushToken(_ token: String, environment: Wire.ApnsEnvironment) {
+        pushToken = (token, environment)
+        for handle in handles {
+            applyPush(to: handle)
+        }
+    }
+
+    /// Push a handle's current token + mute state down to its client in ONE
+    /// atomic call (registering the remembered token, if any, and mirroring
+    /// `PairedInstance.mutePush`), so muting one machine deregisters only its
+    /// token and leaves every other machine's registration untouched
+    /// (per-pairing isolation) — and each apply emits at most one relay frame.
+    private func applyPush(to handle: ClientHandle) {
+        handle.store.applyPush(token: pushToken, muted: handle.instance.mutePush)
     }
 
     // MARK: - Building a client

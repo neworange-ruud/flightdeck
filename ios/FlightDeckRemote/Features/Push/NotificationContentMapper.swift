@@ -91,8 +91,14 @@ enum NotificationContentMapper {
     }
 
     /// Build the `UNNotificationContent` for an event under the current
-    /// settings, or `nil` if it should not be presented at all.
-    static func content(for event: Wire.AgentEvent, settings: NotificationSettings) -> UNNotificationContent? {
+    /// settings, or `nil` if it should not be presented at all. `pairingId`,
+    /// when known, is stamped into the payload so a tap deep-links to the
+    /// originating machine (multi-pairing push, remote-control-b8d.10).
+    static func content(
+        for event: Wire.AgentEvent,
+        settings: NotificationSettings,
+        pairingId: String? = nil
+    ) -> UNNotificationContent? {
         guard case let .present(withSound) = NotificationPolicy.outcome(for: event, settings: settings) else {
             return nil
         }
@@ -102,7 +108,8 @@ enum NotificationContentMapper {
         content.body = model.body
         content.interruptionLevel = model.urgency == .timeSensitive ? .timeSensitive : .active
         content.threadIdentifier = model.deepLink.sessionId.rawValue
-        content.userInfo = PushPayload.userInfo(eventId: model.eventId, deepLink: model.deepLink)
+        content.userInfo = PushPayload.userInfo(
+            eventId: model.eventId, deepLink: model.deepLink, pairingId: pairingId)
 
         if withSound {
             switch model.sound {

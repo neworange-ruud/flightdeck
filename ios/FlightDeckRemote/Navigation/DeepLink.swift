@@ -23,10 +23,17 @@ import Foundation
 struct DeepLink: Equatable {
     let projectId: String
     let sessionId: String
+    /// Which paired machine this link targets (multi-pairing push,
+    /// remote-control-b8d.10). Carried by a notification tap so navigation can
+    /// resolve the right `PairedInstance`/per-instance store (b8d.12). `nil`
+    /// for the `flightdeck-remote://` URL scheme (single-pairing / no machine
+    /// context) and for relay-built pushes that predate the field.
+    let pairingId: String?
 
-    init(projectId: String, sessionId: String) {
+    init(projectId: String, sessionId: String, pairingId: String? = nil) {
         self.projectId = projectId
         self.sessionId = sessionId
+        self.pairingId = pairingId
     }
 
     /// Parses `flightdeck-remote://agent/<project_id>/<session_id>`.

@@ -174,28 +174,54 @@ struct SettingsView: View {
 
     /// One row per paired machine: its resolved display name (override >
     /// desktop-reported > generic fallback, `PairedInstance.displayName`) plus
-    /// an online/offline dot, tappable to open `MachineRenameSheet`.
+    /// an online/offline dot, tappable to open `MachineRenameSheet`, with a
+    /// trailing per-machine push mute toggle (remote-control-b8d.10). The name
+    /// area and the mute control are SEPARATE buttons so tapping mute never
+    /// opens rename and vice-versa.
     private func machineRow(for instance: PairedInstance) -> some View {
-        Button {
-            renamingMachine = RenamingMachine(pairingId: instance.pairingId)
-        } label: {
-            HStack(spacing: Theme.Spacing.md) {
-                Circle()
-                    .fill(instance.lastKnownOnline ? Theme.statusIdle : Theme.textMutedDark)
-                    .frame(width: 8, height: 8)
-                Text(instance.displayName)
-                    .typography(Typography.body)
-                    .foregroundStyle(Theme.textPrimary)
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .foregroundStyle(Theme.textMutedDark)
-                    .font(.system(size: 13, weight: .semibold))
+        HStack(spacing: Theme.Spacing.md) {
+            Button {
+                renamingMachine = RenamingMachine(pairingId: instance.pairingId)
+            } label: {
+                HStack(spacing: Theme.Spacing.md) {
+                    Circle()
+                        .fill(instance.lastKnownOnline ? Theme.statusIdle : Theme.textMutedDark)
+                        .frame(width: 8, height: 8)
+                    Text(instance.displayName)
+                        .typography(Typography.body)
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer(minLength: Theme.Spacing.sm)
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(Theme.textMutedDark)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .contentShape(Rectangle())
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("settings-machine-row-\(instance.pairingId)")
+
+            machineMuteButton(for: instance)
+        }
+        .padding(Theme.Spacing.lg)
+    }
+
+    /// Per-machine push mute (remote-control-b8d.10): toggles
+    /// `PairedInstance.mutePush`, which the transport coordinator observes to
+    /// (de)register this machine's own APNs token — muting one machine never
+    /// affects the others (per-pairing tokens). A bell that slashes when muted.
+    private func machineMuteButton(for instance: PairedInstance) -> some View {
+        Button {
+            router.pairingStore.setMutePush(pairingId: instance.pairingId, !instance.mutePush)
+        } label: {
+            Image(systemName: instance.mutePush ? "bell.slash.fill" : "bell.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(instance.mutePush ? Theme.textMutedDark : Theme.accent)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(Theme.Spacing.lg)
-        .accessibilityIdentifier("settings-machine-row-\(instance.pairingId)")
+        .accessibilityLabel(instance.mutePush ? "Unmute notifications" : "Mute notifications")
+        .accessibilityIdentifier("settings-machine-mute-\(instance.pairingId)")
     }
 
     // MARK: - Connection

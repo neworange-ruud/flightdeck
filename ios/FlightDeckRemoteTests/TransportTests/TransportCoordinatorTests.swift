@@ -384,4 +384,93 @@ import CryptoKit
         // by `reconcile`, is untouched).
         #expect(h.coordinator.handles.first?.instance.machineNameFromDesktop == nil)
     }
+
+    // MARK: - Per-machine push mute (remote-control-b8d.10)
+
+    private func registerCount(_ frames: [Wire.RelayFrame]) -> Int {
+        frames.filter { if case .registerPushToken = $0 { return true }; return false }.count
+    }
+
+    private func unregisterCount(_ frames: [Wire.RelayFrame]) -> Int {
+        frames.filter { if case .unregisterPushToken = $0 { return true }; return false }.count
+    }
+
+    @Test func registerPushTokenRegistersEveryLiveMachineWithItsOwnToken() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+
+        // Both machines register their OWN token against their OWN pairingId.
+        for index in h.instances.indices {
+            _ = await waitUntil { await self.registerCount(h.book.channels[index].sentFrames()) == 1 }
+        }
+        for (index, instance) in h.instances.enumerated() {
+            let frames = await h.book.channels[index].sentFrames()
+            let reg = try #require(frames.first { if case .registerPushToken = $0 { return true }; return false })
+            guard case let .registerPushToken(pairingId, token, env) = reg else { return }
+            #expect(pairingId.rawValue == instance.pairingId)
+            #expect(token == "tok_hex")
+            #expect(env == .sandbox)
+        }
+    }
+
+    @Test func mutingOneMachineDeregistersOnlyItAndLeavesOthersRegistered() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], pairingStore: pairingStore)
+        for instance in h.instances { pairingStore.add(instance) }
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // Both registered.
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+        for index in h.instances.indices {
+            _ = await waitUntil { await self.registerCount(h.book.channels[index].sentFrames()) == 1 }
+        }
+        #expect(await registerCount(h.book.channels[0].sentFrames()) == 1)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+
+        // Mute pair_a only — the mute flips in the store and reconcile applies it.
+        pairingStore.setMutePush(pairingId: "pair_a", true)
+        await h.coordinator.reconcile(with: pairingStore.list)
+
+        // pair_a (channel 0) deregisters exactly once; pair_b (channel 1) never does.
+        let aDeregistered = await waitUntil { await self.unregisterCount(h.book.channels[0].sentFrames()) == 1 }
+        #expect(aDeregistered)
+        // Give pair_b a chance to (wrongly) deregister before asserting it didn't.
+        _ = await waitUntil { await self.unregisterCount(h.book.channels[1].sentFrames()) > 0 }
+        #expect(await unregisterCount(h.book.channels[1].sentFrames()) == 0)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+
+        // Unmuting pair_a re-registers only it (register count 1 → 2), pair_b unchanged.
+        pairingStore.setMutePush(pairingId: "pair_a", false)
+        await h.coordinator.reconcile(with: pairingStore.list)
+        let aReRegistered = await waitUntil { await self.registerCount(h.book.channels[0].sentFrames()) == 2 }
+        #expect(aReRegistered)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+    }
+
+    @Test func aMachineAddedAfterTheTokenArrivedIsRegisteredToo() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        // Start with only pair_a live and registered.
+        await h.coordinator.reconcile(with: [h.instances[0]])
+        await h.coordinator.setForeground(true)
+        await handshake(h.book.channels[0], client: try #require(h.coordinator.client(for: "pair_a")))
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+        _ = await waitUntil { await self.registerCount(h.book.channels[0].sentFrames()) == 1 }
+
+        // Now add pair_b — the coordinator remembered the token and registers it
+        // once its socket goes live, without a fresh token refresh.
+        await h.coordinator.reconcile(with: h.instances)
+        await handshake(h.book.channels[1], client: try #require(h.coordinator.client(for: "pair_b")))
+        let bRegistered = await waitUntil { await self.registerCount(h.book.channels[1].sentFrames()) == 1 }
+        #expect(bRegistered)
+    }
 }

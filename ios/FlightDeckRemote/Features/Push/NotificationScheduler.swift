@@ -45,9 +45,17 @@ final class NotificationScheduler {
     /// Present notifications for any not-yet-seen events, honoring `settings`
     /// (toggles + per-project mute). Deduped by `event_id`; suppressed events
     /// still count as "seen" so flipping a toggle later doesn't retro-fire them.
-    func ingest(_ events: [Wire.AgentEvent], settings: NotificationSettings) {
+    /// `pairingId` (which machine these events came from) is stamped into each
+    /// notification so a tap deep-links to the originating machine (multi-
+    /// pairing push, remote-control-b8d.10).
+    func ingest(
+        _ events: [Wire.AgentEvent],
+        settings: NotificationSettings,
+        pairingId: String? = nil
+    ) {
         for event in events where scheduledEventIds.insert(event.eventId.rawValue).inserted {
-            guard let content = NotificationContentMapper.content(for: event, settings: settings) else {
+            guard let content = NotificationContentMapper.content(
+                for: event, settings: settings, pairingId: pairingId) else {
                 continue
             }
             let request = UNNotificationRequest(

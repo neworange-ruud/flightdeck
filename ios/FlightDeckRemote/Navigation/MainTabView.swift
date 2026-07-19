@@ -114,8 +114,15 @@ struct MainTabView: View {
             .onChange(of: transportStore.agentEvents) { _, newEvents in
                 activityStore.ingest(newEvents, tabSelected: router.selectedTab == .activity)
                 // Same stream drives local notifications (deduped by event_id,
-                // gated by the user's toggles + per-project mute).
-                notificationScheduler.ingest(newEvents, settings: notificationPreferences.settings)
+                // gated by the user's toggles + per-project mute). Stamp the
+                // originating machine so a tap deep-links to it (multi-pairing
+                // push, remote-control-b8d.10). The transitional single-store
+                // bridge feeds the primary (first) machine's events until
+                // remote-control-b8d.12 fans notifications per-instance.
+                notificationScheduler.ingest(
+                    newEvents,
+                    settings: notificationPreferences.settings,
+                    pairingId: coordinator.activePairingIds.first)
             }
             .onChange(of: pushCoordinator.deviceTokenHex) { _, token in
                 if let token {
@@ -163,14 +170,13 @@ struct MainTabView: View {
         }
     }
 
-    /// Register the APNs token with every live per-machine client. Per-machine
-    /// mute + pairingId deep-link is remote-control-b8d.10's refinement; here we
-    /// simply make sure each active pairing has the token (idempotent — the relay
-    /// overwrites). No-op when nothing is paired.
+    /// Register the APNs token with every live per-machine client, applying
+    /// each machine's mute preference (remote-control-b8d.10): an unmuted
+    /// machine registers its own per-pairing token; a muted one is (kept)
+    /// deregistered. Idempotent — safe to call on every token refresh / mount.
+    /// No-op when nothing is paired.
     private func registerPushTokenEverywhere(_ token: String) {
-        for store in coordinator.stores {
-            store.registerPushToken(token, environment: pushCoordinator.environment)
-        }
+        coordinator.registerPushToken(token, environment: pushCoordinator.environment)
     }
 
     /// Whether the Projects tab currently has a chat route pushed (the tab bar

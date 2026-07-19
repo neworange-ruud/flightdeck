@@ -33,8 +33,8 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func fixtureInventoryIsComplete() {
         #expect(ProtocolFixtures.all.count == ProtocolFixtures.expectedCount)
-        // 20 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files.
-        #expect(ProtocolFixtures.all.count >= 47)
+        // 21 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files.
+        #expect(ProtocolFixtures.all.count >= 48)
         for category in ["relay", "desktop_to_phone", "phone_to_desktop"] {
             #expect(ProtocolFixtures.all.contains { $0.category == category },
                     "no fixtures embedded for category \(category)")

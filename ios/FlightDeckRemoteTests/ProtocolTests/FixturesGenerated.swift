@@ -12,10 +12,11 @@
 //    desktop_to_phone -> Wire.DesktopToPhone
 //    phone_to_desktop -> Wire.PhoneCommand
 //
-//  remote-control-b8d.9 note: only the new `machine_name` entry below was
-//  hand-spliced in (rather than running the full sync script) because
-//  `remote/protocol/tests/fixtures/` also picked up `revoke`/`pairing_revoked`
-//  and a `pairing_offer.claim_token_hint` field from the SAME upstream commit
+//  remote-control-b8d.9/.10 note: only the new `machine_name` (b8d.9) and
+//  `unregister_push_token` (b8d.10) entries below were hand-spliced in (rather
+//  than running the full sync script) because `remote/protocol/tests/fixtures/`
+//  also picked up `revoke`/`pairing_revoked` and a
+//  `pairing_offer.claim_token_hint` field from the SAME upstream commit
 //  (7f0cd86) for remote-control-b8d.2, which the iOS `Wire.RelayFrame` mirror
 //  doesn't decode yet (that's remote-control-b8d.11's job). Re-run
 //  `ios/scripts/sync-fixtures.sh` for a full resync once b8d.11 lands.
@@ -114,6 +115,10 @@ enum ProtocolFixtures {
             category: "relay",
             name: "register_push_token",
             base64: "ewogICJ0eXBlIjogInJlZ2lzdGVyX3B1c2hfdG9rZW4iLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiLAogICJ0b2tlbiI6ICI3NDBmNDcwN2JlYmNmNzRmOWI3YzI1ZDQ4ZTMzNTg5NDVmNmFhMDFkYTVkZGIzODc0NjJjN2VhZjYxYmI3OGFkIiwKICAiZW52aXJvbm1lbnQiOiAicHJvZHVjdGlvbiIKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "unregister_push_token",
+            base64: "ewogICJ0eXBlIjogInVucmVnaXN0ZXJfcHVzaF90b2tlbiIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "resume",
@@ -234,5 +239,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 48
+    static let expectedCount = 49
 }
