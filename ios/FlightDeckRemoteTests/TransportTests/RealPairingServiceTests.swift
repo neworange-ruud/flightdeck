@@ -70,6 +70,43 @@ import CryptoKit
         #expect(sent.contains { if case .authResponse = $0 { return true }; return false })
     }
 
+    /// Multi-pairing (remote-control-b8d.4): a successful `pair(with:)`
+    /// APPENDS a `PairedInstance` to the injected `PairingStore` — pairing
+    /// with a second Mac must not evict the first.
+    @Test func successfulPairAppendsToPairingStoreWithoutEvictingExisting() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        pairingStore.add(PairedInstance(pairingId: "pre-existing", relayURL: URL(string: "wss://relay.example/other")!))
+
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: recordStore,
+            identityStore: keychain,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5),
+            pairingStore: pairingStore
+        )
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_real_2"),
+            peerDeviceId: Wire.DeviceId("desk_2"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_real_2")]))
+
+        let relayURL = URL(string: "wss://relay.example/v1")!
+        _ = try await service.pair(with: .code("4729", relayURL: relayURL))
+
+        #expect(pairingStore.list.map(\.pairingId) == ["pre-existing", "pair_real_2"], "pairing appends rather than replacing what was already paired")
+        let appended = try #require(pairingStore.list.first { $0.pairingId == "pair_real_2" })
+        #expect(appended.relayURL == relayURL)
+        #expect(appended.lastKnownOnline == true)
+    }
+
     @Test func qrPathAlsoUsesClaimTokenAsSalt() async throws {
         let keychain = InMemoryKeychainStore()
         let channel = ScriptedChannel()

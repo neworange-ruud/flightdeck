@@ -22,7 +22,16 @@ struct PairingView: View {
     var pairingStore: PairingStore
     // Chosen at the composition root: the deterministic mock under UI tests /
     // in DEBUG, the real relay-backed service otherwise (PairingServiceFactory).
-    var service: PairingServicing = PairingServiceFactory.makeDefault()
+    // Defaulted via `init` (rather than a plain property default) so it's
+    // wired to THIS view's `pairingStore` — a real pairing then appends its
+    // `PairedInstance` to the very store this view (and the rest of the app)
+    // observes, not an orphaned scratch instance (remote-control-b8d.4).
+    var service: PairingServicing
+
+    init(pairingStore: PairingStore, service: PairingServicing? = nil) {
+        self.pairingStore = pairingStore
+        self.service = service ?? PairingServiceFactory.makeDefault(pairingStore: pairingStore)
+    }
 
     @State private var code: String = ""
     @State private var isLoading = false

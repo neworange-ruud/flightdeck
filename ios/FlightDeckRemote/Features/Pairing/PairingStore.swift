@@ -2,18 +2,34 @@
 //  PairingStore.swift
 //  FlightDeckRemote
 //
-//  Tracks whether this device is paired with a FlightDeck desktop instance
-//  (PRD §9: "persists until explicitly unpaired"). Persistence is currently
-//  backed by `UserDefaults` via `PairingStateProviding` — a protocol seam so
-//  the real Pairing feature task can swap in its actual backing (Keychain /
-//  relay-confirmed state) without touching call sites or `AppRouter`.
+//  Tracks the set of FlightDeck desktop instances this device is paired with
+//  (multi-pairing, remote-control-b8d). The persisted source of truth is
+//  `[PairedInstance]` — non-secret display/prefs metadata keyed by
+//  `pairingId`, joined to the Keychain-backed `PairingRecord`/
+//  `PairingRecordStore` (remote-control-b8d.3) which holds the secrets and
+//  cursors. This store is `@Observable` so the transport coordinator
+//  (b8d.5), the aggregated feed (b8d.6), the router (b8d.7), push (b8d.10),
+//  and settings/unpair (b8d.11) all react to `add`/`remove`/setter calls.
+//
+//  Transitional bridge (remote-control-b8d.4): `isPaired`, `pairedDevice`,
+//  `completePairing(with:)`, `unpair()`, and (DEBUG) `debugTogglePaired()`
+//  are the pre-multi-pairing single-device API. They are kept, UNCHANGED in
+//  behavior and persisted independently via `PairingStateProviding`, so
+//  `AppRouter`/`PairingView`/`SettingsView`/`SettingsUnpairCoordinator` and
+//  their existing tests keep compiling and passing without modification.
+//  The binary router (`AppRouter.route` derived from `isPaired`) is rewritten
+//  against the `[PairedInstance]` list in remote-control-b8d.7; until then,
+//  both the boolean bridge and the persisted list are updated independently
+//  by their respective call sites (see `RealPairingService.pair`, which
+//  appends a `PairedInstance` in addition to the `PairedDevice` handed back
+//  for `completePairing(with:)`).
 //
 
 import Foundation
 import Observation
 
-/// Persistence seam for pairing state. `PairingStore` depends on this
-/// protocol rather than `UserDefaults` directly, so:
+/// Persistence seam for the single-device `isPaired` bridge. `PairingStore`
+/// depends on this protocol rather than `UserDefaults` directly, so:
 ///  - the real Pairing feature can swap in its own backing later, and
 ///  - tests can inject an in-memory provider (see `InMemoryPairingStateProvider`
 ///    in `PairingStoreTests`) for hermetic, order-independent runs.
@@ -22,8 +38,7 @@ protocol PairingStateProviding {
     func saveIsPaired(_ isPaired: Bool)
 }
 
-/// `UserDefaults`-backed implementation used until the real pairing feature
-/// (Keychain-backed device identity + relay confirmation) lands.
+/// `UserDefaults`-backed implementation of the `isPaired` bridge.
 struct UserDefaultsPairingStateProvider: PairingStateProviding {
     private let defaults: UserDefaults
     private let key = "agency.neworange.flightdeck.remote.isPaired"
@@ -41,13 +56,123 @@ struct UserDefaultsPairingStateProvider: PairingStateProviding {
     }
 }
 
-/// Tracks whether this device currently has an active pairing with a Mac.
-/// `AppRouter` reads `isPaired` to decide between the Pairing screen and the
-/// main tab container (PRD §5.8 entry flow).
+/// Persistence seam for the `[PairedInstance]` metadata list — the multi-
+/// pairing source of truth. Separate from `PairingStateProviding` (the
+/// single-device boolean bridge) so each can evolve/be tested independently.
+protocol PairedInstancesProviding {
+    func loadInstances() -> [PairedInstance]
+    func saveInstances(_ instances: [PairedInstance])
+}
+
+/// `UserDefaults`-backed JSON persistence for `[PairedInstance]`. Everything
+/// in `PairedInstance` is non-secret display/prefs metadata (secrets and
+/// cursors stay in the Keychain-backed `PairingRecordStore`), so
+/// `UserDefaults` is an appropriate backing — no Keychain access needed here.
+struct UserDefaultsPairedInstancesProvider: PairedInstancesProviding {
+    private let defaults: UserDefaults
+    private let key = "agency.neworange.flightdeck.remote.pairedInstances.v1"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func loadInstances() -> [PairedInstance] {
+        guard let data = defaults.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([PairedInstance].self, from: data)) ?? []
+    }
+
+    func saveInstances(_ instances: [PairedInstance]) {
+        guard let data = try? JSONEncoder().encode(instances) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
+/// Tracks every FlightDeck desktop instance this device is currently paired
+/// with. `[PairedInstance]` (the `list`) is the multi-pairing source of
+/// truth; `isPaired`/`pairedDevice` are a transitional single-device bridge
+/// kept for existing call sites (see file-level doc comment).
 @Observable
 final class PairingStore {
     private let storage: PairingStateProviding
+    private let instancesStorage: PairedInstancesProviding
 
+    // MARK: - Multi-pairing source of truth
+
+    /// Every paired instance, in the order they were added (oldest first).
+    /// Cap enforcement (~3-4 instances) is deferred to remote-control-b8d.7 —
+    /// this store places no limit on `add`.
+    private(set) var instances: [PairedInstance]
+
+    /// Read-only view of `instances`, for call sites that want the
+    /// "consumer" name matching the issue's API shape (transport coordinator,
+    /// feed, router, push, settings).
+    var list: [PairedInstance] { instances }
+
+    /// Bridge for code that only needs to know "is this device paired with
+    /// anything at all" without caring about the transitional single-device
+    /// `isPaired` flag — true once at least one instance has been added, or
+    /// (until b8d.7 rewires the router) if the legacy `isPaired` flag is set.
+    var hasAnyPairing: Bool { isPaired || !instances.isEmpty }
+
+    /// Records a successful pairing transaction: appends a new
+    /// `PairedInstance` (or replaces the existing entry for the same
+    /// `pairingId`, making a re-pair against an already-known machine
+    /// idempotent rather than duplicating it), then persists the list.
+    func add(_ instance: PairedInstance) {
+        instances.removeAll { $0.pairingId == instance.pairingId }
+        instances.append(instance)
+        persistInstances()
+    }
+
+    /// Removes the instance for `pairingId` (unpair that one machine). A
+    /// missing `pairingId` is a no-op.
+    func remove(pairingId: String) {
+        instances.removeAll { $0.pairingId == pairingId }
+        persistInstances()
+    }
+
+    /// Sets (or clears, passing `nil`) the user's override name for
+    /// `pairingId` — always wins in `PairedInstance.displayName` (remote-
+    /// control-b8d.9's naming UI). No-op if `pairingId` isn't known.
+    func setOverrideName(pairingId: String, _ name: String?) {
+        updateInstance(pairingId: pairingId) { $0.userOverrideName = name }
+    }
+
+    /// Mutes/unmutes push notifications from `pairingId` (remote-control-
+    /// b8d.10). No-op if `pairingId` isn't known.
+    func setMutePush(pairingId: String, _ mute: Bool) {
+        updateInstance(pairingId: pairingId) { $0.mutePush = mute }
+    }
+
+    /// Records the machine name most recently reported by the desktop for
+    /// `pairingId` (re-sent every connect, remote-control-b8d.1/.9). No-op if
+    /// `pairingId` isn't known.
+    func setMachineName(pairingId: String, _ name: String?) {
+        updateInstance(pairingId: pairingId) { $0.machineNameFromDesktop = name }
+    }
+
+    /// Records whether `pairingId` was reachable the last time its connection
+    /// was checked (remote-control-b8d.5's coordinator/b8d.6's feed drive
+    /// this). No-op if `pairingId` isn't known.
+    func setLastKnownOnline(pairingId: String, _ online: Bool) {
+        updateInstance(pairingId: pairingId) { $0.lastKnownOnline = online }
+    }
+
+    private func updateInstance(pairingId: String, _ mutate: (inout PairedInstance) -> Void) {
+        guard let index = instances.firstIndex(where: { $0.pairingId == pairingId }) else { return }
+        mutate(&instances[index])
+        persistInstances()
+    }
+
+    private func persistInstances() {
+        instancesStorage.saveInstances(instances)
+    }
+
+    // MARK: - Transitional single-device bridge
+
+    /// `AppRouter` reads `isPaired` to decide between the Pairing screen and
+    /// the main tab container (PRD §5.8 entry flow) until the router is
+    /// rewritten against `list` in remote-control-b8d.7.
     var isPaired: Bool {
         didSet {
             guard isPaired != oldValue else { return }
@@ -55,17 +180,21 @@ final class PairingStore {
         }
     }
 
-    /// Metadata about the currently paired Mac, set by `completePairing(with:)`
-    /// when a real pairing transaction (`PairingServicing`) succeeds. Unlike
-    /// `isPaired`, this is not persisted through `PairingStateProviding` —
-    /// only the paired boolean needs to survive relaunch for routing;
-    /// persisting/rehydrating the device metadata itself is a follow-up for
-    /// whichever task builds the Settings "connected device" surface
-    /// (PRD §5.6) and the Keychain-backed secret storage.
+    /// Metadata about the most recently paired Mac, set by
+    /// `completePairing(with:)`. Kept for `SettingsView`'s "connected device"
+    /// surface until it reads from `list` instead (b8d.7+); NOT persisted
+    /// (unlike `isPaired`) — only the paired boolean needs to survive
+    /// relaunch for routing, while the durable per-instance metadata now
+    /// lives in `list`/`instances`.
     private(set) var pairedDevice: PairedDevice?
 
-    init(storage: PairingStateProviding = UserDefaultsPairingStateProvider()) {
+    init(
+        storage: PairingStateProviding = UserDefaultsPairingStateProvider(),
+        instancesStorage: PairedInstancesProviding = UserDefaultsPairedInstancesProvider()
+    ) {
         self.storage = storage
+        self.instancesStorage = instancesStorage
+        self.instances = instancesStorage.loadInstances()
         var initial = storage.loadIsPaired()
         #if DEBUG
         // UI-test hook: pairing state persists across launches (by design),
@@ -84,6 +213,11 @@ final class PairingStore {
     /// Records a successful pairing transaction (see `PairingServicing`) and
     /// flips `isPaired` — `AppRouter`/`RootView` react automatically and
     /// swap the Pairing screen for the main tab container (PRD §5.8).
+    ///
+    /// This is the transitional single-device bridge: it does NOT itself
+    /// append to `list` — the real relay-backed `RealPairingService.pair`
+    /// does that directly (via its own `pairingStore.add(_:)` call) since it
+    /// alone knows the pairing's `relayURL`.
     func completePairing(with device: PairedDevice) {
         pairedDevice = device
         isPaired = true
@@ -96,7 +230,9 @@ final class PairingStore {
     /// (Features/Settings/) as one step of the full unpair sequence, which
     /// also clears the Keychain-backed `PairingRecord`/`KeyAgreementKeys` —
     /// this method only owns this store's own in-memory/`UserDefaults`
-    /// state.
+    /// state. Does NOT remove anything from `list`/`instances` — unpairing
+    /// one machine out of several is `remove(pairingId:)`'s job
+    /// (remote-control-b8d.11).
     func unpair() {
         pairedDevice = nil
         isPaired = false
