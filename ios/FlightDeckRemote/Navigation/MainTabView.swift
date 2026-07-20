@@ -41,6 +41,16 @@ struct MainTabView: View {
     var connectionSource: (any ConnectionStatusSource)?
 
     @State private var projectsNav = ProjectsNavModel()
+    // The Feed tab's own `NavigationStack` path (remote-control-b8d.8) —
+    // reuses `ProjectsNavModel`/`ProjectsRoute` rather than inventing a
+    // parallel type, since a feed row pushes into the SAME `SessionsListView`/
+    // `AgentChatView` surfaces the Projects tab already does (see `tabContent`'s
+    // `.feed` case). `feedActivePairingId` is the transitional per-push seam
+    // (remote-control-b8d.12 TODO) recording which machine's row was tapped,
+    // so those not-yet-pairingId-aware detail views bind to the RIGHT store
+    // (`feedDetailStore` below) instead of always the primary one.
+    @State private var feedNav = ProjectsNavModel()
+    @State private var feedActivePairingId: String?
     @State private var activityStore = ActivityStore.makeDefault()
     @State private var isPresentingNewAgentSheet = false
     @State private var connectionBanner: ReconnectingBannerModel
@@ -53,6 +63,12 @@ struct MainTabView: View {
     // remote-control-b8d.12 parameterizes them per-pairingId via the coordinator.
     @State private var coordinator: TransportCoordinator
     @State private var transportStore: TransportStore
+    // Unified multi-pairing feed (remote-control-b8d.8): the aggregation over
+    // the SAME coordinator's handles, folded with `router.pairingStore` for
+    // display-name/online-flag resolution (remote-control-b8d.6). Owned here
+    // (not by `FeedView` itself) so it's built exactly once, alongside
+    // `coordinator`, rather than re-built on every `.feed` tab selection.
+    @State private var feedStore: FeedStore
     @Environment(\.scenePhase) private var scenePhase
     // Push wiring (PRD §5.2/§9.1): the notification prefs the Settings screen
     // binds to (also gating presentation), the local-notification scheduler fed
@@ -69,6 +85,7 @@ struct MainTabView: View {
         _coordinator = State(initialValue: coordinator)
         let store = coordinator.primaryStore
         _transportStore = State(initialValue: store)
+        _feedStore = State(initialValue: FeedStore(coordinator: coordinator, pairingStore: router.pairingStore))
         _connectionBanner = State(initialValue: ReconnectingBannerModel(source: connectionSource ?? store))
     }
 
@@ -179,13 +196,30 @@ struct MainTabView: View {
         coordinator.registerPushToken(token, environment: pushCoordinator.environment)
     }
 
-    /// Whether the Projects tab currently has a chat route pushed (the tab bar
-    /// hides there — see the comment at the `CustomTabBar` mount).
+    /// Whether the currently-selected tab has a chat route pushed (the tab
+    /// bar hides there — see the comment at the `CustomTabBar` mount). Checks
+    /// both stacks that can push `.chat` — Projects' own and the Feed tab's
+    /// (remote-control-b8d.8) — since either can land on `AgentChatView`.
     private var isChatRouteActive: Bool {
-        router.selectedTab == .projects && projectsNav.path.contains {
+        let path: [ProjectsRoute]
+        switch router.selectedTab {
+        case .projects: path = projectsNav.path
+        case .feed: path = feedNav.path
+        case .activity, .shell, .settings: return false
+        }
+        return path.contains {
             if case .chat = $0 { return true }
             return false
         }
+    }
+
+    /// The store `SessionsListView`/`AgentChatView` bind to when pushed from
+    /// the Feed tab (remote-control-b8d.8/.12 transitional seam — see
+    /// `feedActivePairingId`'s doc comment): the tapped row's own machine when
+    /// known, else the coordinator's transitional single-store bridge (never
+    /// `nil` — see `TransportCoordinator.primaryStore`).
+    private var feedDetailStore: TransportStore {
+        (feedActivePairingId.flatMap(coordinator.store(for:))) ?? coordinator.primaryStore
     }
 
     /// The link state driving the stale banner: the DEBUG `-uitest-linkstate`
@@ -209,6 +243,37 @@ struct MainTabView: View {
     @ViewBuilder
     private var tabContent: some View {
         switch router.selectedTab {
+        case .feed:
+            // Unified multi-pairing feed (remote-control-b8d.8): its own
+            // `NavigationStack`/`navigationDestination`, structured exactly
+            // like the Projects tab's below (same `ProjectsRoute` shape,
+            // same `SessionsListView`/`AgentChatView` destinations) — the
+            // only difference is which store those destinations bind to,
+            // resolved per-tap via `feedActivePairingId`/`feedDetailStore`
+            // (see their doc comments) rather than always `transportStore`.
+            NavigationStack(path: $feedNav.path) {
+                FeedView(
+                    feedStore: feedStore,
+                    coordinator: coordinator,
+                    router: router,
+                    nav: feedNav,
+                    activePairingId: $feedActivePairingId
+                )
+                .navigationDestination(for: ProjectsRoute.self) { route in
+                    switch route {
+                    case let .sessions(projectId):
+                        SessionsListView(
+                            projectId: Wire.ProjectId(projectId),
+                            transportStore: feedDetailStore,
+                            nav: feedNav,
+                            isPresentingNewAgentSheet: $isPresentingNewAgentSheet
+                        )
+                    case let .chat(projectId, sessionId):
+                        AgentChatView(projectId: projectId, sessionId: sessionId,
+                                      store: feedDetailStore)
+                    }
+                }
+            }
         case .projects:
             NavigationStack(path: $projectsNav.path) {
                 ProjectsListView(transportStore: transportStore, router: router, nav: projectsNav)

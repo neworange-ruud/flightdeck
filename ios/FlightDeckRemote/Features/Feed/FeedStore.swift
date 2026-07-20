@@ -86,10 +86,17 @@ final class FeedStore {
     init(coordinator: TransportCoordinator, pairingStore: PairingStore) {
         self.coordinator = coordinator
         self.pairingStore = pairingStore
-        // Prime the persisted online flags from the current link states, then
-        // keep them in sync as links change.
-        refreshOnlineState()
+        // Keep the persisted online flags in sync as links change. Arming only
+        // *reads* observable state (to register tracking), which is safe here.
         armOnlineObservation()
+        // The initial prime is DEFERRED to the next main-actor tick. FeedStore
+        // is constructed inside `MainTabView.init` (b8d.8); mutating the shared
+        // @Observable `PairingStore` synchronously during SwiftUI's view-
+        // construction pass reentrantly retriggers that update, rebuilding
+        // `MainTabView` (and a fresh `TransportCoordinator` + Secure Enclave
+        // keys) in an infinite loop that hangs app launch until the process is
+        // killed. Deferring the first write breaks the reentrancy.
+        Task { @MainActor [weak self] in self?.refreshOnlineState() }
     }
 
     // MARK: - Aggregated feed (downstream API: b8d.8 UI, b8d.12 detail nav)

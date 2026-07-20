@@ -257,7 +257,12 @@ import Foundation
     @Test func linkStateChangeAutomaticallyUpdatesLastKnownOnline() async throws {
         let h = try makeHarness([("m", "M", nil)])
         // At init the store is disconnected → lastKnownOnline primed to false.
-        #expect(h.pairingStore.instances.first?.lastKnownOnline == false)
+        // The prime is deferred to the next main-actor tick (FeedStore.init must
+        // not mutate the shared @Observable PairingStore synchronously — doing so
+        // during SwiftUI view construction reentrantly hangs app launch), so await
+        // it rather than reading synchronously.
+        let primedOffline = await waitUntilMain { h.pairingStore.instances.first?.lastKnownOnline == false }
+        #expect(primedOffline)
 
         // Flip the link live; the armed observation writes it back.
         h.coordinator.store(for: "m")?.debugSeed(

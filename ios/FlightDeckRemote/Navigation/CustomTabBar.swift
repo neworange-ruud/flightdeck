@@ -21,8 +21,12 @@ struct CustomTabBar: View {
     var onSelectTab: (AppTab) -> Void
     var onTapFAB: () -> Void
 
-    /// Tabs either side of the center FAB, in display order.
-    private let leadingTabs: [AppTab] = [.projects, .activity]
+    /// Tabs either side of the center FAB, in display order. `.feed` leads
+    /// (remote-control-b8d.8): the aggregated multi-machine view is the new
+    /// primary destination for a multi-paired phone, ahead of the existing
+    /// single-machine `.projects` tab (kept, unchanged, per that machine's own
+    /// history — see `AppTab`'s doc comment).
+    private let leadingTabs: [AppTab] = [.feed, .projects, .activity]
     private let trailingTabs: [AppTab] = [.shell, .settings]
 
     var body: some View {
