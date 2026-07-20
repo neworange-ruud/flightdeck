@@ -173,7 +173,7 @@ struct ProjectsListView: View {
     private func projectCard(_ project: Wire.ProjectState) -> some View {
         let vm = RollupModel.viewModel(for: project)
         return Button {
-            nav.path.append(.sessions(projectId: project.projectId.rawValue))
+            nav.path.append(.sessions(projectId: project.projectId.rawValue, pairingId: nil))
         } label: {
             HStack(spacing: Theme.Spacing.md) {
                 StatusDot(status: vm.dot.agentStatus, size: .large)

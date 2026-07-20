@@ -36,7 +36,7 @@ private struct ChatFixtureAutoPushModifier: ViewModifier {
             guard ProcessInfo.processInfo.arguments.contains("-uitest-fixture-transcript"),
                   path.isEmpty
             else { return }
-            path.append(.chat(projectId: "fixture-project", sessionId: "fixture-session"))
+            path.append(.chat(projectId: "fixture-project", sessionId: "fixture-session", pairingId: nil))
         }
     }
 }

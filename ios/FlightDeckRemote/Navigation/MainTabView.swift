@@ -45,12 +45,12 @@ struct MainTabView: View {
     // reuses `ProjectsNavModel`/`ProjectsRoute` rather than inventing a
     // parallel type, since a feed row pushes into the SAME `SessionsListView`/
     // `AgentChatView` surfaces the Projects tab already does (see `tabContent`'s
-    // `.feed` case). `feedActivePairingId` is the transitional per-push seam
-    // (remote-control-b8d.12 TODO) recording which machine's row was tapped,
-    // so those not-yet-pairingId-aware detail views bind to the RIGHT store
-    // (`feedDetailStore` below) instead of always the primary one.
+    // `.feed` case). Each pushed route now carries its OWN `pairingId`
+    // (remote-control-b8d.12), resolved to a store per-destination via
+    // `coordinator.detailStore(for:)` — there is no separate "which machine
+    // is active" state to go stale as the stack grows or a different row is
+    // tapped later.
     @State private var feedNav = ProjectsNavModel()
-    @State private var feedActivePairingId: String?
     @State private var activityStore = ActivityStore.makeDefault()
     @State private var isPresentingNewAgentSheet = false
     @State private var connectionBanner: ReconnectingBannerModel
@@ -59,8 +59,9 @@ struct MainTabView: View {
     // / background→teardown by the `scenePhase` observer below. `transportStore`
     // is the transitional single-store bridge (`coordinator.primaryStore` — the
     // first paired instance, or a recordless fallback when unpaired) that the
-    // existing Projects/Activity/Shell/Settings tabs still bind to until
-    // remote-control-b8d.12 parameterizes them per-pairingId via the coordinator.
+    // Projects/Activity/Shell/Settings tabs deliberately KEEP binding to
+    // (single-store, transitional — out of scope for remote-control-b8d.12,
+    // which only finalizes the FEED tab's per-pairingId navigation below).
     @State private var coordinator: TransportCoordinator
     @State private var transportStore: TransportStore
     // Unified multi-pairing feed (remote-control-b8d.8): the aggregation over
@@ -213,15 +214,6 @@ struct MainTabView: View {
         }
     }
 
-    /// The store `SessionsListView`/`AgentChatView` bind to when pushed from
-    /// the Feed tab (remote-control-b8d.8/.12 transitional seam — see
-    /// `feedActivePairingId`'s doc comment): the tapped row's own machine when
-    /// known, else the coordinator's transitional single-store bridge (never
-    /// `nil` — see `TransportCoordinator.primaryStore`).
-    private var feedDetailStore: TransportStore {
-        (feedActivePairingId.flatMap(coordinator.store(for:))) ?? coordinator.primaryStore
-    }
-
     /// The link state driving the stale banner: the DEBUG `-uitest-linkstate`
     /// forced state wins (mirrors `ReconnectingBannerModel`/`CommandsPausedGate`'s
     /// own DEBUG seam), so UI tests can drive it deterministically without a
@@ -249,28 +241,28 @@ struct MainTabView: View {
             // like the Projects tab's below (same `ProjectsRoute` shape,
             // same `SessionsListView`/`AgentChatView` destinations) — the
             // only difference is which store those destinations bind to,
-            // resolved per-tap via `feedActivePairingId`/`feedDetailStore`
-            // (see their doc comments) rather than always `transportStore`.
+            // resolved per-route via `coordinator.detailStore(for:)` (see
+            // its doc comment) rather than always `transportStore`.
             NavigationStack(path: $feedNav.path) {
                 FeedView(
                     feedStore: feedStore,
                     coordinator: coordinator,
                     router: router,
-                    nav: feedNav,
-                    activePairingId: $feedActivePairingId
+                    nav: feedNav
                 )
                 .navigationDestination(for: ProjectsRoute.self) { route in
                     switch route {
-                    case let .sessions(projectId):
+                    case let .sessions(projectId, pairingId):
                         SessionsListView(
                             projectId: Wire.ProjectId(projectId),
-                            transportStore: feedDetailStore,
+                            transportStore: coordinator.detailStore(for: pairingId),
                             nav: feedNav,
-                            isPresentingNewAgentSheet: $isPresentingNewAgentSheet
+                            isPresentingNewAgentSheet: $isPresentingNewAgentSheet,
+                            pairingId: pairingId
                         )
-                    case let .chat(projectId, sessionId):
+                    case let .chat(projectId, sessionId, pairingId):
                         AgentChatView(projectId: projectId, sessionId: sessionId,
-                                      store: feedDetailStore)
+                                      store: coordinator.detailStore(for: pairingId))
                     }
                 }
             }
@@ -279,14 +271,19 @@ struct MainTabView: View {
                 ProjectsListView(transportStore: transportStore, router: router, nav: projectsNav)
                     .navigationDestination(for: ProjectsRoute.self) { route in
                         switch route {
-                        case let .sessions(projectId):
+                        case let .sessions(projectId, _):
+                            // Projects tab stays single-store/transitional
+                            // (remote-control-b8d.12 scope is the Feed tab) —
+                            // the route's `pairingId` is always `nil` here
+                            // (see every push site on this tab) and ignored;
+                            // always binds `transportStore`.
                             SessionsListView(
                                 projectId: Wire.ProjectId(projectId),
                                 transportStore: transportStore,
                                 nav: projectsNav,
                                 isPresentingNewAgentSheet: $isPresentingNewAgentSheet
                             )
-                        case let .chat(projectId, sessionId):
+                        case let .chat(projectId, sessionId, _):
                             // Thread the live store so Chat binds its commands-paused
                             // gate + transcript to the real (connected) transport —
                             // without it, `ChatViewModel.bind` never runs and the gate

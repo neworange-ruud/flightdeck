@@ -30,14 +30,15 @@
 //  Navigation seam (remote-control-b8d.12): `MainTabView`'s `.feed` tab case
 //  owns this screen's `NavigationStack`/`navigationDestination`, pushing the
 //  SAME `ProjectsRoute` shape (and reusing `SessionsListView`/`AgentChatView`
-//  verbatim) the Projects tab already does. Those detail views aren't
-//  parameterized by `pairingId` yet (that's b8d.12's job), so a tapped row
-//  records its `pairingId` into `activePairingId` — set here, read by
-//  `MainTabView.feedDetailStore` to resolve which machine's `TransportStore`
-//  the pushed destination binds to (falling back to `coordinator.primaryStore`,
-//  the SAME transitional single-store bridge `TransportCoordinator.primaryStore`'s
-//  own doc comment describes). b8d.12 replaces this with true
-//  per-pairingId-parameterized detail views and the seam goes away.
+//  verbatim) the Projects tab already does. A tapped row embeds ITS OWN
+//  `pairingId` straight into the pushed `.sessions` route (see `row(_:)`
+//  below) rather than recording it into any separate mutable "which machine
+//  is active" state — `MainTabView.tabContent`'s `.navigationDestination`
+//  resolves the destination's `TransportStore` from that route value via
+//  `TransportCoordinator.detailStore(for:)`, so a pushed detail is pinned to
+//  the instance it was opened for and can't be switched under it by a later
+//  tap on a different row (falling back to `coordinator.primaryStore` only if
+//  that machine has since been unpaired).
 //
 
 import SwiftUI
@@ -47,8 +48,6 @@ struct FeedView: View {
     var coordinator: TransportCoordinator
     var router: AppRouter
     var nav: ProjectsNavModel
-    // TODO(remote-control-b8d.12): transitional per-tap seam — see file header.
-    @Binding var activePairingId: String?
 
     @State private var isPresentingAddMachine = false
 
@@ -168,8 +167,7 @@ struct FeedView: View {
         let vm = RollupModel.viewModel(for: item.project)
         return HStack(spacing: Theme.Spacing.sm) {
             Button {
-                activePairingId = item.pairingId
-                nav.path.append(.sessions(projectId: item.project.projectId.rawValue))
+                nav.path.append(.sessions(projectId: item.project.projectId.rawValue, pairingId: item.pairingId))
             } label: {
                 rowContent(item: item, vm: vm)
             }
@@ -286,8 +284,7 @@ struct FeedView: View {
             feedStore: feedStore,
             coordinator: coordinator,
             router: AppRouter(pairingStore: pairingStore),
-            nav: ProjectsNavModel(),
-            activePairingId: .constant(nil)
+            nav: ProjectsNavModel()
         )
     }
 }

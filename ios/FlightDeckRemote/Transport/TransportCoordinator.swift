@@ -239,6 +239,19 @@ final class TransportCoordinator {
     /// per-`pairingId` resolution in remote-control-b8d.12.
     var primaryStore: TransportStore { handles.first?.store ?? fallbackStore }
 
+    /// The store a per-instance detail screen (session/chat/monitor) should
+    /// bind to, given the `pairingId` it was OPENED for (remote-control-b8d.12)
+    /// — e.g. the value carried on a pushed `ProjectsRoute`, captured at push
+    /// time rather than re-read from any separately-mutable "active machine"
+    /// state, so a screen already on a nav stack keeps resolving to the same
+    /// machine even after a later tap targets a different one. Falls back to
+    /// `primaryStore` when `pairingId` is `nil` (the Projects tab's
+    /// transitional single-store routes) or no longer active (the machine was
+    /// unpaired while the detail screen was on-screen) — never `nil`.
+    func detailStore(for pairingId: String?) -> TransportStore {
+        pairingId.flatMap(store(for:)) ?? primaryStore
+    }
+
     // MARK: - Initial install (synchronous, pre-foreground)
 
     /// Build (but do not start) one handle per instance, at init — synchronous so

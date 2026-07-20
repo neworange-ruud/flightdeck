@@ -155,6 +155,65 @@ import CryptoKit
         #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
     }
 
+    // MARK: - Per-instance detail binding (remote-control-b8d.12)
+    //
+    // `detailStore(for:)` is what `MainTabView`'s Feed-tab `.navigationDestination`
+    // calls with the `pairingId` carried on the PUSHED `ProjectsRoute` — never
+    // off any separately-mutable "active machine" state — so these prove the
+    // exact resolution a feed-originated session/chat detail relies on.
+
+    @Test func detailStoreForAPairingIdReturnsThatInstancesOwnStore() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        let resolvedA = h.coordinator.detailStore(for: "pair_a")
+        #expect(resolvedA === h.coordinator.store(for: "pair_a"))
+        #expect(resolvedA !== h.coordinator.store(for: "pair_b"))
+    }
+
+    @Test func twoFeedItemsOnDifferentMachinesResolveToDifferentStores() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b", "pair_c"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // Mirrors two `FeedItem`s (remote-control-b8d.6) on different
+        // machines, each tapped into its own `.sessions(pairingId:)` route.
+        let storeForItemOnA = h.coordinator.detailStore(for: "pair_a")
+        let storeForItemOnB = h.coordinator.detailStore(for: "pair_b")
+        let storeForItemOnC = h.coordinator.detailStore(for: "pair_c")
+
+        #expect(storeForItemOnA !== storeForItemOnB)
+        #expect(storeForItemOnB !== storeForItemOnC)
+        #expect(storeForItemOnA !== storeForItemOnC)
+    }
+
+    @Test func detailPinnedToMachineAStaysOnAEvenAfterResolvingB() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // A detail screen pushed for machine A captures its resolved store
+        // once, at push time (the route's `pairingId` is immutable thereafter).
+        let pinnedToA = h.coordinator.detailStore(for: "pair_a")
+
+        // The user backs out and taps a DIFFERENT row (machine B) — resolving
+        // B's store must not retroactively change what A's already-pushed
+        // detail resolved to (no shared mutable "active pairing" to go stale).
+        _ = h.coordinator.detailStore(for: "pair_b")
+
+        #expect(h.coordinator.detailStore(for: "pair_a") === pinnedToA)
+        #expect(pinnedToA === h.coordinator.store(for: "pair_a"))
+    }
+
+    @Test func detailStoreFallsBackToPrimaryForNilOrUnknownPairingId() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // `nil` — the Projects tab's single-store transitional routes.
+        #expect(h.coordinator.detailStore(for: nil) === h.coordinator.primaryStore)
+        // A pairingId that's no longer active (e.g. unpaired while its detail
+        // screen was still on-screen) — never crashes, falls back instead.
+        #expect(h.coordinator.detailStore(for: "gone") === h.coordinator.primaryStore)
+    }
+
     // MARK: - Runtime add / remove
 
     @Test func reconcileAddsAndRemovesOnlyTheAffectedClient() async throws {

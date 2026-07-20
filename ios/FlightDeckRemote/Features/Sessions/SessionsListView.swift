@@ -14,6 +14,13 @@
 //  named `projectId`; tapping a session pushes `.chat(projectId, sessionId)`
 //  onto `ProjectsNavModel.path` — Chat itself is a sibling placeholder today.
 //
+//  `pairingId` (remote-control-b8d.12) is the SAME value this screen itself
+//  was pushed with — it just threads it through onto the `.chat` route it
+//  pushes next, so the chat destination resolves to the same machine's
+//  `TransportStore` this list is already bound to (`transportStore`), rather
+//  than re-deriving it from any separately-mutable "active machine" state.
+//  `nil` on the Projects tab (single-store, transitional).
+//
 
 import SwiftUI
 
@@ -22,6 +29,7 @@ struct SessionsListView: View {
     var transportStore: TransportStore
     var nav: ProjectsNavModel
     var isPresentingNewAgentSheet: Binding<Bool>
+    var pairingId: String? = nil
 
     private var project: Wire.ProjectState? {
         transportStore.snapshot?.projects.first { $0.projectId == projectId }
@@ -121,7 +129,7 @@ struct SessionsListView: View {
 
     private func sessionCard(_ session: Wire.SessionState) -> some View {
         Button {
-            nav.path.append(.chat(projectId: projectId.rawValue, sessionId: session.sessionId.rawValue))
+            nav.path.append(.chat(projectId: projectId.rawValue, sessionId: session.sessionId.rawValue, pairingId: pairingId))
         } label: {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 HStack(spacing: Theme.Spacing.sm) {
