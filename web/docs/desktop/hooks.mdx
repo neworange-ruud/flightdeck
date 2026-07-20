@@ -35,27 +35,10 @@ commands = [
 
 ## Available hooks
 
-<table>
-  <thead>
-    <tr><th>Hook</th><th>When it runs</th><th>Working directory</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>worktree_created</code></td>
-      <td>Right after a new worktree is created for an Agent Tab. It does not run
-      when an existing worktree is reused, or for a tab that runs directly on the
-      base branch (which creates no worktree).</td>
-      <td>The new worktree.</td>
-    </tr>
-    <tr>
-      <td><code>worktree_update</code></td>
-      <td>After an Agent Tab's worktree is rebased onto an updated base branch
-      (the <strong>Rebase</strong> action). Useful when the base moving under the
-      worktree means dependencies or generated files need refreshing.</td>
-      <td>The rebased worktree.</td>
-    </tr>
-  </tbody>
-</table>
+| Hook | When it runs | Working directory |
+| --- | --- | --- |
+| `worktree_created` | Right after a new worktree is created for an Agent Tab. It does not run when an existing worktree is reused, or for a tab that runs directly on the base branch (which creates no worktree). | The new worktree. |
+| `worktree_update` | After an Agent Tab's worktree is rebased onto an updated base branch (the **Rebase** action). Useful when the base moving under the worktree means dependencies or generated files need refreshing. | The rebased worktree. |
 
 More hooks may be added over time. A `hooks.toml` written by a newer FlightDeck
 still loads on an older one — unknown hooks are simply ignored.
