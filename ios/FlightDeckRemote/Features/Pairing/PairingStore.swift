@@ -215,6 +215,14 @@ final class PairingStore {
         if ProcessInfo.processInfo.arguments.contains("-uitest-reset-pairing") {
             initial = false
             storage.saveIsPaired(false)
+            // Multi-pairing (remote-control-b8d.4+) added a persisted
+            // [PairedInstance] list; routing now keys off `hasAnyPairing`
+            // (isPaired || !instances.isEmpty), so the reset must clear the
+            // instance list too — otherwise a leaked instance from a prior
+            // launch keeps the app on the feed and the Pairing screen (with the
+            // DEBUG toggle UI tests rely on) never appears.
+            self.instances = []
+            instancesStorage.saveInstances([])
         }
         #endif
         self.isPaired = initial
