@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.9.0] - 2026-07-20
+
+### New features
+
 - **Repository hooks that run at worktree lifecycle points.** A repo can ship a
   `.flightdeck/hooks.toml` with commands that FlightDeck runs automatically:
   `[worktree_created]` runs in a new worktree right after it is created for an
