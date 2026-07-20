@@ -46,4 +46,64 @@ import SwiftUI
         #expect(FeedRowPresentation.accentColor(dot: .manual, isOffline: true) == nil)
         #expect(FeedRowPresentation.accentColor(dot: .idle, isOffline: true) == nil)
     }
+
+    // MARK: - Event-aware accent (remote-control-fa8)
+
+    @Test func liveErrorRowAccentsRed() {
+        let item = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: true,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1, kind: .error(message: "boom")))
+        #expect(FeedRowPresentation.accentColor(item: item) == Theme.statusRed)
+    }
+
+    @Test func liveNeedsInputEventRowAccentsOrange() {
+        let item = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: true,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1, kind: .needsInput(preview: "?")))
+        #expect(FeedRowPresentation.accentColor(item: item) == RollupModel.color(for: .needsInput))
+    }
+
+    @Test func liveNeedsInputRollupRowAccentsOrangeEvenWithoutEvent() {
+        let item = FeedItemFixtures.item(pairingId: "A", projectId: "p", dot: .needsInput, isOnline: true)
+        #expect(FeedRowPresentation.accentColor(item: item) == RollupModel.color(for: .needsInput))
+    }
+
+    @Test func offlineErrorRowIsNeverAccented() {
+        let item = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: false,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1, kind: .error(message: "boom")))
+        #expect(FeedRowPresentation.accentColor(item: item) == nil)
+    }
+
+    @Test func calmRowHasNoAccent() {
+        let item = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: true,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1,
+                                                kind: .finished(summary: "done", filesChanged: 0, readyToPush: false)))
+        #expect(FeedRowPresentation.accentColor(item: item) == nil)
+    }
+
+    // MARK: - Event-derived summary
+
+    @Test func summaryUsesTheEventMessageWhenPresent() {
+        let item = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: true,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1, kind: .needsInput(preview: "which env?")))
+        #expect(FeedRowPresentation.summaryText(item: item, rollupSummary: "1 agent") == "which env?")
+    }
+
+    @Test func summaryFallsBackToRollupWhenNoEvent() {
+        let item = FeedItemFixtures.item(pairingId: "A", projectId: "p", isOnline: true)
+        #expect(FeedRowPresentation.summaryText(item: item, rollupSummary: "idle · 1 agent") == "idle · 1 agent")
+    }
+
+    @Test func errorSummaryIsRed() {
+        let errItem = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p", isOnline: true,
+            latestEvent: FeedItemFixtures.event(project: "p", atMs: 1, kind: .error(message: "boom")))
+        #expect(FeedRowPresentation.summaryColor(item: errItem) == Theme.statusRed)
+
+        let calmItem = FeedItemFixtures.item(pairingId: "A", projectId: "q", isOnline: true)
+        #expect(FeedRowPresentation.summaryColor(item: calmItem) == Theme.textMuted)
+    }
 }

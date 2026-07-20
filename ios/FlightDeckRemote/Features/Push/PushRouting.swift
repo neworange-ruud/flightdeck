@@ -7,9 +7,9 @@
 //  device-token helpers the registration glue needs.
 //
 //  Routing deliberately reuses the exact same seam the `flightdeck-remote://`
-//  URL scheme and the Activity feed already use — set `AppRouter.pendingDeepLink`
-//  and switch to the Projects tab — rather than duplicating navigation logic
-//  (see `AppRouter.handleDeepLink` / `ActivityFeedModel.handleTap`).
+//  URL scheme already uses — set `AppRouter.pendingDeepLink` and switch to the
+//  Projects tab — rather than duplicating navigation logic
+//  (see `AppRouter.handleDeepLink`).
 //
 
 import Foundation

@@ -116,6 +116,107 @@ import Foundation
         #expect(!FeedStore.isOnline(.authenticating))
     }
 
+    // MARK: - Latest-event folding (remote-control-fa8)
+
+    private func kindedEvent(projectId: String, session: String, atMs: Int64,
+                             kind: Wire.EventKind) -> Wire.AgentEvent {
+        Wire.AgentEvent(
+            eventId: Wire.EventId("evt_\(projectId)_\(atMs)"),
+            kind: kind,
+            deepLink: Wire.DeepLink(projectId: Wire.ProjectId(projectId),
+                                    sessionId: Wire.SessionId(session)),
+            occurredAtMs: atMs,
+            title: "\(projectId) event")
+    }
+
+    @Test func eachItemCarriesItsNewestMatchingEvent() {
+        let src = FeedStore.Source(
+            pairingId: "A", displayName: "A", isOnline: true,
+            snapshot: snapshot(serverTimeMs: 10, projects: [project("p1")]),
+            events: [
+                kindedEvent(projectId: "p1", session: "s_old", atMs: 100,
+                            kind: .finished(summary: "old", filesChanged: 0, readyToPush: false)),
+                kindedEvent(projectId: "p1", session: "s_new", atMs: 300,
+                            kind: .needsInput(preview: "which env?")),
+                kindedEvent(projectId: "other", session: "sx", atMs: 999,
+                            kind: .error(message: "unrelated")),
+            ])
+
+        let item = try! #require(FeedStore.buildItems(from: [src]).first)
+        #expect(item.latestEvent?.occurredAtMs == 300)
+        #expect(item.isNeedsInputEvent)
+        #expect(!item.isErrorEvent)
+        #expect(item.needsAttention)
+        #expect(item.attentionSessionId?.rawValue == "s_new")
+        #expect(item.activityMs == 300)
+    }
+
+    @Test func aProjectWithoutMatchingEventsHasNoLatestEvent() {
+        let src = FeedStore.Source(
+            pairingId: "A", displayName: "A", isOnline: true,
+            snapshot: snapshot(serverTimeMs: 42, projects: [project("p1")]),
+            events: [])
+        let item = try! #require(FeedStore.buildItems(from: [src]).first)
+        #expect(item.latestEvent == nil)
+        #expect(!item.needsAttention)
+        #expect(item.attentionSessionId == nil)
+        #expect(item.activityMs == 42) // falls back to snapshot time
+    }
+
+    @Test func errorEventDrivesErrorStateNotAttentionSessionFromANonAttentionRow() {
+        let errItem = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p1", activityMs: 5,
+            latestEvent: FeedItemFixtures.event(project: "p1", session: "s_err", atMs: 5,
+                                                kind: .error(message: "boom")))
+        #expect(errItem.isErrorEvent)
+        #expect(errItem.needsAttention)
+        #expect(errItem.attentionSessionId?.rawValue == "s_err")
+
+        let doneItem = FeedItemFixtures.item(
+            pairingId: "A", projectId: "p2", activityMs: 5,
+            latestEvent: FeedItemFixtures.event(project: "p2", session: "s_done", atMs: 5,
+                                                kind: .finished(summary: "ok", filesChanged: 1, readyToPush: true)))
+        #expect(!doneItem.isErrorEvent)
+        #expect(!doneItem.needsAttention)
+        #expect(doneItem.attentionSessionId == nil) // finished rows open the sessions list
+    }
+
+    // MARK: - Attention-first sort (remote-control-fa8)
+
+    @Test func sortOrdersOnlineAttentionRecencyThenOffline() {
+        // Deliberately shuffled input across all ranking axes. The spec's three
+        // keys are: online → attention(bool) → activityMs desc (stable). So
+        // within the attention band, the MORE RECENT attention row leads.
+        let needsInput = FeedItemFixtures.item(
+            pairingId: "A", projectId: "needs", dot: .needsInput, isOnline: true, activityMs: 100)
+        let error = FeedItemFixtures.item(
+            pairingId: "A", projectId: "err", isOnline: true, activityMs: 400,
+            latestEvent: FeedItemFixtures.event(project: "err", atMs: 400, kind: .error(message: "x")))
+        let finishedNewer = FeedItemFixtures.item(
+            pairingId: "A", projectId: "fin2", isOnline: true, activityMs: 300,
+            latestEvent: FeedItemFixtures.event(project: "fin2", atMs: 300,
+                                                kind: .finished(summary: "y", filesChanged: 0, readyToPush: false)))
+        let idleOlder = FeedItemFixtures.item(
+            pairingId: "A", projectId: "idle", isOnline: true, activityMs: 50)
+        let offlineNeedsInput = FeedItemFixtures.item(
+            pairingId: "B", projectId: "offneeds", dot: .needsInput, isOnline: false, activityMs: 999)
+
+        let sorted = FeedStore.sorted([idleOlder, offlineNeedsInput, finishedNewer, needsInput, error])
+        // Online first; within online, attention (err, needs) before calm
+        // (fin2, idle), each band by recency desc; offline always last (even a
+        // high-recency offline needs-input row).
+        #expect(sorted.map(\.projectId.rawValue) == ["err", "needs", "fin2", "idle", "offneeds"])
+    }
+
+    @Test func sortPutsAttentionAheadOfMoreRecentCalmRow() {
+        // A needs-input row with OLDER activity still outranks a newer calm row.
+        let attentionOld = FeedItemFixtures.item(
+            pairingId: "A", projectId: "att", dot: .needsInput, isOnline: true, activityMs: 1)
+        let calmNew = FeedItemFixtures.item(
+            pairingId: "A", projectId: "calm", isOnline: true, activityMs: 9_999)
+        #expect(FeedStore.sorted([calmNew, attentionOld]).map(\.projectId.rawValue) == ["att", "calm"])
+    }
+
     // MARK: - Store-backed harness
 
     private struct Harness {

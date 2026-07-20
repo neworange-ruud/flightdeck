@@ -33,4 +33,37 @@ enum FeedRowPresentation {
         guard !isOffline, dot == .needsInput else { return nil }
         return RollupModel.color(for: dot)
     }
+
+    /// The full row accent (remote-control-fa8), folding the latest event in:
+    /// a LIVE error row accents red; a LIVE needs-input row (live roll-up dot
+    /// OR a needs-input event) accents orange; everything else — and every
+    /// offline row (dimmed + badged instead) — draws no accent.
+    static func accentColor(item: FeedItem) -> Color? {
+        guard !item.isOffline else { return nil }
+        if item.isErrorEvent { return Theme.statusRed }
+        if item.project.rollup.dot == .needsInput || item.isNeedsInputEvent {
+            return RollupModel.color(for: .needsInput)
+        }
+        return nil
+    }
+
+    /// The event-derived summary line: the latest event's needs-input preview /
+    /// finished summary / error message (reusing the Activity feed's pure
+    /// `ActivityCellMapper.message` formatting), or `nil` when the project has
+    /// produced no event so the caller falls back to the roll-up summary.
+    static func eventSummary(for item: FeedItem) -> String? {
+        item.latestEvent.map { ActivityCellMapper.message(for: $0.kind) }
+    }
+
+    /// The summary text a row shows: the event-derived line when present, else
+    /// the passed-in roll-up summary.
+    static func summaryText(item: FeedItem, rollupSummary: String) -> String {
+        eventSummary(for: item) ?? rollupSummary
+    }
+
+    /// The summary text color: red for a latest-event error, muted otherwise
+    /// (offline rows are further dimmed by `contentOpacity`).
+    static func summaryColor(item: FeedItem) -> Color {
+        item.isErrorEvent ? Theme.statusRed : Theme.textMuted
+    }
 }

@@ -2,16 +2,19 @@
 //  MainTabView.swift
 //  FlightDeckRemote
 //
-//  The paired app's tab container (PRD §5.7): Projects · Activity ·
-//  [+ FAB] · Shell · Settings, rendered as a bottom-bar overlay + switch on
+//  The paired app's tab container: Feed · Projects · [+ FAB] · Shell ·
+//  Settings, rendered as a bottom-bar overlay + switch on
 //  `router.selectedTab` (see `CustomTabBar`'s doc comment for why this isn't
-//  a plain `TabView`).
+//  a plain `TabView`). The separate Activity tab was folded into the unified
+//  `.feed` (remote-control-fa8) — one surface, carrying unread tracking +
+//  attention + error surfacing + event deep-links across every machine.
 //
 //  Hook points for later feature tasks:
 //  - `projectsNav.path` (`ProjectsNavModel`, typed `[ProjectsRoute]`) — the
 //    Projects tab's `NavigationStack` path, for pushing sessions/chat.
-//  - `activityStore.unreadCount` — the Activity tab's unread badge, cleared
-//    here when the tab is selected.
+//  - `feedUnreadStore` — the unified Feed's multi-machine unread source; its
+//    `unreadCount(items:)` drives the Feed tab's badge, and it is fed by every
+//    machine's `agentEvents` (armed in `.task`, see `armIngestion`).
 //  - the FAB's sheet (`NewAgentView`, Features/Control) — the real "type +
 //    name + base + first task" flow (PRD §5.5); the presentation plumbing
 //    (`isPresentingNewAgentSheet`)
@@ -24,9 +27,6 @@
 //    `transportStore` below — the app's single live `TransportStore`
 //    (`TransportStoreFactory`), which the Projects/Sessions screens also
 //    bind to.
-//  - `activityStore` also bridges `transportStore.agentEvents` in (see the
-//    `.onChange` below) so it stays the Activity tab's real, always-live data
-//    source regardless of which tab is currently showing (PRD §5.7).
 //  - the `StaleBanner` overlay (PRD §9.2) shows whenever the store's data is
 //    cache-seeded (`TransportStore.isCacheStale`) and the link isn't a live
 //    `.connected` session — mounted below the (louder) `ReconnectingBanner`.
@@ -51,7 +51,12 @@ struct MainTabView: View {
     // is active" state to go stale as the stack grows or a different row is
     // tapped later.
     @State private var feedNav = ProjectsNavModel()
-    @State private var activityStore = ActivityStore.makeDefault()
+    // The unified Feed's unread source (remote-control-fa8), replacing the
+    // removed Activity tab's single-machine store: per-item (pairingId+projectId)
+    // watermarks fed by EVERY paired machine's `agentEvents` (armed reactively
+    // over the coordinator in `.task`, never mutated during view construction —
+    // reentrancy hazard). Drives the Feed tab's unread badge + per-row dots.
+    @State private var feedUnreadStore: FeedUnreadStore
     @State private var isPresentingNewAgentSheet = false
     // Measured height of the custom tab bar, published into `tabContent`'s
     // environment (`\.tabBarHeight`) so screens pushed inside the
@@ -65,7 +70,7 @@ struct MainTabView: View {
     // / background→teardown by the `scenePhase` observer below. `transportStore`
     // is the transitional single-store bridge (`coordinator.primaryStore` — the
     // first paired instance, or a recordless fallback when unpaired) that the
-    // Projects/Activity/Shell/Settings tabs deliberately KEEP binding to
+    // Projects/Shell/Settings tabs deliberately KEEP binding to
     // (single-store, transitional — out of scope for remote-control-b8d.12,
     // which only finalizes the FEED tab's per-pairingId navigation below).
     @State private var coordinator: TransportCoordinator
@@ -79,7 +84,7 @@ struct MainTabView: View {
     @Environment(\.scenePhase) private var scenePhase
     // Push wiring (PRD §5.2/§9.1): the notification prefs the Settings screen
     // binds to (also gating presentation), the local-notification scheduler fed
-    // by the same `agentEvents` stream as the Activity feed, and the shared push
+    // by the same `agentEvents` stream as the Feed's unread source, and the shared push
     // coordinator whose APNs token we register with the transport.
     @State private var notificationPreferences = NotificationPreferences()
     @State private var notificationScheduler = NotificationScheduler()
@@ -92,7 +97,18 @@ struct MainTabView: View {
         _coordinator = State(initialValue: coordinator)
         let store = coordinator.primaryStore
         _transportStore = State(initialValue: store)
-        _feedStore = State(initialValue: FeedStore(coordinator: coordinator, pairingStore: router.pairingStore))
+        let feed = FeedStore(coordinator: coordinator, pairingStore: router.pairingStore)
+        #if DEBUG
+        // A device "paired" via the DEBUG toggle has no live coordinator
+        // handles, so the Feed would render empty; under -uitest-fixture-activity
+        // seed the canned multi-variant source so UI tests can exercise the
+        // unified Feed's unread rows/badge, error styling, and deep-links.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-fixture-activity") {
+            feed.debugFixtureSources = [FeedStore.Fixture.source()]
+        }
+        #endif
+        _feedStore = State(initialValue: feed)
+        _feedUnreadStore = State(initialValue: FeedUnreadStore.makeDefault())
         _connectionBanner = State(initialValue: ReconnectingBannerModel(source: connectionSource ?? store))
     }
 
@@ -120,7 +136,7 @@ struct MainTabView: View {
                         if !isChatRouteActive {
                             CustomTabBar(
                                 selectedTab: router.selectedTab,
-                                unreadActivityCount: activityStore.unreadCount,
+                                unreadFeedCount: feedUnreadStore.unreadCount(items: feedStore.items),
                                 onSelectTab: { router.selectedTab = $0 },
                                 onTapFAB: { isPresentingNewAgentSheet = true }
                             )
@@ -134,13 +150,10 @@ struct MainTabView: View {
             .sheet(isPresented: $isPresentingNewAgentSheet) {
                 NewAgentView(store: transportStore)
             }
-            .onChange(of: router.selectedTab) { _, newTab in
-                if newTab == .activity {
-                    activityStore.markViewed()
-                }
-            }
             .onChange(of: transportStore.agentEvents) { _, newEvents in
-                activityStore.ingest(newEvents, tabSelected: router.selectedTab == .activity)
+                // Unread is folded in reactively across EVERY machine by
+                // `feedUnreadStore.armIngestion` (see `.task`), not here — this
+                // handler stays purely the local-notification bridge.
                 // Same stream drives local notifications (deduped by event_id,
                 // gated by the user's toggles + per-project mute). Stamp the
                 // originating machine so a tap deep-links to it (multi-pairing
@@ -177,6 +190,15 @@ struct MainTabView: View {
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("MainTabView")
             .task {
+                // Arm multi-machine unread ingestion BEFORE connecting: the
+                // reactive observation (over every handle's `agentEvents` + the
+                // handle set) folds newly-synced events in, and the initial
+                // `ingestAll` catches any cache-seeded events already present.
+                // Deferred here (a `.task`, post-body) rather than in init/body
+                // so it never mutates the @Observable store during view
+                // construction (reentrancy hang — see `FeedUnreadStore`'s notes).
+                feedUnreadStore.armIngestion(coordinator: coordinator)
+                feedUnreadStore.ingestAll(coordinator: coordinator)
                 // Connect every paired machine on mount (scenePhase is `.active`
                 // here); the `scenePhase` observer drives subsequent transitions.
                 await coordinator.setForeground(true)
@@ -216,7 +238,7 @@ struct MainTabView: View {
         switch router.selectedTab {
         case .projects: path = projectsNav.path
         case .feed: path = feedNav.path
-        case .activity, .shell, .settings: return false
+        case .shell, .settings: return false
         }
         return path.contains {
             if case .chat = $0 { return true }
@@ -256,6 +278,7 @@ struct MainTabView: View {
             NavigationStack(path: $feedNav.path) {
                 FeedView(
                     feedStore: feedStore,
+                    feedUnreadStore: feedUnreadStore,
                     coordinator: coordinator,
                     router: router,
                     nav: feedNav
@@ -308,8 +331,6 @@ struct MainTabView: View {
                     }
                     .chatFixtureAutoPush(path: $projectsNav.path)
             }
-        case .activity:
-            ActivityFeedView(transportStore: transportStore, activityStore: activityStore, router: router)
         case .shell:
             ShellTabView(transportStore: transportStore)
         case .settings:

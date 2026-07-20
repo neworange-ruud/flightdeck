@@ -5,7 +5,8 @@
 //  Exercises the bottom-tab navigation + entry routing (PRD §5.7/§5.8):
 //  unpaired shows Pairing; the DEBUG pairing toggle crosses into the main
 //  tab container; tapping tabs switches content; the center FAB presents
-//  the New-agent sheet; the Activity unread badge is visible then clears.
+//  the New-agent sheet; the Feed unread badge is visible with fixture events
+//  (the separate Activity tab was folded into the Feed — remote-control-fa8).
 //
 
 import XCTest
@@ -56,11 +57,13 @@ final class NavigationUITests: XCTestCase {
         launchAndPair(app)
 
         XCTAssertTrue(element(app, "MainTabView").waitForExistence(timeout: 5), "Expected the tab container after toggling paired state")
+        XCTAssertTrue(element(app, "tab-feed").exists)
         XCTAssertTrue(element(app, "tab-projects").exists)
-        XCTAssertTrue(element(app, "tab-activity").exists)
         XCTAssertTrue(element(app, "tab-shell").exists)
         XCTAssertTrue(element(app, "tab-settings").exists)
         XCTAssertTrue(element(app, "tab-fab-new-agent").exists)
+        // The separate Activity tab was folded into the Feed (remote-control-fa8).
+        XCTAssertFalse(element(app, "tab-activity").exists, "The Activity tab should be gone")
     }
 
     @MainActor
@@ -70,14 +73,14 @@ final class NavigationUITests: XCTestCase {
 
         XCTAssertTrue(element(app, "ProjectsListView").waitForExistence(timeout: 5), "Expected Projects to be the default tab")
 
+        element(app, "tab-feed").tap()
+        XCTAssertTrue(element(app, "FeedView").waitForExistence(timeout: 5))
+
         element(app, "tab-shell").tap()
         XCTAssertTrue(element(app, "ShellTabView").waitForExistence(timeout: 5))
 
         element(app, "tab-settings").tap()
         XCTAssertTrue(element(app, "SettingsView").waitForExistence(timeout: 5))
-
-        element(app, "tab-activity").tap()
-        XCTAssertTrue(element(app, "ActivityFeedView").waitForExistence(timeout: 5))
 
         element(app, "tab-projects").tap()
         XCTAssertTrue(element(app, "ProjectsListView").waitForExistence(timeout: 5))
@@ -93,17 +96,14 @@ final class NavigationUITests: XCTestCase {
     }
 
     @MainActor
-    func testActivityBadgeVisibleThenClearsOnSelection() throws {
+    func testFeedUnreadBadgeVisibleWithFixtureEvents() throws {
         let app = XCUIApplication()
-        // The badge is driven by real (persisted) events now — seed the
-        // deterministic all-unread fixture feed rather than relying on the
-        // old stub's hardcoded default of 1 unread.
+        // The badge is driven by the persisted per-item unread watermarks now —
+        // seed the deterministic all-unread fixture feed.
         app.launchArguments += ["-uitest-fixture-activity"]
         launchAndPair(app)
 
-        XCTAssertTrue(element(app, "tab-activity-unread-badge").waitForExistence(timeout: 5), "Expected the unread badge with unviewed fixture events")
-
-        element(app, "tab-activity").tap()
-        XCTAssertFalse(element(app, "tab-activity-unread-badge").waitForExistence(timeout: 2), "Expected the unread badge to clear once Activity is viewed")
+        XCTAssertTrue(element(app, "tab-feed-unread-badge").waitForExistence(timeout: 5),
+                      "Expected the Feed unread badge with unopened fixture rows")
     }
 }

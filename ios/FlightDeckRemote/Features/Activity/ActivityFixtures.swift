@@ -2,12 +2,14 @@
 //  ActivityFixtures.swift
 //  FlightDeckRemote
 //
-//  Canned `Wire.AgentEvent`s for the `-uitest-fixture-activity` DEBUG seam
-//  (`ActivityStore.makeDefault`). Deep-links reuse `Wire.StateSnapshot`'s
+//  Canned `Wire.AgentEvent`s for the `-uitest-fixture-activity` DEBUG seam.
+//  Since the Activity tab was folded into the unified Feed (remote-control-fa8)
+//  these now seed the FEED's fixture rows + unread state (`FeedStore.Fixture`
+//  and `FeedUnreadStore.makeDefault`). Deep-links reuse `Wire.StateSnapshot`'s
 //  `-uitest-fixture-snapshot` session/project ids (`Features/Monitor/DebugFixtures.swift`)
-//  so a UI test launched with both fixtures can tap a cell and land on a real
-//  chat screen; one event deliberately points at a session absent from that
-//  snapshot to exercise the "session no longer active" dead-link path.
+//  so a UI test launched with both fixtures can tap a needs-input/error row and
+//  land on a real chat screen. One event points at a project's OLDER moment
+//  (same project as the needs-input event) so the fold-to-newest is exercised.
 //
 //  DEBUG-only: never compiled into Release.
 //

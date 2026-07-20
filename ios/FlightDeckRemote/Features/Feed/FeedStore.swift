@@ -61,10 +61,19 @@ struct FeedItem: Identifiable, Equatable, Sendable {
     /// agent-event time for this project, or the machine's snapshot time when the
     /// project has no events. Higher = more recent.
     let activityMs: Int64
+    /// The project's most recent `Wire.AgentEvent` (across every machine's
+    /// stream that deep-links into it), or `nil` if it has produced none. The
+    /// unified Feed (remote-control-fa8) folds Activity's value in here: it
+    /// drives the event-derived summary line (needs-input preview / finished
+    /// summary / error message), the red error state, the attention ordering,
+    /// and the per-event deep-link on tap. `Wire.RollupDot` deliberately has no
+    /// finished/error — those live ONLY on `Wire.AgentEvent.EventKind`.
+    let latestEvent: Wire.AgentEvent?
 
     /// Stable identity across machines: a machine's `pairingId` plus the
     /// project id (distinct machines can host distinctly-ided projects, but the
-    /// join keeps ids unique even if two machines reused a project id).
+    /// join keeps ids unique even if two machines reused a project id). Also the
+    /// per-item key the `FeedUnreadStore` watermarks against.
     var id: String { pairingId + "\u{1f}" + project.projectId.rawValue }
 
     /// Convenience: the underlying project id.
@@ -72,6 +81,34 @@ struct FeedItem: Identifiable, Equatable, Sendable {
 
     /// Convenience negation for the dimmed/offline-badge UI.
     var isOffline: Bool { !isOnline }
+
+    /// The latest event is an error (`EventKind.error`) — the row styles red.
+    var isErrorEvent: Bool {
+        guard let kind = latestEvent?.kind else { return false }
+        if case .error = kind { return true }
+        return false
+    }
+
+    /// The latest event is a needs-input stop (`EventKind.needsInput`).
+    var isNeedsInputEvent: Bool {
+        guard let kind = latestEvent?.kind else { return false }
+        if case .needsInput = kind { return true }
+        return false
+    }
+
+    /// Whether the row demands attention (sorts above the calm rows): the LIVE
+    /// roll-up dot is needs-input, OR the latest event is needs-input/error.
+    var needsAttention: Bool {
+        project.rollup.dot == .needsInput || isNeedsInputEvent || isErrorEvent
+    }
+
+    /// The session a tap should deep-link into when the latest event is a
+    /// needs-input/error one — straight to that agent's chat (remote-control-fa8).
+    /// `nil` for a calm row (finished/idle) or no event, which opens the
+    /// project's sessions list instead.
+    var attentionSessionId: Wire.SessionId? {
+        (isNeedsInputEvent || isErrorEvent) ? latestEvent?.deepLink.sessionId : nil
+    }
 }
 
 @MainActor
@@ -106,6 +143,9 @@ final class FeedStore {
     /// so SwiftUI views bound to it re-render whenever any instance syncs, a
     /// machine connects/disconnects, or the pairing set / names change.
     var items: [FeedItem] {
+        #if DEBUG
+        if let debugFixtureSources { return Self.buildItems(from: debugFixtureSources) }
+        #endif
         let sources = coordinator.handles.map { handle in
             Source(
                 pairingId: handle.pairingId,
@@ -117,6 +157,16 @@ final class FeedStore {
         }
         return Self.buildItems(from: sources)
     }
+
+    #if DEBUG
+    /// Canned sources rendered instead of the (empty) coordinator handles under
+    /// the `-uitest-fixture-activity` seam — a device "paired" via the DEBUG
+    /// toggle has no live handles, so the Feed would otherwise be empty. Seeds
+    /// the same fixture snapshot + events the Activity tab used, so UI tests can
+    /// exercise unread rows/badge, error styling, and event deep-links against
+    /// the Feed deterministically. `nil` (default) in production and normal runs.
+    var debugFixtureSources: [Source]?
+    #endif
 
     // MARK: - Online-state write-back
 
@@ -171,51 +221,59 @@ final class FeedStore {
         let events: [Wire.AgentEvent]
     }
 
-    /// Fold `sources` into the flat, interleaved-by-recency feed. Machines with
-    /// no snapshot contribute nothing. Ordering is by `activityMs` descending,
-    /// with a stable tie-break that preserves source (machine) order and then
-    /// each snapshot's project order — deterministic regardless of the platform
-    /// sort's stability guarantees.
+    /// Fold `sources` into the flat feed. Machines with no snapshot contribute
+    /// nothing. Each item carries the project's latest matching `AgentEvent`
+    /// (remote-control-fa8). Ordering is ATTENTION-FIRST (see `sorted(_:)`).
     static func buildItems(from sources: [Source]) -> [FeedItem] {
         var items: [FeedItem] = []
         for source in sources {
             guard let snapshot = source.snapshot else { continue }
             for project in snapshot.projects {
+                let latest = latestEvent(projectId: project.projectId, events: source.events)
                 items.append(FeedItem(
                     pairingId: source.pairingId,
                     displayName: source.displayName,
                     isOnline: source.isOnline,
                     project: project,
-                    activityMs: activityMs(
-                        projectId: project.projectId,
-                        events: source.events,
-                        serverTimeMs: snapshot.serverTimeMs
-                    )
+                    activityMs: latest?.occurredAtMs ?? snapshot.serverTimeMs,
+                    latestEvent: latest
                 ))
             }
         }
-        return items.enumerated()
+        return sorted(items)
+    }
+
+    /// The attention-first ordering the approved mockup shows (remote-control-fa8):
+    ///   1. online before offline;
+    ///   2. attention (live needs-input OR latest event needs-input/error)
+    ///      before calm;
+    ///   3. most-recent activity (`activityMs`) descending;
+    ///   4. a stable tie-break preserving source (machine) order then project
+    ///      order — deterministic regardless of the platform sort's stability.
+    /// Net effect: the attention rows (needs-input / error) float to the top of
+    /// the online group, calm rows below, and every offline row last — matching
+    /// the approved mockup. Pure and unit-tested (like `buildItems`).
+    static func sorted(_ items: [FeedItem]) -> [FeedItem] {
+        items.enumerated()
             .sorted { lhs, rhs in
-                if lhs.element.activityMs != rhs.element.activityMs {
-                    return lhs.element.activityMs > rhs.element.activityMs
-                }
+                let l = lhs.element, r = rhs.element
+                if l.isOnline != r.isOnline { return l.isOnline }
+                if l.needsAttention != r.needsAttention { return l.needsAttention }
+                if l.activityMs != r.activityMs { return l.activityMs > r.activityMs }
                 return lhs.offset < rhs.offset // stable tie-break
             }
             .map(\.element)
     }
 
-    /// The most-recent activity time for a project: the newest agent-event time
-    /// among events that deep-link into it, or the machine's snapshot time when
-    /// the project has produced no events.
-    static func activityMs(
+    /// The most-recent `AgentEvent` deep-linking into `projectId`, or `nil` when
+    /// the project has produced none.
+    static func latestEvent(
         projectId: Wire.ProjectId,
-        events: [Wire.AgentEvent],
-        serverTimeMs: Int64
-    ) -> Int64 {
+        events: [Wire.AgentEvent]
+    ) -> Wire.AgentEvent? {
         events
             .filter { $0.deepLink.projectId == projectId }
-            .map(\.occurredAtMs)
-            .max() ?? serverTimeMs
+            .max { $0.occurredAtMs < $1.occurredAtMs }
     }
 
     /// Online iff the relay link is authenticated and live; every other state
@@ -225,3 +283,28 @@ final class FeedStore {
         return false
     }
 }
+
+#if DEBUG
+extension FeedStore {
+    /// The synthetic machine the `-uitest-fixture-activity` feed is attributed
+    /// to (no live handle exists under the DEBUG pairing toggle).
+    enum Fixture {
+        static let pairingId = "uitest-fixture-machine"
+        static let displayName = "Studio"
+
+        /// One canned source: the same `uiTestFixture` projects the
+        /// Projects/Sessions tests use, folded with `ActivityFixtures`' mixed
+        /// needs-input / finished / error events so the Feed shows one row per
+        /// attention variant, all initially unread.
+        static func source() -> FeedStore.Source {
+            FeedStore.Source(
+                pairingId: pairingId,
+                displayName: displayName,
+                isOnline: true,
+                snapshot: .uiTestFixture,
+                events: ActivityFixtures.events()
+            )
+        }
+    }
+}
+#endif

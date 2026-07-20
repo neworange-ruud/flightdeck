@@ -45,6 +45,7 @@ import SwiftUI
 
 struct FeedView: View {
     var feedStore: FeedStore
+    var feedUnreadStore: FeedUnreadStore
     var coordinator: TransportCoordinator
     var router: AppRouter
     var nav: ProjectsNavModel
@@ -165,14 +166,15 @@ struct FeedView: View {
 
     private func row(_ item: FeedItem) -> some View {
         let vm = RollupModel.viewModel(for: item.project)
+        let summary = FeedRowPresentation.summaryText(item: item, rollupSummary: vm.summary)
         return HStack(spacing: Theme.Spacing.sm) {
             Button {
-                nav.path.append(.sessions(projectId: item.project.projectId.rawValue, pairingId: item.pairingId))
+                openItem(item)
             } label: {
-                rowContent(item: item, vm: vm)
+                rowContent(item: item, vm: vm, summary: summary)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(Text("\(item.project.name), \(item.displayName), \(vm.summary)"))
+            .accessibilityLabel(Text("\(item.project.name), \(item.displayName), \(summary)"))
 
             // A SIBLING of the (dimmed, when offline) navigate button — never
             // nested inside it, so tapping retry never also navigates and
@@ -183,7 +185,7 @@ struct FeedView: View {
             }
         }
         .padding(Theme.Spacing.lg)
-        .cardStyle(accent: FeedRowPresentation.accentColor(dot: vm.dot, isOffline: item.isOffline))
+        .cardStyle(accent: FeedRowPresentation.accentColor(item: item))
         .listRowInsets(EdgeInsets(top: Theme.Spacing.xs, leading: Theme.Spacing.lg,
                                   bottom: Theme.Spacing.xs, trailing: Theme.Spacing.lg))
         .listRowBackground(Color.clear)
@@ -192,8 +194,10 @@ struct FeedView: View {
         .accessibilityIdentifier("feed-row-\(item.id)")
     }
 
-    private func rowContent(item: FeedItem, vm: ProjectRollupViewModel) -> some View {
+    private func rowContent(item: FeedItem, vm: ProjectRollupViewModel, summary: String) -> some View {
         HStack(spacing: Theme.Spacing.md) {
+            unreadDot(item)
+
             StatusDot(status: vm.dot.agentStatus, size: .large)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -206,9 +210,9 @@ struct FeedView: View {
                         .accessibilityIdentifier("feed-machine-chip-\(item.id)")
                 }
                 HStack(spacing: Theme.Spacing.xs) {
-                    Text(vm.summary)
+                    Text(summary)
                         .typography(Typography.callout)
-                        .foregroundStyle(Theme.textMuted)
+                        .foregroundStyle(FeedRowPresentation.summaryColor(item: item))
                         .lineLimit(1)
                     if item.isOffline {
                         offlineBadge(item)
@@ -224,6 +228,35 @@ struct FeedView: View {
         }
         .opacity(FeedRowPresentation.contentOpacity(isOffline: item.isOffline))
         .contentShape(Rectangle())
+    }
+
+    /// Leading unread indicator (remote-control-fa8): a filled accent dot for an
+    /// unread row (its latest event outranks its last-seen watermark), a hollow
+    /// dim ring once read. Opening the row marks it read (see `openItem`).
+    @ViewBuilder
+    private func unreadDot(_ item: FeedItem) -> some View {
+        let isUnread = feedUnreadStore.isUnread(itemKey: item.id)
+        Image(systemName: isUnread ? "circle.fill" : "circle")
+            .font(.system(size: 8, weight: .bold))
+            .foregroundStyle(isUnread ? Theme.accent : Theme.textDim)
+            .frame(width: 10)
+            .accessibilityElement()
+            .accessibilityIdentifier("feed-unread-dot-\(item.id)")
+            .accessibilityLabel(isUnread ? "Unread" : "Read")
+    }
+
+    /// Open a tapped row (remote-control-fa8): mark it read, then navigate. A
+    /// needs-input/error row with a session deep-links STRAIGHT into that
+    /// session's chat (pushing sessions→chat so Back returns to the list),
+    /// carrying its own `pairingId` so `MainTabView` resolves the destination's
+    /// store per-route (b8d.12); any other row opens the project's sessions list.
+    private func openItem(_ item: FeedItem) {
+        feedUnreadStore.markRead(itemKey: item.id)
+        nav.path.append(.sessions(projectId: item.projectId.rawValue, pairingId: item.pairingId))
+        if let sessionId = item.attentionSessionId {
+            nav.path.append(.chat(projectId: item.projectId.rawValue,
+                                  sessionId: sessionId.rawValue, pairingId: item.pairingId))
+        }
     }
 
     private func offlineBadge(_ item: FeedItem) -> some View {
@@ -282,6 +315,7 @@ struct FeedView: View {
     return NavigationStack {
         FeedView(
             feedStore: feedStore,
+            feedUnreadStore: FeedUnreadStore(persistence: InMemoryFeedUnreadPersisting()),
             coordinator: coordinator,
             router: AppRouter(pairingStore: pairingStore),
             nav: ProjectsNavModel()
