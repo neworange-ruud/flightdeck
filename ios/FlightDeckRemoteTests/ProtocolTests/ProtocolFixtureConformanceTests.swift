@@ -33,8 +33,10 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func fixtureInventoryIsComplete() {
         #expect(ProtocolFixtures.all.count == ProtocolFixtures.expectedCount)
-        // 20 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files.
-        #expect(ProtocolFixtures.all.count >= 47)
+        // 23 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
+        // (relay gained machine_name, unregister_push_token, revoke,
+        // pairing_revoked as their owning iOS issues landed).
+        #expect(ProtocolFixtures.all.count >= 48)
         for category in ["relay", "desktop_to_phone", "phone_to_desktop"] {
             #expect(ProtocolFixtures.all.contains { $0.category == category },
                     "no fixtures embedded for category \(category)")
@@ -139,6 +141,74 @@ struct ProtocolFixtureConformanceTests {
         #expect(command.body == .reply(
             sessionId: Wire.SessionId("sess_fix_login"),
             text: "Yes, run it. Then rebuild."))
+    }
+
+    @Test func machineNameFrameDecodesPairingIdAndName() throws {
+        let data = try fixture("relay", "machine_name")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .machineName(pairingId, machineName) = frame else {
+            Issue.record("expected .machineName, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+        #expect(machineName == "Ruud's MacBook Pro")
+    }
+
+    // MARK: - Machine-name sanitization (§5.7, remote-control-b8d.9)
+
+    @Test func sanitizeMachineNameTrimsSurroundingWhitespace() {
+        #expect(Wire.sanitizeMachineName("  Ruud's Mac  ") == "Ruud's Mac")
+    }
+
+    @Test func sanitizeMachineNameTreatsEmptyOrWhitespaceAsNoName() {
+        #expect(Wire.sanitizeMachineName("") == nil)
+        #expect(Wire.sanitizeMachineName("   ") == nil)
+        #expect(Wire.sanitizeMachineName("\n\t ") == nil)
+    }
+
+    @Test func sanitizeMachineNameBoundsToSixtyFourCharacters() throws {
+        let long = String(repeating: "a", count: 200)
+        let bounded = try #require(Wire.sanitizeMachineName(long))
+        #expect(bounded.count == 64)
+        #expect(bounded == String(repeating: "a", count: 64))
+    }
+
+    @Test func sanitizeMachineNameLeavesAShortNameUntouched() {
+        #expect(Wire.sanitizeMachineName("Work Mac") == "Work Mac")
+    }
+
+    // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
+
+    @Test func revokeFrameDecodesPairingId() throws {
+        let data = try fixture("relay", "revoke")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .revoke(pairingId) = frame else {
+            Issue.record("expected .revoke, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+    }
+
+    @Test func revokeFrameEncodesToSnakeCaseType() throws {
+        let frame = Wire.RelayFrame.revoke(pairingId: Wire.PairingId("pair_x"))
+        let object = try #require(
+            try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(frame)) as? NSDictionary)
+        #expect(object["type"] as? String == "revoke")
+        #expect(object["pairing_id"] as? String == "pair_x")
+    }
+
+    @Test func pairingRevokedFrameDecodesPairingId() throws {
+        let data = try fixture("relay", "pairing_revoked")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .pairingRevoked(pairingId) = frame else {
+            Issue.record("expected .pairingRevoked, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
     }
 
     @Test func envelopeFrameFlattensEncryptedEnvelope() throws {

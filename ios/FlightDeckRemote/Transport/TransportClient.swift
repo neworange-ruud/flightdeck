@@ -66,6 +66,15 @@ actor TransportClient {
     private let identity: DeviceIdentity
     private let keyAgreement: KeyAgreementKeys
     private let recordStore: PairingRecordStore
+    /// The specific pairing this client drives, when the (multi-pairing)
+    /// `TransportCoordinator` instantiates one client per `PairedInstance`
+    /// (remote-control-b8d.5). `nil` keeps the transitional single-pairing
+    /// behavior — the client binds to the first stored record — so existing
+    /// single-store call sites and their tests are unchanged. When set, the
+    /// client loads and persists cursors against *only* that pairing's keyed
+    /// record, so N clients sharing one `PairingRecordStore` never rewrite each
+    /// other's watermarks.
+    private let targetPairingId: String?
     private let connector: any WebSocketConnecting
     private let clientInfo: Wire.ClientInfo
     private let config: Config
@@ -95,6 +104,21 @@ actor TransportClient {
     /// in-memory store drops it on restart. `nil` until the app hands one over.
     private var pushToken: (token: String, environment: Wire.ApnsEnvironment)?
 
+    /// Whether push from THIS pairing is muted (per-machine mute,
+    /// remote-control-b8d.10). While muted the client never registers this
+    /// pairing's token, and if it becomes muted mid-session it actively sends
+    /// `unregister_push_token` to drop whatever the relay is holding. Muting one
+    /// pairing never touches another — each `TransportClient` owns its own flag.
+    private var pushMuted = false
+
+    /// The token this client has registered with the relay in the CURRENT live
+    /// session, or `nil` if it has registered nothing (fresh session, muted, or
+    /// just deregistered). Guards against double-registering the same token
+    /// while live, yet resets on every session teardown so `auth_ok` always
+    /// re-registers after a reconnect (the relay's v1 in-memory store may have
+    /// dropped it across a restart — spec §5.5 / store.rs module docs).
+    private var registeredToken: String?
+
     private var pending: [Wire.CommandId: PendingCommand] = [:]
 
     /// The pre-`auth_ok` handshake phase within one session.
@@ -117,6 +141,7 @@ actor TransportClient {
         identity: DeviceIdentity,
         keyAgreement: KeyAgreementKeys,
         recordStore: PairingRecordStore,
+        pairingId: String? = nil,
         connector: any WebSocketConnecting,
         clientInfo: Wire.ClientInfo? = nil,
         config: Config = Config(),
@@ -126,6 +151,7 @@ actor TransportClient {
         self.identity = identity
         self.keyAgreement = keyAgreement
         self.recordStore = recordStore
+        self.targetPairingId = pairingId
         self.connector = connector
         self.clientInfo = clientInfo ?? Wire.ClientInfo(
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
@@ -163,11 +189,26 @@ actor TransportClient {
         for (_, p) in pending { p.timeout.cancel() }
         pending.removeAll()
         phase = .idle
+        registeredToken = nil
         setLink(.disconnected)
     }
 
     /// The current link state (test/inspection convenience).
     func currentLinkState() -> RemoteLinkState { linkState }
+
+    /// The pairing this client is bound to, when instantiated per-`PairedInstance`
+    /// by the coordinator (`nil` for the transitional single-pairing wiring).
+    nonisolated var pairingId: String? { targetPairingId }
+
+    /// Load this client's record: the keyed record for `targetPairingId` when
+    /// the coordinator scoped this client to one pairing, else the transitional
+    /// first-record shim.
+    private func loadRecord() throws -> PairingRecord? {
+        if let targetPairingId {
+            return try recordStore.load(pairingId: targetPairingId)
+        }
+        return try recordStore.load()
+    }
 
     // MARK: - Public command API
 
@@ -175,6 +216,28 @@ actor TransportClient {
     /// event stream keyed by `command.commandId`.
     func send(_ command: Wire.PhoneCommand) async {
         await sendEnvelope(for: command, track: true)
+    }
+
+    /// Send a phone→relay `revoke` for this pairing (spec §5.8,
+    /// remote-control-b8d.11 unpair-one). Best-effort and fire-and-forget: a
+    /// plaintext relay-plane frame (NOT a sealed command), put on the wire only
+    /// if this pairing's session is currently live. If the relay is unreachable
+    /// (no live session) or the send fails, this is a no-op and returns `false`
+    /// — the caller still removes the pairing locally; the relay's revoke is
+    /// idempotent, so a retry (or the desktop noticing the membership is gone)
+    /// reconciles later. Deliberately does not check `peerConnected`: the relay
+    /// processes a revoke and notifies the desktop on its next connect
+    /// regardless of whether the desktop is online right now. Returns whether a
+    /// frame was actually sent (diagnostic only).
+    @discardableResult
+    func revokePairing() async -> Bool {
+        guard phase == .live, let ch = channel, let record else { return false }
+        do {
+            try await ch.send(.revoke(pairingId: Wire.PairingId(record.pairingId)))
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Register (or refresh) the APNs push token for this pairing (spec §5.5).
@@ -186,14 +249,41 @@ actor TransportClient {
     func registerPushToken(_ token: String, environment: Wire.ApnsEnvironment) {
         pushToken = (token, environment)
         if phase == .live, let ch = channel {
-            Task { await sendPushToken(on: ch) }
+            Task { await reconcilePushToken(on: ch) }
+        }
+    }
+
+    /// Mute/unmute push from this pairing (per-machine mute, spec §5.5 /
+    /// remote-control-b8d.10). Muting a *live* pairing actively deregisters its
+    /// token (so the relay stops pushing immediately); unmuting re-registers the
+    /// held token. When not live the flag is just remembered and applied on the
+    /// next `auth_ok`. Idempotent — a no-op if the flag is unchanged.
+    func setPushMuted(_ muted: Bool) {
+        guard muted != pushMuted else { return }
+        pushMuted = muted
+        if phase == .live, let ch = channel {
+            Task { await reconcilePushToken(on: ch) }
+        }
+    }
+
+    /// Apply the token AND mute intent for this pairing in ONE atomic step
+    /// (remote-control-b8d.10). The `TransportCoordinator` uses this so a single
+    /// `reconcilePushToken` decides register-vs-unregister-vs-nothing — setting
+    /// the token and the mute flag through the two granular setters instead
+    /// would spawn two independent reconciles that could each emit a frame.
+    /// `token == nil` leaves the held token untouched (e.g. no APNs token yet).
+    func applyPush(token: (token: String, environment: Wire.ApnsEnvironment)?, muted: Bool) {
+        if let token { pushToken = token }
+        pushMuted = muted
+        if phase == .live, let ch = channel {
+            Task { await reconcilePushToken(on: ch) }
         }
     }
 
     // MARK: - Supervisor
 
     private func runSupervisor() async {
-        record = (try? recordStore.load()) ?? nil
+        record = (try? loadRecord()) ?? nil
         guard record != nil else {
             setLink(.disconnected)
             return
@@ -272,6 +362,9 @@ actor TransportClient {
         channel = nil
         e2e = nil
         phase = .idle
+        // A new session must re-register from scratch (the relay's v1 in-memory
+        // store may have dropped our token), so forget what THIS session sent.
+        registeredToken = nil
         return sessionAuthed
     }
 
@@ -338,6 +431,18 @@ actor TransportClient {
             emit(.presence(peer: peer, connected: connected))
             return true
 
+        case let .machineName(pairingId, name):
+            // Defensive: only apply a name announced for OUR pairing (this
+            // client is scoped to exactly one pairing/record — b8d.5).
+            guard record?.pairingId == pairingId.rawValue else { return true }
+            // Sanitize/bound before it ever reaches the store (§5.7): an
+            // all-whitespace result reads as "no name" and is dropped rather
+            // than clobbering the previous/fallback display name.
+            if let sanitized = Wire.sanitizeMachineName(name) {
+                emit(.machineName(sanitized))
+            }
+            return true
+
         case let .envelope(env):
             await handleEnvelope(env, on: ch)
             return true
@@ -360,9 +465,15 @@ actor TransportClient {
 
         // Frames the phone never receives in steady state, or handshake
         // restatements: ignore and keep the session alive.
+        // `pairingRevoked` (the relay's confirmation of our own `revoke`) and
+        // `revoke` (phone→relay only) are ignored here: the phone removes its
+        // local pairing state eagerly when it sends the revoke (best-effort,
+        // idempotent — remote-control-b8d.11), so it never gates removal on this
+        // confirmation. If it arrives after teardown this client is already gone.
         case .ack, .resume, .ping, .hello, .authResponse,
              .pairingOffer, .pairingOfferOk, .pairingClaim, .pairingClaimed,
-             .registerPushToken, .pushTokenAck:
+             .registerPushToken, .unregisterPushToken, .pushTokenAck,
+             .revoke, .pairingRevoked:
             return true
         }
     }
@@ -385,20 +496,35 @@ actor TransportClient {
             await sendEnvelope(for: cmd, track: false)
         }
         // Re-register any known push token (the relay's v1 store may have
-        // dropped it across a restart; spec §5.5 / store.rs module docs).
-        await sendPushToken(on: ch)
+        // dropped it across a restart; spec §5.5 / store.rs module docs), unless
+        // this pairing is muted (in which case nothing is sent).
+        await reconcilePushToken(on: ch)
     }
 
-    /// Send the `register_push_token` relay frame if a token is known. Plain
-    /// relay-plane frame (opaque token, outside E2E); a send failure is
+    /// Bring the relay's push-token state for this pairing in line with our
+    /// intent (spec §5.5 / remote-control-b8d.10), sending at most one frame:
+    ///  - unmuted + a token we haven't registered this session → `register_push_token`
+    ///    (and record it so a repeat call doesn't double-register);
+    ///  - muted while a token IS registered → `unregister_push_token` (and forget it);
+    ///  - otherwise (muted with nothing registered, or already up to date) → no-op.
+    /// Plain relay-plane frames (opaque token, outside E2E); a send failure is
     /// swallowed — it will be retried on the next `auth_ok`.
-    private func sendPushToken(on ch: any WebSocketChannel) async {
-        guard let pushToken, let record else { return }
-        try? await ch.send(.registerPushToken(
-            pairingId: Wire.PairingId(record.pairingId),
-            token: pushToken.token,
-            environment: pushToken.environment
-        ))
+    private func reconcilePushToken(on ch: any WebSocketChannel) async {
+        guard let record else { return }
+        let pairingId = Wire.PairingId(record.pairingId)
+        if pushMuted {
+            if registeredToken != nil {
+                try? await ch.send(.unregisterPushToken(pairingId: pairingId))
+                registeredToken = nil
+            }
+        } else if let pushToken, registeredToken != pushToken.token {
+            try? await ch.send(.registerPushToken(
+                pairingId: pairingId,
+                token: pushToken.token,
+                environment: pushToken.environment
+            ))
+            registeredToken = pushToken.token
+        }
     }
 
     private func handleEnvelope(_ env: Wire.EncryptedEnvelope, on ch: any WebSocketChannel) async {
@@ -463,9 +589,9 @@ actor TransportClient {
         record.lastReceivedSeq = env.seq
         self.record = record
         if isReset {
-            _ = try? recordStore.resetInboundCursor(to: env.seq)
+            _ = try? recordStore.resetInboundCursor(to: env.seq, pairingId: record.pairingId)
         } else {
-            _ = try? recordStore.setLastReceivedSeq(env.seq)
+            _ = try? recordStore.setLastReceivedSeq(env.seq, pairingId: record.pairingId)
         }
 
         if case let .commandAck(ack) = message {
@@ -529,7 +655,7 @@ actor TransportClient {
         // Commit the outbound cursor only after a successful send (§6.1).
         record.lastSentSeq = next
         self.record = record
-        _ = try? recordStore.setLastSentSeq(next)
+        _ = try? recordStore.setLastSentSeq(next, pairingId: record.pairingId)
 
         if track {
             emit(.delivery(commandId: commandId, state: .sending))
@@ -605,7 +731,7 @@ actor TransportClient {
         guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
         record.lastSentSeq = 0
         self.record = record
-        _ = try? recordStore.resetOutboundCursor()
+        _ = try? recordStore.resetOutboundCursor(pairingId: record.pairingId)
     }
 
     private func shortToken() -> String {

@@ -161,14 +161,16 @@ final class DocScreenshotUITests: XCTestCase {
     }
 
     @MainActor
-    func test10Activity() throws {
+    func test10Feed() throws {
+        // The Activity tab was folded into the unified Feed (remote-control-fa8):
+        // this now captures the Feed with its attention-first unread rows.
         let app = XCUIApplication()
         launchPaired(app, ["-uitest-fixture-snapshot", "-uitest-fixture-activity", "-uitest-linkstate", "connected:38"])
-        let activityTab = element(app, "tab-activity")
-        XCTAssertTrue(activityTab.waitForExistence(timeout: 10))
-        activityTab.tap()
-        XCTAssertTrue(element(app, "ActivityFeedView").waitForExistence(timeout: 10))
-        snap(app, "10-activity")
+        let feedTab = element(app, "tab-feed")
+        XCTAssertTrue(feedTab.waitForExistence(timeout: 10))
+        feedTab.tap()
+        XCTAssertTrue(element(app, "FeedView").waitForExistence(timeout: 10))
+        snap(app, "10-feed")
     }
 
     @MainActor

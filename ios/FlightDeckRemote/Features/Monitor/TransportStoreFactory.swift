@@ -59,6 +59,78 @@ enum TransportStoreFactory {
         return store
     }
 
+    /// Build the app's multi-pairing `TransportCoordinator` (remote-control-b8d.5):
+    /// one `TransportClient` + `TransportStore` per `PairedInstance`, all sharing
+    /// the phone's single `DeviceIdentity` + `KeyAgreementKeys` (Secure Enclave /
+    /// KA keys are per-device, never per-pairing) and one keyed
+    /// `PairingRecordStore`. Each client owns a fresh `URLSessionWebSocketConnection`
+    /// and a per-pairing `SnapshotCache` file.
+    ///
+    /// Legacy bridge: a device paired before multi-pairing has a `PairingRecord`
+    /// but no `PairedInstance` — synthesized here so the coordinator connects it
+    /// like any other. The DEBUG `-uitest-fixture-snapshot[-stale]` seams seed the
+    /// (recordless) transitional `primaryStore` so the Projects/Sessions screens
+    /// render deterministically without a live desktop, matching the pre-multi-
+    /// pairing `makeDefault` behavior. Real on-disk caches are skipped for any
+    /// `-uitest*` launch (hermeticity).
+    static func makeCoordinator(
+        pairingStore: PairingStore,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> TransportCoordinator {
+        let recordStore = PairingRecordStore()
+        let isUITestLaunch = arguments.contains { $0.hasPrefix("-uitest") }
+        let coordinator = TransportCoordinator(
+            identity: loadIdentity(),
+            keyAgreement: loadKeyAgreement(),
+            recordStore: recordStore,
+            connectorFactory: { URLSessionWebSocketConnection() },
+            cacheFactory: { pairingId in
+                isUITestLaunch
+                    ? nil
+                    : SnapshotCache(fileURL: SnapshotCache.fileURL(forPairingId: pairingId))
+            },
+            // Desktop-announced machine names write back into the SAME
+            // `pairingStore` the caller passed in, so a Mac rename +
+            // reconnect auto-updates `PairedInstance.machineNameFromDesktop`
+            // app-wide (remote-control-b8d.9).
+            pairingStore: pairingStore
+        )
+        if !isUITestLaunch {
+            seedLegacyInstanceIfNeeded(into: pairingStore, recordStore: recordStore)
+        }
+        coordinator.installInitialInstances(pairingStore.list)
+        #if DEBUG
+        if arguments.contains("-uitest-fixture-snapshot") {
+            coordinator.primaryStore.debugSeed(snapshot: .uiTestFixture)
+        } else if arguments.contains("-uitest-fixture-snapshot-stale") {
+            coordinator.primaryStore.seedFromCache(
+                SnapshotCache.CachedState(snapshot: .uiTestFixture, transcripts: [], cachedAtMs: 0))
+        }
+        #endif
+        return coordinator
+    }
+
+    /// One-time legacy migration: if the device is paired (a `PairingRecord`
+    /// exists) but has no `PairedInstance` metadata yet (paired before
+    /// remote-control-b8d.4), synthesize the instance from the record so the
+    /// coordinator treats it as a first-class pairing. Idempotent — a no-op once
+    /// an instance list exists.
+    private static func seedLegacyInstanceIfNeeded(
+        into pairingStore: PairingStore,
+        recordStore: PairingRecordStore
+    ) {
+        guard pairingStore.list.isEmpty,
+              let records = try? recordStore.loadAll(), !records.isEmpty else { return }
+        for record in records {
+            guard let url = URL(string: record.relayURL) else { continue }
+            pairingStore.add(PairedInstance(
+                pairingId: record.pairingId,
+                relayURL: url,
+                pairedAt: record.pairedAt
+            ))
+        }
+    }
+
     private static func makeClient() -> TransportClient {
         TransportClient(
             identity: loadIdentity(),
@@ -95,4 +167,5 @@ private final class InMemoryFallbackKeychainStore: KeychainStoring {
     func get(account: String) throws -> Data? { storage[account] }
     func set(_ data: Data, account: String) throws { storage[account] = data }
     func delete(account: String) throws { storage.removeValue(forKey: account) }
+    func accounts() throws -> [String] { Array(storage.keys) }
 }

@@ -12,6 +12,15 @@
 //    desktop_to_phone -> Wire.DesktopToPhone
 //    phone_to_desktop -> Wire.PhoneCommand
 //
+//  remote-control-b8d.9/.10/.11 note: the `machine_name` (b8d.9),
+//  `unregister_push_token` (b8d.10), and `revoke`/`pairing_revoked` (b8d.11)
+//  entries below were hand-spliced in (rather than running the full sync script)
+//  as their owning iOS issues landed, to avoid pulling in unrelated fields that
+//  the same upstream commit (7f0cd86) also touched (e.g. a
+//  `pairing_offer.claim_token_hint` the `Wire.RelayFrame` mirror doesn't decode
+//  yet). Re-run `ios/scripts/sync-fixtures.sh` for a full resync when that
+//  field is adopted.
+//
 
 import Foundation
 
@@ -68,6 +77,10 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogImhlbGxvX29rIiwKICAicHJvdG9jb2xfdmVyc2lvbiI6IDEsCiAgInNlcnZlcl90aW1lX21zIjogMTc1MjQxMjgwMDAwMCwKICAiY29ubmVjdGlvbl9pZCI6ICJjb25uXzAxSFpYOFEiCn0K"),
         ProtocolFixture(
             category: "relay",
+            name: "machine_name",
+            base64: "ewogICJ0eXBlIjogIm1hY2hpbmVfbmFtZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgIm1hY2hpbmVfbmFtZSI6ICJSdXVkJ3MgTWFjQm9vayBQcm8iCn0K"),
+        ProtocolFixture(
+            category: "relay",
             name: "pairing_claim",
             base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW0iLAogICJjbGFpbV90b2tlbiI6ICI0NzI5LVhrOVFhMkxtIiwKICAiZGV2aWNlX2lkIjogImRldl85ZjNhMWMiLAogICJkZXZpY2VfcHVibGljX2tleSI6ICJjUTJwVjhZYjNOejdXdDFSazRYaDZaZzlNbTBBYTVCYjJDYzREZDZFZTg9IiwKICAia2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlUGhvbmVLZXlBZ3JlZW1lbnRTZWMxUHViS2V5QmFzZTY0V291bGQ2NUJ5dGVzR2cySGg0Smo2S2s4TGwwTW0yTm40UHA2UXE4UnIwU3MyVHQ0VXU2dj09IiwKICAicm9sZSI6ICJwaG9uZSIKfQo="),
         ProtocolFixture(
@@ -104,8 +117,20 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInJlZ2lzdGVyX3B1c2hfdG9rZW4iLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiLAogICJ0b2tlbiI6ICI3NDBmNDcwN2JlYmNmNzRmOWI3YzI1ZDQ4ZTMzNTg5NDVmNmFhMDFkYTVkZGIzODc0NjJjN2VhZjYxYmI3OGFkIiwKICAiZW52aXJvbm1lbnQiOiAicHJvZHVjdGlvbiIKfQo="),
         ProtocolFixture(
             category: "relay",
+            name: "unregister_push_token",
+            base64: "ewogICJ0eXBlIjogInVucmVnaXN0ZXJfcHVzaF90b2tlbiIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
+        ProtocolFixture(
+            category: "relay",
             name: "resume",
             base64: "ewogICJ0eXBlIjogInJlc3VtZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgImZyb21fc2VxIjogNDEKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_revoked",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfcmV2b2tlZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "revoke",
+            base64: "ewogICJ0eXBlIjogInJldm9rZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "version_incompatible",
@@ -222,5 +247,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 47
+    static let expectedCount = 51
 }

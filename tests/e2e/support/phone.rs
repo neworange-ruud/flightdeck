@@ -285,6 +285,7 @@ impl PhoneDriver {
             device_id,
             signature: STANDARD.encode(signature.to_bytes()),
             pairing_ids: vec![pairing_id.clone()],
+            machine_name: None,
         });
         match conn.recv_expect(deadline, "auth_ok") {
             RelayFrame::AuthOk { pairing_ids } => {
@@ -375,6 +376,9 @@ impl PhoneDriver {
                 // Relay-plane acks/errors are not application messages; an
                 // error frame is worth surfacing loudly.
                 RelayFrame::Ack { .. } => {}
+                // The desktop announces its machine name on connect (spec §5.7);
+                // it is relay-plane metadata, not an application message — skip it.
+                RelayFrame::MachineName { .. } => {}
                 RelayFrame::Error { code, message, .. } => {
                     panic!("relay error while awaiting desktop feed: {code:?} — {message}")
                 }
@@ -586,6 +590,7 @@ mod tests {
             device_id: desktop_device.clone(),
             signature: STANDARD.encode(d_sig.to_bytes()),
             pairing_ids: vec![pairing_id.clone()],
+            machine_name: None,
         });
         assert!(matches!(
             desktop.recv_expect(d_deadline, "auth_ok"),

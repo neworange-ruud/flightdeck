@@ -66,6 +66,10 @@ actor ScriptedChannel: WebSocketChannel {
 
     /// The outbound frames captured so far.
     func sentFrames() -> [Wire.RelayFrame] { sent }
+
+    /// Whether `close()` has been called (teardown assertion — no lingering
+    /// socket after `stop`/`stopAll`).
+    func isClosed() -> Bool { closed }
 }
 
 /// A `WebSocketConnecting` that hands out scripted channels. By default it
@@ -118,6 +122,10 @@ final class EventCollector: @unchecked Sendable {
 
     var links: [RemoteLinkState] {
         events.compactMap { if case let .link(s) = $0 { return s }; return nil }
+    }
+
+    var machineNames: [String] {
+        events.compactMap { if case let .machineName(name) = $0 { return name }; return nil }
     }
 
     func deliveries(for id: Wire.CommandId) -> [CommandDeliveryState] {

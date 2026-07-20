@@ -26,6 +26,7 @@ final class InMemoryKeychainStore: KeychainStoring {
     func get(account: String) throws -> Data? { items[account] }
     func set(_ data: Data, account: String) throws { items[account] = data }
     func delete(account: String) throws { items[account] = nil }
+    func accounts() throws -> [String] { Array(items.keys) }
 }
 
 /// Test-only verification helper: verify a raw r‖s signature over `nonce`

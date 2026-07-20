@@ -15,6 +15,22 @@
 //  paired/unpaired boundary stays manually testable in the simulator, and
 //  so existing UI tests (NavigationUITests) keep working unmodified.
 //
+//  Reused, unchanged, as the "Add machine" flow while already paired
+//  (remote-control-b8d.7 — see `AddMachineSheet`): `RealPairingService.pair`
+//  already APPENDS a `PairedInstance` rather than replacing (remote-control-
+//  b8d.4), so completing this flow a second/third/fourth time grows the
+//  paired set instead of overwriting it. Two additions serve that reused
+//  context without touching the handshake itself:
+//   - `onPaired` — an optional completion hook, called right after
+//     `pairingStore.completePairing(with:)`, that `AddMachineSheet` uses to
+//     dismiss itself. `nil` (the default) for the onboarding use — there is
+//     nothing to dismiss when this IS the root screen.
+//   - the cap guard in `pair(with:)` plus `isBlockedByCap`, which disable the
+//     Pair/Scan controls and surface `PairingLimits.capReachedMessage`
+//     whenever `pairingStore.isAtPairingCap` — blocking a new pairing from
+//     ever starting once the multi-pairing hard cap is reached, regardless of
+//     which entry point (onboarding vs. Add machine) presented this screen.
+//
 
 import SwiftUI
 
@@ -22,7 +38,22 @@ struct PairingView: View {
     var pairingStore: PairingStore
     // Chosen at the composition root: the deterministic mock under UI tests /
     // in DEBUG, the real relay-backed service otherwise (PairingServiceFactory).
-    var service: PairingServicing = PairingServiceFactory.makeDefault()
+    // Defaulted via `init` (rather than a plain property default) so it's
+    // wired to THIS view's `pairingStore` — a real pairing then appends its
+    // `PairedInstance` to the very store this view (and the rest of the app)
+    // observes, not an orphaned scratch instance (remote-control-b8d.4).
+    var service: PairingServicing
+    /// Called right after a successful pair completes (see the file-level
+    /// doc comment) — `AddMachineSheet` passes a closure that dismisses the
+    /// sheet; `nil` (the onboarding case, this view IS the root screen) does
+    /// nothing extra.
+    var onPaired: (() -> Void)?
+
+    init(pairingStore: PairingStore, service: PairingServicing? = nil, onPaired: (() -> Void)? = nil) {
+        self.pairingStore = pairingStore
+        self.service = service ?? PairingServiceFactory.makeDefault(pairingStore: pairingStore)
+        self.onPaired = onPaired
+    }
 
     @State private var code: String = ""
     @State private var isLoading = false
@@ -32,6 +63,18 @@ struct PairingView: View {
     @FocusState private var codeFieldFocused: Bool
 
     private var isCodeComplete: Bool { code.count == 4 }
+
+    /// Blocks starting a new pairing once the multi-pairing hard cap
+    /// (`PairingLimits.maxPairedInstances`) is reached — see the file-level
+    /// doc comment.
+    private var isBlockedByCap: Bool { pairingStore.isAtPairingCap }
+
+    /// `errorMessage` wins (it reflects the most recent attempt); otherwise,
+    /// while blocked by the cap, show that explanation up front rather than
+    /// waiting for the user to try and fail.
+    private var displayedMessage: String? {
+        errorMessage ?? (isBlockedByCap ? PairingError.pairingCapReached.errorDescription : nil)
+    }
 
     // Show an unmistakable badge whenever pairing is mocked outside a UI test
     // (remote-control-lae): a mocked handshake never opens a socket to the
@@ -63,8 +106,8 @@ struct PairingView: View {
                         .padding(.top, Theme.Spacing.sm)
                         .modifier(ShakeEffect(animatableData: shakeTrigger))
 
-                    if let errorMessage {
-                        Text(errorMessage)
+                    if let displayedMessage {
+                        Text(displayedMessage)
                             .typography(Typography.callout)
                             .foregroundStyle(Theme.statusRed)
                             .multilineTextAlignment(.center)
@@ -248,10 +291,10 @@ struct PairingView: View {
         .buttonStyle(.plain)
         .foregroundStyle(Theme.bgDeep)
         .background(
-            (isCodeComplete && !isLoading) ? Theme.accent : Theme.accent.opacity(0.35),
+            (isCodeComplete && !isLoading && !isBlockedByCap) ? Theme.accent : Theme.accent.opacity(0.35),
             in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
         )
-        .disabled(!isCodeComplete || isLoading)
+        .disabled(!isCodeComplete || isLoading || isBlockedByCap)
         .accessibilityIdentifier("pair-button")
     }
 
@@ -274,7 +317,7 @@ struct PairingView: View {
                 .typography(Typography.bodyMedium)
         }
         .foregroundStyle(Theme.textPrimary)
-        .disabled(isLoading)
+        .disabled(isLoading || isBlockedByCap)
         .accessibilityIdentifier("scan-qr-button")
     }
 
@@ -305,14 +348,30 @@ struct PairingView: View {
     @MainActor
     private func pair(with input: PairingInput) async {
         errorMessage = nil
+
+        // Cap enforcement (remote-control-b8d.7): block STARTING a new
+        // pairing outright — before touching the network/relay at all —
+        // once `PairingLimits.maxPairedInstances` is already paired. The
+        // Pair/Scan controls are already disabled in this state (see
+        // `isBlockedByCap`), so reaching here means either the guard raced
+        // a state change or a caller invoked `pair(with:)` directly (tests);
+        // both cases still need a message, not a silent no-op.
+        guard !pairingStore.isAtPairingCap else {
+            errorMessage = PairingError.pairingCapReached.errorDescription
+            return
+        }
+
         isLoading = true
         defer { isLoading = false }
 
         do {
             let device = try await service.pair(with: input)
             pairingStore.completePairing(with: device)
-            // No further UI work: RootView swaps this screen out the
-            // instant `pairingStore.isPaired` flips to true.
+            // No further UI work for the onboarding case: RootView swaps
+            // this screen out the instant `pairingStore.hasAnyPairing` flips
+            // to true. For the Add-machine case (`onPaired` non-nil), let
+            // the caller (e.g. `AddMachineSheet`) dismiss itself.
+            onPaired?()
         } catch let error as PairingError {
             errorMessage = error.errorDescription
             triggerShake(for: input)

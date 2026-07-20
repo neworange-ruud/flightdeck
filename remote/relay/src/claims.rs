@@ -84,6 +84,13 @@ impl ClaimTable {
         })
     }
 
+    /// Drop every live token bound to `pairing`. Used when a pairing is revoked
+    /// (spec §10.2) so no dangling claim can later redeem into a gone pairing.
+    /// A no-op when no token targets that pairing.
+    pub fn remove_pairing(&mut self, pairing: &PairingId) {
+        self.entries.retain(|_, e| e.pairing_id != *pairing);
+    }
+
     /// Whether `token` is currently present (issued and not yet redeemed).
     /// Used to decide whether a desktop's `claim_token_hint` is free to reuse
     /// (spec §5.2 amendment): a hint that collides with a live token is refused

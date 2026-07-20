@@ -14,7 +14,7 @@ use flightdeck_relay::{
     config::{Config, LogFormat},
 };
 use flightdeck_remote_protocol::{
-    ClientInfo, DeviceId, PairingId, RelayFrame, Role, PROTOCOL_VERSION,
+    ApnsEnvironment, ClientInfo, DeviceId, PairingId, RelayFrame, Role, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
@@ -264,16 +264,58 @@ impl TestClient {
     /// Sign the challenge and authenticate, activating `pairing_ids`. Returns
     /// the pairings the relay reports active in `auth_ok`.
     pub async fn authenticate(&mut self, pairing_ids: Vec<PairingId>) -> Vec<PairingId> {
+        self.authenticate_named(pairing_ids, None).await
+    }
+
+    /// Like [`Self::authenticate`] but also announces a `machine_name`
+    /// (spec §10.1 — desktops send this on every connect).
+    pub async fn authenticate_named(
+        &mut self,
+        pairing_ids: Vec<PairingId>,
+        machine_name: Option<&str>,
+    ) -> Vec<PairingId> {
         let signature = self.sign_nonce();
         self.send(RelayFrame::AuthResponse {
             device_id: self.device_id.clone(),
             signature,
             pairing_ids,
+            machine_name: machine_name.map(str::to_string),
         })
         .await;
         match self.recv().await {
             RelayFrame::AuthOk { pairing_ids } => pairing_ids,
             other => panic!("expected auth_ok, got {other:?}"),
         }
+    }
+
+    /// Send a phone-initiated revoke for `pairing` (spec §10.2).
+    pub async fn revoke(&mut self, pairing: &PairingId) {
+        self.send(RelayFrame::Revoke {
+            pairing_id: pairing.clone(),
+        })
+        .await;
+    }
+
+    /// Register/refresh an APNs push token for `pairing` (spec §5.5).
+    pub async fn register_push_token(
+        &mut self,
+        pairing: &PairingId,
+        token: &str,
+        environment: ApnsEnvironment,
+    ) {
+        self.send(RelayFrame::RegisterPushToken {
+            pairing_id: pairing.clone(),
+            token: token.to_string(),
+            environment,
+        })
+        .await;
+    }
+
+    /// Deregister the APNs push token for `pairing` without unpairing (spec §5.5).
+    pub async fn unregister_push_token(&mut self, pairing: &PairingId) {
+        self.send(RelayFrame::UnregisterPushToken {
+            pairing_id: pairing.clone(),
+        })
+        .await;
     }
 }

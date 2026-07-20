@@ -161,6 +161,20 @@ pub enum RelayFrame {
         signature: String,
         /// Pairing ids this device wants to activate on this connection.
         pairing_ids: Vec<PairingId>,
+        /// **Desktop only, optional.** The desktop's self-asserted, human-readable
+        /// machine name (e.g. `"Ruud's MacBook Pro"`), sent on **every** connect
+        /// so the phone's per-pairing default name auto-updates when the Mac is
+        /// renamed (spec §10.1). It applies to **all** the `pairing_ids` activated
+        /// on this connection (one Mac → one name). The relay stores it per
+        /// pairing and forwards it to the paired phone via [`Self::MachineName`].
+        ///
+        /// This is **untrusted display text**: the relay length-bounds it and the
+        /// phone sanitizes it before display; it is never used for routing or
+        /// authorization. The phone sends `None` here. `Option` for backward
+        /// compatibility — an older desktop omits it (deserialized as `None`) and
+        /// the phone simply keeps its previous/fallback name.
+        #[serde(default)]
+        machine_name: Option<String>,
     },
 
     /// relay -> endpoint. Authentication succeeded; these pairings are active.
@@ -278,6 +292,55 @@ pub enum RelayFrame {
         at_ms: i64,
     },
 
+    /// relay -> endpoint (phone). The desktop's self-asserted, human-readable
+    /// machine name for a specific pairing (spec §10.1). Forwarded from the
+    /// desktop's [`Self::AuthResponse`] `machine_name`, scoped to one
+    /// `pairing_id` so a phone paired with several Macs can attribute each name
+    /// correctly. The relay emits it:
+    /// * to the phone right after it authenticates, for each activated pairing
+    ///   whose desktop has already announced a name, **and**
+    /// * to the connected phone whenever the desktop (re)connects and announces
+    ///   its name (so a Mac rename propagates on the desktop's next connect).
+    ///
+    /// `machine_name` is **untrusted display text**: the relay length-bounds it
+    /// (see the relay's `MAX_MACHINE_NAME_CHARS`) and the phone must sanitize it
+    /// before display. It is display-only — never used for routing or auth. The
+    /// phone treats this value as the pairing's new default name (a user override
+    /// still wins). A pairing for which no name has been announced simply never
+    /// receives this frame, and the phone keeps its previous/fallback name.
+    MachineName {
+        /// The pairing the name applies to.
+        pairing_id: PairingId,
+        /// The desktop's current display name (already length-bounded).
+        machine_name: String,
+    },
+
+    /// endpoint -> relay. Phone-initiated unpair: revoke a pairing this device is
+    /// a member of (spec §10.2). The relay **must** verify the authenticated
+    /// device is a member of `pairing_id` before removing it; a non-member's
+    /// revoke is refused with `error { code: unknown_pairing }` and changes
+    /// nothing. On success the relay drops the pairing and all of its state
+    /// (membership, claim tokens, queued envelopes, push token) and notifies the
+    /// peer with [`Self::PairingRevoked`]. Revocation is **idempotent**: revoking
+    /// a pairing that is already gone is a success no-op (the relay still replies
+    /// [`Self::PairingRevoked`] to the requester). Only this one pairing is
+    /// affected; the device's other pairings are untouched.
+    Revoke {
+        /// The pairing to revoke.
+        pairing_id: PairingId,
+    },
+
+    /// relay -> endpoint. A pairing was revoked and no longer exists on the
+    /// relay. Sent to the **peer** of the revoker (so a desktop learns its phone
+    /// unpaired it and can return to an unpaired, re-pairable state) and, as an
+    /// idempotent success confirmation, back to the **revoker**. The recipient
+    /// should drop its local record for `pairing_id` and tear down that pairing's
+    /// E2E channel; its other pairings are unaffected.
+    PairingRevoked {
+        /// The pairing that was revoked.
+        pairing_id: PairingId,
+    },
+
     /// Both directions. Carries an opaque E2E payload. `type` is `envelope`; the
     /// envelope's own fields are flattened alongside it.
     Envelope(EncryptedEnvelope),
@@ -327,9 +390,28 @@ pub enum RelayFrame {
         environment: ApnsEnvironment,
     },
 
-    /// relay -> endpoint. Confirms a push token was stored.
+    /// relay -> endpoint. Confirms a push token was stored **or removed** — the
+    /// shared confirmation for both [`Self::RegisterPushToken`] and
+    /// [`Self::UnregisterPushToken`] (both act on the same per-pairing token
+    /// slot, so one ack keeps the wire minimal and symmetric).
     PushTokenAck {
-        /// Pairing the token was stored for.
+        /// Pairing the token was stored/removed for.
+        pairing_id: PairingId,
+    },
+
+    /// phone -> relay. Deregisters the pairing's APNs token **without unpairing**
+    /// (spec §5.5), so a phone can stop this pairing's pushes (e.g. a per-machine
+    /// push mute) while keeping the pairing itself intact. The relay **must**
+    /// verify the authenticated device is a member of `pairing_id` before
+    /// removing anything — a non-member's request is refused with
+    /// `error { code: unknown_pairing }` and changes nothing, mirroring
+    /// [`Self::Revoke`]'s membership invariant. Removal is **idempotent**:
+    /// unregistering when no token is stored is a success no-op. On success the
+    /// relay drops the token and confirms with [`Self::PushTokenAck`]. Only this
+    /// pairing's token is affected; the device's other pairings are untouched and
+    /// the pairing stays paired (unlike [`Self::Revoke`]).
+    UnregisterPushToken {
+        /// Pairing whose push token should be removed.
         pairing_id: PairingId,
     },
 

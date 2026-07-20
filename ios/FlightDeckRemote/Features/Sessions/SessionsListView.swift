@@ -14,6 +14,13 @@
 //  named `projectId`; tapping a session pushes `.chat(projectId, sessionId)`
 //  onto `ProjectsNavModel.path` — Chat itself is a sibling placeholder today.
 //
+//  `pairingId` (remote-control-b8d.12) is the SAME value this screen itself
+//  was pushed with — it just threads it through onto the `.chat` route it
+//  pushes next, so the chat destination resolves to the same machine's
+//  `TransportStore` this list is already bound to (`transportStore`), rather
+//  than re-deriving it from any separately-mutable "active machine" state.
+//  `nil` on the Projects tab (single-store, transitional).
+//
 
 import SwiftUI
 
@@ -22,6 +29,16 @@ struct SessionsListView: View {
     var transportStore: TransportStore
     var nav: ProjectsNavModel
     var isPresentingNewAgentSheet: Binding<Bool>
+    var pairingId: String? = nil
+
+    // The tab bar (mounted by `MainTabView` via `.safeAreaInset`) does NOT
+    // inset this pushed, nav-bar-hidden destination — so without reserving its
+    // height here, the bottom-pinned "New agent session" CTA renders directly
+    // underneath the bar and its taps fall through to whatever tab button sits
+    // at the same point. `MainTabView` publishes the measured bar height into
+    // the environment (which, unlike `.safeAreaInset`, propagates into pushed
+    // destinations); reserving it keeps the CTA above and hittable.
+    @Environment(\.tabBarHeight) private var tabBarHeight
 
     private var project: Wire.ProjectState? {
         transportStore.snapshot?.projects.first { $0.projectId == projectId }
@@ -38,6 +55,11 @@ struct SessionsListView: View {
             if project != nil {
                 newAgentCTA
             }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Reserve the tab bar's height (see `tabBarHeight` above) so the
+            // CTA is not overlapped by the bar mounted above this NavigationStack.
+            Color.clear.frame(height: tabBarHeight)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep)
@@ -121,7 +143,7 @@ struct SessionsListView: View {
 
     private func sessionCard(_ session: Wire.SessionState) -> some View {
         Button {
-            nav.path.append(.chat(projectId: projectId.rawValue, sessionId: session.sessionId.rawValue))
+            nav.path.append(.chat(projectId: projectId.rawValue, sessionId: session.sessionId.rawValue, pairingId: pairingId))
         } label: {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 HStack(spacing: Theme.Spacing.sm) {

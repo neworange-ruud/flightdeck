@@ -91,6 +91,10 @@ enum PairingError: Error, Equatable {
     case timedOut
     /// Camera access was denied/restricted for QR scanning.
     case cameraPermissionDenied
+    /// The multi-pairing hard cap (`PairingLimits.maxPairedInstances`,
+    /// remote-control-b8d.7) has been reached — starting a new pairing is
+    /// blocked until an existing one is unpaired.
+    case pairingCapReached
     /// Anything else, carrying a short honest description for display.
     case unknown(String)
 }
@@ -110,6 +114,8 @@ extension PairingError: LocalizedError {
             return "Pairing timed out. Try again."
         case .cameraPermissionDenied:
             return "Camera access is off — enter the code instead, or enable the camera in Settings."
+        case .pairingCapReached:
+            return PairingLimits.capReachedMessage
         case .unknown(let message):
             return message
         }

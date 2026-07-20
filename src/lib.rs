@@ -1488,6 +1488,20 @@ fn event_loop(
                              Open Settings → Remote to pair again.",
                         );
                     }
+                    RemoteInbound::PairingRevoked { .. } => {
+                        // The phone unpaired this Mac (spec §10.2). The client
+                        // already dropped the pairing; clear the overlay/session
+                        // and let the user know they can pair again.
+                        pairing_session = None;
+                        remote_has_persisted_pairing = false;
+                        if matches!(ui.overlay, UiOverlay::Remote(_)) {
+                            ui.overlay = UiOverlay::None;
+                        }
+                        ui.message(
+                            "Your phone unpaired this Mac. \
+                             Open Settings → Remote to pair again.",
+                        );
+                    }
                     _ => {}
                 }
                 b.handle_inbound(msg);

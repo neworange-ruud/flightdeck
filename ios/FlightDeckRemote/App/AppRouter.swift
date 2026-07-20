@@ -2,10 +2,13 @@
 //  AppRouter.swift
 //  FlightDeckRemote
 //
-//  Top-level entry-flow routing (PRD §5.8): unpaired devices land on the
-//  Pairing screen; paired devices land on the main tab container. This is
-//  the app's single observable source of navigation truth:
-//   - `route` — pairing vs. main, derived from `pairingStore.isPaired`.
+//  Top-level entry-flow routing (PRD §5.8, extended for multi-pairing
+//  remote-control-b8d.7): zero pairings land on the Pairing (onboarding)
+//  screen; one or more paired instances land on the main tab container. This
+//  is the app's single observable source of navigation truth:
+//   - `route` — pairing vs. main, derived from `pairingStore.hasAnyPairing`
+//     (count-based off `[PairedInstance]`, not the legacy single-device
+//     `isPaired` boolean — see `PairingStore`'s doc comment).
 //   - `selectedTab` — which bottom tab is showing (PRD §5.7).
 //   - `pendingDeepLink` — the last `flightdeck-remote://` URL parsed via
 //     `handleDeepLink(url:)` (PRD §5.2/§5.7: notifications deep-link
@@ -38,9 +41,12 @@ final class AppRouter {
         self.pairingStore = pairingStore
     }
 
-    /// Chooses the root screen based on pairing state.
+    /// Chooses the root screen based on pairing state: the main tab container
+    /// (today a stand-in for the unified feed, remote-control-b8d.8) once at
+    /// least one instance is paired, the onboarding Pairing screen when none
+    /// are (remote-control-b8d.7 — replaces the old binary `isPaired` check).
     var route: AppRoute {
-        pairingStore.isPaired ? .main : .pairing
+        pairingStore.hasAnyPairing ? .main : .pairing
     }
 
     /// Parses a `flightdeck-remote://` URL (see `DeepLink`). On success,

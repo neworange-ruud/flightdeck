@@ -60,4 +60,24 @@ struct NotificationContentMapperTests {
         let content = try #require(NotificationContentMapper.content(for: PushFixtures.finished, settings: settings))
         #expect(content.sound == nil) // present, but silent
     }
+
+    // MARK: - Multi-pairing pairingId stamping (remote-control-b8d.10)
+
+    @Test func contentStampsPairingIdSoATapDeepLinksToTheMachine() throws {
+        let settings = NotificationSettings(agentNeedsInput: true)
+        let content = try #require(NotificationContentMapper.content(
+            for: PushFixtures.needsInput, settings: settings, pairingId: "pair_ruud_mbp"))
+        let payload = try #require(PushPayload(userInfo: content.userInfo))
+        #expect(payload.pairingId == "pair_ruud_mbp")
+        #expect(payload.appDeepLink.pairingId == "pair_ruud_mbp")
+    }
+
+    @Test func contentOmitsPairingIdWhenUnknown() throws {
+        let settings = NotificationSettings(agentNeedsInput: true)
+        let content = try #require(NotificationContentMapper.content(
+            for: PushFixtures.needsInput, settings: settings))
+        #expect(content.userInfo["pairing_id"] == nil)
+        let payload = try #require(PushPayload(userInfo: content.userInfo))
+        #expect(payload.pairingId == nil)
+    }
 }

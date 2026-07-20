@@ -39,6 +39,15 @@ struct RealPairingService: PairingServicing {
     private let clientInfo: Wire.ClientInfo
     private let timeout: Duration
     private let peerName: String
+    /// The multi-pairing metadata store (remote-control-b8d.4). `pair(with:)`
+    /// appends a `PairedInstance` here on success — ADDING to whatever's
+    /// already paired rather than replacing it, so pairing with a second (or
+    /// third) Mac doesn't disturb the first. Cap enforcement is deferred to
+    /// remote-control-b8d.7. Callers that want this reflected app-wide
+    /// (router/feed/transport/push/settings all observing the same list)
+    /// must inject the same shared `PairingStore` instance used elsewhere at
+    /// the composition root — see `PairingServiceFactory.makeDefault(pairingStore:)`.
+    private let pairingStore: PairingStore
 
     init(
         connector: any WebSocketConnecting = URLSessionWebSocketConnection(),
@@ -46,7 +55,8 @@ struct RealPairingService: PairingServicing {
         identityStore: KeychainStoring = KeychainStore(service: DeviceIdentity.service),
         clientInfo: Wire.ClientInfo? = nil,
         timeout: Duration = .seconds(15),
-        peerName: String = "Your Mac"
+        peerName: String = "Your Mac",
+        pairingStore: PairingStore = PairingStore()
     ) {
         self.connector = connector
         self.recordStore = recordStore
@@ -58,6 +68,7 @@ struct RealPairingService: PairingServicing {
         )
         self.timeout = timeout
         self.peerName = peerName
+        self.pairingStore = pairingStore
     }
 
     func pair(with input: PairingInput) async throws -> PairedDevice {
@@ -153,6 +164,18 @@ struct RealPairingService: PairingServicing {
             relayURL: params.relayURL.absoluteString
         )
         try? recordStore.save(record)
+
+        // Multi-pairing (remote-control-b8d.4): APPEND this pairing's
+        // display/prefs metadata rather than replacing whatever's already
+        // paired. `machineNameFromDesktop` is nil until the first post-auth
+        // connect reports it (remote-control-b8d.1/.9 wire the phone side of
+        // that up); `PairedInstance.displayName` falls back sanely until then.
+        pairingStore.add(PairedInstance(
+            pairingId: claimed.pairingId.rawValue,
+            relayURL: params.relayURL,
+            pairedAt: record.pairedAt,
+            lastKnownOnline: true
+        ))
 
         return PairedDevice(
             pairingId: claimed.pairingId.rawValue,

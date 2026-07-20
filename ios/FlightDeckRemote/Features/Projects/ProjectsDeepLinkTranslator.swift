@@ -31,9 +31,14 @@ enum ProjectsDeepLinkTranslator {
         guard project.sessions.contains(where: { $0.sessionId.rawValue == link.sessionId }) else {
             return nil
         }
+        // The Projects tab stays single-store/transitional (remote-control-b8d.12
+        // scope is the Feed tab's per-instance navigation) — `link.pairingId`
+        // (carried by a per-machine push payload, remote-control-b8d.10) isn't
+        // wired to a store resolution here yet, so both routes pin `nil`,
+        // matching every other Projects-tab push.
         return [
-            .sessions(projectId: link.projectId),
-            .chat(projectId: link.projectId, sessionId: link.sessionId),
+            .sessions(projectId: link.projectId, pairingId: nil),
+            .chat(projectId: link.projectId, sessionId: link.sessionId, pairingId: nil),
         ]
     }
 }

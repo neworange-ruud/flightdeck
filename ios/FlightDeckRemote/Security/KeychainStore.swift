@@ -36,6 +36,10 @@ protocol KeychainStoring {
     func set(_ data: Data, account: String) throws
     /// Deletes the item for `account`. Missing items are treated as success.
     func delete(account: String) throws
+    /// Returns the account strings of every item stored under this service.
+    /// Used to enumerate a keyed collection (e.g. the per-pairing records
+    /// keyed by `pairingId`). Order is unspecified.
+    func accounts() throws -> [String]
 }
 
 /// Concrete Keychain-backed store. Items are scoped to one service string and
@@ -100,6 +104,28 @@ struct KeychainStore: KeychainStoring {
     func delete(account: String) throws {
         let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.unexpectedStatus(status)
+        }
+    }
+
+    func accounts() throws -> [String] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        query[kSecReturnData as String] = false
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            let items = (result as? [[String: Any]]) ?? []
+            return items.compactMap { $0[kSecAttrAccount as String] as? String }
+        case errSecItemNotFound:
+            return []
+        default:
             throw KeychainError.unexpectedStatus(status)
         }
     }

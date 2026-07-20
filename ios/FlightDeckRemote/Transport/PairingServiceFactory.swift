@@ -31,11 +31,19 @@ import Foundation
 
 enum PairingServiceFactory {
     /// The default `PairingServicing` for this build/run.
+    ///
+    /// `pairingStore` (remote-control-b8d.4) is threaded through to
+    /// `RealPairingService` so a real pairing appends its `PairedInstance` to
+    /// the SAME reactive store the rest of the app (router/feed/transport/
+    /// push/settings) observes — pass the app's shared `PairingStore`
+    /// instance (e.g. `router.pairingStore`) here, not a fresh one, or the
+    /// append won't be visible outside this service.
     static func makeDefault(
         arguments: [String] = ProcessInfo.processInfo.arguments,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        pairingStore: PairingStore = PairingStore()
     ) -> PairingServicing {
-        let service = resolve(arguments: arguments, environment: environment)
+        let service = resolve(arguments: arguments, environment: environment, pairingStore: pairingStore)
         if service is MockPairingService,
            !arguments.contains(where: { $0.hasPrefix("-uitest") }) {
             // Loud one-line warning at the composition root: a mocked handshake
@@ -54,14 +62,17 @@ enum PairingServiceFactory {
         arguments: [String] = ProcessInfo.processInfo.arguments,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        resolve(arguments: arguments, environment: environment) is MockPairingService
+        // `pairingStore` doesn't affect service *selection*, only what a real
+        // service is wired to — a scratch instance is fine here.
+        resolve(arguments: arguments, environment: environment, pairingStore: PairingStore()) is MockPairingService
     }
 
     /// Pure selection logic shared by `makeDefault` and `isMock` so both always
     /// agree on which service is active.
     private static func resolve(
         arguments: [String],
-        environment: [String: String]
+        environment: [String: String],
+        pairingStore: PairingStore
     ) -> PairingServicing {
         // 1. UI tests rely on the deterministic mock.
         if arguments.contains(where: { $0.hasPrefix("-uitest") }) {
@@ -69,7 +80,7 @@ enum PairingServiceFactory {
         }
         // 2. Explicit override.
         switch environment["FLIGHTDECK_PAIRING"] {
-        case "real": return RealPairingService()
+        case "real": return RealPairingService(pairingStore: pairingStore)
         case "mock": return MockPairingService()
         default: break
         }
@@ -80,10 +91,10 @@ enum PairingServiceFactory {
         return MockPairingService()
         #else
         // Physical DEBUG device: use the live relay, not a silent fake.
-        return RealPairingService()
+        return RealPairingService(pairingStore: pairingStore)
         #endif
         #else
-        return RealPairingService()
+        return RealPairingService(pairingStore: pairingStore)
         #endif
     }
 }

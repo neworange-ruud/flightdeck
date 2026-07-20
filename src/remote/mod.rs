@@ -113,6 +113,15 @@ pub enum RemoteInbound {
         /// The pairing ids that were dropped from persisted state.
         pairing_ids: Vec<PairingId>,
     },
+    /// The phone unpaired this Mac: the relay revoked the pairing and notified
+    /// this desktop (`pairing_revoked`, spec §10.2). The client has already
+    /// dropped the pairing from persisted state; the app should tear down that
+    /// pairing's E2E channel and return to an unpaired, re-pairable state. Only
+    /// this pairing is affected — any other pairings continue unchanged.
+    PairingRevoked {
+        /// The pairing the phone revoked.
+        pairing_id: PairingId,
+    },
     /// The relay rejected an outbound envelope with `seq_violation`: our outbound
     /// cursor is ahead of the relay's expected next `seq`, almost always because
     /// the relay lost its in-memory per-pairing watermark across a restart while

@@ -14,6 +14,10 @@
 //  path push once the linked project/session is known, then cleared either
 //  way — see that file's doc comment for the unknown-id behavior.
 //
+//  This screen is ALSO today's stand-in for the unified feed's toolbar
+//  (remote-control-b8d.8 owns the real one): its header's "+" presents
+//  `AddMachineSheet` (remote-control-b8d.7), reachable while already paired.
+//
 
 import SwiftUI
 
@@ -24,6 +28,11 @@ struct ProjectsListView: View {
 
     @State private var isSearching = false
     @State private var searchQuery = ""
+    // Add-machine (remote-control-b8d.7) is reached from the Feed toolbar
+    // (feed-add-machine-button) and Settings (settings-add-machine-button);
+    // the earlier stand-in "+" here was removed because a second
+    // `.sheet(isPresented:)` in this NavigationStack silently swallowed the
+    // shared New-Agent sheet (ProjectsSessionsUITests.testNewAgentCTAOpens…).
     @FocusState private var searchFieldFocused: Bool
 
     private var allProjects: [Wire.ProjectState] {
@@ -141,7 +150,7 @@ struct ProjectsListView: View {
     private func projectCard(_ project: Wire.ProjectState) -> some View {
         let vm = RollupModel.viewModel(for: project)
         return Button {
-            nav.path.append(.sessions(projectId: project.projectId.rawValue))
+            nav.path.append(.sessions(projectId: project.projectId.rawValue, pairingId: nil))
         } label: {
             HStack(spacing: Theme.Spacing.md) {
                 StatusDot(status: vm.dot.agentStatus, size: .large)

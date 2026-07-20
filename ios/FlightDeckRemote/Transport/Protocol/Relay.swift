@@ -146,6 +146,15 @@ extension Wire {
         /// relay -> endpoint. The peer connected or disconnected.
         case peerPresence(pairingId: PairingId, peer: Role,
                           state: PresenceState, atMs: Int64)
+        /// relay -> endpoint (phone only, §5.7 v1 amendment). The desktop's
+        /// human-readable name for this pairing — sent right after the phone
+        /// authenticates (once per activated pairing whose desktop has
+        /// already announced a name) and again whenever the desktop
+        /// (re)connects and announces a name, so a Mac rename propagates on
+        /// its next connect. Untrusted display text: sanitize before display
+        /// (`sanitizeMachineName(_:)`) and treat as the pairing's new
+        /// DEFAULT name — a user override always wins (remote-control-b8d.9).
+        case machineName(pairingId: PairingId, machineName: String)
         /// Both directions. Carries an opaque E2E payload (fields flattened).
         case envelope(EncryptedEnvelope)
         /// Both directions. Cumulative ack up to and including `cursor`.
@@ -159,8 +168,24 @@ extension Wire {
         /// phone -> relay. Registers/refreshes the APNs token for a pairing.
         case registerPushToken(pairingId: PairingId, token: String,
                                environment: ApnsEnvironment)
-        /// relay -> endpoint. Confirms a push token was stored.
+        /// phone -> relay. Drops this pairing's APNs token WITHOUT unpairing —
+        /// per-machine push mute (spec §5.5). Membership-verified + idempotent
+        /// on the relay; confirmed by the SAME `pushTokenAck` as register.
+        case unregisterPushToken(pairingId: PairingId)
+        /// relay -> endpoint. Confirms a push token was stored (register) or
+        /// removed (unregister — the ack is shared, spec §5.5).
         case pushTokenAck(pairingId: PairingId)
+        /// phone -> relay. Unpair (revoke) this pairing (spec §5.8,
+        /// remote-control-b8d.2/.11). The relay verifies membership, removes the
+        /// pairing (members, claims, queues, push token) and notifies the
+        /// desktop. Idempotent: deleting the local record on send is safe, and
+        /// retries are safe.
+        case revoke(pairingId: PairingId)
+        /// relay -> phone. Confirms a pairing was revoked — sent on success AND
+        /// idempotently for an already-removed/unknown-to-caller pairing (spec
+        /// §5.8). The phone removes its local record eagerly on send, so this is
+        /// treated as a non-fatal advisory rather than a gate on removal.
+        case pairingRevoked(pairingId: PairingId)
         /// relay -> endpoint. A relay-plane error.
         case error(code: RelayErrorCode, message: String, pairingId: PairingId?)
         /// Both directions. Graceful shutdown notice.
@@ -169,6 +194,7 @@ extension Wire {
         private enum CodingKeys: String, CodingKey {
             case type, role, client, nonce, signature, peer, state, cursor
             case token, environment, code, message, reason
+            case machineName = "machine_name"
             case protocolVersion = "protocol_version"
             case deviceId = "device_id"
             case serverTimeMs = "server_time_ms"
@@ -251,6 +277,10 @@ extension Wire {
                     peer: try c.decode(Role.self, forKey: .peer),
                     state: try c.decode(PresenceState.self, forKey: .state),
                     atMs: try c.decode(Int64.self, forKey: .atMs))
+            case "machine_name":
+                self = .machineName(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId),
+                    machineName: try c.decode(String.self, forKey: .machineName))
             case "envelope":
                 self = .envelope(try EncryptedEnvelope(from: decoder)) // flattened
             case "ack":
@@ -273,8 +303,17 @@ extension Wire {
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId),
                     token: try c.decode(String.self, forKey: .token),
                     environment: try c.decode(ApnsEnvironment.self, forKey: .environment))
+            case "unregister_push_token":
+                self = .unregisterPushToken(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
             case "push_token_ack":
                 self = .pushTokenAck(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
+            case "revoke":
+                self = .revoke(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
+            case "pairing_revoked":
+                self = .pairingRevoked(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId))
             case "error":
                 self = .error(
@@ -352,6 +391,10 @@ extension Wire {
                 try c.encode(peer, forKey: .peer)
                 try c.encode(state, forKey: .state)
                 try c.encode(atMs, forKey: .atMs)
+            case let .machineName(pairingId, machineName):
+                try c.encode("machine_name", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+                try c.encode(machineName, forKey: .machineName)
             case let .envelope(envelope):
                 try c.encode("envelope", forKey: .type)
                 try envelope.encode(to: encoder) // flattened
@@ -375,8 +418,17 @@ extension Wire {
                 try c.encode(pairingId, forKey: .pairingId)
                 try c.encode(token, forKey: .token)
                 try c.encode(environment, forKey: .environment)
+            case let .unregisterPushToken(pairingId):
+                try c.encode("unregister_push_token", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
             case let .pushTokenAck(pairingId):
                 try c.encode("push_token_ack", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+            case let .revoke(pairingId):
+                try c.encode("revoke", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+            case let .pairingRevoked(pairingId):
+                try c.encode("pairing_revoked", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
             case let .error(code, message, pairingId):
                 try c.encode("error", forKey: .type)
@@ -388,5 +440,28 @@ extension Wire {
                 try c.encode(reason, forKey: .reason) // explicit null
             }
         }
+    }
+
+    // MARK: - Machine name sanitization (§5.7)
+
+    /// Maximum machine-name length (REMOTE_PROTOCOL §5.7) — matches the
+    /// relay's own bound (`remote/relay/src/session.rs::MAX_MACHINE_NAME_CHARS`).
+    static let maxMachineNameLength = 64
+
+    /// Trim and length-bound a `machine_name` frame's value before it is ever
+    /// stored or displayed. The value is untrusted display text from the
+    /// desktop; the relay already trims + bounds it to
+    /// `maxMachineNameLength` characters, but the phone re-applies the same
+    /// rule (belt-and-suspenders — never trust the wire further than the
+    /// contract promises). Mirrors the relay's `bound_machine_name`.
+    ///
+    /// An all-whitespace/empty result is treated as "no name" (`nil`) — the
+    /// relay's own `bound_machine_name` never forwards one, but a caller that
+    /// keeps `nil` here simply falls back to the previous/fallback name
+    /// rather than overwriting it with blank text.
+    static func sanitizeMachineName(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(maxMachineNameLength))
     }
 }

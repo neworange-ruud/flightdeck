@@ -2,14 +2,14 @@
 //  ActivityCellMapping.swift
 //  FlightDeckRemote
 //
-//  Pure `Wire.AgentEvent` → Activity-cell view-model mapping (PRD §5.7): the
-//  chronological feed renders each event through the DesignSystem
-//  `NotificationCell` (needs-input orange / finished green) or, for errors —
-//  a variant `NotificationCell.Kind` doesn't have, since it's built for
-//  exactly two statuses (see its own doc comment) and this feature doesn't
-//  own that file — a locally-styled red-tinted row (`ActivityErrorCell`,
-//  ActivityFeedView.swift). Kept pure and free of SwiftUI/Theme-adjacent
-//  formatting decisions so the mapping is unit-testable without a view host.
+//  Pure `Wire.AgentEvent` → text mapping: the message composition per
+//  `EventKind` (needs-input preview / finished summary + files-changed / error
+//  message) and coarse relative-time formatting. Originally the Activity tab's
+//  cell mapper; after that tab was folded into the unified Feed
+//  (remote-control-fa8) the `message(for:)` half is reused by
+//  `FeedRowPresentation.eventSummary` to render a feed row's event-derived
+//  summary line. Kept pure and free of SwiftUI/Theme-adjacent formatting
+//  decisions so the mapping is unit-testable without a view host.
 //
 
 import Foundation

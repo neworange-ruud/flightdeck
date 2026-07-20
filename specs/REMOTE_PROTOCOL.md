@@ -113,8 +113,9 @@ Every connection begins with version negotiation on the relay plane.
 client → relay : hello { protocol_version, role, device_id, client }
 relay  → client: hello_ok { protocol_version, server_time_ms, connection_id }
 relay  → client: auth_challenge { nonce, server_time_ms }
-client → relay : auth_response { device_id, signature, pairing_ids }
+client → relay : auth_response { device_id, signature, pairing_ids, machine_name? }
 relay  → client: auth_ok { pairing_ids }
+relay  → client: machine_name { pairing_id, machine_name }         // 0..n (phone only, §5.7)
 relay  → client: peer_presence { pairing_id, peer, state, at_ms }   // 0..n
 client → relay : resume { pairing_id, from_seq }                    // per pairing
 relay  → client: envelope { … }                                     // replayed, then live
@@ -141,6 +142,13 @@ relay  → client: envelope { … }                                     // repla
     part of standard ECDSA signing).
 - On failure the relay sends `error { code: auth_failed, … }` and closes.
 - A device may activate several `pairing_ids` on one connection (multi-Mac, §10).
+- **`machine_name` (desktop only, optional, v1 amendment).** The desktop's
+  `auth_response` MAY carry a `machine_name` — the human-readable name of the Mac
+  (e.g. `"Ruud's MacBook Pro"`). It is sent on **every** connect, applies to
+  **all** `pairing_ids` on that connection (one Mac → one name), and the relay
+  forwards it to the phone via `machine_name` frames (§5.7). The phone omits it
+  (`null`). Absent/`null` is fully backward compatible: an older desktop simply
+  never sets it, the relay forwards nothing, and the phone keeps its prior name.
 
 ### 5.2 Pairing bootstrap (first time)
 
@@ -244,6 +252,26 @@ The APNs token is **opaque and outside E2E** — the relay/desktop use it to dri
 notifications when an agent finishes or needs input (PRD §9.1). `environment` is
 `sandbox` | `production`.
 
+**Deregistration (per-machine push mute).** A phone can drop a pairing's token
+**without unpairing** so it stops that pairing's pushes while keeping the pairing:
+
+```
+phone → relay : unregister_push_token { pairing_id }
+relay → phone : push_token_ack { pairing_id }   // shared ack, confirms removal
+```
+
+- **Membership check (mandatory).** The relay **must** verify the authenticated
+  `device_id` is a member of `pairing_id` before removing anything. A
+  **non-member** (or an unknown pairing, which has no members) is refused with
+  `error { code: unknown_pairing, pairing_id }` and changes nothing — the same
+  invariant `revoke` (§5.8) enforces.
+- **Idempotent.** Unregistering when no token is stored is a **success no-op**:
+  the relay still replies `push_token_ack { pairing_id }` and never errors.
+- **Scope.** Only this pairing's token is cleared; the pairing itself and the
+  device's other pairings are untouched (unlike `revoke`, which deletes the
+  pairing). `push_token_ack` is reused as the confirmation for both
+  `register_push_token` and `unregister_push_token`.
+
 ### 5.6 Errors & shutdown
 
 - `error { code, message, pairing_id? }` — machine-readable `RelayErrorCode`
@@ -252,6 +280,70 @@ notifications when an agent finishes or needs input (PRD §9.1). `environment` i
   `internal`). Whether it is fatal is implied by the code (auth/version errors
   close the socket; `peer_unavailable`/`rate_limited` are advisory).
 - `bye { reason? }` — graceful shutdown notice before either side closes.
+
+### 5.7 Machine name (desktop → relay → phone, v1 amendment)
+
+The unified multi-Mac feed (§10) tags each item with the machine it came from.
+The user-facing **default** name comes from the desktop and must auto-update when
+the Mac is renamed, so the machine name travels on an **authenticated post-auth
+frame that is re-sent on every connect** — never in the QR/code payload (which
+would not auto-update).
+
+- **Desktop → relay.** The desktop puts its name in
+  `auth_response.machine_name` (§5.1). The relay length-bounds it (≤ **64
+  characters**, trimmed; an empty result is treated as "no name") and stores it
+  per pairing. It is **untrusted display text**: display-only, never used for
+  routing or auth. Producers should still emit `"machine_name": null` when they
+  have none (fixtures emit explicit `null`).
+- **Relay → phone.** The relay delivers the name in a dedicated per-pairing
+  frame so a phone holding several pairings can attribute each name correctly:
+
+  ```json
+  { "type": "machine_name", "pairing_id": "pair_ruud_mbp",
+    "machine_name": "Ruud's MacBook Pro" }
+  ```
+
+  The relay emits it **to the phone**:
+  1. right after the phone authenticates, once per activated pairing whose
+     desktop has already announced a name, **and**
+  2. whenever the desktop (re)connects and announces a name while the phone is
+     online — so a **Mac rename propagates on the desktop's next connect**.
+
+- **Phone behavior.** Treat the value as the pairing's new **default** name (a
+  user override on the phone always wins) and **sanitize before display**. A
+  pairing for which no name was ever announced simply never receives this frame;
+  keep the previous/fallback name. The relay holds the name only for the live
+  pairing (an in-memory relay loses it on restart; the desktop repopulates it on
+  its next connect), so no persistence beyond the pairing is required.
+
+### 5.8 Unpair / revoke (phone → relay → desktop, v1 amendment)
+
+Unpairing one machine from the phone must both delete the phone's local pairing
+record **and** revoke the pairing on the relay so the desktop learns it is
+unpaired — without disturbing the phone's other pairings.
+
+```
+phone   → relay : revoke { pairing_id }
+relay   → desktop: pairing_revoked { pairing_id }   // the former peer, if connected
+relay   → phone : pairing_revoked { pairing_id }    // idempotent success confirmation
+```
+
+- **Membership check (mandatory security invariant).** The relay **must** verify
+  the authenticated `device_id` is a member of `pairing_id` before removing
+  anything. A **non-member** revoke is refused with
+  `error { code: unknown_pairing, pairing_id }` and changes nothing. (Revocation
+  is role-agnostic — any member may revoke — but v1 only the phone initiates.)
+- **What removal clears.** On success the relay atomically deletes the pairing
+  and **all** of its state: membership, any live claim tokens, both
+  `(pairing, sender)` envelope queues, the push token, and the live routing-table
+  entry. Then it sends `pairing_revoked` to the former peer (so a desktop can
+  drop the pairing and return to an unpaired, **re-pairable** state) and back to
+  the revoker as confirmation.
+- **Idempotent.** Revoking a pairing that is already gone is a **success no-op**:
+  the relay still replies `pairing_revoked { pairing_id }` and never errors.
+- **Scope.** Only the named pairing is affected; the device's other pairings are
+  untouched. The desktop, on `pairing_revoked`, drops that pairing's local record
+  and tears down its E2E channel.
 
 ---
 
@@ -511,8 +603,11 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
   on a single connection via the `pairing_ids` list in `auth_response`, and
   addresses each independently — every envelope, ack, resume, presence and
   push-token frame is already scoped by `pairing_id`.
-- Therefore **multi-Mac is a UI addition, not a protocol change** (PRD §9.1,
-  Round 3). v1 ships a single-Mac UI but the wire format is already multi-pairing.
+- Therefore **multi-Mac is almost entirely a UI addition** (PRD §9.1, Round 3):
+  the wire format was already multi-pairing. The multi-pairing epic adds only two
+  small relay-plane amendments so the phone can label and manage each Mac —
+  the per-pairing **machine name** (§5.7) and **phone-initiated revoke** (§5.8);
+  both are backward compatible and scoped by `pairing_id`.
 - `[TBD]` multiple *phones* per Mac (PRD §13) — the model does not preclude it
   (each phone is a distinct device/pairing), but v1 assumes one active phone.
 
@@ -578,4 +673,5 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
   transcript/event/shell/status types).
 - `remote/protocol/tests/round_trip.rs` — fixture walker + invariant tests.
 - `remote/protocol/tests/fixtures/{relay,desktop_to_phone,phone_to_desktop}/*.json`
-  — one golden fixture per message variant (18 + 10 + 17 = 45).
+  — one golden fixture per message variant (23 + 10 + 17 = 50). The relay set
+  includes `machine_name`, `revoke`, and `pairing_revoked` (§5.7–§5.8).

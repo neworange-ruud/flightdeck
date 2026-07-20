@@ -84,3 +84,91 @@ enum SettingsUnpairCoordinator {
         try? service.destroyKeyAgreementKeys()
     }
 }
+
+// MARK: - Per-pairing unpair (multi-pairing, remote-control-b8d.11)
+
+/// Abstracts the per-machine unpair steps so `PairingUnpairCoordinator` can be
+/// driven end-to-end with a mock — the multi-pairing counterpart to
+/// `SettingsUnpairing`, but every step is scoped to ONE `pairingId` and the
+/// shared-key destruction is a SEPARATE step the coordinator only invokes when
+/// the last pairing is being removed. `@MainActor` because the production
+/// implementation drives the `@MainActor` `TransportCoordinator`.
+@MainActor
+protocol PairingUnpairing {
+    /// Best-effort phone→relay `revoke` for `pairingId` via THAT pairing's live
+    /// client (spec §5.8). Never throws and never blocks local removal — returns
+    /// whether a frame was actually sent (diagnostic only); a `false` (relay
+    /// unreachable) still proceeds to local removal.
+    @discardableResult
+    func revoke(pairingId: String) async -> Bool
+    /// Stop + dispose ONLY this pairing's `TransportClient`, leaving every other
+    /// live client untouched.
+    func stopTransport(pairingId: String) async
+    /// Delete ONLY this pairing's Keychain `PairingRecord`.
+    func deletePairingRecord(pairingId: String) throws
+    /// Destroy the SHARED per-device key-agreement keypair. Invoked by the
+    /// coordinator ONLY when the last pairing is removed — never on a
+    /// unpair-one-of-many. The per-device `DeviceIdentity` (Secure Enclave) is
+    /// deliberately never destroyed here (see `DefaultSettingsUnpairService`'s
+    /// file-level note): unpair revokes pairings, not the phone's identity.
+    func destroySharedKeyAgreementKeys() throws
+}
+
+/// Production per-pairing unpair, composed over the live `TransportCoordinator`
+/// (for the revoke + client teardown) and the keyed `PairingRecordStore`.
+@MainActor
+struct DefaultPairingUnpairService: PairingUnpairing {
+    let coordinator: TransportCoordinator
+    var pairingRecordStore: PairingRecordStore = PairingRecordStore()
+
+    @discardableResult
+    func revoke(pairingId: String) async -> Bool {
+        guard let client = coordinator.client(for: pairingId) else { return false }
+        return await client.revokePairing()
+    }
+
+    func stopTransport(pairingId: String) async {
+        await coordinator.stop(pairingId: pairingId)
+    }
+
+    func deletePairingRecord(pairingId: String) throws {
+        try pairingRecordStore.delete(pairingId: pairingId)
+    }
+
+    func destroySharedKeyAgreementKeys() throws {
+        try KeyAgreementKeys.destroy()
+    }
+}
+
+/// Runs the unpair-one-machine sequence (remote-control-b8d.11) in a fixed
+/// order that keeps the OTHER pairings — and the phone's shared device keys —
+/// working:
+///
+///   1. Best-effort relay `revoke` FIRST, while this pairing's client is still
+///      live (so the desktop learns it's unpaired). If the relay is unreachable
+///      this is a no-op — removal never blocks on the network (§5.8 idempotent).
+///   2. Delete only this pairing's Keychain record (best-effort).
+///   3. Remove only its `PairedInstance` — `@Observable`, so the router, feed,
+///      push, and the transport coordinator's `reconcile` all react.
+///   4. Stop + dispose only its `TransportClient`.
+///   5. ONLY if this was the LAST pairing (`list.isEmpty` after step 3): destroy
+///      the shared key-agreement keypair AND flip the legacy `isPaired` bridge
+///      so `AppRouter` (routing on `hasAnyPairing`) returns to onboarding. While
+///      any other pairing remains, the shared keys are RETAINED untouched.
+@MainActor
+enum PairingUnpairCoordinator {
+    static func run(
+        pairingId: String,
+        service: PairingUnpairing,
+        pairingStore: PairingStore
+    ) async {
+        await service.revoke(pairingId: pairingId)      // 1
+        try? service.deletePairingRecord(pairingId: pairingId)  // 2
+        pairingStore.remove(pairingId: pairingId)       // 3
+        await service.stopTransport(pairingId: pairingId)       // 4
+        if pairingStore.list.isEmpty {                  // 5 — last pairing only
+            try? service.destroySharedKeyAgreementKeys()
+            pairingStore.unpair()
+        }
+    }
+}

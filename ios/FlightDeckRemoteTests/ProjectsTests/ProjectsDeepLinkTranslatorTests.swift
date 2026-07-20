@@ -48,8 +48,8 @@ struct ProjectsDeepLinkTranslatorTests {
     @Test func knownLinkTranslatesToSessionsThenChatPush() {
         let link = DeepLink(projectId: "proj-1", sessionId: "sess-42")
         #expect(ProjectsDeepLinkTranslator.path(for: link, in: snapshot()) == [
-            .sessions(projectId: "proj-1"),
-            .chat(projectId: "proj-1", sessionId: "sess-42"),
+            .sessions(projectId: "proj-1", pairingId: nil),
+            .chat(projectId: "proj-1", sessionId: "sess-42", pairingId: nil),
         ])
     }
 }

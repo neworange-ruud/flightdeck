@@ -30,6 +30,14 @@
 import SwiftUI
 import LocalAuthentication
 
+/// Identifies which paired machine's row requested `MachineRenameSheet`
+/// (remote-control-b8d.9). Exists purely so `.sheet(item:)` — which requires
+/// `Identifiable` — can present it; `id` is just the pairing id itself.
+struct RenamingMachine: Identifiable, Equatable {
+    let pairingId: String
+    var id: String { pairingId }
+}
+
 /// Pure presentation logic for the "Require Face ID to open" row, factored
 /// out so it's unit-testable without instantiating the view (mirrors
 /// `ConnectionLatencyPhrase` in ConnectionIndicator.swift).
@@ -53,10 +61,12 @@ struct FaceIDRowPresentation: Equatable {
 struct SettingsView: View {
     var router: AppRouter
     var transportStore: TransportStore
+    var coordinator: TransportCoordinator
     var pairingRecordStore: PairingRecordStore
     var biometricAuthenticator: BiometricAuthenticating
     var notificationPreferences: NotificationPreferences
     private let unpairService: SettingsUnpairing
+    private let pairingUnpairService: PairingUnpairing
 
     @Environment(AppLockController.self) private var appLock
 
@@ -64,28 +74,48 @@ struct SettingsView: View {
     @State private var pairedAt: Date?
     @State private var canEvaluateBiometrics = true
     @State private var isPresentingUnpairConfirmation = false
+    // Add-machine entry point (remote-control-b8d.7): presents the existing
+    // pairing handshake as a sheet over this SAME shared `router.pairingStore`,
+    // so a completed add is visible here immediately (e.g. `machinesSection`'s
+    // count).
+    @State private var isPresentingAddMachine = false
+    // Per-machine rename affordance (remote-control-b8d.9): the pairingId of
+    // the row currently presenting `MachineRenameSheet`, or `nil` when none.
+    // Wrapped in `RenamingMachine` (rather than a bare `String`) purely so
+    // `.sheet(item:)` has the `Identifiable` conformance it requires.
+    @State private var renamingMachine: RenamingMachine?
+    // Per-machine unpair (remote-control-b8d.11): the machine a destructive
+    // confirmation is currently presented for, or `nil` when none. Drives the
+    // `confirmationDialog(presenting:)` below.
+    @State private var machineToUnpair: PairedInstance?
 
     init(
         router: AppRouter,
         transportStore: TransportStore,
+        coordinator: TransportCoordinator,
         pairingRecordStore: PairingRecordStore = PairingRecordStore(),
         biometricAuthenticator: BiometricAuthenticating = LAContextBiometricAuthenticator(),
         notificationPreferences: NotificationPreferences,
-        unpairService: SettingsUnpairing? = nil
+        unpairService: SettingsUnpairing? = nil,
+        pairingUnpairService: PairingUnpairing? = nil
     ) {
         self.router = router
         self.transportStore = transportStore
+        self.coordinator = coordinator
         self.pairingRecordStore = pairingRecordStore
         self.biometricAuthenticator = biometricAuthenticator
         self.notificationPreferences = notificationPreferences
         self.unpairService = unpairService
             ?? DefaultSettingsUnpairService(transportStore: transportStore, pairingRecordStore: pairingRecordStore)
+        self.pairingUnpairService = pairingUnpairService
+            ?? DefaultPairingUnpairService(coordinator: coordinator, pairingRecordStore: pairingRecordStore)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.xxl) {
                 connectionSection
+                machinesSection
                 securitySection
                 notificationsSection
                 aboutSection
@@ -96,8 +126,148 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep.ignoresSafeArea())
         .onAppear(perform: loadDeviceInfo)
+        .sheet(isPresented: $isPresentingAddMachine) {
+            AddMachineSheet(pairingStore: router.pairingStore)
+        }
+        .sheet(item: $renamingMachine) { machine in
+            MachineRenameSheet(pairingStore: router.pairingStore, pairingId: machine.pairingId)
+        }
+        .confirmationDialog(
+            machineToUnpair.map { "Unpair \($0.displayName)?" } ?? "Unpair this machine?",
+            isPresented: Binding(
+                get: { machineToUnpair != nil },
+                set: { if !$0 { machineToUnpair = nil } }),
+            titleVisibility: .visible,
+            presenting: machineToUnpair
+        ) { machine in
+            Button("Unpair", role: .destructive) {
+                Task { await performUnpair(pairingId: machine.pairingId) }
+            }
+            Button("Cancel", role: .cancel) { machineToUnpair = nil }
+        } message: { _ in
+            Text("This removes it from this phone and revokes it on your Mac. Your other machines stay paired.")
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("SettingsView")
+    }
+
+    // MARK: - Machines (remote-control-b8d.7 Add-machine entry point + b8d.9 rename)
+
+    /// Every paired machine (remote-control-b8d.9), each tappable to rename,
+    /// plus the "Add machine" row (remote-control-b8d.7) reachable from
+    /// Settings while already paired — the other Add-machine entry point is
+    /// the feed toolbar (today `ProjectsListView`'s header, until remote-
+    /// control-b8d.8's unified feed owns its own). The Add row shows the live
+    /// count against the shared cap (`PairingLimits.maxPairedInstances`) so
+    /// "why is Add machine greyed out" is self-explanatory without opening
+    /// the sheet.
+    private var machinesSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            sectionHeader("Machines")
+
+            if !router.pairingStore.list.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(router.pairingStore.list.enumerated()), id: \.element.pairingId) { index, instance in
+                        if index != 0 { rowDivider }
+                        machineRow(for: instance)
+                    }
+                }
+                .cardStyle()
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("settings-machines-card")
+            }
+
+            Button {
+                isPresentingAddMachine = true
+            } label: {
+                HStack {
+                    Text("Add machine")
+                        .typography(Typography.body)
+                        .foregroundStyle(router.pairingStore.isAtPairingCap ? Theme.textMutedDark : Theme.textPrimary)
+                    Spacer()
+                    Text("\(router.pairingStore.list.count)/\(PairingLimits.maxPairedInstances)")
+                        .typography(Typography.caption)
+                        .foregroundStyle(Theme.textMutedDark)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(router.pairingStore.isAtPairingCap)
+            .padding(Theme.Spacing.lg)
+            .cardStyle()
+            .accessibilityIdentifier("settings-add-machine-button")
+        }
+    }
+
+    /// One row per paired machine: its resolved display name (override >
+    /// desktop-reported > generic fallback, `PairedInstance.displayName`) plus
+    /// an online/offline dot, tappable to open `MachineRenameSheet`, with a
+    /// trailing per-machine push mute toggle (remote-control-b8d.10). The name
+    /// area and the mute control are SEPARATE buttons so tapping mute never
+    /// opens rename and vice-versa.
+    private func machineRow(for instance: PairedInstance) -> some View {
+        HStack(spacing: Theme.Spacing.md) {
+            Button {
+                renamingMachine = RenamingMachine(pairingId: instance.pairingId)
+            } label: {
+                HStack(spacing: Theme.Spacing.md) {
+                    Circle()
+                        .fill(instance.lastKnownOnline ? Theme.statusIdle : Theme.textMutedDark)
+                        .frame(width: 8, height: 8)
+                    Text(instance.displayName)
+                        .typography(Typography.body)
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer(minLength: Theme.Spacing.sm)
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(Theme.textMutedDark)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("settings-machine-row-\(instance.pairingId)")
+
+            machineMuteButton(for: instance)
+            machineUnpairButton(for: instance)
+        }
+        .padding(Theme.Spacing.lg)
+    }
+
+    /// Per-machine unpair (remote-control-b8d.11): removes THIS machine from the
+    /// phone and revokes it on the relay/desktop, leaving the others paired with
+    /// the phone's shared device keys intact. Tapping arms a destructive
+    /// confirmation (`machineToUnpair`) rather than acting immediately.
+    private func machineUnpairButton(for instance: PairedInstance) -> some View {
+        Button(role: .destructive) {
+            machineToUnpair = instance
+        } label: {
+            Image(systemName: "minus.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.statusRed)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Unpair machine")
+        .accessibilityIdentifier("settings-machine-unpair-\(instance.pairingId)")
+    }
+
+    /// Per-machine push mute (remote-control-b8d.10): toggles
+    /// `PairedInstance.mutePush`, which the transport coordinator observes to
+    /// (de)register this machine's own APNs token — muting one machine never
+    /// affects the others (per-pairing tokens). A bell that slashes when muted.
+    private func machineMuteButton(for instance: PairedInstance) -> some View {
+        Button {
+            router.pairingStore.setMutePush(pairingId: instance.pairingId, !instance.mutePush)
+        } label: {
+            Image(systemName: instance.mutePush ? "bell.slash.fill" : "bell.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(instance.mutePush ? Theme.textMutedDark : Theme.accent)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(instance.mutePush ? "Unmute notifications" : "Mute notifications")
+        .accessibilityIdentifier("settings-machine-mute-\(instance.pairingId)")
     }
 
     // MARK: - Connection
@@ -363,6 +533,19 @@ struct SettingsView: View {
         await SettingsUnpairCoordinator.run(service: unpairService, pairingStore: router.pairingStore)
     }
 
+    /// Unpair ONE machine (remote-control-b8d.11): revoke on the relay, remove
+    /// its local record + `PairedInstance`, dispose its client, and retain the
+    /// shared device keys unless this was the last pairing (in which case the
+    /// coordinator destroys them and the router returns to onboarding).
+    @MainActor
+    private func performUnpair(pairingId: String) async {
+        await PairingUnpairCoordinator.run(
+            pairingId: pairingId,
+            service: pairingUnpairService,
+            pairingStore: router.pairingStore)
+        machineToUnpair = nil
+    }
+
     private static let pairedAtFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
@@ -383,12 +566,14 @@ struct SettingsView: View {
     router.pairingStore.completePairing(
         with: PairedDevice(pairingId: "preview-pairing", peerName: "Ruud's MacBook Pro", pairedAt: Date())
     )
-    let transportStore = TransportStoreFactory.makeDefault()
+    let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: router.pairingStore)
+    let transportStore = coordinator.primaryStore
     transportStore.debugSeed(snapshot: .uiTestFixture, linkState: .connected(latencyMs: 42))
 
     return SettingsView(
         router: router,
         transportStore: transportStore,
+        coordinator: coordinator,
         notificationPreferences: NotificationPreferences())
         .environment(AppLockController())
 }

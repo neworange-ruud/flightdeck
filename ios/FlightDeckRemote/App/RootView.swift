@@ -2,9 +2,13 @@
 //  RootView.swift
 //  FlightDeckRemote
 //
-//  Renders `AppRouter.route`: the Pairing screen (full-screen, no tab bar)
-//  when unpaired, or the main tab container when paired (PRD §5.8). Also
-//  owns the app's deep-link entry point — `onOpenURL` hands every
+//  Renders `AppRouter.route`: the Pairing (onboarding) screen (full-screen,
+//  no tab bar) with ZERO paired instances, or the main tab container with ONE
+//  OR MORE (PRD §5.8, multi-pairing remote-control-b8d.7 — `AppRouter.route`
+//  is count-based off `PairingStore.hasAnyPairing`, not a binary paired flag).
+//  `MainTabView` is today's stand-in main container; the real unified feed
+//  (remote-control-b8d.8) replaces its content without touching this switch.
+//  Also owns the app's deep-link entry point — `onOpenURL` hands every
 //  `flightdeck-remote://` URL to `router.handleDeepLink(url:)`.
 //
 //  Also owns the Face-ID app-open gate (PRD §5.6/§9): `AppLockView` overlays

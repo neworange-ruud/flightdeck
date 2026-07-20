@@ -122,6 +122,53 @@ import CryptoKit
         await client.stop()
     }
 
+    // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
+
+    @Test func revokePairingSendsRevokeFrameWhenLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let sent = await client.revokePairing()
+        #expect(sent == true)
+
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .revoke = $0 { return true }; return false }
+        }
+        let revoke = try #require(await channel.sentFrames().first {
+            if case .revoke = $0 { return true }; return false
+        })
+        if case let .revoke(pairingId) = revoke {
+            #expect(pairingId == Wire.PairingId("pair_test_1"))
+        }
+        await client.stop()
+    }
+
+    @Test func revokePairingIsNoOpWhenNotLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector,
+                                    config: TransportClient.Config())
+        await client.setEventHandler(collector.handler)
+        // Never started / never reached auth_ok → relay effectively unreachable.
+
+        let sent = await client.revokePairing()
+        #expect(sent == false, "no live session → best-effort revoke sends nothing")
+        #expect(await channel.sentFrames().isEmpty)
+    }
+
     // MARK: - Resume cursor
 
     @Test func resumeUsesPersistedInboundCursor() async throws {
@@ -383,6 +430,105 @@ import CryptoKit
         #expect(state == .disconnected)
         let sent = await channel.sentFrames()
         #expect(sent.isEmpty)
+        await client.stop()
+    }
+
+    // MARK: - Machine name (REMOTE_PROTOCOL §5.7, remote-control-b8d.9)
+
+    @Test func machineNameFrameEmitsSanitizedEventForOurPairing() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        await channel.push(.machineName(
+            pairingId: Wire.PairingId("pair_test_1"),
+            machineName: "  Ruud's MacBook Pro  "))
+        _ = await waitUntil { collector.machineNames.contains("Ruud's MacBook Pro") }
+
+        #expect(collector.machineNames == ["Ruud's MacBook Pro"])
+        await client.stop()
+    }
+
+    @Test func machineNameFrameForADifferentPairingIsIgnored() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        // This client is bound to "pair_test_1" (via its loaded record) — a
+        // frame announced for some OTHER pairing must never leak in.
+        await channel.push(.machineName(pairingId: Wire.PairingId("some_other_pairing"), machineName: "Not Ours"))
+        // Follow with a pong carrying a NON-zero round trip (500ms earlier
+        // than the fixed `now: { 1_752_000_100_000 }` clock) so its distinct
+        // `.connected(latencyMs: 500)` state is a reliable "the frame ahead
+        // of me in this single actor's serial receive loop has already been
+        // handled" signal, without depending on wall-clock sleeps.
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+
+        #expect(collector.machineNames.isEmpty)
+        await client.stop()
+    }
+
+    @Test func machineNameFrameIsBoundedToSixtyFourCharacters() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        let longName = String(repeating: "x", count: 100)
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: longName))
+        _ = await waitUntil { !collector.machineNames.isEmpty }
+
+        #expect(collector.machineNames.first?.count == 64)
+        #expect(collector.machineNames.first == String(repeating: "x", count: 64))
+        await client.stop()
+    }
+
+    @Test func machineNameFrameThatIsAllWhitespaceIsDropped() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: "   "))
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+
+        #expect(collector.machineNames.isEmpty)
         await client.stop()
     }
 }

@@ -2,8 +2,8 @@
 //  CustomTabBar.swift
 //  FlightDeckRemote
 //
-//  Custom bottom tab bar (PRD §5.7): Projects · Activity · [+ FAB, center] ·
-//  Shell · Settings. Hand-built rather than SwiftUI's `TabView` because the
+//  Custom bottom tab bar: Feed · Projects · [+ FAB, center] · Shell ·
+//  Settings. Hand-built rather than SwiftUI's `TabView` because the
 //  center item is a raised, non-tab FAB that *presents* the New-agent flow
 //  instead of switching displayed content — `TabView` has no seam for a
 //  center item that behaves differently from its other tabs.
@@ -15,14 +15,40 @@
 
 import SwiftUI
 
+private struct TabBarHeightKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    /// The measured height of the custom bottom tab bar, published by
+    /// `MainTabView` down through `tabContent`. Screens pushed inside the
+    /// Projects/Feed `NavigationStack`s do NOT inherit the tab bar's
+    /// `.safeAreaInset` (a NavigationStack does not propagate an ancestor's
+    /// bottom safe-area inset to nav-bar-hidden pushed destinations), so a
+    /// bottom-pinned control there (e.g. `SessionsListView`'s "New agent
+    /// session" CTA) would render *underneath* the bar and become unhittable.
+    /// Those screens read this value and reserve matching bottom space so the
+    /// control sits above the bar. Environment values DO propagate into pushed
+    /// destinations, which `.safeAreaInset` does not.
+    var tabBarHeight: CGFloat {
+        get { self[TabBarHeightKey.self] }
+        set { self[TabBarHeightKey.self] = newValue }
+    }
+}
+
 struct CustomTabBar: View {
     var selectedTab: AppTab
-    var unreadActivityCount: Int
+    /// Number of unread FEED rows (remote-control-fa8) — the badge that used
+    /// to live on the now-removed Activity tab now rides the Feed tab.
+    var unreadFeedCount: Int
     var onSelectTab: (AppTab) -> Void
     var onTapFAB: () -> Void
 
-    /// Tabs either side of the center FAB, in display order.
-    private let leadingTabs: [AppTab] = [.projects, .activity]
+    /// Tabs either side of the center FAB, in display order. `.feed` leads: the
+    /// unified, attention-first multi-machine view is the primary destination
+    /// (remote-control-fa8 folded the old Activity tab into it), ahead of the
+    /// single-machine `.projects` tab.
+    private let leadingTabs: [AppTab] = [.feed, .projects]
     private let trailingTabs: [AppTab] = [.shell, .settings]
 
     var body: some View {
@@ -67,7 +93,7 @@ struct CustomTabBar: View {
                         .font(.system(size: 20, weight: .semibold))
                         .frame(height: 22)
 
-                    if tab == .activity && unreadActivityCount > 0 {
+                    if tab == .feed && unreadFeedCount > 0 {
                         Circle()
                             .fill(Theme.statusNeedsInput)
                             .frame(width: 8, height: 8)
@@ -76,7 +102,7 @@ struct CustomTabBar: View {
                             // identifier doesn't propagate onto the
                             // enclosing tab button.
                             .accessibilityElement()
-                            .accessibilityIdentifier("tab-activity-unread-badge")
+                            .accessibilityIdentifier("tab-feed-unread-badge")
                     }
                 }
                 Text(tab.title)
@@ -119,8 +145,8 @@ struct CustomTabBar: View {
     VStack {
         Spacer()
         CustomTabBar(
-            selectedTab: .projects,
-            unreadActivityCount: 1,
+            selectedTab: .feed,
+            unreadFeedCount: 1,
             onSelectTab: { _ in },
             onTapFAB: {}
         )
