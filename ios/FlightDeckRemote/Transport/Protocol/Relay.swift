@@ -175,6 +175,17 @@ extension Wire {
         /// relay -> endpoint. Confirms a push token was stored (register) or
         /// removed (unregister — the ack is shared, spec §5.5).
         case pushTokenAck(pairingId: PairingId)
+        /// phone -> relay. Unpair (revoke) this pairing (spec §5.8,
+        /// remote-control-b8d.2/.11). The relay verifies membership, removes the
+        /// pairing (members, claims, queues, push token) and notifies the
+        /// desktop. Idempotent: deleting the local record on send is safe, and
+        /// retries are safe.
+        case revoke(pairingId: PairingId)
+        /// relay -> phone. Confirms a pairing was revoked — sent on success AND
+        /// idempotently for an already-removed/unknown-to-caller pairing (spec
+        /// §5.8). The phone removes its local record eagerly on send, so this is
+        /// treated as a non-fatal advisory rather than a gate on removal.
+        case pairingRevoked(pairingId: PairingId)
         /// relay -> endpoint. A relay-plane error.
         case error(code: RelayErrorCode, message: String, pairingId: PairingId?)
         /// Both directions. Graceful shutdown notice.
@@ -298,6 +309,12 @@ extension Wire {
             case "push_token_ack":
                 self = .pushTokenAck(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId))
+            case "revoke":
+                self = .revoke(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
+            case "pairing_revoked":
+                self = .pairingRevoked(
+                    pairingId: try c.decode(PairingId.self, forKey: .pairingId))
             case "error":
                 self = .error(
                     code: try c.decode(RelayErrorCode.self, forKey: .code),
@@ -406,6 +423,12 @@ extension Wire {
                 try c.encode(pairingId, forKey: .pairingId)
             case let .pushTokenAck(pairingId):
                 try c.encode("push_token_ack", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+            case let .revoke(pairingId):
+                try c.encode("revoke", forKey: .type)
+                try c.encode(pairingId, forKey: .pairingId)
+            case let .pairingRevoked(pairingId):
+                try c.encode("pairing_revoked", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
             case let .error(code, message, pairingId):
                 try c.encode("error", forKey: .type)

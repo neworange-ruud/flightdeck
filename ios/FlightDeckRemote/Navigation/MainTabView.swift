@@ -306,6 +306,7 @@ struct MainTabView: View {
             SettingsView(
                 router: router,
                 transportStore: transportStore,
+                coordinator: coordinator,
                 notificationPreferences: notificationPreferences)
         }
     }

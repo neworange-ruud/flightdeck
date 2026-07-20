@@ -12,14 +12,14 @@
 //    desktop_to_phone -> Wire.DesktopToPhone
 //    phone_to_desktop -> Wire.PhoneCommand
 //
-//  remote-control-b8d.9/.10 note: only the new `machine_name` (b8d.9) and
-//  `unregister_push_token` (b8d.10) entries below were hand-spliced in (rather
-//  than running the full sync script) because `remote/protocol/tests/fixtures/`
-//  also picked up `revoke`/`pairing_revoked` and a
-//  `pairing_offer.claim_token_hint` field from the SAME upstream commit
-//  (7f0cd86) for remote-control-b8d.2, which the iOS `Wire.RelayFrame` mirror
-//  doesn't decode yet (that's remote-control-b8d.11's job). Re-run
-//  `ios/scripts/sync-fixtures.sh` for a full resync once b8d.11 lands.
+//  remote-control-b8d.9/.10/.11 note: the `machine_name` (b8d.9),
+//  `unregister_push_token` (b8d.10), and `revoke`/`pairing_revoked` (b8d.11)
+//  entries below were hand-spliced in (rather than running the full sync script)
+//  as their owning iOS issues landed, to avoid pulling in unrelated fields that
+//  the same upstream commit (7f0cd86) also touched (e.g. a
+//  `pairing_offer.claim_token_hint` the `Wire.RelayFrame` mirror doesn't decode
+//  yet). Re-run `ios/scripts/sync-fixtures.sh` for a full resync when that
+//  field is adopted.
 //
 
 import Foundation
@@ -123,6 +123,14 @@ enum ProtocolFixtures {
             category: "relay",
             name: "resume",
             base64: "ewogICJ0eXBlIjogInJlc3VtZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgImZyb21fc2VxIjogNDEKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_revoked",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfcmV2b2tlZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "revoke",
+            base64: "ewogICJ0eXBlIjogInJldm9rZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "version_incompatible",
@@ -239,5 +247,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 49
+    static let expectedCount = 51
 }

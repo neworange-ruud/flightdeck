@@ -122,6 +122,53 @@ import CryptoKit
         await client.stop()
     }
 
+    // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
+
+    @Test func revokePairingSendsRevokeFrameWhenLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let sent = await client.revokePairing()
+        #expect(sent == true)
+
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .revoke = $0 { return true }; return false }
+        }
+        let revoke = try #require(await channel.sentFrames().first {
+            if case .revoke = $0 { return true }; return false
+        })
+        if case let .revoke(pairingId) = revoke {
+            #expect(pairingId == Wire.PairingId("pair_test_1"))
+        }
+        await client.stop()
+    }
+
+    @Test func revokePairingIsNoOpWhenNotLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector,
+                                    config: TransportClient.Config())
+        await client.setEventHandler(collector.handler)
+        // Never started / never reached auth_ok → relay effectively unreachable.
+
+        let sent = await client.revokePairing()
+        #expect(sent == false, "no live session → best-effort revoke sends nothing")
+        #expect(await channel.sentFrames().isEmpty)
+    }
+
     // MARK: - Resume cursor
 
     @Test func resumeUsesPersistedInboundCursor() async throws {

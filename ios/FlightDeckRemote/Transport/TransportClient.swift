@@ -218,6 +218,28 @@ actor TransportClient {
         await sendEnvelope(for: command, track: true)
     }
 
+    /// Send a phone→relay `revoke` for this pairing (spec §5.8,
+    /// remote-control-b8d.11 unpair-one). Best-effort and fire-and-forget: a
+    /// plaintext relay-plane frame (NOT a sealed command), put on the wire only
+    /// if this pairing's session is currently live. If the relay is unreachable
+    /// (no live session) or the send fails, this is a no-op and returns `false`
+    /// — the caller still removes the pairing locally; the relay's revoke is
+    /// idempotent, so a retry (or the desktop noticing the membership is gone)
+    /// reconciles later. Deliberately does not check `peerConnected`: the relay
+    /// processes a revoke and notifies the desktop on its next connect
+    /// regardless of whether the desktop is online right now. Returns whether a
+    /// frame was actually sent (diagnostic only).
+    @discardableResult
+    func revokePairing() async -> Bool {
+        guard phase == .live, let ch = channel, let record else { return false }
+        do {
+            try await ch.send(.revoke(pairingId: Wire.PairingId(record.pairingId)))
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Register (or refresh) the APNs push token for this pairing (spec §5.5).
     /// The token is remembered and sent immediately if the session is already
     /// live, and re-sent on every subsequent `auth_ok` (reconnect). Registering
@@ -443,9 +465,15 @@ actor TransportClient {
 
         // Frames the phone never receives in steady state, or handshake
         // restatements: ignore and keep the session alive.
+        // `pairingRevoked` (the relay's confirmation of our own `revoke`) and
+        // `revoke` (phone→relay only) are ignored here: the phone removes its
+        // local pairing state eagerly when it sends the revoke (best-effort,
+        // idempotent — remote-control-b8d.11), so it never gates removal on this
+        // confirmation. If it arrives after teardown this client is already gone.
         case .ack, .resume, .ping, .hello, .authResponse,
              .pairingOffer, .pairingOfferOk, .pairingClaim, .pairingClaimed,
-             .registerPushToken, .unregisterPushToken, .pushTokenAck:
+             .registerPushToken, .unregisterPushToken, .pushTokenAck,
+             .revoke, .pairingRevoked:
             return true
         }
     }

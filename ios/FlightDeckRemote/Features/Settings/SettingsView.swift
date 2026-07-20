@@ -61,10 +61,12 @@ struct FaceIDRowPresentation: Equatable {
 struct SettingsView: View {
     var router: AppRouter
     var transportStore: TransportStore
+    var coordinator: TransportCoordinator
     var pairingRecordStore: PairingRecordStore
     var biometricAuthenticator: BiometricAuthenticating
     var notificationPreferences: NotificationPreferences
     private let unpairService: SettingsUnpairing
+    private let pairingUnpairService: PairingUnpairing
 
     @Environment(AppLockController.self) private var appLock
 
@@ -82,22 +84,31 @@ struct SettingsView: View {
     // Wrapped in `RenamingMachine` (rather than a bare `String`) purely so
     // `.sheet(item:)` has the `Identifiable` conformance it requires.
     @State private var renamingMachine: RenamingMachine?
+    // Per-machine unpair (remote-control-b8d.11): the machine a destructive
+    // confirmation is currently presented for, or `nil` when none. Drives the
+    // `confirmationDialog(presenting:)` below.
+    @State private var machineToUnpair: PairedInstance?
 
     init(
         router: AppRouter,
         transportStore: TransportStore,
+        coordinator: TransportCoordinator,
         pairingRecordStore: PairingRecordStore = PairingRecordStore(),
         biometricAuthenticator: BiometricAuthenticating = LAContextBiometricAuthenticator(),
         notificationPreferences: NotificationPreferences,
-        unpairService: SettingsUnpairing? = nil
+        unpairService: SettingsUnpairing? = nil,
+        pairingUnpairService: PairingUnpairing? = nil
     ) {
         self.router = router
         self.transportStore = transportStore
+        self.coordinator = coordinator
         self.pairingRecordStore = pairingRecordStore
         self.biometricAuthenticator = biometricAuthenticator
         self.notificationPreferences = notificationPreferences
         self.unpairService = unpairService
             ?? DefaultSettingsUnpairService(transportStore: transportStore, pairingRecordStore: pairingRecordStore)
+        self.pairingUnpairService = pairingUnpairService
+            ?? DefaultPairingUnpairService(coordinator: coordinator, pairingRecordStore: pairingRecordStore)
     }
 
     var body: some View {
@@ -120,6 +131,21 @@ struct SettingsView: View {
         }
         .sheet(item: $renamingMachine) { machine in
             MachineRenameSheet(pairingStore: router.pairingStore, pairingId: machine.pairingId)
+        }
+        .confirmationDialog(
+            machineToUnpair.map { "Unpair \($0.displayName)?" } ?? "Unpair this machine?",
+            isPresented: Binding(
+                get: { machineToUnpair != nil },
+                set: { if !$0 { machineToUnpair = nil } }),
+            titleVisibility: .visible,
+            presenting: machineToUnpair
+        ) { machine in
+            Button("Unpair", role: .destructive) {
+                Task { await performUnpair(pairingId: machine.pairingId) }
+            }
+            Button("Cancel", role: .cancel) { machineToUnpair = nil }
+        } message: { _ in
+            Text("This removes it from this phone and revokes it on your Mac. Your other machines stay paired.")
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("SettingsView")
@@ -201,8 +227,28 @@ struct SettingsView: View {
             .accessibilityIdentifier("settings-machine-row-\(instance.pairingId)")
 
             machineMuteButton(for: instance)
+            machineUnpairButton(for: instance)
         }
         .padding(Theme.Spacing.lg)
+    }
+
+    /// Per-machine unpair (remote-control-b8d.11): removes THIS machine from the
+    /// phone and revokes it on the relay/desktop, leaving the others paired with
+    /// the phone's shared device keys intact. Tapping arms a destructive
+    /// confirmation (`machineToUnpair`) rather than acting immediately.
+    private func machineUnpairButton(for instance: PairedInstance) -> some View {
+        Button(role: .destructive) {
+            machineToUnpair = instance
+        } label: {
+            Image(systemName: "minus.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.statusRed)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Unpair machine")
+        .accessibilityIdentifier("settings-machine-unpair-\(instance.pairingId)")
     }
 
     /// Per-machine push mute (remote-control-b8d.10): toggles
@@ -487,6 +533,19 @@ struct SettingsView: View {
         await SettingsUnpairCoordinator.run(service: unpairService, pairingStore: router.pairingStore)
     }
 
+    /// Unpair ONE machine (remote-control-b8d.11): revoke on the relay, remove
+    /// its local record + `PairedInstance`, dispose its client, and retain the
+    /// shared device keys unless this was the last pairing (in which case the
+    /// coordinator destroys them and the router returns to onboarding).
+    @MainActor
+    private func performUnpair(pairingId: String) async {
+        await PairingUnpairCoordinator.run(
+            pairingId: pairingId,
+            service: pairingUnpairService,
+            pairingStore: router.pairingStore)
+        machineToUnpair = nil
+    }
+
     private static let pairedAtFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
@@ -507,12 +566,14 @@ struct SettingsView: View {
     router.pairingStore.completePairing(
         with: PairedDevice(pairingId: "preview-pairing", peerName: "Ruud's MacBook Pro", pairedAt: Date())
     )
-    let transportStore = TransportStoreFactory.makeDefault()
+    let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: router.pairingStore)
+    let transportStore = coordinator.primaryStore
     transportStore.debugSeed(snapshot: .uiTestFixture, linkState: .connected(latencyMs: 42))
 
     return SettingsView(
         router: router,
         transportStore: transportStore,
+        coordinator: coordinator,
         notificationPreferences: NotificationPreferences())
         .environment(AppLockController())
 }

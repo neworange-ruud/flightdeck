@@ -33,7 +33,9 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func fixtureInventoryIsComplete() {
         #expect(ProtocolFixtures.all.count == ProtocolFixtures.expectedCount)
-        // 21 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files.
+        // 23 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
+        // (relay gained machine_name, unregister_push_token, revoke,
+        // pairing_revoked as their owning iOS issues landed).
         #expect(ProtocolFixtures.all.count >= 48)
         for category in ["relay", "desktop_to_phone", "phone_to_desktop"] {
             #expect(ProtocolFixtures.all.contains { $0.category == category },
@@ -174,6 +176,39 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func sanitizeMachineNameLeavesAShortNameUntouched() {
         #expect(Wire.sanitizeMachineName("Work Mac") == "Work Mac")
+    }
+
+    // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
+
+    @Test func revokeFrameDecodesPairingId() throws {
+        let data = try fixture("relay", "revoke")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .revoke(pairingId) = frame else {
+            Issue.record("expected .revoke, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+    }
+
+    @Test func revokeFrameEncodesToSnakeCaseType() throws {
+        let frame = Wire.RelayFrame.revoke(pairingId: Wire.PairingId("pair_x"))
+        let object = try #require(
+            try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(frame)) as? NSDictionary)
+        #expect(object["type"] as? String == "revoke")
+        #expect(object["pairing_id"] as? String == "pair_x")
+    }
+
+    @Test func pairingRevokedFrameDecodesPairingId() throws {
+        let data = try fixture("relay", "pairing_revoked")
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)
+
+        guard case let .pairingRevoked(pairingId) = frame else {
+            Issue.record("expected .pairingRevoked, got \(frame)")
+            return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
     }
 
     @Test func envelopeFrameFlattensEncryptedEnvelope() throws {
