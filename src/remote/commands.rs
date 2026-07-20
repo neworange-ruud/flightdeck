@@ -411,6 +411,8 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             session_id,
             prompt_id,
             choice,
+            option_index: _,
+            free_text: _,
         } => {
             let Some(s) = index.session(session_id) else {
                 return reject(format!("unknown session '{session_id}'"));
@@ -430,6 +432,11 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             if !s.primary_running {
                 return reject("the agent is not running");
             }
+            // Binary fast-path only for now. Multi-option / free-text decisions
+            // (choice = None) are wired up by a follow-up change.
+            let Some(choice) = choice else {
+                return reject("multi-option decisions not yet supported");
+            };
             Translation::PtyInput {
                 project: s.project,
                 tab: s.tab,

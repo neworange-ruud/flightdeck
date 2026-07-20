@@ -33,6 +33,7 @@ pub use common::{
 pub use e2e::{
     ActivityKind, AgentEvent, CommandAck, CommandBody, CommandOutcome, DeepLink, DesktopToPhone,
     EventKind, PermissionChoice, PermissionOption, PhoneCommand, ProjectRollup, ProjectState,
+    PromptKind,
     RollupUpdate, SessionState, SessionStatusDelta, ShellEvent, ShellEventKind, ShellOutput,
     ShellStream, StateSnapshot, StatusRollup, StatusUpdate, TranscriptFeed, TranscriptItem,
 };

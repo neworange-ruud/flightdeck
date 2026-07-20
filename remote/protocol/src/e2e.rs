@@ -28,6 +28,17 @@ pub enum PermissionChoice {
     Deny,
 }
 
+/// Which kind of prompt a [`TranscriptItem::PermissionPrompt`] represents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptKind {
+    /// Binary allow/deny permission request.
+    #[default]
+    Permission,
+    /// A multiple-choice question (Claude AskUserQuestion / OpenCode question.asked).
+    Question,
+}
+
 /// A deep-link target so a notification tap lands on the exact agent/item.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeepLink {
@@ -208,10 +219,19 @@ pub enum TranscriptItem {
         item_id: ItemId,
         /// The prompt id echoed back in a `permission_decision` command.
         prompt_id: PromptId,
-        /// The command/action text the agent wants to run, shown verbatim.
+        /// Permission (binary) vs Question (N-option / free-text). Defaults to
+        /// Permission so v1 JSON without this field still parses.
+        #[serde(default)]
+        kind: PromptKind,
+        /// Command/action text (Permission) or question text (Question), shown
+        /// verbatim.
         command: String,
-        /// The offered options.
+        /// The offered options (>=1). Each carries a stable 0-based index.
         options: Vec<PermissionOption>,
+        /// Whether the phone may submit a free-text answer ("Type your own
+        /// answer").
+        #[serde(default)]
+        allow_free_text: bool,
         /// Wall-clock time (unix ms).
         at_ms: i64,
     },
@@ -220,10 +240,18 @@ pub enum TranscriptItem {
 /// A selectable option on a permission prompt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionOption {
-    /// The choice this option maps to.
-    pub choice: PermissionChoice,
-    /// Human-readable button label, e.g. `Allow once`.
+    /// Stable 0-based index within the prompt's option list.
+    #[serde(default)]
+    pub index: u32,
+    /// The binary choice this option maps to (permission prompts only). None for
+    /// arbitrary Question options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<PermissionChoice>,
+    /// Human-readable button label, e.g. `Allow once` or an AskUserQuestion label.
     pub label: String,
+    /// Optional longer description (AskUserQuestion option descriptions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A slice of a session's cleaned transcript. Used both for a full load
@@ -431,8 +459,16 @@ pub enum CommandBody {
         session_id: SessionId,
         /// The prompt being decided (from the transcript item).
         prompt_id: PromptId,
-        /// Allow-once or deny.
-        choice: PermissionChoice,
+        /// Binary fast-path choice (permission prompts). None when answering a
+        /// Question by option index or free text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<PermissionChoice>,
+        /// Selected option index (Question prompts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_index: Option<u32>,
+        /// Free-text answer ("Type your own answer").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        free_text: Option<String>,
     },
     /// Launch a new agent session (v1 fields only; model/effort inherit desktop
     /// defaults).

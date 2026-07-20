@@ -191,7 +191,9 @@ fn decision(prompt: &str, choice: PermissionChoice) -> CommandBody {
     CommandBody::PermissionDecision {
         session_id: SessionId::new("t1"),
         prompt_id: PromptId::new(prompt),
-        choice,
+        choice: Some(choice),
+        option_index: None,
+        free_text: None,
     }
 }
 

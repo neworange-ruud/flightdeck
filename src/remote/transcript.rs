@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use flightdeck_remote_protocol::{
-    ActivityKind, PermissionChoice, PermissionOption, TranscriptFeed, TranscriptItem,
+    ActivityKind, PermissionChoice, PermissionOption, PromptKind, TranscriptFeed, TranscriptItem,
 };
 use flightdeck_remote_protocol::{ItemId, PromptId, SessionId};
 
@@ -521,17 +521,23 @@ impl TranscriptBuilder {
         self.push_item(TranscriptItem::PermissionPrompt {
             item_id,
             prompt_id,
+            kind: PromptKind::Permission,
             command: preview.clone().unwrap_or_default(),
             options: vec![
                 PermissionOption {
-                    choice: PermissionChoice::AllowOnce,
+                    index: 0,
+                    choice: Some(PermissionChoice::AllowOnce),
                     label: "Allow once".to_string(),
+                    description: None,
                 },
                 PermissionOption {
-                    choice: PermissionChoice::Deny,
+                    index: 1,
+                    choice: Some(PermissionChoice::Deny),
                     label: "Deny".to_string(),
+                    description: None,
                 },
             ],
+            allow_free_text: false,
             at_ms,
         });
         preview
