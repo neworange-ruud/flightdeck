@@ -36,6 +36,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- **FlightDeck Remote: the Activity tab is folded into the unified Feed.** There
+  is now one surface instead of two overlapping lists. Feed rows carry each
+  project's latest agent event, so a row shows an unread dot, highlights
+  needs-input and errors, and reads the event summary inline; the unread badge
+  now lives on the Feed tab and counts unseen activity across *every* paired
+  machine (the old Activity tab only tracked one). Tapping a needs-input or
+  error row jumps straight to that session. Unread state persists across
+  launches and clears per row as you open it.
+
 - **The New Agent dialog is now a single combined form.** Picking the agent and
   naming the branch used to be two sequential prompts; they are now one dialog
   with a radio list of agents (↑/↓ to choose), a branch-name field, and a
