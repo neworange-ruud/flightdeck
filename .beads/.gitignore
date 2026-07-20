@@ -2,6 +2,10 @@
 dolt/
 embeddeddolt/
 
+# Passive export; Dolt is the source of truth and sync channel
+issues.jsonl
+interactions.jsonl
+
 # Runtime files
 bd.sock
 bd.sock.startlock
