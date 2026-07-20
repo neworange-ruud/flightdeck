@@ -376,6 +376,41 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
     }
 }
 
+/// The keystrokes injected to select the `option_index`-th option of a
+/// multi-option (Question) prompt on a supported backend's TUI list.
+///
+/// EMPIRICAL ASSUMPTION — **UNVERIFIED, MUST BE VALIDATED ON A LIVE BUILD.**
+/// Unlike [`permission_keystroke`] (whose per-key bindings are documented CLI
+/// shortcuts), the arrow-navigation model below is inferred from how these
+/// TUIs render selectable lists, not confirmed against a running agent. It is
+/// flagged in the s81 handoff and cannot be checked unattended.
+///
+/// The model: a Question prompt renders its options as a vertical list with
+/// the first option (index 0) focused. Moving the selection down one option is
+/// a DOWN arrow (ESC `[` `B` = `b"\x1b[B"`); Enter (`b"\r"`) activates the
+/// focused option. So selecting option `n` is `n` DOWN arrows followed by
+/// Enter; index 0 is just Enter.
+///
+/// * **Claude Code** (`AskUserQuestion`) and **OpenCode** (`question.asked`)
+///   both use this arrow-nav list model.
+/// * **Codex** has no multi-option Question prompt, so it returns `None`; the
+///   translate arm turns that into an honest rejection.
+pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec<u8>> {
+    const DOWN: &[u8] = b"\x1b[B";
+    match backend {
+        StatusBackend::Claude | StatusBackend::OpenCode => {
+            let mut bytes = Vec::new();
+            for _ in 0..option_index {
+                bytes.extend_from_slice(DOWN);
+            }
+            bytes.push(b'\r');
+            Some(bytes)
+        }
+        // Codex has no multi-option prompt; refuse rather than guess.
+        StatusBackend::Codex => None,
+    }
+}
+
 /// Encode a phone reply exactly as the desktop TUI delivers typed/pasted
 /// input: the text as one paste (bracketed iff the agent enabled DECSET 2004,
 /// newlines normalised to carriage returns — see `encode_paste`), followed by
@@ -411,8 +446,8 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             session_id,
             prompt_id,
             choice,
-            option_index: _,
-            free_text: _,
+            option_index,
+            free_text,
         } => {
             let Some(s) = index.session(session_id) else {
                 return reject(format!("unknown session '{session_id}'"));
@@ -432,15 +467,36 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             if !s.primary_running {
                 return reject("the agent is not running");
             }
-            // Binary fast-path only for now. Multi-option / free-text decisions
-            // (choice = None) are wired up by a follow-up change.
-            let Some(choice) = choice else {
-                return reject("multi-option decisions not yet supported");
+            // Decision-field precedence (commands.rs never sees the prompt
+            // kind, so bytes are chosen purely from which decision field is
+            // set):
+            //   1. `choice`      — the binary fast-path (byte-identical to the
+            //                      original permission-only behaviour).
+            //   2. `free_text`   — a typed answer, delivered like any reply.
+            //                      Deliberately ranked ABOVE `option_index`: if
+            //                      a phone somehow sends both, the explicit
+            //                      free-text answer wins over a list position.
+            //   3. `option_index`— arrow-nav selection of a Question option.
+            //   4. otherwise     — nothing actionable; reject honestly.
+            let free_text = free_text.as_deref().filter(|t| !t.is_empty());
+            let bytes = if let Some(choice) = choice {
+                permission_keystroke(backend, *choice).to_vec()
+            } else if let Some(text) = free_text {
+                encode_reply(text, s.bracketed_paste)
+            } else if let Some(n) = option_index {
+                match option_keystroke(backend, *n) {
+                    Some(b) => b,
+                    None => {
+                        return reject("this agent does not support multi-option prompts");
+                    }
+                }
+            } else {
+                return reject("empty decision");
             };
             Translation::PtyInput {
                 project: s.project,
                 tab: s.tab,
-                bytes: permission_keystroke(backend, *choice).to_vec(),
+                bytes,
             }
         }
 

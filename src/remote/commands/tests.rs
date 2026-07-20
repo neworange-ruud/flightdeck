@@ -197,6 +197,35 @@ fn decision(prompt: &str, choice: PermissionChoice) -> CommandBody {
     }
 }
 
+fn decision_option(prompt: &str, option_index: u32) -> CommandBody {
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new(prompt),
+        choice: None,
+        option_index: Some(option_index),
+        free_text: None,
+    }
+}
+
+fn decision_free_text(prompt: &str, text: &str) -> CommandBody {
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new(prompt),
+        choice: None,
+        option_index: None,
+        free_text: Some(text.to_string()),
+    }
+}
+
+/// A NeedsInput session with a pending prompt on the given backend.
+fn answerable(prompt: &str, backend: StatusBackend) -> SessionIndex {
+    let mut e = entry("t1");
+    e.status = AgentStatus::NeedsInput;
+    e.pending_prompt = Some(PromptId::new(prompt));
+    e.backend = Some(backend);
+    index_with(vec![e])
+}
+
 #[test]
 fn permission_decision_injects_backend_keystroke() {
     let mut e = entry("t1");
@@ -259,6 +288,123 @@ fn permission_decision_rejections() {
     assert!(matches!(
         translate(&decision("t1:p1", PermissionChoice::Deny), &index),
         Translation::Reject { reason } if reason.contains("unknown session")
+    ));
+}
+
+#[test]
+fn option_keystroke_arrow_nav_for_claude_and_opencode() {
+    use StatusBackend::{Claude, Codex, OpenCode};
+    // EMPIRICAL / UNVERIFIED (see option_keystroke doc): index 0 => just Enter;
+    // each further step adds a DOWN arrow (ESC [ B) before the trailing Enter.
+    for backend in [Claude, OpenCode] {
+        assert_eq!(option_keystroke(backend, 0), Some(b"\r".to_vec()));
+        assert_eq!(option_keystroke(backend, 1), Some(b"\x1b[B\r".to_vec()));
+        assert_eq!(
+            option_keystroke(backend, 2),
+            Some(b"\x1b[B\x1b[B\r".to_vec())
+        );
+    }
+    // Codex has no multi-option prompt.
+    assert_eq!(option_keystroke(Codex, 0), None);
+    assert_eq!(option_keystroke(Codex, 2), None);
+}
+
+#[test]
+fn permission_decision_option_index_arrow_nav() {
+    use StatusBackend::{Claude, OpenCode};
+    for backend in [Claude, OpenCode] {
+        let index = answerable("t1:p3", backend);
+        assert_eq!(
+            translate(&decision_option("t1:p3", 0), &index),
+            Translation::PtyInput {
+                project: 0,
+                tab: 0,
+                bytes: b"\r".to_vec(),
+            }
+        );
+        assert_eq!(
+            translate(&decision_option("t1:p3", 1), &index),
+            Translation::PtyInput {
+                project: 0,
+                tab: 0,
+                bytes: b"\x1b[B\r".to_vec(),
+            }
+        );
+        assert_eq!(
+            translate(&decision_option("t1:p3", 2), &index),
+            Translation::PtyInput {
+                project: 0,
+                tab: 0,
+                bytes: b"\x1b[B\x1b[B\r".to_vec(),
+            }
+        );
+    }
+}
+
+#[test]
+fn permission_decision_option_index_rejected_for_codex() {
+    let index = answerable("t1:p3", StatusBackend::Codex);
+    assert!(matches!(
+        translate(&decision_option("t1:p3", 1), &index),
+        Translation::Reject { reason } if reason.contains("multi-option")
+    ));
+}
+
+#[test]
+fn permission_decision_free_text_encodes_reply() {
+    // Free text is delivered like any reply: the text as a paste (bracketed
+    // when the agent enabled DECSET 2004) followed by the Enter CR.
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    assert_eq!(
+        translate(&decision_free_text("t1:p3", "my own answer"), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\x1b[200~my own answer\x1b[201~\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_free_text_wins_over_option_index() {
+    // Precedence: a non-empty free_text beats a set option_index.
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    let body = CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new("t1:p3"),
+        choice: None,
+        option_index: Some(2),
+        free_text: Some("typed instead".to_string()),
+    };
+    assert_eq!(
+        translate(&body, &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\x1b[200~typed instead\x1b[201~\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_empty_decision_rejected() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    // All fields None.
+    let empty = CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new("t1:p3"),
+        choice: None,
+        option_index: None,
+        free_text: None,
+    };
+    assert!(matches!(
+        translate(&empty, &index),
+        Translation::Reject { reason } if reason.contains("empty decision")
+    ));
+    // Empty free_text is treated as no decision too.
+    assert!(matches!(
+        translate(&decision_free_text("t1:p3", ""), &index),
+        Translation::Reject { reason } if reason.contains("empty decision")
     ));
 }
 

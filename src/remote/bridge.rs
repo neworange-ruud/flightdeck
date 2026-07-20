@@ -26,7 +26,7 @@
 //! pairs later gets a populated history.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -35,13 +35,14 @@ use crate::app::state::AppState;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
 use crate::remote::notifier::{build_event, EventArming, EventClass, EventContext};
 use crate::remote::shell::ShellManager;
-use crate::remote::transcript::TranscriptBuilder;
+use crate::remote::transcript::{StructuredPrompt, TranscriptBuilder};
 use crate::remote::{RemoteInbound, RemoteOutbound};
 use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
     AgentStatus, CommandAck, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId,
-    PhoneCommand, ProjectId, PromptId, Role, SessionId, StateSnapshot,
+    PermissionChoice, PermissionOption, PhoneCommand, ProjectId, PromptId, PromptKind, Role,
+    SessionId, StateSnapshot,
 };
 
 /// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
@@ -380,12 +381,29 @@ impl RemoteBridge {
                 let was_needs = matches!(self.prev_status.get(&sid), Some(AgentStatus::NeedsInput));
                 let now_needs = matches!(status, AgentStatus::NeedsInput);
                 if now_needs && !was_needs {
+                    // Only OpenCode writes the prompt sidecar (from its injected
+                    // plugin). Read it BEFORE `on_needs_input` so a captured
+                    // structured prompt supplants the binary fallback, then remove
+                    // it so a stale prompt is never reused on a later edge. We only
+                    // ever touch the file for OpenCode sessions.
+                    let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
+                    let sidecar = if is_opencode {
+                        read_prompt_sidecar(&worktree)
+                    } else {
+                        None
+                    };
                     let builder = self
                         .transcripts
                         .entry(sid.clone())
                         .or_insert_with(|| TranscriptBuilder::new(sid.clone()));
+                    if let Some(sp) = sidecar {
+                        builder.set_structured_prompt(sp);
+                    }
                     let preview = builder.on_needs_input(now_ms as i64);
                     self.previews.insert(sid.clone(), preview);
+                    if is_opencode {
+                        let _ = std::fs::remove_file(prompt_sidecar_path(&worktree));
+                    }
                 } else if !now_needs && was_needs {
                     self.previews.remove(&sid);
                 }
@@ -594,6 +612,117 @@ impl RemoteBridge {
                 ciphertext,
             });
         }
+    }
+}
+
+/// The OpenCode prompt sidecar, written by the injected plugin (see
+/// [`crate::agents::setup`]) on a `question.asked`/`permission.asked` event.
+/// The plugin normalizes OpenCode's (undocumented) `event.properties` into this
+/// stable shape, so the reader only depends on `kind`/`text`/`options`.
+///
+/// EMPIRICAL ASSUMPTION: OpenCode's `event.properties` field names are
+/// unverified. The plugin probes several likely names; if it cannot extract
+/// options it writes an empty array and this reader returns `None` so the
+/// bridge keeps the binary allow/deny fallback.
+#[derive(serde::Deserialize)]
+struct PromptSidecar {
+    kind: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    options: Vec<PromptSidecarOption>,
+}
+
+#[derive(serde::Deserialize)]
+struct PromptSidecarOption {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Path of the OpenCode prompt sidecar within a worktree (sibling of the
+/// `agent-status` file the poller reads).
+fn prompt_sidecar_path(worktree: &Path) -> PathBuf {
+    worktree.join(".flightdeck").join("agent-prompt.json")
+}
+
+/// Classify a permission option's button label into the binary choice it maps
+/// to, or `None` when the wording is not clearly allow-ish or deny-ish (in which
+/// case the caller drops to the binary fallback — the safe default). Substring
+/// matching is deliberate given the unverified OpenCode option schema.
+fn classify_permission_choice(label: &str) -> Option<PermissionChoice> {
+    const ALLOW: &[&str] = &[
+        "allow", "yes", "accept", "approve", "grant", "always", "once", "ok",
+    ];
+    const DENY: &[&str] = &[
+        "deny", "reject", "decline", "cancel", "never", "disallow", "no",
+    ];
+    let l = label.to_ascii_lowercase();
+    if ALLOW.iter().any(|k| l.contains(k)) {
+        Some(PermissionChoice::AllowOnce)
+    } else if DENY.iter().any(|k| l.contains(k)) {
+        Some(PermissionChoice::Deny)
+    } else {
+        None
+    }
+}
+
+/// Read and parse the OpenCode prompt sidecar into a [`StructuredPrompt`], or
+/// `None` (binary fallback) when the file is absent, malformed, or optionless.
+///
+/// - `kind == "question"` → [`PromptKind::Question`], `allow_free_text = true`,
+///   options carry no binary choice (index/label/description only).
+/// - `kind == "permission"` → [`PromptKind::Permission`], `allow_free_text =
+///   false`; each option must classify to allow/deny — if any label is unclear
+///   the whole structured prompt is abandoned in favour of the binary fallback.
+fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
+    let raw = std::fs::read_to_string(prompt_sidecar_path(worktree)).ok()?;
+    let parsed: PromptSidecar = serde_json::from_str(&raw).ok()?;
+    if parsed.options.is_empty() {
+        return None;
+    }
+    match parsed.kind.as_str() {
+        "question" => {
+            let options = parsed
+                .options
+                .into_iter()
+                .enumerate()
+                .map(|(i, o)| PermissionOption {
+                    index: i as u32,
+                    choice: None,
+                    label: o.label,
+                    description: o.description,
+                })
+                .collect();
+            Some(StructuredPrompt {
+                kind: PromptKind::Question,
+                command: parsed.text,
+                options,
+                allow_free_text: true,
+            })
+        }
+        // Permissions are binary. Build a structured prompt only when every
+        // option maps cleanly to allow/deny; otherwise fall back to binary.
+        "permission" => {
+            let mut options = Vec::with_capacity(parsed.options.len());
+            for (i, o) in parsed.options.into_iter().enumerate() {
+                let choice = classify_permission_choice(&o.label)?;
+                options.push(PermissionOption {
+                    index: i as u32,
+                    choice: Some(choice),
+                    label: o.label,
+                    description: o.description,
+                });
+            }
+            Some(StructuredPrompt {
+                kind: PromptKind::Permission,
+                command: parsed.text,
+                options,
+                allow_free_text: false,
+            })
+        }
+        _ => None,
     }
 }
 
