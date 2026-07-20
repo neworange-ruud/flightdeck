@@ -6,19 +6,35 @@ order: 47
 
 # Settings, Security & Offline
 
-The **Settings** tab is where you check the connection, lock the app, tune
-notifications, and unpair. This page also covers the security model and how the
-app behaves offline.
+The **Settings** tab is where you check the connection, manage your paired Macs,
+lock the app, tune notifications, and unpair. This page also covers the security
+model and how the app behaves offline.
 
-![The Settings screen: connection card, security (Face ID, unpair), and notification toggles.](/screenshots/mobile/11-settings.png)
+![The Settings screen: connection card, machines list with rename/mute/unpair, security, and notification toggles.](/screenshots/mobile/11-settings.png)
 
-*Settings — connection status, security, and notification controls in one place.*
+*Settings — connection, your machines, security, and notification controls in one place.*
 
 ## Connection
 
-The **Connection** card names your paired Mac and shows the live link status with
-honest latency — *"Connected · 8ms · low latency"*, *"Connecting…"*, or
-*"Offline."* It also shows when you paired.
+The **Connection** card names the Mac you're focused on and shows the live link
+status with honest latency — *"Connected · 8ms · low latency"*, *"Connecting…"*,
+or *"Offline."* It also shows when you paired.
+
+## Machines
+
+The **Machines** card lists every Mac you're paired with — one row each, with an
+online/offline dot and the machine's display name. Each row lets you:
+
+- **Rename it** — tap the row to open **Rename machine** and set a name that
+  overrides what the desktop reports (**Reset to Mac's name** clears the
+  override). See [Naming your Macs](/remote/pairing#naming-your-macs).
+- **Mute its notifications** — the bell toggle silences push from just that Mac,
+  without touching the others.
+- **Unpair it** — the red minus (–) removes that one Mac after a confirmation and
+  revokes it on the desktop; your other Macs stay paired.
+
+Below the list, **Add machine** [pairs another Mac](/remote/pairing#pairing-more-than-one-mac)
+and shows the live count against the limit (e.g. *3/4*). At four it's disabled.
 
 When the link drops, a **Reconnecting** banner appears at the top of the app with
 *"Commands are paused until the link is back. Nothing is sent blind."* After a
@@ -43,22 +59,26 @@ after the app has been backgrounded.
 ## Notifications
 
 The Security card is followed by the notification controls covered in
-[Activity & Notifications](/remote/activity): the three independent toggles
+[The Feed & Notifications](/remote/feed): the three independent toggles
 (**Agent needs input**, **Agent finished**, **Completion chime**) and the
-per-project **Mute by project** list.
+per-project **Mute by project** list. To silence a whole Mac, use the bell toggle
+on its row in the [Machines](#machines) card above.
 
 ## Unpair
 
-**Unpair this device** (in red) disconnects the phone from your Mac after a
-confirmation. You'll return to the [pairing screen](/remote/pairing) and need to
-pair again to reconnect.
+**Unpair this device** (in red) disconnects the phone from **every** Mac after a
+confirmation and returns you to the [pairing screen](/remote/pairing). To drop
+just one Mac and keep the rest, use the red minus (–) on its row in the
+[Machines](#machines) card instead.
 
 ## The security model
 
 - Your device holds an **identity keypair** whose private key lives in the iOS
   Keychain / Secure Enclave and never leaves the phone.
 - All traffic between phone and Mac is **end-to-end encrypted**; the hosted relay
-  routes opaque ciphertext by pairing ID and cannot read it.
+  routes opaque ciphertext by pairing ID and cannot read it. Each paired Mac is a
+  separate encrypted channel, but they all share the phone's one device identity
+  — unpairing one Mac never disturbs the others' keys.
 - **Pairing** is the moment of trust — after it, your phone can send commands
   that run on your Mac, so only pair with a code/QR you can see on your own
   machine.

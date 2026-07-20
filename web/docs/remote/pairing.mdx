@@ -7,8 +7,9 @@ order: 41
 # Pair Your Phone
 
 Pairing establishes the end-to-end-encrypted link between FlightDeck Remote and
-your Mac. You only do it once per device; the pairing persists across app
-launches until you unpair.
+your Mac. You do it once per Mac; the pairing persists across app launches until
+you unpair. One phone can be paired with **up to four Macs** at once — see
+[Pairing more than one Mac](#pairing-more-than-one-mac).
 
 ![The pairing screen: 'Pair with your Mac', a 4-digit code entry, and 'Scan QR instead'.](/screenshots/mobile/01-pairing.png)
 
@@ -34,7 +35,7 @@ screen. Choose either path:
   **Pair**.
 
 When pairing succeeds, the desktop overlay shows **Paired ✓** and the phone
-moves straight to the [Projects](/remote/monitoring) screen.
+moves straight to the [Feed](/remote/feed).
 
 <Callout type="success">
   Everything after pairing is end-to-end encrypted. The footer on the pairing
@@ -61,9 +62,47 @@ Entering the wrong code shows an inline error and a brief shake, and keeps you o
 the pairing screen so you can try again. The **Pair** button stays disabled until
 you've entered all four digits.
 
+## Pairing more than one Mac
+
+One phone can drive several Macs — a laptop and a desktop, home and work — from a
+single app. Once you're paired with your first Mac, add another from either:
+
+- the **`+`** in the [Feed](/remote/feed) header, or
+- **Add machine** in **Settings → Machines**.
+
+Both open the same pair-a-Mac flow (QR or 4-digit code) as a sheet; on the
+desktop you're adding, run **Pair Phone** exactly as before. The new Mac appears
+in the Feed the moment it connects, and its projects interleave with the rest.
+
+<Callout type="info">
+  A phone can be paired with **up to four Macs**. At the limit the pairing
+  controls are disabled and the app explains why: **"You've reached the limit of
+  4 paired Macs. Unpair one before adding another."** The **Add machine** row in
+  Settings shows the live count (e.g. *3/4*).
+</Callout>
+
+All your Macs share the phone's single device identity — adding a Mac never
+generates new keys, and unpairing one leaves the others' keys untouched.
+
+## Naming your Macs
+
+Each Mac reports its own name (its computer name), shown on the machine chip in
+the Feed and in **Settings → Machines**. To override it — handy when two Macs
+have similar names — tap the machine's row in **Settings → Machines** and use
+**Rename machine**. Your override always wins; **Reset to Mac's name** clears it
+and falls back to what the desktop reports. Renaming on the desktop updates the
+reported name automatically.
+
 ## Unpairing
 
-To disconnect a phone, open **Settings** in the app and tap **Unpair this
-device** (see [Settings & Security](/remote/settings)). On the desktop, run
-**Unpair Phone** from the command palette. After unpairing you'll need to pair
-again to reconnect.
+You can unpair **one** Mac or **all** of them:
+
+- **One Mac** — open **Settings → Machines** and tap the red minus (–) on its
+  row, then confirm. This removes it from the phone and revokes it on your Mac;
+  your other Macs stay paired.
+- **This device entirely** — **Unpair this device** in **Settings → Security**
+  drops every pairing and returns you to the pairing screen.
+
+On the desktop side, run **Unpair Phone** from the command palette. After
+unpairing a Mac you'll need to pair it again to reconnect. See
+[Settings & Security](/remote/settings) for the full Settings layout.

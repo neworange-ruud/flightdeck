@@ -175,12 +175,24 @@ final class DocScreenshotUITests: XCTestCase {
 
     @MainActor
     func test11Settings() throws {
+        // Seed a real multi-machine list (`-uitest-fixture-machines`) so the
+        // Settings "Machines" card shows the per-machine rename/mute/unpair rows
+        // and the Add-machine count, not just an empty "Add machine 0/4". Seeded
+        // instances make `hasAnyPairing` true, so the app boots straight to the
+        // tabs — no debug pairing toggle needed (that's why this doesn't use
+        // `launchPaired`).
         let app = XCUIApplication()
-        launchPaired(app, ["-uitest-fixture-snapshot", "-uitest-reset-applock", "-uitest-linkstate", "connected:38"])
+        app.launchArguments += [
+            "-uitest-reset-pairing", "-uitest-fixture-machines",
+            "-uitest-fixture-snapshot", "-uitest-reset-applock",
+            "-uitest-linkstate", "connected:38",
+        ]
+        app.launch()
         let settingsTab = element(app, "tab-settings")
         XCTAssertTrue(settingsTab.waitForExistence(timeout: 10))
         settingsTab.tap()
         XCTAssertTrue(element(app, "SettingsView").waitForExistence(timeout: 10))
+        XCTAssertTrue(element(app, "settings-machines-card").waitForExistence(timeout: 10))
         snap(app, "11-settings")
     }
 

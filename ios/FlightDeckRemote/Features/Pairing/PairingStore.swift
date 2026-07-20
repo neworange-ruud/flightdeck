@@ -224,9 +224,50 @@ final class PairingStore {
             self.instances = []
             instancesStorage.saveInstances([])
         }
+        // Doc-screenshot / UI-test hook: seed a deterministic multi-machine
+        // list so the Settings "Machines" card and the feed's machine chips
+        // render the real multi-pairing UI (rename/mute/unpair rows, distinct
+        // machine names, an offline machine) without a live relay. Seeding
+        // `instances` is the same path production takes at launch
+        // (`instancesStorage.loadInstances()`), so it can't hang; the coordinator
+        // just reports each seeded machine `.disconnected` (no persisted
+        // PairingRecord). Runs AFTER the reset block so it wins over it, and
+        // overwrites persisted state so it's hermetic on its own.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-fixture-machines") {
+            let seeded = Self.uiTestFixtureMachines
+            self.instances = seeded
+            instancesStorage.saveInstances(seeded)
+        }
         #endif
         self.isPaired = initial
     }
+
+    #if DEBUG
+    /// Deterministic paired-machine list for `-uitest-fixture-machines` (doc
+    /// screenshots + Settings/feed UI tests): two online Macs with distinct
+    /// desktop-reported names and one muted, offline Mac — enough to show the
+    /// online/offline dot, the per-machine mute bell, and the rename/unpair
+    /// affordances. No secrets: the E2E key material lives in `PairingRecord`,
+    /// absent here, so each seeded machine simply resolves to `.disconnected`.
+    static let uiTestFixtureMachines: [PairedInstance] = [
+        PairedInstance(
+            pairingId: "uitest-machine-studio",
+            machineNameFromDesktop: "Studio",
+            relayURL: URL(string: "wss://relay.flightdeck.dev")!,
+            lastKnownOnline: true),
+        PairedInstance(
+            pairingId: "uitest-machine-mbp",
+            machineNameFromDesktop: "MacBook Pro",
+            relayURL: URL(string: "wss://relay.flightdeck.dev")!,
+            lastKnownOnline: true),
+        PairedInstance(
+            pairingId: "uitest-machine-mini",
+            machineNameFromDesktop: "Mac mini",
+            relayURL: URL(string: "wss://relay.flightdeck.dev")!,
+            mutePush: true,
+            lastKnownOnline: false),
+    ]
+    #endif
 
     /// Records a successful pairing transaction (see `PairingServicing`) and
     /// flips `isPaired` — `AppRouter`/`RootView` react automatically and

@@ -7,8 +7,9 @@ order: 40
 # FlightDeck Remote
 
 **FlightDeck Remote** is the companion iOS app for FlightDeck. Pair it to your
-Mac and you can watch every agent, answer their questions, run a shell, and
-drive guarded Git actions — from your phone, wherever you are.
+Mac — or to **several Macs at once** — and you can watch every agent, answer
+their questions, run a shell, and drive guarded Git actions — from your phone,
+wherever you are.
 
 ![The FlightDeck Remote projects screen and an agent conversation on iPhone.](/screenshots/mobile/02-projects-list.png) ![An agent conversation with a live permission prompt.](/screenshots/mobile/07-agent-chat.png)
 
@@ -21,9 +22,9 @@ drive guarded Git actions — from your phone, wherever you are.
 
 ## What you can do from your phone
 
-- **Monitor** — see every project and agent, their status, and Git state at a
-  glance; get [push notifications](/remote/activity) when an agent finishes or
-  needs you.
+- **Monitor** — see every project and agent across all your paired Macs in one
+  [Feed](/remote/feed), with their status and Git state at a glance; get
+  [push notifications](/remote/feed) when an agent finishes or needs you.
 - **Chat** — read a cleaned-up transcript, reply, and approve or deny permission
   prompts inline — including hands-free in [Focus mode](/remote/chat).
 - **Control** — [start new agents](/remote/control), restart them, set a manual
@@ -35,7 +36,10 @@ drive guarded Git actions — from your phone, wherever you are.
 
 Your phone never talks to your Mac directly. Both connect to a **hosted relay**,
 and everything between them is **end-to-end encrypted**: the relay only routes
-opaque ciphertext by pairing ID and never holds the keys to read it.
+opaque ciphertext by pairing ID and never holds the keys to read it. When you
+pair several Macs, each is its own encrypted channel — but they all share the
+one device identity on your phone, so adding or removing a Mac never touches the
+others.
 
 <Callout type="success">
   Pairing is the trust step — it establishes the encrypted channel between your
@@ -49,13 +53,16 @@ To use it you'll:
    under `[remote]` in your FlightDeck config, or run *Pair Phone* from the
    command palette.
 2. **[Pair your phone](/remote/pairing)** — scan a QR code or type a 4-digit
-   code.
+   code. Repeat on each Mac you want to drive (up to four).
 
 ## Start here
 
 <CardGrid>
   <Card href="/remote/pairing" title="Pair Your Phone">
-    Connect the app to your Mac over the encrypted relay.
+    Connect the app to one Mac — or several — over the encrypted relay.
+  </Card>
+  <Card href="/remote/feed" title="The Feed">
+    Every project across all your Macs in one attention-first list.
   </Card>
   <Card href="/remote/monitoring" title="Monitor Projects & Sessions">
     Read the projects list, session rows, status pills, and Git indicators.
@@ -71,6 +78,6 @@ To use it you'll:
 ## What's not on the phone (v1)
 
 Pushing branches and opening PRs stay on the desktop / your agent (the app holds
-no GitHub token). Also out of scope for v1: multiple Macs from one phone,
-several side-by-side shells, and full-screen terminal UIs (vim, top). Agents only
-run while FlightDeck is running on your Mac.
+no GitHub token). Also out of scope for v1: several side-by-side shells, and
+full-screen terminal UIs (vim, top). Agents only run while FlightDeck is running
+on your Mac.
