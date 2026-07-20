@@ -135,8 +135,8 @@ struct FocusModeView: View {
                                  actionState: PermissionActionState, actionable: Bool) -> some View {
         VStack(spacing: Theme.Spacing.md) {
             switch actionState {
-            case let .resolved(choice):
-                resolvedBanner(choice)
+            case let .resolved(answer):
+                resolvedBanner(answer)
             case .stale:
                 Text("Already answered on the desktop")
                     .typography(Typography.callout)
@@ -156,13 +156,24 @@ struct FocusModeView: View {
     private func bigDecisionButton(option: Wire.PermissionOption,
                                    actionState: PermissionActionState,
                                    actionable: Bool, promptId: Wire.PromptId) -> some View {
+        // Binary permission options map to the choice fast-path; a Question's
+        // options (no `choice`) answer by index instead.
+        let answer: PermissionAnswer = option.choice.map { .choice($0) }
+            ?? .option(index: option.index, label: option.label)
         let isAllow = option.choice == .allowOnce
         let inFlight: Bool = {
-            if case let .sending(choice) = actionState { return choice == option.choice }
+            if case let .sending(sent) = actionState { return sent == answer }
             return false
         }()
         return Button {
-            model.decidePermission(promptId: promptId, choice: option.choice)
+            switch answer {
+            case let .choice(choice):
+                model.decidePermission(promptId: promptId, choice: choice)
+            case let .option(index, label):
+                model.decidePermission(promptId: promptId, optionIndex: index, label: label)
+            case .freeText:
+                break // options never carry a free-text answer
+            }
         } label: {
             ZStack {
                 Text(option.label)
@@ -188,8 +199,8 @@ struct FocusModeView: View {
         .accessibilityIdentifier(isAllow ? "focus-approve" : "focus-deny")
     }
 
-    private func resolvedBanner(_ choice: Wire.PermissionChoice) -> some View {
-        Text(choice == .allowOnce ? "Approved ✓" : "Denied ✕")
+    private func resolvedBanner(_ answer: PermissionAnswer) -> some View {
+        Text(answer.resolvedText)
             .typography(Typography.headline)
             .foregroundStyle(Theme.textMuted)
             .frame(maxWidth: .infinity)

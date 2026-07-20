@@ -88,8 +88,8 @@ import Foundation
 
     @Test func itemAccessorsCoverEveryVariant() {
         let perm = Wire.TranscriptItem.permissionPrompt(
-            itemId: Wire.ItemId("p"), promptId: Wire.PromptId("prom"),
-            command: "ls", options: [], atMs: 7)
+            itemId: Wire.ItemId("p"), promptId: Wire.PromptId("prom"), kind: .permission,
+            command: "ls", options: [], allowFreeText: false, atMs: 7)
         #expect(perm.itemId == Wire.ItemId("p"))
         #expect(perm.atMs == 7)
         #expect(perm.permissionPromptId == Wire.PromptId("prom"))

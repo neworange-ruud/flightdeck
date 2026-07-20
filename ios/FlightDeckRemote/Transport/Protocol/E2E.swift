@@ -222,12 +222,60 @@ extension Wire {
         case other
     }
 
-    /// A selectable option on a permission prompt.
+    /// Binary (allow/deny) vs. multi-option/free-text prompt. Defaults to
+    /// `.permission` when the key is absent (Rust `#[serde(default)]`), so
+    /// pre-v2 desktop builds' prompts still decode.
+    enum PromptKind: String, Codable, Hashable, Sendable {
+        /// Binary allow/deny permission request.
+        case permission
+        /// A multiple-choice question (Claude AskUserQuestion / OpenCode
+        /// `question.asked`).
+        case question
+    }
+
+    /// A selectable option on a permission/question prompt.
     struct PermissionOption: Codable, Hashable, Sendable {
-        /// The choice this option maps to.
-        var choice: PermissionChoice
-        /// Human-readable button label, e.g. `Allow once`.
+        /// Stable 0-based index within the prompt's option list.
+        var index: Int
+        /// The binary choice this option maps to (permission prompts only).
+        /// `nil` for arbitrary Question options.
+        var choice: PermissionChoice?
+        /// Human-readable button label, e.g. `Allow once` or an
+        /// AskUserQuestion label.
         var label: String
+        /// Optional longer description (AskUserQuestion option descriptions).
+        var description: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case index, choice, label, description
+        }
+
+        init(index: Int = 0, choice: PermissionChoice? = nil, label: String,
+             description: String? = nil) {
+            self.index = index
+            self.choice = choice
+            self.label = label
+            self.description = description
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // `#[serde(default)]` on the Rust side: absent `index` decodes to 0.
+            index = try c.decodeIfPresent(Int.self, forKey: .index) ?? 0
+            choice = try c.decodeIfPresent(PermissionChoice.self, forKey: .choice)
+            label = try c.decode(String.self, forKey: .label)
+            description = try c.decodeIfPresent(String.self, forKey: .description)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(index, forKey: .index)
+            // `skip_serializing_if = "Option::is_none"` on the Rust side — omit
+            // (never emit an explicit null) when absent.
+            try c.encodeIfPresent(choice, forKey: .choice)
+            try c.encode(label, forKey: .label)
+            try c.encodeIfPresent(description, forKey: .description)
+        }
     }
 
     /// One item in the cleaned transcript. Internally tagged by `type`.
@@ -239,15 +287,17 @@ extension Wire {
         /// A collapsible activity pill (noisy tool call, summarized).
         case activity(itemId: ItemId, summary: String, detail: String?,
                       body: String?, kind: ActivityKind, atMs: Int64)
-        /// An inline permission prompt awaiting a decision.
-        case permissionPrompt(itemId: ItemId, promptId: PromptId,
+        /// An inline permission (binary) or question (N-option/free-text)
+        /// prompt awaiting a decision.
+        case permissionPrompt(itemId: ItemId, promptId: PromptId, kind: PromptKind,
                               command: String, options: [PermissionOption],
-                              atMs: Int64)
+                              allowFreeText: Bool, atMs: Int64)
 
         private enum CodingKeys: String, CodingKey {
             case type, text, summary, detail, body, kind, command, options
             case itemId = "item_id"
             case promptId = "prompt_id"
+            case allowFreeText = "allow_free_text"
             case atMs = "at_ms"
         }
 
@@ -277,8 +327,12 @@ extension Wire {
                 self = .permissionPrompt(
                     itemId: try c.decode(ItemId.self, forKey: .itemId),
                     promptId: try c.decode(PromptId.self, forKey: .promptId),
+                    // `#[serde(default)]`: absent `kind` means a pre-v2
+                    // desktop's binary permission prompt.
+                    kind: try c.decodeIfPresent(PromptKind.self, forKey: .kind) ?? .permission,
                     command: try c.decode(String.self, forKey: .command),
                     options: try c.decode([PermissionOption].self, forKey: .options),
+                    allowFreeText: try c.decodeIfPresent(Bool.self, forKey: .allowFreeText) ?? false,
                     atMs: try c.decode(Int64.self, forKey: .atMs))
             default:
                 throw DecodingError.dataCorruptedError(
@@ -308,12 +362,14 @@ extension Wire {
                 try c.encode(body, forKey: .body) // explicit null
                 try c.encode(kind, forKey: .kind)
                 try c.encode(atMs, forKey: .atMs)
-            case let .permissionPrompt(itemId, promptId, command, options, atMs):
+            case let .permissionPrompt(itemId, promptId, kind, command, options, allowFreeText, atMs):
                 try c.encode("permission_prompt", forKey: .type)
                 try c.encode(itemId, forKey: .itemId)
                 try c.encode(promptId, forKey: .promptId)
+                try c.encode(kind, forKey: .kind)
                 try c.encode(command, forKey: .command)
                 try c.encode(options, forKey: .options)
+                try c.encode(allowFreeText, forKey: .allowFreeText)
                 try c.encode(atMs, forKey: .atMs)
             }
         }
@@ -650,9 +706,12 @@ extension Wire {
     enum CommandBody: Codable, Hashable, Sendable {
         /// Reply / follow-up prose to an agent.
         case reply(sessionId: SessionId, text: String)
-        /// Resolve a permission prompt.
+        /// Resolve a permission/question prompt. Exactly one of `choice`
+        /// (binary fast-path), `optionIndex` (Question, by position), or
+        /// `freeText` (typed "Other" answer) is set.
         case permissionDecision(sessionId: SessionId, promptId: PromptId,
-                                choice: PermissionChoice)
+                                choice: PermissionChoice?, optionIndex: Int?,
+                                freeText: String?)
         /// Launch a new agent session.
         case newAgent(projectId: ProjectId, agentType: AgentType, name: String,
                       baseBranch: String, firstTask: String)
@@ -698,6 +757,8 @@ extension Wire {
             case shellId = "shell_id"
             case fromIndex = "from_index"
             case eventIds = "event_ids"
+            case optionIndex = "option_index"
+            case freeText = "free_text"
         }
 
         init(from decoder: Decoder) throws {
@@ -712,7 +773,9 @@ extension Wire {
                 self = .permissionDecision(
                     sessionId: try c.decode(SessionId.self, forKey: .sessionId),
                     promptId: try c.decode(PromptId.self, forKey: .promptId),
-                    choice: try c.decode(PermissionChoice.self, forKey: .choice))
+                    choice: try c.decodeIfPresent(PermissionChoice.self, forKey: .choice),
+                    optionIndex: try c.decodeIfPresent(Int.self, forKey: .optionIndex),
+                    freeText: try c.decodeIfPresent(String.self, forKey: .freeText))
             case "new_agent":
                 self = .newAgent(
                     projectId: try c.decode(ProjectId.self, forKey: .projectId),
@@ -786,11 +849,15 @@ extension Wire {
                 try c.encode("reply", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)
                 try c.encode(text, forKey: .text)
-            case let .permissionDecision(sessionId, promptId, choice):
+            case let .permissionDecision(sessionId, promptId, choice, optionIndex, freeText):
                 try c.encode("permission_decision", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)
                 try c.encode(promptId, forKey: .promptId)
-                try c.encode(choice, forKey: .choice)
+                // `skip_serializing_if = "Option::is_none"` on the Rust side —
+                // omit whichever of the three is unset (never explicit null).
+                try c.encodeIfPresent(choice, forKey: .choice)
+                try c.encodeIfPresent(optionIndex, forKey: .optionIndex)
+                try c.encodeIfPresent(freeText, forKey: .freeText)
             case let .newAgent(projectId, agentType, name, baseBranch, firstTask):
                 try c.encode("new_agent", forKey: .type)
                 try c.encode(projectId, forKey: .projectId)
