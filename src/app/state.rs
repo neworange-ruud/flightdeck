@@ -1452,10 +1452,13 @@ impl AppState {
     /// Pull base (SPECS §5.2). Runs `git pull --rebase` in the base folder (the
     /// repo root) so merged PRs land on the local base branch without leaving
     /// FlightDeck. A global action — it never touches an Agent Tab's worktree.
-    /// Refuses up front if the base folder is dirty (pull --rebase would refuse
-    /// anyway, but we surface a clear reason); aborts on conflict, leaving the
-    /// base folder exactly as it was. The base branch must be the one checked out
-    /// in the root.
+    /// On a dirty base folder, `git pull --rebase` would refuse, so we stash the
+    /// uncommitted changes first, pull, then re-apply them — restoring the base
+    /// folder to a dirty-but-pulled state. If the changes cannot be re-applied
+    /// cleanly (they conflict with what was pulled), the stash is left in place
+    /// and we report so the user can recover them by hand. Aborts on a pull
+    /// conflict, leaving the base folder exactly as it was. The base branch must
+    /// be the one checked out in the root.
     fn cmd_pull_base(&mut self, services: &Services) -> Result<Effect> {
         let base = self.base_branch.clone();
         let root = self.repo_root.clone();
@@ -1469,21 +1472,48 @@ impl AppState {
             )));
         }
 
-        // `git pull --rebase` refuses on a dirty tree; FlightDeck never stashes
-        // or discards (SPECS §5), so surface a clear refusal instead.
-        if services.git.is_dirty(&root)? {
-            return Ok(Effect::Refused(format!(
-                "Base folder has uncommitted changes; commit or stash before pulling {base}."
-            )));
-        }
+        // A dirty base folder makes `git pull --rebase` refuse. Rather than
+        // refuse ourselves, stash the (tracked) uncommitted changes so the pull
+        // can run, then restore them afterwards. `stash_push` reports whether an
+        // entry was actually created — an untracked-only dirty tree has nothing
+        // to stash and does not block the rebase, so `stashed` stays false and
+        // no re-apply is attempted.
+        let stashed = if services.git.is_dirty(&root)? {
+            services.git.stash_push(&root)?
+        } else {
+            false
+        };
 
         let outcome = services.git.pull_base(&root)?;
+
+        // Restore the stashed changes regardless of whether the pull rebased or
+        // was aborted on conflict (in either case the tree is back on `base`).
+        let restored = if stashed {
+            if services.git.stash_apply(&root)? {
+                services.git.stash_drop(&root)?;
+                true
+            } else {
+                // Changes conflict with what was pulled: leave the entry so the
+                // user can recover it, and report — even if the pull succeeded.
+                return Ok(Effect::Refused(format!(
+                    "Pulled {base}, but your uncommitted changes could not be re-applied on top (they conflict with what was pulled). They are safe in the stash (stash@{{0}}) — recover them with `git stash apply` once the conflict is resolved, then `git stash drop`."
+                )));
+            }
+        } else {
+            false
+        };
+
         if outcome.conflicted || !outcome.rebased {
             return Ok(Effect::Refused(outcome.message));
         }
 
+        let restore_note = if restored {
+            " Restored your stashed changes."
+        } else {
+            ""
+        };
         Ok(Effect::Message(format!(
-            "Pulled {base} (git pull --rebase)."
+            "Pulled {base} (git pull --rebase).{restore_note}"
         )))
     }
 
@@ -3740,13 +3770,18 @@ mod tests {
         }
         // The pull ran in the base folder (the repo root), never a worktree.
         assert_eq!(git.pull_bases(), vec![PathBuf::from(REPO)]);
+        // A clean base folder needs no stashing.
+        assert!(git.stash_pushes().is_empty());
+        assert!(git.stash_applies().is_empty());
     }
 
     #[test]
-    fn pull_base_refused_when_base_folder_dirty() {
+    fn pull_base_stashes_and_restores_when_dirty() {
         let config = Config::default();
         let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        // Dirty base with tracked changes: stash_push creates an entry.
         git.set_dirty_at(Path::new(REPO), true);
+        git.set_stash_created(true);
         let fs = FakeFs::new();
         let pty = FakePty::new();
         let clock = FakeClock::default();
@@ -3754,9 +3789,103 @@ mod tests {
 
         let mut app = fresh_state(config);
         let effect = app.dispatch(Command::PullBase, &svc).unwrap();
-        assert!(matches!(effect, Effect::Refused(_)));
-        // A dirty base folder must not be pulled over.
-        assert!(git.pull_bases().is_empty());
+        match effect {
+            Effect::Message(m) => {
+                assert!(m.contains("Pulled main"), "got: {m}");
+                assert!(m.contains("Restored"), "got: {m}");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+        // Stashed → pulled → re-applied → dropped, all in the base folder.
+        let repo = PathBuf::from(REPO);
+        assert_eq!(git.stash_pushes(), vec![repo.clone()]);
+        assert_eq!(git.pull_bases(), vec![repo.clone()]);
+        assert_eq!(git.stash_applies(), vec![repo.clone()]);
+        assert_eq!(git.stash_drops(), vec![repo]);
+    }
+
+    #[test]
+    fn pull_base_dirty_untracked_only_pulls_without_reapply() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        // Dirty, but nothing tracked to stash (untracked-only): no entry made.
+        git.set_dirty_at(Path::new(REPO), true);
+        git.set_stash_created(false);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        match effect {
+            Effect::Message(m) => {
+                assert!(m.contains("Pulled main"), "got: {m}");
+                assert!(!m.contains("Restored"), "nothing was stashed: {m}");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+        // We tried to stash but nothing was created, so no re-apply/drop.
+        assert_eq!(git.stash_pushes(), vec![PathBuf::from(REPO)]);
+        assert_eq!(git.pull_bases(), vec![PathBuf::from(REPO)]);
+        assert!(git.stash_applies().is_empty());
+        assert!(git.stash_drops().is_empty());
+    }
+
+    #[test]
+    fn pull_base_reports_and_keeps_stash_when_reapply_conflicts() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        git.set_dirty_at(Path::new(REPO), true);
+        git.set_stash_created(true);
+        // The stashed changes conflict with what was pulled.
+        git.set_stash_apply_ok(false);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        match effect {
+            Effect::Refused(m) => {
+                assert!(m.contains("stash"), "should cite the stash: {m}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // We pulled and tried to re-apply, but must NOT drop the entry — the
+        // user's changes have to stay recoverable.
+        assert_eq!(git.pull_bases(), vec![PathBuf::from(REPO)]);
+        assert_eq!(git.stash_applies(), vec![PathBuf::from(REPO)]);
+        assert!(git.stash_drops().is_empty());
+    }
+
+    #[test]
+    fn pull_base_restores_stash_even_when_pull_conflicts() {
+        let config = Config::default();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        git.set_dirty_at(Path::new(REPO), true);
+        git.set_stash_created(true);
+        git.set_pull_base_outcome(crate::contracts::RebaseOutcome {
+            rebased: false,
+            conflicted: true,
+            message: "CONFLICT in file.rs".to_string(),
+        });
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app.dispatch(Command::PullBase, &svc).unwrap();
+        // The pull conflict is surfaced...
+        match effect {
+            Effect::Refused(m) => assert!(m.contains("CONFLICT"), "got: {m}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // ...but the stash was still restored so no work is stranded.
+        assert_eq!(git.stash_applies(), vec![PathBuf::from(REPO)]);
+        assert_eq!(git.stash_drops(), vec![PathBuf::from(REPO)]);
     }
 
     #[test]

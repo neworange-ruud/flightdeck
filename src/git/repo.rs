@@ -287,20 +287,113 @@ impl GitExecutor for GitCli {
         }
         let combined = format!("{}\n{}", stdout_trimmed(&out), stderr_trimmed(&out));
         let conflicted = combined.to_lowercase().contains("conflict");
-        // See rebase_onto: verify the abort itself succeeded before reporting
-        // an "unchanged" outcome.
-        let abort_out = self.run_in(cwd, &["rebase", "--abort"])?;
-        if !abort_out.status.success() {
-            return Err(FlightDeckError::Git(format!(
-                "pull --rebase failed and the abort also failed ({}); the base folder may be left mid-rebase and needs manual `git rebase --abort`",
-                stderr_trimmed(&abort_out)
-            )));
+        // A `git pull --rebase` can fail *before* any rebase starts (e.g. no
+        // configured upstream, or a network failure during fetch), in which case
+        // there is nothing to abort. Only abort — and only treat an abort
+        // failure as fatal — when a rebase is actually in progress; otherwise
+        // return the honest pull error so the caller can refuse cleanly rather
+        // than raising the scary "abort also failed" hard error.
+        if self.rebase_in_progress(cwd) {
+            // See rebase_onto: verify the abort itself succeeded before
+            // reporting an "unchanged" outcome.
+            let abort_out = self.run_in(cwd, &["rebase", "--abort"])?;
+            if !abort_out.status.success() {
+                return Err(FlightDeckError::Git(format!(
+                    "pull --rebase failed and the abort also failed ({}); the base folder may be left mid-rebase and needs manual `git rebase --abort`",
+                    stderr_trimmed(&abort_out)
+                )));
+            }
         }
         Ok(RebaseOutcome {
             rebased: false,
             conflicted,
             message: combined.trim().to_string(),
         })
+    }
+
+    fn stash_push(&self, cwd: &Path) -> Result<bool> {
+        // Stash tracked, uncommitted changes so Pull base (§5.2) can rebase on a
+        // clean tree. We compare `refs/stash` before and after so we can tell
+        // whether an entry was actually created: `git stash push` exits 0 and
+        // prints "No local changes to save" when there is nothing tracked to
+        // stash (e.g. the tree is dirty only with untracked files, which do not
+        // block a rebase), and we must not later try to re-apply a stash that
+        // was never made. This never touches commit history.
+        let before = self.stash_ref(cwd);
+        let out = self.run_in(
+            cwd,
+            &["stash", "push", "--message", "flightdeck: pull base"],
+        )?;
+        require_success(&out, "stash push")?;
+        let after = self.stash_ref(cwd);
+        Ok(before != after)
+    }
+
+    fn stash_apply(&self, cwd: &Path) -> Result<bool> {
+        // Re-apply the entry [`stash_push`] created, keeping it in the stash
+        // list. A non-zero exit means the changes conflicted with the freshly
+        // pulled base; we report that (and leave the entry) rather than erroring,
+        // so the caller can tell the user their changes are recoverable.
+        let out = self.run_in(cwd, &["stash", "apply"])?;
+        Ok(out.status.success())
+    }
+
+    fn stash_drop(&self, cwd: &Path) -> Result<()> {
+        let out = self.run_in(cwd, &["stash", "drop"])?;
+        require_success(&out, "stash drop")
+    }
+}
+
+impl GitCli {
+    /// Whether a rebase is actually in progress in `cwd`, determined from git's
+    /// own state directories (`rebase-merge` / `rebase-apply`) rather than by
+    /// parsing command output — the latter is unreliable, e.g. a `pull --rebase`
+    /// that fails on a missing upstream still prints the word "rebase" in its
+    /// hint text without ever starting one. Git creates these directories only
+    /// while a rebase (including `pull --rebase`) is mid-flight, so their
+    /// presence is the authoritative signal that an abort is needed.
+    fn rebase_in_progress(&self, cwd: &Path) -> bool {
+        for name in ["rebase-merge", "rebase-apply"] {
+            let Ok(out) = self.run_in(cwd, &["rev-parse", "--git-path", name]) else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let raw = stdout_trimmed(&out);
+            if raw.is_empty() {
+                continue;
+            }
+            // `--git-path` yields a path relative to `cwd` (git was invoked with
+            // `-C cwd`); resolve it against `cwd` unless already absolute.
+            let path = if Path::new(&raw).is_absolute() {
+                PathBuf::from(&raw)
+            } else {
+                cwd.join(&raw)
+            };
+            if path.exists() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The commit SHA of the top stash entry (`refs/stash`), or `None` when the
+    /// stash is empty. Used by [`GitExecutor::stash_push`] to detect whether a
+    /// new entry was created.
+    fn stash_ref(&self, cwd: &Path) -> Option<String> {
+        let out = self
+            .run_in(cwd, &["rev-parse", "--verify", "--quiet", "refs/stash"])
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let sha = stdout_trimmed(&out);
+        if sha.is_empty() {
+            None
+        } else {
+            Some(sha)
+        }
     }
 }
 
