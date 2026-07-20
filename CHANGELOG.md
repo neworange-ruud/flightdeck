@@ -8,6 +8,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **FlightDeck Remote: pair one phone with multiple Macs.** The iOS app now
+  pairs with several FlightDeck desktops at once (up to four) instead of exactly
+  one. A new unified feed interleaves activity from every paired machine into a
+  single list ordered by recency, each row tagged with a machine chip; offline
+  machines still appear from their last-known snapshot, dimmed with an "offline"
+  badge and tap-to-retry. Each machine keeps its own live connection (its own
+  relay URL) while the app is foreground and hands off to push when backgrounded.
+  Add a machine at any time from the feed or Settings; opening a session, chat,
+  or shell from a feed row drives that specific machine with no cross-talk.
+  Each Mac reports its own name (auto-updating when you rename the Mac, with an
+  optional per-machine override), push is per-machine with individual mute, and
+  you can unpair one machine — which revokes it on the relay so the desktop
+  learns — without disturbing the others or re-pairing the rest. Existing
+  single-machine pairings migrate automatically on upgrade; no re-pair needed.
+  Protocol additions are backward compatible: the desktop carries its machine
+  name on every connect, and the relay gained membership-verified,
+  idempotent revoke and push-token unregister paths.
+
 - **Run an agent directly on the base branch, in the project root.** The New
   Agent flow now offers a "run from base branch" option that starts the agent —
   and any child shells you open in that tab — in the repository root on the base
