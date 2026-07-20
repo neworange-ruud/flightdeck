@@ -59,6 +59,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   with a radio list of agents (↑/↓ to choose), a branch-name field, and a
   "run from base branch" toggle (Tab) that disables the branch field when on.
 
+- **Docs: FlightDeck Remote documentation covers multi-pairing.** The Remote
+  docs now describe pairing with multiple Macs (add/rename/mute/unpair a
+  machine), and the Activity page became **The Feed & Notifications** to match
+  the unified Feed. Stale mobile screenshots were regenerated.
+
 ### Bug fixes
 
 - None yet.
