@@ -664,6 +664,19 @@ pub struct RebaseOutcome {
     pub message: String,
 }
 
+/// Outcome of running one hook command through the shell (SPECS §7 hooks).
+/// Combined stdout+stderr is captured (never inherited) so hook output can never
+/// corrupt the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutcome {
+    /// True if the command exited zero.
+    pub success: bool,
+    /// The exit code, if the process exited normally (None if killed by signal).
+    pub code: Option<i32>,
+    /// Combined stdout + stderr, captured (may be empty).
+    pub output: String,
+}
+
 /// Terminal dimensions for a PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {

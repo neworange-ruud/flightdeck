@@ -17,10 +17,10 @@ use crate::agents::status::{combine_status, DisplayStatus};
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
-    AgentDef, Clock, Config, ContainerRuntime, ContainerState, ContainersConfig, FileSystem,
-    FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification, NotificationSound,
-    NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize, Result, TabId, TabState,
-    STATE_VERSION,
+    AgentDef, Clock, CommandRunner, Config, ContainerRuntime, ContainerState, ContainersConfig,
+    FileSystem, FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
+    NotificationSound, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize,
+    Result, TabId, TabState, STATE_VERSION,
 };
 use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
@@ -55,6 +55,8 @@ pub struct Services<'a> {
     pub clock: &'a dyn Clock,
     /// Container runtime control plane (SPECS §31).
     pub container: &'a dyn ContainerRuntime,
+    /// Runs repository lifecycle hook commands (SPECS §7 hooks).
+    pub command: &'a dyn CommandRunner,
 }
 
 /// Lifecycle phase of an Agent Tab (SPECS §16/§17).
@@ -92,24 +94,46 @@ pub struct WorktreeJob {
     pub needs_create: bool,
     /// Whether to create the branch before adding the worktree.
     pub create_branch: bool,
+    /// `[worktree_created]` hook commands to run in the new worktree once it is
+    /// materialized (SPECS §7 hooks). Empty when the repo defines no hook or the
+    /// worktree is being reused. Owned so the job stays `Send`.
+    pub created_hooks: Vec<String>,
 }
 
 /// Run the slow part of new-tab creation off the UI thread: materialize the
-/// worktree described by `job`. A no-op when the worktree is being reused.
+/// worktree described by `job`, then run its `[worktree_created]` hook commands
+/// in the new worktree. A no-op when the worktree is being reused.
 ///
 /// Free function (no `&self`) so a background worker can call it with a cloned
-/// [`GitExecutor`] without borrowing [`AppState`].
-pub fn materialize_worktree(git: &dyn GitExecutor, job: &WorktreeJob) -> Result<()> {
-    if job.needs_create {
-        create_worktree(
-            git,
-            &job.branch,
-            &job.base_branch,
-            &job.worktree_abs,
-            job.create_branch,
-        )?;
+/// [`GitExecutor`]/[`CommandRunner`] without borrowing [`AppState`].
+///
+/// Returns a [`crate::hooks::HookReport`] describing the hook run (`None` when no
+/// worktree was created or the repo defines no hook). Hook failures are
+/// **best-effort**: they are reported, never propagated — the worktree already
+/// exists, and failing here would remove the tab and strand it.
+pub fn materialize_worktree(
+    git: &dyn GitExecutor,
+    runner: &dyn CommandRunner,
+    job: &WorktreeJob,
+) -> Result<Option<crate::hooks::HookReport>> {
+    if !job.needs_create {
+        return Ok(None);
     }
-    Ok(())
+    create_worktree(
+        git,
+        &job.branch,
+        &job.base_branch,
+        &job.worktree_abs,
+        job.create_branch,
+    )?;
+    if job.created_hooks.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::hooks::run_commands(
+        runner,
+        &job.created_hooks,
+        &job.worktree_abs,
+    )))
 }
 
 /// How to launch (or reattach) a tab's primary terminal (SPECS §31).
@@ -843,15 +867,22 @@ impl AppState {
         services: &Services,
     ) -> Result<Effect> {
         let job = self.begin_new_agent_tab(name, agent_key, services)?;
-        let outcome = match materialize_worktree(services.git, &job) {
-            Ok(()) => self.finalize_new_tab(&job.tab_id, services),
-            Err(e) => Err(e),
-        };
+        let (outcome, hook_report) =
+            match materialize_worktree(services.git, services.command, &job) {
+                Ok(report) => (self.finalize_new_tab(&job.tab_id, services), report),
+                Err(e) => (Err(e), None),
+            };
         // Either step failing must leave no dead placeholder (the TabPhase
         // contract: creation failures remove the tab entirely). A spawn failure
         // in `finalize` (e.g. a missing container image) is no exception.
         if outcome.is_err() {
             self.fail_new_tab(&job.tab_id);
+            return outcome;
+        }
+        // The tab is created and the agent is running; a failing `worktree_created`
+        // hook is surfaced as a warning but never rolls back the tab (best-effort).
+        if let Some(warning) = hook_report.and_then(|r| r.warning_message("worktree_created")) {
+            return Ok(Effect::Warning(warning));
         }
         outcome
     }
@@ -959,6 +990,16 @@ impl AppState {
             .unwrap_or_else(|_| worktree_abs.clone())
             .to_string_lossy()
             .to_string();
+        // Load the repo's `[worktree_created]` hook commands to run once the new
+        // worktree is materialized. Only a freshly-created worktree runs them; a
+        // reused one is already set up (SPECS §7 hooks). Best-effort: loading a
+        // missing/invalid hooks file yields no commands and never fails creation.
+        let created_hooks = if needs_create {
+            crate::hooks::load_hooks(services.fs, &self.repo_root).worktree_created
+        } else {
+            Vec::new()
+        };
+
         let created_at = services.clock.now_iso8601();
         let id = format!("{slug}-{created_at}");
         let meta = TabState {
@@ -1001,6 +1042,7 @@ impl AppState {
             worktree_abs,
             needs_create,
             create_branch,
+            created_hooks,
         })
     }
 
@@ -1086,6 +1128,8 @@ impl AppState {
             // Nothing to materialize — the root worktree already exists.
             needs_create: false,
             create_branch: false,
+            // A base-branch tab creates no worktree, so no `worktree_created` hook.
+            created_hooks: Vec::new(),
         })
     }
 
@@ -1444,9 +1488,26 @@ impl AppState {
             self.tabs[idx].meta.base_commit_sha = sha;
         }
         self.persist(services)?;
-        Ok(Effect::Message(format!(
+
+        // Run the repo's `[worktree_update]` hook in the just-rebased worktree
+        // (SPECS §7 hooks) — the base branch changed under it, so e.g. deps may
+        // need reinstalling. Best-effort: a failing hook is surfaced as a warning
+        // but never undoes the rebase.
+        let update_hooks = crate::hooks::load_hooks(services.fs, &self.repo_root).worktree_update;
+        let hook_warning = if update_hooks.is_empty() {
+            None
+        } else {
+            crate::hooks::run_commands(services.command, &update_hooks, &agent_worktree)
+                .warning_message("worktree_update")
+        };
+
+        let base_msg = format!(
             "Rebased {agent_branch} onto {base_branch}. If the branch was pushed, force-push to update the remote / PR."
-        )))
+        );
+        match hook_warning {
+            Some(w) => Ok(Effect::Warning(format!("{base_msg} {w}"))),
+            None => Ok(Effect::Message(base_msg)),
+        }
     }
 
     /// Pull base (SPECS §5.2). Runs `git pull --rebase` in the base folder (the
@@ -2233,7 +2294,9 @@ mod tests {
     use super::*;
     use crate::contracts::{AgentDef, ContainerState, StatusPatterns, UiConfig, WorktreesConfig};
     use crate::persistence::project_state::default_state;
-    use crate::testing::{FakeClock, FakeContainerRuntime, FakeFs, FakeGit, FakePty};
+    use crate::testing::{
+        FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeGit, FakePty,
+    };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -2304,12 +2367,17 @@ mod tests {
         // configured `FakeContainerRuntime`.
         let container: &'static FakeContainerRuntime =
             Box::leak(Box::new(FakeContainerRuntime::new()));
+        // Likewise, most tests don't configure hook commands; leak a default fake
+        // runner (succeeds for everything). Hook-specific tests build `Services`
+        // explicitly with a configured `FakeCommandRunner`.
+        let command: &'static FakeCommandRunner = Box::leak(Box::new(FakeCommandRunner::new()));
         Services {
             git,
             fs,
             pty,
             clock,
             container,
+            command,
         }
     }
 
@@ -2499,7 +2567,7 @@ mod tests {
         assert!(fs.file_contents(Path::new(STATE)).is_none());
 
         // The worker runs the slow step, then finalize spawns + flips to Ready.
-        materialize_worktree(&git, &job).unwrap();
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
         let effect = app
             .finalize_new_tab(&job.tab_id, &services(&git, &fs, &pty, &clock))
             .unwrap();
@@ -2514,6 +2582,175 @@ mod tests {
             .file_contents(Path::new(STATE))
             .expect("state.json written")
             .contains("flightdeck/fix-login-bug"));
+    }
+
+    // --- §7 hooks: worktree_created / worktree_update ---------------------
+
+    #[test]
+    fn worktree_created_hook_runs_in_the_new_worktree() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        // A repo hook that installs deps in every new worktree.
+        let fs = FakeFs::new().with_file(
+            "/repo/.flightdeck/hooks.toml",
+            "[worktree_created]\ncommands = [\"npm install\"]\n",
+        );
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab("Fix Login Bug", None, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        // The hook commands are captured onto the job for the worker to run.
+        assert_eq!(job.created_hooks, vec!["npm install".to_string()]);
+
+        // The worker runs the hook in the freshly-created worktree.
+        let runner = FakeCommandRunner::new();
+        let report = materialize_worktree(&git, &runner, &job).unwrap();
+        assert!(report.expect("hook ran").failure.is_none());
+        assert_eq!(
+            runner.invocations(),
+            vec![(
+                "npm install".to_string(),
+                job.worktree_abs.to_string_lossy().to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn created_hook_does_not_run_when_worktree_is_reused() {
+        // A reused (existing) worktree is already set up, so its `needs_create`
+        // is false and no `worktree_created` hook fires.
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let runner = FakeCommandRunner::new();
+        let job = WorktreeJob {
+            tab_id: "t".to_string(),
+            branch: "flightdeck/x".to_string(),
+            base_branch: "main".to_string(),
+            worktree_abs: PathBuf::from("/repo/.flightdeck/worktrees/x"),
+            needs_create: false,
+            create_branch: false,
+            created_hooks: vec!["npm install".to_string()],
+        };
+        let report = materialize_worktree(&git, &runner, &job).unwrap();
+        assert!(report.is_none());
+        assert!(runner.invocations().is_empty());
+        assert!(git.added_worktrees().is_empty());
+    }
+
+    #[test]
+    fn created_hook_failure_surfaces_warning_but_keeps_the_tab() {
+        use crate::contracts::CommandOutcome;
+
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new().with_file(
+            "/repo/.flightdeck/hooks.toml",
+            "[worktree_created]\ncommands = [\"boom\"]\n",
+        );
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new();
+        let command = FakeCommandRunner::new();
+        command.set_result(
+            "boom",
+            CommandOutcome {
+                success: false,
+                code: Some(1),
+                output: "nope".to_string(),
+            },
+        );
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let mut app = fresh_state(config);
+        // The synchronous create path runs the hook and surfaces its failure.
+        let effect = app
+            .dispatch(
+                Command::NewAgentTab {
+                    name: "Fix".to_string(),
+                    agent_key: None,
+                },
+                &svc,
+            )
+            .unwrap();
+        match effect {
+            Effect::Warning(w) => assert!(w.contains("worktree_created"), "got: {w}"),
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        // A failing hook never rolls back the created, running tab.
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].phase, TabPhase::Ready);
+    }
+
+    #[test]
+    fn worktree_update_hook_runs_after_rebase() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new().with_file(
+            "/repo/.flightdeck/hooks.toml",
+            "[worktree_update]\ncommands = [\"npm install\"]\n",
+        );
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new();
+        let command = FakeCommandRunner::new();
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+        // No `worktree_created` command, so creating the tab ran nothing.
+        assert!(command.invocations().is_empty());
+        git.set_current_branch(app.tabs[0].meta.branch.clone());
+
+        let effect = app
+            .dispatch(Command::RebaseWorktree { confirm: true }, &svc)
+            .unwrap();
+        // A clean rebase + passing hook keeps the plain success message.
+        assert!(matches!(effect, Effect::Message(_)));
+
+        // The update hook ran once, in the rebased worktree.
+        let wt = to_absolute(
+            Path::new(REPO),
+            Path::new(&app.tabs[0].meta.worktree_path_relative),
+        );
+        assert_eq!(
+            command.invocations(),
+            vec![("npm install".to_string(), wt.to_string_lossy().to_string())]
+        );
     }
 
     #[test]
@@ -2546,7 +2783,7 @@ mod tests {
         assert_eq!(job.worktree_abs, PathBuf::from(REPO));
 
         // Materialize is a no-op — no `git worktree add` ever runs.
-        materialize_worktree(&git, &job).unwrap();
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
         assert!(git.added_worktrees().is_empty());
         assert!(git.created_branches().is_empty());
 
@@ -2602,7 +2839,7 @@ mod tests {
         let job = app
             .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
             .unwrap();
-        materialize_worktree(&git, &job).unwrap();
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
         app.finalize_new_tab(&job.tab_id, &services(&git, &fs, &pty, &clock))
             .unwrap();
 
@@ -4700,12 +4937,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = FakeContainerRuntime::new().with_image(image.clone());
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         app.dispatch(new_tab_cmd(), &svc).unwrap();
@@ -4742,12 +4981,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = FakeContainerRuntime::new(); // no image registered
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         let err = app.dispatch(new_tab_cmd(), &svc).unwrap_err();
@@ -4766,12 +5007,14 @@ mod tests {
         let clock = FakeClock::default();
         let container = FakeContainerRuntime::new();
         container.set_unavailable("podman machine not running");
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         // Validation fails before any git mutation (no worktree added).
@@ -4789,12 +5032,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = FakeContainerRuntime::new().with_image(image);
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
         app.dispatch(new_tab_cmd(), &svc).unwrap();
         let name = container_name(&app.tabs[0].meta.id);
@@ -4870,12 +5115,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = FakeContainerRuntime::new().with_image(image);
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
         app.dispatch(new_tab_cmd(), &svc).unwrap();
         let name = container_name(&app.tabs[0].meta.id);
@@ -4914,12 +5161,14 @@ mod tests {
         let name = container_name("r");
         let container = FakeContainerRuntime::new();
         container.set_container_state(&name, ContainerState::Running);
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         let started = app.resume_agents(&svc);
@@ -4946,12 +5195,14 @@ mod tests {
         // Container is gone (default Absent) but the image exists → resume starts
         // a fresh detached container rather than leaving the tab agent-less.
         let container = FakeContainerRuntime::new().with_image(image);
+        let command = FakeCommandRunner::new();
         let svc = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         let started = app.resume_agents(&svc);

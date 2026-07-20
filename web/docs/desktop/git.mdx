@@ -94,7 +94,9 @@ its **local** base branch. It:
   the agent is running),
 - requires a clean worktree and both branches present,
 - aborts on conflict, leaving the worktree exactly as it was,
-- advances the stored base SHA on success.
+- advances the stored base SHA on success,
+- runs the repo's [`worktree_update` hook](/desktop/hooks) in the rebased
+  worktree on success, if one is configured.
 
 <Callout type="warning">
   If the branch was already pushed, a rebase means it will need a force-push

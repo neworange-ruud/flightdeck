@@ -6,11 +6,12 @@
 //! real filesystem mutation outside tempdirs, no real PTY.
 
 use crate::contracts::domain::{
-    ContainerState, MergeOutcome, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+    CommandOutcome, ContainerState, MergeOutcome, ProcessState, PtySize, RebaseOutcome,
+    WorktreeInfo,
 };
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::traits::{
-    Clock, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
+    Clock, CommandRunner, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -994,6 +995,76 @@ impl ContainerRuntime for FakeContainerRuntime {
 // ===========================================================================
 // FakeClock — fixed time
 // ===========================================================================
+
+// ===========================================================================
+// FakeCommandRunner — records hook command invocations
+// ===========================================================================
+
+/// [`CommandRunner`] that records every `(script, cwd)` it was asked to run and
+/// returns success by default. Per-script outcomes can be overridden to simulate
+/// a failing hook command.
+#[derive(Debug, Clone, Default)]
+pub struct FakeCommandRunner {
+    inner: Arc<Mutex<FakeRunnerState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeRunnerState {
+    /// Recorded invocations as `(script, cwd)`.
+    invocations: Vec<(String, String)>,
+    /// Per-script outcome overrides (default is success with empty output).
+    results: HashMap<String, CommandOutcome>,
+    /// When set, `run_shell` returns this error instead of running (simulates a
+    /// shell that could not be launched).
+    launch_error: Option<String>,
+}
+
+impl FakeCommandRunner {
+    /// Create a runner that succeeds for every command.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the outcome returned for `script`.
+    pub fn set_result(&self, script: impl Into<String>, outcome: CommandOutcome) {
+        self.inner
+            .lock()
+            .unwrap()
+            .results
+            .insert(script.into(), outcome);
+    }
+
+    /// Make `run_shell` fail to launch (returns an `Err`) for every command.
+    pub fn fail_to_launch(&self, message: impl Into<String>) {
+        self.inner.lock().unwrap().launch_error = Some(message.into());
+    }
+
+    /// The recorded `(script, cwd)` invocations, in order.
+    pub fn invocations(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().invocations.clone()
+    }
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome> {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .invocations
+            .push((script.to_string(), cwd.to_string_lossy().to_string()));
+        if let Some(msg) = &state.launch_error {
+            return Err(FlightDeckError::Io(msg.clone()));
+        }
+        Ok(state
+            .results
+            .get(script)
+            .cloned()
+            .unwrap_or(CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            }))
+    }
+}
 
 /// [`Clock`] returning a fixed timestamp and a settable millisecond counter.
 #[derive(Debug, Clone)]

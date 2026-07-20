@@ -8,6 +8,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Repository hooks that run at worktree lifecycle points.** A repo can ship a
+  `.flightdeck/hooks.toml` with commands that FlightDeck runs automatically:
+  `[worktree_created]` runs in a new worktree right after it is created for an
+  Agent Tab (e.g. `npm install`), and `[worktree_update]` runs in a worktree
+  after it is rebased onto an updated base branch. Commands run sequentially
+  through your shell and stop at the first non-zero exit; a single command may
+  span multiple lines using TOML triple-quoted strings. Hooks are best-effort —
+  a failing hook is surfaced as a warning but never rolls back the worktree. The
+  file is created (empty, commented) on first run and is `.gitignore`d by
+  default, so hooks stay opt-in per machine until you un-ignore and commit it to
+  share them with your team.
+
 - **FlightDeck Remote: pair one phone with multiple Macs.** The iOS app now
   pairs with several FlightDeck desktops at once (up to four) instead of exactly
   one. A new unified feed interleaves activity from every paired machine into a

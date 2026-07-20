@@ -81,3 +81,10 @@ The project `.flightdeck/config.toml` is meant to be committed and shared with
 your team; runtime state (`state.json`, `worktrees/`, `runtime/`) is
 `.gitignore`d automatically. Your personal preferences live in the global file,
 outside the repo.
+
+## Hooks
+
+A separate per-repo file, `.flightdeck/hooks.toml`, runs shell commands at points
+in a worktree's lifecycle (for example, `npm install` in every new worktree).
+Unlike `config.toml`, it is `.gitignore`d by default so hooks stay opt-in per
+machine. See [Hooks](/desktop/hooks) for the full reference.

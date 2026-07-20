@@ -17,6 +17,7 @@ pub struct InitOutcome {
     pub created_config: bool,
     pub created_state: bool,
     pub created_worktrees_dir: bool,
+    pub created_hooks: bool,
 }
 
 /// Ensure `.flightdeck/` and its contents exist under `repo_root` (SPECS §7).
@@ -32,6 +33,7 @@ pub fn initialize(
     let config_path = flightdeck_dir.join("config.toml");
     let state_path = flightdeck_dir.join("state.json");
     let worktrees_dir = flightdeck_dir.join("worktrees");
+    let hooks_path = flightdeck_dir.join(crate::hooks::HOOKS_FILE_NAME);
 
     // 1. Create .flightdeck/ if missing
     if !fs.exists(&flightdeck_dir) {
@@ -63,6 +65,15 @@ pub fn initialize(
     if !fs.exists(&worktrees_dir) {
         fs.create_dir_all(&worktrees_dir)?;
         outcome.created_worktrees_dir = true;
+    }
+
+    // 5. Create the default (empty, only commented) hooks.toml if missing, so it
+    //    exists in the repo for the user to opt into (SPECS §7). It is gitignored
+    //    by default (see `crate::fs::ignore`), so the user consciously un-ignores
+    //    and commits it to share hooks with their team.
+    if !fs.exists(&hooks_path) {
+        fs.write(&hooks_path, crate::hooks::DEFAULT_HOOKS_TEMPLATE)?;
+        outcome.created_hooks = true;
     }
 
     Ok(outcome)
@@ -106,6 +117,22 @@ mod tests {
         assert!(outcome.created_config);
         assert!(outcome.created_state);
         assert!(outcome.created_worktrees_dir);
+        assert!(outcome.created_hooks);
+    }
+
+    #[test]
+    fn init_creates_default_hooks_file() {
+        let fs = FakeFs::new();
+        let repo = Path::new("/repo");
+        initialize(&fs, repo, "proj", "main").unwrap();
+        let hooks_path = Path::new("/repo/.flightdeck/hooks.toml");
+        assert!(fs.exists(hooks_path));
+        let contents = fs.file_contents(hooks_path).unwrap();
+        // The shipped default documents both hooks but defines no commands.
+        assert!(contents.contains("[worktree_created]"), "hooks: {contents}");
+        assert!(contents.contains("[worktree_update]"), "hooks: {contents}");
+        let hooks = crate::hooks::parse_hooks(&contents).unwrap();
+        assert!(hooks.is_empty(), "default hooks must define no commands");
     }
 
     #[test]
@@ -188,6 +215,7 @@ mod tests {
         assert!(first.created_config);
         assert!(first.created_state);
         assert!(first.created_worktrees_dir);
+        assert!(first.created_hooks);
 
         // Capture the file contents before the second call
         let config_before = fs
@@ -203,6 +231,7 @@ mod tests {
         assert!(!second.created_config);
         assert!(!second.created_state);
         assert!(!second.created_worktrees_dir);
+        assert!(!second.created_hooks);
 
         // Files must not have been overwritten
         let config_after = fs
