@@ -1,0 +1,114 @@
+---
+label: Hooks
+section: Desktop Guide
+order: 26
+---
+
+# Hooks
+
+Hooks let a repository run shell commands automatically at points in a worktree's
+lifecycle — for example, installing dependencies as soon as a new worktree is
+created, so an agent starts in a ready-to-build tree.
+
+Hooks live in a per-repo `.flightdeck/hooks.toml`. FlightDeck creates this file
+(empty, only commented) the first time it opens a project, and gitignores it by
+default — so hooks only affect the machine that opts in until you deliberately
+share them (see [Sharing hooks](#sharing-hooks-with-your-team)).
+
+## The file
+
+```toml
+# <repo>/.flightdeck/hooks.toml
+
+# Runs in a new worktree right after it is created for an Agent Tab.
+[worktree_created]
+commands = [
+  "npm install",
+]
+
+# Runs in an Agent Tab's worktree after it is rebased onto an updated base branch.
+[worktree_update]
+commands = [
+  "npm install",
+]
+```
+
+## Available hooks
+
+<table>
+  <thead>
+    <tr><th>Hook</th><th>When it runs</th><th>Working directory</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>worktree_created</code></td>
+      <td>Right after a new worktree is created for an Agent Tab. It does not run
+      when an existing worktree is reused, or for a tab that runs directly on the
+      base branch (which creates no worktree).</td>
+      <td>The new worktree.</td>
+    </tr>
+    <tr>
+      <td><code>worktree_update</code></td>
+      <td>After an Agent Tab's worktree is rebased onto an updated base branch
+      (the <strong>Rebase</strong> action). Useful when the base moving under the
+      worktree means dependencies or generated files need refreshing.</td>
+      <td>The rebased worktree.</td>
+    </tr>
+  </tbody>
+</table>
+
+More hooks may be added over time. A `hooks.toml` written by a newer FlightDeck
+still loads on an older one — unknown hooks are simply ignored.
+
+## How commands run
+
+Each hook has a `commands` array. Commands run **sequentially**, in the hook's
+working directory, through your shell (`sh -c` on macOS/Linux, `cmd /C` on
+Windows). If a command exits non-zero, the remaining commands for that hook are
+**skipped** — a hook behaves like a `set -e` script.
+
+### Multi-line commands
+
+A single command may span multiple lines using TOML's triple-quoted strings. The
+whole block runs as one shell script, so it shares one working directory and
+environment:
+
+```toml
+[worktree_created]
+commands = [
+  "cp .env.example .env",
+  """
+  npm install
+  npm run build
+  """,
+]
+```
+
+Here the first array entry runs as its own script, then the triple-quoted entry
+runs as a second script containing both `npm` lines.
+
+## Best-effort, never destructive
+
+Hooks are **best-effort**. A failing hook is surfaced as a warning but never rolls
+back the worktree it ran in — the worktree already exists, and FlightDeck never
+throws away your work. If a `worktree_created` command fails, the Agent Tab is
+still created and its agent still starts; you'll see a toast naming the command
+that failed.
+
+Hook output is captured (not streamed to the terminal), so a noisy command can
+never corrupt the FlightDeck UI. Hooks are meant for non-interactive setup — for
+an interactive process, open a shell in the tab instead.
+
+## Sharing hooks with your team
+
+`.flightdeck/hooks.toml` is added to your `.gitignore` by default, alongside the
+other `.flightdeck/` runtime entries. This keeps hooks opt-in per machine: a hook
+runs arbitrary commands, so committing one to a shared repo should be a
+deliberate choice.
+
+To share your hooks with the team:
+
+1. Remove the `.flightdeck/hooks.toml` line from your `.gitignore`.
+2. Commit `.flightdeck/hooks.toml`.
+
+Everyone who pulls the repo then gets the same hooks.

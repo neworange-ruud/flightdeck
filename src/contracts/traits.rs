@@ -8,7 +8,8 @@
 //! the guarded rebase carve-out (`rebase_onto`/`pull_base`) documented below.
 
 use crate::contracts::domain::{
-    ContainerState, MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+    CommandOutcome, ContainerState, MergeOutcome, Notification, ProcessState, PtySize,
+    RebaseOutcome, WorktreeInfo,
 };
 use crate::contracts::error::Result;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,22 @@ pub trait PtySession: Send {
     fn process_state(&self) -> ProcessState;
     /// Force-terminate the whole process tree (SPECS §25 force path).
     fn terminate_tree(&mut self) -> Result<()>;
+}
+
+/// Runs non-interactive shell commands for repository lifecycle hooks (SPECS §7
+/// hooks). A seam like [`GitExecutor`]: the real impl shells out through the
+/// platform shell, tests record the invocations.
+///
+/// This is only for the fire-and-collect hook commands in `.flightdeck/hooks.toml`
+/// (worktree setup / update). Interactive agent and shell processes go through
+/// [`PtyBackend`], never here — a hook must capture its output so it can never
+/// write to the terminal FlightDeck is drawing on.
+pub trait CommandRunner {
+    /// Run `script` through the platform shell (`sh -c` on Unix, `cmd /C` on
+    /// Windows) with `cwd` as the working directory, capturing combined
+    /// stdout+stderr. Returns a [`CommandOutcome`]; an `Err` means the shell
+    /// itself could not be launched, not that the script exited non-zero.
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome>;
 }
 
 /// Posts OS notifications when an agent finishes a running task (SPECS §24).

@@ -4,11 +4,13 @@
 //! The non-trivial real implementations live with their owning modules:
 //! `GitExecutor` → [`crate::git`], `PtyBackend` → [`crate::terminal`].
 
+use crate::contracts::domain::CommandOutcome;
 use crate::contracts::error::{FlightDeckError, Result};
-use crate::contracts::traits::{Clock, FileSystem};
+use crate::contracts::traits::{Clock, CommandRunner, FileSystem};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `std::fs`-backed [`FileSystem`].
@@ -140,6 +142,53 @@ fn atomic_temp_path(p: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "tmp".to_string());
     p.with_file_name(format!(".{name}.fdtmp"))
+}
+
+/// Shells out through the platform shell to run repository hook commands
+/// (SPECS §7 hooks). A stateless unit struct so it is trivially `Clone`/`Copy`
+/// and can be constructed wherever a worktree job needs one (including the
+/// background worktree worker).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome> {
+        // Unix: `sh -c <script>`; Windows: `cmd /C <script>`. The whole script is
+        // passed as a single argument so a multi-line (triple-quoted TOML) command
+        // runs as one shell script.
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(script);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        };
+
+        let output = cmd
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| FlightDeckError::Io(format!("failed to run hook command: {e}")))?;
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+
+        Ok(CommandOutcome {
+            success: output.status.success(),
+            code: output.status.code(),
+            output: combined,
+        })
+    }
 }
 
 /// System-clock-backed [`Clock`] producing UTC ISO-8601 timestamps.

@@ -29,6 +29,8 @@ FlightDeck then:
 - validates the agent's command exists on your `PATH`,
 - creates (or attaches to) the `flightdeck/<slug>` branch,
 - creates (or reuses) a worktree at `.flightdeck/worktrees/<slug>`,
+- runs the repo's [`worktree_created` hook](/desktop/hooks) in a freshly-created
+  worktree (e.g. `npm install`), if one is configured,
 - launches the agent in the worktree and focuses its terminal.
 
 <Callout type="note">

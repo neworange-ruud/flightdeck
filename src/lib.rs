@@ -14,6 +14,7 @@ pub mod app;
 pub mod config;
 pub mod fs;
 pub mod git;
+pub mod hooks;
 pub mod notify;
 pub mod persistence;
 pub mod remote;
@@ -61,10 +62,10 @@ use crate::config::init::{ensure_global_config, initialize};
 use crate::config::load::{global_config_path, load_config, load_layered_config};
 use crate::config::schema::default_config;
 use crate::contracts::error::{FlightDeckError, Result};
-use crate::contracts::real::{RealClock, RealFs};
+use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
-    Clock, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus, Notifier, ProcessState,
-    PtyBackend, PtySize,
+    Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus,
+    Notifier, ProcessState, PtyBackend, PtySize,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -158,11 +159,13 @@ pub fn run() -> Result<()> {
     let pty = PortablePtyBackend;
     let clock = RealClock;
     let container = crate::runtime::PodmanCli;
+    let command = SystemCommandRunner;
     let env = Env {
         fs: &fs,
         pty: &pty,
         clock: &clock,
         container: &container,
+        command: &command,
     };
 
     // The launch project (the cwd's repository) must be a git repo — fail fast
@@ -1024,6 +1027,7 @@ struct Env<'a> {
     pty: &'a dyn PtyBackend,
     clock: &'a dyn Clock,
     container: &'a dyn ContainerRuntime,
+    command: &'a dyn CommandRunner,
 }
 
 impl<'a> Env<'a> {
@@ -1035,6 +1039,7 @@ impl<'a> Env<'a> {
             pty: self.pty,
             clock: self.clock,
             container: self.container,
+            command: self.command,
         }
     }
 }
@@ -2394,6 +2399,9 @@ fn deliver_first_tasks(
 struct CreateOutcome {
     tab_id: String,
     result: Result<()>,
+    /// A best-effort warning from the `[worktree_created]` hook run (SPECS §7),
+    /// surfaced after the tab is finalized. `None` when no hook ran or it passed.
+    hook_warning: Option<String>,
 }
 
 /// A message from the background git-status worker (SPECS §21).
@@ -2418,15 +2426,26 @@ fn spawn_worktree_job(
     let lock = Arc::clone(git_lock);
     let tx = create_tx.clone();
     std::thread::spawn(move || {
-        let result = {
+        // Stateless real runner for the `[worktree_created]` hook; safe to build
+        // on the worker thread (SPECS §7 hooks).
+        let command = SystemCommandRunner;
+        let outcome = {
             // Recover from a poisoned lock (a previous worker panicked) rather
             // than cascading the panic into every future creation.
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            materialize_worktree(&git, &job)
+            materialize_worktree(&git, &command, &job)
+        };
+        let (result, hook_warning) = match outcome {
+            Ok(report) => (
+                Ok(()),
+                report.and_then(|r| r.warning_message("worktree_created")),
+            ),
+            Err(e) => (Err(e), None),
         };
         let _ = tx.send(CreateOutcome {
             tab_id: job.tab_id,
             result,
+            hook_warning,
         });
     });
 }
@@ -2449,7 +2468,12 @@ fn drain_create_outcomes(
                 // active one so a background project's completion is not noisy.
                 Ok(effect) => {
                     if is_active {
-                        apply_effect(effect, state, ui)
+                        apply_effect(effect, state, ui);
+                        // A failing `[worktree_created]` hook is surfaced after the
+                        // tab is up (best-effort; the tab is kept — SPECS §7 hooks).
+                        if let Some(warning) = outcome.hook_warning {
+                            ui.message(warning);
+                        }
                     }
                 }
                 Err(e) => {
@@ -5143,12 +5167,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         // ↑ moves the radio selection to the first agent (claude).
@@ -5363,12 +5389,14 @@ mod tests {
         let handle = pty.queue_session();
         let clock = FakeClock::default();
         let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
         let mut state = AppState::new(
             config,
@@ -5414,12 +5442,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         let state = startup(&services, repo, repo).expect("startup should succeed");
@@ -5445,12 +5475,14 @@ mod tests {
         let pty = FakePty::new();
         let clock = FakeClock::default();
         let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
         let services = Services {
             git: &git,
             fs: &fs,
             pty: &pty,
             clock: &clock,
             container: &container,
+            command: &command,
         };
 
         let state = startup(&services, repo, repo).expect("startup should succeed");
@@ -5696,11 +5728,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -5750,11 +5784,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -5815,11 +5851,13 @@ mod tests {
             let fs = FakeFs::new().with_dir("/repo/worktrees/target");
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -5947,11 +5985,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -5985,11 +6025,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -6050,11 +6092,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -6094,11 +6138,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -6147,11 +6193,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -6362,11 +6410,13 @@ mod tests {
             let fs = FakeFs::new();
             let clock = FakeClock::default();
             let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -6529,11 +6579,13 @@ mod tests {
                 .with_dir("/repo1/worktrees/proj1");
             let clock = FakeClock::default();
             let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
             let env = Env {
                 fs: &fs,
                 pty: &pty,
                 clock: &clock,
                 container: &container,
+                command: &command,
             };
 
             let mut workspace = Workspace {
