@@ -53,6 +53,12 @@ struct MainTabView: View {
     @State private var feedNav = ProjectsNavModel()
     @State private var activityStore = ActivityStore.makeDefault()
     @State private var isPresentingNewAgentSheet = false
+    // Measured height of the custom tab bar, published into `tabContent`'s
+    // environment (`\.tabBarHeight`) so screens pushed inside the
+    // Projects/Feed `NavigationStack`s — which do NOT inherit the tab bar's
+    // `.safeAreaInset` — can reserve matching bottom space and keep their
+    // bottom-pinned controls above (and hittable, not under) the bar.
+    @State private var tabBarHeight: CGFloat = 0
     @State private var connectionBanner: ReconnectingBannerModel
     // Multi-pairing transport (remote-control-b8d.5): the coordinator owns one
     // live client+store per paired machine and is driven foreground→connect-all
@@ -96,6 +102,7 @@ struct MainTabView: View {
                 tabContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .environment(\.isCacheStaleOffline, isStaleBannerVisible)
+                    .environment(\.tabBarHeight, isChatRouteActive ? 0 : tabBarHeight)
                     // `.safeAreaInset` (rather than overlaying the tab bar as a
                     // ZStack sibling drawn on top) folds the bar's own height
                     // into `tabContent`'s bottom safe area. That matters for
@@ -117,6 +124,9 @@ struct MainTabView: View {
                                 onSelectTab: { router.selectedTab = $0 },
                                 onTapFAB: { isPresentingNewAgentSheet = true }
                             )
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                                tabBarHeight = height
+                            }
                         }
                     }
             }

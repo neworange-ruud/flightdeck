@@ -15,6 +15,27 @@
 
 import SwiftUI
 
+private struct TabBarHeightKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    /// The measured height of the custom bottom tab bar, published by
+    /// `MainTabView` down through `tabContent`. Screens pushed inside the
+    /// Projects/Feed `NavigationStack`s do NOT inherit the tab bar's
+    /// `.safeAreaInset` (a NavigationStack does not propagate an ancestor's
+    /// bottom safe-area inset to nav-bar-hidden pushed destinations), so a
+    /// bottom-pinned control there (e.g. `SessionsListView`'s "New agent
+    /// session" CTA) would render *underneath* the bar and become unhittable.
+    /// Those screens read this value and reserve matching bottom space so the
+    /// control sits above the bar. Environment values DO propagate into pushed
+    /// destinations, which `.safeAreaInset` does not.
+    var tabBarHeight: CGFloat {
+        get { self[TabBarHeightKey.self] }
+        set { self[TabBarHeightKey.self] = newValue }
+    }
+}
+
 struct CustomTabBar: View {
     var selectedTab: AppTab
     var unreadActivityCount: Int

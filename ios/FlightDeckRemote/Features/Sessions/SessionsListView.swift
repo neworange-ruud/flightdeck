@@ -31,6 +31,15 @@ struct SessionsListView: View {
     var isPresentingNewAgentSheet: Binding<Bool>
     var pairingId: String? = nil
 
+    // The tab bar (mounted by `MainTabView` via `.safeAreaInset`) does NOT
+    // inset this pushed, nav-bar-hidden destination — so without reserving its
+    // height here, the bottom-pinned "New agent session" CTA renders directly
+    // underneath the bar and its taps fall through to whatever tab button sits
+    // at the same point. `MainTabView` publishes the measured bar height into
+    // the environment (which, unlike `.safeAreaInset`, propagates into pushed
+    // destinations); reserving it keeps the CTA above and hittable.
+    @Environment(\.tabBarHeight) private var tabBarHeight
+
     private var project: Wire.ProjectState? {
         transportStore.snapshot?.projects.first { $0.projectId == projectId }
     }
@@ -46,6 +55,11 @@ struct SessionsListView: View {
             if project != nil {
                 newAgentCTA
             }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Reserve the tab bar's height (see `tabBarHeight` above) so the
+            // CTA is not overlapped by the bar mounted above this NavigationStack.
+            Color.clear.frame(height: tabBarHeight)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bgDeep)
