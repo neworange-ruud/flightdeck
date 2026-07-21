@@ -47,11 +47,24 @@ others.
   Secure Enclave and never leaves the phone.
 </Callout>
 
+## Availability
+
+<Callout type="warning">
+  **The default relay is not open to the public.** FlightDeck ships configured to
+  use a hosted relay (`relay.flightdeckai.app`), but that relay is currently
+  **restricted** — it does not accept connections from the general public, so
+  enabling Remote against the default URL will not connect. You are free to
+  **host your own relay** and point FlightDeck at it (set `relay_url` under
+  `[remote]` in your config, or edit it in the configuration manager), but
+  **self-hosting is not supported by the author in any way**.
+</Callout>
+
 To use it you'll:
 
 1. **Enable Remote on the desktop** — it's off by default. Set `enabled = true`
    under `[remote]` in your FlightDeck config, or run *Pair Phone* from the
-   command palette.
+   command palette. Remember the default relay is [not publicly
+   accessible](#availability) — set `relay_url` to your own relay first.
 2. **[Pair your phone](/remote/pairing)** — scan a QR code or type a 4-digit
    code. Repeat on each Mac you want to drive (up to four).
 

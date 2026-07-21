@@ -73,6 +73,15 @@ FlightDeck Remote (phone pairing). See [FlightDeck Remote](/remote).
 | `enabled` | `false` | Master switch for phone pairing |
 | `relay_url` | `wss://relay.flightdeckai.app/ws` | Relay WebSocket URL (empty disables) |
 
+<Callout type="warning">
+  The default `relay_url` (`relay.flightdeckai.app`) is **restricted and not
+  accessible to the public** — enabling Remote against it will not connect. You
+  may set `relay_url` to a relay you host yourself, but self-hosting is not
+  supported by the author. See [FlightDeck Remote → Availability](/remote#availability).
+  Both `enabled` and `relay_url` can also be edited in the in-app configuration
+  manager.
+</Callout>
+
 ## `[containers]`
 
 Run agents in Podman containers. See [Agents in Containers](/desktop/containers).
