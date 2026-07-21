@@ -12,7 +12,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **Web app ingress is now public.** The Azure Container App serving the landing
+  page and `/docs` (`ca-neworange-web-dev-neu`) no longer inherits the relay's
+  deny-by-default IP allowlist — it's a public site, so anyone can reach it. The
+  relay (`ca-neworange-flightdeck-dev-neu`) stays IP-restricted. `web/deploy/setup.sh`
+  no longer mirrors the allowlist onto the web app, and the deploy docs/workflow
+  reflect the public ingress.
 
 ### Bug fixes
 
