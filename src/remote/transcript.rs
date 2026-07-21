@@ -138,6 +138,9 @@ pub struct StructuredPrompt {
     pub options: Vec<PermissionOption>,
     /// Whether the phone may submit a free-text answer ("Type your own answer").
     pub allow_free_text: bool,
+    /// Whether the phone may select multiple options (a `multiSelect` /
+    /// checklist question). `false` for permissions and single-select questions.
+    pub multi_select: bool,
 }
 
 /// Reconstructs one session's cleaned transcript by tailing its agent session
@@ -638,6 +641,7 @@ impl TranscriptBuilder {
             command: sp.command,
             options: sp.options,
             allow_free_text: sp.allow_free_text,
+            multi_select: sp.multi_select,
             at_ms,
         });
         self.open_prompt = preview.clone();
@@ -685,6 +689,7 @@ impl TranscriptBuilder {
                 },
             ],
             allow_free_text: false,
+            multi_select: false,
             at_ms,
         });
         preview
@@ -791,10 +796,10 @@ fn truncate_preview(text: &str) -> Option<String> {
 }
 
 /// Parse a Claude `AskUserQuestion` tool_use `input` into a [`StructuredPrompt`]
-/// (v1: the primary question only, `questions[0]`). Returns `None` — so the
+/// (the primary question only, `questions[0]`). Returns `None` — so the
 /// caller falls back to a normal activity pill — when the shape is missing or
-/// oddly typed (no question text, or no options with labels). `multiSelect` is
-/// treated as single-select for v1.
+/// oddly typed (no question text, or no options with labels). The question's
+/// `multiSelect` bool becomes [`StructuredPrompt::multi_select`].
 pub(crate) fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
     let question = input
         .get("questions")
@@ -828,11 +833,16 @@ pub(crate) fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt>
     if options.is_empty() {
         return None;
     }
+    let multi_select = question
+        .get("multiSelect")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(StructuredPrompt {
         kind: PromptKind::Question,
         command,
         options,
         allow_free_text: true,
+        multi_select,
     })
 }
 

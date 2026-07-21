@@ -303,6 +303,14 @@ final class ChatViewModel {
         decide(promptId: promptId, answer: .option(index: optionIndex, label: label))
     }
 
+    /// Resolve a multi-select (checklist) Question by selecting several options
+    /// (sends `option_indices`). `labels` (paired with `indices`) are carried
+    /// for display only. No-op if nothing is selected.
+    func decidePermission(promptId: Wire.PromptId, optionIndices: [Int], labels: [String]) {
+        guard !optionIndices.isEmpty else { return }
+        decide(promptId: promptId, answer: .options(indices: optionIndices, labels: labels))
+    }
+
     /// Resolve a Question prompt with a typed "Type your own answer" reply
     /// (sends `free_text`). No-op if `text` is empty.
     func decidePermission(promptId: Wire.PromptId, freeText text: String) {
@@ -338,20 +346,27 @@ final class ChatViewModel {
     }
 
     /// Build the `permission_decision` command body for an answer: `choice`
-    /// (binary fast-path), `option_index` (Question, by position), or
-    /// `free_text` (typed answer) — exactly one is populated, matching the
-    /// wire's `skip_serializing_if` convention.
+    /// (binary fast-path), `option_index` (single-select Question), `option_indices`
+    /// (multi-select checklist), or `free_text` (typed answer) — exactly one is
+    /// populated, matching the wire's `skip_serializing_if` convention.
     private func commandBody(promptId: Wire.PromptId, answer: PermissionAnswer) -> Wire.CommandBody {
         switch answer {
         case let .choice(choice):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
-                                       choice: choice, optionIndex: nil, freeText: nil)
+                                       choice: choice, optionIndex: nil,
+                                       optionIndices: nil, freeText: nil)
         case let .option(index, _):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
-                                       choice: nil, optionIndex: index, freeText: nil)
+                                       choice: nil, optionIndex: index,
+                                       optionIndices: nil, freeText: nil)
+        case let .options(indices, _):
+            return .permissionDecision(sessionId: sessionId, promptId: promptId,
+                                       choice: nil, optionIndex: nil,
+                                       optionIndices: indices, freeText: nil)
         case let .freeText(text):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
-                                       choice: nil, optionIndex: nil, freeText: text)
+                                       choice: nil, optionIndex: nil,
+                                       optionIndices: nil, freeText: text)
         }
     }
 

@@ -129,7 +129,7 @@ struct ProtocolFixtureConformanceTests {
         }
         #expect(feed.items.count == 6)
 
-        guard case let .permissionPrompt(_, promptId1, kind1, command1, options1, allowFreeText1, _) =
+        guard case let .permissionPrompt(_, promptId1, kind1, command1, options1, allowFreeText1, multiSelect1, _) =
             feed.items[4] else {
             Issue.record("expected item[4] to be a permission_prompt"); return
         }
@@ -137,11 +137,12 @@ struct ProtocolFixtureConformanceTests {
         #expect(kind1 == .permission)
         #expect(command1 == "rm -rf dist/")
         #expect(allowFreeText1 == false)
+        #expect(multiSelect1 == false)
         #expect(options1.count == 2)
         #expect(options1[0] == Wire.PermissionOption(index: 0, choice: .allowOnce, label: "Allow once"))
         #expect(options1[1] == Wire.PermissionOption(index: 1, choice: .deny, label: "Deny"))
 
-        guard case let .permissionPrompt(_, promptId2, kind2, command2, options2, allowFreeText2, _) =
+        guard case let .permissionPrompt(_, promptId2, kind2, command2, options2, allowFreeText2, multiSelect2, _) =
             feed.items[5] else {
             Issue.record("expected item[5] to be a permission_prompt"); return
         }
@@ -149,6 +150,7 @@ struct ProtocolFixtureConformanceTests {
         #expect(kind2 == .question)
         #expect(command2 == "Which database should the login service use?")
         #expect(allowFreeText2 == true)
+        #expect(multiSelect2 == false)
         #expect(options2.count == 3)
         #expect(options2[0] == Wire.PermissionOption(
             index: 0, choice: nil, label: "Postgres",
@@ -181,11 +183,13 @@ struct ProtocolFixtureConformanceTests {
         }
         """.utf8)
         let item = try JSONDecoder().decode(Wire.TranscriptItem.self, from: json)
-        guard case let .permissionPrompt(_, _, kind, _, options, allowFreeText, _) = item else {
+        guard case let .permissionPrompt(_, _, kind, _, options, allowFreeText, multiSelect, _) = item else {
             Issue.record("expected .permissionPrompt"); return
         }
         #expect(kind == .permission)
         #expect(allowFreeText == false)
+        // Absent `multi_select` (a pre-v3 desktop) defaults to single-select.
+        #expect(multiSelect == false)
         // Options with no `index` key default to 0 (Rust `#[serde(default)]`).
         #expect(options[0].index == 0)
         #expect(options[1].index == 0)
@@ -201,7 +205,7 @@ struct ProtocolFixtureConformanceTests {
             body: .permissionDecision(
                 sessionId: Wire.SessionId("sess_fix_login"),
                 promptId: Wire.PromptId("prompt_q1"),
-                choice: nil, optionIndex: 2, freeText: nil))
+                choice: nil, optionIndex: 2, optionIndices: nil, freeText: nil))
         let encoded = try JSONEncoder().encode(command)
         let object = try #require(
             try JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
@@ -209,7 +213,33 @@ struct ProtocolFixtureConformanceTests {
         #expect(object["type"] as? String == "permission_decision")
         #expect(object["option_index"] as? Int == 2)
         #expect(object["choice"] == nil, "binary choice key must be omitted, not null")
+        #expect(object["option_indices"] == nil, "option_indices key must be omitted, not null")
         #expect(object["free_text"] == nil, "free_text key must be omitted, not null")
+
+        let decoded = try JSONDecoder().decode(Wire.PhoneCommand.self, from: encoded)
+        #expect(decoded == command)
+    }
+
+    /// Encoding a multi-select `option_indices` decision omits the single-select
+    /// `option_index`/`choice`/`free_text` keys, and round-trips.
+    @Test func optionIndicesDecisionEncodesWithoutOtherFields() throws {
+        let command = Wire.PhoneCommand(
+            commandId: Wire.CommandId("cmd_ois"),
+            issuedAtMs: 1_752_412_811_000,
+            body: .permissionDecision(
+                sessionId: Wire.SessionId("sess_fix_login"),
+                promptId: Wire.PromptId("prompt_ms1"),
+                choice: nil, optionIndex: nil,
+                optionIndices: [0, 2], freeText: nil))
+        let encoded = try JSONEncoder().encode(command)
+        let object = try #require(
+            try JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
+
+        #expect(object["type"] as? String == "permission_decision")
+        #expect(object["option_indices"] as? [Int] == [0, 2])
+        #expect(object["choice"] == nil)
+        #expect(object["option_index"] == nil)
+        #expect(object["free_text"] == nil)
 
         let decoded = try JSONDecoder().decode(Wire.PhoneCommand.self, from: encoded)
         #expect(decoded == command)
@@ -223,7 +253,7 @@ struct ProtocolFixtureConformanceTests {
             body: .permissionDecision(
                 sessionId: Wire.SessionId("sess_fix_login"),
                 promptId: Wire.PromptId("prompt_q1"),
-                choice: nil, optionIndex: nil, freeText: "Use CockroachDB instead."))
+                choice: nil, optionIndex: nil, optionIndices: nil, freeText: "Use CockroachDB instead."))
         let encoded = try JSONEncoder().encode(command)
         let object = try #require(
             try JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
@@ -246,7 +276,7 @@ struct ProtocolFixtureConformanceTests {
         #expect(decoded.body == .permissionDecision(
             sessionId: Wire.SessionId("sess_fix_login"),
             promptId: Wire.PromptId("prompt_ab12"),
-            choice: .deny, optionIndex: nil, freeText: nil))
+            choice: .deny, optionIndex: nil, optionIndices: nil, freeText: nil))
 
         let encoded = try JSONEncoder().encode(decoded)
         let object = try #require(

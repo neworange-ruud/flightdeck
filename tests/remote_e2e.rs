@@ -398,6 +398,7 @@ fn remote_capabilities_end_to_end() {
         prompt_id: PromptId::new("no-such-prompt"),
         choice: Some(PermissionChoice::AllowOnce),
         option_index: None,
+        option_indices: None,
         free_text: None,
     });
     let ack = await_ack(&mut h.phone, &perm_cmd, ACK_TIMEOUT);

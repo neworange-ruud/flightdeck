@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 use crate::ids::SessionId;
 
 /// Protocol version this build speaks and prefers.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// v3 adds multi-select (checklist) questions: `PermissionPrompt.multi_select`
+/// and `PermissionDecision.option_indices`. Both are `#[serde(default)]`, so v2
+/// peers still parse v3 frames (missing fields → single-select).
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Oldest protocol version this build can still interoperate with.
 pub const MIN_SUPPORTED_VERSION: u16 = 1;
 /// Newest protocol version this build can interoperate with.
-pub const MAX_SUPPORTED_VERSION: u16 = 2;
+pub const MAX_SUPPORTED_VERSION: u16 = 3;
 
 /// The two roles that connect to the relay for a given pairing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

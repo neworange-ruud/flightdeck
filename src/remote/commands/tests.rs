@@ -194,6 +194,7 @@ fn decision(prompt: &str, choice: PermissionChoice) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: Some(choice),
         option_index: None,
+        option_indices: None,
         free_text: None,
     }
 }
@@ -204,6 +205,18 @@ fn decision_option(prompt: &str, option_index: u32) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: None,
         option_index: Some(option_index),
+        option_indices: None,
+        free_text: None,
+    }
+}
+
+fn decision_options(prompt: &str, option_indices: Vec<u32>) -> CommandBody {
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new(prompt),
+        choice: None,
+        option_index: None,
+        option_indices: Some(option_indices),
         free_text: None,
     }
 }
@@ -214,6 +227,7 @@ fn decision_free_text(prompt: &str, text: &str) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: None,
         option_index: None,
+        option_indices: None,
         free_text: Some(text.to_string()),
     }
 }
@@ -374,6 +388,99 @@ fn permission_decision_option_index_rejected_for_codex() {
 }
 
 #[test]
+fn multi_option_keystroke_toggles_by_number_for_claude() {
+    use StatusBackend::Claude;
+    // Claude multi-select: press each selected option's number to toggle it,
+    // then Enter submits the set. Indices are sorted + deduped first.
+    assert_eq!(
+        multi_option_keystroke(Claude, &[0, 2], false),
+        Some(b"13\r".to_vec())
+    );
+    assert_eq!(
+        multi_option_keystroke(Claude, &[2, 0, 2], true),
+        Some(b"13\r".to_vec()),
+        "indices are deduped and sorted before toggling"
+    );
+    // A single selection in a multi-select prompt still toggles + submits.
+    assert_eq!(
+        multi_option_keystroke(Claude, &[1], false),
+        Some(b"2\r".to_vec())
+    );
+    // An option beyond single digits falls back to arrow+Space (SS3 under DECCKM).
+    assert_eq!(
+        multi_option_keystroke(Claude, &[9], true),
+        Some([b"\x1bOB".repeat(9).as_slice(), b" \r"].concat())
+    );
+    // Empty selection is not actionable.
+    assert_eq!(multi_option_keystroke(Claude, &[], false), None);
+}
+
+#[test]
+fn multi_option_keystroke_arrow_space_for_opencode() {
+    use StatusBackend::{Codex, OpenCode};
+    // OpenCode multi-select: walk DOWN to each target in ascending order,
+    // toggling with Space, then Enter. Option 0 needs no DOWN. Cursor position
+    // is cumulative, so [0, 2] is: Space, DOWN, DOWN, Space, Enter.
+    assert_eq!(
+        multi_option_keystroke(OpenCode, &[0, 2], false),
+        Some(b" \x1b[B\x1b[B \r".to_vec())
+    );
+    // DECCKM uses SS3 `ESC O B` for DOWN.
+    assert_eq!(
+        multi_option_keystroke(OpenCode, &[1], true),
+        Some(b"\x1bOB \r".to_vec())
+    );
+    // Codex has no multi-option prompt.
+    assert_eq!(multi_option_keystroke(Codex, &[0, 1], false), None);
+}
+
+#[test]
+fn permission_decision_option_indices_claude_toggles_and_submits() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    assert_eq!(
+        translate(&decision_options("t1:p3", vec![0, 2]), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"13\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_option_indices_arrow_space_for_opencode() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    assert_eq!(
+        translate(&decision_options("t1:p3", vec![0, 2]), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b" \x1b[B\x1b[B \r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_option_indices_rejected_for_codex() {
+    let index = answerable("t1:p3", StatusBackend::Codex);
+    assert!(matches!(
+        translate(&decision_options("t1:p3", vec![0, 1]), &index),
+        Translation::Reject { reason } if reason.contains("multi-select")
+    ));
+}
+
+#[test]
+fn permission_decision_empty_option_indices_falls_through() {
+    // An empty indices vec is not a valid multi-select answer; with no other
+    // field set it is rejected as an empty decision (not silently accepted).
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    assert!(matches!(
+        translate(&decision_options("t1:p3", vec![]), &index),
+        Translation::Reject { reason } if reason.contains("empty decision")
+    ));
+}
+
+#[test]
 fn permission_decision_free_text_encodes_reply() {
     // Free text is delivered like any reply: the text as a paste (bracketed
     // when the agent enabled DECSET 2004) followed by the Enter CR.
@@ -397,6 +504,7 @@ fn permission_decision_free_text_wins_over_option_index() {
         prompt_id: PromptId::new("t1:p3"),
         choice: None,
         option_index: Some(2),
+        option_indices: None,
         free_text: Some("typed instead".to_string()),
     };
     assert_eq!(
@@ -418,6 +526,7 @@ fn permission_decision_empty_decision_rejected() {
         prompt_id: PromptId::new("t1:p3"),
         choice: None,
         option_index: None,
+        option_indices: None,
         free_text: None,
     };
     assert!(matches!(

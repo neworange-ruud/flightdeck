@@ -698,6 +698,10 @@ struct PromptSidecar {
     text: String,
     #[serde(default)]
     options: Vec<PromptSidecarOption>,
+    /// Whether the question accepts multiple selections (checklist). The
+    /// OpenCode runtime plugin probes `multiple`/`multiSelect` and writes this.
+    #[serde(default)]
+    multiple: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -790,6 +794,7 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 command: parsed.text,
                 options,
                 allow_free_text: true,
+                multi_select: parsed.multiple,
             })
         }
         // Permissions are binary. Build a structured prompt only when every
@@ -810,6 +815,8 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 command: parsed.text,
                 options,
                 allow_free_text: false,
+                // Permissions are always a single binary choice.
+                multi_select: false,
             })
         }
         _ => None,

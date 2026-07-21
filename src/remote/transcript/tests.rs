@@ -297,11 +297,13 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
             command,
             options,
             allow_free_text,
+            multi_select,
             ..
         }) => {
             assert_eq!(*kind, PromptKind::Question);
             assert_eq!(command, "Which database should we use?");
             assert!(*allow_free_text, "AskUserQuestion always allows free text");
+            assert!(!*multi_select, "multiSelect:false is single-select");
             assert_eq!(options.len(), 3);
             let expect = [
                 (0u32, "Postgres", "Relational, ACID"),
@@ -317,6 +319,31 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
                     "Question options carry no binary choice"
                 );
             }
+        }
+        other => panic!("expected a Question PermissionPrompt, got {other:?}"),
+    }
+}
+
+const ASK_USER_QUESTION_MULTI: &str = r#"{"type":"assistant","uuid":"aqm","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which checks should run before merge?","header":"Checks","multiSelect":true,"options":[{"label":"Tests"},{"label":"Clippy"},{"label":"Fmt"}]}]}}]}}"#;
+
+#[test]
+fn ask_user_question_multi_select_sets_the_flag() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASK_USER_QUESTION_MULTI]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt {
+            kind,
+            multi_select,
+            options,
+            ..
+        }) => {
+            assert_eq!(*kind, PromptKind::Question);
+            assert!(*multi_select, "multiSelect:true is a checklist question");
+            assert_eq!(options.len(), 3);
         }
         other => panic!("expected a Question PermissionPrompt, got {other:?}"),
     }

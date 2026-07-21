@@ -729,6 +729,10 @@ fn sidecar_question_surfaces_structured_question_prompt() {
     let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
     assert_eq!(sp.kind, PromptKind::Question);
     assert!(sp.allow_free_text, "questions allow a free-text answer");
+    assert!(
+        !sp.multi_select,
+        "no `multiple` field defaults to single-select"
+    );
     assert_eq!(sp.command, "Which framework?");
     assert_eq!(sp.options.len(), 3);
     assert_eq!(sp.options[0].index, 0);
@@ -759,6 +763,37 @@ fn sidecar_question_surfaces_structured_question_prompt() {
         }
         other => panic!("expected a PermissionPrompt, got {other:?}"),
     }
+}
+
+#[test]
+fn sidecar_multi_select_question_sets_the_flag() {
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"Which checks?","multiple":true,"options":[
+            {"label":"Tests"},{"label":"Clippy"}]}"#,
+    );
+
+    let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert!(sp.multi_select, "`multiple`:true is a checklist question");
+    assert_eq!(sp.options.len(), 2);
+}
+
+#[test]
+fn sidecar_permission_is_never_multi_select() {
+    // A permission sidecar with a stray `multiple` flag stays single-choice:
+    // permissions are always a binary decision.
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"Run tests?","multiple":true,"options":[
+            {"label":"Allow"},{"label":"Deny"}]}"#,
+    );
+
+    let sp = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Permission);
+    assert!(!sp.multi_select, "permissions are never multi-select");
 }
 
 #[test]

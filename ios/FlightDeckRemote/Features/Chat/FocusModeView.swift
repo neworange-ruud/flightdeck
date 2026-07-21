@@ -23,6 +23,8 @@ struct FocusModeView: View {
     @Bindable var model: ChatViewModel
     let dictation: DictationController
     @Environment(\.dismiss) private var dismiss
+    /// Options toggled on in a multi-select checklist, before Submit.
+    @State private var focusSelected: Set<Int> = []
 
     var body: some View {
         // Read observable state in the tracked top scope (same pattern as
@@ -41,6 +43,7 @@ struct FocusModeView: View {
                        let promptId = presentation.pendingPromptId {
                         pinnedAsk(command: command)
                         decisionButtons(promptId: promptId, options: presentation.options,
+                                        multiSelect: presentation.multiSelect,
                                         actionState: actionState, actionable: actionable)
                     } else {
                         noPendingNote
@@ -132,6 +135,7 @@ struct FocusModeView: View {
     // MARK: - Approve / Deny
 
     private func decisionButtons(promptId: Wire.PromptId, options: [Wire.PermissionOption],
+                                 multiSelect: Bool,
                                  actionState: PermissionActionState, actionable: Bool) -> some View {
         VStack(spacing: Theme.Spacing.md) {
             switch actionState {
@@ -143,13 +147,84 @@ struct FocusModeView: View {
                     .foregroundStyle(Theme.textMuted)
                     .accessibilityIdentifier("focus-stale")
             default:
-                HStack(spacing: Theme.Spacing.md) {
-                    ForEach(Array(options.enumerated()), id: \.offset) { _, option in
-                        bigDecisionButton(option: option, actionState: actionState,
-                                          actionable: actionable, promptId: promptId)
+                if multiSelect {
+                    focusChecklist(promptId: promptId, options: options,
+                                   actionState: actionState, actionable: actionable)
+                } else {
+                    HStack(spacing: Theme.Spacing.md) {
+                        ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                            bigDecisionButton(option: option, actionState: actionState,
+                                              actionable: actionable, promptId: promptId)
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// A multi-select checklist for focus mode: toggle several options, then a
+    /// full-width Submit sends them together (mirrors the chat card's checklist).
+    private func focusChecklist(promptId: Wire.PromptId, options: [Wire.PermissionOption],
+                                actionState: PermissionActionState, actionable: Bool) -> some View {
+        let submitting: Bool = {
+            if case let .sending(answer) = actionState, case .options = answer { return true }
+            return false
+        }()
+        return VStack(spacing: Theme.Spacing.sm) {
+            ForEach(options, id: \.index) { option in
+                let isOn = focusSelected.contains(option.index)
+                Button {
+                    if isOn { focusSelected.remove(option.index) }
+                    else { focusSelected.insert(option.index) }
+                } label: {
+                    HStack(spacing: Theme.Spacing.sm) {
+                        Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                            .font(.system(size: 22))
+                            .foregroundStyle(isOn ? Theme.accent : Theme.textMuted)
+                        Text(option.label)
+                            .typography(Typography.headline)
+                            .foregroundStyle(Theme.textPrimary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(Theme.Spacing.md)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                        .fill(Theme.bgRaised)
+                )
+                .disabled(!actionable)
+                .accessibilityIdentifier("focus-check-\(option.index)")
+                .accessibilityAddTraits(isOn ? .isSelected : [])
+            }
+            Button {
+                let indices = options.map(\.index).filter { focusSelected.contains($0) }
+                guard !indices.isEmpty else { return }
+                let labels = options.filter { focusSelected.contains($0.index) }.map(\.label)
+                model.decidePermission(promptId: promptId, optionIndices: indices, labels: labels)
+            } label: {
+                ZStack {
+                    Text("Submit \(focusSelected.count) selected")
+                        .typography(Typography.headline)
+                        .opacity(submitting ? 0 : 1)
+                    if submitting {
+                        WorkingSpinner(size: 22, lineWidth: 2.5, color: Theme.bgDeep)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Theme.Spacing.lg)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Theme.bgDeep)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                    .fill(Theme.accent)
+            )
+            .disabled(!actionable || focusSelected.isEmpty)
+            .opacity(actionable ? 1 : 0.5)
+            .accessibilityIdentifier("focus-submit")
         }
     }
 
@@ -171,8 +246,8 @@ struct FocusModeView: View {
                 model.decidePermission(promptId: promptId, choice: choice)
             case let .option(index, label):
                 model.decidePermission(promptId: promptId, optionIndex: index, label: label)
-            case .freeText:
-                break // options never carry a free-text answer
+            case .options, .freeText:
+                break // single-tap buttons never carry a multi-select or free-text answer
             }
         } label: {
             ZStack {

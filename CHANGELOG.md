@@ -27,6 +27,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   indexed options, an `option_index` / `free_text` decision), desktop capture
   for Claude and OpenCode, the decision→keystroke mapping, and the iOS prompt
   card.
+- **FlightDeck Remote: answer multi-select (checklist) questions from the
+  phone.** When an agent asks a question that allows several answers (Claude
+  Code's `AskUserQuestion` with `multiSelect`, or an OpenCode multi-select
+  question), the phone now renders it as a checklist — toggle any number of
+  options on, then tap **Submit** to send them together. Single-select
+  questions still submit on the first tap, and binary Allow / Deny is
+  unchanged. Bumps the wire protocol to v3 (`multi_select` on the question,
+  `option_indices` on the decision) and drives the agent's TUI to toggle and
+  submit the whole set. (remote-control-dc9)
 
 ### Improvements
 

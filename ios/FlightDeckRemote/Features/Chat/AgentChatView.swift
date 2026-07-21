@@ -243,6 +243,8 @@ struct AgentChatView: View {
                                     model.decidePermission(promptId: pid, choice: choice)
                                 case let .option(index, label):
                                     model.decidePermission(promptId: pid, optionIndex: index, label: label)
+                                case let .options(indices, labels):
+                                    model.decidePermission(promptId: pid, optionIndices: indices, labels: labels)
                                 case let .freeText(text):
                                     model.decidePermission(promptId: pid, freeText: text)
                                 }

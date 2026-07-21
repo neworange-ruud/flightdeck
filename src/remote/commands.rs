@@ -432,6 +432,68 @@ pub fn option_keystroke(
     }
 }
 
+/// The keystrokes injected to select SEVERAL options of a multi-select
+/// (checklist / `multiSelect`) Question prompt, then submit them together.
+/// `option_indices` are the phone's chosen 0-based indices (deduplicated and
+/// sorted here so navigation is monotonic and each option is toggled once).
+///
+/// UNVERIFIED against a live agent (remote-control-dc9); single-select was
+/// confirmed live but the multi-select toggle/submit sequence is a best-effort
+/// derivation that MUST be validated on a real build:
+///
+/// * **Claude Code** multi-select renders a checklist. Unlike single-select —
+///   where the number key selects AND submits — in multi mode the number key is
+///   expected to TOGGLE the option and leave the list open, with **Enter**
+///   submitting the whole set. So this presses each selected option's number
+///   (`1..9`), then Enter. Robust to cursor position, like the single-select
+///   path. A list with an option at index `>= 9` falls back to arrow+Space.
+/// * **OpenCode** multi-select: from the first option focused, walk DOWN to each
+///   target in ascending order and toggle it with **Space** (DECCKM-aware, like
+///   the single-select arrow path), then **Enter** submits. Derive the real
+///   sequence from `agent-prompt.debug.json` on a live multi-select question.
+/// * **Codex** has no such prompt → `None` (an honest rejection upstream).
+pub fn multi_option_keystroke(
+    backend: StatusBackend,
+    option_indices: &[u32],
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
+    let mut indices: Vec<u32> = option_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        return None;
+    }
+    match backend {
+        // Claude: toggle each option by its number key; Enter submits the set.
+        StatusBackend::Claude if indices.iter().all(|&i| i < 9) => {
+            let mut bytes: Vec<u8> = indices.iter().map(|&i| b'1' + i as u8).collect();
+            bytes.push(b'\r');
+            Some(bytes)
+        }
+        // Arrow navigation + Space toggle. DECCKM → SS3 `ESC O B`; else CSI.
+        StatusBackend::Claude | StatusBackend::OpenCode => {
+            let down: &[u8] = if application_cursor {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            };
+            let mut bytes = Vec::new();
+            let mut cursor = 0u32;
+            for &target in &indices {
+                for _ in cursor..target {
+                    bytes.extend_from_slice(down);
+                }
+                bytes.push(b' '); // Space toggles the focused option.
+                cursor = target;
+            }
+            bytes.push(b'\r'); // Enter submits the selected set.
+            Some(bytes)
+        }
+        // Codex has no multi-option prompt; refuse rather than guess.
+        StatusBackend::Codex => None,
+    }
+}
+
 /// Encode a phone reply exactly as the desktop TUI delivers typed/pasted
 /// input: the text as one paste (bracketed iff the agent enabled DECSET 2004,
 /// newlines normalised to carriage returns — see `encode_paste`), followed by
@@ -468,6 +530,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             prompt_id,
             choice,
             option_index,
+            option_indices,
             free_text,
         } => {
             let Some(s) = index.session(session_id) else {
@@ -491,19 +554,32 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             // Decision-field precedence (commands.rs never sees the prompt
             // kind, so bytes are chosen purely from which decision field is
             // set):
-            //   1. `choice`      — the binary fast-path (byte-identical to the
-            //                      original permission-only behaviour).
-            //   2. `free_text`   — a typed answer, delivered like any reply.
-            //                      Deliberately ranked ABOVE `option_index`: if
-            //                      a phone somehow sends both, the explicit
-            //                      free-text answer wins over a list position.
-            //   3. `option_index`— arrow-nav selection of a Question option.
-            //   4. otherwise     — nothing actionable; reject honestly.
+            //   1. `choice`         — the binary fast-path (byte-identical to
+            //                         the original permission-only behaviour).
+            //   2. `free_text`      — a typed answer, delivered like any reply.
+            //                         Deliberately ranked ABOVE the option
+            //                         fields: if a phone somehow sends both, the
+            //                         explicit free-text answer wins over a list
+            //                         position.
+            //   3. `option_indices` — multi-select (checklist) toggle + submit.
+            //                         Ranked above `option_index` because it is
+            //                         the more specific answer; a phone only
+            //                         populates it for a `multi_select` prompt.
+            //   4. `option_index`   — single-option selection.
+            //   5. otherwise        — nothing actionable; reject honestly.
             let free_text = free_text.as_deref().filter(|t| !t.is_empty());
+            let option_indices = option_indices.as_deref().filter(|v| !v.is_empty());
             let bytes = if let Some(choice) = choice {
                 permission_keystroke(backend, *choice).to_vec()
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
+            } else if let Some(indices) = option_indices {
+                match multi_option_keystroke(backend, indices, s.application_cursor) {
+                    Some(b) => b,
+                    None => {
+                        return reject("this agent does not support multi-select prompts");
+                    }
+                }
             } else if let Some(n) = option_index {
                 match option_keystroke(backend, *n, s.application_cursor) {
                     Some(b) => b,
