@@ -11,8 +11,11 @@
 # so it may scale out), independent deploy cadence.
 #
 # Idempotent-ish: safe to re-run. It cloud-builds the image (no local Docker),
-# creates-or-updates the app, mirrors the relay's IP allowlist onto it, and
-# grants the existing GitHub-OIDC deploy identity rights over the new app.
+# creates-or-updates the app, and grants the existing GitHub-OIDC deploy
+# identity rights over the new app.
+#
+# The web app ingress is PUBLIC (no IP allowlist) — it's a public landing page
+# and docs site. Only the relay stays IP-restricted.
 #
 # Requires: az CLI logged in to the "New Orange Internal" subscription, and
 # (for the final GitHub-wiring step) the gh CLI with repo admin.
@@ -28,7 +31,6 @@ ENVNAME="cae-neworange-flightdeck-dev-neu"
 REGION="northeurope"
 PULL_ID="id-neworange-flightdeck-dev-neu-pull"     # AcrPull, reused
 DEPLOY_ID="id-neworange-flightdeck-dev-neu-deploy" # GitHub-OIDC, reused
-RELAY_APP="ca-neworange-flightdeck-dev-neu"         # source of the IP allowlist
 
 # ---- The new web app ------------------------------------------------------
 APP="ca-neworange-web-dev-neu"
@@ -74,23 +76,7 @@ else
     --env-vars PORT=8080 NODE_ENV=production HOSTNAME=0.0.0.0 -o none
 fi
 
-# 3. Mirror the relay's IP allowlist onto the web app (deny-by-default).
-#    All rules share action=Allow; adding any Allow rule denies every other
-#    source. We read the live relay rules so the two apps never drift.
-echo "==> Applying IP allowlist (copied from $RELAY_APP)"
-az containerapp ingress access-restriction list -g "$RG" -n "$RELAY_APP" -o json \
-  | python3 -c '
-import json,sys
-for r in json.load(sys.stdin):
-    print(r["name"], r["ipAddressRange"], r.get("description",""), sep="\t")
-' | while IFS=$'\t' read -r name range desc; do
-    az containerapp ingress access-restriction set -g "$RG" -n "$APP" \
-      --rule-name "$name" --ip-address "$range" --action Allow \
-      --description "$desc" -o none
-    echo "    + $name $range"
-  done
-
-# 4. Grant the existing GitHub-OIDC deploy identity Contributor on THIS app so
+# 3. Grant the existing GitHub-OIDC deploy identity Contributor on THIS app so
 #    the web-deploy workflow can push revisions (AcrPush on the registry is
 #    already held from the relay setup).
 echo "==> Granting deploy identity Contributor on $APP"
@@ -100,7 +86,7 @@ az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role Contributor --scope "$APP_ID" \
   -o none 2>/dev/null || echo "    (role assignment already present)"
 
-# 5. Wire GitHub so .github/workflows/web-deploy.yml can find the app.
+# 4. Wire GitHub so .github/workflows/web-deploy.yml can find the app.
 #    RG/ACR vars and the OIDC secrets are shared with the relay workflow.
 if command -v gh >/dev/null 2>&1; then
   echo "==> Setting GitHub variable AZURE_WEB_CONTAINERAPP_NAME"
@@ -117,9 +103,8 @@ cat <<EOF
     App FQDN         : https://$FQDN
     Domain verify id : $VERIFY_ID         (for the asuid.www TXT record)
 
-www is the PRIMARY host (subdomain -> CNAME validation works behind the IP
-allowlist and auto-renews). The apex can't get a managed cert behind the
-allowlist, so apex -> www is a TransIP registrar redirect, not an ACA binding.
+www is the PRIMARY host (subdomain -> CNAME validation, auto-renews). apex ->
+www is a TransIP registrar redirect, not an ACA binding.
 
 1. DNS records on flightdeckai.app (TransIP DNS panel):
      CNAME  www          -> $FQDN

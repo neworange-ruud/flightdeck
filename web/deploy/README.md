@@ -31,11 +31,12 @@ rebuild the relay on every content edit.
 | Pull identity | `id-…-pull` (AcrPull) — shared |
 | Deploy identity | `id-…-deploy` (GitHub-OIDC, AcrPush + Contributor on this app) — shared |
 
-**Ingress is IP-restricted (deny-by-default allowlist)** — the same allowlist as
-the relay. `setup.sh` copies the relay's rules onto the web app so the two never
-drift. All rules share action `Allow`; adding any `Allow` rule denies every
-other source. Manage with
-`az containerapp ingress access-restriction {set,remove,list} -g <rg> -n ca-neworange-web-dev-neu`.
+**Ingress is public (no IP allowlist).** It's a public landing page and docs
+site, so anyone can reach it. Only the **relay** stays IP-restricted
+(deny-by-default allowlist) — the web app deliberately does not inherit it. If
+you ever need to lock the web app down, add `Allow` rules with
+`az containerapp ingress access-restriction {set,remove,list} -g <rg> -n ca-neworange-web-dev-neu`
+(any `Allow` rule flips the ingress to deny-by-default for every other source).
 
 ## Domains
 
@@ -44,11 +45,11 @@ apex redirects to it.
 
 Why not the apex? Azure's *free managed certificate* for an **apex** domain
 validates via an **HTTP-01 challenge from DigiCert** (it must reach
-`http://flightdeckai.app/.well-known/…` on port 80). Our deny-by-default IP
-allowlist blocks DigiCert, so an apex managed cert never issues (and couldn't
-renew). A **subdomain** validates over **CNAME** — pure DNS — which works behind
-the allowlist and auto-renews. That's why `relay.flightdeckai.app` works, and
-why we serve on `www` here.
+`http://flightdeckai.app/.well-known/…` on port 80), whereas a **subdomain**
+validates over **CNAME** — pure DNS. The web app's ingress is now public so an
+apex HTTP-01 challenge would succeed, but we keep serving on `www` (the existing,
+working arrangement) and redirect the apex to it. The relay stays IP-restricted,
+which is exactly why `relay.flightdeckai.app` uses CNAME validation.
 
 - **`www.flightdeckai.app`** → bound to the app; ACA-managed cert via **CNAME
   validation**. This is the canonical host.
@@ -85,7 +86,7 @@ apex A record pointing at the ACA static IP.
 **First time / from a laptop:**
 
 ```bash
-web/deploy/setup.sh            # cloud-build, create app, copy IP allowlist, wire GitHub
+web/deploy/setup.sh            # cloud-build, create app, wire GitHub
 # create the DNS records it prints, wait for propagation, then:
 web/deploy/bind-custom-domain.sh
 ```
@@ -104,12 +105,12 @@ Reuses the relay's repo **secrets** (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
 
 ## Health
 
-The Next server answers `GET /` (and `/docs`). CI verifies the ingress responds;
-from an IP-restricted network a `403` from a non-allowlisted runner still proves
-the revision is live.
+The Next server answers `GET /` (and `/docs`). CI verifies the ingress responds
+with a `2xx`/`3xx` (it also tolerates `403`, which would only appear if the app
+were re-locked behind an IP allowlist).
 
 ## Cost (rough)
 
 Adds ~$15–25/mo for the web app's `0.5 vCPU / 1 GiB` single warm replica (it
-scales to 3 only under load, which the IP allowlist makes rare). RG/ACR/env/
-identities are already paid for by the relay.
+scales to 3 only under load). RG/ACR/env/identities are already paid for by the
+relay.

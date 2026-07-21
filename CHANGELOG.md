@@ -19,6 +19,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- **Web app ingress is now public.** The Azure Container App serving the landing
+  page and `/docs` (`ca-neworange-web-dev-neu`) no longer inherits the relay's
+  deny-by-default IP allowlist — it's a public site, so anyone can reach it. The
+  relay (`ca-neworange-flightdeck-dev-neu`) stays IP-restricted. `web/deploy/setup.sh`
+  no longer mirrors the allowlist onto the web app, and the deploy docs/workflow
+  reflect the public ingress.
 - **Document that the default relay is not public.** FlightDeck ships with a
   default relay (`relay.flightdeckai.app`) that is **restricted and not
   accessible to the public**; you can host your own relay instead, but

@@ -121,9 +121,10 @@ jobs:
             -n "${{ vars.AZURE_WEB_CONTAINERAPP_NAME }}" \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "web: https://$FQDN"
-          # The ingress is IP-restricted; the GitHub runner is not allowlisted,
-          # so a 403 here still proves the new revision is serving. Any 2xx/3xx
-          # or 403 means the app is up; a connection failure or 5xx is a failure.
+          # The web ingress is public, so the runner should get a 2xx/3xx. We
+          # still accept 403 in case the app is ever re-locked behind an IP
+          # allowlist (the runner isn't allowlisted). A connection failure or
+          # 5xx is a failure.
           for i in $(seq 1 30); do
             code="$(curl -s -o /dev/null -w '%{http_code}' "https://$FQDN/" || echo 000)"
             echo "attempt $i: HTTP $code"
