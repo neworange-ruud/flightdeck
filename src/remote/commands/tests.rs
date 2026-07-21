@@ -17,6 +17,7 @@ fn entry(id: &str) -> SessionEntry {
         primary_running: true,
         all_stopped: false,
         bracketed_paste: true,
+        application_cursor: false,
         pending_prompt: None,
     }
 }
@@ -294,19 +295,40 @@ fn permission_decision_rejections() {
 #[test]
 fn option_keystroke_arrow_nav_for_claude_and_opencode() {
     use StatusBackend::{Claude, Codex, OpenCode};
-    // EMPIRICAL / UNVERIFIED (see option_keystroke doc): index 0 => just Enter;
-    // each further step adds a DOWN arrow (ESC [ B) before the trailing Enter.
+    // index 0 => just Enter; each further step adds a DOWN arrow before the
+    // trailing Enter. Normal cursor mode (application_cursor = false) uses the
+    // CSI form `ESC [ B`.
     for backend in [Claude, OpenCode] {
-        assert_eq!(option_keystroke(backend, 0), Some(b"\r".to_vec()));
-        assert_eq!(option_keystroke(backend, 1), Some(b"\x1b[B\r".to_vec()));
+        assert_eq!(option_keystroke(backend, 0, false), Some(b"\r".to_vec()));
         assert_eq!(
-            option_keystroke(backend, 2),
+            option_keystroke(backend, 1, false),
+            Some(b"\x1b[B\r".to_vec())
+        );
+        assert_eq!(
+            option_keystroke(backend, 2, false),
             Some(b"\x1b[B\x1b[B\r".to_vec())
         );
     }
     // Codex has no multi-option prompt.
-    assert_eq!(option_keystroke(Codex, 0), None);
-    assert_eq!(option_keystroke(Codex, 2), None);
+    assert_eq!(option_keystroke(Codex, 0, false), None);
+    assert_eq!(option_keystroke(Codex, 2, false), None);
+}
+
+#[test]
+fn option_keystroke_uses_ss3_arrows_in_application_cursor_mode() {
+    use StatusBackend::Claude;
+    // Full-screen TUIs (Claude Code, OpenCode) enable application cursor keys
+    // (DECCKM), where DOWN is the SS3 form `ESC O B`. Sending the CSI form there
+    // is ignored and the selection never leaves index 0 (remote-control-qa1).
+    assert_eq!(option_keystroke(Claude, 0, true), Some(b"\r".to_vec()));
+    assert_eq!(
+        option_keystroke(Claude, 1, true),
+        Some(b"\x1bOB\r".to_vec())
+    );
+    assert_eq!(
+        option_keystroke(Claude, 2, true),
+        Some(b"\x1bOB\x1bOB\r".to_vec())
+    );
 }
 
 #[test]

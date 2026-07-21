@@ -129,6 +129,10 @@ pub struct SessionEntry {
     /// Whether the primary terminal application has enabled bracketed paste
     /// (DECSET 2004), which decides how reply text is framed.
     pub bracketed_paste: bool,
+    /// Whether the primary terminal application has enabled application cursor
+    /// keys mode (DECCKM / DECSET 1), which decides how a synthesized arrow-key
+    /// selection is encoded (`ESC O B` vs `ESC [ B`) — see [`option_keystroke`].
+    pub application_cursor: bool,
     /// The currently pending permission prompt id, if any (the most recently
     /// minted one from the transcript builder).
     pub pending_prompt: Option<PromptId>,
@@ -201,6 +205,11 @@ pub fn build_index(
                     .session
                     .primary()
                     .map(|t| t.bracketed_paste())
+                    .unwrap_or(false),
+                application_cursor: tab
+                    .session
+                    .primary()
+                    .map(|t| t.application_cursor())
                     .unwrap_or(false),
                 pending_prompt: pending_prompt(&tab.meta.id),
             });
@@ -379,29 +388,39 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
 /// The keystrokes injected to select the `option_index`-th option of a
 /// multi-option (Question) prompt on a supported backend's TUI list.
 ///
-/// EMPIRICAL ASSUMPTION — **UNVERIFIED, MUST BE VALIDATED ON A LIVE BUILD.**
-/// Unlike [`permission_keystroke`] (whose per-key bindings are documented CLI
-/// shortcuts), the arrow-navigation model below is inferred from how these
-/// TUIs render selectable lists, not confirmed against a running agent. It is
-/// flagged in the s81 handoff and cannot be checked unattended.
+/// The model: a Question prompt renders its options as a vertical list with the
+/// first option (index 0) focused. Moving the selection down one option is a
+/// DOWN arrow; Enter (`b"\r"`) activates the focused option. So selecting option
+/// `n` is `n` DOWN arrows followed by Enter; index 0 is just Enter.
 ///
-/// The model: a Question prompt renders its options as a vertical list with
-/// the first option (index 0) focused. Moving the selection down one option is
-/// a DOWN arrow (ESC `[` `B` = `b"\x1b[B"`); Enter (`b"\r"`) activates the
-/// focused option. So selecting option `n` is `n` DOWN arrows followed by
-/// Enter; index 0 is just Enter.
+/// The arrow encoding depends on the terminal's cursor-keys mode: full-screen
+/// TUIs (Claude Code, OpenCode) enable **application cursor keys** (DECCKM),
+/// where DOWN is `ESC O B` (SS3), not the normal `ESC [ B` (CSI). Sending the
+/// wrong form is silently ignored by the app, so the selection never moves and
+/// the default (index 0) is activated instead — the phone would answer "Sushi"
+/// yet the agent registers "Pizza" (remote-control-qa1). `application_cursor`
+/// comes from the live terminal (`vt100` DECCKM state) so the right form is used.
 ///
 /// * **Claude Code** (`AskUserQuestion`) and **OpenCode** (`question.asked`)
 ///   both use this arrow-nav list model.
 /// * **Codex** has no multi-option Question prompt, so it returns `None`; the
 ///   translate arm turns that into an honest rejection.
-pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec<u8>> {
-    const DOWN: &[u8] = b"\x1b[B";
+pub fn option_keystroke(
+    backend: StatusBackend,
+    option_index: u32,
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
+    // DECCKM (application cursor keys) → SS3 `ESC O B`; otherwise CSI `ESC [ B`.
+    let down: &[u8] = if application_cursor {
+        b"\x1bOB"
+    } else {
+        b"\x1b[B"
+    };
     match backend {
         StatusBackend::Claude | StatusBackend::OpenCode => {
             let mut bytes = Vec::new();
             for _ in 0..option_index {
-                bytes.extend_from_slice(DOWN);
+                bytes.extend_from_slice(down);
             }
             bytes.push(b'\r');
             Some(bytes)
@@ -484,7 +503,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
             } else if let Some(n) = option_index {
-                match option_keystroke(backend, *n) {
+                match option_keystroke(backend, *n, s.application_cursor) {
                     Some(b) => b,
                     None => {
                         return reject("this agent does not support multi-option prompts");
