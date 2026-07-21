@@ -90,7 +90,9 @@ enum FocusMode {
         case let .userMessage(_, text, _):
             return "You: \(firstLine(text, budget: proseCharBudget))"
         case let .agentMessage(_, text, _):
-            return firstLine(text, budget: proseCharBudget)
+            // Agent prose is Markdown; strip syntax so the condensed one-line
+            // peek reads cleanly instead of showing raw `**` / `#` / backticks.
+            return firstLine(ChatMarkdown.plainText(text), budget: proseCharBudget)
         case let .activity(_, summary, _, _, _, _):
             return summary
         case let .permissionPrompt(_, _, command, _, _):

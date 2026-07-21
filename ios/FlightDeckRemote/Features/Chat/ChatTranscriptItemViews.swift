@@ -74,7 +74,8 @@ struct TranscriptRowView: View {
 // MARK: - Prose
 
 /// A prose message. User messages are right-aligned in an accented bubble;
-/// agent messages are left-aligned readable body.
+/// agent messages are left-aligned readable body. Agent prose is Markdown
+/// (rendered as rich text via `MarkdownProseView`); user prose is verbatim.
 struct ProseBubble: View {
     enum Sender { case user, agent }
 
@@ -103,16 +104,12 @@ struct ProseBubble: View {
         VStack(alignment: .trailing, spacing: Theme.Spacing.xxs) {
             HStack {
                 if sender == .user { Spacer(minLength: Theme.Spacing.xxl) }
-                Text(text)
-                    .typography(Typography.body)
-                    .foregroundStyle(sender == .user ? Theme.bgDeep : Theme.textPrimary)
-                    .multilineTextAlignment(.leading)
+                bubbleContent
                     .padding(.horizontal, Theme.Spacing.md)
                     .padding(.vertical, Theme.Spacing.sm)
                     .background(bubbleBackground)
                     .opacity(isPending ? 0.6 : 1)
                     .frame(maxWidth: .infinity, alignment: sender == .user ? .trailing : .leading)
-                    .accessibilityIdentifier(sender == .user ? "prose-user" : "prose-agent")
                 if sender == .agent { Spacer(minLength: Theme.Spacing.xxl) }
             }
 
@@ -133,6 +130,23 @@ struct ProseBubble: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("prose-user-retry")
             }
+        }
+    }
+
+    /// The bubble's text. User messages are verbatim (right-aligned, accented);
+    /// agent messages are Markdown rendered as rich text (keeps `prose-agent`).
+    @ViewBuilder
+    private var bubbleContent: some View {
+        switch sender {
+        case .user:
+            Text(text)
+                .typography(Typography.body)
+                .foregroundStyle(Theme.bgDeep)
+                .multilineTextAlignment(.leading)
+                .accessibilityIdentifier("prose-user")
+        case .agent:
+            MarkdownProseView(text: text, textColor: Theme.textPrimary,
+                              identifier: "prose-agent")
         }
     }
 
@@ -198,9 +212,9 @@ struct ActivityPillView: View {
             if isExpanded, hasDetail {
                 VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                     if let prose, !prose.isEmpty {
-                        Text(prose)
-                            .typography(Typography.callout)
-                            .foregroundStyle(Theme.textMuted)
+                        // Agent explanation prose can carry Markdown; the diff /
+                        // command `detail` below stays raw mono.
+                        MarkdownProseView(text: prose, textColor: Theme.textMuted)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     if let detail, !detail.isEmpty {

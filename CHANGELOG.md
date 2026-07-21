@@ -8,7 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **FlightDeck Remote: agent replies render as rich text.** The desktop sends
+  agent responses as Markdown; the iOS app now parses and renders them instead
+  of showing raw syntax. Agent chat bubbles and the activity pill's expandable
+  prose format headings, **bold**/*italic*, `inline code`, bullet and numbered
+  lists, fenced code blocks, blockquotes, and links using the app's Geist /
+  Geist Mono type and Theme colors. The eyes-free focus-mode "Recently" peek
+  strips Markdown syntax so its one-line summaries stay clean. User messages are
+  still shown verbatim.
 
 ### Improvements
 

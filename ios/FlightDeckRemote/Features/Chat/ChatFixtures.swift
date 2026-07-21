@@ -24,6 +24,25 @@ enum ChatFixtures {
 
     private static let base: Int64 = 1_720_000_000_000
 
+    /// A Markdown-rich agent reply (bold, inline code, a bullet list, and a
+    /// fenced code block) so the rich-text rendering is exercised end-to-end.
+    /// Hoisted out of the array literal to keep the fixture's type-check fast.
+    private static let agent2Markdown = """
+    Tests pass and the redirect now keeps the return URL. Here's **what changed**:
+
+    - Thread `returnTo` through the `refresh()` boundary
+    - Fall back to `/` when no return URL is saved
+    - Add a regression test in `redirect.test.ts`
+
+    Verify with:
+
+    ```bash
+    npm test -- redirect
+    ```
+
+    Before I rebuild I want to clear the stale build output.
+    """
+
     /// The main seeded transcript window (positions 0…5).
     static func items() -> [Wire.TranscriptItem] {
         [
@@ -65,7 +84,7 @@ enum ChatFixtures {
                 atMs: base + 20 * 60 * 1000),
             .agentMessage(
                 itemId: Wire.ItemId("fx-agent-2"),
-                text: "Tests pass and the redirect now keeps the return URL. Before I rebuild I want to clear the stale build output.",
+                text: agent2Markdown,
                 atMs: base + 20 * 60 * 1000 + 5_000),
             .permissionPrompt(
                 itemId: Wire.ItemId("fx-perm-1"),
