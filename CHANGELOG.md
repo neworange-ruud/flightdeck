@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.10.0] - 2026-07-21
+
+### New features
+
 - **FlightDeck Remote: agent replies render as rich text.** The desktop sends
   agent responses as Markdown; the iOS app now parses and renders them instead
   of showing raw syntax. Agent chat bubbles and the activity pill's expandable
