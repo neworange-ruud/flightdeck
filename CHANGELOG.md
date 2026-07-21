@@ -35,13 +35,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 ### Bug fixes
 
 - **FlightDeck Remote: answering a multiple-choice question now selects the
-  right option.** The phone drives the agent's option list by injecting DOWN
-  arrows, but full-screen TUIs (Claude Code, OpenCode) run in application-cursor-
-  keys mode (DECCKM), where DOWN is `ESC O B`, not the `ESC [ B` that was being
-  sent — so the arrows were ignored, the selection never moved, and the agent
-  activated whatever option was focused by default (you answered "Sushi" but it
-  registered "Pizza"). The arrow form is now chosen from the terminal's live
-  cursor-keys mode. (remote-control-qa1)
+  right option.** Selecting an option on the phone drove the agent's list by
+  arrow-key navigation, which mis-landed (you picked option 1 but the agent
+  registered option 3). Claude's `AskUserQuestion` numbers its options `1..N` and
+  pressing the number selects that option directly, so the phone now sends the
+  option's number — robust to the cursor position and terminal mode. (OpenCode
+  keeps arrow navigation, encoded for its live cursor-keys mode.) (remote-control-qa1)
 - **FlightDeck Remote: base-branch agents now show a transcript at all.** An
   agent running on the base branch (worktree `.`) had its worktree built as
   `repo_root/.`, whose string-mangled session-store path never matched the clean

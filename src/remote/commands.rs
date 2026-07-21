@@ -388,21 +388,21 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
 /// The keystrokes injected to select the `option_index`-th option of a
 /// multi-option (Question) prompt on a supported backend's TUI list.
 ///
-/// The model: a Question prompt renders its options as a vertical list with the
-/// first option (index 0) focused. Moving the selection down one option is a
-/// DOWN arrow; Enter (`b"\r"`) activates the focused option. So selecting option
-/// `n` is `n` DOWN arrows followed by Enter; index 0 is just Enter.
-///
-/// The arrow encoding depends on the terminal's cursor-keys mode: full-screen
-/// TUIs (Claude Code, OpenCode) enable **application cursor keys** (DECCKM),
-/// where DOWN is `ESC O B` (SS3), not the normal `ESC [ B` (CSI). Sending the
-/// wrong form is silently ignored by the app, so the selection never moves and
-/// the default (index 0) is activated instead — the phone would answer "Sushi"
-/// yet the agent registers "Pizza" (remote-control-qa1). `application_cursor`
-/// comes from the live terminal (`vt100` DECCKM state) so the right form is used.
-///
-/// * **Claude Code** (`AskUserQuestion`) and **OpenCode** (`question.asked`)
-///   both use this arrow-nav list model.
+/// * **Claude Code** (`AskUserQuestion`) lists its options numbered `1..N`, and
+///   pressing the **number key selects AND submits** that option outright —
+///   verified live: the binary "1" keystroke answered option 1. This is used in
+///   preference to arrow navigation because it is robust to the initial cursor
+///   position, the terminal's cursor-keys mode, and any extra trailing rows
+///   ("Type something" / "Chat about this") the list renders. Only single-digit
+///   options (`1..9`, i.e. `index < 9`) are reachable this way; a longer list
+///   falls back to arrow navigation. Fixes the phone answering option 1 but the
+///   agent registering option 3 (remote-control-qa1).
+/// * **OpenCode** (`question.asked`) uses arrow navigation: from the first
+///   option focused, `n` DOWN arrows then Enter select option `n`. The DOWN
+///   encoding depends on the terminal's cursor-keys mode — full-screen TUIs
+///   enable **application cursor keys** (DECCKM) where DOWN is `ESC O B` (SS3),
+///   not the normal `ESC [ B` (CSI); `application_cursor` (from the live `vt100`
+///   state) selects the right form so the keystroke is not silently ignored.
 /// * **Codex** has no multi-option Question prompt, so it returns `None`; the
 ///   translate arm turns that into an honest rejection.
 pub fn option_keystroke(
@@ -410,14 +410,16 @@ pub fn option_keystroke(
     option_index: u32,
     application_cursor: bool,
 ) -> Option<Vec<u8>> {
-    // DECCKM (application cursor keys) → SS3 `ESC O B`; otherwise CSI `ESC [ B`.
-    let down: &[u8] = if application_cursor {
-        b"\x1bOB"
-    } else {
-        b"\x1b[B"
-    };
     match backend {
+        // Claude: press the option's number (select + submit) when single-digit.
+        StatusBackend::Claude if option_index < 9 => Some(vec![b'1' + option_index as u8]),
         StatusBackend::Claude | StatusBackend::OpenCode => {
+            // Arrow navigation. DECCKM → SS3 `ESC O B`; otherwise CSI `ESC [ B`.
+            let down: &[u8] = if application_cursor {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            };
             let mut bytes = Vec::new();
             for _ in 0..option_index {
                 bytes.extend_from_slice(down);

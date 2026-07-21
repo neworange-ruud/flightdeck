@@ -293,74 +293,75 @@ fn permission_decision_rejections() {
 }
 
 #[test]
-fn option_keystroke_arrow_nav_for_claude_and_opencode() {
-    use StatusBackend::{Claude, Codex, OpenCode};
-    // index 0 => just Enter; each further step adds a DOWN arrow before the
-    // trailing Enter. Normal cursor mode (application_cursor = false) uses the
-    // CSI form `ESC [ B`.
-    for backend in [Claude, OpenCode] {
-        assert_eq!(option_keystroke(backend, 0, false), Some(b"\r".to_vec()));
-        assert_eq!(
-            option_keystroke(backend, 1, false),
-            Some(b"\x1b[B\r".to_vec())
-        );
-        assert_eq!(
-            option_keystroke(backend, 2, false),
-            Some(b"\x1b[B\x1b[B\r".to_vec())
-        );
-    }
+fn option_keystroke_uses_the_option_number_for_claude() {
+    use StatusBackend::Claude;
+    // Claude's AskUserQuestion numbers its options 1..N; pressing the digit
+    // selects AND submits that option (verified live). index 0 => "1", etc.
+    // Cursor mode is irrelevant for the digit path (remote-control-qa1).
+    assert_eq!(option_keystroke(Claude, 0, false), Some(b"1".to_vec()));
+    assert_eq!(option_keystroke(Claude, 1, true), Some(b"2".to_vec()));
+    assert_eq!(option_keystroke(Claude, 2, false), Some(b"3".to_vec()));
+    assert_eq!(option_keystroke(Claude, 8, false), Some(b"9".to_vec()));
+    // Beyond single digits, fall back to arrow navigation (SS3 under DECCKM).
+    assert_eq!(
+        option_keystroke(Claude, 9, true),
+        Some([b"\x1bOB".repeat(9), b"\r".to_vec()].concat())
+    );
+}
+
+#[test]
+fn option_keystroke_arrow_nav_for_opencode() {
+    use StatusBackend::{Codex, OpenCode};
+    // OpenCode uses arrow-nav: index 0 => just Enter; each step adds a DOWN
+    // arrow. Normal cursor mode uses CSI `ESC [ B`; DECCKM uses SS3 `ESC O B`.
+    assert_eq!(option_keystroke(OpenCode, 0, false), Some(b"\r".to_vec()));
+    assert_eq!(
+        option_keystroke(OpenCode, 1, false),
+        Some(b"\x1b[B\r".to_vec())
+    );
+    assert_eq!(
+        option_keystroke(OpenCode, 2, true),
+        Some(b"\x1bOB\x1bOB\r".to_vec())
+    );
     // Codex has no multi-option prompt.
     assert_eq!(option_keystroke(Codex, 0, false), None);
     assert_eq!(option_keystroke(Codex, 2, false), None);
 }
 
 #[test]
-fn option_keystroke_uses_ss3_arrows_in_application_cursor_mode() {
-    use StatusBackend::Claude;
-    // Full-screen TUIs (Claude Code, OpenCode) enable application cursor keys
-    // (DECCKM), where DOWN is the SS3 form `ESC O B`. Sending the CSI form there
-    // is ignored and the selection never leaves index 0 (remote-control-qa1).
-    assert_eq!(option_keystroke(Claude, 0, true), Some(b"\r".to_vec()));
-    assert_eq!(
-        option_keystroke(Claude, 1, true),
-        Some(b"\x1bOB\r".to_vec())
-    );
-    assert_eq!(
-        option_keystroke(Claude, 2, true),
-        Some(b"\x1bOB\x1bOB\r".to_vec())
-    );
-}
-
-#[test]
-fn permission_decision_option_index_arrow_nav() {
-    use StatusBackend::{Claude, OpenCode};
-    for backend in [Claude, OpenCode] {
-        let index = answerable("t1:p3", backend);
+fn permission_decision_option_index_claude_sends_the_option_number() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    for (opt, digit) in [(0u32, b"1"), (1, b"2"), (2, b"3")] {
         assert_eq!(
-            translate(&decision_option("t1:p3", 0), &index),
+            translate(&decision_option("t1:p3", opt), &index),
             Translation::PtyInput {
                 project: 0,
                 tab: 0,
-                bytes: b"\r".to_vec(),
-            }
-        );
-        assert_eq!(
-            translate(&decision_option("t1:p3", 1), &index),
-            Translation::PtyInput {
-                project: 0,
-                tab: 0,
-                bytes: b"\x1b[B\r".to_vec(),
-            }
-        );
-        assert_eq!(
-            translate(&decision_option("t1:p3", 2), &index),
-            Translation::PtyInput {
-                project: 0,
-                tab: 0,
-                bytes: b"\x1b[B\x1b[B\r".to_vec(),
+                bytes: digit.to_vec(),
             }
         );
     }
+}
+
+#[test]
+fn permission_decision_option_index_arrow_nav_for_opencode() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    assert_eq!(
+        translate(&decision_option("t1:p3", 0), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\r".to_vec(),
+        }
+    );
+    assert_eq!(
+        translate(&decision_option("t1:p3", 2), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\x1b[B\x1b[B\r".to_vec(),
+        }
+    );
 }
 
 #[test]
