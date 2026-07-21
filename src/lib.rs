@@ -1937,20 +1937,30 @@ fn service_remote_commands(
         };
         let translation = translate(&cmd.body, &index);
         let (outcome, message) = match translation {
-            // Two-phase keystroke write: send the toggles + Tab now, and defer
-            // the submit Enter so it lands after Claude's Confirm tab renders
-            // (remote-control-dc9). The deferred write is flushed on a later tick.
-            Translation::PtyInputThenDeferred {
+            // Timed keystroke sequence: write the first chunk now and queue the
+            // rest at increasing due times so Claude's Ink TUI re-renders between
+            // keys (remote-control-dc9). The queued chunks flush on later ticks.
+            Translation::PtyInputSequence {
                 project,
                 tab,
                 session_id,
-                immediate,
-                deferred,
-                delay_ms,
+                chunks,
+                step_delay_ms,
             } => match workspace.projects.get_mut(project) {
+                None => remote_target_gone(),
                 Some(p) => {
-                    if write_primary_pty(&mut p.state, tab, &immediate) {
-                        bridge.enqueue_deferred_pty(session_id, now_ms + delay_ms, deferred);
+                    let first_ok = chunks
+                        .first()
+                        .map(|c| write_primary_pty(&mut p.state, tab, c))
+                        .unwrap_or(true);
+                    if first_ok {
+                        for (i, chunk) in chunks.iter().enumerate().skip(1) {
+                            bridge.enqueue_deferred_pty(
+                                session_id.clone(),
+                                now_ms + (i as u64) * step_delay_ms,
+                                chunk.clone(),
+                            );
+                        }
                         (CommandOutcome::Applied, None)
                     } else {
                         (
@@ -1959,7 +1969,6 @@ fn service_remote_commands(
                         )
                     }
                 }
-                None => remote_target_gone(),
             },
             other => execute_remote_translation(
                 other,
@@ -2060,20 +2069,23 @@ fn execute_remote_translation(
             action,
         } => execute_shell_action(shells, workspace, env, project, tab, &session_id, action),
 
-        // PtyInputThenDeferred is intercepted in `service_remote_commands` (which
-        // owns the deferred-write queue). If it ever reaches the generic executor
-        // — e.g. a direct test call — degrade to writing the immediate part; the
-        // trailing submit Enter is dropped in that path.
-        Translation::PtyInputThenDeferred {
+        // PtyInputSequence is intercepted in `service_remote_commands` (which owns
+        // the deferred-write queue that spaces the chunks). If it ever reaches the
+        // generic executor — e.g. a direct test call — degrade to writing every
+        // chunk back-to-back (no inter-key spacing).
+        Translation::PtyInputSequence {
             project,
             tab,
-            immediate,
+            chunks,
             ..
         } => {
             let Some(p) = workspace.projects.get_mut(project) else {
                 return remote_target_gone();
             };
-            if write_primary_pty(&mut p.state, tab, &immediate) {
+            let ok = chunks
+                .iter()
+                .all(|chunk| write_primary_pty(&mut p.state, tab, chunk));
+            if ok {
                 (CommandOutcome::Applied, None)
             } else {
                 (

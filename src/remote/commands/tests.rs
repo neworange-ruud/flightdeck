@@ -426,20 +426,26 @@ fn multi_option_keystroke_toggles_and_confirms_for_opencode() {
 }
 
 #[test]
-fn permission_decision_option_indices_claude_defers_the_submit_enter() {
+fn permission_decision_option_indices_claude_is_a_spaced_sequence() {
     let index = answerable("t1:p3", StatusBackend::Claude);
-    // Claude: everything up to and including the Tab to the Confirm tab is
-    // written immediately; the trailing submit Enter is deferred so it lands
-    // after the tab renders (remote-control-dc9).
+    // Claude: each keystroke is its own chunk so the Ink TUI re-renders between
+    // them (remote-control-dc9). [0, 2] → toggle 0 (Enter), Down, Down, toggle 2
+    // (Enter), Tab to Confirm, Enter to submit.
     assert_eq!(
         translate(&decision_options("t1:p3", vec![0, 2]), &index),
-        Translation::PtyInputThenDeferred {
+        Translation::PtyInputSequence {
             project: 0,
             tab: 0,
             session_id: SessionId::new("t1"),
-            immediate: b"\r\x1b[B\x1b[B\r\t".to_vec(),
-            deferred: b"\r".to_vec(),
-            delay_ms: crate::remote::commands::MULTI_SELECT_SUBMIT_DELAY_MS,
+            chunks: vec![
+                b"\r".to_vec(),     // Enter: toggle option 0
+                b"\x1b[B".to_vec(), // Down: 0 -> 1
+                b"\x1b[B".to_vec(), // Down: 1 -> 2
+                b"\r".to_vec(),     // Enter: toggle option 2
+                b"\t".to_vec(),     // Tab: to Confirm
+                b"\r".to_vec(),     // Enter: submit
+            ],
+            step_delay_ms: crate::remote::commands::MULTI_SELECT_STEP_DELAY_MS,
         }
     );
 }

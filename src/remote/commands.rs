@@ -279,24 +279,28 @@ pub enum Translation {
         bytes: Vec<u8>,
     },
     /// Write `immediate` to the session's primary terminal now, then `deferred`
-    /// after `delay_ms`. Used for Claude's multi-select submit: the trailing
-    /// Enter must arrive AFTER the Tab-driven switch to the Confirm tab has
-    /// rendered, or Claude's Ink TUI drops it and the form never submits
-    /// (remote-control-dc9). `session_id` re-resolves the tab at flush time,
-    /// since tab indices may shift during the delay.
-    PtyInputThenDeferred {
-        /// Workspace project index (for the immediate write).
+    /// Write a SEQUENCE of keystroke chunks to the session's primary terminal,
+    /// one chunk every `step_delay_ms` starting immediately. Used for Claude's
+    /// multi-select form: its Ink (React) TUI re-renders asynchronously and its
+    /// key handler closes over the current highlight index, so a burst of
+    /// navigation/toggle/submit keys races the re-render — a `Down` then `Enter`
+    /// toggles the *pre-move* option (always the first), and the submit `Enter`
+    /// arrives before the Confirm tab mounts. Spacing each keystroke lets React
+    /// re-render (and the highlight/selection settle) in between
+    /// (remote-control-dc9). `session_id` re-resolves the tab for the later
+    /// chunks, since tab indices may shift during the sequence.
+    PtyInputSequence {
+        /// Workspace project index (for the first chunk).
         project: usize,
-        /// Tab index within the project (for the immediate write).
+        /// Tab index within the project (for the first chunk).
         tab: usize,
-        /// Session whose primary PTY receives the deferred write.
+        /// Session whose primary PTY receives the later chunks.
         session_id: SessionId,
-        /// Bytes written now (toggles + navigation + the Tab to Confirm).
-        immediate: Vec<u8>,
-        /// Bytes written after `delay_ms` (the submit Enter).
-        deferred: Vec<u8>,
-        /// How long to wait before the deferred write, in ms.
-        delay_ms: u64,
+        /// Keystroke chunks in order; chunk 0 is written now, chunk `i` at
+        /// `now + i * step_delay_ms`.
+        chunks: Vec<Vec<u8>>,
+        /// Delay between consecutive chunks, in ms.
+        step_delay_ms: u64,
     },
     /// Dispatch an existing app [`Command`] against the tab (the executor
     /// temporarily selects it, preserving the user's on-screen selection).
@@ -443,12 +447,35 @@ pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec
 /// cursor-keys mode (remote-control-dc9).
 const DOWN_ARROW: &[u8] = b"\x1b[B";
 
-/// How long to wait after switching to Claude's Confirm tab before injecting
-/// the submit Enter (see [`Translation::PtyInputThenDeferred`]). Long enough for
-/// the Ink TUI to render the new tab so the Enter is not dropped, short enough
-/// to feel instant. The 50ms main-loop poll means the actual wait rounds up to
-/// the next tick.
-pub const MULTI_SELECT_SUBMIT_DELAY_MS: u64 = 150;
+/// Delay between consecutive injected keystrokes when driving Claude's
+/// multi-select form (see [`Translation::PtyInputSequence`]). Long enough for
+/// the Ink TUI to re-render between keys so the highlight actually moves and the
+/// toggle/submit see the settled state, short enough to feel responsive. The
+/// 50ms main-loop poll means each step rounds up to the next tick.
+pub const MULTI_SELECT_STEP_DELAY_MS: u64 = 150;
+
+/// The spaced keystroke chunks that drive Claude's multi-select form to toggle
+/// exactly `indices` and submit. Each chunk is a single keystroke, delivered one
+/// [`MULTI_SELECT_STEP_DELAY_MS`] apart so Claude's async re-render settles
+/// between them (remote-control-dc9): from the first option, one `Down` per row
+/// to reach each target, `Enter` to toggle it, then `Tab` to the Confirm tab and
+/// `Enter` to submit. `indices` must be sorted + deduplicated by the caller.
+fn claude_multi_select_chunks(indices: &[u32]) -> Vec<Vec<u8>> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0u32;
+    for &target in indices {
+        // One Down per row: consecutive Downs also race the re-render (each
+        // handler would read the same stale index), so they are separate chunks.
+        for _ in cursor..target {
+            chunks.push(DOWN_ARROW.to_vec());
+        }
+        chunks.push(b"\r".to_vec()); // Enter toggles the highlighted option.
+        cursor = target;
+    }
+    chunks.push(b"\t".to_vec()); // Tab to the far-right Confirm tab.
+    chunks.push(b"\r".to_vec()); // Enter submits the whole form.
+    chunks
+}
 
 /// The keystrokes injected to select SEVERAL options of a multi-select
 /// (checklist / `multiSelect`) Question prompt, then submit them together.
@@ -583,26 +610,29 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
             } else if let Some(indices) = option_indices {
-                let Some(mut b) = multi_option_keystroke(backend, indices) else {
-                    return reject("this agent does not support multi-select prompts");
-                };
-                // Claude's Ink TUI drops the submit Enter when it arrives during
-                // the Tab-driven switch to the Confirm tab, so the form never
-                // submits (remote-control-dc9). Split off that trailing Enter (the
-                // last byte) and deliver it after a short delay, once the tab has
-                // rendered. OpenCode has no such screen and submits in one burst.
+                // Claude's Ink TUI races injected keystrokes against its async
+                // re-render, so navigation + toggle + submit must be spaced out —
+                // a burst toggles the wrong (pre-move) option and never submits
+                // (remote-control-dc9). Drive it as a timed keystroke sequence.
+                // OpenCode processes input synchronously and submits in one burst.
                 if backend == StatusBackend::Claude {
-                    let deferred = vec![b.pop().expect("keystroke sequence is non-empty")];
-                    return Translation::PtyInputThenDeferred {
+                    let mut sorted: Vec<u32> = indices.to_vec();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    return Translation::PtyInputSequence {
                         project: s.project,
                         tab: s.tab,
                         session_id: session_id.clone(),
-                        immediate: b,
-                        deferred,
-                        delay_ms: MULTI_SELECT_SUBMIT_DELAY_MS,
+                        chunks: claude_multi_select_chunks(&sorted),
+                        step_delay_ms: MULTI_SELECT_STEP_DELAY_MS,
                     };
                 }
-                b
+                match multi_option_keystroke(backend, indices) {
+                    Some(b) => b,
+                    None => {
+                        return reject("this agent does not support multi-select prompts");
+                    }
+                }
             } else if let Some(n) = option_index {
                 match option_keystroke(backend, *n) {
                     Some(b) => b,
