@@ -56,6 +56,8 @@ pub enum UiOverlay {
     Palette(CommandPalette),
     /// Help / keybindings overlay.
     Help,
+    /// About dialog: version, description, and authorship / credits.
+    About,
     /// Git status panel for the active tab, optionally with a PR URL.
     GitStatus {
         /// The git status data (typically from [`GitStatusCache`]).
@@ -601,6 +603,7 @@ pub fn draw(
         UiOverlay::Help => {
             draw_help_overlay(frame, area, state.config.ui.use_f2_to_leave_terminal_focus)
         }
+        UiOverlay::About => draw_about_overlay(frame, area),
         UiOverlay::GitStatus { status, pr_url } => {
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
         }
@@ -2058,15 +2061,6 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
     // Curated rows.
     for row in manager.rows() {
         let marker = if row.selected { "▸ " } else { "  " };
-        let control = if row.is_bool {
-            if row.bool_value {
-                "[x]".to_string()
-            } else {
-                "[ ]".to_string()
-            }
-        } else {
-            format!("‹{}›", row.value)
-        };
         let name_style = if row.selected {
             Style::default()
                 .fg(Color::White)
@@ -2079,13 +2073,64 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
             Origin::Global => Style::default().fg(Color::Blue),
             Origin::Default => Style::default().fg(Color::DarkGray),
         };
-        lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(accent)),
-            Span::styled(format!("{control:<8} "), Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{:<22}", row.label), name_style),
-            Span::styled(format!("({})", row.origin.label()), origin_style),
-        ]));
+        if row.is_text {
+            // A free-text field (e.g. the relay URL): the value can be long, so
+            // render it after the label rather than in the fixed control column.
+            // When editing, append a block cursor and highlight the value.
+            let value_style = if row.editing {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let value = if row.editing {
+                format!("{}█", row.value)
+            } else {
+                row.value.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent)),
+                Span::styled(format!("{:<22}", row.label), name_style),
+                Span::styled(value, value_style),
+                Span::raw(" "),
+                Span::styled(format!("({})", row.origin.label()), origin_style),
+            ]));
+        } else {
+            let control = if row.is_bool {
+                if row.bool_value {
+                    "[x]".to_string()
+                } else {
+                    "[ ]".to_string()
+                }
+            } else {
+                format!("‹{}›", row.value)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent)),
+                Span::styled(format!("{control:<8} "), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{:<22}", row.label), name_style),
+                Span::styled(format!("({})", row.origin.label()), origin_style),
+            ]));
+        }
     }
+
+    // A standing note that the default relay is private, so users understand why
+    // enabling Remote against it won't connect (mirrors the config-file comment).
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Note: the default relay (relay.flightdeckai.app) is restricted and not",
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(Span::styled(
+        "publicly accessible. Point Relay URL at your own relay to use Remote",
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(Span::styled(
+        "(self-hosting is unsupported). See https://flightdeckai.app/remote",
+        Style::default().fg(Color::Yellow),
+    )));
 
     lines.push(Line::raw(""));
     if let Some(status) = manager.status() {
@@ -2103,14 +2148,21 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "↑↓ move   Space toggle   Tab switch scope   c clear override",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "s save   e edit file in $EDITOR   Esc close",
-        Style::default().fg(Color::DarkGray),
-    )));
+    if manager.is_editing() {
+        lines.push(Line::from(Span::styled(
+            "Type to edit   Enter save value   Esc cancel   Backspace delete",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "↑↓ move   Space toggle / edit   Tab switch scope   c clear override",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "s save   e edit file in $EDITOR   Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     // Fit the box to its content instead of stretching it to a fixed height.
     // centered_overlay still clamps it when the terminal is shorter.
@@ -2123,6 +2175,66 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent));
     let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, overlay_area);
+}
+
+/// Draw the About dialog: version, one-line description, and authorship credits.
+pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
+    let accent = Color::Cyan;
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("FlightDeck  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "A terminal UI for orchestrating parallel AI coding agents.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Built by ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Ruud van Falier",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("with collaboration from ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Sander Langhorst",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "https://flightdeckai.app",
+            Style::default().fg(accent),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Esc / q to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let overlay_area = layout::centered_overlay(area, 62, content_height.saturating_add(2));
+    frame.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .title(" About FlightDeck ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent));
+    let para = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .block(block);
     frame.render_widget(para, overlay_area);
 }
 
@@ -3358,11 +3470,62 @@ mod tests {
         .unwrap();
 
         let buffer = term.backend().buffer();
-        // Thirteen settings plus headers, spacing, legend, and two border rows
-        // fit the box to its content (23 of 24 rows) rather than stretching to a
-        // fixed height; centered_overlay places its top-left corner at column 7.
+        // Fifteen settings (incl. the two remote fields) plus headers, the relay
+        // restriction note, legend, and borders now exceed a 24-row terminal, so
+        // centered_overlay clamps the box to the full height. Its top-left corner
+        // is still at column 7 (width 66 centered in 80).
         assert_eq!(buffer[(7, 0)].symbol(), "┌");
-        assert_eq!(buffer[(7, 22)].symbol(), "└");
+        assert_eq!(buffer[(7, 23)].symbol(), "└");
+    }
+
+    #[test]
+    fn config_overlay_shows_relay_restriction_note() {
+        let mut term = test_terminal(100, 40);
+        let state = empty_state();
+        let cache = empty_cache();
+        let manager = ConfigManager::new(
+            "demo-project",
+            Some(PathBuf::from("/home/u/.flightdeck/config.toml")),
+            PathBuf::from("/repo/.flightdeck/config.toml"),
+            toml::Table::new(),
+            toml::Table::new(),
+            vec!["opencode".to_string()],
+        );
+        term.draw(|frame| {
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        let text: String = (0..40_u16)
+            .flat_map(|y| (0..100_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("Relay URL"), "relay field must render");
+        assert!(
+            text.contains("restricted"),
+            "the relay restriction note must render"
+        );
+    }
+
+    #[test]
+    fn draw_does_not_panic_with_about_overlay() {
+        let mut term = test_terminal(80, 24);
+        let state = empty_state();
+        let cache = empty_cache();
+        term.draw(|frame| {
+            draw(frame, &state, &cache, &UiOverlay::About, 0);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        let text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("Ruud van Falier"), "author must render");
+        assert!(
+            text.contains("Sander Langhorst"),
+            "collaborator must render"
+        );
     }
 
     #[test]

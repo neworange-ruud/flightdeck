@@ -196,6 +196,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::Dispatch(Command::ShowHelp),
     },
     PaletteEntry {
+        group: "View",
+        label: "About FlightDeck",
+        action: PaletteAction::Dispatch(Command::ShowAbout),
+    },
+    PaletteEntry {
         group: "Global",
         label: "Quit",
         action: PaletteAction::Dispatch(Command::Quit),
@@ -208,8 +213,8 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// files are now symlinked into new worktrees automatically, so the "Copy
 /// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
-/// Phone") bring the total to 28.
-pub const REQUIRED_ACTION_COUNT: usize = 28;
+/// Phone") bring the total to 28, plus "About FlightDeck" makes 29.
+pub const REQUIRED_ACTION_COUNT: usize = 29;
 
 /// The command palette model (SPECS §22).
 ///
@@ -396,6 +401,7 @@ mod tests {
             "Unpair Phone",
             "Toggle Split View",
             "Show Help",
+            "About FlightDeck",
             "Quit",
         ];
         let labels: Vec<&str> = ALL_ENTRIES.iter().map(|e| e.label).collect();

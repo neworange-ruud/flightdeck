@@ -9,8 +9,8 @@
 //! project either inherits the global agent set or specifies its own in full.
 
 use crate::contracts::{
-    AgentDef, Config, ContainersConfig, GitConfig, NotificationsConfig, UiConfig, UpdateConfig,
-    WorktreesConfig,
+    AgentDef, Config, ContainersConfig, GitConfig, NotificationsConfig, RemoteConfig, UiConfig,
+    UpdateConfig, WorktreesConfig,
 };
 use crate::contracts::{FileSystem, FlightDeckError, Result};
 use serde::Serialize;
@@ -83,8 +83,43 @@ struct GlobalConfigView<'a> {
     ui: &'a UiConfig,
     notifications: &'a NotificationsConfig,
     update: &'a UpdateConfig,
+    remote: &'a RemoteConfig,
     containers: &'a ContainersConfig,
     agents: &'a BTreeMap<String, AgentDef>,
+}
+
+/// The explanatory comment injected above the `[remote]` section of any global
+/// `config.toml` we write. It documents that FlightDeck Remote is off by default
+/// and — importantly — that the default relay is **not** open to the public.
+const REMOTE_SECTION_COMMENT: &str = "\
+# FlightDeck Remote (optional phone <-> desktop link). Off by default.
+#
+# NOTE: the default relay URL below (relay.flightdeckai.app) is currently
+# RESTRICTED and is NOT accessible to the public — enabling remote against it
+# will not connect. You may point relay_url at a relay you host yourself, but
+# self-hosting is not supported by the author in any way. See the docs for
+# details: https://flightdeckai.app/remote
+";
+
+/// Insert [`REMOTE_SECTION_COMMENT`] directly above the `[remote]` table header
+/// in a serialized TOML body. The `toml` crate drops comments on serialization,
+/// so we re-attach this one every time we write the global file. A no-op if the
+/// body has no `[remote]` section.
+fn annotate_remote_section(body: &str) -> String {
+    match body.lines().position(|l| l.trim() == "[remote]") {
+        Some(idx) => {
+            let mut out = String::with_capacity(body.len() + REMOTE_SECTION_COMMENT.len());
+            for (i, line) in body.lines().enumerate() {
+                if i == idx {
+                    out.push_str(REMOTE_SECTION_COMMENT);
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+        None => body.to_string(),
+    }
 }
 
 /// Serialize the global base config (all sections except `[project]`) with the
@@ -96,12 +131,16 @@ pub fn serialize_global_config(config: &Config) -> Result<String> {
         ui: &config.ui,
         notifications: &config.notifications,
         update: &config.update,
+        remote: &config.remote,
         containers: &config.containers,
         agents: &config.agents,
     };
     let body = toml::to_string_pretty(&view)
         .map_err(|e| FlightDeckError::Config(format!("failed to serialize global config: {e}")))?;
-    Ok(format!("{GLOBAL_CONFIG_HEADER}{body}"))
+    Ok(format!(
+        "{GLOBAL_CONFIG_HEADER}{}",
+        annotate_remote_section(&body)
+    ))
 }
 
 /// The minimal initial project `config.toml`: only project identity, with an
@@ -123,7 +162,10 @@ pub fn minimal_project_config(name: &str, base_branch: &str) -> String {
 pub fn serialize_global_table(table: &toml::Table) -> Result<String> {
     let body = toml::to_string_pretty(table)
         .map_err(|e| FlightDeckError::Config(format!("failed to serialize global config: {e}")))?;
-    Ok(format!("{GLOBAL_CONFIG_HEADER}{body}"))
+    Ok(format!(
+        "{GLOBAL_CONFIG_HEADER}{}",
+        annotate_remote_section(&body)
+    ))
 }
 
 /// Serialize a raw project override table with the [`PROJECT_CONFIG_HEADER`]
@@ -278,6 +320,38 @@ mod tests {
             .status_patterns
             .error
             .contains(&"Error".to_string()));
+    }
+
+    #[test]
+    fn global_config_documents_remote_section_and_restriction() {
+        let toml = serialize_global_config(&default_config("x", "main")).unwrap();
+        // The [remote] section is present, off by default, with the default relay.
+        assert!(toml.contains("[remote]"), "global: {toml}");
+        assert!(toml.contains("enabled = false"), "global: {toml}");
+        assert!(toml.contains("relay.flightdeckai.app"), "global: {toml}");
+        // The restriction note is attached as a comment above the section.
+        assert!(
+            toml.contains("RESTRICTED") && toml.contains("NOT accessible to the public"),
+            "global: {toml}"
+        );
+        // It still parses back into a valid config (comment is inert).
+        let cfg = parse_config(&toml).unwrap();
+        assert!(!cfg.remote.enabled);
+        assert_eq!(cfg.remote.relay_url, "wss://relay.flightdeckai.app/ws");
+    }
+
+    #[test]
+    fn global_table_save_reattaches_remote_comment() {
+        // Simulate the config manager saving a global table that includes [remote].
+        let table: toml::Table = "[remote]\nenabled = true\nrelay_url = \"wss://x/ws\"\n"
+            .parse()
+            .unwrap();
+        let out = serialize_global_table(&table).unwrap();
+        assert!(out.contains("RESTRICTED"), "out: {out}");
+        // The comment sits directly above the section header.
+        let comment_idx = out.find("# FlightDeck Remote").unwrap();
+        let header_idx = out.find("[remote]").unwrap();
+        assert!(comment_idx < header_idx, "comment must precede header");
     }
 
     #[test]

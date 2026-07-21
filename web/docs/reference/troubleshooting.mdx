@@ -75,6 +75,14 @@ Make sure Remote is enabled on the desktop (`[remote] enabled = true`, or run
 hasn't expired — the desktop overlay shows a countdown. Re-run *Pair Phone* for a
 fresh code. See [Pair Your Phone](/remote/pairing).
 
+<Callout type="warning">
+  If it still won't connect: the relay configured by default
+  (`relay.flightdeckai.app`) is **restricted and not accessible to the public**.
+  You must point `relay_url` at a relay you host yourself (self-hosting is
+  unsupported by the author). See
+  [FlightDeck Remote → Availability](/remote#availability).
+</Callout>
+
 ### The camera won't scan the QR
 
 If the camera is unavailable or permission is denied, tap **Enter code instead**

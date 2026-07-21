@@ -8,11 +8,26 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **About dialog.** A new "About FlightDeck" entry in the command palette opens
+  a dialog showing the version and credits — FlightDeck is built by Ruud van
+  Falier, with collaboration from Sander Langhorst.
+- **Configure FlightDeck Remote from the configuration manager.** The in-app
+  configuration manager now edits both the remote master switch
+  (`remote.enabled`) and the relay URL (`remote.relay_url`). Text fields are
+  edited inline — press `Space` to start, type, `Enter` to save, `Esc` to
+  cancel.
 
 ### Improvements
 
-- None yet.
+- **Document that the default relay is not public.** FlightDeck ships with a
+  default relay (`relay.flightdeckai.app`) that is **restricted and not
+  accessible to the public**; you can host your own relay instead, but
+  self-hosting is unsupported by the author. This is now stated across the docs
+  (with references wherever FlightDeck Remote is mentioned), in the in-app
+  configuration manager, and as a comment in the generated global `config.toml`.
+- **First-run global `config.toml` now documents the `[remote]` section.** It is
+  written with `enabled = false` and the default `relay_url`, alongside a comment
+  explaining the relay restriction.
 
 ### Bug fixes
 
