@@ -53,6 +53,7 @@
         }
       ],
       "allow_free_text": false,
+      "multi_select": false,
       "at_ms": 1752412730000
     },
     {
@@ -79,6 +80,7 @@
         }
       ],
       "allow_free_text": true,
+      "multi_select": false,
       "at_ms": 1752412740000
     }
   ]

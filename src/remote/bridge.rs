@@ -45,6 +45,14 @@ use flightdeck_remote_protocol::{
     SessionId, StateSnapshot,
 };
 
+/// How long to wait for a racing Claude `AskUserQuestion` to be ingested from
+/// the JSONL before treating a needs-input edge as a real permission prompt and
+/// synthesizing the binary allow/deny fallback (remote-control-qa1). The
+/// PreToolUse hook flips the status to `waiting` at essentially the same instant
+/// the tool_use is written, so the ingest normally wins within a tick or two;
+/// this bound only delays a genuine permission prompt, never a question.
+const PROMPT_SETTLE_MS: u64 = 750;
+
 /// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
 /// header the payload will travel under (`seq`, `sent_at_ms`), returns
 /// `(nonce_b64, ciphertext_b64)` for a [`RemoteOutbound::SendEnvelope`], or
@@ -100,6 +108,11 @@ pub struct RemoteBridge {
     arming: HashMap<SessionId, EventArming>,
     previews: HashMap<SessionId, Option<String>>,
     prev_status: HashMap<SessionId, AgentStatus>,
+    /// For Claude sessions: the clock-ms at which the session entered needs-input
+    /// with no structured prompt yet, while we wait for a possibly-racing
+    /// AskUserQuestion to be ingested from the JSONL before falling back to the
+    /// binary allow/deny prompt (remote-control-qa1). Absent once resolved.
+    needs_input_since: HashMap<SessionId, u64>,
     event_seq: u64,
     pairing: Option<PairingId>,
     snapshot_needed: bool,
@@ -123,6 +136,12 @@ pub struct RemoteBridge {
     /// restart with an established pairing, [`Self::install_channel`] seeds this
     /// from the persisted high-water mark so the phone's dedup never stalls.
     out_seq: u64,
+    /// Keystrokes queued to inject into a session's primary PTY after a short
+    /// delay: `(session, due_ms, bytes)`. Used for Claude's multi-select submit
+    /// Enter, which must arrive AFTER the Tab-driven switch to the Confirm tab
+    /// has rendered or the Ink TUI drops it (remote-control-dc9). Flushed by
+    /// `service_remote_commands` once `due_ms` passes.
+    deferred_pty: Vec<(SessionId, u64, Vec<u8>)>,
 }
 
 impl RemoteBridge {
@@ -137,6 +156,7 @@ impl RemoteBridge {
             arming: HashMap::new(),
             previews: HashMap::new(),
             prev_status: HashMap::new(),
+            needs_input_since: HashMap::new(),
             event_seq: 0,
             pairing: None,
             snapshot_needed: true,
@@ -148,6 +168,7 @@ impl RemoteBridge {
             open,
             home: None,
             out_seq: 0,
+            deferred_pty: Vec::new(),
         }
     }
 
@@ -207,6 +228,27 @@ impl RemoteBridge {
     /// messages queued here are flushed (sealed) by [`Self::tick`].
     pub fn shells_mut(&mut self) -> &mut ShellManager {
         &mut self.shells
+    }
+
+    /// Queue keystrokes to inject into `session`'s primary PTY once `due_ms`
+    /// passes (see `deferred_pty`). Used for Claude's multi-select submit Enter.
+    pub fn enqueue_deferred_pty(&mut self, session: SessionId, due_ms: u64, bytes: Vec<u8>) {
+        self.deferred_pty.push((session, due_ms, bytes));
+    }
+
+    /// Remove and return every queued deferred PTY write whose `due_ms` is at or
+    /// before `now_ms`, as `(session, bytes)`. Order preserved.
+    pub fn take_due_deferred_pty(&mut self, now_ms: u64) -> Vec<(SessionId, Vec<u8>)> {
+        let mut due = Vec::new();
+        self.deferred_pty.retain(|(session, due_ms, bytes)| {
+            if *due_ms <= now_ms {
+                due.push((session.clone(), bytes.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        due
     }
 
     /// Tee a coalesced read of a child terminal's PTY bytes into the shell
@@ -380,15 +422,24 @@ impl RemoteBridge {
                 // Needs-input edge → capture preview + inline permission prompt.
                 let was_needs = matches!(self.prev_status.get(&sid), Some(AgentStatus::NeedsInput));
                 let now_needs = matches!(status, AgentStatus::NeedsInput);
+                // Claude asks questions via an AskUserQuestion tool_use in the
+                // JSONL (ingested above); OpenCode/Codex do not, so only Claude
+                // can race a status flip against its own transcript record.
+                let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
+                let is_claude = !is_opencode && !tab.meta.agent.eq_ignore_ascii_case("codex");
                 if now_needs && !was_needs {
-                    // Only OpenCode writes the prompt sidecar (from its injected
-                    // plugin). Read it BEFORE `on_needs_input` so a captured
-                    // structured prompt supplants the binary fallback, then remove
-                    // it so a stale prompt is never reused on a later edge. We only
-                    // ever touch the file for OpenCode sessions.
-                    let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
+                    // Read the agent's prompt sidecar BEFORE `on_needs_input` so a
+                    // captured structured prompt supplants the binary fallback:
+                    // OpenCode's plugin writes `agent-prompt.json`; Claude's
+                    // PreToolUse hook writes `agent-question.json` for an
+                    // AskUserQuestion. The sidecar is written before the status
+                    // flips to `waiting`, so it is present on this edge and the
+                    // real question shows immediately — never the binary card whose
+                    // keystroke would answer it (remote-control-qa1).
                     let sidecar = if is_opencode {
                         read_prompt_sidecar(&worktree)
+                    } else if is_claude {
+                        read_claude_question_sidecar(&worktree)
                     } else {
                         None
                     };
@@ -399,13 +450,64 @@ impl RemoteBridge {
                     if let Some(sp) = sidecar {
                         builder.set_structured_prompt(sp);
                     }
-                    let preview = builder.on_needs_input(now_ms as i64);
-                    self.previews.insert(sid.clone(), preview);
+                    if builder.has_structured_prompt() {
+                        // A structured prompt is ready now (an OpenCode sidecar, or
+                        // a Claude AskUserQuestion already ingested this tick) —
+                        // surface it immediately.
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                    } else if is_claude {
+                        // Claude is waiting but no question has been ingested yet.
+                        // It may be a real permission prompt OR an AskUserQuestion
+                        // whose JSONL line has not landed. DEFER the binary
+                        // fallback: emitting it now would show a bogus allow/deny
+                        // card whose "Allow once" keystroke ("1") the live question
+                        // selector consumes as an answer (remote-control-qa1).
+                        self.needs_input_since.insert(sid.clone(), now_ms);
+                    } else {
+                        // OpenCode/Codex: no JSONL-ingested question can race, so
+                        // the binary fallback (or sidecar) is correct immediately.
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                    }
                     if is_opencode {
                         let _ = std::fs::remove_file(prompt_sidecar_path(&worktree));
                     }
+                    if is_claude {
+                        // Consume the sidecar so a later, unrelated wait never
+                        // reuses this question.
+                        let _ = std::fs::remove_file(claude_question_sidecar_path(&worktree));
+                    }
+                } else if now_needs && was_needs {
+                    // Still waiting with a deferred Claude binary fallback: resolve
+                    // it once the AskUserQuestion has been ingested (surface the
+                    // question, no binary) or the settle window elapses (it was a
+                    // real permission prompt after all → binary now).
+                    if let Some(&since) = self.needs_input_since.get(&sid) {
+                        let builder = self
+                            .transcripts
+                            .entry(sid.clone())
+                            .or_insert_with(|| TranscriptBuilder::new(sid.clone()));
+                        if builder.has_open_prompt() {
+                            self.needs_input_since.remove(&sid);
+                            self.previews
+                                .insert(sid.clone(), builder.open_prompt_preview());
+                        } else if now_ms.saturating_sub(since) >= PROMPT_SETTLE_MS {
+                            self.needs_input_since.remove(&sid);
+                            let preview = builder.on_needs_input(now_ms as i64);
+                            self.previews.insert(sid.clone(), preview);
+                        }
+                    }
                 } else if !now_needs && was_needs {
                     self.previews.remove(&sid);
+                    self.needs_input_since.remove(&sid);
+                    // The prompt was answered (agent left needs-input) — clear the
+                    // open-prompt dedup guard so the NEXT question in this session
+                    // surfaces as a fresh prompt instead of being suppressed as a
+                    // duplicate and reusing the old frame (remote-control-dc9).
+                    if let Some(builder) = self.transcripts.get_mut(&sid) {
+                        builder.clear_open_prompt();
+                    }
                 }
 
                 // Event edge (arming always advances; grace only gates sending).
@@ -631,6 +733,10 @@ struct PromptSidecar {
     text: String,
     #[serde(default)]
     options: Vec<PromptSidecarOption>,
+    /// Whether the question accepts multiple selections (checklist). The
+    /// OpenCode runtime plugin probes `multiple`/`multiSelect` and writes this.
+    #[serde(default)]
+    multiple: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -645,6 +751,29 @@ struct PromptSidecarOption {
 /// `agent-status` file the poller reads).
 fn prompt_sidecar_path(worktree: &Path) -> PathBuf {
     worktree.join(".flightdeck").join("agent-prompt.json")
+}
+
+/// Path of the Claude AskUserQuestion sidecar within a worktree. Written by the
+/// Claude `PreToolUse`/`AskUserQuestion` hook (which pipes the hook's stdin —
+/// the `{tool_name, tool_input, …}` payload — to this file) at the instant the
+/// question is asked, BEFORE it flips the status to `waiting`. This gives the
+/// desktop the question deterministically on the needs-input edge, rather than
+/// waiting for Claude to write the tool_use to its JSONL — which it does only
+/// AFTER the user answers, so the binary fallback would otherwise win the race
+/// and its "Allow" keystroke would answer the live question (remote-control-qa1).
+fn claude_question_sidecar_path(worktree: &Path) -> PathBuf {
+    worktree.join(".flightdeck").join("agent-question.json")
+}
+
+/// Read and parse the Claude AskUserQuestion sidecar into a [`StructuredPrompt`],
+/// or `None` when it is absent/malformed. The file holds the raw PreToolUse hook
+/// payload, so the `tool_input` field is the AskUserQuestion input the transcript
+/// parser already understands.
+fn read_claude_question_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
+    let raw = std::fs::read_to_string(claude_question_sidecar_path(worktree)).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let input = parsed.get("tool_input")?;
+    crate::remote::transcript::parse_ask_user_question(input)
 }
 
 /// Classify a permission option's button label into the binary choice it maps
@@ -700,6 +829,7 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 command: parsed.text,
                 options,
                 allow_free_text: true,
+                multi_select: parsed.multiple,
             })
         }
         // Permissions are binary. Build a structured prompt only when every
@@ -720,6 +850,8 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 command: parsed.text,
                 options,
                 allow_free_text: false,
+                // Permissions are always a single binary choice.
+                multi_select: false,
             })
         }
         _ => None,

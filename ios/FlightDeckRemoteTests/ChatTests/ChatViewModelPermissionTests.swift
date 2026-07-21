@@ -56,11 +56,12 @@ import Foundation
 
         #expect(model.permissionActionState(promptId) == .sending(.choice(.allowOnce)))
         #expect(sender.sends.count == 1)
-        if case let .permissionDecision(sessionId, pid, choice, optionIndex, freeText) = sender.sends.first?.body {
+        if case let .permissionDecision(sessionId, pid, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body {
             #expect(sessionId == Wire.SessionId("s1"))
             #expect(pid == promptId)
             #expect(choice == .allowOnce)
             #expect(optionIndex == nil)
+            #expect(optionIndices == nil)
             #expect(freeText == nil)
         } else {
             Issue.record("expected .permissionDecision")
@@ -119,12 +120,36 @@ import Foundation
         model.decidePermission(promptId: promptId, optionIndex: 2, label: "Redis")
 
         #expect(model.permissionActionState(promptId) == .sending(.option(index: 2, label: "Redis")))
-        guard case let .permissionDecision(_, _, choice, optionIndex, freeText) = sender.sends.first?.body else {
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
             Issue.record("expected .permissionDecision"); return
         }
         #expect(choice == nil)
         #expect(optionIndex == 2)
+        #expect(optionIndices == nil)
         #expect(freeText == nil)
+    }
+
+    @Test func decideOptionIndicesSendsOptionIndicesNotOptionIndex() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, optionIndices: [0, 2],
+                               labels: ["Tests", "Fmt"])
+
+        #expect(model.permissionActionState(promptId)
+                == .sending(.options(indices: [0, 2], labels: ["Tests", "Fmt"])))
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
+            Issue.record("expected .permissionDecision"); return
+        }
+        #expect(choice == nil)
+        #expect(optionIndex == nil)
+        #expect(optionIndices == [0, 2])
+        #expect(freeText == nil)
+    }
+
+    @Test func decideOptionIndicesIgnoresEmptySelection() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, optionIndices: [], labels: [])
+        #expect(sender.sends.isEmpty)
+        #expect(model.permissionActionState(promptId) == .idle)
     }
 
     @Test func decideFreeTextSendsFreeTextNotChoice() {
@@ -133,11 +158,12 @@ import Foundation
 
         #expect(model.permissionActionState(promptId)
                 == .sending(.freeText("Use CockroachDB instead.")))
-        guard case let .permissionDecision(_, _, choice, optionIndex, freeText) = sender.sends.first?.body else {
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
             Issue.record("expected .permissionDecision"); return
         }
         #expect(choice == nil)
         #expect(optionIndex == nil)
+        #expect(optionIndices == nil)
         #expect(freeText == "Use CockroachDB instead.")
     }
 

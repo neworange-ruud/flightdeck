@@ -58,6 +58,31 @@ fn reconstructs_user_assistant_and_activity() {
 }
 
 #[test]
+fn resolve_source_normalizes_a_base_branch_trailing_dot_cwd() {
+    // A base-branch agent's worktree is `repo_root.join(".")` → `…/wt/.`. Claude
+    // records its session under the CLEAN `…/wt`, so resolve_source must find it
+    // despite the trailing `.`, or the transcript stays permanently empty
+    // (remote-control-ou3). The mangled dir below matches the clean path only.
+    let home = tempfile::tempdir().unwrap();
+    let claude_dir = home.path().join(".claude/projects/-home-u-wt");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+
+    let dotted = std::path::Path::new("/home/u/wt/.");
+    match resolve_source("claude", dotted, home.path()) {
+        Some(TranscriptSource::Jsonl { path, format }) => {
+            assert_eq!(format, SessionFormat::Claude);
+            assert!(path.ends_with("11111111-1111-1111-1111-111111111111.jsonl"));
+        }
+        other => panic!("expected a Claude Jsonl source for a trailing-dot cwd, got {other:?}"),
+    }
+}
+
+#[test]
 fn skips_tool_results_meta_and_sidechain() {
     let f = NamedTempFile::new().unwrap();
     append(
@@ -251,13 +276,20 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
     let mut b = builder();
     b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
 
-    // No Activity pill (nor any other item) is emitted for the AskUserQuestion
-    // block — it is held as a structured prompt instead.
-    assert_eq!(b.total(), 0, "AskUserQuestion emits no activity pill");
+    // The AskUserQuestion is surfaced as a Question PermissionPrompt IMMEDIATELY
+    // at ingest — not held for a later needs-input edge (remote-control-z30). No
+    // Activity pill is emitted for it.
+    assert_eq!(b.total(), 1, "AskUserQuestion emits the prompt at ingest");
 
-    // The needs-input edge surfaces it as a Question PermissionPrompt.
+    // A subsequent needs-input edge for the same (still-unanswered) question does
+    // NOT stack a second, binary prompt — it just reports the preview.
     let preview = b.on_needs_input(0);
     assert_eq!(preview.as_deref(), Some("Which database should we use?"));
+    assert_eq!(
+        b.total(),
+        1,
+        "needs-input does not duplicate the open question"
+    );
 
     match b.load(None).items.last() {
         Some(TranscriptItem::PermissionPrompt {
@@ -265,11 +297,13 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
             command,
             options,
             allow_free_text,
+            multi_select,
             ..
         }) => {
             assert_eq!(*kind, PromptKind::Question);
             assert_eq!(command, "Which database should we use?");
             assert!(*allow_free_text, "AskUserQuestion always allows free text");
+            assert!(!*multi_select, "multiSelect:false is single-select");
             assert_eq!(options.len(), 3);
             let expect = [
                 (0u32, "Postgres", "Relational, ACID"),
@@ -287,6 +321,59 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
             }
         }
         other => panic!("expected a Question PermissionPrompt, got {other:?}"),
+    }
+}
+
+const ASK_USER_QUESTION_MULTI: &str = r#"{"type":"assistant","uuid":"aqm","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which checks should run before merge?","header":"Checks","multiSelect":true,"options":[{"label":"Tests"},{"label":"Clippy"},{"label":"Fmt"}]}]}}]}}"#;
+
+#[test]
+fn ask_user_question_multi_select_sets_the_flag() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASK_USER_QUESTION_MULTI]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt {
+            kind,
+            multi_select,
+            options,
+            ..
+        }) => {
+            assert_eq!(*kind, PromptKind::Question);
+            assert!(*multi_select, "multiSelect:true is a checklist question");
+            assert_eq!(options.len(), 3);
+        }
+        other => panic!("expected a Question PermissionPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn answering_a_question_lets_a_later_needs_input_edge_prompt_again() {
+    // A question surfaced at ingest opens a prompt; a following user turn answers
+    // it (clearing the open-prompt guard) so a subsequent needs-input edge for a
+    // *new* wait synthesizes its binary prompt as usual (remote-control-z30).
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASK_USER_QUESTION, USER]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+    // Prompt (from ingest) + the user's answer.
+    assert_eq!(b.total(), 2);
+
+    // The next needs-input edge is a fresh wait: it emits the binary fallback.
+    b.on_needs_input(0);
+    assert_eq!(
+        b.total(),
+        3,
+        "a new wait after an answer emits its own prompt"
+    );
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt { kind, .. }) => {
+            assert_eq!(*kind, PromptKind::Permission);
+        }
+        other => panic!("expected a binary Permission prompt, got {other:?}"),
     }
 }
 
@@ -662,4 +749,60 @@ fn opencode_sync_reads_db_and_resets_on_session_switch() {
         vec!["user:second"],
         "switching to the newer session id resets the transcript"
     );
+}
+
+/// Regression (remote-control-dc9): once a structured prompt is answered and the
+/// bridge calls `clear_open_prompt`, the NEXT question in the same session must
+/// surface as a fresh prompt — the open-prompt dedup guard must not suppress it
+/// as a duplicate (the bug where a follow-up question reused the old frame).
+#[test]
+fn clear_open_prompt_lets_the_next_question_surface() {
+    fn question(text: &str) -> StructuredPrompt {
+        StructuredPrompt {
+            kind: PromptKind::Question,
+            command: text.to_string(),
+            options: vec![PermissionOption {
+                index: 0,
+                choice: None,
+                label: "A".to_string(),
+                description: None,
+            }],
+            allow_free_text: true,
+            multi_select: true,
+        }
+    }
+
+    let mut b = builder();
+    // Q1 captured (OpenCode sidecar style) then surfaced on the needs-input edge.
+    b.set_structured_prompt(question("Q1?"));
+    b.on_needs_input(1);
+    assert!(b.has_open_prompt());
+    let after_q1 = b.total();
+
+    // The SAME question captured again while still open must NOT re-emit.
+    b.set_structured_prompt(question("Q1?"));
+    b.on_needs_input(2);
+    assert_eq!(
+        b.total(),
+        after_q1,
+        "duplicate of the open question is deduped"
+    );
+
+    // The agent answers → the bridge clears the guard on the leaving-needs-input
+    // edge.
+    b.clear_open_prompt();
+    assert!(!b.has_open_prompt());
+
+    // A new question now surfaces as a fresh prompt (not suppressed).
+    b.set_structured_prompt(question("Q2?"));
+    b.on_needs_input(3);
+    assert_eq!(
+        b.total(),
+        after_q1 + 1,
+        "the next question surfaces after the guard is cleared"
+    );
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt { command, .. }) => assert_eq!(command, "Q2?"),
+        other => panic!("expected the new Q2 prompt, got {other:?}"),
+    }
 }

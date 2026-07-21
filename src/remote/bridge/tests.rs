@@ -6,7 +6,7 @@ use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::relay::EncryptedEnvelope;
 use flightdeck_remote_protocol::{
-    CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role, TranscriptItem,
+    CommandBody, CommandId, DesktopToPhone, PhoneCommand, PromptKind, Role, TranscriptItem,
 };
 
 use std::io::Write as _;
@@ -27,6 +27,22 @@ fn seed_claude_session(home: &std::path::Path, worktree_abs: &str, lines: &[&str
     for l in lines {
         writeln!(f, "{l}").unwrap();
     }
+}
+
+/// Append one JSONL record to the session seeded by [`seed_claude_session`],
+/// simulating the agent writing a new turn after the initial sync.
+fn append_claude_line(home: &std::path::Path, worktree_abs: &str, line: &str) {
+    let mangled: String = worktree_abs
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let path = home
+        .join(".claude")
+        .join("projects")
+        .join(mangled)
+        .join("11111111-1111-1111-1111-111111111111.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(f, "{line}").unwrap();
 }
 
 // --- fixtures --------------------------------------------------------------
@@ -261,24 +277,144 @@ fn needs_input_populates_pending_question() {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
     }
-    // Transition to needs-input.
+    // Transition to needs-input. This is a plain permission prompt (no
+    // AskUserQuestion in the JSONL), so the binary fallback — and thus its
+    // preview — is DEFERRED by PROMPT_SETTLE_MS while the bridge waits for a
+    // possibly-racing question to be ingested (remote-control-qa1). The status
+    // still flips immediately.
     set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
     let views = vec![view("proj", &app, &cache)];
-    let msgs = collect(&mut b, &views, 2_000);
-    let update = msgs
+    let early = collect(&mut b, &views, 2_000);
+    let early_update = early
         .iter()
         .find_map(|m| match m {
             DesktopToPhone::StatusUpdate(u) => Some(u),
             _ => None,
         })
         .expect("status update");
-    let d = &update.updates[0];
-    assert_eq!(d.status, AgentStatus::NeedsInput);
+    assert_eq!(early_update.updates[0].status, AgentStatus::NeedsInput);
+    assert!(
+        early_update.updates[0].pending_question.is_none(),
+        "the binary preview is deferred until the settle window elapses"
+    );
+
+    // After the settle window (no question arrived), the binary fallback is
+    // synthesized and its preview reaches the phone.
+    let views = vec![view("proj", &app, &cache)];
+    let settled = collect(&mut b, &views, 2_000 + super::PROMPT_SETTLE_MS + 1);
+    let d = settled
+        .iter()
+        .find_map(|m| match m {
+            DesktopToPhone::StatusUpdate(u) => u.updates.first(),
+            _ => None,
+        })
+        .expect("status update after settle");
     assert!(d
         .pending_question
         .as_deref()
         .unwrap()
         .contains("installer script"));
+}
+
+#[test]
+fn ask_user_question_racing_the_status_flip_is_not_shown_as_a_binary_prompt() {
+    // Reproduces remote-control-qa1's premature-answer bug: the PreToolUse hook
+    // flips status to waiting before the AskUserQuestion tool_use is written to
+    // the JSONL. The bridge must NOT emit the binary allow/deny fallback in that
+    // window (its "Allow once" keystroke would be consumed by the live question
+    // selector as an answer); it must surface the real Question once ingested.
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    seed_claude_session(
+        home.path(),
+        worktree,
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Working on it."}]}}"#,
+        ],
+    );
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let _ = collect(&mut b, &views, 1_000);
+    }
+
+    // Status flips to waiting while the question is still racing → no prompt.
+    set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let early = collect(&mut b, &views, 2_000);
+        assert!(
+            !early.iter().any(|m| matches!(m,
+                DesktopToPhone::TranscriptAppend(f)
+                    if f.items.iter().any(|i| matches!(i, TranscriptItem::PermissionPrompt { .. })))),
+            "no prompt may be emitted while the AskUserQuestion is still racing"
+        );
+    }
+
+    // The AskUserQuestion lands; the next tick surfaces it as a Question — never
+    // a binary allow/deny — and still within the settle window.
+    append_claude_line(
+        home.path(),
+        worktree,
+        r#"{"type":"assistant","uuid":"aq1","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Pizza or sushi?","header":"Lunch","multiSelect":false,"options":[{"label":"Pizza"},{"label":"Sushi"}]}]}}]}}"#,
+    );
+    let views = vec![view("proj", &app, &cache)];
+    let msgs = collect(&mut b, &views, 2_100);
+    let (kind, free_text) = msgs
+        .iter()
+        .filter_map(|m| match m {
+            DesktopToPhone::TranscriptAppend(f) => Some(f),
+            _ => None,
+        })
+        .flat_map(|f| f.items.iter())
+        .find_map(|i| match i {
+            TranscriptItem::PermissionPrompt {
+                kind,
+                allow_free_text,
+                ..
+            } => Some((*kind, *allow_free_text)),
+            _ => None,
+        })
+        .expect("the question should now be surfaced");
+    assert_eq!(
+        kind,
+        PromptKind::Question,
+        "surfaced as a Question, not binary"
+    );
+    assert!(free_text, "AskUserQuestion allows a free-text answer");
+}
+
+#[test]
+fn reads_claude_question_sidecar_into_a_structured_prompt() {
+    // The PreToolUse hook pipes its stdin (the AskUserQuestion payload) to
+    // `.flightdeck/agent-question.json`; the bridge parses `tool_input` from it
+    // into a Question prompt on the needs-input edge (remote-control-qa1).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".flightdeck")).unwrap();
+    std::fs::write(
+        dir.path().join(".flightdeck/agent-question.json"),
+        r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Lunch?","header":"L","options":[{"label":"Pizza","description":"cheesy"},{"label":"Sushi"}]}]}}"#,
+    )
+    .unwrap();
+
+    let sp = super::read_claude_question_sidecar(dir.path()).expect("parsed sidecar");
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert_eq!(sp.command, "Lunch?");
+    assert_eq!(sp.options.len(), 2);
+    assert_eq!(sp.options[0].label, "Pizza");
+    assert!(
+        sp.allow_free_text,
+        "AskUserQuestion allows a free-text answer"
+    );
+
+    // A missing/blank sidecar yields no prompt (→ binary fallback for a real
+    // permission).
+    let empty = tempfile::tempdir().unwrap();
+    assert!(super::read_claude_question_sidecar(empty.path()).is_none());
 }
 
 // --- transcript reconstruction from the session file -----------------------
@@ -593,6 +729,10 @@ fn sidecar_question_surfaces_structured_question_prompt() {
     let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
     assert_eq!(sp.kind, PromptKind::Question);
     assert!(sp.allow_free_text, "questions allow a free-text answer");
+    assert!(
+        !sp.multi_select,
+        "no `multiple` field defaults to single-select"
+    );
     assert_eq!(sp.command, "Which framework?");
     assert_eq!(sp.options.len(), 3);
     assert_eq!(sp.options[0].index, 0);
@@ -623,6 +763,37 @@ fn sidecar_question_surfaces_structured_question_prompt() {
         }
         other => panic!("expected a PermissionPrompt, got {other:?}"),
     }
+}
+
+#[test]
+fn sidecar_multi_select_question_sets_the_flag() {
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"Which checks?","multiple":true,"options":[
+            {"label":"Tests"},{"label":"Clippy"}]}"#,
+    );
+
+    let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert!(sp.multi_select, "`multiple`:true is a checklist question");
+    assert_eq!(sp.options.len(), 2);
+}
+
+#[test]
+fn sidecar_permission_is_never_multi_select() {
+    // A permission sidecar with a stray `multiple` flag stays single-choice:
+    // permissions are always a binary decision.
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"Run tests?","multiple":true,"options":[
+            {"label":"Allow"},{"label":"Deny"}]}"#,
+    );
+
+    let sp = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Permission);
+    assert!(!sp.multi_select, "permissions are never multi-select");
 }
 
 #[test]
@@ -689,4 +860,22 @@ fn unclear_permission_and_empty_options_fall_back_to_binary() {
     // Malformed JSON -> None.
     write_sidecar(wt.path(), "{not json");
     assert!(read_prompt_sidecar(wt.path()).is_none());
+}
+
+#[test]
+fn deferred_pty_writes_fire_only_once_due() {
+    // Claude's multi-select submit Enter is queued with a future due time and
+    // must not flush early, then flush exactly once when the deadline passes
+    // (remote-control-dc9).
+    let mut b = RemoteBridge::passthrough(0);
+    let sid = SessionId::new("s1");
+    b.enqueue_deferred_pty(sid.clone(), 1_000, b"\r".to_vec());
+
+    // Before the deadline: nothing is due.
+    assert!(b.take_due_deferred_pty(999).is_empty());
+    // At/after the deadline: the write is returned, once.
+    let due = b.take_due_deferred_pty(1_000);
+    assert_eq!(due, vec![(sid, b"\r".to_vec())]);
+    // Already drained — a later poll yields nothing.
+    assert!(b.take_due_deferred_pty(2_000).is_empty());
 }

@@ -96,6 +96,7 @@ enum ChatFixtures {
                     Wire.PermissionOption(index: 1, choice: .deny, label: "Deny"),
                 ],
                 allowFreeText: false,
+                multiSelect: false,
                 atMs: base + 20 * 60 * 1000 + 8_000),
         ]
     }

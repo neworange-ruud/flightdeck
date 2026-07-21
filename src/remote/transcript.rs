@@ -21,10 +21,16 @@
 //!   pill (summarised by tool);
 //! * tool results, sidechain (subagent) turns, and meta records are skipped.
 //!
-//! Permission prompts are **not** in the session file; the bridge calls
-//! [`TranscriptBuilder::on_needs_input`] when the status hook reports the agent
-//! stopped for input, and we synthesize an inline
-//! [`TranscriptItem::PermissionPrompt`] whose preview is the agent's last prose.
+//! Answerable prompts surface two ways. A Claude `AskUserQuestion` **is** in the
+//! session file (a tool_use), so it is emitted as an inline
+//! [`TranscriptItem::PermissionPrompt`] the moment it is ingested — it does not
+//! wait for a status edge, which for some agents/hooks never flips to `waiting`
+//! and would otherwise leave the question invisible on the phone
+//! (remote-control-z30). Binary permission prompts are **not** in the session
+//! file; the bridge calls [`TranscriptBuilder::on_needs_input`] when the status
+//! hook reports the agent stopped for input, and we synthesize an inline prompt
+//! whose preview is the agent's last prose (OpenCode passes a captured
+//! structured prompt through the same edge via [`TranscriptBuilder::set_structured_prompt`]).
 //!
 //! Three agents are supported, resolved by [`resolve_source`]:
 //! * **Claude Code** — JSONL file, `type=user|assistant`, `message.content`
@@ -72,11 +78,38 @@ pub enum TranscriptSource {
     OpenCode { db: PathBuf, directory: String },
 }
 
+/// Drop `.` (current-dir) components from a path. A base-branch agent
+/// (`runs_on_base`) has `worktree_path_relative == "."`, so the desktop builds
+/// its worktree as `repo_root.join(".")` → `…/repo/.`. Claude and OpenCode
+/// canonicalize their cwd before recording a session, so they store it under the
+/// clean `…/repo`. Left as-is, the string-mangled Claude project dir gains a
+/// spurious trailing `-` (and the OpenCode `directory` a trailing `/.`) and never
+/// matches what the agent wrote — so no session file is found and the transcript
+/// stays permanently empty (remote-control-ou3). Stripping `CurDir` mirrors what
+/// the agent's own `getcwd` does, without resolving symlinks (which would risk
+/// diverging from the path real worktrees already match).
+fn clean_cwd(cwd: &Path) -> PathBuf {
+    let cleaned: PathBuf = cwd
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
 /// Resolve where `agent`'s conversation for `cwd` lives (store rooted at
 /// `home`), or `None` if there is nothing to read yet. Claude/Codex resolve to a
 /// JSONL file via [`crate::agents::resume`]; OpenCode resolves to its SQLite DB
 /// (remote-control-fyj) when that DB exists.
 pub fn resolve_source(agent: &str, cwd: &Path, home: &Path) -> Option<TranscriptSource> {
+    // Normalize away `.`/current-dir components so a base-branch agent's
+    // `repo_root/.` cwd matches the clean path the agent recorded its session
+    // under (remote-control-ou3).
+    let cwd = clean_cwd(cwd);
+    let cwd = cwd.as_path();
     if let Some((path, format)) = crate::agents::resume::newest_session_path(agent, cwd, home) {
         return Some(TranscriptSource::Jsonl { path, format });
     }
@@ -105,6 +138,9 @@ pub struct StructuredPrompt {
     pub options: Vec<PermissionOption>,
     /// Whether the phone may submit a free-text answer ("Type your own answer").
     pub allow_free_text: bool,
+    /// Whether the phone may select multiple options (a `multiSelect` /
+    /// checklist question). `false` for permissions and single-select questions.
+    pub multi_select: bool,
 }
 
 /// Reconstructs one session's cleaned transcript by tailing its agent session
@@ -135,8 +171,14 @@ pub struct TranscriptBuilder {
     /// Monotonic prompt counter for stable PromptIds.
     prompt_seq: u64,
     /// A structured prompt captured during ingest, consumed (and cleared) by the
-    /// next [`Self::on_needs_input`] edge in place of the binary fallback.
+    /// next [`Self::on_needs_input`] edge in place of the binary fallback. Used
+    /// by the OpenCode sidecar path, whose prompt is not in the tailed store.
     pending_structured: Option<StructuredPrompt>,
+    /// Preview of a structured prompt already surfaced *at ingest time* (a Claude
+    /// `AskUserQuestion`, which lives in the session file) and not yet answered.
+    /// While `Some`, the needs-input edge must NOT synthesize a second (binary)
+    /// prompt for the same wait — it just reports this preview (remote-control-z30).
+    open_prompt: Option<String>,
 }
 
 impl TranscriptBuilder {
@@ -156,6 +198,7 @@ impl TranscriptBuilder {
             sent_upto: 0,
             prompt_seq: 0,
             pending_structured: None,
+            open_prompt: None,
         }
     }
 
@@ -163,6 +206,40 @@ impl TranscriptBuilder {
     /// [`Self::on_needs_input`] edge (instead of the binary fallback).
     pub fn set_structured_prompt(&mut self, p: StructuredPrompt) {
         self.pending_structured = Some(p);
+    }
+
+    /// Whether a structured prompt is ready to surface right now — either
+    /// captured and awaiting the needs-input edge (`pending_structured`, e.g. the
+    /// OpenCode sidecar) or already emitted at ingest and unanswered
+    /// (`open_prompt`, a Claude AskUserQuestion). The bridge uses this to decide
+    /// whether to surface a prompt immediately or defer the binary fallback.
+    pub fn has_structured_prompt(&self) -> bool {
+        self.pending_structured.is_some() || self.open_prompt.is_some()
+    }
+
+    /// Whether an ingest-time structured prompt (a Claude AskUserQuestion) is
+    /// currently emitted and unanswered — the signal that a deferred binary
+    /// fallback must be abandoned because the real question has now arrived.
+    pub fn has_open_prompt(&self) -> bool {
+        self.open_prompt.is_some()
+    }
+
+    /// The preview (question text) of the currently open ingest-time prompt.
+    pub fn open_prompt_preview(&self) -> Option<String> {
+        self.open_prompt.clone()
+    }
+
+    /// Clear the open-prompt dedup guard (and any captured-but-unemitted
+    /// prompt) once the current prompt has been answered — i.e. the agent left
+    /// needs-input. Without this, the guard that stops ONE question emitting
+    /// twice (ingest vs sidecar) also suppresses the NEXT question in the
+    /// session as a false duplicate, so a follow-up question reuses the old
+    /// answered frame instead of surfacing anew (remote-control-dc9). Claude
+    /// also clears `open_prompt` when the answer's user-turn record is ingested;
+    /// OpenCode has no such record, so the bridge calls this on the status edge.
+    pub fn clear_open_prompt(&mut self) {
+        self.open_prompt = None;
+        self.pending_structured = None;
     }
 
     /// Ingest any new conversation from `source`, dispatching to the file-tail
@@ -261,6 +338,7 @@ impl TranscriptBuilder {
         self.total = 0;
         self.sent_upto = 0;
         self.pending_structured = None;
+        self.open_prompt = None;
         // `prompt_seq` intentionally keeps advancing so PromptIds stay unique.
     }
 
@@ -300,6 +378,9 @@ impl TranscriptBuilder {
                 if o.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     return;
                 }
+                // A user turn answers any prompt that was awaiting input, so an
+                // open ingest-time question is now resolved (remote-control-z30).
+                self.open_prompt = None;
                 let content = o.get("message").and_then(|m| m.get("content"));
                 if let Some(text) = extract_user_text(content) {
                     let text = text.trim().to_string();
@@ -345,12 +426,23 @@ impl TranscriptBuilder {
                             let empty = Value::Null;
                             let input = b.get("input").unwrap_or(&empty);
                             // A Claude `AskUserQuestion` is an answerable prompt, not
-                            // an activity: capture it as a structured prompt for the
-                            // next needs-input edge and emit NO activity pill. If the
-                            // JSON is missing/oddly-typed, fall through to the pill.
+                            // an activity. It lives in the session file, so surface it
+                            // as a Question prompt IMMEDIATELY rather than waiting for a
+                            // needs-input status edge — that edge depends on a status
+                            // hook flipping to `waiting`, which does not fire for
+                            // AskUserQuestion on every agent, leaving the question
+                            // invisible on the phone (remote-control-z30). Emit no
+                            // activity pill. If the JSON is missing/oddly-typed, fall
+                            // through to the pill.
                             if name == "AskUserQuestion" {
                                 if let Some(sp) = parse_ask_user_question(input) {
-                                    self.set_structured_prompt(sp);
+                                    // Skip if this question was already surfaced
+                                    // (the PreToolUse sidecar delivers it before the
+                                    // JSONL record lands) so it is not shown twice
+                                    // (remote-control-qa1). Either way, emit no pill.
+                                    if self.open_prompt.is_none() {
+                                        self.emit_structured_prompt(sp, at_ms);
+                                    }
                                     continue;
                                 }
                             }
@@ -546,29 +638,49 @@ impl TranscriptBuilder {
         }
     }
 
+    /// Emit a structured prompt as an inline [`TranscriptItem::PermissionPrompt`]
+    /// now, minting a fresh prompt id, and remember its preview as the currently
+    /// open prompt. Shared by the ingest-time AskUserQuestion capture and the
+    /// needs-input edge (OpenCode sidecar). Returns the preview.
+    fn emit_structured_prompt(&mut self, sp: StructuredPrompt, at_ms: i64) -> Option<String> {
+        self.prompt_seq += 1;
+        let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
+        let item_id = ItemId::new(format!("{}:prompt:{}", self.session_id, self.prompt_seq));
+        let preview = truncate_preview(&sp.command);
+        self.push_item(TranscriptItem::PermissionPrompt {
+            item_id,
+            prompt_id,
+            kind: sp.kind,
+            command: sp.command,
+            options: sp.options,
+            allow_free_text: sp.allow_free_text,
+            multi_select: sp.multi_select,
+            at_ms,
+        });
+        self.open_prompt = preview.clone();
+        preview
+    }
+
     /// The bridge calls this on the working/idle → needs-input edge: synthesize
     /// an inline permission prompt whose preview is the agent's last prose (the
     /// session file has no permission records). Returns the preview (if any).
     pub fn on_needs_input(&mut self, at_ms: i64) -> Option<String> {
+        // If a structured prompt was already surfaced (a Claude AskUserQuestion
+        // emitted at ingest), do NOT emit anything else for the same wait — and
+        // discard any duplicate captured prompt (e.g. the sidecar for the SAME
+        // question) so the phone never sees it twice (remote-control-qa1).
+        if let Some(preview) = self.open_prompt.clone() {
+            self.pending_structured = None;
+            return Some(preview);
+        }
+        // Otherwise a captured structured prompt (the OpenCode sidecar, or the
+        // Claude AskUserQuestion sidecar) supplants the binary allow/deny fallback.
+        if let Some(sp) = self.pending_structured.take() {
+            return self.emit_structured_prompt(sp, at_ms);
+        }
         self.prompt_seq += 1;
         let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
         let item_id = ItemId::new(format!("{}:prompt:{}", self.session_id, self.prompt_seq));
-        // A structured prompt captured during ingest (e.g. AskUserQuestion) is
-        // surfaced here in place of the synthesized binary allow/deny fallback,
-        // using the SAME prompt_seq/item_id bump.
-        if let Some(sp) = self.pending_structured.take() {
-            let preview = truncate_preview(&sp.command);
-            self.push_item(TranscriptItem::PermissionPrompt {
-                item_id,
-                prompt_id,
-                kind: sp.kind,
-                command: sp.command,
-                options: sp.options,
-                allow_free_text: sp.allow_free_text,
-                at_ms,
-            });
-            return preview;
-        }
         let preview = self.build_preview();
         self.push_item(TranscriptItem::PermissionPrompt {
             item_id,
@@ -590,6 +702,7 @@ impl TranscriptBuilder {
                 },
             ],
             allow_free_text: false,
+            multi_select: false,
             at_ms,
         });
         preview
@@ -696,11 +809,11 @@ fn truncate_preview(text: &str) -> Option<String> {
 }
 
 /// Parse a Claude `AskUserQuestion` tool_use `input` into a [`StructuredPrompt`]
-/// (v1: the primary question only, `questions[0]`). Returns `None` — so the
+/// (the primary question only, `questions[0]`). Returns `None` — so the
 /// caller falls back to a normal activity pill — when the shape is missing or
-/// oddly typed (no question text, or no options with labels). `multiSelect` is
-/// treated as single-select for v1.
-fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
+/// oddly typed (no question text, or no options with labels). The question's
+/// `multiSelect` bool becomes [`StructuredPrompt::multi_select`].
+pub(crate) fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
     let question = input
         .get("questions")
         .and_then(Value::as_array)
@@ -733,11 +846,16 @@ fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
     if options.is_empty() {
         return None;
     }
+    let multi_select = question
+        .get("multiSelect")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(StructuredPrompt {
         kind: PromptKind::Question,
         command,
         options,
         allow_free_text: true,
+        multi_select,
     })
 }
 

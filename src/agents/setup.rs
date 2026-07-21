@@ -180,6 +180,7 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
     "Stop": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "StopFailure": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
+    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && { cat > .flightdeck/agent-question.json; printf 'waiting\\n' >> .flightdeck/agent-status; }; exit 0"}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'working\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "Notification": [
       {"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]},
@@ -208,26 +209,49 @@ export const FlightDeckStatus = async ({ directory, worktree }) => {
   const writePrompt = (event) => {
     try {
       if (!existsSync(fdDir)) return;
+      // Capture the raw event so the exact schema can be inspected/parsed even
+      // if the normalization below misses a field (remote-control-qa1). Not
+      // consumed by the desktop; overwritten each prompt.
+      try {
+        writeFileSync(
+          join(fdDir, "agent-prompt.debug.json"),
+          JSON.stringify({ type: event.type, properties: event.properties }, null, 2),
+        );
+      } catch (_) {}
       const p = event.properties || {};
       const kind = event.type === "question.asked" ? "question" : "permission";
-      const m = p.metadata || {};
-      const text = p.question ?? p.title ?? p.text ?? m.title ?? m.text ?? "";
-      const raw = Array.isArray(p.options)
-        ? p.options
-        : Array.isArray(m.options)
-          ? m.options
-          : [];
-      const options = raw.map((o) =>
+      // OpenCode's question payload uses `questions[]` (each with `options`/
+      // `choices` of `{label,value,hint}`) and a `multiple` flag; a permission
+      // uses top-level `title`/`options`. Probe both, and the nested `question`
+      // object, so real options reach the phone instead of an empty card.
+      const q = Array.isArray(p.questions)
+        ? p.questions[0] || {}
+        : p.question && typeof p.question === "object"
+          ? p.question
+          : p;
+      const text =
+        q.question ?? q.title ?? q.header ?? p.title ?? p.text ?? p.prompt ?? "";
+      const rawOpts = Array.isArray(q.options)
+        ? q.options
+        : Array.isArray(q.choices)
+          ? q.choices
+          : Array.isArray(p.options)
+            ? p.options
+            : Array.isArray(p.choices)
+              ? p.choices
+              : [];
+      const options = rawOpts.map((o) =>
         o && typeof o === "object"
           ? {
-              label: String(o.label ?? o.title ?? o.text ?? o.value ?? ""),
-              description: o.description ?? o.hint ?? o.detail ?? undefined,
+              label: String(o.label ?? o.title ?? o.value ?? o.text ?? ""),
+              description: o.hint ?? o.description ?? o.detail ?? undefined,
             }
           : { label: String(o) },
       );
+      const multiple = Boolean(q.multiple ?? q.multiSelect ?? p.multiple ?? false);
       writeFileSync(
         join(fdDir, "agent-prompt.json"),
-        JSON.stringify({ kind, text: String(text), options }),
+        JSON.stringify({ kind, text: String(text), options, multiple }),
       );
     } catch (_) {}
   };
@@ -397,6 +421,17 @@ const CLAUDE_SETTINGS: &str = r##"{
           {
             "type": "command",
             "command": "r=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'waiting\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && { cat > \"$r/.flightdeck/agent-question.json\" 2>/dev/null; printf 'waiting\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; }; exit 0"
           }
         ]
       }
@@ -596,8 +631,23 @@ mod tests {
                 "/repo/.flightdeck/runtime/status/claude/hooks/hooks.json",
             ))
             .unwrap();
-        serde_json::from_str::<serde_json::Value>(&hooks).expect("valid Claude hooks JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&hooks).expect("valid Claude hooks JSON");
         assert!(hooks.contains("UserPromptSubmit"));
+        // AskUserQuestion must flip the agent to `waiting` (remote-control-z30):
+        // Claude fires no PermissionRequest for a question, so a PreToolUse hook
+        // matching the tool is what surfaces the wait to the phone.
+        let pre = &parsed["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "AskUserQuestion");
+        let pre_cmd = pre["hooks"][0]["command"].as_str().unwrap_or_default();
+        assert!(pre_cmd.contains("waiting"), "must flip status to waiting");
+        // Must also capture the hook's stdin (the AskUserQuestion tool_input) to
+        // the question sidecar the bridge reads, so the phone gets the real
+        // question deterministically instead of a racing binary card (qa1).
+        assert!(
+            pre_cmd.contains("agent-question.json") && pre_cmd.contains("cat >"),
+            "PreToolUse must pipe stdin to the question sidecar"
+        );
         let manifest = fs
             .file_contents(Path::new(
                 "/repo/.flightdeck/runtime/status/claude/.claude-plugin/plugin.json",

@@ -48,6 +48,9 @@ enum PermissionAnswer: Equatable, Sendable {
     /// A selected Question option, by index — `label` is carried along purely
     /// for display (the wire only sends the index).
     case option(index: Int, label: String)
+    /// The selected options of a multi-select (checklist) Question, by index —
+    /// `labels` (in the same order as `indices`) are carried for display only.
+    case options(indices: [Int], labels: [String])
     /// A typed "Type your own answer" reply.
     case freeText(String)
 
@@ -59,6 +62,8 @@ enum PermissionAnswer: Equatable, Sendable {
             return choice == .allowOnce ? "Allowed ✓" : "Denied ✕"
         case let .option(_, label):
             return "Answered “\(label)” ✓"
+        case let .options(_, labels):
+            return "Answered “\(labels.joined(separator: ", "))” ✓"
         case let .freeText(text):
             return "Answered “\(text)” ✓"
         }

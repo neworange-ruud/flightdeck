@@ -35,6 +35,9 @@ struct FocusModePresentation: Equatable, Sendable {
     let pendingPromptId: Wire.PromptId?
     /// The pending prompt's decision options (Allow once / Deny).
     let options: [Wire.PermissionOption]
+    /// Whether the pending prompt is a multi-select checklist (toggle several
+    /// then submit) rather than a single tap-to-submit choice.
+    let multiSelect: Bool
     /// The condensed history, oldest → newest, ending with the pending "now".
     let timeline: [FocusTimelineEntry]
 
@@ -59,9 +62,11 @@ enum FocusMode {
 
         var command: String?
         var options: [Wire.PermissionOption] = []
-        if case let .permissionPrompt(_, _, _, cmd, opts, _, _)? = pendingItem {
+        var multiSelect = false
+        if case let .permissionPrompt(_, _, _, cmd, opts, _, multi, _)? = pendingItem {
             command = cmd
             options = opts
+            multiSelect = multi
         }
 
         // Keep the most recent slice, condense each, and mark the pending one.
@@ -81,6 +86,7 @@ enum FocusMode {
             pendingPromptId: currentPending == nil ? nil
                 : pendingItem?.permissionPromptId,
             options: options,
+            multiSelect: multiSelect,
             timeline: timeline)
     }
 
@@ -95,7 +101,7 @@ enum FocusMode {
             return firstLine(ChatMarkdown.plainText(text), budget: proseCharBudget)
         case let .activity(_, summary, _, _, _, _):
             return summary
-        case let .permissionPrompt(_, _, _, command, _, _, _):
+        case let .permissionPrompt(_, _, _, command, _, _, _, _):
             return "Wants to run \(command)"
         }
     }

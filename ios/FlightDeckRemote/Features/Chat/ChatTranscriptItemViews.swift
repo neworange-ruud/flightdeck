@@ -60,9 +60,10 @@ struct TranscriptRowView: View {
             ActivityPillView(index: row.index, summary: summary, detail: detail,
                              prose: body, kind: kind, isExpanded: isExpanded,
                              onToggle: onToggle)
-        case let .permissionPrompt(_, promptId, kind, command, options, allowFreeText, _):
+        case let .permissionPrompt(_, promptId, kind, command, options, allowFreeText, multiSelect, _):
             PermissionPromptCard(promptId: promptId, kind: kind, command: command,
                                  options: options, allowFreeText: allowFreeText,
+                                 multiSelect: multiSelect,
                                  isPending: isPending,
                                  actionState: permissionState,
                                  isActionable: permissionActionable,
@@ -256,6 +257,9 @@ struct PermissionPromptCard: View {
     let command: String
     let options: [Wire.PermissionOption]
     let allowFreeText: Bool
+    /// Whether the prompt is a checklist (several options selected then submitted
+    /// together) rather than a single tap-to-submit choice.
+    let multiSelect: Bool
     let isPending: Bool
     let actionState: PermissionActionState
     /// Whether the options are live (current prompt + link up + no decision yet).
@@ -267,6 +271,9 @@ struct PermissionPromptCard: View {
     /// (new prompt row) always starts collapsed.
     @State private var freeTextDraft: String = ""
     @State private var freeTextExpanded = false
+    /// The set of option indices toggled on in a multi-select checklist. Local
+    /// to the card; a fresh prompt row starts with nothing selected.
+    @State private var multiSelected: Set<Int> = []
 
     /// Keep the original 2-button horizontal Allow/Deny layout only for the
     /// classic binary permission shape (visual continuity); every other shape
@@ -371,7 +378,9 @@ struct PermissionPromptCard: View {
     @ViewBuilder
     private var optionsSection: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            if isBinaryPermission {
+            if multiSelect {
+                checklist
+            } else if isBinaryPermission {
                 buttons
             } else {
                 optionList
@@ -380,6 +389,89 @@ struct PermissionPromptCard: View {
                 freeTextAffordance
             }
         }
+    }
+
+    /// The answer currently being submitted from the checklist, if any (used to
+    /// show the spinner on the Submit button while the multi-select is in flight).
+    private var multiInFlight: PermissionAnswer? {
+        if case let .sending(answer) = actionState, case .options = answer { return answer }
+        return nil
+    }
+
+    /// A multi-select (checklist) Question: each option toggles on/off, and an
+    /// explicit Submit button sends the whole set. Unlike the single-select list
+    /// (where one tap selects AND submits), nothing is sent until Submit.
+    private var checklist: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            ForEach(options, id: \.index) { option in
+                let isOn = multiSelected.contains(option.index)
+                Button {
+                    if isOn { multiSelected.remove(option.index) }
+                    else { multiSelected.insert(option.index) }
+                } label: {
+                    HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                        Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                            .font(.system(size: 20))
+                            .foregroundStyle(isOn ? Theme.accent : Theme.textMuted)
+                        VStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                            Text(option.label)
+                                .typography(Typography.bodyMedium)
+                                .foregroundStyle(Theme.textPrimary)
+                                .multilineTextAlignment(.leading)
+                            if let description = option.description, !description.isEmpty {
+                                Text(description)
+                                    .typography(Typography.caption)
+                                    .foregroundStyle(Theme.textMuted)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(Theme.Spacing.sm)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                        .fill(Theme.bgRaised)
+                )
+                .disabled(!isActionable)
+                .accessibilityIdentifier("permission-check-\(option.index)")
+                .accessibilityAddTraits(isOn ? .isSelected : [])
+            }
+            submitButton
+        }
+    }
+
+    /// The checklist's Submit control: sends the toggled-on options as one
+    /// multi-select answer. Disabled until at least one option is selected.
+    private var submitButton: some View {
+        Button {
+            let indices = options.map(\.index).filter { multiSelected.contains($0) }
+            guard !indices.isEmpty else { return }
+            let labels = options.filter { multiSelected.contains($0.index) }.map(\.label)
+            onDecide(.options(indices: indices, labels: labels))
+        } label: {
+            ZStack {
+                Text("Submit \(multiSelected.count) selected")
+                    .typography(Typography.bodyMedium)
+                    .opacity(multiInFlight == nil ? 1 : 0)
+                if multiInFlight != nil {
+                    WorkingSpinner(size: 16, lineWidth: 2, color: Theme.bgDeep)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, Theme.Spacing.sm)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Theme.bgDeep)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                .fill(Theme.accent)
+        )
+        .disabled(!isActionable || multiSelected.isEmpty)
+        .accessibilityIdentifier("permission-submit")
     }
 
     /// The classic 2-button horizontal Allow/Deny row (binary permission only).

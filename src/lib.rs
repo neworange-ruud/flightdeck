@@ -1902,6 +1902,18 @@ fn service_remote_commands(
     now_ms: u64,
     send: &mut dyn FnMut(RemoteOutbound),
 ) {
+    // Flush any deferred keystrokes now due — e.g. Claude's multi-select submit
+    // Enter, held back until the Tab-driven Confirm-tab switch has rendered so
+    // the Ink TUI does not drop it (remote-control-dc9). Re-resolve the tab
+    // since indices may have shifted during the delay.
+    for (session_id, bytes) in bridge.take_due_deferred_pty(now_ms) {
+        if let Some((pi, ti)) = resolve_primary_tab(workspace, &session_id) {
+            if let Some(p) = workspace.projects.get_mut(pi) {
+                let _ = write_primary_pty(&mut p.state, ti, &bytes);
+            }
+        }
+    }
+
     for cmd in bridge.take_pending_commands() {
         // Idempotency: a retransmitted command id is acked, never re-applied.
         if let Some(ack) = ledger.duplicate_ack(&cmd.command_id) {
@@ -1924,14 +1936,49 @@ fn service_remote_commands(
             build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
         };
         let translation = translate(&cmd.body, &index);
-        let (outcome, message) = execute_remote_translation(
-            translation,
-            workspace,
-            env,
-            now_ms,
-            first_tasks,
-            bridge.shells_mut(),
-        );
+        let (outcome, message) = match translation {
+            // Timed keystroke sequence: write the first chunk now and queue the
+            // rest at increasing due times so Claude's Ink TUI re-renders between
+            // keys (remote-control-dc9). The queued chunks flush on later ticks.
+            Translation::PtyInputSequence {
+                project,
+                tab,
+                session_id,
+                chunks,
+                step_delay_ms,
+            } => match workspace.projects.get_mut(project) {
+                None => remote_target_gone(),
+                Some(p) => {
+                    let first_ok = chunks
+                        .first()
+                        .map(|c| write_primary_pty(&mut p.state, tab, c))
+                        .unwrap_or(true);
+                    if first_ok {
+                        for (i, chunk) in chunks.iter().enumerate().skip(1) {
+                            bridge.enqueue_deferred_pty(
+                                session_id.clone(),
+                                now_ms + (i as u64) * step_delay_ms,
+                                chunk.clone(),
+                            );
+                        }
+                        (CommandOutcome::Applied, None)
+                    } else {
+                        (
+                            CommandOutcome::Failed,
+                            Some("could not write to the agent terminal".to_string()),
+                        )
+                    }
+                }
+            },
+            other => execute_remote_translation(
+                other,
+                workspace,
+                env,
+                now_ms,
+                first_tasks,
+                bridge.shells_mut(),
+            ),
+        };
         ledger.record(cmd.command_id.clone(), outcome, message.clone());
         bridge.send_ack(
             CommandAck {
@@ -1980,6 +2027,19 @@ fn poll_remote_shell_exits(bridge: &mut RemoteBridge, workspace: &Workspace) {
     }
 }
 
+/// Resolve a session id to its `(project index, tab index)` in the live
+/// workspace, or `None` if the session/tab no longer exists. Used to place a
+/// deferred PTY write on the right tab even if indices shifted during the delay.
+fn resolve_primary_tab(workspace: &Workspace, session_id: &SessionId) -> Option<(usize, usize)> {
+    workspace.projects.iter().enumerate().find_map(|(pi, p)| {
+        p.state
+            .tabs
+            .iter()
+            .position(|t| t.meta.id == session_id.as_str())
+            .map(|ti| (pi, ti))
+    })
+}
+
 /// The ack for a session/project that vanished between translation and
 /// execution (possible only if an earlier command in the same batch removed it).
 fn remote_target_gone() -> (CommandOutcome, Option<String>) {
@@ -2008,6 +2068,32 @@ fn execute_remote_translation(
             session_id,
             action,
         } => execute_shell_action(shells, workspace, env, project, tab, &session_id, action),
+
+        // PtyInputSequence is intercepted in `service_remote_commands` (which owns
+        // the deferred-write queue that spaces the chunks). If it ever reaches the
+        // generic executor — e.g. a direct test call — degrade to writing every
+        // chunk back-to-back (no inter-key spacing).
+        Translation::PtyInputSequence {
+            project,
+            tab,
+            chunks,
+            ..
+        } => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            let ok = chunks
+                .iter()
+                .all(|chunk| write_primary_pty(&mut p.state, tab, chunk));
+            if ok {
+                (CommandOutcome::Applied, None)
+            } else {
+                (
+                    CommandOutcome::Failed,
+                    Some("could not write to the agent terminal".to_string()),
+                )
+            }
+        }
 
         Translation::PtyInput {
             project,

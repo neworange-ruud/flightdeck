@@ -27,14 +27,72 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   indexed options, an `option_index` / `free_text` decision), desktop capture
   for Claude and OpenCode, the decision→keystroke mapping, and the iOS prompt
   card.
+- **FlightDeck Remote: answer multi-select (checklist) questions from the
+  phone.** When an agent asks a question that allows several answers (Claude
+  Code's `AskUserQuestion` with `multiSelect`, or an OpenCode multi-select
+  question), the phone now renders it as a checklist — toggle any number of
+  options on, then tap **Submit** to send them together. Single-select
+  questions still submit on the first tap, and binary Allow / Deny is
+  unchanged. Bumps the wire protocol to v3 (`multi_select` on the question,
+  `option_indices` on the decision) and drives the agent's TUI to toggle and
+  submit the whole set. (remote-control-dc9)
 
 ### Improvements
 
-- None yet.
+- **FlightDeck Remote: OpenCode questions surface their real options.** The
+  OpenCode status plugin read the question's options from the wrong field, so an
+  OpenCode question reached the phone as an empty Allow/Deny card. It now reads
+  OpenCode's actual payload (`questions[]` / `choices`, `label`/`value`/`hint`),
+  so the real options are offered. (remote-control-qa1)
 
 ### Bug fixes
 
-- None yet.
+- **FlightDeck Remote: a follow-up question in the same session shows as a new
+  prompt.** After you answered one question, a second question the agent asked
+  in the same session reused the first (already-answered) card instead of
+  surfacing the new one — most visible on OpenCode. The desktop now clears its
+  open-prompt de-duplication guard once a prompt is answered, so every new
+  question appears fresh. (remote-control-dc9)
+- **FlightDeck Remote: answering a multiple-choice question now selects the
+  right option.** Selecting an option on the phone drove the agent's list by
+  arrow-key navigation, which mis-landed (you picked option 1 but the agent
+  registered option 3). Claude's `AskUserQuestion` numbers its options `1..N` and
+  pressing the number selects that option directly, so the phone now sends the
+  option's number — robust to the cursor position and terminal mode. (OpenCode
+  keeps arrow navigation, encoded for its live cursor-keys mode.) (remote-control-qa1)
+- **FlightDeck Remote: base-branch agents now show a transcript at all.** An
+  agent running on the base branch (worktree `.`) had its worktree built as
+  `repo_root/.`, whose string-mangled session-store path never matched the clean
+  path Claude/OpenCode actually record under — so the desktop found no session
+  file and the phone showed nothing: no agent responses, no user messages, and
+  no questions (only an empty Allow/Deny fallback). The lookup now normalizes
+  away the trailing `.`, so these agents' conversations reach the phone. This was
+  the primary reason `main` agents appeared silent on the phone. (remote-control-ou3)
+- **FlightDeck Remote: agent questions now reach the phone reliably.** A Claude
+  Code `AskUserQuestion` used to be invisible on the phone: it was captured but
+  only surfaced on a "waiting-for-input" status edge that, for a question (as
+  opposed to a permission prompt), no status hook ever fired — so the prompt was
+  never shown, in the chat or as a row status. Questions are now emitted as an
+  answerable prompt the moment the agent asks (they live in the session file),
+  independent of the status edge, and a new Claude `PreToolUse`/`AskUserQuestion`
+  hook flips the agent to `waiting` so the row status, rollup, and notifications
+  are correct too. (remote-control-z30)
+- **FlightDeck Remote: a question no longer shows a phantom permission prompt
+  first.** Claude writes an `AskUserQuestion` to its session log only *after* it
+  is answered, so the phone used to show a generic (empty) Allow/Deny card while
+  the agent waited — and accepting it drove the live selector (its "Allow"
+  keystroke lands as an answer), marking the question answered with the wrong
+  option. The Claude `AskUserQuestion` hook now writes the question to a sidecar
+  the instant it is asked (mirroring OpenCode), so the desktop surfaces the real
+  question to the phone immediately, with no binary card in between. A genuine
+  permission prompt still shows the Allow/Deny card as before. (remote-control-qa1)
+- **FlightDeck Remote: the Projects tab now lists projects from every paired
+  Mac.** It previously bound to a single machine, so with more than one Mac
+  paired it silently hid all but one machine's projects (and could strand on an
+  abandoned session from an orphaned pairing). It now aggregates across all
+  paired machines — matching the Feed — and each project opens against the
+  machine it belongs to. The Projects and Sessions screens also gained real
+  pull-to-refresh. (remote-control-aj2)
 
 ## [1.9.0] - 2026-07-20
 

@@ -144,14 +144,64 @@ fn question_prompt_round_trips() {
             },
         ],
         allow_free_text: true,
+        multi_select: false,
         at_ms: 1752412740000,
     };
     let v = serde_json::to_value(&item).unwrap();
     assert_eq!(v["kind"], "question");
     assert_eq!(v["allow_free_text"], true);
+    assert_eq!(v["multi_select"], false);
     assert_eq!(v["options"][2]["index"], 2);
     assert!(v["options"][0].get("choice").is_none());
     assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
+}
+
+/// A multi-select (checklist) `PermissionPrompt` with `multi_select = true`
+/// survives a JSON round-trip, and a v2 payload without the field defaults to
+/// single-select.
+#[test]
+fn multi_select_question_round_trips() {
+    let item = TranscriptItem::PermissionPrompt {
+        item_id: ItemId::new("item_ms1"),
+        prompt_id: PromptId::new("prompt_ms1"),
+        kind: PromptKind::Question,
+        command: "Which checks should run before merge?".into(),
+        options: vec![
+            PermissionOption {
+                index: 0,
+                choice: None,
+                label: "Tests".into(),
+                description: None,
+            },
+            PermissionOption {
+                index: 1,
+                choice: None,
+                label: "Clippy".into(),
+                description: None,
+            },
+        ],
+        allow_free_text: false,
+        multi_select: true,
+        at_ms: 1752412740000,
+    };
+    let v = serde_json::to_value(&item).unwrap();
+    assert_eq!(v["multi_select"], true);
+    assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
+
+    // A v2 frame (no `multi_select`) parses as single-select.
+    let legacy = serde_json::json!({
+        "type": "permission_prompt",
+        "item_id": "item_legacy",
+        "prompt_id": "prompt_legacy",
+        "kind": "question",
+        "command": "Pick one.",
+        "options": [{ "index": 0, "label": "A" }],
+        "at_ms": 1752412740000i64,
+    });
+    match serde_json::from_value::<TranscriptItem>(legacy).unwrap() {
+        TranscriptItem::PermissionPrompt { multi_select, .. } => assert!(!multi_select),
+        other => panic!("expected PermissionPrompt, got {other:?}"),
+    }
 }
 
 /// A multi-option `PermissionDecision` answered by option index round-trips and
@@ -166,6 +216,7 @@ fn option_index_decision_round_trips() {
             prompt_id: PromptId::new("prompt_q1"),
             choice: None,
             option_index: Some(2),
+            option_indices: None,
             free_text: None,
         },
     };
@@ -173,6 +224,33 @@ fn option_index_decision_round_trips() {
     assert_eq!(v["type"], "permission_decision");
     assert_eq!(v["option_index"], 2);
     assert!(v.get("choice").is_none(), "binary choice must be omitted");
+    assert!(v.get("option_indices").is_none());
+    assert!(v.get("free_text").is_none());
+    assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
+}
+
+/// A multi-select `PermissionDecision` answered by option indices round-trips
+/// and omits the single-select `option_index`/`choice` fields.
+#[test]
+fn option_indices_decision_round_trips() {
+    let cmd = PhoneCommand {
+        command_id: CommandId::new("cmd_ois"),
+        issued_at_ms: 1752412811000,
+        body: CommandBody::PermissionDecision {
+            session_id: SessionId::new("sess_fix_login"),
+            prompt_id: PromptId::new("prompt_ms1"),
+            choice: None,
+            option_index: None,
+            option_indices: Some(vec![0, 2]),
+            free_text: None,
+        },
+    };
+    let v = serde_json::to_value(&cmd).unwrap();
+    assert_eq!(v["type"], "permission_decision");
+    assert_eq!(v["option_indices"][0], 0);
+    assert_eq!(v["option_indices"][1], 2);
+    assert!(v.get("choice").is_none());
+    assert!(v.get("option_index").is_none());
     assert!(v.get("free_text").is_none());
     assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
 }
@@ -188,6 +266,7 @@ fn free_text_decision_round_trips() {
             prompt_id: PromptId::new("prompt_q1"),
             choice: None,
             option_index: None,
+            option_indices: None,
             free_text: Some("Use CockroachDB instead.".into()),
         },
     };

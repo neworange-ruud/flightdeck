@@ -234,10 +234,26 @@ final class TransportCoordinator {
         handles.first { $0.pairingId == pairingId }?.client
     }
 
-    /// Transitional single-store bridge: the first active instance's store, or
-    /// the recordless `fallbackStore` when nothing is paired. Replaced by
-    /// per-`pairingId` resolution in remote-control-b8d.12.
-    var primaryStore: TransportStore { handles.first?.store ?? fallbackStore }
+    /// Transitional single-store bridge for the Projects/Shell/Settings tabs.
+    ///
+    /// Prefers a **live (connected)** instance over the mere first handle so a
+    /// stuck pairing at the front of `handles` — e.g. an orphaned pairing the
+    /// relay no longer knows, which reconnects forever without ever reaching
+    /// `auth_ok` and keeps re-seeding its stale cached snapshot — cannot mask a
+    /// healthy instance and strand the Projects tab on an abandoned session
+    /// (remote-control-aj2). Falls back to the first handle (all offline → show
+    /// its last-known cache, honestly flagged as stale) then the recordless
+    /// `fallbackStore`. Read dynamically by the Projects tab, so it re-resolves
+    /// to the live store the moment a handle finishes connecting. Fully replaced
+    /// by per-`pairingId` / aggregated resolution in remote-control-b8d.12.
+    var primaryStore: TransportStore {
+        if let live = handles.first(where: {
+            if case .connected = $0.store.linkState { return true } else { return false }
+        }) {
+            return live.store
+        }
+        return handles.first?.store ?? fallbackStore
+    }
 
     /// The store a per-instance detail screen (session/chat/monitor) should
     /// bind to, given the `pairingId` it was OPENED for (remote-control-b8d.12)

@@ -232,6 +232,11 @@ pub enum TranscriptItem {
         /// answer").
         #[serde(default)]
         allow_free_text: bool,
+        /// Whether the phone may select MULTIPLE options (a checklist /
+        /// `multiSelect` question) and submit them together. `false` (the v2
+        /// default) keeps the single-tap-submits behaviour.
+        #[serde(default)]
+        multi_select: bool,
         /// Wall-clock time (unix ms).
         at_ms: i64,
     },
@@ -463,9 +468,15 @@ pub enum CommandBody {
         /// Question by option index or free text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choice: Option<PermissionChoice>,
-        /// Selected option index (Question prompts).
+        /// Selected option index (single-select Question prompts).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         option_index: Option<u32>,
+        /// Selected option indices (multi-select / checklist Question prompts).
+        /// When present and non-empty this supersedes `option_index`. Kept
+        /// separate from `option_index` so a v2 desktop still answers the
+        /// single-select field it understands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_indices: Option<Vec<u32>>,
         /// Free-text answer ("Type your own answer").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         free_text: Option<String>,

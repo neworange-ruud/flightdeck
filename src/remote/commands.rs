@@ -278,6 +278,30 @@ pub enum Translation {
         /// The exact bytes to write.
         bytes: Vec<u8>,
     },
+    /// Write `immediate` to the session's primary terminal now, then `deferred`
+    /// Write a SEQUENCE of keystroke chunks to the session's primary terminal,
+    /// one chunk every `step_delay_ms` starting immediately. Used for Claude's
+    /// multi-select form: its Ink (React) TUI re-renders asynchronously and its
+    /// key handler closes over the current highlight index, so a burst of
+    /// navigation/toggle/submit keys races the re-render — a `Down` then `Enter`
+    /// toggles the *pre-move* option (always the first), and the submit `Enter`
+    /// arrives before the Confirm tab mounts. Spacing each keystroke lets React
+    /// re-render (and the highlight/selection settle) in between
+    /// (remote-control-dc9). `session_id` re-resolves the tab for the later
+    /// chunks, since tab indices may shift during the sequence.
+    PtyInputSequence {
+        /// Workspace project index (for the first chunk).
+        project: usize,
+        /// Tab index within the project (for the first chunk).
+        tab: usize,
+        /// Session whose primary PTY receives the later chunks.
+        session_id: SessionId,
+        /// Keystroke chunks in order; chunk 0 is written now, chunk `i` at
+        /// `now + i * step_delay_ms`.
+        chunks: Vec<Vec<u8>>,
+        /// Delay between consecutive chunks, in ms.
+        step_delay_ms: u64,
+    },
     /// Dispatch an existing app [`Command`] against the tab (the executor
     /// temporarily selects it, preserving the user's on-screen selection).
     Dispatch {
@@ -379,31 +403,126 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
 /// The keystrokes injected to select the `option_index`-th option of a
 /// multi-option (Question) prompt on a supported backend's TUI list.
 ///
-/// EMPIRICAL ASSUMPTION — **UNVERIFIED, MUST BE VALIDATED ON A LIVE BUILD.**
-/// Unlike [`permission_keystroke`] (whose per-key bindings are documented CLI
-/// shortcuts), the arrow-navigation model below is inferred from how these
-/// TUIs render selectable lists, not confirmed against a running agent. It is
-/// flagged in the s81 handoff and cannot be checked unattended.
-///
-/// The model: a Question prompt renders its options as a vertical list with
-/// the first option (index 0) focused. Moving the selection down one option is
-/// a DOWN arrow (ESC `[` `B` = `b"\x1b[B"`); Enter (`b"\r"`) activates the
-/// focused option. So selecting option `n` is `n` DOWN arrows followed by
-/// Enter; index 0 is just Enter.
-///
-/// * **Claude Code** (`AskUserQuestion`) and **OpenCode** (`question.asked`)
-///   both use this arrow-nav list model.
+/// * **Claude Code** (`AskUserQuestion`) lists its options numbered `1..N`, and
+///   pressing the **number key selects AND submits** that option outright —
+///   verified live: the binary "1" keystroke answered option 1. This is used in
+///   preference to arrow navigation because it is robust to the initial cursor
+///   position, the terminal's cursor-keys mode, and any extra trailing rows
+///   ("Type something" / "Chat about this") the list renders. Only single-digit
+///   options (`1..9`, i.e. `index < 9`) are reachable this way; a longer list
+///   falls back to arrow navigation. Fixes the phone answering option 1 but the
+///   agent registering option 3 (remote-control-qa1).
+/// * **OpenCode** (`question.asked`) uses arrow navigation: from the first
+///   option focused, `n` DOWN arrows then Enter select option `n`. DOWN is the
+///   CSI form `ESC [ B` — the exact bytes the desktop's own keyboard handler
+///   sends for the Down key (see `tui::input`), which both agents accept. (An
+///   earlier SS3 `ESC O B` form, gated on the terminal's DECCKM state, was
+///   WRONG: the desktop is not DECCKM-aware, so its physical arrows are always
+///   CSI; injecting SS3 for a DECCKM app like Claude was silently ignored —
+///   remote-control-dc9.)
 /// * **Codex** has no multi-option Question prompt, so it returns `None`; the
 ///   translate arm turns that into an honest rejection.
 pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec<u8>> {
-    const DOWN: &[u8] = b"\x1b[B";
+    match backend {
+        // Claude: press the option's number (select + submit) when single-digit.
+        StatusBackend::Claude if option_index < 9 => Some(vec![b'1' + option_index as u8]),
+        StatusBackend::Claude | StatusBackend::OpenCode => {
+            // Arrow navigation: `n` DOWN presses (CSI, matching `tui::input`).
+            let mut bytes = Vec::new();
+            for _ in 0..option_index {
+                bytes.extend_from_slice(DOWN_ARROW);
+            }
+            bytes.push(b'\r');
+            Some(bytes)
+        }
+        // Codex has no multi-option prompt; refuse rather than guess.
+        StatusBackend::Codex => None,
+    }
+}
+
+/// The Down-arrow bytes the desktop injects for list navigation — the CSI form
+/// `ESC [ B`, identical to what `tui::input` sends for a physical Down key.
+/// FlightDeck's input layer is not DECCKM-aware (it never emits the SS3 `ESC O
+/// B` form), so both agents' TUIs are driven with CSI regardless of their
+/// cursor-keys mode (remote-control-dc9).
+const DOWN_ARROW: &[u8] = b"\x1b[B";
+
+/// Delay between consecutive injected keystrokes when driving Claude's
+/// multi-select form (see [`Translation::PtyInputSequence`]). Long enough for
+/// the Ink TUI to re-render between keys so the highlight actually moves and the
+/// toggle/submit see the settled state, short enough to feel responsive. The
+/// 50ms main-loop poll means each step rounds up to the next tick.
+pub const MULTI_SELECT_STEP_DELAY_MS: u64 = 150;
+
+/// The spaced keystroke chunks that drive Claude's multi-select form to toggle
+/// exactly `indices` and submit. Each chunk is a single keystroke, delivered one
+/// [`MULTI_SELECT_STEP_DELAY_MS`] apart so Claude's async re-render settles
+/// between them (remote-control-dc9): from the first option, one `Down` per row
+/// to reach each target, `Enter` to toggle it, then `Tab` to the Confirm tab and
+/// `Enter` to submit. `indices` must be sorted + deduplicated by the caller.
+fn claude_multi_select_chunks(indices: &[u32]) -> Vec<Vec<u8>> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0u32;
+    for &target in indices {
+        // One Down per row: consecutive Downs also race the re-render (each
+        // handler would read the same stale index), so they are separate chunks.
+        for _ in cursor..target {
+            chunks.push(DOWN_ARROW.to_vec());
+        }
+        chunks.push(b"\r".to_vec()); // Enter toggles the highlighted option.
+        cursor = target;
+    }
+    chunks.push(b"\t".to_vec()); // Tab to the far-right Confirm tab.
+    chunks.push(b"\r".to_vec()); // Enter submits the whole form.
+    chunks
+}
+
+/// The keystrokes injected to select SEVERAL options of a multi-select
+/// (checklist / `multiSelect`) Question prompt, then submit them together.
+/// `option_indices` are the phone's chosen 0-based indices (deduplicated and
+/// sorted here so navigation is monotonic and each option is toggled once).
+///
+/// Claude Code and OpenCode render the SAME multi-select form (verified live —
+/// remote-control-dc9, see bd memory `askuserquestion-real-tui-model`):
+///
+/// * **Up/Down** move the highlight within the current question's options.
+/// * **Enter** *toggles* the highlighted option's checkbox — it does NOT submit
+///   (this is the key difference from single-select, where Enter/the number key
+///   selects AND submits).
+/// * **Tab** (and Left/Right) switch between question tabs; the far-right
+///   **Confirm** tab submits the whole form.
+///
+/// So, from the initial highlight on the first option, this walks Down to each
+/// target in ascending order and presses Enter to toggle it, then presses Tab
+/// to reach the Confirm tab and Enter to submit. Down is the CSI form `ESC [ B`
+/// ([`DOWN_ARROW`], matching the desktop's own key encoding); Tab (`\t`) and
+/// Enter (`\r`) are mode-independent.
+///
+/// SCOPE: single-question prompts only. A prompt with MULTIPLE question tabs is
+/// not yet handled — the single `Tab` here lands on the next question, not
+/// Confirm, when other questions precede it (remote-control follow-up).
+///
+/// **Codex** has no such prompt → `None` (an honest rejection upstream).
+pub fn multi_option_keystroke(backend: StatusBackend, option_indices: &[u32]) -> Option<Vec<u8>> {
+    let mut indices: Vec<u32> = option_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        return None;
+    }
     match backend {
         StatusBackend::Claude | StatusBackend::OpenCode => {
             let mut bytes = Vec::new();
-            for _ in 0..option_index {
-                bytes.extend_from_slice(DOWN);
+            let mut cursor = 0u32;
+            for &target in &indices {
+                for _ in cursor..target {
+                    bytes.extend_from_slice(DOWN_ARROW);
+                }
+                bytes.push(b'\r'); // Enter toggles the highlighted option.
+                cursor = target;
             }
-            bytes.push(b'\r');
+            bytes.push(b'\t'); // Tab to the far-right Confirm tab.
+            bytes.push(b'\r'); // Enter submits the whole form.
             Some(bytes)
         }
         // Codex has no multi-option prompt; refuse rather than guess.
@@ -447,6 +566,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             prompt_id,
             choice,
             option_index,
+            option_indices,
             free_text,
         } => {
             let Some(s) = index.session(session_id) else {
@@ -470,19 +590,49 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             // Decision-field precedence (commands.rs never sees the prompt
             // kind, so bytes are chosen purely from which decision field is
             // set):
-            //   1. `choice`      — the binary fast-path (byte-identical to the
-            //                      original permission-only behaviour).
-            //   2. `free_text`   — a typed answer, delivered like any reply.
-            //                      Deliberately ranked ABOVE `option_index`: if
-            //                      a phone somehow sends both, the explicit
-            //                      free-text answer wins over a list position.
-            //   3. `option_index`— arrow-nav selection of a Question option.
-            //   4. otherwise     — nothing actionable; reject honestly.
+            //   1. `choice`         — the binary fast-path (byte-identical to
+            //                         the original permission-only behaviour).
+            //   2. `free_text`      — a typed answer, delivered like any reply.
+            //                         Deliberately ranked ABOVE the option
+            //                         fields: if a phone somehow sends both, the
+            //                         explicit free-text answer wins over a list
+            //                         position.
+            //   3. `option_indices` — multi-select (checklist) toggle + submit.
+            //                         Ranked above `option_index` because it is
+            //                         the more specific answer; a phone only
+            //                         populates it for a `multi_select` prompt.
+            //   4. `option_index`   — single-option selection.
+            //   5. otherwise        — nothing actionable; reject honestly.
             let free_text = free_text.as_deref().filter(|t| !t.is_empty());
+            let option_indices = option_indices.as_deref().filter(|v| !v.is_empty());
             let bytes = if let Some(choice) = choice {
                 permission_keystroke(backend, *choice).to_vec()
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
+            } else if let Some(indices) = option_indices {
+                // Claude's Ink TUI races injected keystrokes against its async
+                // re-render, so navigation + toggle + submit must be spaced out —
+                // a burst toggles the wrong (pre-move) option and never submits
+                // (remote-control-dc9). Drive it as a timed keystroke sequence.
+                // OpenCode processes input synchronously and submits in one burst.
+                if backend == StatusBackend::Claude {
+                    let mut sorted: Vec<u32> = indices.to_vec();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    return Translation::PtyInputSequence {
+                        project: s.project,
+                        tab: s.tab,
+                        session_id: session_id.clone(),
+                        chunks: claude_multi_select_chunks(&sorted),
+                        step_delay_ms: MULTI_SELECT_STEP_DELAY_MS,
+                    };
+                }
+                match multi_option_keystroke(backend, indices) {
+                    Some(b) => b,
+                    None => {
+                        return reject("this agent does not support multi-select prompts");
+                    }
+                }
             } else if let Some(n) = option_index {
                 match option_keystroke(backend, *n) {
                     Some(b) => b,

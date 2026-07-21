@@ -13,3 +13,4 @@
 /web/*.tsbuildinfo
 
 .claude/worktrees
+.flightdeck/hooks.toml

@@ -193,6 +193,7 @@ fn decision(prompt: &str, choice: PermissionChoice) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: Some(choice),
         option_index: None,
+        option_indices: None,
         free_text: None,
     }
 }
@@ -203,6 +204,18 @@ fn decision_option(prompt: &str, option_index: u32) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: None,
         option_index: Some(option_index),
+        option_indices: None,
+        free_text: None,
+    }
+}
+
+fn decision_options(prompt: &str, option_indices: Vec<u32>) -> CommandBody {
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new(prompt),
+        choice: None,
+        option_index: None,
+        option_indices: Some(option_indices),
         free_text: None,
     }
 }
@@ -213,6 +226,7 @@ fn decision_free_text(prompt: &str, text: &str) -> CommandBody {
         prompt_id: PromptId::new(prompt),
         choice: None,
         option_index: None,
+        option_indices: None,
         free_text: Some(text.to_string()),
     }
 }
@@ -292,53 +306,72 @@ fn permission_decision_rejections() {
 }
 
 #[test]
-fn option_keystroke_arrow_nav_for_claude_and_opencode() {
-    use StatusBackend::{Claude, Codex, OpenCode};
-    // EMPIRICAL / UNVERIFIED (see option_keystroke doc): index 0 => just Enter;
-    // each further step adds a DOWN arrow (ESC [ B) before the trailing Enter.
-    for backend in [Claude, OpenCode] {
-        assert_eq!(option_keystroke(backend, 0), Some(b"\r".to_vec()));
-        assert_eq!(option_keystroke(backend, 1), Some(b"\x1b[B\r".to_vec()));
-        assert_eq!(
-            option_keystroke(backend, 2),
-            Some(b"\x1b[B\x1b[B\r".to_vec())
-        );
-    }
+fn option_keystroke_uses_the_option_number_for_claude() {
+    use StatusBackend::Claude;
+    // Claude's AskUserQuestion numbers its options 1..N; pressing the digit
+    // selects AND submits that option (verified live). index 0 => "1", etc.
+    assert_eq!(option_keystroke(Claude, 0), Some(b"1".to_vec()));
+    assert_eq!(option_keystroke(Claude, 1), Some(b"2".to_vec()));
+    assert_eq!(option_keystroke(Claude, 2), Some(b"3".to_vec()));
+    assert_eq!(option_keystroke(Claude, 8), Some(b"9".to_vec()));
+    // Beyond single digits, fall back to CSI arrow navigation.
+    assert_eq!(
+        option_keystroke(Claude, 9),
+        Some([b"\x1b[B".repeat(9), b"\r".to_vec()].concat())
+    );
+}
+
+#[test]
+fn option_keystroke_arrow_nav_for_opencode() {
+    use StatusBackend::{Codex, OpenCode};
+    // OpenCode uses arrow-nav: index 0 => just Enter; each step adds a DOWN
+    // arrow. DOWN is always the CSI form `ESC [ B` (matching the desktop's own
+    // key encoding — the desktop is not DECCKM-aware, remote-control-dc9).
+    assert_eq!(option_keystroke(OpenCode, 0), Some(b"\r".to_vec()));
+    assert_eq!(option_keystroke(OpenCode, 1), Some(b"\x1b[B\r".to_vec()));
+    assert_eq!(
+        option_keystroke(OpenCode, 2),
+        Some(b"\x1b[B\x1b[B\r".to_vec())
+    );
     // Codex has no multi-option prompt.
     assert_eq!(option_keystroke(Codex, 0), None);
     assert_eq!(option_keystroke(Codex, 2), None);
 }
 
 #[test]
-fn permission_decision_option_index_arrow_nav() {
-    use StatusBackend::{Claude, OpenCode};
-    for backend in [Claude, OpenCode] {
-        let index = answerable("t1:p3", backend);
+fn permission_decision_option_index_claude_sends_the_option_number() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    for (opt, digit) in [(0u32, b"1"), (1, b"2"), (2, b"3")] {
         assert_eq!(
-            translate(&decision_option("t1:p3", 0), &index),
+            translate(&decision_option("t1:p3", opt), &index),
             Translation::PtyInput {
                 project: 0,
                 tab: 0,
-                bytes: b"\r".to_vec(),
-            }
-        );
-        assert_eq!(
-            translate(&decision_option("t1:p3", 1), &index),
-            Translation::PtyInput {
-                project: 0,
-                tab: 0,
-                bytes: b"\x1b[B\r".to_vec(),
-            }
-        );
-        assert_eq!(
-            translate(&decision_option("t1:p3", 2), &index),
-            Translation::PtyInput {
-                project: 0,
-                tab: 0,
-                bytes: b"\x1b[B\x1b[B\r".to_vec(),
+                bytes: digit.to_vec(),
             }
         );
     }
+}
+
+#[test]
+fn permission_decision_option_index_arrow_nav_for_opencode() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    assert_eq!(
+        translate(&decision_option("t1:p3", 0), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\r".to_vec(),
+        }
+    );
+    assert_eq!(
+        translate(&decision_option("t1:p3", 2), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\x1b[B\x1b[B\r".to_vec(),
+        }
+    );
 }
 
 #[test]
@@ -347,6 +380,106 @@ fn permission_decision_option_index_rejected_for_codex() {
     assert!(matches!(
         translate(&decision_option("t1:p3", 1), &index),
         Translation::Reject { reason } if reason.contains("multi-option")
+    ));
+}
+
+#[test]
+fn multi_option_keystroke_toggles_and_confirms_for_claude() {
+    use StatusBackend::Claude;
+    // Claude multi-select is a tabbed form: from the first option, walk DOWN to
+    // each target and press Enter to TOGGLE it, then Tab to the Confirm tab and
+    // Enter to submit. [0, 2] → Enter (toggle 0), DOWN DOWN, Enter (toggle 2),
+    // Tab, Enter. DOWN is always the CSI form `ESC [ B`.
+    assert_eq!(
+        multi_option_keystroke(Claude, &[0, 2]),
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
+    );
+    // Deduped + sorted first.
+    assert_eq!(
+        multi_option_keystroke(Claude, &[2, 0, 2]),
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec()),
+        "indices are deduped and sorted before navigation"
+    );
+    // A single selection still toggles then confirms (DOWN once to option 1).
+    assert_eq!(
+        multi_option_keystroke(Claude, &[1]),
+        Some(b"\x1b[B\r\t\r".to_vec())
+    );
+    // Empty selection is not actionable.
+    assert_eq!(multi_option_keystroke(Claude, &[]), None);
+}
+
+#[test]
+fn multi_option_keystroke_toggles_and_confirms_for_opencode() {
+    use StatusBackend::{Codex, OpenCode};
+    // OpenCode renders the SAME form, so the sequence is identical to Claude's.
+    assert_eq!(
+        multi_option_keystroke(OpenCode, &[0, 2]),
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
+    );
+    assert_eq!(
+        multi_option_keystroke(OpenCode, &[1]),
+        Some(b"\x1b[B\r\t\r".to_vec())
+    );
+    // Codex has no multi-option prompt.
+    assert_eq!(multi_option_keystroke(Codex, &[0, 1]), None);
+}
+
+#[test]
+fn permission_decision_option_indices_claude_is_a_spaced_sequence() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    // Claude: each keystroke is its own chunk so the Ink TUI re-renders between
+    // them (remote-control-dc9). [0, 2] → toggle 0 (Enter), Down, Down, toggle 2
+    // (Enter), Tab to Confirm, Enter to submit.
+    assert_eq!(
+        translate(&decision_options("t1:p3", vec![0, 2]), &index),
+        Translation::PtyInputSequence {
+            project: 0,
+            tab: 0,
+            session_id: SessionId::new("t1"),
+            chunks: vec![
+                b"\r".to_vec(),     // Enter: toggle option 0
+                b"\x1b[B".to_vec(), // Down: 0 -> 1
+                b"\x1b[B".to_vec(), // Down: 1 -> 2
+                b"\r".to_vec(),     // Enter: toggle option 2
+                b"\t".to_vec(),     // Tab: to Confirm
+                b"\r".to_vec(),     // Enter: submit
+            ],
+            step_delay_ms: crate::remote::commands::MULTI_SELECT_STEP_DELAY_MS,
+        }
+    );
+}
+
+#[test]
+fn permission_decision_option_indices_toggles_and_confirms_for_opencode() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    assert_eq!(
+        translate(&decision_options("t1:p3", vec![0, 2]), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\r\x1b[B\x1b[B\r\t\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_option_indices_rejected_for_codex() {
+    let index = answerable("t1:p3", StatusBackend::Codex);
+    assert!(matches!(
+        translate(&decision_options("t1:p3", vec![0, 1]), &index),
+        Translation::Reject { reason } if reason.contains("multi-select")
+    ));
+}
+
+#[test]
+fn permission_decision_empty_option_indices_falls_through() {
+    // An empty indices vec is not a valid multi-select answer; with no other
+    // field set it is rejected as an empty decision (not silently accepted).
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    assert!(matches!(
+        translate(&decision_options("t1:p3", vec![]), &index),
+        Translation::Reject { reason } if reason.contains("empty decision")
     ));
 }
 
@@ -374,6 +507,7 @@ fn permission_decision_free_text_wins_over_option_index() {
         prompt_id: PromptId::new("t1:p3"),
         choice: None,
         option_index: Some(2),
+        option_indices: None,
         free_text: Some("typed instead".to_string()),
     };
     assert_eq!(
@@ -395,6 +529,7 @@ fn permission_decision_empty_decision_rejected() {
         prompt_id: PromptId::new("t1:p3"),
         choice: None,
         option_index: None,
+        option_indices: None,
         free_text: None,
     };
     assert!(matches!(

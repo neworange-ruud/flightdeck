@@ -148,7 +148,10 @@ struct MainTabView: View {
             }
             .background(Theme.bgDeep)
             .sheet(isPresented: $isPresentingNewAgentSheet) {
-                NewAgentView(store: transportStore)
+                // Target the live instance (see `primaryStore`), not the frozen
+                // init-time capture, so a new agent is created on a connected
+                // desktop rather than a stuck/orphaned pairing (remote-control-aj2).
+                NewAgentView(store: coordinator.primaryStore)
             }
             .onChange(of: transportStore.agentEvents) { _, newEvents in
                 // Unread is folded in reactively across EVERY machine by
@@ -301,32 +304,40 @@ struct MainTabView: View {
             }
         case .projects:
             NavigationStack(path: $projectsNav.path) {
-                ProjectsListView(transportStore: transportStore, router: router, nav: projectsNav)
+                ProjectsListView(
+                    transportStore: coordinator.primaryStore,
+                    coordinator: coordinator,
+                    router: router,
+                    nav: projectsNav
+                )
                     .navigationDestination(for: ProjectsRoute.self) { route in
                         switch route {
-                        case let .sessions(projectId, _):
-                            // Projects tab stays single-store/transitional
-                            // (remote-control-b8d.12 scope is the Feed tab) —
-                            // the route's `pairingId` is always `nil` here
-                            // (see every push site on this tab) and ignored;
-                            // always binds `transportStore`.
+                        case let .sessions(projectId, pairingId):
+                            // The Projects tab now AGGREGATES across machines
+                            // (remote-control-aj2), so each row carries the
+                            // pairingId of the machine it belongs to. Bind the
+                            // detail screen to THAT machine's store (falling back
+                            // to the live primary when the route has no pairingId,
+                            // e.g. a deep link).
                             SessionsListView(
                                 projectId: Wire.ProjectId(projectId),
-                                transportStore: transportStore,
+                                transportStore: coordinator.detailStore(for: pairingId),
                                 nav: projectsNav,
-                                isPresentingNewAgentSheet: $isPresentingNewAgentSheet
+                                isPresentingNewAgentSheet: $isPresentingNewAgentSheet,
+                                pairingId: pairingId
                             )
-                        case let .chat(projectId, sessionId, _):
-                            // Thread the live store so Chat binds its commands-paused
-                            // gate + transcript to the real (connected) transport —
-                            // without it, `ChatViewModel.bind` never runs and the gate
-                            // defaults to paused, showing "paused — reconnecting" and
-                            // disabling send even while the link is up (remote-control-9yv).
-                            // The `-uitest-fixture-transcript` tests are unaffected:
-                            // `loadFixtureIfRequested()` wins and returns before the
-                            // store is bound (see `AgentChatView.task`).
+                        case let .chat(projectId, sessionId, pairingId):
+                            // Bind Chat to the store of the machine this session
+                            // belongs to (remote-control-aj2), falling back to the
+                            // live primary when the route carries no pairingId.
+                            // Threading the real (connected) store is also what
+                            // lets ChatViewModel.bind run so the commands-paused
+                            // gate reflects the true link instead of defaulting to
+                            // "paused — reconnecting" (remote-control-9yv). UI-test
+                            // fixtures are unaffected (loadFixtureIfRequested wins
+                            // before the store is bound — see AgentChatView.task).
                             AgentChatView(projectId: projectId, sessionId: sessionId,
-                                          store: transportStore)
+                                          store: coordinator.detailStore(for: pairingId))
                         }
                     }
                     .chatFixtureAutoPush(path: $projectsNav.path)
