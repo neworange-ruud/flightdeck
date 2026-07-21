@@ -24,11 +24,11 @@ extension Wire {
     // MARK: - Version constants
 
     /// Protocol version this build speaks and prefers.
-    static let protocolVersion: UInt16 = 1
+    static let protocolVersion: UInt16 = 2
     /// Oldest protocol version this build can still interoperate with.
     static let minSupportedVersion: UInt16 = 1
     /// Newest protocol version this build can interoperate with.
-    static let maxSupportedVersion: UInt16 = 1
+    static let maxSupportedVersion: UInt16 = 2
 
     // MARK: - Role / agent identity
 

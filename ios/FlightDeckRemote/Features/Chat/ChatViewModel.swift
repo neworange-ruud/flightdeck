@@ -71,7 +71,7 @@ final class ChatViewModel {
     // Command-id ↔ target routing for delivery reconciliation.
     private var commandToOutgoing: [Wire.CommandId: Wire.ItemId] = [:]
     private var commandToPrompt: [Wire.CommandId: Wire.PromptId] = [:]
-    private var permissionChoice: [Wire.PromptId: Wire.PermissionChoice] = [:]
+    private var permissionAnswer: [Wire.PromptId: PermissionAnswer] = [:]
     private var permissionCommandId: [Wire.PromptId: Wire.CommandId] = [:]
 
     // MARK: - Backing state
@@ -290,35 +290,69 @@ final class ChatViewModel {
 
     // MARK: - Permission decisions
 
-    /// Resolve a permission prompt inline (Allow once / Deny). No-op unless the
-    /// prompt is the current pending one and the link is up.
+    /// Resolve a permission prompt inline with the binary Allow once / Deny
+    /// fast-path. No-op unless the prompt is the current pending one and the
+    /// link is up.
     func decidePermission(promptId: Wire.PromptId, choice: Wire.PermissionChoice) {
+        decide(promptId: promptId, answer: .choice(choice))
+    }
+
+    /// Resolve a Question prompt by selecting one of its N options (sends
+    /// `option_index`, not `choice`). `label` is carried for display only.
+    func decidePermission(promptId: Wire.PromptId, optionIndex: Int, label: String) {
+        decide(promptId: promptId, answer: .option(index: optionIndex, label: label))
+    }
+
+    /// Resolve a Question prompt with a typed "Type your own answer" reply
+    /// (sends `free_text`). No-op if `text` is empty.
+    func decidePermission(promptId: Wire.PromptId, freeText text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        decide(promptId: promptId, answer: .freeText(trimmed))
+    }
+
+    /// Shared send path for every decision shape (binary / option / free-text).
+    private func decide(promptId: Wire.PromptId, answer: PermissionAnswer) {
         guard isPermissionActionable(promptId), let sender else { return }
-        let handle = sender.send(
-            .permissionDecision(sessionId: sessionId, promptId: promptId, choice: choice),
-            reusingId: nil)
-        permissionChoice[promptId] = choice
+        let handle = sender.send(commandBody(promptId: promptId, answer: answer), reusingId: nil)
+        permissionAnswer[promptId] = answer
         permissionCommandId[promptId] = handle.commandId
         commandToPrompt[handle.commandId] = promptId
-        permissionActions[promptId] = .sending(choice)
+        permissionActions[promptId] = .sending(answer)
         track(handle)
     }
 
     /// Retry a failed permission decision (same id-reuse rules as replies).
     func retryPermission(_ promptId: Wire.PromptId) {
         guard !commandsPaused, let sender,
-              case let .failed(_, choice, reusesId) = permissionActionState(promptId) else { return }
+              case let .failed(_, answer, reusesId) = permissionActionState(promptId) else { return }
         let oldId = permissionCommandId[promptId]
         let reuseId: Wire.CommandId? = reusesId ? oldId : nil
-        let handle = sender.send(
-            .permissionDecision(sessionId: sessionId, promptId: promptId, choice: choice),
-            reusingId: reuseId)
+        let handle = sender.send(commandBody(promptId: promptId, answer: answer), reusingId: reuseId)
         if let oldId { commandToPrompt[oldId] = nil }
-        permissionChoice[promptId] = choice
+        permissionAnswer[promptId] = answer
         permissionCommandId[promptId] = handle.commandId
         commandToPrompt[handle.commandId] = promptId
-        permissionActions[promptId] = .sending(choice)
+        permissionActions[promptId] = .sending(answer)
         track(handle)
+    }
+
+    /// Build the `permission_decision` command body for an answer: `choice`
+    /// (binary fast-path), `option_index` (Question, by position), or
+    /// `free_text` (typed answer) — exactly one is populated, matching the
+    /// wire's `skip_serializing_if` convention.
+    private func commandBody(promptId: Wire.PromptId, answer: PermissionAnswer) -> Wire.CommandBody {
+        switch answer {
+        case let .choice(choice):
+            return .permissionDecision(sessionId: sessionId, promptId: promptId,
+                                       choice: choice, optionIndex: nil, freeText: nil)
+        case let .option(index, _):
+            return .permissionDecision(sessionId: sessionId, promptId: promptId,
+                                       choice: nil, optionIndex: index, freeText: nil)
+        case let .freeText(text):
+            return .permissionDecision(sessionId: sessionId, promptId: promptId,
+                                       choice: nil, optionIndex: nil, freeText: text)
+        }
     }
 
     // MARK: - Delivery reconciliation
@@ -332,8 +366,8 @@ final class ChatViewModel {
             outgoing[idx].state = ChatSendLogic.outgoingState(for: state)
         }
         if let promptId = commandToPrompt[commandId] {
-            let choice = permissionChoice[promptId] ?? .allowOnce
-            permissionActions[promptId] = ChatSendLogic.permissionState(for: state, choice: choice)
+            let answer = permissionAnswer[promptId] ?? .choice(.allowOnce)
+            permissionActions[promptId] = ChatSendLogic.permissionState(for: state, answer: answer)
         }
     }
 

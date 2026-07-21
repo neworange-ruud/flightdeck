@@ -18,7 +18,11 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use flightdeck_remote_protocol::{DesktopToPhone, PhoneCommand, RelayFrame};
+use flightdeck_remote_protocol::{
+    CommandBody, DesktopToPhone, PermissionOption, PhoneCommand, PromptKind, RelayFrame,
+    TranscriptItem,
+};
+use flightdeck_remote_protocol::{CommandId, ItemId, PromptId, SessionId};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -108,6 +112,91 @@ fn phone_commands_carry_command_id_and_type() {
             "phone_to_desktop/{name}: missing flattened `type`"
         );
     }
+}
+
+/// A Question prompt with three described options (no `choice`, free-text
+/// allowed) survives a JSON round-trip unchanged.
+#[test]
+fn question_prompt_round_trips() {
+    let item = TranscriptItem::PermissionPrompt {
+        item_id: ItemId::new("item_q1"),
+        prompt_id: PromptId::new("prompt_q1"),
+        kind: PromptKind::Question,
+        command: "Which database should the login service use?".into(),
+        options: vec![
+            PermissionOption {
+                index: 0,
+                choice: None,
+                label: "Postgres".into(),
+                description: Some("Use the existing shared Postgres cluster.".into()),
+            },
+            PermissionOption {
+                index: 1,
+                choice: None,
+                label: "SQLite".into(),
+                description: Some("Embed a local SQLite file for now.".into()),
+            },
+            PermissionOption {
+                index: 2,
+                choice: None,
+                label: "Redis".into(),
+                description: Some("Store sessions in Redis with a short TTL.".into()),
+            },
+        ],
+        allow_free_text: true,
+        at_ms: 1752412740000,
+    };
+    let v = serde_json::to_value(&item).unwrap();
+    assert_eq!(v["kind"], "question");
+    assert_eq!(v["allow_free_text"], true);
+    assert_eq!(v["options"][2]["index"], 2);
+    assert!(v["options"][0].get("choice").is_none());
+    assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
+}
+
+/// A multi-option `PermissionDecision` answered by option index round-trips and
+/// omits the binary `choice` field.
+#[test]
+fn option_index_decision_round_trips() {
+    let cmd = PhoneCommand {
+        command_id: CommandId::new("cmd_oi"),
+        issued_at_ms: 1752412811000,
+        body: CommandBody::PermissionDecision {
+            session_id: SessionId::new("sess_fix_login"),
+            prompt_id: PromptId::new("prompt_q1"),
+            choice: None,
+            option_index: Some(2),
+            free_text: None,
+        },
+    };
+    let v = serde_json::to_value(&cmd).unwrap();
+    assert_eq!(v["type"], "permission_decision");
+    assert_eq!(v["option_index"], 2);
+    assert!(v.get("choice").is_none(), "binary choice must be omitted");
+    assert!(v.get("free_text").is_none());
+    assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
+}
+
+/// A free-text `PermissionDecision` round-trips and omits `choice`/`option_index`.
+#[test]
+fn free_text_decision_round_trips() {
+    let cmd = PhoneCommand {
+        command_id: CommandId::new("cmd_ft"),
+        issued_at_ms: 1752412811000,
+        body: CommandBody::PermissionDecision {
+            session_id: SessionId::new("sess_fix_login"),
+            prompt_id: PromptId::new("prompt_q1"),
+            choice: None,
+            option_index: None,
+            free_text: Some("Use CockroachDB instead.".into()),
+        },
+    };
+    let v = serde_json::to_value(&cmd).unwrap();
+    assert_eq!(v["type"], "permission_decision");
+    assert_eq!(v["free_text"], "Use CockroachDB instead.");
+    assert!(v.get("choice").is_none());
+    assert!(v.get("option_index").is_none());
+    assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
 }
 
 /// Count guard: keep fixtures exhaustive as variants are added. Bump these when

@@ -237,6 +237,95 @@ fn missing_file_is_a_safe_noop() {
     assert_eq!(b.total(), 0);
 }
 
+// --- Claude AskUserQuestion (structured prompt) -----------------------------
+
+/// A Claude assistant record whose single content block is an `AskUserQuestion`
+/// tool_use with one question and three described options.
+const ASK_USER_QUESTION: &str = r#"{"type":"assistant","uuid":"aq1","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which database should we use?","header":"Database","multiSelect":false,"options":[{"label":"Postgres","description":"Relational, ACID"},{"label":"SQLite","description":"Embedded, zero-config"},{"label":"Redis","description":"In-memory KV"}]}]}}]}}"#;
+
+#[test]
+fn ask_user_question_becomes_a_structured_question_prompt() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASK_USER_QUESTION]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+
+    // No Activity pill (nor any other item) is emitted for the AskUserQuestion
+    // block — it is held as a structured prompt instead.
+    assert_eq!(b.total(), 0, "AskUserQuestion emits no activity pill");
+
+    // The needs-input edge surfaces it as a Question PermissionPrompt.
+    let preview = b.on_needs_input(0);
+    assert_eq!(preview.as_deref(), Some("Which database should we use?"));
+
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt {
+            kind,
+            command,
+            options,
+            allow_free_text,
+            ..
+        }) => {
+            assert_eq!(*kind, PromptKind::Question);
+            assert_eq!(command, "Which database should we use?");
+            assert!(*allow_free_text, "AskUserQuestion always allows free text");
+            assert_eq!(options.len(), 3);
+            let expect = [
+                (0u32, "Postgres", "Relational, ACID"),
+                (1, "SQLite", "Embedded, zero-config"),
+                (2, "Redis", "In-memory KV"),
+            ];
+            for (opt, (idx, label, desc)) in options.iter().zip(expect) {
+                assert_eq!(opt.index, idx);
+                assert_eq!(opt.label, label);
+                assert_eq!(opt.description.as_deref(), Some(desc));
+                assert!(
+                    opt.choice.is_none(),
+                    "Question options carry no binary choice"
+                );
+            }
+        }
+        other => panic!("expected a Question PermissionPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_normal_tool_use_still_yields_an_activity_pill() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASSISTANT_TOOL]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+    assert_eq!(labels(&b.load(None)), vec!["act[Command]:Run the tests"]);
+}
+
+#[test]
+fn without_a_structured_prompt_needs_input_is_binary_allow_deny() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASSISTANT_TEXT]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+    b.on_needs_input(0);
+
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt {
+            kind,
+            options,
+            allow_free_text,
+            ..
+        }) => {
+            assert_eq!(*kind, PromptKind::Permission);
+            assert!(!*allow_free_text);
+            assert_eq!(options.len(), 2);
+            assert_eq!(options[0].choice, Some(PermissionChoice::AllowOnce));
+            assert_eq!(options[1].choice, Some(PermissionChoice::Deny));
+        }
+        other => panic!("expected a binary Permission prompt, got {other:?}"),
+    }
+}
+
 // --- Codex rollout format ---------------------------------------------------
 //
 // Record shapes below mirror real `~/.codex/sessions/**/rollout-*.jsonl` files:

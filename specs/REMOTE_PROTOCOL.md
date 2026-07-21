@@ -83,8 +83,10 @@ These conventions are fixed so the Rust, relay, and Swift sides agree:
 
 Every connection begins with version negotiation on the relay plane.
 
-- Constants (this build): `PROTOCOL_VERSION = 1`, `MIN_SUPPORTED_VERSION = 1`,
-  `MAX_SUPPORTED_VERSION = 1`.
+- Constants (this build): `PROTOCOL_VERSION = 2`, `MIN_SUPPORTED_VERSION = 1`,
+  `MAX_SUPPORTED_VERSION = 2`. v2 adds multi-option prompts (see §8.1/§8.2); the
+  new prompt/decision fields are `serde` defaults, so v1 JSON still deserializes
+  and `MIN` stays 1.
 - The client opens with `hello { protocol_version, role, device_id, client }`
   advertising its **preferred** version.
 - The relay replies with either:
@@ -96,8 +98,8 @@ Every connection begins with version negotiation on the relay plane.
   within `[local_min, local_max]`, use it; if it is **higher**, fall back to
   `local_max` (the relay answers `hello_ok` at its own max — forward compatible);
   if it is **lower than `local_min`**, it is incompatible. In a v1 build only a
-  preferred version **below 1** yields `version_incompatible`; a future client
-  preferring v2 gets clamped to v1.
+  preferred version **below 1** yields `version_incompatible`; a client
+  preferring v3+ gets clamped to v2.
 - The negotiated version governs the whole connection, including how the E2E
   payloads inside envelopes are interpreted. The E2E application messages do not
   carry a second version field in v1 — the relay-plane negotiated version is
@@ -531,10 +533,19 @@ derives one channel per pairing per endpoint and feeds `salt` (the QR
 
 **Transcript items** (`TranscriptItem`, tag `type`): `user_message`,
 `agent_message`, `activity` (collapsible pill: `summary`, optional `detail`,
-optional expanded `body`, `kind`), `permission_prompt` (`command` text +
-`options[]`). This directly models the design's cleaned transcript with activity
-pills ("Edited auth.ts +18 −4", "Ran npm test · 42 passed") and inline
-permission asks.
+optional expanded `body`, `kind`), `permission_prompt` (`kind`, `command` text,
+`options[]`, `allow_free_text`). This directly models the design's cleaned
+transcript with activity pills ("Edited auth.ts +18 −4", "Ran npm test · 42
+passed") and inline permission asks.
+
+A `permission_prompt` carries a `kind` (v2): `permission` is the binary
+allow/deny ask (options `[allow_once, deny]`); `question` is a multiple-choice
+ask (Claude Code `AskUserQuestion`, OpenCode `question.asked`). Each
+`PermissionOption` has a stable 0-based `index`, a `label`, an optional
+`description`, and — for `permission` kind only — a `choice` (`allow_once` /
+`deny`). `allow_free_text` is `true` when the phone may submit a typed answer
+("Type your own answer"). Both `kind` and `allow_free_text` default (to
+`permission` / `false`) when absent, so a v1 prompt still parses.
 
 **Command outcomes** (`CommandOutcome`): `accepted` (validated, will apply),
 `applied` (done), `rejected` (refused — e.g. failed type-to-confirm), `failed`
@@ -552,7 +563,7 @@ Every command is a `PhoneCommand`:
 | `type` | Key fields | Purpose |
 |--------|-----------|---------|
 | `reply` | `session_id`, `text` | Reply / follow-up prose to an agent. |
-| `permission_decision` | `session_id`, `prompt_id`, `choice` | Resolve a permission prompt (`allow_once` / `deny`). |
+| `permission_decision` | `session_id`, `prompt_id`, optional `choice`, optional `option_index`, optional `free_text` | Resolve a prompt. Binary fast-path sends `choice` (`allow_once`/`deny`); a `question` answer sends `option_index` (0-based) or `free_text`. Exactly one of the three is set; absent fields are omitted (not `null`). |
 | `new_agent` | `project_id`, `agent_type`, `name`, `base_branch`, `first_task` | Launch a new session (v1 fields only; model/effort inherit desktop defaults). |
 | `restart_agent` | `session_id` | Fresh process, same worktree/branch, transcript preserved. |
 | `close_session` | `session_id` | Close a session. |

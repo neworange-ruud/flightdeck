@@ -396,7 +396,9 @@ fn remote_capabilities_end_to_end() {
     let perm_cmd = h.phone.command(CommandBody::PermissionDecision {
         session_id: session_a_id.clone(),
         prompt_id: PromptId::new("no-such-prompt"),
-        choice: PermissionChoice::AllowOnce,
+        choice: Some(PermissionChoice::AllowOnce),
+        option_index: None,
+        free_text: None,
     });
     let ack = await_ack(&mut h.phone, &perm_cmd, ACK_TIMEOUT);
     assert_eq!(

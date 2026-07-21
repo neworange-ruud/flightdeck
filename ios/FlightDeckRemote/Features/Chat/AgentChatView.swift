@@ -237,8 +237,15 @@ struct AgentChatView: View {
                             sendState: sendStates[row.item.itemId],
                             permissionState: actionState,
                             permissionActionable: actionable,
-                            onDecide: { pid, choice in
-                                model.decidePermission(promptId: pid, choice: choice)
+                            onDecide: { pid, answer in
+                                switch answer {
+                                case let .choice(choice):
+                                    model.decidePermission(promptId: pid, choice: choice)
+                                case let .option(index, label):
+                                    model.decidePermission(promptId: pid, optionIndex: index, label: label)
+                                case let .freeText(text):
+                                    model.decidePermission(promptId: pid, freeText: text)
+                                }
                             },
                             onRetryPermission: { model.retryPermission($0) },
                             onRetryOutgoing: { model.retryOutgoing($0) })

@@ -95,8 +95,8 @@ import Foundation
 
     @Test func permissionPromptCondensesToWantsToRun() {
         let entry = FocusMode.condense(.permissionPrompt(
-            itemId: Wire.ItemId("p"), promptId: Wire.PromptId("p1"),
-            command: "rm -rf dist/", options: [], atMs: base))
+            itemId: Wire.ItemId("p"), promptId: Wire.PromptId("p1"), kind: .permission,
+            command: "rm -rf dist/", options: [], allowFreeText: false, atMs: base))
         #expect(entry == "Wants to run rm -rf dist/")
     }
 }

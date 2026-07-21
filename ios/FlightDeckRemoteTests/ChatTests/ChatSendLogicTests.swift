@@ -57,36 +57,54 @@ import Foundation
     // MARK: - Permission action state mapping
 
     @Test func permissionSendingShowsSpinnerForTappedChoice() {
-        let state = ChatSendLogic.permissionState(for: .sending, choice: .allowOnce)
-        #expect(state == .sending(.allowOnce))
+        let state = ChatSendLogic.permissionState(for: .sending, answer: .choice(.allowOnce))
+        #expect(state == .sending(.choice(.allowOnce)))
     }
 
     @Test func permissionAppliedResolves() {
-        #expect(ChatSendLogic.permissionState(for: .delivered(.applied), choice: .deny)
-                == .resolved(.deny))
-        #expect(ChatSendLogic.permissionState(for: .delivered(.duplicate), choice: .allowOnce)
-                == .resolved(.allowOnce))
+        #expect(ChatSendLogic.permissionState(for: .delivered(.applied), answer: .choice(.deny))
+                == .resolved(.choice(.deny)))
+        #expect(ChatSendLogic.permissionState(for: .delivered(.duplicate), answer: .choice(.allowOnce))
+                == .resolved(.choice(.allowOnce)))
     }
 
     @Test func permissionRejectedIsStale() {
         // A rejected ack means the prompt was already answered on the desktop.
-        #expect(ChatSendLogic.permissionState(for: .delivered(.rejected), choice: .allowOnce)
+        #expect(ChatSendLogic.permissionState(for: .delivered(.rejected), answer: .choice(.allowOnce))
                 == .stale)
     }
 
     @Test func permissionTransportFailureIsRetryableWithSameId() {
         let state = ChatSendLogic.permissionState(for: .failed(reason: "timed out"),
-                                                  choice: .allowOnce)
-        #expect(state == .failed(reason: "timed out", choice: .allowOnce, retryReusesId: true))
+                                                  answer: .choice(.allowOnce))
+        #expect(state == .failed(reason: "timed out", answer: .choice(.allowOnce), retryReusesId: true))
     }
 
     @Test func permissionOutcomeFailureIsRetryableWithNewId() {
-        let state = ChatSendLogic.permissionState(for: .delivered(.failed), choice: .deny)
-        guard case let .failed(_, choice, reusesId) = state else {
+        let state = ChatSendLogic.permissionState(for: .delivered(.failed), answer: .choice(.deny))
+        guard case let .failed(_, answer, reusesId) = state else {
             Issue.record("expected .failed"); return
         }
-        #expect(choice == .deny)
+        #expect(answer == .choice(.deny))
         #expect(reusesId == false)
+    }
+
+    // MARK: - Permission action state mapping (option / free-text answers)
+
+    @Test func permissionOptionSendingResolvesAndFails() {
+        let answer = PermissionAnswer.option(index: 2, label: "Redis")
+        #expect(ChatSendLogic.permissionState(for: .sending, answer: answer) == .sending(answer))
+        #expect(ChatSendLogic.permissionState(for: .delivered(.applied), answer: answer)
+                == .resolved(answer))
+        let failed = ChatSendLogic.permissionState(for: .failed(reason: "timed out"), answer: answer)
+        #expect(failed == .failed(reason: "timed out", answer: answer, retryReusesId: true))
+    }
+
+    @Test func permissionFreeTextSendingResolvesAndFails() {
+        let answer = PermissionAnswer.freeText("Use CockroachDB instead.")
+        #expect(ChatSendLogic.permissionState(for: .sending, answer: answer) == .sending(answer))
+        #expect(ChatSendLogic.permissionState(for: .delivered(.applied), answer: answer)
+                == .resolved(answer))
     }
 
     // MARK: - Reconciliation heuristic
