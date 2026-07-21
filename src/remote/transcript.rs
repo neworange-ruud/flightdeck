@@ -229,6 +229,19 @@ impl TranscriptBuilder {
         self.open_prompt.clone()
     }
 
+    /// Clear the open-prompt dedup guard (and any captured-but-unemitted
+    /// prompt) once the current prompt has been answered — i.e. the agent left
+    /// needs-input. Without this, the guard that stops ONE question emitting
+    /// twice (ingest vs sidecar) also suppresses the NEXT question in the
+    /// session as a false duplicate, so a follow-up question reuses the old
+    /// answered frame instead of surfacing anew (remote-control-dc9). Claude
+    /// also clears `open_prompt` when the answer's user-turn record is ingested;
+    /// OpenCode has no such record, so the bridge calls this on the status edge.
+    pub fn clear_open_prompt(&mut self) {
+        self.open_prompt = None;
+        self.pending_structured = None;
+    }
+
     /// Ingest any new conversation from `source`, dispatching to the file-tail
     /// (Claude/Codex) or DB-poll (OpenCode) path. Cheap and safe to call every
     /// tick.

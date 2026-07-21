@@ -1902,6 +1902,18 @@ fn service_remote_commands(
     now_ms: u64,
     send: &mut dyn FnMut(RemoteOutbound),
 ) {
+    // Flush any deferred keystrokes now due — e.g. Claude's multi-select submit
+    // Enter, held back until the Tab-driven Confirm-tab switch has rendered so
+    // the Ink TUI does not drop it (remote-control-dc9). Re-resolve the tab
+    // since indices may have shifted during the delay.
+    for (session_id, bytes) in bridge.take_due_deferred_pty(now_ms) {
+        if let Some((pi, ti)) = resolve_primary_tab(workspace, &session_id) {
+            if let Some(p) = workspace.projects.get_mut(pi) {
+                let _ = write_primary_pty(&mut p.state, ti, &bytes);
+            }
+        }
+    }
+
     for cmd in bridge.take_pending_commands() {
         // Idempotency: a retransmitted command id is acked, never re-applied.
         if let Some(ack) = ledger.duplicate_ack(&cmd.command_id) {
@@ -1924,14 +1936,40 @@ fn service_remote_commands(
             build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
         };
         let translation = translate(&cmd.body, &index);
-        let (outcome, message) = execute_remote_translation(
-            translation,
-            workspace,
-            env,
-            now_ms,
-            first_tasks,
-            bridge.shells_mut(),
-        );
+        let (outcome, message) = match translation {
+            // Two-phase keystroke write: send the toggles + Tab now, and defer
+            // the submit Enter so it lands after Claude's Confirm tab renders
+            // (remote-control-dc9). The deferred write is flushed on a later tick.
+            Translation::PtyInputThenDeferred {
+                project,
+                tab,
+                session_id,
+                immediate,
+                deferred,
+                delay_ms,
+            } => match workspace.projects.get_mut(project) {
+                Some(p) => {
+                    if write_primary_pty(&mut p.state, tab, &immediate) {
+                        bridge.enqueue_deferred_pty(session_id, now_ms + delay_ms, deferred);
+                        (CommandOutcome::Applied, None)
+                    } else {
+                        (
+                            CommandOutcome::Failed,
+                            Some("could not write to the agent terminal".to_string()),
+                        )
+                    }
+                }
+                None => remote_target_gone(),
+            },
+            other => execute_remote_translation(
+                other,
+                workspace,
+                env,
+                now_ms,
+                first_tasks,
+                bridge.shells_mut(),
+            ),
+        };
         ledger.record(cmd.command_id.clone(), outcome, message.clone());
         bridge.send_ack(
             CommandAck {
@@ -1980,6 +2018,19 @@ fn poll_remote_shell_exits(bridge: &mut RemoteBridge, workspace: &Workspace) {
     }
 }
 
+/// Resolve a session id to its `(project index, tab index)` in the live
+/// workspace, or `None` if the session/tab no longer exists. Used to place a
+/// deferred PTY write on the right tab even if indices shifted during the delay.
+fn resolve_primary_tab(workspace: &Workspace, session_id: &SessionId) -> Option<(usize, usize)> {
+    workspace.projects.iter().enumerate().find_map(|(pi, p)| {
+        p.state
+            .tabs
+            .iter()
+            .position(|t| t.meta.id == session_id.as_str())
+            .map(|ti| (pi, ti))
+    })
+}
+
 /// The ack for a session/project that vanished between translation and
 /// execution (possible only if an earlier command in the same batch removed it).
 fn remote_target_gone() -> (CommandOutcome, Option<String>) {
@@ -2008,6 +2059,29 @@ fn execute_remote_translation(
             session_id,
             action,
         } => execute_shell_action(shells, workspace, env, project, tab, &session_id, action),
+
+        // PtyInputThenDeferred is intercepted in `service_remote_commands` (which
+        // owns the deferred-write queue). If it ever reaches the generic executor
+        // — e.g. a direct test call — degrade to writing the immediate part; the
+        // trailing submit Enter is dropped in that path.
+        Translation::PtyInputThenDeferred {
+            project,
+            tab,
+            immediate,
+            ..
+        } => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            if write_primary_pty(&mut p.state, tab, &immediate) {
+                (CommandOutcome::Applied, None)
+            } else {
+                (
+                    CommandOutcome::Failed,
+                    Some("could not write to the agent terminal".to_string()),
+                )
+            }
+        }
 
         Translation::PtyInput {
             project,

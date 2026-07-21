@@ -136,6 +136,12 @@ pub struct RemoteBridge {
     /// restart with an established pairing, [`Self::install_channel`] seeds this
     /// from the persisted high-water mark so the phone's dedup never stalls.
     out_seq: u64,
+    /// Keystrokes queued to inject into a session's primary PTY after a short
+    /// delay: `(session, due_ms, bytes)`. Used for Claude's multi-select submit
+    /// Enter, which must arrive AFTER the Tab-driven switch to the Confirm tab
+    /// has rendered or the Ink TUI drops it (remote-control-dc9). Flushed by
+    /// `service_remote_commands` once `due_ms` passes.
+    deferred_pty: Vec<(SessionId, u64, Vec<u8>)>,
 }
 
 impl RemoteBridge {
@@ -162,6 +168,7 @@ impl RemoteBridge {
             open,
             home: None,
             out_seq: 0,
+            deferred_pty: Vec::new(),
         }
     }
 
@@ -221,6 +228,27 @@ impl RemoteBridge {
     /// messages queued here are flushed (sealed) by [`Self::tick`].
     pub fn shells_mut(&mut self) -> &mut ShellManager {
         &mut self.shells
+    }
+
+    /// Queue keystrokes to inject into `session`'s primary PTY once `due_ms`
+    /// passes (see `deferred_pty`). Used for Claude's multi-select submit Enter.
+    pub fn enqueue_deferred_pty(&mut self, session: SessionId, due_ms: u64, bytes: Vec<u8>) {
+        self.deferred_pty.push((session, due_ms, bytes));
+    }
+
+    /// Remove and return every queued deferred PTY write whose `due_ms` is at or
+    /// before `now_ms`, as `(session, bytes)`. Order preserved.
+    pub fn take_due_deferred_pty(&mut self, now_ms: u64) -> Vec<(SessionId, Vec<u8>)> {
+        let mut due = Vec::new();
+        self.deferred_pty.retain(|(session, due_ms, bytes)| {
+            if *due_ms <= now_ms {
+                due.push((session.clone(), bytes.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        due
     }
 
     /// Tee a coalesced read of a child terminal's PTY bytes into the shell
@@ -473,6 +501,13 @@ impl RemoteBridge {
                 } else if !now_needs && was_needs {
                     self.previews.remove(&sid);
                     self.needs_input_since.remove(&sid);
+                    // The prompt was answered (agent left needs-input) — clear the
+                    // open-prompt dedup guard so the NEXT question in this session
+                    // surfaces as a fresh prompt instead of being suppressed as a
+                    // duplicate and reusing the old frame (remote-control-dc9).
+                    if let Some(builder) = self.transcripts.get_mut(&sid) {
+                        builder.clear_open_prompt();
+                    }
                 }
 
                 // Event edge (arming always advances; grace only gates sending).

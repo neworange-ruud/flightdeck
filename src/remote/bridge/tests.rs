@@ -861,3 +861,21 @@ fn unclear_permission_and_empty_options_fall_back_to_binary() {
     write_sidecar(wt.path(), "{not json");
     assert!(read_prompt_sidecar(wt.path()).is_none());
 }
+
+#[test]
+fn deferred_pty_writes_fire_only_once_due() {
+    // Claude's multi-select submit Enter is queued with a future due time and
+    // must not flush early, then flush exactly once when the deadline passes
+    // (remote-control-dc9).
+    let mut b = RemoteBridge::passthrough(0);
+    let sid = SessionId::new("s1");
+    b.enqueue_deferred_pty(sid.clone(), 1_000, b"\r".to_vec());
+
+    // Before the deadline: nothing is due.
+    assert!(b.take_due_deferred_pty(999).is_empty());
+    // At/after the deadline: the write is returned, once.
+    let due = b.take_due_deferred_pty(1_000);
+    assert_eq!(due, vec![(sid, b"\r".to_vec())]);
+    // Already drained — a later poll yields nothing.
+    assert!(b.take_due_deferred_pty(2_000).is_empty());
+}

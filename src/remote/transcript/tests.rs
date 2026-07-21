@@ -750,3 +750,59 @@ fn opencode_sync_reads_db_and_resets_on_session_switch() {
         "switching to the newer session id resets the transcript"
     );
 }
+
+/// Regression (remote-control-dc9): once a structured prompt is answered and the
+/// bridge calls `clear_open_prompt`, the NEXT question in the same session must
+/// surface as a fresh prompt — the open-prompt dedup guard must not suppress it
+/// as a duplicate (the bug where a follow-up question reused the old frame).
+#[test]
+fn clear_open_prompt_lets_the_next_question_surface() {
+    fn question(text: &str) -> StructuredPrompt {
+        StructuredPrompt {
+            kind: PromptKind::Question,
+            command: text.to_string(),
+            options: vec![PermissionOption {
+                index: 0,
+                choice: None,
+                label: "A".to_string(),
+                description: None,
+            }],
+            allow_free_text: true,
+            multi_select: true,
+        }
+    }
+
+    let mut b = builder();
+    // Q1 captured (OpenCode sidecar style) then surfaced on the needs-input edge.
+    b.set_structured_prompt(question("Q1?"));
+    b.on_needs_input(1);
+    assert!(b.has_open_prompt());
+    let after_q1 = b.total();
+
+    // The SAME question captured again while still open must NOT re-emit.
+    b.set_structured_prompt(question("Q1?"));
+    b.on_needs_input(2);
+    assert_eq!(
+        b.total(),
+        after_q1,
+        "duplicate of the open question is deduped"
+    );
+
+    // The agent answers → the bridge clears the guard on the leaving-needs-input
+    // edge.
+    b.clear_open_prompt();
+    assert!(!b.has_open_prompt());
+
+    // A new question now surfaces as a fresh prompt (not suppressed).
+    b.set_structured_prompt(question("Q2?"));
+    b.on_needs_input(3);
+    assert_eq!(
+        b.total(),
+        after_q1 + 1,
+        "the next question surfaces after the guard is cleared"
+    );
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt { command, .. }) => assert_eq!(command, "Q2?"),
+        other => panic!("expected the new Q2 prompt, got {other:?}"),
+    }
+}

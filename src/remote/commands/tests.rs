@@ -431,14 +431,20 @@ fn multi_option_keystroke_toggles_and_confirms_for_opencode() {
 }
 
 #[test]
-fn permission_decision_option_indices_claude_toggles_and_confirms() {
+fn permission_decision_option_indices_claude_defers_the_submit_enter() {
     let index = answerable("t1:p3", StatusBackend::Claude);
+    // Claude: everything up to and including the Tab to the Confirm tab is
+    // written immediately; the trailing submit Enter is deferred so it lands
+    // after the tab renders (remote-control-dc9).
     assert_eq!(
         translate(&decision_options("t1:p3", vec![0, 2]), &index),
-        Translation::PtyInput {
+        Translation::PtyInputThenDeferred {
             project: 0,
             tab: 0,
-            bytes: b"\r\x1b[B\x1b[B\r\t\r".to_vec(),
+            session_id: SessionId::new("t1"),
+            immediate: b"\r\x1b[B\x1b[B\r\t".to_vec(),
+            deferred: b"\r".to_vec(),
+            delay_ms: crate::remote::commands::MULTI_SELECT_SUBMIT_DELAY_MS,
         }
     );
 }

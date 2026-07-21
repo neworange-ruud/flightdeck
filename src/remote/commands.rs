@@ -287,6 +287,26 @@ pub enum Translation {
         /// The exact bytes to write.
         bytes: Vec<u8>,
     },
+    /// Write `immediate` to the session's primary terminal now, then `deferred`
+    /// after `delay_ms`. Used for Claude's multi-select submit: the trailing
+    /// Enter must arrive AFTER the Tab-driven switch to the Confirm tab has
+    /// rendered, or Claude's Ink TUI drops it and the form never submits
+    /// (remote-control-dc9). `session_id` re-resolves the tab at flush time,
+    /// since tab indices may shift during the delay.
+    PtyInputThenDeferred {
+        /// Workspace project index (for the immediate write).
+        project: usize,
+        /// Tab index within the project (for the immediate write).
+        tab: usize,
+        /// Session whose primary PTY receives the deferred write.
+        session_id: SessionId,
+        /// Bytes written now (toggles + navigation + the Tab to Confirm).
+        immediate: Vec<u8>,
+        /// Bytes written after `delay_ms` (the submit Enter).
+        deferred: Vec<u8>,
+        /// How long to wait before the deferred write, in ms.
+        delay_ms: u64,
+    },
     /// Dispatch an existing app [`Command`] against the tab (the executor
     /// temporarily selects it, preserving the user's on-screen selection).
     Dispatch {
@@ -432,6 +452,13 @@ pub fn option_keystroke(
     }
 }
 
+/// How long to wait after switching to Claude's Confirm tab before injecting
+/// the submit Enter (see [`Translation::PtyInputThenDeferred`]). Long enough for
+/// the Ink TUI to render the new tab so the Enter is not dropped, short enough
+/// to feel instant. The 50ms main-loop poll means the actual wait rounds up to
+/// the next tick.
+pub const MULTI_SELECT_SUBMIT_DELAY_MS: u64 = 150;
+
 /// The keystrokes injected to select SEVERAL options of a multi-select
 /// (checklist / `multiSelect`) Question prompt, then submit them together.
 /// `option_indices` are the phone's chosen 0-based indices (deduplicated and
@@ -574,12 +601,27 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
             } else if let Some(indices) = option_indices {
-                match multi_option_keystroke(backend, indices, s.application_cursor) {
-                    Some(b) => b,
-                    None => {
-                        return reject("this agent does not support multi-select prompts");
-                    }
+                let Some(mut b) = multi_option_keystroke(backend, indices, s.application_cursor)
+                else {
+                    return reject("this agent does not support multi-select prompts");
+                };
+                // Claude's Ink TUI drops the submit Enter when it arrives during
+                // the Tab-driven switch to the Confirm tab, so the form never
+                // submits (remote-control-dc9). Split off that trailing Enter (the
+                // last byte) and deliver it after a short delay, once the tab has
+                // rendered. OpenCode has no such screen and submits in one burst.
+                if backend == StatusBackend::Claude {
+                    let deferred = vec![b.pop().expect("keystroke sequence is non-empty")];
+                    return Translation::PtyInputThenDeferred {
+                        project: s.project,
+                        tab: s.tab,
+                        session_id: session_id.clone(),
+                        immediate: b,
+                        deferred,
+                        delay_ms: MULTI_SELECT_SUBMIT_DELAY_MS,
+                    };
                 }
+                b
             } else if let Some(n) = option_index {
                 match option_keystroke(backend, *n, s.application_cursor) {
                     Some(b) => b,
