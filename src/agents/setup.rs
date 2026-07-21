@@ -209,26 +209,49 @@ export const FlightDeckStatus = async ({ directory, worktree }) => {
   const writePrompt = (event) => {
     try {
       if (!existsSync(fdDir)) return;
+      // Capture the raw event so the exact schema can be inspected/parsed even
+      // if the normalization below misses a field (remote-control-qa1). Not
+      // consumed by the desktop; overwritten each prompt.
+      try {
+        writeFileSync(
+          join(fdDir, "agent-prompt.debug.json"),
+          JSON.stringify({ type: event.type, properties: event.properties }, null, 2),
+        );
+      } catch (_) {}
       const p = event.properties || {};
       const kind = event.type === "question.asked" ? "question" : "permission";
-      const m = p.metadata || {};
-      const text = p.question ?? p.title ?? p.text ?? m.title ?? m.text ?? "";
-      const raw = Array.isArray(p.options)
-        ? p.options
-        : Array.isArray(m.options)
-          ? m.options
-          : [];
-      const options = raw.map((o) =>
+      // OpenCode's question payload uses `questions[]` (each with `options`/
+      // `choices` of `{label,value,hint}`) and a `multiple` flag; a permission
+      // uses top-level `title`/`options`. Probe both, and the nested `question`
+      // object, so real options reach the phone instead of an empty card.
+      const q = Array.isArray(p.questions)
+        ? p.questions[0] || {}
+        : p.question && typeof p.question === "object"
+          ? p.question
+          : p;
+      const text =
+        q.question ?? q.title ?? q.header ?? p.title ?? p.text ?? p.prompt ?? "";
+      const rawOpts = Array.isArray(q.options)
+        ? q.options
+        : Array.isArray(q.choices)
+          ? q.choices
+          : Array.isArray(p.options)
+            ? p.options
+            : Array.isArray(p.choices)
+              ? p.choices
+              : [];
+      const options = rawOpts.map((o) =>
         o && typeof o === "object"
           ? {
-              label: String(o.label ?? o.title ?? o.text ?? o.value ?? ""),
-              description: o.description ?? o.hint ?? o.detail ?? undefined,
+              label: String(o.label ?? o.title ?? o.value ?? o.text ?? ""),
+              description: o.hint ?? o.description ?? o.detail ?? undefined,
             }
           : { label: String(o) },
       );
+      const multiple = Boolean(q.multiple ?? q.multiSelect ?? p.multiple ?? false);
       writeFileSync(
         join(fdDir, "agent-prompt.json"),
-        JSON.stringify({ kind, text: String(text), options }),
+        JSON.stringify({ kind, text: String(text), options, multiple }),
       );
     } catch (_) {}
   };

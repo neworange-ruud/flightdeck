@@ -30,7 +30,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **FlightDeck Remote: OpenCode questions surface their real options.** The
+  OpenCode status plugin read the question's options from the wrong field, so an
+  OpenCode question reached the phone as an empty Allow/Deny card. It now reads
+  OpenCode's actual payload (`questions[]` / `choices`, `label`/`value`/`hint`),
+  so the real options are offered. (remote-control-qa1)
 
 ### Bug fixes
 
