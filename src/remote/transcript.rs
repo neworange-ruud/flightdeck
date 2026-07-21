@@ -420,7 +420,13 @@ impl TranscriptBuilder {
                             // through to the pill.
                             if name == "AskUserQuestion" {
                                 if let Some(sp) = parse_ask_user_question(input) {
-                                    self.emit_structured_prompt(sp, at_ms);
+                                    // Skip if this question was already surfaced
+                                    // (the PreToolUse sidecar delivers it before the
+                                    // JSONL record lands) so it is not shown twice
+                                    // (remote-control-qa1). Either way, emit no pill.
+                                    if self.open_prompt.is_none() {
+                                        self.emit_structured_prompt(sp, at_ms);
+                                    }
                                     continue;
                                 }
                             }
@@ -642,16 +648,18 @@ impl TranscriptBuilder {
     /// an inline permission prompt whose preview is the agent's last prose (the
     /// session file has no permission records). Returns the preview (if any).
     pub fn on_needs_input(&mut self, at_ms: i64) -> Option<String> {
-        // A structured prompt captured via the OpenCode sidecar is surfaced here
-        // in place of the synthesized binary allow/deny fallback.
+        // If a structured prompt was already surfaced (a Claude AskUserQuestion
+        // emitted at ingest), do NOT emit anything else for the same wait — and
+        // discard any duplicate captured prompt (e.g. the sidecar for the SAME
+        // question) so the phone never sees it twice (remote-control-qa1).
+        if let Some(preview) = self.open_prompt.clone() {
+            self.pending_structured = None;
+            return Some(preview);
+        }
+        // Otherwise a captured structured prompt (the OpenCode sidecar, or the
+        // Claude AskUserQuestion sidecar) supplants the binary allow/deny fallback.
         if let Some(sp) = self.pending_structured.take() {
             return self.emit_structured_prompt(sp, at_ms);
-        }
-        // A Claude AskUserQuestion already surfaced at ingest time and is still
-        // unanswered: do NOT emit a second (binary) prompt for the same wait —
-        // just report its preview (remote-control-z30).
-        if let Some(preview) = self.open_prompt.clone() {
-            return Some(preview);
         }
         self.prompt_seq += 1;
         let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
@@ -787,7 +795,7 @@ fn truncate_preview(text: &str) -> Option<String> {
 /// caller falls back to a normal activity pill — when the shape is missing or
 /// oddly typed (no question text, or no options with labels). `multiSelect` is
 /// treated as single-select for v1.
-fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
+pub(crate) fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
     let question = input
         .get("questions")
         .and_then(Value::as_array)

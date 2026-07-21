@@ -60,13 +60,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   hook flips the agent to `waiting` so the row status, rollup, and notifications
   are correct too. (remote-control-z30)
 - **FlightDeck Remote: a question no longer shows a phantom permission prompt
-  first.** The hook that flips an agent to "waiting" can fire a beat before the
-  agent's `AskUserQuestion` is written to its session log, so the phone briefly
-  showed a generic Allow/Deny card — and accepting it drove the agent's live
-  selector (its "Allow" keystroke lands as an answer), marking the question
-  answered with the wrong option. The binary fallback is now deferred briefly so
-  the real question wins the race; a genuine permission prompt still appears
-  (just a moment later). (remote-control-qa1)
+  first.** Claude writes an `AskUserQuestion` to its session log only *after* it
+  is answered, so the phone used to show a generic (empty) Allow/Deny card while
+  the agent waited — and accepting it drove the live selector (its "Allow"
+  keystroke lands as an answer), marking the question answered with the wrong
+  option. The Claude `AskUserQuestion` hook now writes the question to a sidecar
+  the instant it is asked (mirroring OpenCode), so the desktop surfaces the real
+  question to the phone immediately, with no binary card in between. A genuine
+  permission prompt still shows the Allow/Deny card as before. (remote-control-qa1)
 - **FlightDeck Remote: the Projects tab now lists projects from every paired
   Mac.** It previously bound to a single machine, so with more than one Mac
   paired it silently hid all but one machine's projects (and could strand on an

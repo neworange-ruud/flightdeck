@@ -400,13 +400,18 @@ impl RemoteBridge {
                 let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
                 let is_claude = !is_opencode && !tab.meta.agent.eq_ignore_ascii_case("codex");
                 if now_needs && !was_needs {
-                    // Only OpenCode writes the prompt sidecar (from its injected
-                    // plugin). Read it BEFORE `on_needs_input` so a captured
-                    // structured prompt supplants the binary fallback, then remove
-                    // it so a stale prompt is never reused on a later edge. We only
-                    // ever touch the file for OpenCode sessions.
+                    // Read the agent's prompt sidecar BEFORE `on_needs_input` so a
+                    // captured structured prompt supplants the binary fallback:
+                    // OpenCode's plugin writes `agent-prompt.json`; Claude's
+                    // PreToolUse hook writes `agent-question.json` for an
+                    // AskUserQuestion. The sidecar is written before the status
+                    // flips to `waiting`, so it is present on this edge and the
+                    // real question shows immediately — never the binary card whose
+                    // keystroke would answer it (remote-control-qa1).
                     let sidecar = if is_opencode {
                         read_prompt_sidecar(&worktree)
+                    } else if is_claude {
+                        read_claude_question_sidecar(&worktree)
                     } else {
                         None
                     };
@@ -439,6 +444,11 @@ impl RemoteBridge {
                     }
                     if is_opencode {
                         let _ = std::fs::remove_file(prompt_sidecar_path(&worktree));
+                    }
+                    if is_claude {
+                        // Consume the sidecar so a later, unrelated wait never
+                        // reuses this question.
+                        let _ = std::fs::remove_file(claude_question_sidecar_path(&worktree));
                     }
                 } else if now_needs && was_needs {
                     // Still waiting with a deferred Claude binary fallback: resolve
@@ -702,6 +712,29 @@ struct PromptSidecarOption {
 /// `agent-status` file the poller reads).
 fn prompt_sidecar_path(worktree: &Path) -> PathBuf {
     worktree.join(".flightdeck").join("agent-prompt.json")
+}
+
+/// Path of the Claude AskUserQuestion sidecar within a worktree. Written by the
+/// Claude `PreToolUse`/`AskUserQuestion` hook (which pipes the hook's stdin —
+/// the `{tool_name, tool_input, …}` payload — to this file) at the instant the
+/// question is asked, BEFORE it flips the status to `waiting`. This gives the
+/// desktop the question deterministically on the needs-input edge, rather than
+/// waiting for Claude to write the tool_use to its JSONL — which it does only
+/// AFTER the user answers, so the binary fallback would otherwise win the race
+/// and its "Allow" keystroke would answer the live question (remote-control-qa1).
+fn claude_question_sidecar_path(worktree: &Path) -> PathBuf {
+    worktree.join(".flightdeck").join("agent-question.json")
+}
+
+/// Read and parse the Claude AskUserQuestion sidecar into a [`StructuredPrompt`],
+/// or `None` when it is absent/malformed. The file holds the raw PreToolUse hook
+/// payload, so the `tool_input` field is the AskUserQuestion input the transcript
+/// parser already understands.
+fn read_claude_question_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
+    let raw = std::fs::read_to_string(claude_question_sidecar_path(worktree)).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let input = parsed.get("tool_input")?;
+    crate::remote::transcript::parse_ask_user_question(input)
 }
 
 /// Classify a permission option's button label into the binary choice it maps

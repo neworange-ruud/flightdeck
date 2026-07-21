@@ -388,6 +388,35 @@ fn ask_user_question_racing_the_status_flip_is_not_shown_as_a_binary_prompt() {
     assert!(free_text, "AskUserQuestion allows a free-text answer");
 }
 
+#[test]
+fn reads_claude_question_sidecar_into_a_structured_prompt() {
+    // The PreToolUse hook pipes its stdin (the AskUserQuestion payload) to
+    // `.flightdeck/agent-question.json`; the bridge parses `tool_input` from it
+    // into a Question prompt on the needs-input edge (remote-control-qa1).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".flightdeck")).unwrap();
+    std::fs::write(
+        dir.path().join(".flightdeck/agent-question.json"),
+        r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Lunch?","header":"L","options":[{"label":"Pizza","description":"cheesy"},{"label":"Sushi"}]}]}}"#,
+    )
+    .unwrap();
+
+    let sp = super::read_claude_question_sidecar(dir.path()).expect("parsed sidecar");
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert_eq!(sp.command, "Lunch?");
+    assert_eq!(sp.options.len(), 2);
+    assert_eq!(sp.options[0].label, "Pizza");
+    assert!(
+        sp.allow_free_text,
+        "AskUserQuestion allows a free-text answer"
+    );
+
+    // A missing/blank sidecar yields no prompt (→ binary fallback for a real
+    // permission).
+    let empty = tempfile::tempdir().unwrap();
+    assert!(super::read_claude_question_sidecar(empty.path()).is_none());
+}
+
 // --- transcript reconstruction from the session file -----------------------
 
 #[test]

@@ -180,7 +180,7 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
     "Stop": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "StopFailure": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
+    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && { cat > .flightdeck/agent-question.json; printf 'waiting\\n' >> .flightdeck/agent-status; }; exit 0"}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'working\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "Notification": [
       {"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]},
@@ -408,7 +408,7 @@ const CLAUDE_SETTINGS: &str = r##"{
         "hooks": [
           {
             "type": "command",
-            "command": "r=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'waiting\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+            "command": "r=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && { cat > \"$r/.flightdeck/agent-question.json\" 2>/dev/null; printf 'waiting\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; }; exit 0"
           }
         ]
       }
@@ -616,9 +616,15 @@ mod tests {
         // matching the tool is what surfaces the wait to the phone.
         let pre = &parsed["hooks"]["PreToolUse"][0];
         assert_eq!(pre["matcher"], "AskUserQuestion");
-        assert!(pre["hooks"][0]["command"]
-            .as_str()
-            .is_some_and(|c| c.contains("waiting")));
+        let pre_cmd = pre["hooks"][0]["command"].as_str().unwrap_or_default();
+        assert!(pre_cmd.contains("waiting"), "must flip status to waiting");
+        // Must also capture the hook's stdin (the AskUserQuestion tool_input) to
+        // the question sidecar the bridge reads, so the phone gets the real
+        // question deterministically instead of a racing binary card (qa1).
+        assert!(
+            pre_cmd.contains("agent-question.json") && pre_cmd.contains("cat >"),
+            "PreToolUse must pipe stdin to the question sidecar"
+        );
         let manifest = fs
             .file_contents(Path::new(
                 "/repo/.flightdeck/runtime/status/claude/.claude-plugin/plugin.json",
