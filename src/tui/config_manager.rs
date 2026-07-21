@@ -27,11 +27,13 @@ pub enum ConfigScope {
     Project,
 }
 
-/// The kind of a curated field: a boolean toggle or a fixed set of choices.
+/// The kind of a curated field: a boolean toggle, a fixed set of choices, or a
+/// free-text value the user types (e.g. the relay URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldKind {
     Bool,
     Choice(Vec<String>),
+    Text,
 }
 
 /// One curated, editable setting: a label plus the TOML `section.key` it maps to.
@@ -77,6 +79,11 @@ pub struct ConfigRow {
     pub is_bool: bool,
     /// The boolean state when `is_bool` (ignored otherwise).
     pub bool_value: bool,
+    /// True for a free-text field (rendered as an editable value).
+    pub is_text: bool,
+    /// True when this text field is currently being edited (`value` holds the
+    /// in-progress buffer, which a renderer may show with a cursor).
+    pub editing: bool,
 }
 
 /// The configuration manager model (SPECS §8).
@@ -96,6 +103,9 @@ pub struct ConfigManager {
     selected: usize,
     global_dirty: bool,
     project_dirty: bool,
+    /// When a [`FieldKind::Text`] field is being edited, its in-progress buffer.
+    /// `None` means no text field is currently open for editing.
+    editing: Option<String>,
     /// Transient status line (e.g. "Saved.").
     status: Option<String>,
 }
@@ -129,6 +139,7 @@ impl ConfigManager {
             selected: 0,
             global_dirty: false,
             project_dirty: false,
+            editing: None,
             status: None,
         }
     }
@@ -163,15 +174,17 @@ impl ConfigManager {
         }
     }
 
-    /// Move the selection down one row (wraps).
+    /// Move the selection down one row (wraps). Discards any open text edit.
     pub fn select_next(&mut self) {
+        self.editing = None;
         if !self.fields.is_empty() {
             self.selected = (self.selected + 1) % self.fields.len();
         }
     }
 
-    /// Move the selection up one row (wraps).
+    /// Move the selection up one row (wraps). Discards any open text edit.
     pub fn select_prev(&mut self) {
+        self.editing = None;
         let len = self.fields.len();
         if len > 0 {
             self.selected = (self.selected + len - 1) % len;
@@ -180,6 +193,7 @@ impl ConfigManager {
 
     /// Switch between Global and Project scope, clamping the selection.
     pub fn switch_scope(&mut self) {
+        self.editing = None;
         self.scope = match self.scope {
             ConfigScope::Global => ConfigScope::Project,
             ConfigScope::Project => ConfigScope::Global,
@@ -194,13 +208,25 @@ impl ConfigManager {
             .enumerate()
             .map(|(i, f)| {
                 let (value, origin) = self.effective(f);
-                let (display, is_bool, bool_value) = match &f.kind {
+                let editing_this = i == self.selected && self.editing.is_some();
+                let (display, is_bool, bool_value, is_text) = match &f.kind {
                     FieldKind::Bool => {
                         let b = value.as_bool().unwrap_or(false);
-                        ((if b { "on" } else { "off" }).to_string(), true, b)
+                        ((if b { "on" } else { "off" }).to_string(), true, b, false)
                     }
-                    FieldKind::Choice(_) => {
-                        (value.as_str().unwrap_or("").to_string(), false, false)
+                    FieldKind::Choice(_) => (
+                        value.as_str().unwrap_or("").to_string(),
+                        false,
+                        false,
+                        false,
+                    ),
+                    FieldKind::Text => {
+                        let display = if editing_this {
+                            self.editing.clone().unwrap_or_default()
+                        } else {
+                            value.as_str().unwrap_or("").to_string()
+                        };
+                        (display, false, false, true)
                     }
                 };
                 ConfigRow {
@@ -210,6 +236,8 @@ impl ConfigManager {
                     selected: i == self.selected,
                     is_bool,
                     bool_value,
+                    is_text,
+                    editing: editing_this,
                 }
             })
             .collect()
@@ -231,8 +259,59 @@ impl ConfigManager {
                 toml::Value::String(next)
             }
             FieldKind::Choice(_) => return,
+            // A text field is not toggled — activating it opens an inline editor
+            // seeded with the current effective value. The edit is committed by
+            // [`Self::commit_edit`] and discarded by [`Self::cancel_edit`].
+            FieldKind::Text => {
+                self.editing = Some(current.as_str().unwrap_or("").to_string());
+                self.status = None;
+                return;
+            }
         };
         set_value(self.scope_table_mut(), field.section, field.key, new_value);
+        self.mark_dirty();
+    }
+
+    /// Whether an inline text edit is currently open.
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// Append a typed character to the open text edit buffer (no-op if not
+    /// editing).
+    pub fn edit_push_char(&mut self, c: char) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    /// Delete the last character of the open text edit buffer (no-op if not
+    /// editing or already empty).
+    pub fn edit_backspace(&mut self) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf.pop();
+        }
+    }
+
+    /// Discard the open text edit without changing any value.
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// Commit the open text edit into the current scope as an explicit override.
+    pub fn commit_edit(&mut self) {
+        let Some(buf) = self.editing.take() else {
+            return;
+        };
+        let Some(field) = self.fields.get(self.selected).cloned() else {
+            return;
+        };
+        set_value(
+            self.scope_table_mut(),
+            field.section,
+            field.key,
+            toml::Value::String(buf),
+        );
         self.mark_dirty();
     }
 
@@ -387,6 +466,16 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             ),
         },
         b("Dim terminal in app mode", "ui", "dim_terminal_in_app_mode"),
+        // FlightDeck Remote (phone link). The relay URL is free-text so a user
+        // can point it at a relay they host themselves — the default relay is
+        // restricted and not publicly usable (surfaced as a note in the UI).
+        b("FlightDeck Remote (phone link)", "remote", "enabled"),
+        CuratedField {
+            label: "Relay URL",
+            section: "remote",
+            key: "relay_url",
+            kind: FieldKind::Text,
+        },
     ]
 }
 
@@ -528,6 +617,92 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].0.ends_with("config.toml"));
         assert!(outputs[0].0.to_string_lossy().contains(".flightdeck"));
+    }
+
+    /// Move the selection to the field with `label`, returning its row index.
+    fn goto(m: &mut ConfigManager, label: &str) -> usize {
+        let idx = m.rows().iter().position(|r| r.label == label).unwrap();
+        while m.selected_index() != idx {
+            m.select_next();
+        }
+        idx
+    }
+
+    #[test]
+    fn exposes_remote_fields_with_relay_default() {
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let rows = m.rows();
+        let enabled = rows
+            .iter()
+            .find(|r| r.label == "FlightDeck Remote (phone link)")
+            .unwrap();
+        assert!(enabled.is_bool);
+        assert!(!enabled.bool_value, "remote is off by default");
+        let relay = rows.iter().find(|r| r.label == "Relay URL").unwrap();
+        assert!(relay.is_text);
+        // The default relay URL is shown as the inherited fallback.
+        assert_eq!(relay.value, "wss://relay.flightdeckai.app/ws");
+        assert_eq!(relay.origin, Origin::Default);
+    }
+
+    #[test]
+    fn editing_relay_url_writes_a_text_override() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Relay URL");
+        // Activating a text field opens the editor seeded with the current value.
+        m.toggle_selected();
+        assert!(m.is_editing());
+        // Clear it and type a self-hosted URL.
+        for _ in 0.."wss://relay.flightdeckai.app/ws".len() {
+            m.edit_backspace();
+        }
+        for c in "wss://my-relay.example/ws".chars() {
+            m.edit_push_char(c);
+        }
+        m.commit_edit();
+        assert!(!m.is_editing());
+        let relay = m
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "Relay URL")
+            .unwrap();
+        assert_eq!(relay.value, "wss://my-relay.example/ws");
+        assert_eq!(relay.origin, Origin::SetHere);
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[remote]"));
+        assert!(body.contains("relay_url = \"wss://my-relay.example/ws\""));
+    }
+
+    #[test]
+    fn cancel_edit_discards_changes() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Relay URL");
+        m.toggle_selected();
+        m.edit_push_char('x');
+        m.cancel_edit();
+        assert!(!m.is_editing());
+        assert!(!m.dirty(), "cancelled edit must not dirty the config");
+    }
+
+    #[test]
+    fn navigating_away_discards_open_edit() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Relay URL");
+        m.toggle_selected();
+        m.edit_push_char('z');
+        m.select_next();
+        assert!(!m.is_editing());
+        assert!(!m.dirty());
+    }
+
+    #[test]
+    fn toggle_remote_enabled_writes_bool_override() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "FlightDeck Remote (phone link)");
+        m.toggle_selected();
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[remote]"));
+        assert!(body.contains("enabled = true"));
     }
 
     #[test]

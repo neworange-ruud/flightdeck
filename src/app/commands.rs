@@ -170,6 +170,8 @@ pub enum Command {
     ShowGitStatus,
     /// Show help / keybindings (SPECS §23).
     ShowHelp,
+    /// Show the About dialog (version + authorship / credits).
+    ShowAbout,
     /// Toggle split view: lay the selected tab's terminals (agent + shells) out
     /// side by side in equal-width columns instead of as horizontal tabs.
     ToggleSplitView,
@@ -249,6 +251,8 @@ pub enum Effect {
     },
     /// The help screen should be shown (SPECS §23).
     ShowHelp,
+    /// The About dialog should be shown (version + credits).
+    ShowAbout,
 }
 
 #[cfg(test)]

@@ -46,7 +46,8 @@ default (falling back to Global if the project has no config file yet).
 Keys:
 
 - **`↑` / `↓`** — move between settings,
-- **`Space`** — toggle a boolean or cycle a choice,
+- **`Space`** — toggle a boolean, cycle a choice, or start editing a text field
+  (e.g. the relay URL — type to edit, `Enter` saves, `Esc` cancels),
 - **`Tab`** — switch between **Global** and **Project** scope (the header always
   names the file and project you're editing),
 - **`c`** — clear a project override so the value re-inherits from global,
@@ -70,10 +71,19 @@ The manager exposes the settings you change most often:
 | Use F2 to leave terminal focus | `ui.use_f2_to_leave_terminal_focus` |
 | Agent tab position (left / right) | `ui.agent_tab_position` |
 | Default agent | `ui.default_agent` |
+| FlightDeck Remote (phone link) | `remote.enabled` |
+| Relay URL | `remote.relay_url` |
+
+<Callout type="warning">
+  The default relay is **restricted and not accessible to the public** — enabling
+  FlightDeck Remote against it won't connect. Set **Relay URL** to a relay you
+  host yourself (self-hosting is unsupported). See
+  [FlightDeck Remote → Availability](/remote#availability).
+</Callout>
 
 For everything else — Git remote and host, branch prefix, worktree root,
-containers, remote pairing, and custom agents — edit `config.toml` directly
-(press `e`), and see the [full reference](/reference/configuration).
+containers, and custom agents — edit `config.toml` directly (press `e`), and see
+the [full reference](/reference/configuration).
 
 ## What's committed
 

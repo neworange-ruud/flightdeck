@@ -845,6 +845,7 @@ impl AppState {
             Command::RestartAgent => self.cmd_restart_agent(services),
             Command::ShowGitStatus => self.cmd_show_git_status(services),
             Command::ShowHelp => Ok(Effect::ShowHelp),
+            Command::ShowAbout => Ok(Effect::ShowAbout),
             Command::ToggleSplitView => {
                 self.toggle_split_view();
                 let label = if self.split_view { "on" } else { "off" };

@@ -3439,6 +3439,7 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
             };
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,
+        Effect::ShowAbout => ui.overlay = UiOverlay::About,
     }
 }
 
@@ -4400,6 +4401,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
             }
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,
+        Effect::ShowAbout => ui.overlay = UiOverlay::About,
     }
 }
 
@@ -4596,6 +4598,22 @@ fn handle_config_key(
     let Some(cm) = ui.config.as_mut() else {
         return Ok(());
     };
+    // While an inline text field (e.g. the relay URL) is being edited, keystrokes
+    // go to the editor: type to insert, Backspace to delete, Enter to commit, Esc
+    // to cancel. Nothing else (navigation, save, scope switch) fires until the
+    // edit is resolved.
+    if cm.is_editing() {
+        match key.code {
+            KeyCode::Esc => cm.cancel_edit(),
+            KeyCode::Enter => cm.commit_edit(),
+            KeyCode::Backspace => cm.edit_backspace(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cm.edit_push_char(c)
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     match key.code {
         KeyCode::Esc => ui.config = None,
         KeyCode::Up => cm.select_prev(),
