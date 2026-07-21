@@ -23,6 +23,12 @@ import SwiftUI
 
 struct ProjectsListView: View {
     var transportStore: TransportStore
+    /// When set, the list AGGREGATES projects across every paired instance
+    /// (matching the Feed), instead of showing only `transportStore`'s single
+    /// machine — otherwise the Projects tab silently hides every project on all
+    /// but one machine (remote-control-aj2). `nil` in previews/tests keeps the
+    /// simple single-store behaviour.
+    var coordinator: TransportCoordinator? = nil
     var router: AppRouter
     var nav: ProjectsNavModel
 
@@ -35,12 +41,47 @@ struct ProjectsListView: View {
     // shared New-Agent sheet (ProjectsSessionsUITests.testNewAgentCTAOpens…).
     @FocusState private var searchFieldFocused: Bool
 
-    private var allProjects: [Wire.ProjectState] {
-        transportStore.snapshot?.projects ?? []
+    /// One project row, tagged with the machine (pairing) it belongs to so a tap
+    /// binds the detail screens to that machine's store. `pairingId == nil` in
+    /// the single-store fallback (no coordinator), where the route ignores it.
+    private struct Row: Identifiable {
+        let project: Wire.ProjectState
+        let pairingId: String?
+        var id: String { (pairingId ?? "-") + "\u{1f}" + project.projectId.rawValue }
     }
 
-    private var visibleProjects: [Wire.ProjectState] {
-        ProjectsSearch.filter(projects: allProjects, query: searchQuery)
+    private var allRows: [Row] {
+        // Aggregate across paired machines when a coordinator with live handles
+        // is present. With no handles (previews, UI-test fixtures, and the
+        // recordless single-store fallback all seed `transportStore` directly),
+        // fall back to the single store so those paths keep working.
+        if let coordinator, !coordinator.handles.isEmpty {
+            return coordinator.handles.flatMap { handle in
+                (handle.store.snapshot?.projects ?? [])
+                    .map { Row(project: $0, pairingId: handle.pairingId) }
+            }
+        }
+        return (transportStore.snapshot?.projects ?? [])
+            .map { Row(project: $0, pairingId: nil) }
+    }
+
+    private var visibleRows: [Row] {
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return allRows }
+        return allRows.filter {
+            $0.project.name.range(of: trimmed, options: .caseInsensitive) != nil
+        }
+    }
+
+    private var allProjects: [Wire.ProjectState] { allRows.map(\.project) }
+
+    /// Whether any paired machine has delivered a snapshot yet (drives the
+    /// waiting/empty state across all instances, not just one).
+    private var hasAnySnapshot: Bool {
+        if let coordinator, !coordinator.handles.isEmpty {
+            return coordinator.handles.contains { $0.store.snapshot != nil }
+        }
+        return transportStore.snapshot != nil
     }
 
     var body: some View {
@@ -127,9 +168,9 @@ struct ProjectsListView: View {
 
     @ViewBuilder
     private var content: some View {
-        if transportStore.snapshot == nil {
+        if !hasAnySnapshot {
             emptyState
-        } else if visibleProjects.isEmpty {
+        } else if visibleRows.isEmpty {
             noSearchResultsState
         } else {
             projectList
@@ -139,8 +180,8 @@ struct ProjectsListView: View {
     private var projectList: some View {
         ScrollView {
             LazyVStack(spacing: Theme.Spacing.md) {
-                ForEach(visibleProjects, id: \.projectId) { project in
-                    projectCard(project)
+                ForEach(visibleRows) { row in
+                    projectCard(row)
                 }
             }
             .padding(Theme.Spacing.lg)
@@ -148,19 +189,24 @@ struct ProjectsListView: View {
         .refreshable { await refresh() }
     }
 
-    /// Pull-to-refresh: force a fresh snapshot from the (live) desktop so a
+    /// Pull-to-refresh: force a fresh snapshot from every paired desktop so a
     /// stale/last-known list is replaced (remote-control-aj2). These screens
     /// previously had no refresh at all, so a pull-down did nothing.
     private func refresh() async {
-        transportStore.requestSnapshot()
+        if let coordinator, !coordinator.handles.isEmpty {
+            for handle in coordinator.handles { handle.store.requestSnapshot() }
+        } else {
+            transportStore.requestSnapshot()
+        }
         // Let the request round-trip so the spinner reflects real work.
         try? await Task.sleep(for: .milliseconds(600))
     }
 
-    private func projectCard(_ project: Wire.ProjectState) -> some View {
+    private func projectCard(_ row: Row) -> some View {
+        let project = row.project
         let vm = RollupModel.viewModel(for: project)
         return Button {
-            nav.path.append(.sessions(projectId: project.projectId.rawValue, pairingId: nil))
+            nav.path.append(.sessions(projectId: project.projectId.rawValue, pairingId: row.pairingId))
         } label: {
             HStack(spacing: Theme.Spacing.md) {
                 StatusDot(status: vm.dot.agentStatus, size: .large)
@@ -207,10 +253,28 @@ struct ProjectsListView: View {
         .accessibilityIdentifier("projects-empty-state")
     }
 
+    /// The link state to phrase the waiting copy against: with a coordinator,
+    /// the most-alive state across all paired machines (any connected wins, then
+    /// any mid-handshake) so the copy isn't pinned to one machine; otherwise the
+    /// single store's state.
+    private var effectiveLinkState: RemoteLinkState {
+        guard let coordinator, !coordinator.handles.isEmpty else {
+            return transportStore.linkState
+        }
+        let states = coordinator.handles.map(\.store.linkState)
+        if states.contains(where: { if case .connected = $0 { true } else { false } }) {
+            return .connected(latencyMs: 0)
+        }
+        if states.contains(where: { $0 == .connecting || $0 == .authenticating }) {
+            return .connecting
+        }
+        return .disconnected
+    }
+
     /// Phrased honestly against the real link state — never claims to be
     /// "connected" or "waiting" when the truth is different.
     private var waitingTitle: String {
-        switch transportStore.linkState {
+        switch effectiveLinkState {
         case .disconnected: "Waiting for desktop…"
         case .connecting: "Connecting…"
         case .authenticating: "Connecting…"
@@ -219,7 +283,7 @@ struct ProjectsListView: View {
     }
 
     private var waitingSubtitle: String {
-        switch transportStore.linkState {
+        switch effectiveLinkState {
         case .disconnected: "Open FlightDeck on your Mac to see your projects here."
         case .connecting: "Reaching the relay…"
         case .authenticating: "Confirming this device…"

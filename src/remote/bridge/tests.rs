@@ -6,7 +6,7 @@ use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::relay::EncryptedEnvelope;
 use flightdeck_remote_protocol::{
-    CommandBody, CommandId, DesktopToPhone, PhoneCommand, Role, TranscriptItem,
+    CommandBody, CommandId, DesktopToPhone, PhoneCommand, PromptKind, Role, TranscriptItem,
 };
 
 use std::io::Write as _;
@@ -27,6 +27,22 @@ fn seed_claude_session(home: &std::path::Path, worktree_abs: &str, lines: &[&str
     for l in lines {
         writeln!(f, "{l}").unwrap();
     }
+}
+
+/// Append one JSONL record to the session seeded by [`seed_claude_session`],
+/// simulating the agent writing a new turn after the initial sync.
+fn append_claude_line(home: &std::path::Path, worktree_abs: &str, line: &str) {
+    let mangled: String = worktree_abs
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let path = home
+        .join(".claude")
+        .join("projects")
+        .join(mangled)
+        .join("11111111-1111-1111-1111-111111111111.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(f, "{line}").unwrap();
 }
 
 // --- fixtures --------------------------------------------------------------
@@ -261,24 +277,115 @@ fn needs_input_populates_pending_question() {
         let views = vec![view("proj", &app, &cache)];
         let _ = collect(&mut b, &views, 1_000);
     }
-    // Transition to needs-input.
+    // Transition to needs-input. This is a plain permission prompt (no
+    // AskUserQuestion in the JSONL), so the binary fallback — and thus its
+    // preview — is DEFERRED by PROMPT_SETTLE_MS while the bridge waits for a
+    // possibly-racing question to be ingested (remote-control-qa1). The status
+    // still flips immediately.
     set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
     let views = vec![view("proj", &app, &cache)];
-    let msgs = collect(&mut b, &views, 2_000);
-    let update = msgs
+    let early = collect(&mut b, &views, 2_000);
+    let early_update = early
         .iter()
         .find_map(|m| match m {
             DesktopToPhone::StatusUpdate(u) => Some(u),
             _ => None,
         })
         .expect("status update");
-    let d = &update.updates[0];
-    assert_eq!(d.status, AgentStatus::NeedsInput);
+    assert_eq!(early_update.updates[0].status, AgentStatus::NeedsInput);
+    assert!(
+        early_update.updates[0].pending_question.is_none(),
+        "the binary preview is deferred until the settle window elapses"
+    );
+
+    // After the settle window (no question arrived), the binary fallback is
+    // synthesized and its preview reaches the phone.
+    let views = vec![view("proj", &app, &cache)];
+    let settled = collect(&mut b, &views, 2_000 + super::PROMPT_SETTLE_MS + 1);
+    let d = settled
+        .iter()
+        .find_map(|m| match m {
+            DesktopToPhone::StatusUpdate(u) => u.updates.first(),
+            _ => None,
+        })
+        .expect("status update after settle");
     assert!(d
         .pending_question
         .as_deref()
         .unwrap()
         .contains("installer script"));
+}
+
+#[test]
+fn ask_user_question_racing_the_status_flip_is_not_shown_as_a_binary_prompt() {
+    // Reproduces remote-control-qa1's premature-answer bug: the PreToolUse hook
+    // flips status to waiting before the AskUserQuestion tool_use is written to
+    // the JSONL. The bridge must NOT emit the binary allow/deny fallback in that
+    // window (its "Allow once" keystroke would be consumed by the live question
+    // selector as an answer); it must surface the real Question once ingested.
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    seed_claude_session(
+        home.path(),
+        worktree,
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Working on it."}]}}"#,
+        ],
+    );
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let _ = collect(&mut b, &views, 1_000);
+    }
+
+    // Status flips to waiting while the question is still racing → no prompt.
+    set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let early = collect(&mut b, &views, 2_000);
+        assert!(
+            !early.iter().any(|m| matches!(m,
+                DesktopToPhone::TranscriptAppend(f)
+                    if f.items.iter().any(|i| matches!(i, TranscriptItem::PermissionPrompt { .. })))),
+            "no prompt may be emitted while the AskUserQuestion is still racing"
+        );
+    }
+
+    // The AskUserQuestion lands; the next tick surfaces it as a Question — never
+    // a binary allow/deny — and still within the settle window.
+    append_claude_line(
+        home.path(),
+        worktree,
+        r#"{"type":"assistant","uuid":"aq1","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Pizza or sushi?","header":"Lunch","multiSelect":false,"options":[{"label":"Pizza"},{"label":"Sushi"}]}]}}]}}"#,
+    );
+    let views = vec![view("proj", &app, &cache)];
+    let msgs = collect(&mut b, &views, 2_100);
+    let (kind, free_text) = msgs
+        .iter()
+        .filter_map(|m| match m {
+            DesktopToPhone::TranscriptAppend(f) => Some(f),
+            _ => None,
+        })
+        .flat_map(|f| f.items.iter())
+        .find_map(|i| match i {
+            TranscriptItem::PermissionPrompt {
+                kind,
+                allow_free_text,
+                ..
+            } => Some((*kind, *allow_free_text)),
+            _ => None,
+        })
+        .expect("the question should now be surfaced");
+    assert_eq!(
+        kind,
+        PromptKind::Question,
+        "surfaced as a Question, not binary"
+    );
+    assert!(free_text, "AskUserQuestion allows a free-text answer");
 }
 
 // --- transcript reconstruction from the session file -----------------------

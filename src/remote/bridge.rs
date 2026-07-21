@@ -45,6 +45,14 @@ use flightdeck_remote_protocol::{
     SessionId, StateSnapshot,
 };
 
+/// How long to wait for a racing Claude `AskUserQuestion` to be ingested from
+/// the JSONL before treating a needs-input edge as a real permission prompt and
+/// synthesizing the binary allow/deny fallback (remote-control-qa1). The
+/// PreToolUse hook flips the status to `waiting` at essentially the same instant
+/// the tool_use is written, so the ingest normally wins within a tick or two;
+/// this bound only delays a genuine permission prompt, never a question.
+const PROMPT_SETTLE_MS: u64 = 750;
+
 /// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
 /// header the payload will travel under (`seq`, `sent_at_ms`), returns
 /// `(nonce_b64, ciphertext_b64)` for a [`RemoteOutbound::SendEnvelope`], or
@@ -100,6 +108,11 @@ pub struct RemoteBridge {
     arming: HashMap<SessionId, EventArming>,
     previews: HashMap<SessionId, Option<String>>,
     prev_status: HashMap<SessionId, AgentStatus>,
+    /// For Claude sessions: the clock-ms at which the session entered needs-input
+    /// with no structured prompt yet, while we wait for a possibly-racing
+    /// AskUserQuestion to be ingested from the JSONL before falling back to the
+    /// binary allow/deny prompt (remote-control-qa1). Absent once resolved.
+    needs_input_since: HashMap<SessionId, u64>,
     event_seq: u64,
     pairing: Option<PairingId>,
     snapshot_needed: bool,
@@ -137,6 +150,7 @@ impl RemoteBridge {
             arming: HashMap::new(),
             previews: HashMap::new(),
             prev_status: HashMap::new(),
+            needs_input_since: HashMap::new(),
             event_seq: 0,
             pairing: None,
             snapshot_needed: true,
@@ -380,13 +394,17 @@ impl RemoteBridge {
                 // Needs-input edge → capture preview + inline permission prompt.
                 let was_needs = matches!(self.prev_status.get(&sid), Some(AgentStatus::NeedsInput));
                 let now_needs = matches!(status, AgentStatus::NeedsInput);
+                // Claude asks questions via an AskUserQuestion tool_use in the
+                // JSONL (ingested above); OpenCode/Codex do not, so only Claude
+                // can race a status flip against its own transcript record.
+                let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
+                let is_claude = !is_opencode && !tab.meta.agent.eq_ignore_ascii_case("codex");
                 if now_needs && !was_needs {
                     // Only OpenCode writes the prompt sidecar (from its injected
                     // plugin). Read it BEFORE `on_needs_input` so a captured
                     // structured prompt supplants the binary fallback, then remove
                     // it so a stale prompt is never reused on a later edge. We only
                     // ever touch the file for OpenCode sessions.
-                    let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
                     let sidecar = if is_opencode {
                         read_prompt_sidecar(&worktree)
                     } else {
@@ -399,13 +417,52 @@ impl RemoteBridge {
                     if let Some(sp) = sidecar {
                         builder.set_structured_prompt(sp);
                     }
-                    let preview = builder.on_needs_input(now_ms as i64);
-                    self.previews.insert(sid.clone(), preview);
+                    if builder.has_structured_prompt() {
+                        // A structured prompt is ready now (an OpenCode sidecar, or
+                        // a Claude AskUserQuestion already ingested this tick) —
+                        // surface it immediately.
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                    } else if is_claude {
+                        // Claude is waiting but no question has been ingested yet.
+                        // It may be a real permission prompt OR an AskUserQuestion
+                        // whose JSONL line has not landed. DEFER the binary
+                        // fallback: emitting it now would show a bogus allow/deny
+                        // card whose "Allow once" keystroke ("1") the live question
+                        // selector consumes as an answer (remote-control-qa1).
+                        self.needs_input_since.insert(sid.clone(), now_ms);
+                    } else {
+                        // OpenCode/Codex: no JSONL-ingested question can race, so
+                        // the binary fallback (or sidecar) is correct immediately.
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                    }
                     if is_opencode {
                         let _ = std::fs::remove_file(prompt_sidecar_path(&worktree));
                     }
+                } else if now_needs && was_needs {
+                    // Still waiting with a deferred Claude binary fallback: resolve
+                    // it once the AskUserQuestion has been ingested (surface the
+                    // question, no binary) or the settle window elapses (it was a
+                    // real permission prompt after all → binary now).
+                    if let Some(&since) = self.needs_input_since.get(&sid) {
+                        let builder = self
+                            .transcripts
+                            .entry(sid.clone())
+                            .or_insert_with(|| TranscriptBuilder::new(sid.clone()));
+                        if builder.has_open_prompt() {
+                            self.needs_input_since.remove(&sid);
+                            self.previews
+                                .insert(sid.clone(), builder.open_prompt_preview());
+                        } else if now_ms.saturating_sub(since) >= PROMPT_SETTLE_MS {
+                            self.needs_input_since.remove(&sid);
+                            let preview = builder.on_needs_input(now_ms as i64);
+                            self.previews.insert(sid.clone(), preview);
+                        }
+                    }
                 } else if !now_needs && was_needs {
                     self.previews.remove(&sid);
+                    self.needs_input_since.remove(&sid);
                 }
 
                 // Event edge (arming always advances; grace only gates sending).

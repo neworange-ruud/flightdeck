@@ -205,6 +205,27 @@ impl TranscriptBuilder {
         self.pending_structured = Some(p);
     }
 
+    /// Whether a structured prompt is ready to surface right now — either
+    /// captured and awaiting the needs-input edge (`pending_structured`, e.g. the
+    /// OpenCode sidecar) or already emitted at ingest and unanswered
+    /// (`open_prompt`, a Claude AskUserQuestion). The bridge uses this to decide
+    /// whether to surface a prompt immediately or defer the binary fallback.
+    pub fn has_structured_prompt(&self) -> bool {
+        self.pending_structured.is_some() || self.open_prompt.is_some()
+    }
+
+    /// Whether an ingest-time structured prompt (a Claude AskUserQuestion) is
+    /// currently emitted and unanswered — the signal that a deferred binary
+    /// fallback must be abandoned because the real question has now arrived.
+    pub fn has_open_prompt(&self) -> bool {
+        self.open_prompt.is_some()
+    }
+
+    /// The preview (question text) of the currently open ingest-time prompt.
+    pub fn open_prompt_preview(&self) -> Option<String> {
+        self.open_prompt.clone()
+    }
+
     /// Ingest any new conversation from `source`, dispatching to the file-tail
     /// (Claude/Codex) or DB-poll (OpenCode) path. Cheap and safe to call every
     /// tick.

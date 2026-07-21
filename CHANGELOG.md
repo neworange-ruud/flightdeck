@@ -59,14 +59,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   independent of the status edge, and a new Claude `PreToolUse`/`AskUserQuestion`
   hook flips the agent to `waiting` so the row status, rollup, and notifications
   are correct too. (remote-control-z30)
-- **FlightDeck Remote: the Projects tab no longer strands on an abandoned
-  session.** When a Mac was re-paired (or a pairing was otherwise orphaned so it
-  never reconnects), the Projects tab could keep showing that dead pairing's
-  stale, cached session list — an agent/branch the desktop no longer tracks —
-  and reconnect, restart, and pull-to-refresh all failed to clear it. The
-  Projects tab now follows the live (connected) instance instead of blindly the
-  oldest handle, and the Projects and Sessions screens gained real pull-to-
-  refresh that requests a fresh snapshot. (remote-control-aj2)
+- **FlightDeck Remote: a question no longer shows a phantom permission prompt
+  first.** The hook that flips an agent to "waiting" can fire a beat before the
+  agent's `AskUserQuestion` is written to its session log, so the phone briefly
+  showed a generic Allow/Deny card — and accepting it drove the agent's live
+  selector (its "Allow" keystroke lands as an answer), marking the question
+  answered with the wrong option. The binary fallback is now deferred briefly so
+  the real question wins the race; a genuine permission prompt still appears
+  (just a moment later). (remote-control-qa1)
+- **FlightDeck Remote: the Projects tab now lists projects from every paired
+  Mac.** It previously bound to a single machine, so with more than one Mac
+  paired it silently hid all but one machine's projects (and could strand on an
+  abandoned session from an orphaned pairing). It now aggregates across all
+  paired machines — matching the Feed — and each project opens against the
+  machine it belongs to. The Projects and Sessions screens also gained real
+  pull-to-refresh. (remote-control-aj2)
 
 ## [1.9.0] - 2026-07-20
 
