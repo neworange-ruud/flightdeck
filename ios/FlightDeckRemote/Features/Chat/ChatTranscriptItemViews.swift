@@ -34,7 +34,7 @@ struct TranscriptRowView: View {
     let permissionState: PermissionActionState
     /// Whether this permission row's Allow/Deny buttons are live.
     let permissionActionable: Bool
-    let onDecide: (Wire.PromptId, Wire.PermissionChoice) -> Void
+    let onDecide: (Wire.PromptId, PermissionAnswer) -> Void
     let onRetryPermission: (Wire.PromptId) -> Void
     let onRetryOutgoing: (Wire.ItemId) -> Void
 
@@ -60,9 +60,10 @@ struct TranscriptRowView: View {
             ActivityPillView(index: row.index, summary: summary, detail: detail,
                              prose: body, kind: kind, isExpanded: isExpanded,
                              onToggle: onToggle)
-        case let .permissionPrompt(_, promptId, command, options, _):
-            PermissionPromptCard(promptId: promptId, command: command,
-                                 options: options, isPending: isPending,
+        case let .permissionPrompt(_, promptId, kind, command, options, allowFreeText, _):
+            PermissionPromptCard(promptId: promptId, kind: kind, command: command,
+                                 options: options, allowFreeText: allowFreeText,
+                                 isPending: isPending,
                                  actionState: permissionState,
                                  isActionable: permissionActionable,
                                  onDecide: { onDecide(promptId, $0) },
@@ -251,29 +252,48 @@ struct ActivityPillView: View {
 /// an undelivered failure surface honest inline notes (PRD §5.8).
 struct PermissionPromptCard: View {
     let promptId: Wire.PromptId
+    let kind: Wire.PromptKind
     let command: String
     let options: [Wire.PermissionOption]
+    let allowFreeText: Bool
     let isPending: Bool
     let actionState: PermissionActionState
-    /// Whether the buttons are live (current prompt + link up + no decision yet).
+    /// Whether the options are live (current prompt + link up + no decision yet).
     let isActionable: Bool
-    let onDecide: (Wire.PermissionChoice) -> Void
+    let onDecide: (PermissionAnswer) -> Void
     let onRetry: () -> Void
 
-    private var inFlight: Wire.PermissionChoice? {
-        if case let .sending(choice) = actionState { return choice }
+    /// Free-text draft + expand state. Local to the card — a fresh decision
+    /// (new prompt row) always starts collapsed.
+    @State private var freeTextDraft: String = ""
+    @State private var freeTextExpanded = false
+
+    /// Keep the original 2-button horizontal Allow/Deny layout only for the
+    /// classic binary permission shape (visual continuity); every other shape
+    /// (N-option Question, or a permission prompt with a non-standard option
+    /// count) renders as a vertical selectable list.
+    private var isBinaryPermission: Bool {
+        kind == .permission && options.count == 2
+    }
+
+    private var inFlight: PermissionAnswer? {
+        if case let .sending(answer) = actionState { return answer }
         return nil
+    }
+
+    private var title: String {
+        kind == .question ? "Question" : "Permission needed"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-            Text("Permission needed")
+            Text(title)
                 .typography(Typography.captionBold)
                 .foregroundStyle(Theme.accent)
                 .textCase(.uppercase)
 
             Text(command)
-                .typography(Typography.monoMedium)
+                .typography(kind == .question ? Typography.bodyMedium : Typography.monoMedium)
                 .foregroundStyle(Theme.textPrimary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -305,8 +325,8 @@ struct PermissionPromptCard: View {
     @ViewBuilder
     private var resolution: some View {
         switch actionState {
-        case let .resolved(choice):
-            resolvedLine(choice)
+        case let .resolved(answer):
+            resolvedLine(answer)
         case .stale:
             Text("This prompt was already answered on the desktop")
                 .typography(Typography.caption)
@@ -314,7 +334,7 @@ struct PermissionPromptCard: View {
                 .accessibilityIdentifier("permission-stale")
         case let .failed(reason, _, _):
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                buttons
+                optionsSection
                 Button(action: onRetry) {
                     HStack(spacing: Theme.Spacing.xs) {
                         Image(systemName: "exclamationmark.circle.fill")
@@ -328,35 +348,55 @@ struct PermissionPromptCard: View {
             }
         case .idle, .sending:
             VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-                buttons
-                Text("or say “approve” · hold mic below")
-                    .typography(Typography.caption)
-                    .foregroundStyle(Theme.textDim)
-                    .accessibilityIdentifier("permission-voice-hint")
+                optionsSection
+                if kind == .permission {
+                    Text("or say “approve” · hold mic below")
+                        .typography(Typography.caption)
+                        .foregroundStyle(Theme.textDim)
+                        .accessibilityIdentifier("permission-voice-hint")
+                }
             }
         }
     }
 
-    private func resolvedLine(_ choice: Wire.PermissionChoice) -> some View {
-        let allowed = choice == .allowOnce
-        return Text(allowed ? "Allowed ✓" : "Denied ✕")
+    private func resolvedLine(_ answer: PermissionAnswer) -> some View {
+        Text(answer.resolvedText)
             .typography(Typography.callout)
             .foregroundStyle(Theme.textMuted)
             .accessibilityIdentifier("permission-resolved")
     }
 
+    /// The live options: the binary 2-button row, or a vertical selectable
+    /// list for N options — plus the free-text affordance when offered.
+    @ViewBuilder
+    private var optionsSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            if isBinaryPermission {
+                buttons
+            } else {
+                optionList
+            }
+            if allowFreeText {
+                freeTextAffordance
+            }
+        }
+    }
+
+    /// The classic 2-button horizontal Allow/Deny row (binary permission only).
     private var buttons: some View {
         HStack(spacing: Theme.Spacing.sm) {
-            ForEach(Array(options.enumerated()), id: \.offset) { _, option in
-                let isAllow = option.choice == .allowOnce
+            ForEach(options, id: \.index) { option in
+                let choice = option.choice ?? .deny
+                let isAllow = choice == .allowOnce
+                let answer = PermissionAnswer.choice(choice)
                 Button {
-                    onDecide(option.choice)
+                    onDecide(answer)
                 } label: {
                     ZStack {
                         Text(option.label)
                             .typography(Typography.bodyMedium)
-                            .opacity(inFlight == option.choice ? 0 : 1)
-                        if inFlight == option.choice {
+                            .opacity(inFlight == answer ? 0 : 1)
+                        if inFlight == answer {
                             WorkingSpinner(size: 16, lineWidth: 2,
                                            color: isAllow ? Theme.bgDeep : Theme.textPrimary)
                         }
@@ -374,6 +414,97 @@ struct PermissionPromptCard: View {
                 .disabled(!isActionable)
                 .accessibilityIdentifier(isAllow ? "permission-allow" : "permission-deny")
             }
+        }
+    }
+
+    /// A vertical selectable list (label + optional description) — the
+    /// default rendering for an N-option Question, and for any permission
+    /// prompt that isn't the classic 2-option shape.
+    private var optionList: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            ForEach(options, id: \.index) { option in
+                let answer = PermissionAnswer.option(index: option.index, label: option.label)
+                Button {
+                    onDecide(answer)
+                } label: {
+                    HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                        VStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                            Text(option.label)
+                                .typography(Typography.bodyMedium)
+                                .foregroundStyle(Theme.textPrimary)
+                                .multilineTextAlignment(.leading)
+                            if let description = option.description, !description.isEmpty {
+                                Text(description)
+                                    .typography(Typography.caption)
+                                    .foregroundStyle(Theme.textMuted)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        if inFlight == answer {
+                            WorkingSpinner(size: 16, lineWidth: 2, color: Theme.textPrimary)
+                        }
+                    }
+                    .padding(Theme.Spacing.sm)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                        .fill(Theme.bgRaised)
+                )
+                .disabled(!isActionable)
+                .accessibilityIdentifier("permission-option-\(option.index)")
+            }
+        }
+    }
+
+    /// "Type your own answer" — collapsed to a text-button affordance until
+    /// tapped, then an expandable inline text field + send button.
+    @ViewBuilder
+    private var freeTextAffordance: some View {
+        if freeTextExpanded {
+            HStack(spacing: Theme.Spacing.sm) {
+                TextField("Type your own answer", text: $freeTextDraft)
+                    .typography(Typography.body)
+                    .foregroundStyle(Theme.textPrimary)
+                    .padding(Theme.Spacing.sm)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Radius.card - 6, style: .continuous)
+                            .fill(Theme.bgField)
+                    )
+                    .disabled(!isActionable)
+                    .accessibilityIdentifier("permission-free-text-field")
+                Button {
+                    let text = freeTextDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { return }
+                    onDecide(.freeText(text))
+                } label: {
+                    if case let .sending(.freeText(pending)) = actionState,
+                       pending == freeTextDraft.trimmingCharacters(in: .whitespacesAndNewlines) {
+                        WorkingSpinner(size: 18, lineWidth: 2, color: Theme.accent)
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 22))
+                            .foregroundStyle(Theme.accent)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(!isActionable
+                    || freeTextDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("permission-free-text-send")
+            }
+        } else {
+            Button {
+                freeTextExpanded = true
+            } label: {
+                Text("Type your own answer")
+                    .typography(Typography.callout)
+                    .foregroundStyle(Theme.accent)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isActionable)
+            .accessibilityIdentifier("permission-free-text-toggle")
         }
     }
 }

@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use flightdeck_remote_protocol::{
-    ActivityKind, PermissionChoice, PermissionOption, TranscriptFeed, TranscriptItem,
+    ActivityKind, PermissionChoice, PermissionOption, PromptKind, TranscriptFeed, TranscriptItem,
 };
 use flightdeck_remote_protocol::{ItemId, PromptId, SessionId};
 
@@ -92,6 +92,21 @@ pub fn resolve_source(agent: &str, cwd: &Path, home: &Path) -> Option<Transcript
     None
 }
 
+/// A structured prompt captured during ingest (e.g. a Claude `AskUserQuestion`
+/// tool call), surfaced by the next [`TranscriptBuilder::on_needs_input`] edge
+/// instead of the synthesized binary allow/deny fallback.
+#[derive(Clone, Debug)]
+pub struct StructuredPrompt {
+    /// Permission (binary) vs Question (N-option / free-text).
+    pub kind: PromptKind,
+    /// Question text (Question) or permission/action text (Permission).
+    pub command: String,
+    /// The offered options, already indexed `0..n`, with labels/descriptions.
+    pub options: Vec<PermissionOption>,
+    /// Whether the phone may submit a free-text answer ("Type your own answer").
+    pub allow_free_text: bool,
+}
+
 /// Reconstructs one session's cleaned transcript by tailing its agent session
 /// JSONL and translating each record into a [`TranscriptItem`].
 pub struct TranscriptBuilder {
@@ -119,6 +134,9 @@ pub struct TranscriptBuilder {
     sent_upto: u64,
     /// Monotonic prompt counter for stable PromptIds.
     prompt_seq: u64,
+    /// A structured prompt captured during ingest, consumed (and cleared) by the
+    /// next [`Self::on_needs_input`] edge in place of the binary fallback.
+    pending_structured: Option<StructuredPrompt>,
 }
 
 impl TranscriptBuilder {
@@ -137,7 +155,14 @@ impl TranscriptBuilder {
             total: 0,
             sent_upto: 0,
             prompt_seq: 0,
+            pending_structured: None,
         }
+    }
+
+    /// Capture a structured prompt to be surfaced by the next
+    /// [`Self::on_needs_input`] edge (instead of the binary fallback).
+    pub fn set_structured_prompt(&mut self, p: StructuredPrompt) {
+        self.pending_structured = Some(p);
     }
 
     /// Ingest any new conversation from `source`, dispatching to the file-tail
@@ -235,6 +260,7 @@ impl TranscriptBuilder {
         self.base_index = 0;
         self.total = 0;
         self.sent_upto = 0;
+        self.pending_structured = None;
         // `prompt_seq` intentionally keeps advancing so PromptIds stay unique.
     }
 
@@ -318,6 +344,16 @@ impl TranscriptBuilder {
                             let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
                             let empty = Value::Null;
                             let input = b.get("input").unwrap_or(&empty);
+                            // A Claude `AskUserQuestion` is an answerable prompt, not
+                            // an activity: capture it as a structured prompt for the
+                            // next needs-input edge and emit NO activity pill. If the
+                            // JSON is missing/oddly-typed, fall through to the pill.
+                            if name == "AskUserQuestion" {
+                                if let Some(sp) = parse_ask_user_question(input) {
+                                    self.set_structured_prompt(sp);
+                                    continue;
+                                }
+                            }
                             let (summary, detail, body, kind) = tool_activity(name, input);
                             let item_id = self.item_id(&uuid, i);
                             self.push_item(TranscriptItem::Activity {
@@ -514,24 +550,46 @@ impl TranscriptBuilder {
     /// an inline permission prompt whose preview is the agent's last prose (the
     /// session file has no permission records). Returns the preview (if any).
     pub fn on_needs_input(&mut self, at_ms: i64) -> Option<String> {
-        let preview = self.build_preview();
         self.prompt_seq += 1;
         let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
         let item_id = ItemId::new(format!("{}:prompt:{}", self.session_id, self.prompt_seq));
+        // A structured prompt captured during ingest (e.g. AskUserQuestion) is
+        // surfaced here in place of the synthesized binary allow/deny fallback,
+        // using the SAME prompt_seq/item_id bump.
+        if let Some(sp) = self.pending_structured.take() {
+            let preview = truncate_preview(&sp.command);
+            self.push_item(TranscriptItem::PermissionPrompt {
+                item_id,
+                prompt_id,
+                kind: sp.kind,
+                command: sp.command,
+                options: sp.options,
+                allow_free_text: sp.allow_free_text,
+                at_ms,
+            });
+            return preview;
+        }
+        let preview = self.build_preview();
         self.push_item(TranscriptItem::PermissionPrompt {
             item_id,
             prompt_id,
+            kind: PromptKind::Permission,
             command: preview.clone().unwrap_or_default(),
             options: vec![
                 PermissionOption {
-                    choice: PermissionChoice::AllowOnce,
+                    index: 0,
+                    choice: Some(PermissionChoice::AllowOnce),
                     label: "Allow once".to_string(),
+                    description: None,
                 },
                 PermissionOption {
-                    choice: PermissionChoice::Deny,
+                    index: 1,
+                    choice: Some(PermissionChoice::Deny),
                     label: "Deny".to_string(),
+                    description: None,
                 },
             ],
+            allow_free_text: false,
             at_ms,
         });
         preview
@@ -539,15 +597,7 @@ impl TranscriptBuilder {
 
     /// The agent's last prose, truncated, as the needs-input preview.
     fn build_preview(&self) -> Option<String> {
-        let mut text = self.last_agent_text.as_ref()?.trim().to_string();
-        if text.is_empty() {
-            return None;
-        }
-        if text.chars().count() > PREVIEW_CAP {
-            text = text.chars().take(PREVIEW_CAP).collect();
-            text.push('…');
-        }
-        Some(text)
+        truncate_preview(self.last_agent_text.as_ref()?)
     }
 
     /// A stable item id from the record uuid + block index, falling back to the
@@ -627,6 +677,69 @@ impl TranscriptBuilder {
 // ---------------------------------------------------------------------------
 // Record → item helpers
 // ---------------------------------------------------------------------------
+
+/// Trim `text` and cap it at [`PREVIEW_CAP`] chars (appending `…` when cut),
+/// or `None` when empty. Shared by the last-prose preview and structured-prompt
+/// previews.
+fn truncate_preview(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > PREVIEW_CAP {
+        let mut out: String = text.chars().take(PREVIEW_CAP).collect();
+        out.push('…');
+        Some(out)
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Parse a Claude `AskUserQuestion` tool_use `input` into a [`StructuredPrompt`]
+/// (v1: the primary question only, `questions[0]`). Returns `None` — so the
+/// caller falls back to a normal activity pill — when the shape is missing or
+/// oddly typed (no question text, or no options with labels). `multiSelect` is
+/// treated as single-select for v1.
+fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
+    let question = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .and_then(|qs| qs.first())?;
+    let command = question
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    let options: Vec<PermissionOption> = question
+        .get("options")
+        .and_then(Value::as_array)?
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            let label = o.get("label").and_then(Value::as_str)?.to_string();
+            let description = o
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(PermissionOption {
+                index: i as u32,
+                choice: None,
+                label,
+                description,
+            })
+        })
+        .collect();
+    if options.is_empty() {
+        return None;
+    }
+    Some(StructuredPrompt {
+        kind: PromptKind::Question,
+        command,
+        options,
+        allow_free_text: true,
+    })
+}
 
 /// Extract displayable prose from a `user` record's `content`: a bare string is
 /// the prompt; an array yields its `text` blocks joined. A tool-result-only

@@ -46,7 +46,7 @@ async fn incompatible_version_is_rejected_and_closed() {
 
     // Per `negotiate_version` (the normative negotiator the relay uses), a peer
     // advertising a version *below* MIN_SUPPORTED is incompatible; a peer above
-    // MAX is clamped down and accepted. In a single-version (v1) build the only
+    // MAX is clamped down and accepted. MIN_SUPPORTED is 1, so the only
     // incompatible case is version 0.
     let hello = RelayFrame::Hello {
         protocol_version: 0,
@@ -74,7 +74,7 @@ async fn incompatible_version_is_rejected_and_closed() {
         RelayFrame::VersionIncompatible {
             your_version: 0,
             min_supported: 1,
-            max_supported: 1,
+            max_supported: 2,
         }
     ));
 }

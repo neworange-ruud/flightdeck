@@ -59,7 +59,7 @@ enum FocusMode {
 
         var command: String?
         var options: [Wire.PermissionOption] = []
-        if case let .permissionPrompt(_, _, cmd, opts, _)? = pendingItem {
+        if case let .permissionPrompt(_, _, _, cmd, opts, _, _)? = pendingItem {
             command = cmd
             options = opts
         }
@@ -95,7 +95,7 @@ enum FocusMode {
             return firstLine(ChatMarkdown.plainText(text), budget: proseCharBudget)
         case let .activity(_, summary, _, _, _, _):
             return summary
-        case let .permissionPrompt(_, _, command, _, _):
+        case let .permissionPrompt(_, _, _, command, _, _, _):
             return "Wants to run \(command)"
         }
     }

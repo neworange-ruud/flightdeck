@@ -38,18 +38,48 @@
       "type": "permission_prompt",
       "item_id": "item_0005",
       "prompt_id": "prompt_ab12",
+      "kind": "permission",
       "command": "rm -rf dist/",
       "options": [
         {
+          "index": 0,
           "choice": "allow_once",
           "label": "Allow once"
         },
         {
+          "index": 1,
           "choice": "deny",
           "label": "Deny"
         }
       ],
+      "allow_free_text": false,
       "at_ms": 1752412730000
+    },
+    {
+      "type": "permission_prompt",
+      "item_id": "item_0006",
+      "prompt_id": "prompt_cd34",
+      "kind": "question",
+      "command": "Which database should the login service use?",
+      "options": [
+        {
+          "index": 0,
+          "label": "Postgres",
+          "description": "Use the existing shared Postgres cluster."
+        },
+        {
+          "index": 1,
+          "label": "SQLite",
+          "description": "Embed a local SQLite file for now."
+        },
+        {
+          "index": 2,
+          "label": "Redis",
+          "description": "Store sessions in Redis with a short TTL."
+        }
+      ],
+      "allow_free_text": true,
+      "at_ms": 1752412740000
     }
   ]
 }

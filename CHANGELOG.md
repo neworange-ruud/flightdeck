@@ -16,6 +16,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   Geist Mono type and Theme colors. The eyes-free focus-mode "Recently" peek
   strips Markdown syntax so its one-line summaries stay clean. User messages are
   still shown verbatim.
+- **FlightDeck Remote: answer an agent's multiple-choice prompts from the
+  phone.** When an agent asks a real multiple-choice question (Claude Code's
+  `AskUserQuestion`, OpenCode's `question.asked`) it now reaches the phone as a
+  selectable list of the agent's actual options — each with its label and
+  description — instead of a generic Allow-once / Deny card. Pick an option (or
+  type your own answer when the question allows it) and FlightDeck drives the
+  agent's TUI to that choice. Binary permission prompts keep the familiar
+  two-button Allow / Deny card. Spans the wire protocol (v2: `PromptKind`,
+  indexed options, an `option_index` / `free_text` decision), desktop capture
+  for Claude and OpenCode, the decision→keystroke mapping, and the iOS prompt
+  card.
 
 ### Improvements
 

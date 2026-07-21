@@ -89,11 +89,13 @@ enum ChatFixtures {
             .permissionPrompt(
                 itemId: Wire.ItemId("fx-perm-1"),
                 promptId: Wire.PromptId("fx-prompt-1"),
+                kind: .permission,
                 command: "rm -rf dist/",
                 options: [
-                    Wire.PermissionOption(choice: .allowOnce, label: "Allow once"),
-                    Wire.PermissionOption(choice: .deny, label: "Deny"),
+                    Wire.PermissionOption(index: 0, choice: .allowOnce, label: "Allow once"),
+                    Wire.PermissionOption(index: 1, choice: .deny, label: "Deny"),
                 ],
+                allowFreeText: false,
                 atMs: base + 20 * 60 * 1000 + 8_000),
         ]
     }

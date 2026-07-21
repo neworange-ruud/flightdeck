@@ -54,12 +54,14 @@ import Foundation
         let (model, sender) = makeModel()
         model.decidePermission(promptId: promptId, choice: .allowOnce)
 
-        #expect(model.permissionActionState(promptId) == .sending(.allowOnce))
+        #expect(model.permissionActionState(promptId) == .sending(.choice(.allowOnce)))
         #expect(sender.sends.count == 1)
-        if case let .permissionDecision(sessionId, pid, choice) = sender.sends.first?.body {
+        if case let .permissionDecision(sessionId, pid, choice, optionIndex, freeText) = sender.sends.first?.body {
             #expect(sessionId == Wire.SessionId("s1"))
             #expect(pid == promptId)
             #expect(choice == .allowOnce)
+            #expect(optionIndex == nil)
+            #expect(freeText == nil)
         } else {
             Issue.record("expected .permissionDecision")
         }
@@ -71,7 +73,7 @@ import Foundation
         let (model, sender) = makeModel()
         model.decidePermission(promptId: promptId, choice: .deny)
         model.applyDelivery(commandId: sender.lastCommandId!, state: .delivered(.applied))
-        #expect(model.permissionActionState(promptId) == .resolved(.deny))
+        #expect(model.permissionActionState(promptId) == .resolved(.choice(.deny)))
     }
 
     @Test func rejectedIsStale() {
@@ -89,10 +91,10 @@ import Foundation
         let originalId = sender.lastCommandId!
         model.applyDelivery(commandId: originalId, state: .failed(reason: "timed out"))
 
-        guard case let .failed(_, choice, reusesId) = model.permissionActionState(promptId) else {
+        guard case let .failed(_, answer, reusesId) = model.permissionActionState(promptId) else {
             Issue.record("expected .failed"); return
         }
-        #expect(choice == .allowOnce)
+        #expect(answer == .choice(.allowOnce))
         #expect(reusesId)
         // A failed decision is actionable again (retry).
         #expect(model.isPermissionActionable(promptId))
@@ -100,7 +102,7 @@ import Foundation
         model.retryPermission(promptId)
         #expect(sender.sends.count == 2)
         #expect(sender.sends[1].commandId == originalId) // dedup-safe reuse
-        #expect(model.permissionActionState(promptId) == .sending(.allowOnce))
+        #expect(model.permissionActionState(promptId) == .sending(.choice(.allowOnce)))
     }
 
     @Test func decideBlockedWhenPaused() {
@@ -108,5 +110,48 @@ import Foundation
         model.decidePermission(promptId: promptId, choice: .allowOnce)
         #expect(sender.sends.isEmpty)
         #expect(model.permissionActionState(promptId) == .idle)
+    }
+
+    // MARK: - Question-style decisions (option index / free text)
+
+    @Test func decideOptionIndexSendsOptionIndexNotChoice() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, optionIndex: 2, label: "Redis")
+
+        #expect(model.permissionActionState(promptId) == .sending(.option(index: 2, label: "Redis")))
+        guard case let .permissionDecision(_, _, choice, optionIndex, freeText) = sender.sends.first?.body else {
+            Issue.record("expected .permissionDecision"); return
+        }
+        #expect(choice == nil)
+        #expect(optionIndex == 2)
+        #expect(freeText == nil)
+    }
+
+    @Test func decideFreeTextSendsFreeTextNotChoice() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, freeText: "Use CockroachDB instead.")
+
+        #expect(model.permissionActionState(promptId)
+                == .sending(.freeText("Use CockroachDB instead.")))
+        guard case let .permissionDecision(_, _, choice, optionIndex, freeText) = sender.sends.first?.body else {
+            Issue.record("expected .permissionDecision"); return
+        }
+        #expect(choice == nil)
+        #expect(optionIndex == nil)
+        #expect(freeText == "Use CockroachDB instead.")
+    }
+
+    @Test func decideFreeTextIgnoresBlankText() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, freeText: "   ")
+        #expect(sender.sends.isEmpty)
+    }
+
+    @Test func optionResolvesAndCanFailRetry() {
+        let (model, sender) = makeModel()
+        model.decidePermission(promptId: promptId, optionIndex: 1, label: "SQLite")
+        model.applyDelivery(commandId: sender.lastCommandId!, state: .delivered(.applied))
+        #expect(model.permissionActionState(promptId)
+                == .resolved(.option(index: 1, label: "SQLite")))
     }
 }

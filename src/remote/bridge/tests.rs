@@ -563,3 +563,130 @@ fn seq_resync_for_other_pairing_is_ignored() {
         "an unrelated resync must not rewind the stream"
     );
 }
+
+// --- OpenCode prompt sidecar (remote-control-tdv) --------------------------
+
+/// Write `<worktree>/.flightdeck/agent-prompt.json` with `body`, returning the
+/// worktree root so the reader can be pointed at it.
+fn write_sidecar(dir: &std::path::Path, body: &str) {
+    let fd = dir.join(".flightdeck");
+    std::fs::create_dir_all(&fd).unwrap();
+    std::fs::write(fd.join("agent-prompt.json"), body).unwrap();
+}
+
+/// The most recently pushed item of a builder, via its full load.
+fn last_item(builder: &TranscriptBuilder) -> TranscriptItem {
+    builder.load(None).items.into_iter().next_back().unwrap()
+}
+
+#[test]
+fn sidecar_question_surfaces_structured_question_prompt() {
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"Which framework?","options":[
+            {"label":"React","description":"Use React"},
+            {"label":"Vue"},
+            {"label":"Svelte","description":"Use Svelte"}]}"#,
+    );
+
+    let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert!(sp.allow_free_text, "questions allow a free-text answer");
+    assert_eq!(sp.command, "Which framework?");
+    assert_eq!(sp.options.len(), 3);
+    assert_eq!(sp.options[0].index, 0);
+    assert_eq!(sp.options[0].label, "React");
+    assert_eq!(sp.options[0].description.as_deref(), Some("Use React"));
+    assert_eq!(sp.options[1].description, None);
+    assert!(
+        sp.options.iter().all(|o| o.choice.is_none()),
+        "question options carry no binary choice"
+    );
+
+    // Feeding it to a builder makes the needs-input edge emit a Question prompt.
+    let mut builder = TranscriptBuilder::new(SessionId::new("s1"));
+    builder.set_structured_prompt(sp);
+    builder.on_needs_input(1_000);
+    match last_item(&builder) {
+        TranscriptItem::PermissionPrompt {
+            kind,
+            command,
+            options,
+            allow_free_text,
+            ..
+        } => {
+            assert_eq!(kind, PromptKind::Question);
+            assert_eq!(command, "Which framework?");
+            assert_eq!(options.len(), 3);
+            assert!(allow_free_text);
+        }
+        other => panic!("expected a PermissionPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_sidecar_yields_binary_fallback() {
+    let wt = tempfile::tempdir().unwrap();
+    assert!(
+        read_prompt_sidecar(wt.path()).is_none(),
+        "absent sidecar -> binary fallback"
+    );
+
+    // A builder with no structured prompt emits the binary allow/deny prompt.
+    let mut builder = TranscriptBuilder::new(SessionId::new("s2"));
+    builder.on_needs_input(1_000);
+    match last_item(&builder) {
+        TranscriptItem::PermissionPrompt {
+            kind,
+            options,
+            allow_free_text,
+            ..
+        } => {
+            assert_eq!(kind, PromptKind::Permission);
+            assert_eq!(options.len(), 2, "binary allow/deny");
+            assert_eq!(options[0].choice, Some(PermissionChoice::AllowOnce));
+            assert_eq!(options[1].choice, Some(PermissionChoice::Deny));
+            assert!(!allow_free_text);
+        }
+        other => panic!("expected a PermissionPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn sidecar_permission_maps_options_to_binary_choices() {
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"Run rm -rf?","options":[
+            {"label":"Allow once"},{"label":"Deny"}]}"#,
+    );
+    let sp = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    assert_eq!(sp.kind, PromptKind::Permission);
+    assert!(!sp.allow_free_text);
+    assert_eq!(sp.options[0].choice, Some(PermissionChoice::AllowOnce));
+    assert_eq!(sp.options[1].choice, Some(PermissionChoice::Deny));
+}
+
+#[test]
+fn unclear_permission_and_empty_options_fall_back_to_binary() {
+    let wt = tempfile::tempdir().unwrap();
+
+    // Empty options -> None regardless of kind.
+    write_sidecar(wt.path(), r#"{"kind":"question","text":"?","options":[]}"#);
+    assert!(read_prompt_sidecar(wt.path()).is_none());
+
+    // A permission option whose label is neither allow-ish nor deny-ish -> None.
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"?","options":[{"label":"Maybe"},{"label":"Deny"}]}"#,
+    );
+    assert!(
+        read_prompt_sidecar(wt.path()).is_none(),
+        "an unclassifiable permission option must fall back to binary"
+    );
+
+    // Malformed JSON -> None.
+    write_sidecar(wt.path(), "{not json");
+    assert!(read_prompt_sidecar(wt.path()).is_none());
+}

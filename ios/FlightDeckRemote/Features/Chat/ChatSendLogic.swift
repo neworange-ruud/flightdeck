@@ -37,20 +37,48 @@ enum OutgoingState: Equatable, Sendable {
     case failed(reason: String, retryReusesId: Bool)
 }
 
-/// Display state of an inline permission decision (Allow once / Deny).
+/// What the phone answered a permission/question prompt with. Generalizes the
+/// old binary-only `PermissionChoice` payload so the action-state machine
+/// (and the card that renders it) can show *what* was answered — a binary
+/// choice, a selected N-option, or a typed free-text reply — not just
+/// Allowed/Denied.
+enum PermissionAnswer: Equatable, Sendable {
+    /// The binary fast-path (permission prompts).
+    case choice(Wire.PermissionChoice)
+    /// A selected Question option, by index — `label` is carried along purely
+    /// for display (the wire only sends the index).
+    case option(index: Int, label: String)
+    /// A typed "Type your own answer" reply.
+    case freeText(String)
+
+    /// A short human-readable resolved label, e.g. for "Allowed ✓" / "Answered
+    /// “Postgres” ✓" lines.
+    var resolvedText: String {
+        switch self {
+        case let .choice(choice):
+            return choice == .allowOnce ? "Allowed ✓" : "Denied ✕"
+        case let .option(_, label):
+            return "Answered “\(label)” ✓"
+        case let .freeText(text):
+            return "Answered “\(text)” ✓"
+        }
+    }
+}
+
+/// Display state of an inline permission/question decision.
 enum PermissionActionState: Equatable, Sendable {
-    /// No decision in flight — the buttons are live (if the prompt is current).
+    /// No decision in flight — the options are live (if the prompt is current).
     case idle
-    /// A decision was tapped and is awaiting the desktop ack (spinner on the
-    /// tapped button); `choice` is the button the user pressed.
-    case sending(Wire.PermissionChoice)
+    /// A decision was tapped/typed and is awaiting the desktop ack (spinner on
+    /// the chosen option); `answer` is what the user picked/typed.
+    case sending(PermissionAnswer)
     /// The desktop applied the decision — the card collapses to a muted result.
-    case resolved(Wire.PermissionChoice)
+    case resolved(PermissionAnswer)
     /// The desktop rejected the decision because the prompt was already answered
     /// there (stale) — an honest inline note, no retry.
     case stale
     /// The decision was not delivered — a retry affordance is offered.
-    case failed(reason: String, choice: Wire.PermissionChoice, retryReusesId: Bool)
+    case failed(reason: String, answer: PermissionAnswer, retryReusesId: Bool)
 }
 
 /// An optimistically-appended outgoing user message. Held locally by
@@ -103,26 +131,26 @@ enum ChatSendLogic {
     }
 
     /// Map a command's delivery state to a permission-action display state,
-    /// given the `choice` the user tapped.
+    /// given the `answer` the user picked/typed.
     static func permissionState(for delivery: CommandDeliveryState,
-                                choice: Wire.PermissionChoice) -> PermissionActionState {
+                                answer: PermissionAnswer) -> PermissionActionState {
         switch delivery {
         case .sending:
-            return .sending(choice)
+            return .sending(answer)
         case let .delivered(outcome):
             switch outcome {
             case .accepted, .applied, .duplicate:
-                return .resolved(choice)
+                return .resolved(answer)
             case .rejected:
                 // Validated against the *current* pending prompt on the desktop;
                 // a rejected decision means the prompt was already answered there.
                 return .stale
             case .failed:
-                return .failed(reason: notDeliveredReason, choice: choice,
+                return .failed(reason: notDeliveredReason, answer: answer,
                                retryReusesId: retryReusesId(for: delivery))
             }
         case let .failed(reason):
-            return .failed(reason: reason, choice: choice,
+            return .failed(reason: reason, answer: answer,
                            retryReusesId: retryReusesId(for: delivery))
         }
     }
