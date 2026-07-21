@@ -437,21 +437,27 @@ pub fn option_keystroke(
 /// `option_indices` are the phone's chosen 0-based indices (deduplicated and
 /// sorted here so navigation is monotonic and each option is toggled once).
 ///
-/// UNVERIFIED against a live agent (remote-control-dc9); single-select was
-/// confirmed live but the multi-select toggle/submit sequence is a best-effort
-/// derivation that MUST be validated on a real build:
+/// Claude Code and OpenCode render the SAME multi-select form (verified live —
+/// remote-control-dc9, see bd memory `askuserquestion-real-tui-model`):
 ///
-/// * **Claude Code** multi-select renders a checklist. Unlike single-select —
-///   where the number key selects AND submits — in multi mode the number key is
-///   expected to TOGGLE the option and leave the list open, with **Enter**
-///   submitting the whole set. So this presses each selected option's number
-///   (`1..9`), then Enter. Robust to cursor position, like the single-select
-///   path. A list with an option at index `>= 9` falls back to arrow+Space.
-/// * **OpenCode** multi-select: from the first option focused, walk DOWN to each
-///   target in ascending order and toggle it with **Space** (DECCKM-aware, like
-///   the single-select arrow path), then **Enter** submits. Derive the real
-///   sequence from `agent-prompt.debug.json` on a live multi-select question.
-/// * **Codex** has no such prompt → `None` (an honest rejection upstream).
+/// * **Up/Down** move the highlight within the current question's options.
+/// * **Enter** *toggles* the highlighted option's checkbox — it does NOT submit
+///   (this is the key difference from single-select, where Enter/the number key
+///   selects AND submits).
+/// * **Tab** (and Left/Right) switch between question tabs; the far-right
+///   **Confirm** tab submits the whole form.
+///
+/// So, from the initial highlight on the first option, this walks Down to each
+/// target in ascending order and presses Enter to toggle it, then presses Tab
+/// to reach the Confirm tab and Enter to submit. Down is DECCKM-aware (SS3
+/// `ESC O B` under application-cursor mode, else CSI `ESC [ B`); Tab (`\t`) and
+/// Enter (`\r`) are mode-independent.
+///
+/// SCOPE: single-question prompts only. A prompt with MULTIPLE question tabs is
+/// not yet handled — the single `Tab` here lands on the next question, not
+/// Confirm, when other questions precede it (remote-control follow-up).
+///
+/// **Codex** has no such prompt → `None` (an honest rejection upstream).
 pub fn multi_option_keystroke(
     backend: StatusBackend,
     option_indices: &[u32],
@@ -464,13 +470,6 @@ pub fn multi_option_keystroke(
         return None;
     }
     match backend {
-        // Claude: toggle each option by its number key; Enter submits the set.
-        StatusBackend::Claude if indices.iter().all(|&i| i < 9) => {
-            let mut bytes: Vec<u8> = indices.iter().map(|&i| b'1' + i as u8).collect();
-            bytes.push(b'\r');
-            Some(bytes)
-        }
-        // Arrow navigation + Space toggle. DECCKM → SS3 `ESC O B`; else CSI.
         StatusBackend::Claude | StatusBackend::OpenCode => {
             let down: &[u8] = if application_cursor {
                 b"\x1bOB"
@@ -483,10 +482,11 @@ pub fn multi_option_keystroke(
                 for _ in cursor..target {
                     bytes.extend_from_slice(down);
                 }
-                bytes.push(b' '); // Space toggles the focused option.
+                bytes.push(b'\r'); // Enter toggles the highlighted option.
                 cursor = target;
             }
-            bytes.push(b'\r'); // Enter submits the selected set.
+            bytes.push(b'\t'); // Tab to the far-right Confirm tab.
+            bytes.push(b'\r'); // Enter submits the whole form.
             Some(bytes)
         }
         // Codex has no multi-option prompt; refuse rather than guess.

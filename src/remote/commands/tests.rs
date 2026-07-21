@@ -388,74 +388,70 @@ fn permission_decision_option_index_rejected_for_codex() {
 }
 
 #[test]
-fn multi_option_keystroke_toggles_by_number_for_claude() {
+fn multi_option_keystroke_toggles_and_confirms_for_claude() {
     use StatusBackend::Claude;
-    // Claude multi-select: press each selected option's number to toggle it,
-    // then Enter submits the set. Indices are sorted + deduped first.
+    // Claude multi-select is a tabbed form: from the first option, walk DOWN to
+    // each target and press Enter to TOGGLE it, then Tab to the Confirm tab and
+    // Enter to submit. [0, 2] → Enter (toggle 0), DOWN DOWN, Enter (toggle 2),
+    // Tab, Enter. DOWN is CSI in normal cursor mode.
     assert_eq!(
         multi_option_keystroke(Claude, &[0, 2], false),
-        Some(b"13\r".to_vec())
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
     );
+    // Deduped + sorted first; DECCKM uses SS3 `ESC O B` for DOWN.
     assert_eq!(
         multi_option_keystroke(Claude, &[2, 0, 2], true),
-        Some(b"13\r".to_vec()),
-        "indices are deduped and sorted before toggling"
+        Some(b"\r\x1bOB\x1bOB\r\t\r".to_vec()),
+        "indices are deduped and sorted before navigation"
     );
-    // A single selection in a multi-select prompt still toggles + submits.
+    // A single selection still toggles then confirms (DOWN once to option 1).
     assert_eq!(
         multi_option_keystroke(Claude, &[1], false),
-        Some(b"2\r".to_vec())
-    );
-    // An option beyond single digits falls back to arrow+Space (SS3 under DECCKM).
-    assert_eq!(
-        multi_option_keystroke(Claude, &[9], true),
-        Some([b"\x1bOB".repeat(9).as_slice(), b" \r"].concat())
+        Some(b"\x1b[B\r\t\r".to_vec())
     );
     // Empty selection is not actionable.
     assert_eq!(multi_option_keystroke(Claude, &[], false), None);
 }
 
 #[test]
-fn multi_option_keystroke_arrow_space_for_opencode() {
+fn multi_option_keystroke_toggles_and_confirms_for_opencode() {
     use StatusBackend::{Codex, OpenCode};
-    // OpenCode multi-select: walk DOWN to each target in ascending order,
-    // toggling with Space, then Enter. Option 0 needs no DOWN. Cursor position
-    // is cumulative, so [0, 2] is: Space, DOWN, DOWN, Space, Enter.
+    // OpenCode renders the SAME form, so the sequence is identical to Claude's.
     assert_eq!(
         multi_option_keystroke(OpenCode, &[0, 2], false),
-        Some(b" \x1b[B\x1b[B \r".to_vec())
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
     );
     // DECCKM uses SS3 `ESC O B` for DOWN.
     assert_eq!(
         multi_option_keystroke(OpenCode, &[1], true),
-        Some(b"\x1bOB \r".to_vec())
+        Some(b"\x1bOB\r\t\r".to_vec())
     );
     // Codex has no multi-option prompt.
     assert_eq!(multi_option_keystroke(Codex, &[0, 1], false), None);
 }
 
 #[test]
-fn permission_decision_option_indices_claude_toggles_and_submits() {
+fn permission_decision_option_indices_claude_toggles_and_confirms() {
     let index = answerable("t1:p3", StatusBackend::Claude);
     assert_eq!(
         translate(&decision_options("t1:p3", vec![0, 2]), &index),
         Translation::PtyInput {
             project: 0,
             tab: 0,
-            bytes: b"13\r".to_vec(),
+            bytes: b"\r\x1b[B\x1b[B\r\t\r".to_vec(),
         }
     );
 }
 
 #[test]
-fn permission_decision_option_indices_arrow_space_for_opencode() {
+fn permission_decision_option_indices_toggles_and_confirms_for_opencode() {
     let index = answerable("t1:p3", StatusBackend::OpenCode);
     assert_eq!(
         translate(&decision_options("t1:p3", vec![0, 2]), &index),
         Translation::PtyInput {
             project: 0,
             tab: 0,
-            bytes: b" \x1b[B\x1b[B \r".to_vec(),
+            bytes: b"\r\x1b[B\x1b[B\r\t\r".to_vec(),
         }
     );
 }
