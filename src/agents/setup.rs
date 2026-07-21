@@ -180,6 +180,7 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
     "Stop": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "StopFailure": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
+    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'working\\n' >> .flightdeck/agent-status; exit 0"}]}],
     "Notification": [
       {"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]},
@@ -401,6 +402,17 @@ const CLAUDE_SETTINGS: &str = r##"{
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'waiting\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
@@ -596,8 +608,17 @@ mod tests {
                 "/repo/.flightdeck/runtime/status/claude/hooks/hooks.json",
             ))
             .unwrap();
-        serde_json::from_str::<serde_json::Value>(&hooks).expect("valid Claude hooks JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&hooks).expect("valid Claude hooks JSON");
         assert!(hooks.contains("UserPromptSubmit"));
+        // AskUserQuestion must flip the agent to `waiting` (remote-control-z30):
+        // Claude fires no PermissionRequest for a question, so a PreToolUse hook
+        // matching the tool is what surfaces the wait to the phone.
+        let pre = &parsed["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "AskUserQuestion");
+        assert!(pre["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains("waiting")));
         let manifest = fs
             .file_contents(Path::new(
                 "/repo/.flightdeck/runtime/status/claude/.claude-plugin/plugin.json",

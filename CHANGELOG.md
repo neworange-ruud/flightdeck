@@ -34,7 +34,23 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **FlightDeck Remote: agent questions now reach the phone reliably.** A Claude
+  Code `AskUserQuestion` used to be invisible on the phone: it was captured but
+  only surfaced on a "waiting-for-input" status edge that, for a question (as
+  opposed to a permission prompt), no status hook ever fired — so the prompt was
+  never shown, in the chat or as a row status. Questions are now emitted as an
+  answerable prompt the moment the agent asks (they live in the session file),
+  independent of the status edge, and a new Claude `PreToolUse`/`AskUserQuestion`
+  hook flips the agent to `waiting` so the row status, rollup, and notifications
+  are correct too. (remote-control-z30)
+- **FlightDeck Remote: the Projects tab no longer strands on an abandoned
+  session.** When a Mac was re-paired (or a pairing was otherwise orphaned so it
+  never reconnects), the Projects tab could keep showing that dead pairing's
+  stale, cached session list — an agent/branch the desktop no longer tracks —
+  and reconnect, restart, and pull-to-refresh all failed to clear it. The
+  Projects tab now follows the live (connected) instance instead of blindly the
+  oldest handle, and the Projects and Sessions screens gained real pull-to-
+  refresh that requests a fresh snapshot. (remote-control-aj2)
 
 ## [1.9.0] - 2026-07-20
 

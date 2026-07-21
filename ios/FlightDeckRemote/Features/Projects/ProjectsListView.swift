@@ -145,6 +145,16 @@ struct ProjectsListView: View {
             }
             .padding(Theme.Spacing.lg)
         }
+        .refreshable { await refresh() }
+    }
+
+    /// Pull-to-refresh: force a fresh snapshot from the (live) desktop so a
+    /// stale/last-known list is replaced (remote-control-aj2). These screens
+    /// previously had no refresh at all, so a pull-down did nothing.
+    private func refresh() async {
+        transportStore.requestSnapshot()
+        // Let the request round-trip so the spinner reflects real work.
+        try? await Task.sleep(for: .milliseconds(600))
     }
 
     private func projectCard(_ project: Wire.ProjectState) -> some View {

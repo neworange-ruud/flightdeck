@@ -155,6 +155,24 @@ import CryptoKit
         #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
     }
 
+    @Test func primaryStorePrefersAConnectedInstanceOverAStuckFirstOne() throws {
+        // The first pairing is stuck offline (e.g. an orphaned pairing the relay
+        // no longer knows, which never reaches auth_ok yet keeps re-seeding its
+        // stale cached snapshot); a later pairing is live. The Projects tab —
+        // which reads `primaryStore` dynamically — must follow the LIVE instance
+        // rather than stranding on the stale first one (remote-control-aj2).
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // All disconnected right after install → falls back to the first.
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+
+        // pair_b connects; pair_a stays disconnected.
+        let snap = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        h.coordinator.handles[1].store.debugSeed(snapshot: snap, linkState: .connected(latencyMs: 5))
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"))
+    }
+
     // MARK: - Per-instance detail binding (remote-control-b8d.12)
     //
     // `detailStore(for:)` is what `MainTabView`'s Feed-tab `.navigationDestination`

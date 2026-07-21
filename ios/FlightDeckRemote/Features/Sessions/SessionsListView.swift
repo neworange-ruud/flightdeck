@@ -139,6 +139,15 @@ struct SessionsListView: View {
             }
             .padding(Theme.Spacing.lg)
         }
+        .refreshable { await refresh() }
+    }
+
+    /// Pull-to-refresh: force a fresh snapshot so an abandoned/last-known
+    /// session list is replaced by the desktop's current state
+    /// (remote-control-aj2). This screen previously had no refresh at all.
+    private func refresh() async {
+        transportStore.requestSnapshot()
+        try? await Task.sleep(for: .milliseconds(600))
     }
 
     private func sessionCard(_ session: Wire.SessionState) -> some View {

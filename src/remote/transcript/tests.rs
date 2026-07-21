@@ -251,13 +251,20 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
     let mut b = builder();
     b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
 
-    // No Activity pill (nor any other item) is emitted for the AskUserQuestion
-    // block — it is held as a structured prompt instead.
-    assert_eq!(b.total(), 0, "AskUserQuestion emits no activity pill");
+    // The AskUserQuestion is surfaced as a Question PermissionPrompt IMMEDIATELY
+    // at ingest — not held for a later needs-input edge (remote-control-z30). No
+    // Activity pill is emitted for it.
+    assert_eq!(b.total(), 1, "AskUserQuestion emits the prompt at ingest");
 
-    // The needs-input edge surfaces it as a Question PermissionPrompt.
+    // A subsequent needs-input edge for the same (still-unanswered) question does
+    // NOT stack a second, binary prompt — it just reports the preview.
     let preview = b.on_needs_input(0);
     assert_eq!(preview.as_deref(), Some("Which database should we use?"));
+    assert_eq!(
+        b.total(),
+        1,
+        "needs-input does not duplicate the open question"
+    );
 
     match b.load(None).items.last() {
         Some(TranscriptItem::PermissionPrompt {
@@ -287,6 +294,34 @@ fn ask_user_question_becomes_a_structured_question_prompt() {
             }
         }
         other => panic!("expected a Question PermissionPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn answering_a_question_lets_a_later_needs_input_edge_prompt_again() {
+    // A question surfaced at ingest opens a prompt; a following user turn answers
+    // it (clearing the open-prompt guard) so a subsequent needs-input edge for a
+    // *new* wait synthesizes its binary prompt as usual (remote-control-z30).
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[ASK_USER_QUESTION, USER]);
+
+    let mut b = builder();
+    b.sync_jsonl(f.path(), SessionFormat::Claude, 0);
+    // Prompt (from ingest) + the user's answer.
+    assert_eq!(b.total(), 2);
+
+    // The next needs-input edge is a fresh wait: it emits the binary fallback.
+    b.on_needs_input(0);
+    assert_eq!(
+        b.total(),
+        3,
+        "a new wait after an answer emits its own prompt"
+    );
+    match b.load(None).items.last() {
+        Some(TranscriptItem::PermissionPrompt { kind, .. }) => {
+            assert_eq!(*kind, PromptKind::Permission);
+        }
+        other => panic!("expected a binary Permission prompt, got {other:?}"),
     }
 }
 

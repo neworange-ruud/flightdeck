@@ -21,10 +21,16 @@
 //!   pill (summarised by tool);
 //! * tool results, sidechain (subagent) turns, and meta records are skipped.
 //!
-//! Permission prompts are **not** in the session file; the bridge calls
-//! [`TranscriptBuilder::on_needs_input`] when the status hook reports the agent
-//! stopped for input, and we synthesize an inline
-//! [`TranscriptItem::PermissionPrompt`] whose preview is the agent's last prose.
+//! Answerable prompts surface two ways. A Claude `AskUserQuestion` **is** in the
+//! session file (a tool_use), so it is emitted as an inline
+//! [`TranscriptItem::PermissionPrompt`] the moment it is ingested — it does not
+//! wait for a status edge, which for some agents/hooks never flips to `waiting`
+//! and would otherwise leave the question invisible on the phone
+//! (remote-control-z30). Binary permission prompts are **not** in the session
+//! file; the bridge calls [`TranscriptBuilder::on_needs_input`] when the status
+//! hook reports the agent stopped for input, and we synthesize an inline prompt
+//! whose preview is the agent's last prose (OpenCode passes a captured
+//! structured prompt through the same edge via [`TranscriptBuilder::set_structured_prompt`]).
 //!
 //! Three agents are supported, resolved by [`resolve_source`]:
 //! * **Claude Code** — JSONL file, `type=user|assistant`, `message.content`
@@ -135,8 +141,14 @@ pub struct TranscriptBuilder {
     /// Monotonic prompt counter for stable PromptIds.
     prompt_seq: u64,
     /// A structured prompt captured during ingest, consumed (and cleared) by the
-    /// next [`Self::on_needs_input`] edge in place of the binary fallback.
+    /// next [`Self::on_needs_input`] edge in place of the binary fallback. Used
+    /// by the OpenCode sidecar path, whose prompt is not in the tailed store.
     pending_structured: Option<StructuredPrompt>,
+    /// Preview of a structured prompt already surfaced *at ingest time* (a Claude
+    /// `AskUserQuestion`, which lives in the session file) and not yet answered.
+    /// While `Some`, the needs-input edge must NOT synthesize a second (binary)
+    /// prompt for the same wait — it just reports this preview (remote-control-z30).
+    open_prompt: Option<String>,
 }
 
 impl TranscriptBuilder {
@@ -156,6 +168,7 @@ impl TranscriptBuilder {
             sent_upto: 0,
             prompt_seq: 0,
             pending_structured: None,
+            open_prompt: None,
         }
     }
 
@@ -261,6 +274,7 @@ impl TranscriptBuilder {
         self.total = 0;
         self.sent_upto = 0;
         self.pending_structured = None;
+        self.open_prompt = None;
         // `prompt_seq` intentionally keeps advancing so PromptIds stay unique.
     }
 
@@ -300,6 +314,9 @@ impl TranscriptBuilder {
                 if o.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     return;
                 }
+                // A user turn answers any prompt that was awaiting input, so an
+                // open ingest-time question is now resolved (remote-control-z30).
+                self.open_prompt = None;
                 let content = o.get("message").and_then(|m| m.get("content"));
                 if let Some(text) = extract_user_text(content) {
                     let text = text.trim().to_string();
@@ -345,12 +362,17 @@ impl TranscriptBuilder {
                             let empty = Value::Null;
                             let input = b.get("input").unwrap_or(&empty);
                             // A Claude `AskUserQuestion` is an answerable prompt, not
-                            // an activity: capture it as a structured prompt for the
-                            // next needs-input edge and emit NO activity pill. If the
-                            // JSON is missing/oddly-typed, fall through to the pill.
+                            // an activity. It lives in the session file, so surface it
+                            // as a Question prompt IMMEDIATELY rather than waiting for a
+                            // needs-input status edge — that edge depends on a status
+                            // hook flipping to `waiting`, which does not fire for
+                            // AskUserQuestion on every agent, leaving the question
+                            // invisible on the phone (remote-control-z30). Emit no
+                            // activity pill. If the JSON is missing/oddly-typed, fall
+                            // through to the pill.
                             if name == "AskUserQuestion" {
                                 if let Some(sp) = parse_ask_user_question(input) {
-                                    self.set_structured_prompt(sp);
+                                    self.emit_structured_prompt(sp, at_ms);
                                     continue;
                                 }
                             }
@@ -546,29 +568,46 @@ impl TranscriptBuilder {
         }
     }
 
+    /// Emit a structured prompt as an inline [`TranscriptItem::PermissionPrompt`]
+    /// now, minting a fresh prompt id, and remember its preview as the currently
+    /// open prompt. Shared by the ingest-time AskUserQuestion capture and the
+    /// needs-input edge (OpenCode sidecar). Returns the preview.
+    fn emit_structured_prompt(&mut self, sp: StructuredPrompt, at_ms: i64) -> Option<String> {
+        self.prompt_seq += 1;
+        let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
+        let item_id = ItemId::new(format!("{}:prompt:{}", self.session_id, self.prompt_seq));
+        let preview = truncate_preview(&sp.command);
+        self.push_item(TranscriptItem::PermissionPrompt {
+            item_id,
+            prompt_id,
+            kind: sp.kind,
+            command: sp.command,
+            options: sp.options,
+            allow_free_text: sp.allow_free_text,
+            at_ms,
+        });
+        self.open_prompt = preview.clone();
+        preview
+    }
+
     /// The bridge calls this on the working/idle → needs-input edge: synthesize
     /// an inline permission prompt whose preview is the agent's last prose (the
     /// session file has no permission records). Returns the preview (if any).
     pub fn on_needs_input(&mut self, at_ms: i64) -> Option<String> {
+        // A structured prompt captured via the OpenCode sidecar is surfaced here
+        // in place of the synthesized binary allow/deny fallback.
+        if let Some(sp) = self.pending_structured.take() {
+            return self.emit_structured_prompt(sp, at_ms);
+        }
+        // A Claude AskUserQuestion already surfaced at ingest time and is still
+        // unanswered: do NOT emit a second (binary) prompt for the same wait —
+        // just report its preview (remote-control-z30).
+        if let Some(preview) = self.open_prompt.clone() {
+            return Some(preview);
+        }
         self.prompt_seq += 1;
         let prompt_id = PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq));
         let item_id = ItemId::new(format!("{}:prompt:{}", self.session_id, self.prompt_seq));
-        // A structured prompt captured during ingest (e.g. AskUserQuestion) is
-        // surfaced here in place of the synthesized binary allow/deny fallback,
-        // using the SAME prompt_seq/item_id bump.
-        if let Some(sp) = self.pending_structured.take() {
-            let preview = truncate_preview(&sp.command);
-            self.push_item(TranscriptItem::PermissionPrompt {
-                item_id,
-                prompt_id,
-                kind: sp.kind,
-                command: sp.command,
-                options: sp.options,
-                allow_free_text: sp.allow_free_text,
-                at_ms,
-            });
-            return preview;
-        }
         let preview = self.build_preview();
         self.push_item(TranscriptItem::PermissionPrompt {
             item_id,

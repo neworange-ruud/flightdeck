@@ -148,7 +148,10 @@ struct MainTabView: View {
             }
             .background(Theme.bgDeep)
             .sheet(isPresented: $isPresentingNewAgentSheet) {
-                NewAgentView(store: transportStore)
+                // Target the live instance (see `primaryStore`), not the frozen
+                // init-time capture, so a new agent is created on a connected
+                // desktop rather than a stuck/orphaned pairing (remote-control-aj2).
+                NewAgentView(store: coordinator.primaryStore)
             }
             .onChange(of: transportStore.agentEvents) { _, newEvents in
                 // Unread is folded in reactively across EVERY machine by
@@ -301,18 +304,21 @@ struct MainTabView: View {
             }
         case .projects:
             NavigationStack(path: $projectsNav.path) {
-                ProjectsListView(transportStore: transportStore, router: router, nav: projectsNav)
+                ProjectsListView(transportStore: coordinator.primaryStore, router: router, nav: projectsNav)
                     .navigationDestination(for: ProjectsRoute.self) { route in
                         switch route {
                         case let .sessions(projectId, _):
                             // Projects tab stays single-store/transitional
                             // (remote-control-b8d.12 scope is the Feed tab) —
                             // the route's `pairingId` is always `nil` here
-                            // (see every push site on this tab) and ignored;
-                            // always binds `transportStore`.
+                            // (see every push site on this tab) and ignored.
+                            // Bind `coordinator.primaryStore` DYNAMICALLY (not the
+                            // frozen `transportStore` captured at init) so the tab
+                            // follows the live instance and never strands on a
+                            // stuck/orphaned pairing's stale cache (remote-control-aj2).
                             SessionsListView(
                                 projectId: Wire.ProjectId(projectId),
-                                transportStore: transportStore,
+                                transportStore: coordinator.primaryStore,
                                 nav: projectsNav,
                                 isPresentingNewAgentSheet: $isPresentingNewAgentSheet
                             )
@@ -326,7 +332,7 @@ struct MainTabView: View {
                             // `loadFixtureIfRequested()` wins and returns before the
                             // store is bound (see `AgentChatView.task`).
                             AgentChatView(projectId: projectId, sessionId: sessionId,
-                                          store: transportStore)
+                                          store: coordinator.primaryStore)
                         }
                     }
                     .chatFixtureAutoPush(path: $projectsNav.path)
