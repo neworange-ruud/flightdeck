@@ -34,6 +34,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **FlightDeck Remote: base-branch agents now show a transcript at all.** An
+  agent running on the base branch (worktree `.`) had its worktree built as
+  `repo_root/.`, whose string-mangled session-store path never matched the clean
+  path Claude/OpenCode actually record under — so the desktop found no session
+  file and the phone showed nothing: no agent responses, no user messages, and
+  no questions (only an empty Allow/Deny fallback). The lookup now normalizes
+  away the trailing `.`, so these agents' conversations reach the phone. This was
+  the primary reason `main` agents appeared silent on the phone. (remote-control-ou3)
 - **FlightDeck Remote: agent questions now reach the phone reliably.** A Claude
   Code `AskUserQuestion` used to be invisible on the phone: it was captured but
   only surfaced on a "waiting-for-input" status edge that, for a question (as

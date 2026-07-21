@@ -58,6 +58,31 @@ fn reconstructs_user_assistant_and_activity() {
 }
 
 #[test]
+fn resolve_source_normalizes_a_base_branch_trailing_dot_cwd() {
+    // A base-branch agent's worktree is `repo_root.join(".")` → `…/wt/.`. Claude
+    // records its session under the CLEAN `…/wt`, so resolve_source must find it
+    // despite the trailing `.`, or the transcript stays permanently empty
+    // (remote-control-ou3). The mangled dir below matches the clean path only.
+    let home = tempfile::tempdir().unwrap();
+    let claude_dir = home.path().join(".claude/projects/-home-u-wt");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+
+    let dotted = std::path::Path::new("/home/u/wt/.");
+    match resolve_source("claude", dotted, home.path()) {
+        Some(TranscriptSource::Jsonl { path, format }) => {
+            assert_eq!(format, SessionFormat::Claude);
+            assert!(path.ends_with("11111111-1111-1111-1111-111111111111.jsonl"));
+        }
+        other => panic!("expected a Claude Jsonl source for a trailing-dot cwd, got {other:?}"),
+    }
+}
+
+#[test]
 fn skips_tool_results_meta_and_sidechain() {
     let f = NamedTempFile::new().unwrap();
     append(

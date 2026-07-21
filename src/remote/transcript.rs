@@ -78,11 +78,38 @@ pub enum TranscriptSource {
     OpenCode { db: PathBuf, directory: String },
 }
 
+/// Drop `.` (current-dir) components from a path. A base-branch agent
+/// (`runs_on_base`) has `worktree_path_relative == "."`, so the desktop builds
+/// its worktree as `repo_root.join(".")` → `…/repo/.`. Claude and OpenCode
+/// canonicalize their cwd before recording a session, so they store it under the
+/// clean `…/repo`. Left as-is, the string-mangled Claude project dir gains a
+/// spurious trailing `-` (and the OpenCode `directory` a trailing `/.`) and never
+/// matches what the agent wrote — so no session file is found and the transcript
+/// stays permanently empty (remote-control-ou3). Stripping `CurDir` mirrors what
+/// the agent's own `getcwd` does, without resolving symlinks (which would risk
+/// diverging from the path real worktrees already match).
+fn clean_cwd(cwd: &Path) -> PathBuf {
+    let cleaned: PathBuf = cwd
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
 /// Resolve where `agent`'s conversation for `cwd` lives (store rooted at
 /// `home`), or `None` if there is nothing to read yet. Claude/Codex resolve to a
 /// JSONL file via [`crate::agents::resume`]; OpenCode resolves to its SQLite DB
 /// (remote-control-fyj) when that DB exists.
 pub fn resolve_source(agent: &str, cwd: &Path, home: &Path) -> Option<TranscriptSource> {
+    // Normalize away `.`/current-dir components so a base-branch agent's
+    // `repo_root/.` cwd matches the clean path the agent recorded its session
+    // under (remote-control-ou3).
+    let cwd = clean_cwd(cwd);
+    let cwd = cwd.as_path();
     if let Some((path, format)) = crate::agents::resume::newest_session_path(agent, cwd, home) {
         return Some(TranscriptSource::Jsonl { path, format });
     }
