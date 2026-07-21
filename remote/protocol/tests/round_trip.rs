@@ -151,10 +151,7 @@ fn question_prompt_round_trips() {
     assert_eq!(v["allow_free_text"], true);
     assert_eq!(v["options"][2]["index"], 2);
     assert!(v["options"][0].get("choice").is_none());
-    assert_eq!(
-        serde_json::from_value::<TranscriptItem>(v).unwrap(),
-        item
-    );
+    assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
 }
 
 /// A multi-option `PermissionDecision` answered by option index round-trips and
