@@ -47,6 +47,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **FlightDeck Remote: a follow-up question in the same session shows as a new
+  prompt.** After you answered one question, a second question the agent asked
+  in the same session reused the first (already-answered) card instead of
+  surfacing the new one — most visible on OpenCode. The desktop now clears its
+  open-prompt de-duplication guard once a prompt is answered, so every new
+  question appears fresh. (remote-control-dc9)
 - **FlightDeck Remote: answering a multiple-choice question now selects the
   right option.** Selecting an option on the phone drove the agent's list by
   arrow-key navigation, which mis-landed (you picked option 1 but the agent
