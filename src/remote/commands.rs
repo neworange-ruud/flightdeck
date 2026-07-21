@@ -129,10 +129,6 @@ pub struct SessionEntry {
     /// Whether the primary terminal application has enabled bracketed paste
     /// (DECSET 2004), which decides how reply text is framed.
     pub bracketed_paste: bool,
-    /// Whether the primary terminal application has enabled application cursor
-    /// keys mode (DECCKM / DECSET 1), which decides how a synthesized arrow-key
-    /// selection is encoded (`ESC O B` vs `ESC [ B`) — see [`option_keystroke`].
-    pub application_cursor: bool,
     /// The currently pending permission prompt id, if any (the most recently
     /// minted one from the transcript builder).
     pub pending_prompt: Option<PromptId>,
@@ -205,11 +201,6 @@ pub fn build_index(
                     .session
                     .primary()
                     .map(|t| t.bracketed_paste())
-                    .unwrap_or(false),
-                application_cursor: tab
-                    .session
-                    .primary()
-                    .map(|t| t.application_cursor())
                     .unwrap_or(false),
                 pending_prompt: pending_prompt(&tab.meta.id),
             });
@@ -418,31 +409,24 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
 ///   falls back to arrow navigation. Fixes the phone answering option 1 but the
 ///   agent registering option 3 (remote-control-qa1).
 /// * **OpenCode** (`question.asked`) uses arrow navigation: from the first
-///   option focused, `n` DOWN arrows then Enter select option `n`. The DOWN
-///   encoding depends on the terminal's cursor-keys mode — full-screen TUIs
-///   enable **application cursor keys** (DECCKM) where DOWN is `ESC O B` (SS3),
-///   not the normal `ESC [ B` (CSI); `application_cursor` (from the live `vt100`
-///   state) selects the right form so the keystroke is not silently ignored.
+///   option focused, `n` DOWN arrows then Enter select option `n`. DOWN is the
+///   CSI form `ESC [ B` — the exact bytes the desktop's own keyboard handler
+///   sends for the Down key (see `tui::input`), which both agents accept. (An
+///   earlier SS3 `ESC O B` form, gated on the terminal's DECCKM state, was
+///   WRONG: the desktop is not DECCKM-aware, so its physical arrows are always
+///   CSI; injecting SS3 for a DECCKM app like Claude was silently ignored —
+///   remote-control-dc9.)
 /// * **Codex** has no multi-option Question prompt, so it returns `None`; the
 ///   translate arm turns that into an honest rejection.
-pub fn option_keystroke(
-    backend: StatusBackend,
-    option_index: u32,
-    application_cursor: bool,
-) -> Option<Vec<u8>> {
+pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec<u8>> {
     match backend {
         // Claude: press the option's number (select + submit) when single-digit.
         StatusBackend::Claude if option_index < 9 => Some(vec![b'1' + option_index as u8]),
         StatusBackend::Claude | StatusBackend::OpenCode => {
-            // Arrow navigation. DECCKM → SS3 `ESC O B`; otherwise CSI `ESC [ B`.
-            let down: &[u8] = if application_cursor {
-                b"\x1bOB"
-            } else {
-                b"\x1b[B"
-            };
+            // Arrow navigation: `n` DOWN presses (CSI, matching `tui::input`).
             let mut bytes = Vec::new();
             for _ in 0..option_index {
-                bytes.extend_from_slice(down);
+                bytes.extend_from_slice(DOWN_ARROW);
             }
             bytes.push(b'\r');
             Some(bytes)
@@ -451,6 +435,13 @@ pub fn option_keystroke(
         StatusBackend::Codex => None,
     }
 }
+
+/// The Down-arrow bytes the desktop injects for list navigation — the CSI form
+/// `ESC [ B`, identical to what `tui::input` sends for a physical Down key.
+/// FlightDeck's input layer is not DECCKM-aware (it never emits the SS3 `ESC O
+/// B` form), so both agents' TUIs are driven with CSI regardless of their
+/// cursor-keys mode (remote-control-dc9).
+const DOWN_ARROW: &[u8] = b"\x1b[B";
 
 /// How long to wait after switching to Claude's Confirm tab before injecting
 /// the submit Enter (see [`Translation::PtyInputThenDeferred`]). Long enough for
@@ -476,8 +467,8 @@ pub const MULTI_SELECT_SUBMIT_DELAY_MS: u64 = 150;
 ///
 /// So, from the initial highlight on the first option, this walks Down to each
 /// target in ascending order and presses Enter to toggle it, then presses Tab
-/// to reach the Confirm tab and Enter to submit. Down is DECCKM-aware (SS3
-/// `ESC O B` under application-cursor mode, else CSI `ESC [ B`); Tab (`\t`) and
+/// to reach the Confirm tab and Enter to submit. Down is the CSI form `ESC [ B`
+/// ([`DOWN_ARROW`], matching the desktop's own key encoding); Tab (`\t`) and
 /// Enter (`\r`) are mode-independent.
 ///
 /// SCOPE: single-question prompts only. A prompt with MULTIPLE question tabs is
@@ -485,11 +476,7 @@ pub const MULTI_SELECT_SUBMIT_DELAY_MS: u64 = 150;
 /// Confirm, when other questions precede it (remote-control follow-up).
 ///
 /// **Codex** has no such prompt → `None` (an honest rejection upstream).
-pub fn multi_option_keystroke(
-    backend: StatusBackend,
-    option_indices: &[u32],
-    application_cursor: bool,
-) -> Option<Vec<u8>> {
+pub fn multi_option_keystroke(backend: StatusBackend, option_indices: &[u32]) -> Option<Vec<u8>> {
     let mut indices: Vec<u32> = option_indices.to_vec();
     indices.sort_unstable();
     indices.dedup();
@@ -498,16 +485,11 @@ pub fn multi_option_keystroke(
     }
     match backend {
         StatusBackend::Claude | StatusBackend::OpenCode => {
-            let down: &[u8] = if application_cursor {
-                b"\x1bOB"
-            } else {
-                b"\x1b[B"
-            };
             let mut bytes = Vec::new();
             let mut cursor = 0u32;
             for &target in &indices {
                 for _ in cursor..target {
-                    bytes.extend_from_slice(down);
+                    bytes.extend_from_slice(DOWN_ARROW);
                 }
                 bytes.push(b'\r'); // Enter toggles the highlighted option.
                 cursor = target;
@@ -601,8 +583,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
             } else if let Some(indices) = option_indices {
-                let Some(mut b) = multi_option_keystroke(backend, indices, s.application_cursor)
-                else {
+                let Some(mut b) = multi_option_keystroke(backend, indices) else {
                     return reject("this agent does not support multi-select prompts");
                 };
                 // Claude's Ink TUI drops the submit Enter when it arrives during
@@ -623,7 +604,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
                 }
                 b
             } else if let Some(n) = option_index {
-                match option_keystroke(backend, *n, s.application_cursor) {
+                match option_keystroke(backend, *n) {
                     Some(b) => b,
                     None => {
                         return reject("this agent does not support multi-option prompts");

@@ -17,7 +17,6 @@ fn entry(id: &str) -> SessionEntry {
         primary_running: true,
         all_stopped: false,
         bracketed_paste: true,
-        application_cursor: false,
         pending_prompt: None,
     }
 }
@@ -311,15 +310,14 @@ fn option_keystroke_uses_the_option_number_for_claude() {
     use StatusBackend::Claude;
     // Claude's AskUserQuestion numbers its options 1..N; pressing the digit
     // selects AND submits that option (verified live). index 0 => "1", etc.
-    // Cursor mode is irrelevant for the digit path (remote-control-qa1).
-    assert_eq!(option_keystroke(Claude, 0, false), Some(b"1".to_vec()));
-    assert_eq!(option_keystroke(Claude, 1, true), Some(b"2".to_vec()));
-    assert_eq!(option_keystroke(Claude, 2, false), Some(b"3".to_vec()));
-    assert_eq!(option_keystroke(Claude, 8, false), Some(b"9".to_vec()));
-    // Beyond single digits, fall back to arrow navigation (SS3 under DECCKM).
+    assert_eq!(option_keystroke(Claude, 0), Some(b"1".to_vec()));
+    assert_eq!(option_keystroke(Claude, 1), Some(b"2".to_vec()));
+    assert_eq!(option_keystroke(Claude, 2), Some(b"3".to_vec()));
+    assert_eq!(option_keystroke(Claude, 8), Some(b"9".to_vec()));
+    // Beyond single digits, fall back to CSI arrow navigation.
     assert_eq!(
-        option_keystroke(Claude, 9, true),
-        Some([b"\x1bOB".repeat(9), b"\r".to_vec()].concat())
+        option_keystroke(Claude, 9),
+        Some([b"\x1b[B".repeat(9), b"\r".to_vec()].concat())
     );
 }
 
@@ -327,19 +325,17 @@ fn option_keystroke_uses_the_option_number_for_claude() {
 fn option_keystroke_arrow_nav_for_opencode() {
     use StatusBackend::{Codex, OpenCode};
     // OpenCode uses arrow-nav: index 0 => just Enter; each step adds a DOWN
-    // arrow. Normal cursor mode uses CSI `ESC [ B`; DECCKM uses SS3 `ESC O B`.
-    assert_eq!(option_keystroke(OpenCode, 0, false), Some(b"\r".to_vec()));
+    // arrow. DOWN is always the CSI form `ESC [ B` (matching the desktop's own
+    // key encoding — the desktop is not DECCKM-aware, remote-control-dc9).
+    assert_eq!(option_keystroke(OpenCode, 0), Some(b"\r".to_vec()));
+    assert_eq!(option_keystroke(OpenCode, 1), Some(b"\x1b[B\r".to_vec()));
     assert_eq!(
-        option_keystroke(OpenCode, 1, false),
-        Some(b"\x1b[B\r".to_vec())
-    );
-    assert_eq!(
-        option_keystroke(OpenCode, 2, true),
-        Some(b"\x1bOB\x1bOB\r".to_vec())
+        option_keystroke(OpenCode, 2),
+        Some(b"\x1b[B\x1b[B\r".to_vec())
     );
     // Codex has no multi-option prompt.
-    assert_eq!(option_keystroke(Codex, 0, false), None);
-    assert_eq!(option_keystroke(Codex, 2, false), None);
+    assert_eq!(option_keystroke(Codex, 0), None);
+    assert_eq!(option_keystroke(Codex, 2), None);
 }
 
 #[test]
@@ -393,24 +389,24 @@ fn multi_option_keystroke_toggles_and_confirms_for_claude() {
     // Claude multi-select is a tabbed form: from the first option, walk DOWN to
     // each target and press Enter to TOGGLE it, then Tab to the Confirm tab and
     // Enter to submit. [0, 2] → Enter (toggle 0), DOWN DOWN, Enter (toggle 2),
-    // Tab, Enter. DOWN is CSI in normal cursor mode.
+    // Tab, Enter. DOWN is always the CSI form `ESC [ B`.
     assert_eq!(
-        multi_option_keystroke(Claude, &[0, 2], false),
+        multi_option_keystroke(Claude, &[0, 2]),
         Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
     );
-    // Deduped + sorted first; DECCKM uses SS3 `ESC O B` for DOWN.
+    // Deduped + sorted first.
     assert_eq!(
-        multi_option_keystroke(Claude, &[2, 0, 2], true),
-        Some(b"\r\x1bOB\x1bOB\r\t\r".to_vec()),
+        multi_option_keystroke(Claude, &[2, 0, 2]),
+        Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec()),
         "indices are deduped and sorted before navigation"
     );
     // A single selection still toggles then confirms (DOWN once to option 1).
     assert_eq!(
-        multi_option_keystroke(Claude, &[1], false),
+        multi_option_keystroke(Claude, &[1]),
         Some(b"\x1b[B\r\t\r".to_vec())
     );
     // Empty selection is not actionable.
-    assert_eq!(multi_option_keystroke(Claude, &[], false), None);
+    assert_eq!(multi_option_keystroke(Claude, &[]), None);
 }
 
 #[test]
@@ -418,16 +414,15 @@ fn multi_option_keystroke_toggles_and_confirms_for_opencode() {
     use StatusBackend::{Codex, OpenCode};
     // OpenCode renders the SAME form, so the sequence is identical to Claude's.
     assert_eq!(
-        multi_option_keystroke(OpenCode, &[0, 2], false),
+        multi_option_keystroke(OpenCode, &[0, 2]),
         Some(b"\r\x1b[B\x1b[B\r\t\r".to_vec())
     );
-    // DECCKM uses SS3 `ESC O B` for DOWN.
     assert_eq!(
-        multi_option_keystroke(OpenCode, &[1], true),
-        Some(b"\x1bOB\r\t\r".to_vec())
+        multi_option_keystroke(OpenCode, &[1]),
+        Some(b"\x1b[B\r\t\r".to_vec())
     );
     // Codex has no multi-option prompt.
-    assert_eq!(multi_option_keystroke(Codex, &[0, 1], false), None);
+    assert_eq!(multi_option_keystroke(Codex, &[0, 1]), None);
 }
 
 #[test]
