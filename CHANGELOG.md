@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.10.1] - 2026-07-21
+
+### New features
+
 - **About dialog.** A new "About FlightDeck" entry in the command palette opens
   a dialog showing the version and credits — FlightDeck is built by Ruud van
   Falier, with collaboration from Sander Langhorst.
