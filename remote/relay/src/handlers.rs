@@ -20,6 +20,7 @@ use futures_util::{
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::session::Connection;
 use crate::AppState;
@@ -85,8 +86,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Writer task owns the sink; it exits when the channel closes (all senders
     // dropped once the state machine returns and the registry handle is
-    // detached), then completes the close handshake.
-    let writer = tokio::spawn(writer_task(sink, out_rx));
+    // detached), then completes the close handshake. It also emits a
+    // server-initiated WS ping every `ping_interval` so a healthy-but-quiet
+    // client keeps sending Pongs (which reset the read loop's liveness clock)
+    // and a half-open socket surfaces a write error (remote-control-0ef.1).
+    let ping_interval = state.config.ping_interval;
+    let writer = tokio::spawn(writer_task(sink, out_rx, ping_interval));
 
     // Run the state machine to completion (this also cleans up the registry).
     Connection::new(state, out_tx).run(stream).await;
@@ -95,20 +100,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let _ = writer.await;
 }
 
-/// Drains outbound [`RelayFrame`]s to the WebSocket sink as JSON text, then
-/// sends a Close frame to finish the RFC 6455 handshake cleanly.
-async fn writer_task(mut sink: SplitSink<WebSocket, Message>, mut rx: mpsc::Receiver<RelayFrame>) {
-    while let Some(frame) = rx.recv().await {
-        // Serialization of these small, well-typed frames does not fail in
-        // practice; if the socket write fails the peer is gone, so stop.
-        match serde_json::to_string(&frame) {
-            Ok(text) => {
-                if sink.send(Message::Text(text.into())).await.is_err() {
-                    return;
+/// Drains outbound [`RelayFrame`]s to the WebSocket sink as JSON text and, on a
+/// fixed `ping_interval`, emits a server-initiated WS ping. Finishes with a
+/// Close frame to complete the RFC 6455 handshake cleanly.
+///
+/// The ping is a protocol-level [`Message::Ping`] (not a `RelayFrame`), so it
+/// needs no wire change: a conformant client's WS stack answers with a Pong,
+/// which the read loop counts as inbound liveness (remote-control-0ef.1). A
+/// dead peer eventually fails the ping write, which also ends the task.
+async fn writer_task(
+    mut sink: SplitSink<WebSocket, Message>,
+    mut rx: mpsc::Receiver<RelayFrame>,
+    ping_interval: Duration,
+) {
+    let mut ping = tokio::time::interval(ping_interval);
+    // The first tick fires immediately; consume it so the first *real* ping is
+    // one full interval out, and never let a stall bunch up missed ticks.
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ping.tick().await;
+
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                let Some(frame) = frame else { break }; // all senders dropped
+                // Serialization of these small, well-typed frames does not fail
+                // in practice; if the socket write fails the peer is gone, so
+                // stop.
+                match serde_json::to_string(&frame) {
+                    Ok(text) => {
+                        if sink.send(Message::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to serialize outbound frame");
+                    }
                 }
             }
-            Err(err) => {
-                tracing::error!(error = %err, "failed to serialize outbound frame");
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Vec::<u8>::new().into())).await.is_err() {
+                    return; // socket gone
+                }
             }
         }
     }

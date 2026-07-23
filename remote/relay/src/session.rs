@@ -21,6 +21,7 @@
 //! **verbatim**; this module never base64-decodes or otherwise inspects
 //! `ciphertext` (PRD §9.1).
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -29,14 +30,14 @@ use flightdeck_remote_protocol::{
     RelayErrorCode, RelayFrame, Role, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 use futures_util::stream::{SplitStream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{timeout_at, Duration, Instant};
 
 use crate::auth;
 use crate::claims::ClaimError;
 use crate::ids;
-use crate::queue::{AppendOutcome, QueueError};
-use crate::router::{peer_role, ConnHandle};
+use crate::queue::{AppendOutcome, QueueError, ResumeOutcome};
+use crate::router::{peer_role, ConnHandle, TrySendOutcome};
 use crate::store::RevokeOutcome;
 use crate::AppState;
 
@@ -130,6 +131,11 @@ pub struct Connection {
     /// How many `pairing_claim` frames this connection has attempted, for the
     /// per-connection rate limit ([`MAX_CLAIM_ATTEMPTS_PER_CONN`]).
     claim_attempts: u32,
+    /// Fires when a newer leg supersedes one of this connection's slots in the
+    /// registry, telling the read loop to tear down (remote-control-0ef.8).
+    /// The same `Arc` is cloned into every [`ConnHandle`] this connection
+    /// registers, so superseding any leg wakes the whole connection.
+    shutdown: Arc<Notify>,
     phase: Phase,
 }
 
@@ -142,7 +148,19 @@ impl Connection {
             connection_id: ids::connection_id(),
             role: None,
             claim_attempts: 0,
+            shutdown: Arc::new(Notify::new()),
             phase: Phase::AwaitingHello,
+        }
+    }
+
+    /// Build a registry handle for this connection: its outbound sender plus the
+    /// shared shutdown signal, so superseding this handle later can tear the
+    /// connection down (remote-control-0ef.8).
+    fn handle(&self) -> ConnHandle {
+        ConnHandle {
+            connection_id: self.connection_id.clone(),
+            tx: self.out_tx.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -151,14 +169,45 @@ impl Connection {
     pub async fn run(mut self, mut reader: SplitStream<WebSocket>) {
         let auth_deadline =
             Instant::now() + Duration::from_secs(self.state.config.auth_timeout_secs);
+        let idle_timeout = self.state.config.idle_timeout;
+        // Liveness clock: reset on every inbound frame. An authenticated
+        // connection that goes silent past `idle_timeout` is torn down
+        // (remote-control-0ef.1). Server-initiated WS pings (driven by the
+        // writer task) keep a healthy-but-quiet client sending Pongs, which
+        // count as inbound traffic and keep resetting this.
+        let mut last_inbound = Instant::now();
 
         loop {
             let authed = matches!(self.phase, Phase::Authed { .. });
 
-            // Only the pre-auth phase is deadline-bounded (spec §5.1).
             let next = if authed {
-                reader.next().await
+                // Post-auth: liveness-bounded (remote-control-0ef.1) and
+                // preemptible by supersession (remote-control-0ef.8).
+                let idle_deadline = last_inbound + idle_timeout;
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.notified() => {
+                        tracing::info!(
+                            conn = %self.connection_id,
+                            "superseded by a newer connection for the same role; shutting down"
+                        );
+                        break;
+                    }
+                    res = timeout_at(idle_deadline, reader.next()) => match res {
+                        Ok(msg) => msg,
+                        Err(_) => {
+                            tracing::info!(
+                                conn = %self.connection_id,
+                                "idle timeout: no inbound frame within the liveness deadline; tearing down"
+                            );
+                            break;
+                        }
+                    },
+                }
             } else {
+                // Pre-auth is bounded only by the auth deadline (spec §5.1); an
+                // unauthenticated connection holds no registry slot, so it can
+                // neither be superseded nor needs the idle sweep.
                 match timeout_at(auth_deadline, reader.next()).await {
                     Ok(msg) => msg,
                     Err(_) => {
@@ -178,6 +227,10 @@ impl Connection {
                 Ok(m) => m,
                 Err(_) => break, // transport error / abrupt drop
             };
+
+            // Any inbound frame — an app frame or the Pong answering a server
+            // ping — proves the peer is alive; reset the liveness clock.
+            last_inbound = Instant::now();
 
             let flow = match msg {
                 Message::Text(text) => self.on_text(&text).await,
@@ -403,7 +456,7 @@ impl Connection {
         let token = match claim_token_hint {
             Some(hint)
                 if is_valid_claim_hint(&hint)
-                    && self.state.store.claim_token_is_free(&hint).await =>
+                    && self.state.store.claim_token_is_free(&hint, now_ms()).await =>
             {
                 hint
             }
@@ -438,10 +491,7 @@ impl Connection {
             if !activated.contains(&pairing_id) {
                 activated.push(pairing_id.clone());
             }
-            let handle = ConnHandle {
-                connection_id: self.connection_id.clone(),
-                tx: self.out_tx.clone(),
-            };
+            let handle = self.handle();
             self.state
                 .registry
                 .attach(&pairing_id, Role::Desktop, handle);
@@ -642,10 +692,7 @@ impl Connection {
         // Attach each activated pairing to the live routing table and exchange
         // presence with any already-connected peer.
         let role = self.role.expect("role set at hello");
-        let handle = ConnHandle {
-            connection_id: self.connection_id.clone(),
-            tx: self.out_tx.clone(),
-        };
+        let handle = self.handle();
         for pairing in &activated {
             let peer = self.state.registry.attach(pairing, role, handle.clone());
             tracing::info!(
@@ -967,14 +1014,41 @@ impl Connection {
             .await;
             return Flow::Continue;
         }
-        // Replay the peer's queued envelopes with seq > from_seq, in order.
-        let replay = self
+        // Replay the peer's queued envelopes with seq > from_seq, in order —
+        // unless a drop-oldest overflow shed seqs this receiver still needs.
+        match self
             .state
             .store
-            .replay(&pairing_id, peer_role(role), from_seq)
-            .await;
-        for env in replay {
-            self.send(RelayFrame::Envelope(env)).await;
+            .resume(&pairing_id, peer_role(role), from_seq)
+            .await
+        {
+            ResumeOutcome::Replay(replay) => {
+                for env in replay {
+                    self.send(RelayFrame::Envelope(env)).await;
+                }
+            }
+            ResumeOutcome::Resync => {
+                // The receiver asked to resume from before the oldest envelope
+                // we still hold: overflow dropped the in-between seqs and they
+                // are gone (remote-control-0ef.7). Replaying would hand the
+                // receiver a stream with a permanent hole its gapless-seq
+                // enforcement stalls on. Reuse the existing SeqViolation→resync
+                // advisory instead of inventing a new frame: the receiver drops
+                // its stale cursor for this pairing and requests a fresh
+                // snapshot from its peer (the same recovery the enqueue-side
+                // SeqViolation triggers), so the stream restarts cleanly rather
+                // than silently losing data.
+                tracing::info!(
+                    conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                    from_seq, "resume precedes oldest retained envelope; signaling resync"
+                );
+                self.send_error(
+                    RelayErrorCode::SeqViolation,
+                    "resume precedes oldest retained envelope; resync required",
+                    Some(pairing_id),
+                )
+                .await;
+            }
         }
         Flow::Continue
     }
@@ -1051,12 +1125,42 @@ impl Connection {
 /// and does not receive pushes.
 async fn deliver_or_push(state: &AppState, env: &EncryptedEnvelope, sender: Role) {
     if let Some(peer) = state.registry.peer(&env.pairing_id, sender) {
-        let ok = peer.send(RelayFrame::Envelope(env.clone())).await;
-        tracing::info!(
-            pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
-            peer_conn = %peer.connection_id, sent = ok,
-            "DIAG deliver -> peer connected"
-        );
+        // Non-blocking forward (remote-control-0ef.6). A slow or half-open peer
+        // whose outbound channel is full (or already closed) must NOT be awaited
+        // here: awaiting would let that stuck receiver back-pressure the healthy
+        // *sender's* read loop through this path, freezing a working leg. On
+        // `Full`/`Closed` we drop the live forward — which is safe because the
+        // envelope is already durably buffered in the store's `SenderQueue`
+        // (this runs only after a successful `enqueue`). When the receiver next
+        // notices the resulting seq gap, or reconnects, it issues
+        // `resume { from_seq }` and pulls the dropped envelope from the buffer —
+        // the same recovery the SeqViolation→resync path relies on. A healthy
+        // peer never hits this: it has 256 frames of head room and drains
+        // promptly.
+        match peer.try_send(RelayFrame::Envelope(env.clone())) {
+            TrySendOutcome::Sent => {
+                tracing::info!(
+                    pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
+                    peer_conn = %peer.connection_id,
+                    "DIAG deliver -> peer connected (forwarded)"
+                );
+            }
+            TrySendOutcome::Full => {
+                tracing::warn!(
+                    pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
+                    peer_conn = %peer.connection_id,
+                    "peer outbound channel full (slow/half-open); dropped live forward, \
+                     receiver will resume from the queue"
+                );
+            }
+            TrySendOutcome::Closed => {
+                tracing::info!(
+                    pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
+                    peer_conn = %peer.connection_id,
+                    "peer writer gone; dropped live forward, receiver will resume from the queue"
+                );
+            }
+        }
         return;
     }
     tracing::info!(
@@ -1124,11 +1228,18 @@ mod tests {
     }
 
     fn conn_handle(id: &str) -> (ConnHandle, mpsc::Receiver<RelayFrame>) {
-        let (tx, rx) = mpsc::channel(8);
+        conn_handle_bounded(id, 8)
+    }
+
+    /// Like [`conn_handle`] but with an explicit channel bound, so a test can
+    /// jam a peer's outbox to simulate a slow/stuck receiver.
+    fn conn_handle_bounded(id: &str, bound: usize) -> (ConnHandle, mpsc::Receiver<RelayFrame>) {
+        let (tx, rx) = mpsc::channel(bound);
         (
             ConnHandle {
                 connection_id: id.into(),
                 tx,
+                shutdown: Arc::new(Notify::new()),
             },
             rx,
         )
@@ -1202,6 +1313,44 @@ mod tests {
         let push = Arc::new(RecordingPush::default());
         let state = state_with_push(push.clone());
         deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+        assert!(push.fired.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stuck_peer_does_not_block_the_forwarding_sender() {
+        // remote-control-0ef.6: a peer whose outbound channel is jammed (a slow
+        // or half-open zombie that never drains) must not back-pressure the
+        // healthy sender. `deliver_or_push` is the exact call the sender's read
+        // loop awaits per envelope; it must return promptly instead of parking
+        // on the full channel.
+        let push = Arc::new(RecordingPush::default());
+        let state = state_with_push(push.clone());
+        let pairing = PairingId::new("pair");
+
+        // Attach a phone peer with a bound-1 outbox and jam it. `_rx` is held but
+        // never drained, so the channel stays full — the half-open-socket case.
+        let (phone, _rx) = conn_handle_bounded("conn_phone_stuck", 1);
+        phone
+            .tx
+            .try_send(RelayFrame::Pong {
+                client_time_ms: 0,
+                server_time_ms: 0,
+            })
+            .expect("prime the jammed channel");
+        state.registry.attach(&pairing, Role::Phone, phone);
+
+        // The forward must complete without awaiting the drained channel. A
+        // regression (reverting to `send().await`) would hang here until the
+        // test's timeout fires.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop),
+        )
+        .await
+        .expect("deliver_or_push must not block on a jammed peer outbox");
+
+        // The peer is 'connected' (just slow), so no APNs push is fired — the
+        // dropped envelope stays buffered for the peer to resume.
         assert!(push.fired.lock().unwrap().is_empty());
     }
 

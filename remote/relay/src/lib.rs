@@ -26,6 +26,7 @@ pub mod store;
 pub mod telemetry;
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{routing::get, Router};
 use tower_http::trace::TraceLayer;
@@ -34,6 +35,15 @@ use apns::{NoopPushService, PushService};
 use config::Config;
 use router::Registry;
 use store::{InMemoryStore, RelayStore};
+
+/// Current wall-clock time in unix milliseconds. (Mirrors the private helper in
+/// [`session`]; duplicated here to keep the background sweeper self-contained.)
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Shared application state, handed to every handler via `axum::State`.
 #[derive(Clone)]
@@ -59,8 +69,16 @@ impl AppState {
     /// config (the live APNs sender when both configured and built with the
     /// `apns-live` feature; otherwise a no-op).
     pub fn new(config: Config) -> Self {
-        let push = default_push_service(&config);
-        Self::with_push(config, push)
+        // Build the store first so the live push service can be handed a
+        // token-purge hook (dead-token cleanup, remote-control-0ef.14).
+        let store: Arc<dyn RelayStore> = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
+        let push = default_push_service(&config, store.clone());
+        Self {
+            config: Arc::new(config),
+            store,
+            registry: Arc::new(Registry::new()),
+            push,
+        }
     }
 
     /// Build application state with an explicitly-supplied push service.
@@ -80,19 +98,24 @@ impl AppState {
 /// Choose the push service for a config: the live APNs sender when APNs is
 /// configured *and* the `apns-live` feature is compiled in; a no-op otherwise
 /// (so the default build — and CI without Apple secrets — still runs).
-fn default_push_service(config: &Config) -> Arc<dyn PushService> {
+fn default_push_service(config: &Config, store: Arc<dyn RelayStore>) -> Arc<dyn PushService> {
     #[cfg(feature = "apns-live")]
     if let Some(apns) = config.apns.clone() {
         match apns::live::HttpApnsTransport::new() {
             Ok(transport) => {
-                return Arc::new(apns::ApnsPushService::new(apns, transport));
+                // Wire the store as the token-purge hook so a permanent APNs
+                // rejection (410/BadDeviceToken) removes the dead token
+                // (remote-control-0ef.14).
+                return Arc::new(
+                    apns::ApnsPushService::new(apns, transport).with_purge(store.clone()),
+                );
             }
             Err(err) => {
                 tracing::warn!(%err, "apns: could not build live transport; push disabled");
             }
         }
     }
-    let _ = config; // silence unused warning when `apns-live` is off
+    let _ = (config, store); // silence unused warnings when `apns-live` is off
     Arc::new(NoopPushService)
 }
 
@@ -103,6 +126,7 @@ fn default_push_service(config: &Config) -> Arc<dyn PushService> {
 /// ephemeral port without going through the process entry point.
 pub fn app(config: Config) -> Router {
     let state = AppState::new(config);
+    spawn_claim_sweeper(state.store.clone(), state.config.claim_sweep_interval);
 
     Router::new()
         .route("/healthz", get(handlers::healthz))
@@ -111,6 +135,30 @@ pub fn app(config: Config) -> Router {
         .route("/ws", get(handlers::ws_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Spawn the periodic claim-token sweep (remote-control-0ef.16). A
+/// `pairing_offer` whose 4-digit code is never entered leaves a claim entry in
+/// the store; redemption/revocation only reap tokens lazily, so without this
+/// task the claim table grows unboundedly for the life of the process. The task
+/// wakes every [`Config::claim_sweep_interval`] and evicts every entry past its
+/// TTL. Detached: it lives for the process (or, in tests, until the runtime is
+/// dropped).
+fn spawn_claim_sweeper(store: Arc<dyn RelayStore>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; consume it so the first real sweep
+        // happens one interval in (nothing can have expired at t=0).
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let removed = store.sweep_expired_claims(now_ms()).await;
+            if removed > 0 {
+                tracing::debug!(removed, "claim sweep: evicted expired claim tokens");
+            }
+        }
+    });
 }
 
 /// Resolves once the process receives a shutdown signal: SIGTERM (what
@@ -141,5 +189,45 @@ pub async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received Ctrl+C, shutting down"),
         _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flightdeck_remote_protocol::{DeviceId, PairingId};
+
+    #[tokio::test]
+    async fn claim_sweeper_evicts_expired_tokens() {
+        // remote-control-0ef.16: the wired-up background sweep physically evicts
+        // an abandoned (issued-but-never-redeemed, now-expired) claim token so
+        // the table cannot grow without bound. The sweep *logic* is unit-tested
+        // in claims.rs/store.rs; this proves the task is actually spawned and
+        // ticking.
+        let store = Arc::new(InMemoryStore::new(1000));
+        let past = now_ms() - 10_000; // already past its TTL
+        store
+            .issue_claim(
+                "stale".into(),
+                PairingId::new("p"),
+                DeviceId::new("d"),
+                past,
+            )
+            .await;
+        assert_eq!(store.claim_entry_count(), 1, "token is physically present");
+
+        spawn_claim_sweeper(store.clone(), Duration::from_millis(20));
+        let mut swept = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if store.claim_entry_count() == 0 {
+                swept = true;
+                break;
+            }
+        }
+        assert!(
+            swept,
+            "background sweeper should physically evict the expired token"
+        );
     }
 }
