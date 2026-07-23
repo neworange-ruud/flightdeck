@@ -126,6 +126,17 @@ pub struct RemoteBridge {
     /// preserved: a reconnect re-arms `snapshot_needed` via `Paired`, so a single
     /// fresh snapshot — not a stale backlog — is sent when the link returns.
     link_up: bool,
+    /// Whether a phone peer is currently attached to the pairing. While no phone
+    /// is attached the bridge does NOT seal+send the per-tick snapshot/status/
+    /// rollup deltas — during the 2026-07-22 incident the desktop sealed and sent
+    /// a status_update every second for hours into an empty relay queue with no
+    /// peer to receive it (remote-control-uqa). Presence is authoritative even
+    /// across a desktop reconnect: the relay announces an already-connected
+    /// peer's presence to the freshly-attached leg (session.rs on attach). A
+    /// phone (re)attaching re-arms `snapshot_needed` so it still gets a full,
+    /// current snapshot the moment it connects. Defaults to `false` (no phone
+    /// until one attaches); unit tests that drive presence set it explicitly.
+    peer_present: bool,
     snapshot_needed: bool,
     grace_until_ms: u64,
     pending_transcript_requests: Vec<(SessionId, Option<u64>)>,
@@ -171,6 +182,7 @@ impl RemoteBridge {
             event_seq: 0,
             pairing: None,
             link_up: true,
+            peer_present: false,
             snapshot_needed: true,
             grace_until_ms,
             pending_transcript_requests: Vec::new(),
@@ -341,7 +353,20 @@ impl RemoteBridge {
                     }
                 }
             }
-            RemoteInbound::Presence { .. } => {}
+            // Track whether a phone peer is attached so `tick` can skip sealing
+            // per-tick deltas to nobody (remote-control-uqa). A phone becoming
+            // present re-arms `snapshot_needed` so it receives a fresh full
+            // snapshot on attach rather than waiting for the next change.
+            RemoteInbound::Presence { peer, state, .. } => {
+                if peer == Role::Phone {
+                    let now_present =
+                        matches!(state, flightdeck_remote_protocol::PresenceState::Connected);
+                    if now_present && !self.peer_present {
+                        self.snapshot_needed = true;
+                    }
+                    self.peer_present = now_present;
+                }
+            }
             // Track link state so `tick` can pause seal/queue while the relay is
             // unreachable (remote-control-0ef.10). Only a live, authenticated link
             // (`Connected`) permits sending; Connecting/Disconnected/Incompatible
@@ -559,45 +584,56 @@ impl RemoteBridge {
             self.send_msg(DesktopToPhone::Event(ev), sent_at, send);
         }
 
-        // Build the current world and reconcile against what the phone saw.
-        let snap = self.build_snapshot(projects, now_ms);
-        let delta = self.feed.diff(&snap);
-        if self.snapshot_needed || delta.set_changed {
-            self.feed.record_snapshot(&snap);
-            self.snapshot_needed = false;
-            self.send_msg(DesktopToPhone::Snapshot(snap), sent_at, send);
-            // Alongside a full snapshot, push each session's full git status
-            // detail (design §5.5) built from the cached worktree status. This
-            // is how the phone learns per-session git detail; there is no
-            // dedicated request command, so a `request_snapshot` refreshes it.
-            for pv in projects {
-                for tab in pv.state.tabs.iter() {
-                    let detail = feed::git_status_detail(
-                        &SessionId::new(&tab.meta.id),
-                        pv.cache.get(&tab.meta.id),
-                        &tab.meta.branch,
-                    );
-                    self.send_msg(DesktopToPhone::GitStatus(detail), sent_at, send);
+        // Per-tick snapshot / status / rollup deltas go out only when a phone
+        // peer is actually attached. With no phone present the desktop otherwise
+        // seals + sends a status_update into an empty relay queue every tick with
+        // no one to receive it — observed spamming ~once a second for hours during
+        // the 2026-07-22 incident (remote-control-uqa). A phone attaching re-arms
+        // `snapshot_needed` (see the presence handler), so it still gets a full,
+        // current snapshot the instant it connects. Events, transcript flushes and
+        // shell output below are edge/request-driven, not per-tick, so they are
+        // unaffected.
+        if self.peer_present {
+            // Build the current world and reconcile against what the phone saw.
+            let snap = self.build_snapshot(projects, now_ms);
+            let delta = self.feed.diff(&snap);
+            if self.snapshot_needed || delta.set_changed {
+                self.feed.record_snapshot(&snap);
+                self.snapshot_needed = false;
+                self.send_msg(DesktopToPhone::Snapshot(snap), sent_at, send);
+                // Alongside a full snapshot, push each session's full git status
+                // detail (design §5.5) built from the cached worktree status. This
+                // is how the phone learns per-session git detail; there is no
+                // dedicated request command, so a `request_snapshot` refreshes it.
+                for pv in projects {
+                    for tab in pv.state.tabs.iter() {
+                        let detail = feed::git_status_detail(
+                            &SessionId::new(&tab.meta.id),
+                            pv.cache.get(&tab.meta.id),
+                            &tab.meta.branch,
+                        );
+                        self.send_msg(DesktopToPhone::GitStatus(detail), sent_at, send);
+                    }
                 }
-            }
-        } else {
-            if !delta.status.is_empty() {
-                self.send_msg(
-                    DesktopToPhone::StatusUpdate(flightdeck_remote_protocol::StatusUpdate {
-                        updates: delta.status,
-                    }),
-                    sent_at,
-                    send,
-                );
-            }
-            if !delta.rollups.is_empty() {
-                self.send_msg(
-                    DesktopToPhone::Rollup(flightdeck_remote_protocol::RollupUpdate {
-                        projects: delta.rollups,
-                    }),
-                    sent_at,
-                    send,
-                );
+            } else {
+                if !delta.status.is_empty() {
+                    self.send_msg(
+                        DesktopToPhone::StatusUpdate(flightdeck_remote_protocol::StatusUpdate {
+                            updates: delta.status,
+                        }),
+                        sent_at,
+                        send,
+                    );
+                }
+                if !delta.rollups.is_empty() {
+                    self.send_msg(
+                        DesktopToPhone::Rollup(flightdeck_remote_protocol::RollupUpdate {
+                            projects: delta.rollups,
+                        }),
+                        sent_at,
+                        send,
+                    );
+                }
             }
         }
 

@@ -38,6 +38,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   incompatible relay protocol version is now a distinct terminal state ("update
   FlightDeck") rather than an invisible forever-retry, and connect/DNS errors are
   surfaced for diagnostics instead of being discarded (remote-control-0ef.20).
+- **FlightDeck Remote (desktop): no status spam when no phone is connected.** The
+  desktop used to seal and send a `status_update` every render tick — about once
+  a second, for hours — into an empty relay queue even when no phone was attached
+  (seen throughout the 2026-07-22 incident). It now only seals+sends the per-tick
+  snapshot/status/rollup deltas while a phone peer is actually attached; a phone
+  that (re)connects still gets a fresh full snapshot the instant it attaches
+  (remote-control-uqa).
 - **FlightDeck Remote (relay): dead or slow peers no longer freeze a healthy
   peer, silently linger, or go undetected.** Three connection-lifecycle fixes on
   the relay: (1) a slow/half-open receiver can no longer head-of-line-block the
