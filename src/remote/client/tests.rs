@@ -39,6 +39,29 @@ fn backoff_starts_at_one_second_and_caps_at_sixty() {
     assert_eq!(backoff_delay(100, 1.0), Duration::from_millis(60_000));
 }
 
+// --- Backoff reset only after a stable authed session (0ef.2) --------------
+
+/// A session that reached `auth_ok` then immediately dropped (relay crash/
+/// redeploy loop) must NOT reset the reconnect backoff to zero, or the client
+/// hammers the relay ~once/second forever. Only a session that stayed
+/// authenticated for at least `min_stable` resets it (remote-control-0ef.2).
+#[test]
+fn backoff_resets_only_after_a_stable_authed_session() {
+    let min = Duration::from_secs(10);
+    // Never authenticated → never resets.
+    assert!(!session_resets_backoff(None, min));
+    // Authenticated but flapped under the stable threshold → no reset.
+    assert!(!session_resets_backoff(Some(Duration::from_millis(0)), min));
+    assert!(!session_resets_backoff(Some(Duration::from_secs(1)), min));
+    assert!(!session_resets_backoff(
+        Some(Duration::from_millis(9_999)),
+        min
+    ));
+    // Authenticated and stayed healthy past the threshold → resets.
+    assert!(session_resets_backoff(Some(Duration::from_secs(10)), min));
+    assert!(session_resets_backoff(Some(Duration::from_secs(120)), min));
+}
+
 #[test]
 fn backoff_is_monotonic_until_the_cap() {
     let mut prev = Duration::ZERO;
@@ -821,5 +844,251 @@ fn pairing_revoked_drops_pairing_and_notifies_app() {
     );
 
     let _ = mock.join();
+    handle.stop();
+}
+
+// --- Half-open / liveness teardown (0ef.1) ---------------------------------
+
+/// Build a [`ClientTuning`] with a short liveness deadline (and no forced write
+/// failures) so a half-open socket is detected in milliseconds, not the real 60s.
+fn fast_liveness_tuning(liveness: Duration) -> ClientTuning {
+    ClientTuning {
+        liveness_timeout: liveness,
+        ..ClientTuning::default()
+    }
+}
+
+/// A socket that dies without a FIN (laptop sleep, NAT reap, relay redeploy) stays
+/// "open" to the client: idle reads loop forever and the tiny pings sit in the
+/// kernel send buffer so the write timeout never trips. The liveness deadline must
+/// notice the absence of ANY inbound frame and tear the session down so the
+/// supervisor reconnects (remote-control-0ef.1). The mock authenticates, then holds
+/// conn #1 OPEN and SILENT — the reconnect is driven purely by the liveness
+/// deadline, never by a socket close.
+#[test]
+fn half_open_socket_is_torn_down_by_liveness_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        // conn #1: authenticate, then go silent while holding the socket open.
+        let s1 = accept_within(&listener).expect("first connect");
+        let mut ws1 = tungstenite::accept(s1).unwrap();
+        assert!(mock_authenticate(&mut ws1, &pubkey, &["p"]));
+        // Keep conn #1 alive and silent so the client's reconnect is caused by
+        // the liveness deadline, not by conn #1 being closed.
+        let _held = ws1;
+
+        // conn #2: the client reconnected because conn #1 delivered no inbound
+        // frames for the liveness window — the half-open link was detected.
+        let s2 = accept_within(&listener).expect("reconnect after liveness teardown");
+        let mut ws2 = tungstenite::accept(s2).unwrap();
+        assert!(mock_authenticate(&mut ws2, &pubkey, &["p"]));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    // A persisted pairing makes conn #1 auth-first (no pre-auth offer wait).
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("p"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_tuned(
+        cfg,
+        identity,
+        store,
+        in_tx,
+        out_rx,
+        fast_liveness_tuning(Duration::from_millis(300)),
+    );
+
+    // Must reach Connected TWICE: once on conn #1, then again after the half-open
+    // socket is torn down by the liveness deadline and the client reconnects.
+    let mut connected = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && connected < 2 {
+        if let Ok(RemoteInbound::Link(RemoteLinkState::Connected { .. })) =
+            in_rx.recv_timeout(Duration::from_millis(200))
+        {
+            connected += 1;
+        }
+    }
+    assert!(
+        connected >= 2,
+        "liveness deadline must tear down a half-open socket and reconnect (got {connected} Connected)"
+    );
+
+    handle.stop();
+    let _ = mock.join();
+}
+
+// --- No wire seq gap across a failed write + reconnect (0ef.9) --------------
+
+/// When an outbound envelope's write fails mid-session the client must HOLD that
+/// exact envelope and re-send it on the next session, so its `seq` is never
+/// skipped on the wire — the bridge already advanced its `out_seq` past it, so a
+/// dropped envelope would leave a gap the phone's contiguous-seq dedup stalls on
+/// (remote-control-0ef.9). The forced-write-failure test seam makes the failure
+/// deterministic (no dependence on OS-specific TCP RST timing): the first envelope
+/// write fails, and the mock's SECOND connection must receive that same envelope
+/// at seq 1 — not seq 2 (which is what a dropped-and-skipped envelope would leave).
+#[test]
+fn failed_envelope_write_is_held_and_resent_without_a_seq_gap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        // conn #1: authenticate, read the resume, then block until the client
+        // tears the session down (its envelope write was forced to fail → the
+        // session ends and drops the socket, unblocking this read with None).
+        let s1 = accept_within(&listener).expect("first connect");
+        let mut ws1 = tungstenite::accept(s1).unwrap();
+        assert!(mock_authenticate(&mut ws1, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws1) {
+            Some(RelayFrame::Resume { pairing_id, .. }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+            }
+            other => panic!("expected resume on conn #1, got {other:?}"),
+        }
+        // The forced-failed envelope is never written; the session ends. Wait for
+        // the client to drop conn #1 (returns None), then move on to conn #2.
+        let _ = ws_recv(&mut ws1);
+
+        // conn #2: the client re-sends the HELD envelope first. It must arrive at
+        // seq 1 (re-sent), proving the seq was not skipped.
+        let s2 = accept_within(&listener).expect("reconnect");
+        let mut ws2 = tungstenite::accept(s2).unwrap();
+        assert!(mock_authenticate(&mut ws2, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws2) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume on conn #2, got {other:?}"),
+        }
+        let resent = ws_recv_envelope(&mut ws2);
+        assert_eq!(
+            resent.seq, 1,
+            "the held envelope must be re-sent at its original seq (no gap)"
+        );
+        ws_send(
+            &mut ws2,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 1,
+            },
+        );
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    // Force the first envelope write to fail so the hold/re-send path is exercised.
+    let tuning = ClientTuning {
+        fail_next_envelope_writes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        ..ClientTuning::default()
+    };
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
+
+    // As the bridge: once connected on conn #1, enqueue exactly one envelope (seq
+    // 1). Its write is forced to fail; the client holds it and re-sends on conn #2.
+    wait_for_connected(&in_rx);
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_test"),
+            seq: 1,
+            sent_at_ms: 1_000,
+            nonce: "bg==".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+        })
+        .unwrap();
+
+    mock.join().unwrap();
+    handle.stop();
+}
+
+// --- Version-incompatible is a distinct terminal state (0ef.20) -------------
+
+/// A relay past this build's supported protocol range is permanent until the app
+/// updates — retrying can never succeed. The client must surface a DISTINCT
+/// terminal [`RemoteLinkState::Incompatible`] and STOP reconnecting, instead of
+/// backoff-looping forever in silence (remote-control-0ef.20).
+#[test]
+fn version_incompatible_is_terminal_and_stops_reconnecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+
+    let mock = std::thread::spawn(move || {
+        // Answer the first hello with version_incompatible, then keep accepting to
+        // prove the client does NOT reconnect (surplus accepts simply time out).
+        let s1 = accept_within(&listener).expect("first connect");
+        let mut ws1 = tungstenite::accept(s1).unwrap();
+        if !matches!(ws_recv(&mut ws1), Some(RelayFrame::Hello { .. })) {
+            return false;
+        }
+        ws_send(
+            &mut ws1,
+            &RelayFrame::VersionIncompatible {
+                your_version: 3,
+                min_supported: 4,
+                max_supported: 4,
+            },
+        );
+        // If the client (wrongly) reconnects, a second connection arrives.
+        accept_within(&listener).is_some()
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    // The client must report the distinct terminal Incompatible state.
+    let mut incompatible = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && incompatible.is_none() {
+        if let Ok(RemoteInbound::Link(RemoteLinkState::Incompatible {
+            our_version,
+            relay_min,
+            relay_max,
+        })) = in_rx.recv_timeout(Duration::from_millis(200))
+        {
+            incompatible = Some((our_version, relay_min, relay_max));
+        }
+    }
+    let versions = incompatible.expect("client must surface a terminal Incompatible link state");
+    assert_eq!(
+        versions,
+        (3, 4, 4),
+        "the incompatible-version detail must be surfaced for the UI"
+    );
+
+    // It must NOT reconnect: the mock's second accept should time out (false).
+    let reconnected = mock.join().unwrap();
+    assert!(
+        !reconnected,
+        "version-incompatible is terminal — the client must stop reconnecting"
+    );
+
     handle.stop();
 }

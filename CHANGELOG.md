@@ -16,7 +16,25 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **FlightDeck Remote (desktop): the connection survives sleep/wake, flaps, and
+  outages instead of silently wedging.** Five transport-durability fixes on the
+  desktop client: (1) a half-open socket (laptop sleep/wake, Wi-Fi↔cell handoff)
+  is now detected — the client tears the session down and reconnects if no
+  inbound frame arrives within a 60s liveness window, instead of looping on idle
+  reads forever while the UI still shows "connected" (remote-control-0ef.1,
+  desktop portion); (2) a relay that authenticates then immediately drops no
+  longer resets the reconnect backoff to zero — backoff only resets after a
+  session stays healthy for ≥10s, so a crash/redeploy loop no longer hammers
+  reconnects ~once a second (remote-control-0ef.2); (3) an outbound envelope
+  whose write fails is now held and re-sent on the next session before any newer
+  traffic, so its `seq` slots back in contiguously and the phone's dedup never
+  stalls on a gap (remote-control-0ef.9); (4) while the relay link is down the
+  bridge pauses sealing/queueing status, rollup, shell, and transcript envelopes
+  — during an outage it no longer burns crypto/CPU building a backlog into an
+  unbounded channel that floods out on reconnect (remote-control-0ef.10); (5) an
+  incompatible relay protocol version is now a distinct terminal state ("update
+  FlightDeck") rather than an invisible forever-retry, and connect/DNS errors are
+  surfaced for diagnostics instead of being discarded (remote-control-0ef.20).
 
 ## [1.10.1] - 2026-07-21
 

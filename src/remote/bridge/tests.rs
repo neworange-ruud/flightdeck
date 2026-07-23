@@ -862,6 +862,79 @@ fn unclear_permission_and_empty_options_fall_back_to_binary() {
     assert!(read_prompt_sidecar(wt.path()).is_none());
 }
 
+// --- link-state gating: pause seal/queue during a relay outage (0ef.10) -----
+
+/// While the relay link is down the bridge must PAUSE all seal/queue work — it
+/// otherwise seals StatusUpdate/Rollup/etc. into the outbound channel every tick
+/// during an outage (the client is not draining it while reconnecting), growing
+/// it without bound and flooding the backlog on reconnect (remote-control-0ef.10).
+/// Reconnect-replay is preserved: a reconnect re-arms a fresh snapshot via
+/// `Paired`, and the outbound seq is not corrupted (it never advances while paused).
+#[test]
+fn disconnected_link_pauses_seal_and_queue() {
+    use crate::remote::RemoteLinkState;
+
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    // Baseline: paired + link up (default) → the first tick seals+queues.
+    let first = collect_raw(&mut b, &views, 1_000);
+    let high = first
+        .iter()
+        .map(seq_of)
+        .max()
+        .expect("connected link sends");
+    assert!(high >= 1);
+
+    // Relay outage: the client reports the link Disconnected → seal/queue pauses.
+    b.handle_inbound(RemoteInbound::Link(RemoteLinkState::Disconnected));
+    assert!(
+        collect_raw(&mut b, &views, 2_000).is_empty(),
+        "no seal/queue while the link is down (0ef.10)"
+    );
+    // Still paused mid-reconnect (Connecting is not yet authenticated).
+    b.handle_inbound(RemoteInbound::Link(RemoteLinkState::Connecting));
+    assert!(
+        collect_raw(&mut b, &views, 3_000).is_empty(),
+        "still paused while reconnecting"
+    );
+    // And on the terminal Incompatible state.
+    b.handle_inbound(RemoteInbound::Link(RemoteLinkState::Incompatible {
+        our_version: 3,
+        relay_min: 4,
+        relay_max: 4,
+    }));
+    assert!(
+        collect_raw(&mut b, &views, 4_000).is_empty(),
+        "paused on the terminal version-incompatible state"
+    );
+
+    // Reconnect: the real path re-emits Link(Connected) + Paired, which re-arms a
+    // fresh snapshot. The stream resumes WITHOUT a stale backlog and the seq keeps
+    // ascending from where it left off (not corrupted by the paused ticks).
+    b.handle_inbound(RemoteInbound::Link(RemoteLinkState::Connected {
+        latency_ms: 5,
+    }));
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let after = collect_raw(&mut b, &views, 5_000);
+    assert_eq!(
+        after.iter().map(seq_of).min().expect("resumes sending"),
+        high + 1,
+        "outbound seq keeps ascending across the outage — no gap, no rewind"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|o| matches!(decode(o), DesktopToPhone::Snapshot(_))),
+        "reconnect leads with a fresh snapshot, not a paused-tick backlog"
+    );
+}
+
 #[test]
 fn deferred_pty_writes_fire_only_once_due() {
     // Claude's multi-select submit Enter is queued with a future due time and
