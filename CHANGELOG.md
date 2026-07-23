@@ -69,6 +69,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   e.g. ingress-blocked on cellular) it points at the phone's own connection, and
   only asks "is FlightDeck running on your Mac?" when the relay is reachable but
   the desktop is actually absent.
+- **Desktop: coalesced cursor persistence removes write amplification.** The
+  relay client no longer rewrites the entire `~/.flightdeck/remote.json` (plus a
+  `chmod 0600`) on every streamed envelope, inbound envelope, and peer ack —
+  under shell streaming that was many full-file rewrites per second for a
+  monotonic counter bump. A `CursorFlushGate` now debounces those cursor persists
+  to at most one write every 2s and always flushes on session end, while
+  pairing-lifecycle changes still persist immediately. A hard-crash loses at most
+  a couple of seconds of resume/dedup cursor progress, which the relay's
+  at-least-once redelivery already tolerates (remote-control-0ef.11).
+- **Relay: SQLite store delegates to the canonical queue/claim logic.** The
+  file-backed `SqliteStore` no longer re-expresses gapless-seq / dedup /
+  drop-oldest-overflow / single-use-TTL in SQL. New rehydration constructors
+  (`SenderQueue::from_snapshot`, `ClaimTable::from_records`) let each mutating
+  method load the canonical type, run the one true algorithm, and write the
+  snapshot back — so the two store implementations can no longer drift
+  (remote-control-tvc). The multi-question protocol fields were also reviewed and
+  deliberately kept at `PROTOCOL_VERSION` v3 (wire-compatible, no bump needed —
+  remote-control-ssw).
 
 ### Bug fixes
 
