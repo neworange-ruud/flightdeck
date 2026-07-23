@@ -118,6 +118,14 @@ fn paired_bridge() -> RemoteBridge {
         pairing_id: PairingId::new("pair-1"),
         peer_device_id: None,
     });
+    // A phone peer is attached: the relay announces peer presence on attach, and
+    // the desktop only seals+sends per-tick deltas while a phone is present
+    // (remote-control-uqa). These tests model the phone-connected path.
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new("pair-1"),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
     b
 }
 
@@ -152,6 +160,46 @@ fn no_output_without_a_pairing() {
     let msgs = collect(&mut b, &views, 1_000);
     assert!(msgs.is_empty());
     assert!(!b.is_paired());
+}
+
+#[test]
+fn no_deltas_sealed_or_sent_while_no_phone_peer_attached() {
+    // remote-control-uqa: paired + link up, but no phone attached. The bridge
+    // must NOT seal+send per-tick snapshot/status/rollup deltas (the 2026-07-22
+    // incident had it sending a status_update ~once a second for hours into an
+    // empty relay queue). A phone attaching then gets a fresh full snapshot.
+    let mut b = RemoteBridge::passthrough(0);
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    // No Presence event yet → peer_present stays false.
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+    assert!(b.is_paired());
+
+    assert!(
+        collect(&mut b, &views, 1_000).is_empty(),
+        "no phone attached → nothing sealed/sent"
+    );
+    assert!(
+        collect(&mut b, &views, 2_000).is_empty(),
+        "still nothing on the next tick (this was the once-a-second spam)"
+    );
+
+    // Phone attaches → the next tick leads with a fresh snapshot.
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new("pair-1"),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
+    let msgs = collect(&mut b, &views, 3_000);
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, DesktopToPhone::Snapshot(_))),
+        "a newly-attached phone gets a fresh snapshot, got {msgs:?}"
+    );
 }
 
 // --- snapshot on connect ---------------------------------------------------
