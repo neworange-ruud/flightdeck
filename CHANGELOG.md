@@ -29,6 +29,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   60s with no inbound traffic, announcing `Disconnected` to the peer, so a
   half-open socket is reclaimed instead of leaking a session, writer task, and
   registry handle (remote-control-0ef.1, relay portion).
+- **FlightDeck Remote (relay): pending-queue and claim-table durability.** Three
+  fixes that stop silent data loss and unbounded memory growth on the relay: (1)
+  when a `(pairing, sender)` queue overflows and drop-oldest sheds un-acked
+  envelopes, a resuming receiver is now told to **resync** (request a fresh
+  snapshot) instead of being handed a stream with a permanent hole its
+  gapless-seq enforcement stalls on — an ack-pruned resume is still a clean
+  replay (remote-control-0ef.7); (2) a periodic sweep now evicts expired
+  claim tokens, so an abandoned `pairing_offer` code that is never entered no
+  longer leaks an entry for the life of the process, and an expired-but-unswept
+  token no longer blocks reuse of its 4-digit code (remote-control-0ef.16); (3)
+  revoking a pairing now garbage-collects the device identity and key-agreement
+  keys of any member no surviving pairing still references (remote-control-0ef.17).
 
 ## [1.10.1] - 2026-07-21
 

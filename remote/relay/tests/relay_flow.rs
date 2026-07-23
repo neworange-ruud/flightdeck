@@ -533,9 +533,14 @@ async fn queue_overflow_emits_advisory_and_keeps_newest() {
         }
     ));
 
-    // Reconnect the phone and resume from 0: only the newest 3 (seq 3,4,5)
-    // survive drop-oldest.
-    let mut phone = TestClient::connect_with_key(&base, Role::Phone, "dev_phone", phone_key).await;
+    // Reconnect the phone and resume from 0. Drop-oldest shed seq 1 and 2, so a
+    // contiguous replay starting at seq 1 is impossible. Rather than silently
+    // hand over a gapped stream (seq 3,4,5) that the phone's gapless-seq
+    // enforcement would stall on forever, the relay now signals a resync
+    // (SeqViolation) so the phone abandons its stale cursor and requests a fresh
+    // snapshot (remote-control-0ef.7).
+    let mut phone =
+        TestClient::connect_with_key(&base, Role::Phone, "dev_phone", phone_key.clone()).await;
     phone.authenticate(vec![pairing.clone()]).await;
     phone
         .send(RelayFrame::Resume {
@@ -543,12 +548,38 @@ async fn queue_overflow_emits_advisory_and_keeps_newest() {
             from_seq: 0,
         })
         .await;
+    let resync = phone
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    assert!(
+        matches!(
+            resync,
+            RelayFrame::Error {
+                code: RelayErrorCode::SeqViolation,
+                ..
+            }
+        ),
+        "resume across an overflow gap must signal resync, got {resync:?}"
+    );
+    // No gapped envelope stream follows the resync signal.
+    phone.expect_idle(300).await;
+
+    // A receiver that resumes from just above the drop (seq 2) still gets a
+    // clean replay of the retained tail — the resync is specific to the hole.
+    let mut phone2 = TestClient::connect_with_key(&base, Role::Phone, "dev_phone", phone_key).await;
+    phone2.authenticate(vec![pairing.clone()]).await;
+    phone2
+        .send(RelayFrame::Resume {
+            pairing_id: pairing.clone(),
+            from_seq: 2,
+        })
+        .await;
     let mut got = Vec::new();
     for _ in 0..3 {
-        got.push(env_seq(&phone.recv_until(is_envelope).await));
+        got.push(env_seq(&phone2.recv_until(is_envelope).await));
     }
     assert_eq!(got, vec![3, 4, 5]);
-    phone.expect_idle(300).await;
+    phone2.expect_idle(300).await;
 }
 
 // ── machine name (spec §10.1) ───────────────────────────────────────────────

@@ -36,7 +36,7 @@ use tokio::time::{timeout_at, Duration, Instant};
 use crate::auth;
 use crate::claims::ClaimError;
 use crate::ids;
-use crate::queue::{AppendOutcome, QueueError};
+use crate::queue::{AppendOutcome, QueueError, ResumeOutcome};
 use crate::router::{peer_role, ConnHandle, TrySendOutcome};
 use crate::store::RevokeOutcome;
 use crate::AppState;
@@ -456,7 +456,7 @@ impl Connection {
         let token = match claim_token_hint {
             Some(hint)
                 if is_valid_claim_hint(&hint)
-                    && self.state.store.claim_token_is_free(&hint).await =>
+                    && self.state.store.claim_token_is_free(&hint, now_ms()).await =>
             {
                 hint
             }
@@ -1014,14 +1014,41 @@ impl Connection {
             .await;
             return Flow::Continue;
         }
-        // Replay the peer's queued envelopes with seq > from_seq, in order.
-        let replay = self
+        // Replay the peer's queued envelopes with seq > from_seq, in order —
+        // unless a drop-oldest overflow shed seqs this receiver still needs.
+        match self
             .state
             .store
-            .replay(&pairing_id, peer_role(role), from_seq)
-            .await;
-        for env in replay {
-            self.send(RelayFrame::Envelope(env)).await;
+            .resume(&pairing_id, peer_role(role), from_seq)
+            .await
+        {
+            ResumeOutcome::Replay(replay) => {
+                for env in replay {
+                    self.send(RelayFrame::Envelope(env)).await;
+                }
+            }
+            ResumeOutcome::Resync => {
+                // The receiver asked to resume from before the oldest envelope
+                // we still hold: overflow dropped the in-between seqs and they
+                // are gone (remote-control-0ef.7). Replaying would hand the
+                // receiver a stream with a permanent hole its gapless-seq
+                // enforcement stalls on. Reuse the existing SeqViolation→resync
+                // advisory instead of inventing a new frame: the receiver drops
+                // its stale cursor for this pairing and requests a fresh
+                // snapshot from its peer (the same recovery the enqueue-side
+                // SeqViolation triggers), so the stream restarts cleanly rather
+                // than silently losing data.
+                tracing::info!(
+                    conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                    from_seq, "resume precedes oldest retained envelope; signaling resync"
+                );
+                self.send_error(
+                    RelayErrorCode::SeqViolation,
+                    "resume precedes oldest retained envelope; resync required",
+                    Some(pairing_id),
+                )
+                .await;
+            }
         }
         Flow::Continue
     }
