@@ -38,6 +38,25 @@ struct Entry {
     expires_at_ms: i64,
 }
 
+/// One claim-table row as a flat, public value, for round-tripping the table
+/// through a durable [`RelayStore`] (remote-control-tvc). Lets the sqlite store
+/// rehydrate a [`ClaimTable`] from disk via [`ClaimTable::from_records`] and read
+/// the survivors back via [`ClaimTable::records`], so the TTL / single-use logic
+/// lives only here rather than being re-expressed in SQL.
+///
+/// [`RelayStore`]: crate::store::RelayStore
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRecord {
+    /// The claim-token string (the table's key).
+    pub token: String,
+    /// The pairing the token joins.
+    pub pairing_id: PairingId,
+    /// The desktop that offered the pairing.
+    pub desktop_device: DeviceId,
+    /// Absolute wall-clock expiry in unix milliseconds.
+    pub expires_at_ms: i64,
+}
+
 /// A table of live claim tokens. Not thread-safe on its own; the store wraps it
 /// in a lock.
 #[derive(Debug, Default)]
@@ -49,6 +68,32 @@ impl ClaimTable {
     /// Empty table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rehydrate a table from persisted [`ClaimRecord`]s so a durable
+    /// [`RelayStore`] can reuse this type's TTL / single-use redemption logic
+    /// instead of re-expressing it in SQL (remote-control-tvc). A later record
+    /// with a duplicate token wins, matching [`Self::issue`]'s overwrite.
+    ///
+    /// [`RelayStore`]: crate::store::RelayStore
+    pub fn from_records(records: impl IntoIterator<Item = ClaimRecord>) -> Self {
+        let mut table = Self::new();
+        for r in records {
+            table.issue(r.token, r.pairing_id, r.desktop_device, r.expires_at_ms);
+        }
+        table
+    }
+
+    /// The current entries as flat [`ClaimRecord`]s, in unspecified order — the
+    /// snapshot a durable store writes back after a canonical mutation
+    /// (remote-control-tvc). Pairs with [`Self::from_records`].
+    pub fn records(&self) -> impl Iterator<Item = ClaimRecord> + '_ {
+        self.entries.iter().map(|(token, e)| ClaimRecord {
+            token: token.clone(),
+            pairing_id: e.pairing_id.clone(),
+            desktop_device: e.desktop_device.clone(),
+            expires_at_ms: e.expires_at_ms,
+        })
     }
 
     /// Register a freshly-minted token. Overwrites any prior entry for the same
@@ -200,6 +245,33 @@ mod tests {
         );
         // The unknown token is trivially absent.
         assert!(!t.contains("nope", 0));
+    }
+
+    #[test]
+    fn from_records_round_trips_and_reuses_ttl_logic() {
+        // remote-control-tvc: a table rehydrated from persisted records must
+        // behave exactly like the live table, so a durable store can delegate the
+        // TTL / single-use logic here rather than re-expressing it in SQL.
+        let live = table_with_token(10_000);
+        let records: Vec<ClaimRecord> = live.records().collect();
+        assert_eq!(records.len(), 1);
+
+        let mut restored = ClaimTable::from_records(records);
+        // Boundary + single-use redemption behave identically after rehydration.
+        assert!(
+            restored.contains("4729-Xk9Qa2Lm", 10_000),
+            "live at boundary"
+        );
+        assert!(
+            !restored.contains("4729-Xk9Qa2Lm", 10_001),
+            "expired past TTL"
+        );
+        assert!(restored.redeem("4729-Xk9Qa2Lm", 5_000).is_ok());
+        assert_eq!(
+            restored.redeem("4729-Xk9Qa2Lm", 5_000),
+            Err(ClaimError::Unknown),
+            "single-use after rehydration"
+        );
     }
 
     #[test]

@@ -96,6 +96,30 @@ impl SenderQueue {
         }
     }
 
+    /// Rehydrate a queue from a persisted snapshot so a durable [`RelayStore`]
+    /// can reuse this type's canonical append/resume/ack logic instead of
+    /// re-expressing it in SQL — the two would otherwise drift
+    /// (remote-control-tvc). `buffer` must be the retained (un-acked, un-dropped)
+    /// envelopes in ascending-`seq` order, exactly as [`Self::append`] /
+    /// [`Self::ack`] leave the internal buffer; `high_water` and `ack_cursor` are
+    /// the stream's persisted cursors. `max_len` is clamped to at least 1, as in
+    /// [`Self::new`].
+    ///
+    /// [`RelayStore`]: crate::store::RelayStore
+    pub fn from_snapshot(
+        high_water: u64,
+        ack_cursor: u64,
+        buffer: Vec<EncryptedEnvelope>,
+        max_len: usize,
+    ) -> Self {
+        Self {
+            high_water,
+            ack_cursor,
+            buf: VecDeque::from(buffer),
+            max_len: max_len.max(1),
+        }
+    }
+
     /// Highest `seq` accepted so far (the stream's high-water mark).
     pub fn high_water(&self) -> u64 {
         self.high_water
@@ -139,6 +163,14 @@ impl SenderQueue {
                 got: env.seq,
             })
         }
+    }
+
+    /// The retained (un-acked, un-dropped) envelopes in ascending-`seq` order —
+    /// the buffer half of the snapshot a durable store persists after a canonical
+    /// mutation (remote-control-tvc). Pairs with [`Self::from_snapshot`],
+    /// [`Self::high_water`], and [`Self::ack_cursor`].
+    pub fn buffered(&self) -> impl Iterator<Item = &EncryptedEnvelope> + '_ {
+        self.buf.iter()
     }
 
     /// Return, in order, every buffered envelope with `seq > from_seq`. Used to
@@ -412,6 +444,64 @@ mod tests {
         }
         q.ack(5);
         assert_eq!(q.resume(5), ResumeOutcome::Replay(vec![]));
+    }
+
+    #[test]
+    fn from_snapshot_round_trips_and_continues() {
+        // remote-control-tvc: a queue rehydrated from a persisted snapshot must
+        // behave exactly like the live queue it was snapshotted from — the whole
+        // point of letting a durable store reuse this logic instead of re-doing it.
+        let mut live = SenderQueue::new(100);
+        for seq in 1..=5 {
+            live.append(env(seq)).unwrap();
+        }
+        live.ack(2); // prune 1,2; buffer = [3,4,5], high_water 5, ack_cursor 2.
+
+        let restored = SenderQueue::from_snapshot(
+            live.high_water(),
+            live.ack_cursor(),
+            live.buffered().cloned().collect(),
+            100,
+        );
+        assert_eq!(restored.high_water(), 5);
+        assert_eq!(restored.ack_cursor(), 2);
+        assert_eq!(
+            restored.buffered().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+
+        // The rehydrated queue continues the stream gaplessly and dedups the head.
+        let mut restored = restored;
+        assert_eq!(restored.append(env(5)), Ok(AppendOutcome::Duplicate));
+        assert_eq!(
+            restored.append(env(6)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(restored.high_water(), 6);
+    }
+
+    #[test]
+    fn from_snapshot_preserves_overflow_gap_resync() {
+        // A snapshot taken after a drop-oldest overflow must still signal Resync
+        // for a resume from before the retained front (remote-control-tvc + 0ef.7).
+        let mut live = SenderQueue::new(3);
+        for seq in 1..=5 {
+            live.append(env(seq)).unwrap(); // drops 1,2; buffer = [3,4,5].
+        }
+        let restored = SenderQueue::from_snapshot(
+            live.high_water(),
+            live.ack_cursor(),
+            live.buffered().cloned().collect(),
+            3,
+        );
+        assert_eq!(restored.resume(0), ResumeOutcome::Resync);
+        assert_eq!(restored.resume(1), ResumeOutcome::Resync);
+        match restored.resume(2) {
+            ResumeOutcome::Replay(v) => {
+                assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5])
+            }
+            ResumeOutcome::Resync => panic!("seq 3 is retained; expected a clean replay"),
+        }
     }
 
     #[test]
