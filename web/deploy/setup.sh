@@ -78,12 +78,18 @@ fi
 
 # 3. Grant the existing GitHub-OIDC deploy identity Contributor on THIS app so
 #    the web-deploy workflow can push revisions (AcrPush on the registry is
-#    already held from the relay setup).
+#    already held from the relay setup), and Container Registry Tasks
+#    Contributor on the registry so its `az acr build` step can run.
 echo "==> Granting deploy identity Contributor on $APP"
 GHA_PRINCIPAL=$(az identity show -g "$RG" -n "$DEPLOY_ID" --query principalId -o tsv)
 APP_ID=$(az containerapp show -g "$RG" -n "$APP" --query id -o tsv)
+ACR_ID=$(az acr show -n "$ACR" --query id -o tsv)
 az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role Contributor --scope "$APP_ID" \
+  -o none 2>/dev/null || echo "    (role assignment already present)"
+echo "==> Granting deploy identity Container Registry Tasks Contributor on $ACR"
+az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role "Container Registry Tasks Contributor" --scope "$ACR_ID" \
   -o none 2>/dev/null || echo "    (role assignment already present)"
 
 # 4. Wire GitHub so .github/workflows/web-deploy.yml can find the app.
