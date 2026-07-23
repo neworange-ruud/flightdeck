@@ -2189,6 +2189,41 @@ fn execute_remote_translation(
                 Err(e) => (CommandOutcome::Failed, Some(e.to_string())),
             }
         }
+
+        Translation::NeedsMainLoop(MainLoopAction::ResumeAndReply {
+            project,
+            tab_id,
+            text,
+        }) => {
+            let Some(p) = workspace.projects.get_mut(project) else {
+                return remote_target_gone();
+            };
+            // Resume the not-started agent (continuing its session, exactly like
+            // navigating to it on the desktop), then queue the reply so it is
+            // delivered once the terminal is ready — reusing the first-task
+            // readiness gate (remote-control-1l4).
+            let resumed = {
+                let services = env.services(&p.git);
+                p.state.resume_tab_by_id(&tab_id, &services)
+            };
+            match resumed {
+                Ok(()) => {
+                    first_tasks.push(PendingFirstTask {
+                        tab_id,
+                        text,
+                        queued_at_ms: now_ms,
+                    });
+                    (
+                        CommandOutcome::Accepted,
+                        Some(
+                            "Starting the agent; your message will be sent once it is ready."
+                                .to_string(),
+                        ),
+                    )
+                }
+                Err(e) => (CommandOutcome::Failed, Some(e.to_string())),
+            }
+        }
     }
 }
 
@@ -5873,6 +5908,87 @@ mod tests {
             assert_eq!(acks.len(), 1);
             assert_eq!(acks[0].command_id, CommandId::new("c1"));
             assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+        }
+
+        /// A reply to a *not-started* agent (recovered tab whose project was not
+        /// active at startup) resumes the agent and defers the text, then
+        /// delivers it once the terminal is ready — instead of rejecting
+        /// (remote-control-1l4).
+        #[test]
+        fn reply_to_not_started_agent_resumes_then_delivers_when_ready() {
+            let dir = TempDir::new().unwrap();
+            let agent = make_real_agent(&dir, "opencode");
+            let config = config_with_agent(agent);
+            let pty = FakePty::new();
+            // Queue the session the resume spawn will claim; keep its handle.
+            let handle = pty.queue_session();
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs: vec![tab_state("t1", "target", "opencode")],
+            };
+            let mut app = AppState::new(config, state, "/repo", "/repo/.flightdeck/state.json");
+            app.set_pty_size(PtySize::default());
+            assert_eq!(
+                app.tabs[0].session.primary_state(),
+                ProcessState::NotStarted
+            );
+            let mut workspace = workspace_with(app);
+            // The worktree must exist for the resume spawn.
+            let fs = FakeFs::new().with_dir("/repo/worktrees/target");
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+
+            let mut bridge = RemoteBridge::passthrough(0);
+            let cmd = PhoneCommand {
+                command_id: CommandId::new("c-resume"),
+                issued_at_ms: 0,
+                body: CommandBody::Reply {
+                    session_id: SessionId::new("t1"),
+                    text: "resume and go".to_string(),
+                },
+            };
+            bridge.handle_inbound(RemoteInbound::Envelope(envelope(1, &cmd)));
+
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                &mut bridge,
+                &mut ledger,
+                &mut first_tasks,
+                &mut workspace,
+                &env,
+                1_000,
+                &mut |o| sent.push(o),
+            );
+
+            // Resumed (spawned) and the reply queued — not written yet, and
+            // acked as accepted rather than rejected.
+            assert_eq!(
+                workspace.projects[0].state.tabs[0].session.primary_state(),
+                ProcessState::Running
+            );
+            assert_eq!(first_tasks.len(), 1);
+            assert!(handle.input().is_empty());
+            let acks = decode_acks(&sent);
+            assert_eq!(acks.len(), 1);
+            assert_eq!(acks[0].outcome, CommandOutcome::Accepted);
+
+            // Once the ready-gate window elapses (fresh terminal never enables
+            // bracketed paste), the queued reply is delivered raw + Enter.
+            deliver_first_tasks(&mut first_tasks, &mut workspace, 12_000);
+            assert_eq!(handle.input(), b"resume and go\r".to_vec());
+            assert!(first_tasks.is_empty());
         }
 
         /// A retransmitted command id is acked as duplicate, never re-applied.

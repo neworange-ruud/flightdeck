@@ -2205,6 +2205,28 @@ impl AppState {
         started
     }
 
+    /// Resume a single not-started tab by id, continuing its session — the same
+    /// launch [`resume_agents`] performs, but scoped to one tab so messaging one
+    /// agent from the phone never silently starts its siblings
+    /// (remote-control-1l4). A no-op if the tab already has a live/other-state
+    /// primary (e.g. it raced to running); errors if the tab is gone or its
+    /// worktree is missing (surfaced to the phone as a failed command).
+    pub fn resume_tab_by_id(&mut self, tab_id: &str, services: &Services) -> Result<()> {
+        let idx = self
+            .tabs
+            .iter()
+            .position(|t| t.meta.id == tab_id)
+            .ok_or_else(|| FlightDeckError::Other(format!("unknown session '{tab_id}'")))?;
+        if self.tabs[idx].session.primary_state() != ProcessState::NotStarted {
+            return Ok(());
+        }
+        // `allow_attach = true` matches desktop navigation (reattach to a
+        // still-running container; start fresh if it is gone).
+        self.start_primary_for(idx, services, true)?;
+        let _ = self.persist(services);
+        Ok(())
+    }
+
     /// Pin the session each freshly-launched agent created, so a later restart
     /// resumes that tab's own session even when multiple agents share one
     /// worktree (SPECS: continuation). For every tab still holding a launch
@@ -4549,6 +4571,107 @@ mod tests {
         assert_eq!(pty.spawns().len(), 1);
         assert_eq!(app.tabs[0].session.primary_state(), ProcessState::Running);
         assert!(!app.tabs[0].meta.recovered);
+    }
+
+    #[test]
+    fn resume_tab_by_id_starts_only_the_named_not_started_tab() {
+        // Messaging one agent from the phone must resume exactly that tab, not
+        // its siblings (remote-control-1l4).
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("a"));
+        ps.tabs.push(recovered_tab("b"));
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new()
+            .with_dir("/repo/.flightdeck/worktrees/a")
+            .with_dir("/repo/.flightdeck/worktrees/b");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        app.resume_tab_by_id("b", &services(&git, &fs, &pty, &clock))
+            .unwrap();
+        assert_eq!(pty.spawns().len(), 1);
+        assert_eq!(
+            app.tabs[0].session.primary_state(),
+            ProcessState::NotStarted
+        );
+        assert_eq!(app.tabs[1].session.primary_state(), ProcessState::Running);
+    }
+
+    #[test]
+    fn resume_tab_by_id_is_noop_when_already_running() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("r"));
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new().with_dir("/repo/.flightdeck/worktrees/r");
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        app.resume_tab_by_id("r", &svc).unwrap();
+        // A second call after it is running spawns nothing more.
+        app.resume_tab_by_id("r", &svc).unwrap();
+        assert_eq!(pty.spawns().len(), 1);
+        assert_eq!(app.tabs[0].session.primary_state(), ProcessState::Running);
+    }
+
+    #[test]
+    fn resume_tab_by_id_errors_on_unknown_tab() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let mut app = AppState::new(config, default_state("main"), REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+
+        assert!(app
+            .resume_tab_by_id("ghost", &services(&git, &fs, &pty, &clock))
+            .is_err());
+    }
+
+    #[test]
+    fn resume_tab_by_id_errors_when_worktree_missing() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        ps.tabs.push(recovered_tab("r"));
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.set_pty_size(PtySize { rows: 24, cols: 80 });
+
+        // No worktree dir on the fake fs: start_primary_for refuses to spawn.
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+
+        assert!(app
+            .resume_tab_by_id("r", &services(&git, &fs, &pty, &clock))
+            .is_err());
+        assert_eq!(
+            app.tabs[0].session.primary_state(),
+            ProcessState::NotStarted
+        );
     }
 
     #[test]
