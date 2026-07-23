@@ -12,7 +12,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **Deploy runbooks capture the ACR Tasks grant.** `remote/relay/deploy/README.md`
+  and `web/deploy/setup.sh` now grant the deploy identity **Container Registry
+  Tasks Contributor** on the registry alongside `AcrPush`, so a from-scratch
+  rebuild no longer misses the role that `web-deploy`'s `az acr build` step needs.
 
 ### Bug fixes
 
@@ -51,6 +54,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   (remote-control-0ef.14); (3) the APNs provider JWT is now cached and refreshed
   on a ~20-minute cadence rather than minted on every push, avoiding wasted CPU
   and APNs `TooManyProviderTokenUpdates` (429) under a burst (remote-control-0ef.15).
+- **Deploy image tags no longer get a trailing dash.** The "Resolve image tag"
+  step in `relay-deploy.yml` and `web-deploy.yml` used `echo` into `tr`, whose
+  trailing newline became a `-` (e.g. `v1.8.0-`). Switched to `printf '%s'`.
 
 ## [1.10.1] - 2026-07-21
 
