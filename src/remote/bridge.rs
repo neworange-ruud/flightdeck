@@ -115,6 +115,17 @@ pub struct RemoteBridge {
     needs_input_since: HashMap<SessionId, u64>,
     event_seq: u64,
     pairing: Option<PairingId>,
+    /// Whether the relay link is currently up (authenticated). While it is down
+    /// the bridge PAUSES all seal/queue work: sealing StatusUpdate/Rollup/shell/
+    /// transcript envelopes every render tick during a relay outage burns crypto
+    /// and CPU and, because the client thread is not draining the outbound channel
+    /// while reconnecting, grows it without bound until the whole backlog floods
+    /// out on reconnect (remote-control-0ef.10). Defaults to `true` so callers
+    /// that never forward link state (the unit tests) behave exactly as before;
+    /// production toggles it from [`RemoteInbound::Link`]. Reconnect-replay is
+    /// preserved: a reconnect re-arms `snapshot_needed` via `Paired`, so a single
+    /// fresh snapshot — not a stale backlog — is sent when the link returns.
+    link_up: bool,
     snapshot_needed: bool,
     grace_until_ms: u64,
     pending_transcript_requests: Vec<(SessionId, Option<u64>)>,
@@ -159,6 +170,7 @@ impl RemoteBridge {
             needs_input_since: HashMap::new(),
             event_seq: 0,
             pairing: None,
+            link_up: true,
             snapshot_needed: true,
             grace_until_ms,
             pending_transcript_requests: Vec::new(),
@@ -329,7 +341,15 @@ impl RemoteBridge {
                     }
                 }
             }
-            RemoteInbound::Presence { .. } | RemoteInbound::Link(_) => {}
+            RemoteInbound::Presence { .. } => {}
+            // Track link state so `tick` can pause seal/queue while the relay is
+            // unreachable (remote-control-0ef.10). Only a live, authenticated link
+            // (`Connected`) permits sending; Connecting/Disconnected/Incompatible
+            // all pause. On reconnect the client re-emits `Paired`, which re-arms
+            // `snapshot_needed`, so a fresh snapshot is sent — not a stale backlog.
+            RemoteInbound::Link(state) => {
+                self.link_up = matches!(state, crate::remote::RemoteLinkState::Connected { .. });
+            }
             // The relay no longer knows our pairing; the client dropped it and
             // will re-offer. Forget it here too and revert to the passthrough
             // sealer so we stop sealing to a dead channel (remote-control-1jy).
@@ -522,8 +542,13 @@ impl RemoteBridge {
             }
         }
 
-        // Nothing to transmit without a pairing (state kept for the next pair).
-        if self.pairing.is_none() {
+        // Nothing to transmit without a pairing (state kept for the next pair), or
+        // while the relay link is down — pause seal/queue during an outage so we
+        // do not burn crypto/CPU sealing into an outbound channel the client is
+        // not draining (unbounded growth + a reconnect flood), remote-control-0ef.10.
+        // All per-session/transcript bookkeeping above still runs, so a reconnect
+        // sends fresh, current state.
+        if self.pairing.is_none() || !self.link_up {
             return;
         }
 

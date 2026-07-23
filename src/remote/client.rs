@@ -24,7 +24,7 @@
 //! a mid-frame timeout resumes cleanly on the next read.
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -54,6 +54,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Latency-probe interval.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Liveness deadline: tear the session down and reconnect if no inbound frame
+/// (Pong, Envelope, Ack — anything) arrives for this long. A half-open socket
+/// (laptop sleep/wake, wifi↔cell handoff, relay redeploy, NAT idle-reap) stays
+/// "open" with the tiny pings sitting in the kernel send buffer, so
+/// [`WRITE_TIMEOUT`] never trips and idle reads loop forever — without this the
+/// dead link is never noticed (remote-control-0ef.1). Coordinated with the
+/// relay's own server-side idle sweep (both 60s) and a multiple of
+/// [`PING_INTERVAL`] so a couple of lost pongs don't cause a spurious teardown.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Minimum time a session must stay authenticated before a clean drop is allowed
+/// to reset the reconnect backoff. A session that reaches `auth_ok` then
+/// immediately drops (relay crash/redeploy loop, authed-idle eviction) must NOT
+/// reset the backoff to zero, or the client hammers the relay with a ~1s
+/// reconnect loop forever (remote-control-0ef.2).
+const MIN_STABLE_SESSION: Duration = Duration::from_secs(10);
 /// Overall budget for completing the auth handshake before giving up.
 const AUTH_DEADLINE: Duration = Duration::from_secs(15);
 /// How long a fresh desktop (no persisted pairings) waits after the
@@ -80,6 +95,48 @@ const BACKOFF_CAP_MS: u64 = 60_000;
 /// relay is never mistaken for a wiped one.
 const AUTH_REJECT_REOFFER_THRESHOLD: u32 = 3;
 
+// --- Session tuning (test seam) --------------------------------------------
+
+/// Timing knobs threaded through the session, injectable so tests can drive the
+/// liveness-teardown (0ef.1) and backoff-reset-stability (0ef.2) logic with short
+/// durations instead of real minute-long waits. Production always uses
+/// [`ClientTuning::default`] — the real constants — via [`RemoteHandle::start`].
+#[derive(Clone)]
+struct ClientTuning {
+    /// See [`LIVENESS_TIMEOUT`].
+    liveness_timeout: Duration,
+    /// See [`MIN_STABLE_SESSION`].
+    min_stable_session: Duration,
+    /// Test seam only: when `> 0`, the next N outbound envelope writes are forced
+    /// to fail (the counter is decremented on each) so the failed-write re-send
+    /// path (remote-control-0ef.9) can be exercised deterministically, without
+    /// relying on OS-specific TCP RST timing. Production passes a zero counter, so
+    /// the check never fires. Per-instance (not a global) to avoid contaminating
+    /// other tests running in the same process.
+    fail_next_envelope_writes: Arc<AtomicU32>,
+}
+
+impl Default for ClientTuning {
+    fn default() -> Self {
+        ClientTuning {
+            liveness_timeout: LIVENESS_TIMEOUT,
+            min_stable_session: MIN_STABLE_SESSION,
+            fail_next_envelope_writes: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl ClientTuning {
+    /// Consume one forced-write-failure token, returning `true` when a write
+    /// should be treated as failed. A no-op (always `false`) in production, where
+    /// the counter is zero.
+    fn take_forced_write_failure(&self) -> bool {
+        self.fail_next_envelope_writes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
 // --- Public link state -----------------------------------------------------
 
 /// The relay connection state, pushed to the app over `RemoteInbound::Link`.
@@ -94,6 +151,19 @@ pub enum RemoteLinkState {
     Connected {
         /// Last measured phone↔relay round-trip in milliseconds.
         latency_ms: u64,
+    },
+    /// The relay speaks a protocol version incompatible with this build — a
+    /// **terminal** state: the client stops reconnecting (retrying can never
+    /// succeed until the app is updated) instead of silently backoff-looping
+    /// forever, so the UI can surface an actionable "update FlightDeck" prompt
+    /// rather than an endless "reconnecting" (remote-control-0ef.20).
+    Incompatible {
+        /// The protocol version this build offered.
+        our_version: u16,
+        /// Oldest version the relay supports.
+        relay_min: u16,
+        /// Newest version the relay supports.
+        relay_max: u16,
     },
 }
 
@@ -177,12 +247,41 @@ impl RemoteHandle {
         inbound_tx: Sender<RemoteInbound>,
         outbound_rx: Receiver<RemoteOutbound>,
     ) -> RemoteHandle {
+        Self::start_tuned(
+            cfg,
+            identity,
+            store,
+            inbound_tx,
+            outbound_rx,
+            ClientTuning::default(),
+        )
+    }
+
+    /// Start with an explicit [`RemoteStore`] and [`ClientTuning`]. The tuning
+    /// lets tests drive liveness/stability logic with short durations and force
+    /// write failures; production uses [`start_with_store`](Self::start_with_store).
+    fn start_tuned(
+        cfg: RemoteConfig,
+        identity: DeviceIdentity,
+        store: Box<dyn RemoteStore>,
+        inbound_tx: Sender<RemoteInbound>,
+        outbound_rx: Receiver<RemoteOutbound>,
+        tuning: ClientTuning,
+    ) -> RemoteHandle {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let join = std::thread::Builder::new()
             .name("flightdeck-remote".to_string())
             .spawn(move || {
-                run(cfg, identity, store, inbound_tx, outbound_rx, stop_thread);
+                run(
+                    cfg,
+                    identity,
+                    store,
+                    inbound_tx,
+                    outbound_rx,
+                    stop_thread,
+                    tuning,
+                );
             })
             .ok();
         RemoteHandle { stop, join }
@@ -417,15 +516,54 @@ fn connect(url: &str) -> Result<RelaySocket, String> {
 enum SessionEnd {
     /// `stop()` was requested; do not reconnect.
     Stopped,
-    /// The session ended; reconnect. `authed` is whether we ever reached
-    /// `auth_ok` (a good session that merely dropped resets the backoff).
-    Ended { authed: bool },
+    /// The session ended; reconnect. `authed_for` is `Some(duration)` if we
+    /// reached `auth_ok` (carrying how long we then stayed authenticated) or
+    /// `None` if we never authenticated. Only a session that stayed authed for at
+    /// least [`ClientTuning::min_stable_session`] resets the reconnect backoff
+    /// (remote-control-0ef.2). `pending` carries an outbound envelope whose write
+    /// failed mid-session, to be re-sent first on the next session so its `seq` is
+    /// never skipped on the wire (remote-control-0ef.9).
+    Ended {
+        /// How long the session stayed authenticated, or `None` if it never did.
+        authed_for: Option<Duration>,
+        /// An in-flight envelope to re-send on the next session (0ef.9).
+        pending: Option<RemoteOutbound>,
+    },
     /// The relay explicitly rejected our auth-first `auth_response` for a
     /// persisted pairing (`auth_failed`/`unknown_pairing`) — it no longer knows
     /// this device/pairing. Distinct from a transient [`Self::Ended`] drop so
     /// the supervisor can self-heal after repeated rejections rather than loop
     /// forever on a dead pairing (remote-control-1jy).
     AuthRejected,
+    /// The relay speaks a protocol version outside this build's supported range.
+    /// Terminal: the supervisor reports [`RemoteLinkState::Incompatible`] and
+    /// stops reconnecting (remote-control-0ef.20).
+    VersionIncompatible {
+        /// The version this build offered.
+        our_version: u16,
+        /// Oldest version the relay supports.
+        relay_min: u16,
+        /// Newest version the relay supports.
+        relay_max: u16,
+    },
+}
+
+/// A session that never authenticated: reconnect without resetting backoff and
+/// with nothing to re-send.
+fn ended_unauthed() -> SessionEnd {
+    SessionEnd::Ended {
+        authed_for: None,
+        pending: None,
+    }
+}
+
+/// Whether a just-ended session justifies resetting the reconnect backoff to
+/// zero. Only a session that reached `auth_ok` **and** then stayed authenticated
+/// for at least `min_stable` counts as healthy; a post-auth flap does not, so a
+/// crash/redeploy loop keeps growing its backoff instead of hammering the relay
+/// ~once/second (remote-control-0ef.2).
+fn session_resets_backoff(authed_for: Option<Duration>, min_stable: Duration) -> bool {
+    matches!(authed_for, Some(d) if d >= min_stable)
 }
 
 fn report(inbound_tx: &Sender<RemoteInbound>, state: RemoteLinkState) {
@@ -440,11 +578,15 @@ fn run(
     inbound_tx: Sender<RemoteInbound>,
     outbound_rx: Receiver<RemoteOutbound>,
     stop: Arc<AtomicBool>,
+    tuning: ClientTuning,
 ) {
     let mut attempt: u32 = 0;
     // Consecutive auth rejections of our persisted pairing (see
     // [`AUTH_REJECT_REOFFER_THRESHOLD`]). Any non-rejection outcome resets it.
     let mut auth_reject_streak: u32 = 0;
+    // An outbound envelope whose write failed on the previous session, to re-send
+    // first on the next one so its `seq` is not skipped on the wire (0ef.9).
+    let mut pending: Option<RemoteOutbound> = None;
     // Keep persisted state authoritative for the private key regardless of what
     // was on disk when the thread started.
     let mut state = store.load();
@@ -460,18 +602,58 @@ fn run(
             &inbound_tx,
             &outbound_rx,
             &stop,
+            &tuning,
+            pending.take(),
         );
-        report(&inbound_tx, RemoteLinkState::Disconnected);
 
         match end {
-            SessionEnd::Stopped => break,
-            SessionEnd::Ended { authed } => {
+            SessionEnd::Stopped => {
+                report(&inbound_tx, RemoteLinkState::Disconnected);
+                break;
+            }
+            SessionEnd::VersionIncompatible {
+                our_version,
+                relay_min,
+                relay_max,
+            } => {
+                // Terminal: retrying can never succeed until the app is updated,
+                // so surface an actionable state and stop reconnecting rather than
+                // backoff-loop forever in silence (0ef.20).
+                eprintln!(
+                    "flightdeck-remote: relay protocol version incompatible \
+                     (we offer v{our_version}, relay supports v{relay_min}..=v{relay_max}); \
+                     update FlightDeck. Not reconnecting."
+                );
+                report(
+                    &inbound_tx,
+                    RemoteLinkState::Incompatible {
+                        our_version,
+                        relay_min,
+                        relay_max,
+                    },
+                );
+                break;
+            }
+            SessionEnd::Ended {
+                authed_for,
+                pending: p,
+            } => {
+                // Carry any failed-write envelope into the next session (0ef.9).
+                pending = p;
+                report(&inbound_tx, RemoteLinkState::Disconnected);
                 // A successful (or merely dropped) session breaks any rejection
                 // streak — the relay is not persistently rejecting us.
                 auth_reject_streak = 0;
-                attempt = if authed { 0 } else { attempt.saturating_add(1) };
+                // Only a session that stayed healthily authenticated resets the
+                // backoff; a post-auth flap keeps it growing (0ef.2).
+                attempt = if session_resets_backoff(authed_for, tuning.min_stable_session) {
+                    0
+                } else {
+                    attempt.saturating_add(1)
+                };
             }
             SessionEnd::AuthRejected => {
+                report(&inbound_tx, RemoteLinkState::Disconnected);
                 auth_reject_streak = auth_reject_streak.saturating_add(1);
                 attempt = attempt.saturating_add(1);
                 if auth_reject_streak >= AUTH_REJECT_REOFFER_THRESHOLD {
@@ -529,6 +711,7 @@ fn effective_url(cfg: &RemoteConfig, state: &RemoteState) -> String {
 }
 
 /// One connection session: connect, authenticate, resume, then pump.
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     cfg: &RemoteConfig,
     identity: &DeviceIdentity,
@@ -537,11 +720,21 @@ fn run_session(
     inbound_tx: &Sender<RemoteInbound>,
     outbound_rx: &Receiver<RemoteOutbound>,
     stop: &AtomicBool,
+    tuning: &ClientTuning,
+    pending_in: Option<RemoteOutbound>,
 ) -> SessionEnd {
     let url = effective_url(cfg, state);
     let mut sock = match connect(&url) {
         Ok(s) => s,
-        Err(_e) => return SessionEnd::Ended { authed: false },
+        Err(e) => {
+            // Expose the connect-error detail for diagnostics instead of
+            // silently discarding it — a bad relay URL / DNS failure otherwise
+            // retries forever with the user seeing only "reconnecting" and zero
+            // signal about why (remote-control-0ef.20).
+            crate::remote::debuglog::log(&format!("client CONNECT failed url={url} err={e}"));
+            eprintln!("flightdeck-remote: connect to {url} failed: {e}");
+            return ended_unauthed();
+        }
     };
 
     // hello.
@@ -552,7 +745,7 @@ fn run_session(
         client: client_info(),
     };
     if send_frame(&mut sock, &hello).is_err() {
-        return SessionEnd::Ended { authed: false };
+        return ended_unauthed();
     }
 
     // Drive hello_ok → auth_challenge → auth_response → auth_ok under a deadline.
@@ -606,7 +799,7 @@ fn run_session(
             return SessionEnd::Stopped;
         }
         if Instant::now() > deadline {
-            return SessionEnd::Ended { authed: false };
+            return ended_unauthed();
         }
 
         // Fresh-desktop pre-auth window: watch for the pending pairing request so
@@ -617,7 +810,7 @@ fn run_session(
                     Ok(RemoteOutbound::RequestPairing { claim_token_hint }) => {
                         let offer = build_pairing_offer(identity, claim_token_hint);
                         if send_frame(&mut sock, &offer).is_err() {
-                            return SessionEnd::Ended { authed: false };
+                            return ended_unauthed();
                         }
                         offer_sent = true;
                     }
@@ -625,7 +818,7 @@ fn run_session(
                     Err(TryRecvError::Empty) => {
                         if Instant::now() >= wait_until {
                             if !send_auth_response(&mut sock, identity, nonce, state) {
-                                return SessionEnd::Ended { authed: false };
+                                return ended_unauthed();
                             }
                             sent_auth = true;
                         }
@@ -642,11 +835,23 @@ fn run_session(
 
         match read_frame(&mut sock) {
             Incoming::Idle => continue,
-            Incoming::Closed => return SessionEnd::Ended { authed: false },
+            Incoming::Closed => return ended_unauthed(),
             Incoming::Frame(frame) => match *frame {
                 RelayFrame::HelloOk { .. } => saw_hello_ok = true,
-                RelayFrame::VersionIncompatible { .. } => {
-                    return SessionEnd::Ended { authed: false };
+                RelayFrame::VersionIncompatible {
+                    your_version,
+                    min_supported,
+                    max_supported,
+                } => {
+                    // Terminal condition (0ef.20): the relay's supported range
+                    // does not include our version, so reconnecting can never
+                    // succeed until the app updates. Surface it distinctly rather
+                    // than treating it as a transient drop that backoff-loops.
+                    return SessionEnd::VersionIncompatible {
+                        our_version: your_version,
+                        relay_min: min_supported,
+                        relay_max: max_supported,
+                    };
                 }
                 RelayFrame::AuthChallenge { nonce, .. }
                     if saw_hello_ok && challenge_nonce.is_none() =>
@@ -659,7 +864,7 @@ fn run_session(
                     } else {
                         // Returning desktop: auth-first, exactly as before.
                         if !send_auth_response(&mut sock, identity, &nonce, state) {
-                            return SessionEnd::Ended { authed: false };
+                            return ended_unauthed();
                         }
                         sent_auth = true;
                         auth_first = true;
@@ -684,11 +889,11 @@ fn run_session(
                     match challenge_nonce.as_ref() {
                         Some(nonce) => {
                             if !send_auth_response(&mut sock, identity, nonce, state) {
-                                return SessionEnd::Ended { authed: false };
+                                return ended_unauthed();
                             }
                             sent_auth = true;
                         }
-                        None => return SessionEnd::Ended { authed: false },
+                        None => return ended_unauthed(),
                     }
                 }
                 RelayFrame::AuthOk { pairing_ids } if sent_auth => {
@@ -710,18 +915,42 @@ fn run_session(
                     {
                         return SessionEnd::AuthRejected;
                     }
-                    return SessionEnd::Ended { authed: false };
+                    return ended_unauthed();
                 }
                 _ => continue, // unexpected pre-auth frame; ignore
             },
         }
     }
 
+    // From here on we are authenticated; measure how long we stay up so a
+    // sub-threshold flap does not reset the reconnect backoff (0ef.2).
+    let authed_at = Instant::now();
+
+    // Re-send an envelope whose write failed on the previous session BEFORE any
+    // freshly-queued traffic, so its `seq` slots back into the stream contiguously
+    // and the phone's dedup never stalls on a gap (0ef.9). If the write fails
+    // again, hold it once more for the next session.
+    if let Some(out) = pending_in {
+        if let Sent::Broke { retry } =
+            handle_outbound(&mut sock, identity, state, store, tuning, out)
+        {
+            return SessionEnd::Ended {
+                authed_for: Some(authed_at.elapsed()),
+                pending: retry,
+            };
+        }
+    }
+
     // Replay anything the app queued during the pre-auth offer wait before the
     // steady-state pump takes over (normally nothing).
     for out in deferred {
-        if !handle_outbound(&mut sock, identity, state, store, out) {
-            return SessionEnd::Ended { authed: true };
+        if let Sent::Broke { retry } =
+            handle_outbound(&mut sock, identity, state, store, tuning, out)
+        {
+            return SessionEnd::Ended {
+                authed_for: Some(authed_at.elapsed()),
+                pending: retry,
+            };
         }
     }
 
@@ -734,6 +963,8 @@ fn run_session(
         inbound_tx,
         outbound_rx,
         stop,
+        tuning,
+        authed_at,
     )
 }
 
@@ -901,6 +1132,17 @@ fn on_authenticated(
     }
 }
 
+/// The outcome of handing one app→relay message to the socket.
+enum Sent {
+    /// Delivered (or applied locally); the session continues.
+    Ok,
+    /// The socket broke while sending; the session must end. `retry` carries the
+    /// envelope that failed to write (a `SendEnvelope`), so the supervisor can
+    /// re-send it on the next session and never skip its `seq` on the wire
+    /// (remote-control-0ef.9). `None` for a non-envelope send failure.
+    Broke { retry: Option<RemoteOutbound> },
+}
+
 /// The steady-state loop: drain outbound, fire pings, read inbound frames.
 #[allow(clippy::too_many_arguments)]
 fn pump(
@@ -911,8 +1153,16 @@ fn pump(
     inbound_tx: &Sender<RemoteInbound>,
     outbound_rx: &Receiver<RemoteOutbound>,
     stop: &AtomicBool,
+    tuning: &ClientTuning,
+    authed_at: Instant,
 ) -> SessionEnd {
     let mut last_ping = Instant::now();
+    // Last time ANY inbound frame arrived (Pong, Envelope, Ack, presence …). A
+    // half-open socket delivers nothing yet never errors on our tiny pinging, so
+    // we tear the session down once this exceeds the liveness deadline instead of
+    // looping on idle reads forever (remote-control-0ef.1). Seeded at auth so a
+    // silent socket is caught even if the very first frame never arrives.
+    let mut last_inbound = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = send_frame(sock, &RelayFrame::Bye { reason: None });
@@ -920,12 +1170,30 @@ fn pump(
             return SessionEnd::Stopped;
         }
 
+        // Half-open detection: no inbound frame for the liveness window → the link
+        // is silently dead; tear it down so the supervisor reconnects (0ef.1).
+        if last_inbound.elapsed() >= tuning.liveness_timeout {
+            crate::remote::debuglog::log(&format!(
+                "client LIVENESS timeout ({}s) — tearing down half-open session",
+                tuning.liveness_timeout.as_secs()
+            ));
+            return SessionEnd::Ended {
+                authed_for: Some(authed_at.elapsed()),
+                pending: None,
+            };
+        }
+
         // Drain everything the app queued for us.
         loop {
             match outbound_rx.try_recv() {
                 Ok(out) => {
-                    if !handle_outbound(sock, identity, state, store, out) {
-                        return SessionEnd::Ended { authed: true };
+                    if let Sent::Broke { retry } =
+                        handle_outbound(sock, identity, state, store, tuning, out)
+                    {
+                        return SessionEnd::Ended {
+                            authed_for: Some(authed_at.elapsed()),
+                            pending: retry,
+                        };
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -950,24 +1218,35 @@ fn pump(
 
         match read_frame(sock) {
             Incoming::Idle => {}
-            Incoming::Closed => return SessionEnd::Ended { authed: true },
+            Incoming::Closed => {
+                return SessionEnd::Ended {
+                    authed_for: Some(authed_at.elapsed()),
+                    pending: None,
+                }
+            }
             Incoming::Frame(frame) => {
+                // Any inbound frame proves the link is alive — reset the deadline.
+                last_inbound = Instant::now();
                 if !handle_frame(sock, state, store, inbound_tx, *frame) {
-                    return SessionEnd::Ended { authed: true };
+                    return SessionEnd::Ended {
+                        authed_for: Some(authed_at.elapsed()),
+                        pending: None,
+                    };
                 }
             }
         }
     }
 }
 
-/// Handle one app→relay message. Returns `false` if the socket broke.
+/// Handle one app→relay message. Returns [`Sent::Broke`] if the socket broke.
 fn handle_outbound(
     sock: &mut RelaySocket,
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
+    tuning: &ClientTuning,
     out: RemoteOutbound,
-) -> bool {
+) -> Sent {
     match out {
         RemoteOutbound::SendEnvelope {
             pairing_id,
@@ -984,14 +1263,16 @@ fn handle_outbound(
                     .push(crate::remote::Pairing::new(key.clone()));
             }
             // The bridge owns and assigns the gapless `seq` (it must seal under
-            // the exact header, spec §7.1); the client sends it verbatim.
+            // the exact header, spec §7.1); the client sends it verbatim. Clone the
+            // header fields into the wire frame so the originals can rebuild the
+            // envelope for re-send if the write fails (0ef.9).
             let envelope = EncryptedEnvelope {
                 pairing_id: pairing_id.clone(),
                 seq,
                 sender: Role::Desktop,
                 sent_at_ms,
-                nonce,
-                ciphertext,
+                nonce: nonce.clone(),
+                ciphertext: ciphertext.clone(),
             };
             crate::remote::debuglog::log(&format!(
                 "client SEND envelope pairing={} seq={} bytes={}",
@@ -999,11 +1280,28 @@ fn handle_outbound(
                 seq,
                 envelope.ciphertext.len()
             ));
-            if send_frame(sock, &RelayFrame::Envelope(envelope)).is_err() {
+            // A forced failure (test seam) short-circuits the real write so it is
+            // never delivered; production always evaluates the real send.
+            if tuning.take_forced_write_failure()
+                || send_frame(sock, &RelayFrame::Envelope(envelope)).is_err()
+            {
                 crate::remote::debuglog::log(&format!(
-                    "client SEND envelope FAILED (socket) pairing={key} seq={seq}"
+                    "client SEND envelope FAILED (socket) pairing={key} seq={seq} — holding to re-send"
                 ));
-                return false;
+                // Hold the exact envelope so the next session re-sends it before
+                // any newer traffic — the bridge already advanced its `out_seq`
+                // past this `seq`, so dropping it would leave a wire gap the phone
+                // stalls on (0ef.9). The high-water mark is deliberately NOT
+                // committed (below), keeping the persisted cursor consistent.
+                return Sent::Broke {
+                    retry: Some(RemoteOutbound::SendEnvelope {
+                        pairing_id,
+                        seq,
+                        sent_at_ms,
+                        nonce,
+                        ciphertext,
+                    }),
+                };
             }
             // Commit the high-water mark only once the send succeeded so a failed
             // write never leaves a gap the peer's dedup would stall on.
@@ -1013,17 +1311,25 @@ fn handle_outbound(
                 }
             }
             store.save(state);
-            true
+            Sent::Ok
         }
         RemoteOutbound::Ack { pairing_id, cursor } => {
-            send_frame(sock, &RelayFrame::Ack { pairing_id, cursor }).is_ok()
+            if send_frame(sock, &RelayFrame::Ack { pairing_id, cursor }).is_ok() {
+                Sent::Ok
+            } else {
+                Sent::Broke { retry: None }
+            }
         }
         RemoteOutbound::RequestPairing { claim_token_hint } => {
             // Desktop-initiated pairing bootstrap (spec §5.2). For a returning
             // desktop this rides the post-auth pump; a fresh desktop offers
             // pre-auth instead (see [`run_session`]). Same offer either way.
             let offer = build_pairing_offer(identity, claim_token_hint);
-            send_frame(sock, &offer).is_ok()
+            if send_frame(sock, &offer).is_ok() {
+                Sent::Ok
+            } else {
+                Sent::Broke { retry: None }
+            }
         }
         RemoteOutbound::Unpair { pairing_id } => {
             // Local clear only (no relay-plane unpair frame in v1): drop the
@@ -1031,7 +1337,7 @@ fn handle_outbound(
             let key = pairing_id.as_str().to_string();
             state.pairings.retain(|p| p.pairing_id != key);
             store.save(state);
-            true
+            Sent::Ok
         }
     }
 }
