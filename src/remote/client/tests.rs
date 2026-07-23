@@ -73,6 +73,99 @@ fn backoff_is_monotonic_until_the_cap() {
     }
 }
 
+// --- Cursor-persist debounce (0ef.11) --------------------------------------
+
+/// A [`RemoteStore`] that only counts `save` calls, for asserting the gate
+/// coalesces many cursor bumps into few disk writes.
+struct CountingStore(std::sync::atomic::AtomicUsize);
+
+impl RemoteStore for CountingStore {
+    fn load(&self) -> RemoteState {
+        RemoteState::default()
+    }
+    fn save(&self, _state: &RemoteState) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Many cursor bumps inside one interval must collapse to a single write once the
+/// interval elapses — the whole point of the gate (remote-control-0ef.11).
+#[test]
+fn cursor_flush_gate_coalesces_dirty_bumps_into_one_write() {
+    let store = CountingStore(std::sync::atomic::AtomicUsize::new(0));
+    let state = RemoteState::default();
+    let mut gate = CursorFlushGate::new(Duration::from_millis(50));
+
+    // A burst of bumps within the interval writes nothing yet.
+    for _ in 0..100 {
+        gate.mark_dirty();
+        gate.maybe_flush(&store, &state);
+    }
+    assert_eq!(
+        store.0.load(Ordering::SeqCst),
+        0,
+        "bumps within the interval must not hit disk"
+    );
+
+    // Once the interval elapses, the next tick writes exactly once for the burst.
+    std::thread::sleep(Duration::from_millis(60));
+    gate.maybe_flush(&store, &state);
+    assert_eq!(
+        store.0.load(Ordering::SeqCst),
+        1,
+        "one coalesced write after the interval"
+    );
+
+    // A clean gate never writes, however long we wait.
+    std::thread::sleep(Duration::from_millis(60));
+    gate.maybe_flush(&store, &state);
+    assert_eq!(
+        store.0.load(Ordering::SeqCst),
+        1,
+        "a clean gate never writes"
+    );
+}
+
+/// The session-end flush must persist a pending bump even when the debounce
+/// interval has not elapsed, so a clean teardown never loses a cursor.
+#[test]
+fn cursor_flush_gate_flush_persists_pending_regardless_of_interval() {
+    let store = CountingStore(std::sync::atomic::AtomicUsize::new(0));
+    let state = RemoteState::default();
+    let mut gate = CursorFlushGate::new(Duration::from_secs(3600));
+
+    gate.mark_dirty();
+    gate.maybe_flush(&store, &state); // interval not elapsed → no-op
+    assert_eq!(store.0.load(Ordering::SeqCst), 0);
+
+    gate.flush(&store, &state); // session end → force
+    assert_eq!(
+        store.0.load(Ordering::SeqCst),
+        1,
+        "session-end flush persists a dirty gate"
+    );
+    gate.flush(&store, &state); // now clean
+    assert_eq!(store.0.load(Ordering::SeqCst), 1);
+}
+
+/// `mark_clean` (called after a lifecycle `store.save` wrote the whole state)
+/// folds the pending cursor bump into that write, so the next flush is a no-op.
+#[test]
+fn cursor_flush_gate_mark_clean_folds_pending_bump() {
+    let store = CountingStore(std::sync::atomic::AtomicUsize::new(0));
+    let state = RemoteState::default();
+    let mut gate = CursorFlushGate::new(Duration::ZERO);
+
+    gate.mark_dirty();
+    gate.mark_clean(); // stands in for an out-of-band lifecycle save
+    gate.flush(&store, &state);
+    assert_eq!(
+        store.0.load(Ordering::SeqCst),
+        0,
+        "mark_clean folds the pending bump; no extra write"
+    );
+}
+
 // --- Mock relay harness ----------------------------------------------------
 
 /// In-memory [`RemoteStore`] so tests never touch `~/.flightdeck`.
@@ -636,7 +729,14 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
 
     let (in_tx, in_rx) = channel();
     let (out_tx, out_rx) = channel();
-    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    // This test inspects the persisted outbound cursor mid-session, so disable the
+    // cursor-persist debounce (0ef.11): a zero interval flushes a dirty gate on the
+    // next pump tick, restoring the pre-debounce near-immediate persistence.
+    let tuning = ClientTuning {
+        cursor_flush_interval: Duration::ZERO,
+        ..ClientTuning::default()
+    };
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
 
     // Once connected, act as the bridge and send the next outbound envelope.
     wait_for_connected(&in_rx);
