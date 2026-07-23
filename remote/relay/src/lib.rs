@@ -69,8 +69,16 @@ impl AppState {
     /// config (the live APNs sender when both configured and built with the
     /// `apns-live` feature; otherwise a no-op).
     pub fn new(config: Config) -> Self {
-        let push = default_push_service(&config);
-        Self::with_push(config, push)
+        // Build the store first so the live push service can be handed a
+        // token-purge hook (dead-token cleanup, remote-control-0ef.14).
+        let store: Arc<dyn RelayStore> = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
+        let push = default_push_service(&config, store.clone());
+        Self {
+            config: Arc::new(config),
+            store,
+            registry: Arc::new(Registry::new()),
+            push,
+        }
     }
 
     /// Build application state with an explicitly-supplied push service.
@@ -90,19 +98,24 @@ impl AppState {
 /// Choose the push service for a config: the live APNs sender when APNs is
 /// configured *and* the `apns-live` feature is compiled in; a no-op otherwise
 /// (so the default build — and CI without Apple secrets — still runs).
-fn default_push_service(config: &Config) -> Arc<dyn PushService> {
+fn default_push_service(config: &Config, store: Arc<dyn RelayStore>) -> Arc<dyn PushService> {
     #[cfg(feature = "apns-live")]
     if let Some(apns) = config.apns.clone() {
         match apns::live::HttpApnsTransport::new() {
             Ok(transport) => {
-                return Arc::new(apns::ApnsPushService::new(apns, transport));
+                // Wire the store as the token-purge hook so a permanent APNs
+                // rejection (410/BadDeviceToken) removes the dead token
+                // (remote-control-0ef.14).
+                return Arc::new(
+                    apns::ApnsPushService::new(apns, transport).with_purge(store.clone()),
+                );
             }
             Err(err) => {
                 tracing::warn!(%err, "apns: could not build live transport; push disabled");
             }
         }
     }
-    let _ = config; // silence unused warning when `apns-live` is off
+    let _ = (config, store); // silence unused warnings when `apns-live` is off
     Arc::new(NoopPushService)
 }
 

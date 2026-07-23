@@ -41,6 +41,16 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   token no longer blocks reuse of its 4-digit code (remote-control-0ef.16); (3)
   revoking a pairing now garbage-collects the device identity and key-agreement
   keys of any member no surviving pairing still references (remote-control-0ef.17).
+- **FlightDeck Remote (relay): APNs wake pushes are more reliable.** Three fixes
+  to the offline-wake path: (1) the wake push now uses a non-zero
+  `apns-expiration` (a ~5-minute store-and-forward window) instead of
+  deliver-once, so a momentarily-unreachable phone still gets woken
+  (remote-control-0ef.5); (2) a transient push failure is now retried (bounded,
+  with backoff) instead of being dropped, and a permanent `410`/`BadDeviceToken`
+  response purges the dead token so the relay stops firing at it
+  (remote-control-0ef.14); (3) the APNs provider JWT is now cached and refreshed
+  on a ~20-minute cadence rather than minted on every push, avoiding wasted CPU
+  and APNs `TooManyProviderTokenUpdates` (429) under a burst (remote-control-0ef.15).
 
 ## [1.10.1] - 2026-07-21
 
