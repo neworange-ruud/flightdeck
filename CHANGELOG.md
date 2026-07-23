@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.11.0] - 2026-07-23
+
+### New features
+
 - **Remote: message an agent that hasn't started yet.** After FlightDeck
   restarts on Desktop, only the active project's agents are resumed; every other
   recovered tab is not-started but still shows as an idle agent on the phone.
