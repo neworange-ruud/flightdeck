@@ -20,10 +20,24 @@
 //! [`EncryptedEnvelope`]: flightdeck_remote_protocol::EncryptedEnvelope
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use flightdeck_remote_protocol::{PairingId, RelayFrame, Role};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+
+/// Outcome of a non-blocking [`ConnHandle::try_send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendOutcome {
+    /// The frame was accepted into the peer's outbound channel.
+    Sent,
+    /// The peer's outbound channel is full — a slow or half-open (zombie) peer
+    /// that is not draining. The frame was **not** enqueued.
+    Full,
+    /// The peer's writer has gone away (channel closed). The frame was **not**
+    /// enqueued.
+    Closed,
+}
 
 /// A handle to a live connection's outbound channel.
 #[derive(Clone)]
@@ -32,13 +46,46 @@ pub struct ConnHandle {
     pub connection_id: String,
     /// Bounded sender into the connection's writer task.
     pub tx: mpsc::Sender<RelayFrame>,
+    /// Fires when this connection is superseded by a newer leg for the same
+    /// `(pairing, role)` and must tear itself down (remote-control-0ef.8).
+    /// Shared with the owning [`crate::session::Connection`], which selects on
+    /// it in its read loop. Cloned into every registry entry for the
+    /// connection, so superseding any one of its legs signals the whole
+    /// connection.
+    pub shutdown: Arc<Notify>,
 }
 
 impl ConnHandle {
     /// Best-effort send of a frame to this connection. Returns `false` if the
     /// connection's writer has gone away (channel closed).
+    ///
+    /// Awaits if the outbound channel is full, applying natural back-pressure —
+    /// appropriate for the connection's **own** low-volume control frames. Do
+    /// **not** use it to forward a *peer's* traffic: a stuck receiver would then
+    /// back-pressure the healthy sender's read loop (remote-control-0ef.6). Use
+    /// [`Self::try_send`] on that path.
     pub async fn send(&self, frame: RelayFrame) -> bool {
         self.tx.send(frame).await.is_ok()
+    }
+
+    /// Non-blocking send. Never awaits: a full or closed channel returns
+    /// immediately with the corresponding [`TrySendOutcome`] rather than
+    /// parking the caller. Used on the peer-forward hot path so one dead/slow
+    /// receiver cannot freeze a healthy sender (remote-control-0ef.6).
+    pub fn try_send(&self, frame: RelayFrame) -> TrySendOutcome {
+        match self.tx.try_send(frame) {
+            Ok(()) => TrySendOutcome::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => TrySendOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => TrySendOutcome::Closed,
+        }
+    }
+
+    /// Signal the owning connection to shut down because a newer leg has
+    /// superseded it (remote-control-0ef.8). Idempotent and non-blocking:
+    /// [`Notify::notify_one`] stores a permit if the connection is not yet
+    /// awaiting, so the wakeup is never lost to a race.
+    fn supersede(&self) {
+        self.shutdown.notify_one();
     }
 }
 
@@ -89,6 +136,13 @@ impl Registry {
     /// leg's handle if the peer is already connected (so the caller can announce
     /// presence in both directions). Replaces any stale handle for the same
     /// `(pairing, role)` — the newest connection wins.
+    ///
+    /// If a *different* connection already held this `(pairing, role)` slot, it
+    /// is a superseded (likely half-open) leg: [`ConnHandle::supersede`] signals
+    /// it to tear down rather than leaving two same-role legs to coexist
+    /// (remote-control-0ef.8). Re-attaching the *same* connection (e.g. an
+    /// already-authed desktop offering another pairing on its live socket) never
+    /// signals shutdown.
     pub fn attach(
         &self,
         pairing: &PairingId,
@@ -97,15 +151,25 @@ impl Registry {
     ) -> Option<ConnHandle> {
         let mut slots = self.lock();
         let slot = slots.entry(pairing.clone()).or_default();
-        *slot.role_mut(role) = Some(handle);
+        let new_id = handle.connection_id.clone();
+        if let Some(previous) = slot.role_mut(role).replace(handle) {
+            if previous.connection_id != new_id {
+                previous.supersede();
+            }
+        }
         slot.role(role.peer()).clone()
     }
 
     /// Detach a connection's leg, but only if the stored handle is still *this*
     /// connection (identified by `connection_id`) — so a reconnect that already
     /// replaced the handle is not torn down by the old connection's cleanup.
-    /// Returns the peer handle if one is present, for a disconnect presence
-    /// announcement.
+    /// Returns the peer handle **only when this connection actually owned the
+    /// slot**, for a disconnect presence announcement.
+    ///
+    /// When the slot has already been taken over by a newer leg (the superseded
+    /// case, remote-control-0ef.8), the peer is now talking to that newer leg,
+    /// so the old connection's cleanup must **not** announce a disconnect —
+    /// hence `None`. The newer leg already announced its own `Connected`.
     pub fn detach(
         &self,
         pairing: &PairingId,
@@ -118,10 +182,13 @@ impl Registry {
             .role(role)
             .as_ref()
             .is_some_and(|h| h.connection_id == connection_id);
-        if still_ours {
+        let peer = if still_ours {
             *slot.role_mut(role) = None;
-        }
-        let peer = slot.role(role.peer()).clone();
+            slot.role(role.peer()).clone()
+        } else {
+            // A newer leg owns this slot; leave it — and its peer — untouched.
+            None
+        };
         if slot.is_empty() {
             slots.remove(pairing);
         }
@@ -174,6 +241,7 @@ mod tests {
             ConnHandle {
                 connection_id: id.into(),
                 tx,
+                shutdown: Arc::new(Notify::new()),
             },
             rx,
         )
@@ -219,6 +287,54 @@ mod tests {
         // The current connection's cleanup does evict, and empties the slot.
         reg.detach(&pairing, Role::Desktop, "conn_d2");
         assert!(reg.peer(&pairing, Role::Phone).is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_supersedes_the_previous_same_role_connection() {
+        // A second attach for the same (pairing, role) must signal the first
+        // connection to shut down (remote-control-0ef.8) instead of leaving two
+        // same-role legs to coexist.
+        let reg = Registry::new();
+        let pairing = PairingId::new("pair");
+
+        let (d1, _r1) = handle("conn_d1");
+        let d1_shutdown = d1.shutdown.clone();
+        reg.attach(&pairing, Role::Desktop, d1);
+
+        // A reconnect (different connection id) takes over the slot.
+        let (d2, _r2) = handle("conn_d2");
+        reg.attach(&pairing, Role::Desktop, d2);
+
+        // The superseded connection was signalled. `notify_one` leaves a stored
+        // permit, so `notified()` resolves immediately (bounded by a timeout so
+        // a regression fails the test rather than hanging).
+        tokio::time::timeout(std::time::Duration::from_secs(1), d1_shutdown.notified())
+            .await
+            .expect("superseded connection must be signalled to shut down");
+    }
+
+    #[tokio::test]
+    async fn reattaching_same_connection_does_not_signal_shutdown() {
+        // An already-authed connection re-attaching itself (e.g. offering an
+        // extra pairing on its live socket) must not be told to shut down.
+        let reg = Registry::new();
+        let pairing = PairingId::new("pair");
+
+        let (d1, _r1) = handle("conn_d1");
+        let d1_shutdown = d1.shutdown.clone();
+        reg.attach(&pairing, Role::Desktop, d1.clone());
+        reg.attach(&pairing, Role::Desktop, d1);
+
+        // No shutdown permit stored → `notified()` does not resolve.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                d1_shutdown.notified()
+            )
+            .await
+            .is_err(),
+            "re-attaching the same connection must not signal shutdown"
+        );
     }
 
     #[test]

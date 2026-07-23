@@ -39,6 +39,23 @@ pub enum QueueError {
     },
 }
 
+/// Result of servicing a `resume { from_seq }` against a [`SenderQueue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The buffered envelopes with `seq > from_seq`, in order (possibly empty).
+    /// Delivering these leaves no hole: `from_seq + 1` is either the oldest
+    /// retained envelope or the receiver is already caught up.
+    Replay(Vec<EncryptedEnvelope>),
+    /// The receiver's next-needed seq (`from_seq + 1`) falls **below** the oldest
+    /// seq still buffered: earlier envelopes were shed by drop-oldest overflow
+    /// (see [`AppendOutcome::Accepted`]'s `overflow`) and are gone for good.
+    /// Replaying would hand the receiver a stream with a hole, which its gapless
+    /// enforcement rejects — the receiver stalls forever. The caller must instead
+    /// signal a resync so the receiver abandons its stale cursor and requests a
+    /// fresh snapshot (remote-control-0ef.7).
+    Resync,
+}
+
 /// Result of accepting an envelope into a [`SenderQueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -134,6 +151,42 @@ impl SenderQueue {
             .filter(|e| e.seq > from_seq)
             .cloned()
             .collect()
+    }
+
+    /// Service a `resume { from_seq }`, distinguishing a clean replay from a
+    /// drop-induced gap that requires a resync (remote-control-0ef.7).
+    ///
+    /// Drop-oldest overflow ([`Self::append`]) sheds the lowest un-acked
+    /// envelopes **without** advancing [`Self::ack_cursor`], so the buffer's
+    /// front `seq` can sit strictly above `ack_cursor + 1`. A receiver that
+    /// resumes from a `from_seq` older than that front is asking for envelopes
+    /// the relay no longer holds; those seqs will never arrive. Rather than
+    /// [`Self::replay`] a hole the receiver stalls on, return
+    /// [`ResumeOutcome::Resync`] so the caller can tell the receiver to request
+    /// a fresh snapshot.
+    ///
+    /// **Recovery path.** The session maps `Resync` onto the same
+    /// `SeqViolation` advisory the enqueue path already uses: the receiver
+    /// zeroes its cursor for this pairing and asks its peer for a fresh
+    /// snapshot (restarting the peer's stream), so no new wire frame is needed.
+    pub fn resume(&self, from_seq: u64) -> ResumeOutcome {
+        if let Some(front) = self.buf.front() {
+            // The front can sit above `ack_cursor + 1` in exactly one case:
+            // drop-oldest overflow shed un-acked seqs (see [`Self::append`]).
+            // Cumulative ack ([`Self::ack`]) also advances the front, but
+            // *contiguously* (front becomes `ack_cursor + 1`), and those seqs
+            // were delivered and acknowledged — not lost. So a hole that forces
+            // a resync exists only when BOTH hold: the front is above the ack
+            // watermark's successor (an overflow drop happened) AND the receiver
+            // is asking for a seq below that front. Without the overflow guard,
+            // a plain `ack`-pruned resume (`from_seq` below an acked front) would
+            // be misread as a gap.
+            let overflow_gap = front.seq > self.ack_cursor + 1;
+            if overflow_gap && from_seq + 1 < front.seq {
+                return ResumeOutcome::Resync;
+            }
+        }
+        ResumeOutcome::Replay(self.replay(from_seq))
     }
 
     /// Prune every buffered envelope with `seq <= cursor` (cumulative ack,
@@ -300,5 +353,83 @@ mod tests {
         assert_eq!(seqs, vec![2, 3, 4], "oldest dropped, newest retained");
         // Sequencing continues gaplessly despite the drop.
         assert_eq!(q.high_water(), 4);
+    }
+
+    #[test]
+    fn resume_replays_when_no_gap() {
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=5 {
+            q.append(env(seq)).unwrap();
+        }
+        // A resume from a point the buffer still covers replays cleanly.
+        match q.resume(2) {
+            ResumeOutcome::Replay(v) => {
+                assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+            }
+            ResumeOutcome::Resync => panic!("no drop occurred; expected a clean replay"),
+        }
+        // Resuming from the head yields an empty (still clean) replay.
+        assert_eq!(q.resume(5), ResumeOutcome::Replay(vec![]));
+    }
+
+    #[test]
+    fn resume_signals_resync_after_drop_oldest() {
+        // remote-control-0ef.7: a drop-oldest overflow leaves the buffer's front
+        // above ack_cursor + 1. A receiver resuming from before that front asked
+        // for shed envelopes → it must be told to RESYNC, not handed a hole.
+        let mut q = SenderQueue::new(3);
+        for seq in 1..=5 {
+            q.append(env(seq)).unwrap();
+        }
+        // Buffer now holds seq 3,4,5 (1 and 2 were dropped). ack_cursor is still 0.
+        assert_eq!(
+            q.replay(0).iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        // A fresh receiver (from_seq 0) needs seq 1, which is gone → resync.
+        assert_eq!(q.resume(0), ResumeOutcome::Resync);
+        // A receiver that last saw seq 1 needs seq 2, also gone → resync.
+        assert_eq!(q.resume(1), ResumeOutcome::Resync);
+        // A receiver that last saw seq 2 needs seq 3, which is the front → clean.
+        match q.resume(2) {
+            ResumeOutcome::Replay(v) => {
+                assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+            }
+            ResumeOutcome::Resync => panic!("seq 3 is retained; expected a clean replay"),
+        }
+    }
+
+    #[test]
+    fn resume_on_empty_or_acked_queue_never_resyncs() {
+        // An empty queue (no drops) is always a clean, empty replay.
+        let q = SenderQueue::new(3);
+        assert_eq!(q.resume(0), ResumeOutcome::Replay(vec![]));
+
+        // After a clean ack (no drop), resuming from the ack point is clean.
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=5 {
+            q.append(env(seq)).unwrap();
+        }
+        q.ack(5);
+        assert_eq!(q.resume(5), ResumeOutcome::Replay(vec![]));
+    }
+
+    #[test]
+    fn resume_from_before_an_acked_front_is_clean_not_resync() {
+        // Regression (remote-control-0ef.7): ack-pruning advances the buffer
+        // front contiguously (front == ack_cursor + 1). A resume from *before*
+        // that front must NOT be misread as an overflow gap — those seqs were
+        // delivered and acknowledged, so replaying the retained tail is correct.
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=3 {
+            q.append(env(seq)).unwrap();
+        }
+        q.ack(1); // prune seq 1; front is now seq 2, ack_cursor = 1.
+        match q.resume(0) {
+            ResumeOutcome::Replay(v) => {
+                assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+            }
+            ResumeOutcome::Resync => panic!("an ack-prune is not an overflow gap"),
+        }
     }
 }

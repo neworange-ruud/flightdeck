@@ -6,6 +6,7 @@
 //! likely extend `Config`, not replace this pattern.
 
 use std::env;
+use std::time::Duration;
 
 use crate::apns::ApnsConfig;
 
@@ -53,6 +54,31 @@ pub struct Config {
     /// and single-use"). `CLAIM_TOKEN_TTL_SECS`, default `120`.
     pub claim_token_ttl_secs: u64,
 
+    /// How often the relay sends a server-initiated WebSocket ping on an
+    /// authenticated connection (remote-control-0ef.1). The client's WS stack
+    /// answers with a Pong, which counts as inbound traffic and so resets the
+    /// [`Self::idle_timeout`] liveness deadline. `PING_INTERVAL_SECS`, default
+    /// `20`. **Coordinated with the desktop/iOS clients** — all three tiers use
+    /// a 20s ping interval so liveness expectations agree.
+    pub ping_interval: Duration,
+
+    /// Liveness deadline on an authenticated connection: if no inbound frame
+    /// (an app frame, or the Pong answering a server ping) arrives within this
+    /// window, the relay tears the connection down — detaching it and telling
+    /// the peer the leg went away (remote-control-0ef.1). This is what catches a
+    /// half-open/zombie socket that dies without a TCP FIN. `IDLE_TIMEOUT_SECS`,
+    /// default `60` (3× the ping interval, so a couple of dropped pings are
+    /// tolerated before teardown). **Coordinated with the desktop/iOS clients.**
+    pub idle_timeout: Duration,
+
+    /// How often the relay sweeps expired claim tokens from the store
+    /// (remote-control-0ef.16). A `pairing_offer` whose 4-digit code is never
+    /// entered leaves its claim entry behind; without a periodic sweep the
+    /// table grows unboundedly for the life of the process. `CLAIM_SWEEP_INTERVAL_SECS`,
+    /// default `60` (well under the `claim_token_ttl_secs` of 120, so an
+    /// abandoned token lives at most ~1 TTL past expiry before being reaped).
+    pub claim_sweep_interval: Duration,
+
     /// APNs push credentials, if configured (spec §5.5). `None` disables push:
     /// the relay still queues events for `resume`, it just can't wake a
     /// backgrounded phone. Populated from `APNS_*` env vars by
@@ -74,6 +100,9 @@ impl Config {
             auth_timeout_secs: 10,
             queue_max_per_pairing: 1000,
             claim_token_ttl_secs: 120,
+            ping_interval: Duration::from_secs(20),
+            idle_timeout: Duration::from_secs(60),
+            claim_sweep_interval: Duration::from_secs(60),
             apns: None,
         }
     }
@@ -89,6 +118,9 @@ impl Config {
             env::var("AUTH_TIMEOUT_SECS").ok(),
             env::var("QUEUE_MAX_PER_PAIRING").ok(),
             env::var("CLAIM_TOKEN_TTL_SECS").ok(),
+            env::var("PING_INTERVAL_SECS").ok(),
+            env::var("IDLE_TIMEOUT_SECS").ok(),
+            env::var("CLAIM_SWEEP_INTERVAL_SECS").ok(),
         );
         // APNs is read separately (not through `from_vars`) so the pure-parser
         // tests stay small and no test ever needs Apple credentials.
@@ -107,6 +139,9 @@ impl Config {
         auth_timeout_secs: Option<String>,
         queue_max_per_pairing: Option<String>,
         claim_token_ttl_secs: Option<String>,
+        ping_interval_secs: Option<String>,
+        idle_timeout_secs: Option<String>,
+        claim_sweep_interval_secs: Option<String>,
     ) -> Self {
         let port = port.and_then(|v| v.parse::<u16>().ok()).unwrap_or(8080);
 
@@ -131,6 +166,21 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(120);
+        let ping_interval = ping_interval_secs
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(20));
+        let idle_timeout = idle_timeout_secs
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(60));
+        let claim_sweep_interval = claim_sweep_interval_secs
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(60));
 
         Self {
             port,
@@ -139,6 +189,9 @@ impl Config {
             auth_timeout_secs,
             queue_max_per_pairing,
             claim_token_ttl_secs,
+            ping_interval,
+            idle_timeout,
+            claim_sweep_interval,
             apns: None,
         }
     }
@@ -150,13 +203,16 @@ mod tests {
 
     #[test]
     fn defaults_when_unset() {
-        let config = Config::from_vars(None, None, None, None, None, None);
+        let config = Config::from_vars(None, None, None, None, None, None, None, None, None);
         assert_eq!(config.port, 8080);
         assert_eq!(config.log_format, LogFormat::Pretty);
         assert_eq!(config.git_sha, "unknown");
         assert_eq!(config.auth_timeout_secs, 10);
         assert_eq!(config.queue_max_per_pairing, 1000);
         assert_eq!(config.claim_token_ttl_secs, 120);
+        assert_eq!(config.ping_interval, Duration::from_secs(20));
+        assert_eq!(config.idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.claim_sweep_interval, Duration::from_secs(60));
     }
 
     #[test]
@@ -168,6 +224,9 @@ mod tests {
             Some("30".to_string()),
             Some("50".to_string()),
             Some("300".to_string()),
+            Some("15".to_string()),
+            Some("45".to_string()),
+            Some("90".to_string()),
         );
         assert_eq!(config.port, 9090);
         assert_eq!(config.log_format, LogFormat::Json);
@@ -175,12 +234,24 @@ mod tests {
         assert_eq!(config.auth_timeout_secs, 30);
         assert_eq!(config.queue_max_per_pairing, 50);
         assert_eq!(config.claim_token_ttl_secs, 300);
+        assert_eq!(config.ping_interval, Duration::from_secs(15));
+        assert_eq!(config.idle_timeout, Duration::from_secs(45));
+        assert_eq!(config.claim_sweep_interval, Duration::from_secs(90));
     }
 
     #[test]
     fn falls_back_on_invalid_port() {
-        let config =
-            Config::from_vars(Some("not-a-port".to_string()), None, None, None, None, None);
+        let config = Config::from_vars(
+            Some("not-a-port".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(config.port, 8080);
     }
 
@@ -190,12 +261,18 @@ mod tests {
             None,
             None,
             None,
-            Some("0".to_string()),   // zero timeout is nonsensical → default
-            Some("nan".to_string()), // unparseable → default
-            Some("0".to_string()),   // zero TTL → default
+            Some("0".to_string()),    // zero timeout is nonsensical → default
+            Some("nan".to_string()),  // unparseable → default
+            Some("0".to_string()),    // zero TTL → default
+            Some("0".to_string()),    // zero ping interval → default
+            Some("nope".to_string()), // unparseable idle timeout → default
+            Some("0".to_string()),    // zero sweep interval → default
         );
         assert_eq!(config.auth_timeout_secs, 10);
         assert_eq!(config.queue_max_per_pairing, 1000);
         assert_eq!(config.claim_token_ttl_secs, 120);
+        assert_eq!(config.ping_interval, Duration::from_secs(20));
+        assert_eq!(config.idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.claim_sweep_interval, Duration::from_secs(60));
     }
 }

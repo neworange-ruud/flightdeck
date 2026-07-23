@@ -15,7 +15,7 @@ here — this is a public repo. They live in the repo's Actions **variables** an
 | Container Apps env | Consumption profile. **Prefer North Europe** — West Europe has repeatedly returned `ManagedEnvironmentCapacityHeavyUsageError` for new environments. |
 | Container App | `0.25 vCPU / 0.5 GiB`, `minReplicas: 1`, `maxReplicas: 1` |
 | Pull identity | user-assigned MI with **AcrPull** on the registry |
-| Deploy identity | user-assigned MI, GitHub-OIDC federated, **AcrPush** on the registry + **Contributor** on the app only |
+| Deploy identity | user-assigned MI, GitHub-OIDC federated, **AcrPush** + **Container Registry Tasks Contributor** on the registry (the latter is required for web-deploy's `az acr build` step) + **Contributor** on the app only |
 
 **`maxReplicas: 1` is required, not a tuning choice** — routing state is in
 process memory (`store::InMemoryStore`), so both legs of a pairing must land on
@@ -115,7 +115,8 @@ az containerapp create -g "$RG" -n "$APP" --environment "$ENVNAME" \
   --env-vars PORT=8080 LOG_FORMAT=json GIT_SHA=latest
 
 # 5. GitHub OIDC deploy identity: federated credential for the production
-#    environment, AcrPush on the registry, Contributor on the app only.
+#    environment, AcrPush + Container Registry Tasks Contributor on the
+#    registry, Contributor on the app only.
 az identity create -g "$RG" -n "$APP-gha"
 az identity federated-credential create --identity-name "$APP-gha" -g "$RG" \
   --name gha-production \
@@ -126,6 +127,10 @@ GHA_PRINCIPAL=$(az identity show -g "$RG" -n "$APP-gha" --query principalId -o t
 APP_ID=$(az containerapp show -g "$RG" -n "$APP" --query id -o tsv)
 az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role AcrPush --scope "$ACR_ID"
+# web-deploy's `az acr build` step needs this role too — AcrPush alone isn't
+# enough to run ACR Tasks builds.
+az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role "Container Registry Tasks Contributor" --scope "$ACR_ID"
 az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role Contributor --scope "$APP_ID"
 
