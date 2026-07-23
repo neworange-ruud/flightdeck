@@ -41,22 +41,32 @@ fn public_key_b64(vk: &VerifyingKey) -> String {
     b64(vk.to_encoded_point(false).as_bytes())
 }
 
-/// Spawn the relay on an ephemeral port with the given tuning, returning the
-/// base `http://…` URL. `queue_max` sets `QUEUE_MAX_PER_PAIRING`.
-pub async fn spawn_app_with(queue_max: usize, auth_timeout_secs: u64) -> String {
+/// Spawn the relay on an ephemeral port with a caller-supplied config,
+/// returning the base `http://…` URL. The mutator receives a default
+/// [`Config`] (ephemeral port already set) to tweak before the app is built.
+pub async fn spawn_app_config(mutate: impl FnOnce(&mut Config)) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
     let mut config = Config::new(addr.port(), LogFormat::Pretty, "test-sha");
-    config.queue_max_per_pairing = queue_max;
-    config.auth_timeout_secs = auth_timeout_secs;
+    mutate(&mut config);
 
     tokio::spawn(async move {
         axum::serve(listener, app(config)).await.expect("serve");
     });
     format!("http://{addr}")
+}
+
+/// Spawn the relay on an ephemeral port with the given tuning, returning the
+/// base `http://…` URL. `queue_max` sets `QUEUE_MAX_PER_PAIRING`.
+pub async fn spawn_app_with(queue_max: usize, auth_timeout_secs: u64) -> String {
+    spawn_app_config(|config| {
+        config.queue_max_per_pairing = queue_max;
+        config.auth_timeout_secs = auth_timeout_secs;
+    })
+    .await
 }
 
 /// Spawn with defaults suitable for most tests.
@@ -191,6 +201,54 @@ impl TestClient {
             let frame = self.recv().await;
             if pred(&frame) {
                 return frame;
+            }
+        }
+    }
+
+    /// Like [`Self::recv_until`], but tolerant of transport-level WS Ping/Pong
+    /// frames instead of panicking on them — required when the relay's
+    /// server-initiated ping interval is short enough to fire mid-test. Polling
+    /// the stream in this loop is also what drives tokio-tungstenite's automatic
+    /// Pong response, so calling this keeps *this* connection's liveness clock
+    /// on the relay reset (i.e. it stays alive) while we wait.
+    pub async fn recv_until_alive(&mut self, pred: impl Fn(&RelayFrame) -> bool) -> RelayFrame {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+                .await
+                .expect("recv timed out")
+                .expect("stream ended")
+                .expect("ws error");
+            match msg {
+                WsMessage::Text(text) => {
+                    let frame: RelayFrame = serde_json::from_str(&text).expect("parse frame");
+                    if pred(&frame) {
+                        return frame;
+                    }
+                }
+                // Keepalives: skip; the poll itself drove the auto-Pong.
+                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// Assert the relay tears the connection down within `ms`: the stream must
+    /// yield a Close (or simply end / error) rather than staying open. Interim
+    /// data or WS Ping/Pong frames are tolerated and skipped — only the
+    /// close/end is asserted. Panics if the connection is still delivering
+    /// application frames when the deadline passes.
+    pub async fn expect_closed(&mut self, ms: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+                // Stream ended or a Close frame arrived → torn down, as expected.
+                Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => return,
+                // Transport-level keepalives are not a teardown; keep waiting.
+                Ok(Some(Ok(WsMessage::Ping(_)))) | Ok(Some(Ok(WsMessage::Pong(_)))) => continue,
+                Ok(Some(Ok(other))) => {
+                    panic!("expected the connection to be torn down, got frame: {other:?}")
+                }
+                Err(_) => panic!("connection was not torn down within {ms}ms"),
             }
         }
     }

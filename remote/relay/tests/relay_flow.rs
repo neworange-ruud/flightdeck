@@ -5,12 +5,14 @@
 
 mod support;
 
+use std::time::Duration;
+
 use flightdeck_remote_protocol::{
     ApnsEnvironment, ClientInfo, DeviceId, EncryptedEnvelope, PairingId, PresenceState,
     RelayErrorCode, RelayFrame, Role,
 };
 use futures_util::{SinkExt, StreamExt};
-use support::{bogus_signature, spawn_app, spawn_app_with, TestClient};
+use support::{bogus_signature, spawn_app, spawn_app_config, spawn_app_with, TestClient};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 /// Build an envelope with opaque (possibly garbage) ciphertext.
@@ -868,6 +870,133 @@ async fn non_member_cannot_unregister_push_token() {
         err,
         RelayFrame::Error {
             code: RelayErrorCode::UnknownPairing,
+            ..
+        }
+    ));
+}
+
+// ── connection lifecycle: supersession & liveness ───────────────────────────
+
+/// remote-control-0ef.8: a same-role reconnect must actively tear down the
+/// superseded leg (not leave two coexisting), and routing must continue through
+/// the new leg without the old connection's cleanup disturbing the peer.
+#[tokio::test]
+async fn reconnect_supersedes_and_tears_down_the_old_leg() {
+    let base = spawn_app().await;
+
+    // Desktop pairs and authenticates; phone joins and authenticates.
+    let mut desktop1 = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let desktop_key = desktop1.key();
+    let (pairing, token) = desktop1.offer_pairing().await;
+    desktop1.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // Drain desktop1 up to the phone-connected presence.
+    desktop1
+        .recv_until(|f| {
+            matches!(
+                f,
+                RelayFrame::PeerPresence {
+                    state: PresenceState::Connected,
+                    ..
+                }
+            )
+        })
+        .await;
+
+    // The desktop reconnects with the SAME identity → supersedes desktop1's
+    // leg for this (pairing, role).
+    let mut desktop2 =
+        TestClient::connect_with_key(&base, Role::Desktop, "dev_mac", desktop_key).await;
+    desktop2.authenticate(vec![pairing.clone()]).await;
+
+    // The old connection is actively torn down rather than lingering.
+    desktop1.expect_closed(3000).await;
+
+    // Routing now flows through the new leg: phone → desktop2 still works, and
+    // the superseded conn's cleanup did not evict desktop2 from the slot.
+    phone
+        .send(envelope(&pairing, Role::Phone, 1, "p->d#1"))
+        .await;
+    assert_eq!(env_seq(&desktop2.recv_until(is_envelope).await), 1);
+}
+
+/// remote-control-0ef.1: an authenticated connection that sends no inbound
+/// frame past the idle deadline is torn down. Ping interval is kept large so
+/// the client's auto-Pong cannot mask the missing app traffic — this exercises
+/// the pure idle sweep.
+#[tokio::test]
+async fn authed_connection_with_no_inbound_traffic_is_torn_down() {
+    let base = spawn_app_config(|c| {
+        c.idle_timeout = Duration::from_millis(300);
+        c.ping_interval = Duration::from_secs(60);
+    })
+    .await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, _token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing]).await;
+
+    // Silent from here on → the relay's liveness sweep tears it down.
+    desktop.expect_closed(3000).await;
+}
+
+/// remote-control-0ef.1: when the idle sweep tears a leg down, the peer is told
+/// the leg went away (detach + peer presence update). The desktop is kept alive
+/// by the server ping / auto-Pong loop; the phone is left unpolled so it never
+/// Pongs and thus times out.
+#[tokio::test]
+async fn idle_timeout_notifies_the_peer_of_disconnect() {
+    let base = spawn_app_config(|c| {
+        c.idle_timeout = Duration::from_millis(1000);
+        c.ping_interval = Duration::from_millis(150);
+    })
+    .await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+    // Phone is now silent and unpolled → it will not answer server pings and so
+    // trips the idle deadline. We never touch `phone` again.
+
+    // Desktop stays alive (its recv loop drives auto-Pongs) and observes first
+    // the phone's connect, then — after the phone's idle timeout — its
+    // disconnect.
+    desktop
+        .recv_until_alive(|f| {
+            matches!(
+                f,
+                RelayFrame::PeerPresence {
+                    state: PresenceState::Connected,
+                    ..
+                }
+            )
+        })
+        .await;
+
+    let gone = desktop
+        .recv_until_alive(|f| {
+            matches!(
+                f,
+                RelayFrame::PeerPresence {
+                    state: PresenceState::Disconnected,
+                    ..
+                }
+            )
+        })
+        .await;
+    assert!(matches!(
+        gone,
+        RelayFrame::PeerPresence {
+            peer: Role::Phone,
+            state: PresenceState::Disconnected,
             ..
         }
     ));

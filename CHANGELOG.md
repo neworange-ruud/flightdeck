@@ -16,7 +16,19 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **FlightDeck Remote (relay): dead or slow peers no longer freeze a healthy
+  peer, silently linger, or go undetected.** Three connection-lifecycle fixes on
+  the relay: (1) a slow/half-open receiver can no longer head-of-line-block the
+  sender — the relay now forwards to a peer with a non-blocking `try_send` and
+  lets the buffered envelope be replayed on `resume` instead of awaiting a jammed
+  outbox (remote-control-0ef.6); (2) a reconnecting client now actively
+  supersedes its previous connection (the old reader/writer tasks are signalled
+  to shut down) rather than leaving two same-role legs coexisting
+  (remote-control-0ef.8); (3) authenticated connections are now liveness-checked
+  — the relay sends periodic WebSocket pings and tears a connection down after
+  60s with no inbound traffic, announcing `Disconnected` to the peer, so a
+  half-open socket is reclaimed instead of leaking a session, writer task, and
+  registry handle (remote-control-0ef.1, relay portion).
 
 ## [1.10.1] - 2026-07-21
 
