@@ -19,8 +19,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use flightdeck_remote_protocol::{
-    CommandBody, DesktopToPhone, PermissionOption, PhoneCommand, PromptKind, RelayFrame,
-    TranscriptItem,
+    CommandBody, DesktopToPhone, PermissionOption, PhoneCommand, PromptKind, PromptQuestion,
+    QuestionAnswer, RelayFrame, TranscriptItem,
 };
 use flightdeck_remote_protocol::{CommandId, ItemId, PromptId, SessionId};
 
@@ -145,6 +145,7 @@ fn question_prompt_round_trips() {
         ],
         allow_free_text: true,
         multi_select: false,
+        questions: vec![],
         at_ms: 1752412740000,
     };
     let v = serde_json::to_value(&item).unwrap();
@@ -153,6 +154,10 @@ fn question_prompt_round_trips() {
     assert_eq!(v["multi_select"], false);
     assert_eq!(v["options"][2]["index"], 2);
     assert!(v["options"][0].get("choice").is_none());
+    assert!(
+        v.get("questions").is_none(),
+        "an empty questions list is omitted from the wire"
+    );
     assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
 }
 
@@ -182,6 +187,7 @@ fn multi_select_question_round_trips() {
         ],
         allow_free_text: false,
         multi_select: true,
+        questions: vec![],
         at_ms: 1752412740000,
     };
     let v = serde_json::to_value(&item).unwrap();
@@ -218,6 +224,7 @@ fn option_index_decision_round_trips() {
             option_index: Some(2),
             option_indices: None,
             free_text: None,
+            answers: None,
         },
     };
     let v = serde_json::to_value(&cmd).unwrap();
@@ -226,6 +233,7 @@ fn option_index_decision_round_trips() {
     assert!(v.get("choice").is_none(), "binary choice must be omitted");
     assert!(v.get("option_indices").is_none());
     assert!(v.get("free_text").is_none());
+    assert!(v.get("answers").is_none());
     assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
 }
 
@@ -243,6 +251,7 @@ fn option_indices_decision_round_trips() {
             option_index: None,
             option_indices: Some(vec![0, 2]),
             free_text: None,
+            answers: None,
         },
     };
     let v = serde_json::to_value(&cmd).unwrap();
@@ -268,6 +277,7 @@ fn free_text_decision_round_trips() {
             option_index: None,
             option_indices: None,
             free_text: Some("Use CockroachDB instead.".into()),
+            answers: None,
         },
     };
     let v = serde_json::to_value(&cmd).unwrap();
@@ -276,6 +286,133 @@ fn free_text_decision_round_trips() {
     assert!(v.get("choice").is_none());
     assert!(v.get("option_index").is_none());
     assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
+}
+
+/// A multi-question `PermissionPrompt` (a Claude `AskUserQuestion` carrying
+/// several question tabs) round-trips, and an older payload without the
+/// `questions` list still parses (empty list → the flat single-question fields
+/// apply).
+#[test]
+fn multi_question_prompt_round_trips() {
+    let item = TranscriptItem::PermissionPrompt {
+        item_id: ItemId::new("item_mq1"),
+        prompt_id: PromptId::new("prompt_mq1"),
+        kind: PromptKind::Question,
+        // Flat fields mirror the first question, for a pre-v4 consumer.
+        command: "Which database?".into(),
+        options: vec![PermissionOption {
+            index: 0,
+            choice: None,
+            label: "Postgres".into(),
+            description: None,
+        }],
+        allow_free_text: true,
+        multi_select: false,
+        questions: vec![
+            PromptQuestion {
+                header: Some("Database".into()),
+                question: "Which database?".into(),
+                options: vec![
+                    PermissionOption {
+                        index: 0,
+                        choice: None,
+                        label: "Postgres".into(),
+                        description: None,
+                    },
+                    PermissionOption {
+                        index: 1,
+                        choice: None,
+                        label: "SQLite".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+            },
+            PromptQuestion {
+                header: Some("Checks".into()),
+                question: "Which checks run before merge?".into(),
+                options: vec![
+                    PermissionOption {
+                        index: 0,
+                        choice: None,
+                        label: "Tests".into(),
+                        description: None,
+                    },
+                    PermissionOption {
+                        index: 1,
+                        choice: None,
+                        label: "Clippy".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: true,
+            },
+        ],
+        at_ms: 1752412740000,
+    };
+    let v = serde_json::to_value(&item).unwrap();
+    assert_eq!(v["questions"][0]["header"], "Database");
+    assert_eq!(v["questions"][1]["multi_select"], true);
+    assert_eq!(serde_json::from_value::<TranscriptItem>(v).unwrap(), item);
+
+    // A payload without `questions` parses with an empty questions list.
+    let legacy = serde_json::json!({
+        "type": "permission_prompt",
+        "item_id": "item_legacy",
+        "prompt_id": "prompt_legacy",
+        "kind": "question",
+        "command": "Pick one.",
+        "options": [{ "index": 0, "label": "A" }],
+        "at_ms": 1752412740000i64,
+    });
+    match serde_json::from_value::<TranscriptItem>(legacy).unwrap() {
+        TranscriptItem::PermissionPrompt { questions, .. } => assert!(questions.is_empty()),
+        other => panic!("expected PermissionPrompt, got {other:?}"),
+    }
+}
+
+/// A multi-question `PermissionDecision` (`answers`) round-trips, and a v3
+/// payload without `answers` parses with `answers = None`.
+#[test]
+fn answers_decision_round_trips() {
+    let cmd = PhoneCommand {
+        command_id: CommandId::new("cmd_ans"),
+        issued_at_ms: 1752412811000,
+        body: CommandBody::PermissionDecision {
+            session_id: SessionId::new("sess_fix_login"),
+            prompt_id: PromptId::new("prompt_mq1"),
+            choice: None,
+            option_index: None,
+            option_indices: None,
+            free_text: None,
+            answers: Some(vec![
+                QuestionAnswer {
+                    option_indices: vec![0],
+                },
+                QuestionAnswer {
+                    option_indices: vec![0, 1],
+                },
+            ]),
+        },
+    };
+    let v = serde_json::to_value(&cmd).unwrap();
+    assert_eq!(v["type"], "permission_decision");
+    assert_eq!(v["answers"][0]["option_indices"][0], 0);
+    assert_eq!(v["answers"][1]["option_indices"][1], 1);
+    assert!(v.get("option_index").is_none());
+    assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
+
+    // A payload without `answers` parses as None.
+    let legacy = serde_json::json!({
+        "type": "permission_decision",
+        "session_id": "sess_x",
+        "prompt_id": "prompt_x",
+        "option_index": 1,
+    });
+    match serde_json::from_value::<CommandBody>(legacy).unwrap() {
+        CommandBody::PermissionDecision { answers, .. } => assert!(answers.is_none()),
+        other => panic!("expected PermissionDecision, got {other:?}"),
+    }
 }
 
 /// Count guard: keep fixtures exhaustive as variants are added. Bump these when

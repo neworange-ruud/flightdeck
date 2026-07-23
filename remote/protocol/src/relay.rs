@@ -118,6 +118,22 @@ pub enum RelayFrame {
         device_id: DeviceId,
         /// Non-secret build metadata.
         client: ClientInfo,
+        /// **Optional shared relay password** (remote-control-uq7). A relay that
+        /// is configured with `FLIGHTDECK_RELAY_PASSWORD` gates access on this
+        /// value: it rejects the connection (a plain `error { code: auth_failed }`
+        /// then close) when this field is missing or does not match, comparing in
+        /// constant time. A relay with **no** password configured ignores this
+        /// field entirely and stays open, so local/dev relays and older clients
+        /// keep working. `Option` + `#[serde(default)]` for backward compatibility:
+        /// an older client omits it (deserialized as `None`), which an
+        /// unconfigured relay accepts and a configured relay rejects.
+        ///
+        /// This is a coarse network-admission secret shared by every client and
+        /// the relay; it is **not** a substitute for the per-device
+        /// challenge-response auth (spec §5.1) or the end-to-end crypto — those
+        /// still run underneath. It never appears in any `hello_ok`/log line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_password: Option<String>,
     },
 
     /// relay -> endpoint. Accepts the connection at a negotiated version.

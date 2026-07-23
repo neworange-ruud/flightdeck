@@ -29,12 +29,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{routing::get, Router};
+use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 
 use apns::{NoopPushService, PushService};
-use config::Config;
+use config::{Config, StoreBackend};
 use router::Registry;
-use store::{InMemoryStore, RelayStore};
+use store::{InMemoryStore, RelayStore, SqliteStore};
 
 /// Current wall-clock time in unix milliseconds. (Mirrors the private helper in
 /// [`session`]; duplicated here to keep the background sweeper self-contained.)
@@ -61,6 +62,16 @@ pub struct AppState {
     /// configured, the live sender under the `apns-live` feature, or a
     /// recording double under test.
     pub push: Arc<dyn PushService>,
+    /// Broadcasts the shutdown notice to every live `/ws` connection's writer
+    /// task (see [`handlers::writer_task`]). Flips `false` -> `true` exactly
+    /// once, when [`shutdown_signal`] observes SIGTERM/Ctrl-C; each writer task
+    /// holds its own [`watch::Receiver`] (via `subscribe()`) so it can react —
+    /// sending a `bye` frame and a native WS Close frame — without the relay
+    /// needing to enumerate connections by pairing (that table, [`Registry`],
+    /// is keyed for envelope routing, not broadcast). A `watch` is used rather
+    /// than a one-shot per connection because the number of live connections is
+    /// unbounded and unknown ahead of time.
+    pub shutdown_tx: Arc<watch::Sender<bool>>,
 }
 
 impl AppState {
@@ -69,15 +80,18 @@ impl AppState {
     /// config (the live APNs sender when both configured and built with the
     /// `apns-live` feature; otherwise a no-op).
     pub fn new(config: Config) -> Self {
-        // Build the store first so the live push service can be handed a
+        // Build the store first (honoring the configured backend — in-memory or
+        // persistent sqlite) so the live push service can be handed a
         // token-purge hook (dead-token cleanup, remote-control-0ef.14).
-        let store: Arc<dyn RelayStore> = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
+        let store = build_store(&config);
         let push = default_push_service(&config, store.clone());
+        let (shutdown_tx, _rx) = watch::channel(false);
         Self {
             config: Arc::new(config),
             store,
             registry: Arc::new(Registry::new()),
             push,
+            shutdown_tx: Arc::new(shutdown_tx),
         }
     }
 
@@ -85,13 +99,41 @@ impl AppState {
     /// Lets tests inject a recording [`PushService`] without touching the
     /// connection state machine.
     pub fn with_push(config: Config, push: Arc<dyn PushService>) -> Self {
-        let store = Arc::new(InMemoryStore::new(config.queue_max_per_pairing));
+        let store = build_store(&config);
+        let (shutdown_tx, _rx) = watch::channel(false);
         Self {
             config: Arc::new(config),
             store,
             registry: Arc::new(Registry::new()),
             push,
+            shutdown_tx: Arc::new(shutdown_tx),
         }
+    }
+}
+
+/// Construct the durable store selected by [`Config::store`]. The in-memory
+/// store is the default; `sqlite:<path>` selects the persistent
+/// [`SqliteStore`]. If the sqlite file cannot be opened we log the failure and
+/// fall back to in-memory rather than aborting startup — the relay still serves,
+/// but state will not survive a restart until the path is fixed.
+fn build_store(config: &Config) -> Arc<dyn RelayStore> {
+    match &config.store {
+        StoreBackend::Memory => Arc::new(InMemoryStore::new(config.queue_max_per_pairing)),
+        StoreBackend::Sqlite(path) => match SqliteStore::open(path, config.queue_max_per_pairing) {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "relay store: sqlite (persistent)");
+                Arc::new(store)
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    %err,
+                    "relay store: failed to open sqlite; falling back to in-memory \
+                     (state will NOT survive restart)"
+                );
+                Arc::new(InMemoryStore::new(config.queue_max_per_pairing))
+            }
+        },
     }
 }
 
@@ -123,18 +165,35 @@ fn default_push_service(config: &Config, store: Arc<dyn RelayStore>) -> Arc<dyn 
 ///
 /// Exposed as a plain function — rather than only being assembled inside
 /// `main` — so integration tests can mount the exact same app on an
-/// ephemeral port without going through the process entry point.
+/// ephemeral port without going through the process entry point. Tests that
+/// only need the router (no graceful-shutdown broadcast) can keep calling
+/// this; `main` uses [`build`] instead, to get back the same
+/// [`AppState::shutdown_tx`] the mounted connections subscribe to.
 pub fn app(config: Config) -> Router {
+    build(config).0
+}
+
+/// Like [`app`], but also returns the [`AppState::shutdown_tx`] handle so the
+/// caller can drive [`shutdown_signal`] with the *same* sender the mounted
+/// router's connections subscribed to (a fresh `app(config)` call would build
+/// its own `AppState` — and thus its own, unreachable, shutdown sender).
+pub fn build(config: Config) -> (Router, Arc<watch::Sender<bool>>) {
     let state = AppState::new(config);
+    let shutdown_tx = state.shutdown_tx.clone();
+    // Evict expired claim tokens on a periodic sweep (remote-control-0ef.16).
+    // Both entry points route through here — `app` (tests) and `main`
+    // (production) — so arming it here covers both.
     spawn_claim_sweeper(state.store.clone(), state.config.claim_sweep_interval);
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/version", get(handlers::version))
         .route("/ws", get(handlers::ws_handler))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+
+    (router, shutdown_tx)
 }
 
 /// Spawn the periodic claim-token sweep (remote-control-0ef.16). A
@@ -166,9 +225,16 @@ fn spawn_claim_sweeper(store: Arc<dyn RelayStore>, interval: Duration) {
 /// deactivation) or Ctrl-C (local `cargo run`), whichever comes first.
 ///
 /// Intended to be passed to `axum::serve(..).with_graceful_shutdown(..)` so
-/// in-flight requests (including open WebSocket connections) get a chance
-/// to drain instead of being hard-killed.
-pub async fn shutdown_signal() {
+/// in-flight requests get a chance to drain instead of being hard-killed.
+/// Before resolving, flips `shutdown_tx` to `true` — every live `/ws`
+/// connection's writer task is watching this sender (via `subscribe()`) and
+/// reacts by sending a `bye` frame plus a native WebSocket Close frame (see
+/// [`handlers::writer_task`]), so peers see a clean close instead of a TCP
+/// reset when the process later exits. The caller (`main`) is expected to
+/// additionally bound the *overall* `axum::serve(..).await` with a timeout —
+/// this function only handles notifying connections, not capping how long a
+/// stuck client can hold the process open.
+pub async fn shutdown_signal(shutdown_tx: Arc<watch::Sender<bool>>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -190,6 +256,15 @@ pub async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("received Ctrl+C, shutting down"),
         _ = terminate => tracing::info!("received SIGTERM, shutting down"),
     }
+
+    // `send_modify` (rather than `send`) unconditionally updates the shared
+    // value even with zero live receivers right now — e.g. no connections are
+    // open at the exact moment of shutdown — so a connection that subscribes
+    // a moment later (in the narrow window before `axum` stops accepting new
+    // ones) still observes `true` immediately via `borrow()` and closes
+    // cleanly, rather than silently missing a notification that `send` would
+    // have dropped on the floor.
+    shutdown_tx.send_modify(|v| *v = true);
 }
 
 #[cfg(test)]

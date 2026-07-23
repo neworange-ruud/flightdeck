@@ -237,9 +237,46 @@ pub enum TranscriptItem {
         /// default) keeps the single-tap-submits behaviour.
         #[serde(default)]
         multi_select: bool,
+        /// All questions in the prompt's form, in tab order. A Claude
+        /// `AskUserQuestion` can carry SEVERAL questions rendered as tabs with a
+        /// final Confirm; each [`PromptQuestion`] has its own options and
+        /// `multi_select` flag. Empty for a plain permission prompt, and for a
+        /// pre-v4 desktop that only populated the flat `command`/`options`/
+        /// `multi_select` fields above — a phone that finds it empty falls back
+        /// to those single-question fields. The flat fields always mirror
+        /// `questions[0]`, so a phone that ignores this list still renders (and
+        /// can answer) the first question exactly as before.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<PromptQuestion>,
         /// Wall-clock time (unix ms).
         at_ms: i64,
     },
+}
+
+/// One question within a (possibly multi-question) prompt form. A Claude
+/// `AskUserQuestion` can carry several of these, each rendered as its own tab.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQuestion {
+    /// Short tab header (AskUserQuestion `header`), if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The question text shown to the human.
+    pub question: String,
+    /// This question's offered options (>=1), each with a stable 0-based index.
+    pub options: Vec<PermissionOption>,
+    /// Whether this question accepts MULTIPLE selected options (a checklist).
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// The phone's answer to ONE question within a multi-question form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    /// The chosen 0-based option indices for this question, in its own option
+    /// order. One entry for a single-select question, several for a
+    /// multi-select (checklist) one; empty leaves the question unanswered.
+    #[serde(default)]
+    pub option_indices: Vec<u32>,
 }
 
 /// A selectable option on a permission prompt.
@@ -480,6 +517,14 @@ pub enum CommandBody {
         /// Free-text answer ("Type your own answer").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         free_text: Option<String>,
+        /// Per-question answers for a MULTI-question tabbed form, in the same
+        /// order as [`TranscriptItem::PermissionPrompt::questions`] — one
+        /// [`QuestionAnswer`] per question tab. When present and non-empty this
+        /// supersedes the single-question `option_index`/`option_indices`
+        /// fields. Kept separate so a pre-v4 desktop still answers the flat
+        /// single-question fields it understands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<QuestionAnswer>>,
     },
     /// Launch a new agent session (v1 fields only; model/effort inherit desktop
     /// defaults).

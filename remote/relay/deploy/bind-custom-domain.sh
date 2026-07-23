@@ -12,11 +12,11 @@
 # (the TXT is this app's customDomainVerificationId; verify with
 #  `az containerapp show -g <rg> -n <app> --query properties.customDomainVerificationId`.)
 #
-# The relay ingress is IP-restricted (deny-by-default allowlist). ACA managed
-# certificate issuance validates domain ownership via the asuid TXT + CNAME, so
-# the CNAME-validation path used here does not require lifting the allowlist.
-# If a future run reports an HTTP/ACME validation failure, temporarily remove
-# the IP restrictions, bind, then re-add them.
+# The relay ingress is open (access is gated by the shared FLIGHTDECK_RELAY_PASSWORD,
+# not by a source-IP allowlist — remote-control-uq7). ACA managed certificate
+# issuance validates domain ownership via the asuid TXT + CNAME, which is
+# unaffected by ingress access rules either way, so this script needs no special
+# handling for it.
 #
 # Usage:  remote/relay/deploy/bind-custom-domain.sh
 # Requires: az CLI logged in to the "New Orange Internal" subscription.

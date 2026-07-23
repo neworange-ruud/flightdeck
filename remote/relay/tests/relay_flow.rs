@@ -59,6 +59,7 @@ async fn incompatible_version_is_rejected_and_closed() {
             platform: "t".into(),
             os_version: None,
         },
+        relay_password: None,
     };
     ws.send(WsMessage::Text(
         serde_json::to_string(&hello).unwrap().into(),
