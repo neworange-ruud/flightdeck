@@ -15,6 +15,7 @@ fn entry(id: &str) -> SessionEntry {
         backend: Some(StatusBackend::Claude),
         status: AgentStatus::Idle,
         primary_running: true,
+        primary_not_started: false,
         all_stopped: false,
         bracketed_paste: true,
         pending_prompt: None,
@@ -151,6 +152,52 @@ fn reply_rejections() {
     let mut stopped = entry("t2");
     stopped.primary_running = false;
     let index = index_with(vec![stopped]);
+    assert!(matches!(
+        translate(
+            &CommandBody::Reply {
+                session_id: SessionId::new("t2"),
+                text: "hi".to_string(),
+            },
+            &index,
+        ),
+        Translation::Reject { reason } if reason.contains("not running")
+    ));
+}
+
+#[test]
+fn reply_to_not_started_agent_resumes_and_defers() {
+    // A recovered tab whose project was not active at startup is NotStarted but
+    // shows as Idle on the phone. A reply resumes it and defers the text, rather
+    // than rejecting (remote-control-1l4).
+    let mut e = entry("t2");
+    e.primary_running = false;
+    e.primary_not_started = true;
+    let index = index_with(vec![e]);
+    let t = translate(
+        &CommandBody::Reply {
+            session_id: SessionId::new("t2"),
+            text: "resume and go".to_string(),
+        },
+        &index,
+    );
+    assert_eq!(
+        t,
+        Translation::NeedsMainLoop(MainLoopAction::ResumeAndReply {
+            project: 0,
+            tab_id: "t2".to_string(),
+            text: "resume and go".to_string(),
+        })
+    );
+}
+
+#[test]
+fn reply_to_stopped_agent_still_rejects() {
+    // A genuinely stopped/exited agent (not NotStarted) keeps asking the user to
+    // restart it explicitly — only NotStarted auto-resumes.
+    let mut e = entry("t2");
+    e.primary_running = false;
+    e.primary_not_started = false;
+    let index = index_with(vec![e]);
     assert!(matches!(
         translate(
             &CommandBody::Reply {

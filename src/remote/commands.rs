@@ -124,6 +124,11 @@ pub struct SessionEntry {
     pub status: AgentStatus,
     /// Whether the primary agent process is running.
     pub primary_running: bool,
+    /// Whether the primary agent has never been launched this session
+    /// (`ProcessState::NotStarted`). True for recovered tabs whose project was
+    /// not the active one at startup — they show as Idle on the phone but must
+    /// be resumed before a reply can be typed (remote-control-1l4).
+    pub primary_not_started: bool,
     /// Whether every process in the tab (primary + children) has stopped.
     pub all_stopped: bool,
     /// Whether the primary terminal application has enabled bracketed paste
@@ -196,6 +201,7 @@ pub fn build_index(
                 backend,
                 status: feed::agent_status(tab.display_status(now_ms)),
                 primary_running: tab.session.primary_state() == ProcessState::Running,
+                primary_not_started: tab.session.primary_state() == ProcessState::NotStarted,
                 all_stopped: tab.session.all_stopped(),
                 bracketed_paste: tab
                     .session
@@ -229,6 +235,19 @@ pub enum MainLoopAction {
         agent_key: String,
         /// The first task to send once the agent is up (may be empty).
         first_task: String,
+    },
+    /// Resume a not-started agent (recovered tab whose project was not the
+    /// active one at startup) so the phone can message it, then deliver `text`
+    /// once its terminal is ready — the same resume the desktop performs when
+    /// you navigate to the agent (remote-control-1l4). The launch is I/O, so it
+    /// runs in the executor, not the pure translator.
+    ResumeAndReply {
+        /// Workspace project index.
+        project: usize,
+        /// The tab (== session) to resume; located by id at execution time.
+        tab_id: String,
+        /// The reply to deliver once the resumed agent is ready.
+        text: String,
     },
 }
 
@@ -596,6 +615,19 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
                 return reject("empty reply");
             }
             if !s.primary_running {
+                // A recovered tab whose project was not the active one at
+                // startup is NotStarted but shows as Idle on the phone. Resume
+                // it (the same continuation the desktop runs on navigation) and
+                // deliver the reply once its terminal is ready, rather than
+                // rejecting (remote-control-1l4). A genuinely stopped/exited
+                // agent still asks the user to restart it explicitly.
+                if s.primary_not_started {
+                    return Translation::NeedsMainLoop(MainLoopAction::ResumeAndReply {
+                        project: s.project,
+                        tab_id: s.id.as_str().to_string(),
+                        text: text.clone(),
+                    });
+                }
                 return reject("the agent is not running; restart it first");
             }
             Translation::PtyInput {
@@ -936,7 +968,10 @@ pub const FIRST_TASK_BRACKETED_WAIT_MS: u64 = 10_000;
 /// state tells the phone what actually happened to the tab).
 pub const FIRST_TASK_EXPIRY_MS: u64 = 120_000;
 
-/// A first task queued by a `new_agent` command, awaiting a ready agent.
+/// A prompt queued for an agent that is not ready to receive it yet, awaiting a
+/// ready terminal. Two sources: a `new_agent` command's first task, and a reply
+/// sent to a not-started agent that is being resumed (remote-control-1l4). Both
+/// share the same readiness gate ([`first_task_decision`]) and expiry.
 pub struct PendingFirstTask {
     /// The tab (== session) the task belongs to.
     pub tab_id: String,

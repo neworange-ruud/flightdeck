@@ -8,6 +8,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Remote: message an agent that hasn't started yet.** After FlightDeck
+  restarts on Desktop, only the active project's agents are resumed; every other
+  recovered tab is not-started but still shows as an idle agent on the phone.
+  Sending a message to such an agent now transparently resumes its session — the
+  same continuation the desktop performs when you navigate to the agent — and
+  delivers the prompt once the terminal is ready, instead of rejecting with "the
+  agent is not running; restart it first". Desktop-only, reusing the existing
+  first-task readiness gate; no protocol or iOS change. A genuinely
+  stopped/exited agent still asks you to restart it explicitly.
 - **Remote: shared relay password replaces the IP allowlist.** The relay's
   deny-by-default IP allowlist (fundamentally incompatible with a roaming phone
   on cellular) is removed; the relay now gates the WebSocket `hello` on an
