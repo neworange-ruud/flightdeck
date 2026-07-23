@@ -18,13 +18,16 @@
 //! redeem, ack) run inside a transaction so a mid-operation failure cannot leave
 //! a half-applied write.
 //!
-//! **Semantics parity.** The queue and claim-token rules are the same ones
-//! encoded by [`crate::queue::SenderQueue`] and [`crate::claims::ClaimTable`];
-//! they are re-expressed here in SQL because those types own private state and
-//! offer no way to rehydrate an arbitrary `(high_water, ack_cursor, buffer)`
-//! snapshot from disk. Claim-token TTL is absolute wall-clock (`expires_at_ms`),
-//! so a token that expired while the relay was down still fails redemption after
-//! reload — expired tokens never resurrect.
+//! **Semantics parity.** The queue and claim-token *rules* are not re-expressed
+//! here: the gapless/dedup/drop-oldest/resume logic still lives in
+//! [`crate::queue::SenderQueue`] and the TTL/single-use logic in
+//! [`crate::claims::ClaimTable`]. Each mutating method rehydrates the canonical
+//! type from the persisted rows (via `from_snapshot` / `from_records`), runs the
+//! one true algorithm, and writes the resulting snapshot back — so SQL is a pure
+//! serializer and the two implementations cannot drift (remote-control-tvc).
+//! Claim-token TTL is absolute wall-clock (`expires_at_ms`), so a token that
+//! expired while the relay was down still fails redemption after reload — expired
+//! tokens never resurrect.
 //!
 //! **Persistence caveat (out of scope here).** SQLite persists to whatever file
 //! path it is given; whether that path survives a redeploy is a *deployment*
@@ -41,8 +44,8 @@ use async_trait::async_trait;
 use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::claims::{ClaimError, RedeemedClaim};
-use crate::queue::{AppendOutcome, QueueError, ResumeOutcome};
+use crate::claims::{ClaimError, ClaimRecord, ClaimTable, RedeemedClaim};
+use crate::queue::{AppendOutcome, QueueError, ResumeOutcome, SenderQueue};
 use crate::store::{PairingMembers, RelayStore, RevokeOutcome, StoreError};
 
 /// Schema for the relay's durable state. `IF NOT EXISTS` throughout so opening
@@ -122,6 +125,130 @@ fn apns_env_from_str(s: &str) -> ApnsEnvironment {
     }
 }
 
+/// A SQLite failure inside a store method is unrecoverable at this layer (disk
+/// gone, corruption) and the infallible trait has no channel to report it, so we
+/// panic — matching `InMemoryStore`'s treatment of a poisoned mutex.
+const DB_ERR: &str = "relay sqlite store operation failed";
+
+// --- Canonical-type (de)serialization (remote-control-tvc) -----------------
+//
+// These turn the SQL rows for one stream / the claim table into the canonical
+// `SenderQueue` / `ClaimTable`, run the one true algorithm, and write the
+// snapshot back. All queue/claim *logic* stays in those types; SQL only stores
+// and restores their state, so the two store impls cannot diverge.
+
+/// Rehydrate the canonical [`SenderQueue`] for one `(pairing, sender)` stream
+/// from its persisted rows. An absent stream yields an empty queue, so callers
+/// need no special-casing — its `resume` is a clean empty replay and its `ack`
+/// a no-op, exactly as [`super::InMemoryStore`] behaves for an unknown queue.
+fn load_queue(conn: &Connection, pairing: &PairingId, sender: Role, max_len: usize) -> SenderQueue {
+    let tag = sender_tag(sender);
+    let p = pairing.as_str();
+    let (high_water, ack_cursor) = conn
+        .query_row(
+            "SELECT high_water, ack_cursor FROM queue_streams
+             WHERE pairing_id = ?1 AND sender = ?2",
+            params![p, tag],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )
+        .optional()
+        .expect(DB_ERR)
+        .unwrap_or((0, 0));
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, sent_at_ms, nonce, ciphertext FROM queue_envelopes
+             WHERE pairing_id = ?1 AND sender = ?2 ORDER BY seq ASC",
+        )
+        .expect(DB_ERR);
+    let buffer: Vec<EncryptedEnvelope> = stmt
+        .query_map(params![p, tag], |row| {
+            Ok(EncryptedEnvelope {
+                pairing_id: pairing.clone(),
+                seq: row.get::<_, i64>(0)? as u64,
+                sender,
+                sent_at_ms: row.get(1)?,
+                nonce: row.get(2)?,
+                ciphertext: row.get(3)?,
+            })
+        })
+        .expect(DB_ERR)
+        .map(|r| r.expect(DB_ERR))
+        .collect();
+
+    SenderQueue::from_snapshot(high_water, ack_cursor, buffer, max_len)
+}
+
+/// Persist a stream's post-mutation snapshot: the cursors plus the full retained
+/// buffer. Must run inside the caller's transaction so the read-modify-write is
+/// atomic. There is no gapless / drop-oldest arithmetic here — [`SenderQueue`]
+/// already produced the correct state.
+fn save_queue(conn: &Connection, pairing: &PairingId, sender: Role, q: &SenderQueue) {
+    let tag = sender_tag(sender);
+    let p = pairing.as_str();
+    conn.execute(
+        "INSERT INTO queue_streams (pairing_id, sender, high_water, ack_cursor)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(pairing_id, sender) DO UPDATE SET
+            high_water = excluded.high_water, ack_cursor = excluded.ack_cursor",
+        params![p, tag, q.high_water() as i64, q.ack_cursor() as i64],
+    )
+    .expect(DB_ERR);
+    conn.execute(
+        "DELETE FROM queue_envelopes WHERE pairing_id = ?1 AND sender = ?2",
+        params![p, tag],
+    )
+    .expect(DB_ERR);
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO queue_envelopes
+                (pairing_id, sender, seq, sent_at_ms, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .expect(DB_ERR);
+    for e in q.buffered() {
+        stmt.execute(params![
+            p,
+            tag,
+            e.seq as i64,
+            e.sent_at_ms,
+            e.nonce,
+            e.ciphertext
+        ])
+        .expect(DB_ERR);
+    }
+}
+
+/// Read one claim row as a [`ClaimRecord`], if present.
+fn load_claim(conn: &Connection, token: &str) -> Option<ClaimRecord> {
+    conn.query_row(
+        "SELECT token, pairing_id, desktop, expires_at_ms FROM claims WHERE token = ?1",
+        params![token],
+        claim_record_from_row,
+    )
+    .optional()
+    .expect(DB_ERR)
+}
+
+/// Read every claim row as [`ClaimRecord`]s (for a full-table sweep).
+fn load_all_claims(conn: &Connection) -> Vec<ClaimRecord> {
+    let mut stmt = conn
+        .prepare("SELECT token, pairing_id, desktop, expires_at_ms FROM claims")
+        .expect(DB_ERR);
+    let rows = stmt.query_map([], claim_record_from_row).expect(DB_ERR);
+    rows.map(|r| r.expect(DB_ERR)).collect()
+}
+
+/// Row → [`ClaimRecord`] mapper shared by the single- and all-row loaders.
+fn claim_record_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    Ok(ClaimRecord {
+        token: r.get(0)?,
+        pairing_id: PairingId::new(r.get::<_, String>(1)?),
+        desktop_device: DeviceId::new(r.get::<_, String>(2)?),
+        expires_at_ms: r.get(3)?,
+    })
+}
+
 /// File-backed [`RelayStore`]. See the module docs for the rationale and the
 /// deployment caveat.
 pub struct SqliteStore {
@@ -155,11 +282,6 @@ impl SqliteStore {
         self.conn.lock().expect("relay sqlite store mutex poisoned")
     }
 }
-
-/// A SQLite failure inside a store method is unrecoverable at this layer (disk
-/// gone, corruption) and the infallible trait has no channel to report it, so we
-/// panic — matching `InMemoryStore`'s treatment of a poisoned mutex.
-const DB_ERR: &str = "relay sqlite store operation failed";
 
 #[async_trait]
 impl RelayStore for SqliteStore {
@@ -372,238 +494,103 @@ impl RelayStore for SqliteStore {
     }
 
     async fn claim_token_is_free(&self, token: &str, now_ms: i64) -> bool {
-        // A token is *taken* only while it is live: present AND not past its TTL
-        // (`now_ms <= expires_at_ms`), mirroring `ClaimTable::contains`. An
-        // expired-but-unswept entry counts as **free** so a colliding
-        // `claim_token_hint` can be reused (remote-control-0ef.16); the entry
-        // will be physically reaped by the periodic sweep.
-        let live: i64 = self
-            .lock()
-            .query_row(
-                "SELECT COUNT(*) FROM claims WHERE token = ?1 AND ?2 <= expires_at_ms",
-                params![token, now_ms],
-                |row| row.get(0),
-            )
-            .expect(DB_ERR);
-        live == 0
+        // Rehydrate a (0-or-1-entry) `ClaimTable` and ask the canonical liveness
+        // check: an expired-but-unswept entry counts as **free** so a colliding
+        // `claim_token_hint` can be reused (remote-control-0ef.16). The TTL
+        // boundary lives only in `ClaimTable::contains`.
+        let record = load_claim(&self.lock(), token);
+        !ClaimTable::from_records(record).contains(token, now_ms)
     }
 
     async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError> {
         let mut conn = self.lock();
         let tx = conn.transaction().expect(DB_ERR);
-        let row: Option<(String, String, i64)> = tx
-            .query_row(
-                "SELECT pairing_id, desktop, expires_at_ms FROM claims WHERE token = ?1",
-                params![token],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .expect(DB_ERR);
-        let Some((pairing_id, desktop, expires_at_ms)) = row else {
-            // Unknown tokens are left untouched (nothing to consume).
-            return Err(ClaimError::Unknown);
-        };
-        // Single-use: consume the entry whether it succeeds or is expired, so it
-        // cannot be retried (matches `ClaimTable::redeem`).
-        tx.execute("DELETE FROM claims WHERE token = ?1", params![token])
-            .expect(DB_ERR);
-        tx.commit().expect(DB_ERR);
-        if now_ms > expires_at_ms {
-            return Err(ClaimError::Expired);
+        // Run the canonical single-use + TTL redemption over the one stored row.
+        let mut table = ClaimTable::from_records(load_claim(&tx, token));
+        let result = table.redeem(token, now_ms);
+        // `redeem` consumes the entry on success OR expiry (single-use), and
+        // leaves an unknown token untouched — mirror exactly that in SQL.
+        if !matches!(result, Err(ClaimError::Unknown)) {
+            tx.execute("DELETE FROM claims WHERE token = ?1", params![token])
+                .expect(DB_ERR);
+            tx.commit().expect(DB_ERR);
         }
-        Ok(RedeemedClaim {
-            pairing_id: PairingId::new(pairing_id),
-            desktop_device: DeviceId::new(desktop),
-        })
+        result
     }
 
     async fn sweep_expired_claims(&self, now_ms: i64) -> usize {
-        // Evict every entry past its TTL (`now_ms > expires_at_ms`) and report
-        // how many were removed, matching `ClaimTable::sweep_expired` (which
-        // retains `now_ms <= expires_at_ms`). An entry exactly at its boundary is
-        // still live and kept. `Connection::execute` returns the affected count.
-        self.lock()
-            .execute(
-                "DELETE FROM claims WHERE expires_at_ms < ?1",
-                params![now_ms],
-            )
-            .expect(DB_ERR)
+        // Rehydrate the whole table, let `ClaimTable::sweep_expired` apply the
+        // canonical TTL predicate and count, then rewrite the survivors. The
+        // claim table is small and the sweep is periodic, so a full round-trip is
+        // cheap — and it keeps the "which entries expired" decision in one place.
+        let mut conn = self.lock();
+        let tx = conn.transaction().expect(DB_ERR);
+        let mut table = ClaimTable::from_records(load_all_claims(&tx));
+        let removed = table.sweep_expired(now_ms);
+        if removed > 0 {
+            tx.execute("DELETE FROM claims", []).expect(DB_ERR);
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO claims (token, pairing_id, desktop, expires_at_ms)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )
+                    .expect(DB_ERR);
+                for r in table.records() {
+                    stmt.execute(params![
+                        r.token,
+                        r.pairing_id.as_str(),
+                        r.desktop_device.as_str(),
+                        r.expires_at_ms
+                    ])
+                    .expect(DB_ERR);
+                }
+            }
+            tx.commit().expect(DB_ERR);
+        }
+        removed
     }
 
     async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError> {
-        let max = self.queue_max_per_pairing;
         let mut conn = self.lock();
         let tx = conn.transaction().expect(DB_ERR);
-        let pairing = env.pairing_id.as_str();
-        let tag = sender_tag(env.sender);
-
-        let (high_water, ack_cursor): (u64, u64) = tx
-            .query_row(
-                "SELECT high_water, ack_cursor FROM queue_streams
-                 WHERE pairing_id = ?1 AND sender = ?2",
-                params![pairing, tag],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()
-            .expect(DB_ERR)
-            .unwrap_or((0, 0));
-
-        let expected = high_water + 1;
-        if env.seq == expected {
-            let buf_len: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM queue_envelopes WHERE pairing_id = ?1 AND sender = ?2",
-                    params![pairing, tag],
-                    |r| r.get(0),
-                )
-                .expect(DB_ERR);
-            let overflow = buf_len as usize >= max;
-            if overflow {
-                // Drop the oldest un-acked envelope (lowest seq) to make room,
-                // matching `SenderQueue`'s drop-oldest overflow policy.
-                tx.execute(
-                    "DELETE FROM queue_envelopes
-                     WHERE pairing_id = ?1 AND sender = ?2
-                       AND seq = (SELECT MIN(seq) FROM queue_envelopes
-                                  WHERE pairing_id = ?1 AND sender = ?2)",
-                    params![pairing, tag],
-                )
-                .expect(DB_ERR);
-            }
-            tx.execute(
-                "INSERT INTO queue_envelopes
-                    (pairing_id, sender, seq, sent_at_ms, nonce, ciphertext)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    pairing,
-                    tag,
-                    env.seq as i64,
-                    env.sent_at_ms,
-                    env.nonce,
-                    env.ciphertext
-                ],
-            )
-            .expect(DB_ERR);
-            tx.execute(
-                "INSERT INTO queue_streams (pairing_id, sender, high_water, ack_cursor)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(pairing_id, sender) DO UPDATE SET high_water = excluded.high_water",
-                params![pairing, tag, env.seq as i64, ack_cursor as i64],
-            )
-            .expect(DB_ERR);
+        let pairing = env.pairing_id.clone();
+        let sender = env.sender;
+        // Rehydrate the canonical queue, let it make the gapless / dedup /
+        // drop-oldest decision, then persist the resulting snapshot. On a
+        // `SeqViolation` the `?` returns early and the transaction rolls back, so
+        // a rejected envelope leaves the store untouched.
+        let mut queue = load_queue(&tx, &pairing, sender, self.queue_max_per_pairing);
+        let outcome = queue.append(env)?;
+        // A `Duplicate` changed nothing, so skip the write-back entirely.
+        if matches!(outcome, AppendOutcome::Accepted { .. }) {
+            save_queue(&tx, &pairing, sender, &queue);
             tx.commit().expect(DB_ERR);
-            Ok(AppendOutcome::Accepted { overflow })
-        } else if high_water > 0 && env.seq == high_water {
-            // Idempotent re-send of the current head; nothing changes.
-            Ok(AppendOutcome::Duplicate)
-        } else {
-            Err(QueueError::SeqViolation {
-                expected,
-                got: env.seq,
-            })
         }
+        Ok(outcome)
     }
 
     async fn resume(&self, pairing: &PairingId, sender: Role, from_seq: u64) -> ResumeOutcome {
+        // An absent stream rehydrates as an empty queue, whose `resume` is a clean
+        // empty replay — so no special-casing is needed. The overflow-gap vs.
+        // clean-replay decision (remote-control-0ef.7) lives in `SenderQueue`.
         let conn = self.lock();
-        let tag = sender_tag(sender);
-        let p = pairing.as_str();
-
-        // The stream row exists iff this `(pairing, sender)` queue was ever
-        // written. Absent → a clean, empty replay (mirrors `InMemoryStore`'s
-        // `queues.get(..).map(..).unwrap_or(Replay(empty))`).
-        let ack_cursor: Option<u64> = conn
-            .query_row(
-                "SELECT ack_cursor FROM queue_streams WHERE pairing_id = ?1 AND sender = ?2",
-                params![p, tag],
-                |r| r.get::<_, i64>(0).map(|v| v as u64),
-            )
-            .optional()
-            .expect(DB_ERR);
-        let Some(ack_cursor) = ack_cursor else {
-            return ResumeOutcome::Replay(Vec::new());
-        };
-
-        // Lowest retained (un-acked, un-dropped) seq. `MIN` over an empty buffer
-        // is SQL `NULL` → `None`, meaning the buffer is empty (everything acked),
-        // which is always a clean — possibly empty — replay.
-        let front: Option<u64> = conn
-            .query_row(
-                "SELECT MIN(seq) FROM queue_envelopes WHERE pairing_id = ?1 AND sender = ?2",
-                params![p, tag],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .expect(DB_ERR)
-            .map(|v| v as u64);
-
-        // Mirror `SenderQueue::resume` (remote-control-0ef.7): a hole that forces
-        // a resync exists only when a drop-oldest overflow pushed the front above
-        // `ack_cursor + 1` AND the receiver is asking for a seq below that front.
-        // An ack-pruned front is contiguous (`front == ack_cursor + 1`), so a
-        // resume from before it is a normal replay of the retained tail, never a
-        // resync.
-        if let Some(front) = front {
-            let overflow_gap = front > ack_cursor + 1;
-            if overflow_gap && from_seq + 1 < front {
-                return ResumeOutcome::Resync;
-            }
-        }
-
-        // Clean replay: every retained envelope with `seq > from_seq`, in order.
-        let mut stmt = conn
-            .prepare(
-                "SELECT seq, sent_at_ms, nonce, ciphertext FROM queue_envelopes
-                 WHERE pairing_id = ?1 AND sender = ?2 AND seq > ?3
-                 ORDER BY seq ASC",
-            )
-            .expect(DB_ERR);
-        let rows = stmt
-            .query_map(params![p, tag, from_seq as i64], |row| {
-                Ok(EncryptedEnvelope {
-                    pairing_id: pairing.clone(),
-                    seq: row.get::<_, i64>(0)? as u64,
-                    sender,
-                    sent_at_ms: row.get(1)?,
-                    nonce: row.get(2)?,
-                    ciphertext: row.get(3)?,
-                })
-            })
-            .expect(DB_ERR);
-        ResumeOutcome::Replay(rows.map(|r| r.expect(DB_ERR)).collect())
+        load_queue(&conn, pairing, sender, self.queue_max_per_pairing).resume(from_seq)
     }
 
     async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64) {
         let mut conn = self.lock();
-        let tag = sender_tag(sender);
-        let stream: Option<(u64, u64)> = conn
-            .query_row(
-                "SELECT high_water, ack_cursor FROM queue_streams
-                 WHERE pairing_id = ?1 AND sender = ?2",
-                params![pairing.as_str(), tag],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()
-            .expect(DB_ERR);
-        let Some((high_water, ack_cursor)) = stream else {
-            // Ack on an absent queue is a no-op, matching `InMemoryStore`.
-            return;
-        };
-        let cursor = cursor.min(high_water);
-        if cursor <= ack_cursor {
-            return;
-        }
         let tx = conn.transaction().expect(DB_ERR);
-        tx.execute(
-            "UPDATE queue_streams SET ack_cursor = ?1 WHERE pairing_id = ?2 AND sender = ?3",
-            params![cursor as i64, pairing.as_str(), tag],
-        )
-        .expect(DB_ERR);
-        tx.execute(
-            "DELETE FROM queue_envelopes WHERE pairing_id = ?1 AND sender = ?2 AND seq <= ?3",
-            params![pairing.as_str(), tag, cursor as i64],
-        )
-        .expect(DB_ERR);
-        tx.commit().expect(DB_ERR);
+        let mut queue = load_queue(&tx, pairing, sender, self.queue_max_per_pairing);
+        let before = queue.ack_cursor();
+        queue.ack(cursor);
+        // `ack` prunes the buffer iff the ack cursor advances; only then is there
+        // anything to persist (an absent queue or a stale cursor is a no-op, and
+        // the transaction rolls back on drop).
+        if queue.ack_cursor() != before {
+            save_queue(&tx, pairing, sender, &queue);
+            tx.commit().expect(DB_ERR);
+        }
     }
 
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment) {

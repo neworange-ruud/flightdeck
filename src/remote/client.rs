@@ -86,6 +86,21 @@ const BACKOFF_BASE_MS: u64 = 1_000;
 /// Backoff ceiling in milliseconds.
 const BACKOFF_CAP_MS: u64 = 60_000;
 
+/// How often the debounced cursor persist actually hits disk during a live
+/// session. Every streamed outbound envelope, inbound envelope, and peer ack
+/// bumps a monotonic cursor in [`RemoteState`]; without coalescing each bump
+/// rewrote the entire pretty-printed `remote.json` and re-`chmod`'d it 0600 —
+/// many full-file rewrites per second under shell streaming, for a counter tick
+/// (remote-control-0ef.11). The [`CursorFlushGate`] marks those bumps dirty and
+/// flushes at most once per this interval; pairing-lifecycle changes still
+/// persist immediately, and a dirty gate is always flushed on session end so a
+/// clean teardown never loses a cursor. Well under [`LIVENESS_TIMEOUT`] so at
+/// most a couple of seconds of cursor progress is ever at risk on a hard crash —
+/// and those cursors are resume/dedup optimizations the relay's at-least-once
+/// redelivery already tolerates (a rewound outbound cursor self-heals via the
+/// `seq_violation` resync, remote-control-bbf).
+const CURSOR_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How many *consecutive* auth rejections of a persisted pairing (the relay
 /// answering our auth-first `auth_response` with `auth_failed`/`unknown_pairing`)
 /// the supervisor tolerates before self-healing: dropping the stale pairing so
@@ -114,6 +129,10 @@ struct ClientTuning {
     /// the check never fires. Per-instance (not a global) to avoid contaminating
     /// other tests running in the same process.
     fail_next_envelope_writes: Arc<AtomicU32>,
+    /// See [`CURSOR_FLUSH_INTERVAL`]. Tests that assert a debounced cursor has
+    /// reached the store set this to [`Duration::ZERO`] so every pump tick
+    /// flushes a dirty gate immediately; production uses the real interval.
+    cursor_flush_interval: Duration,
 }
 
 impl Default for ClientTuning {
@@ -122,6 +141,7 @@ impl Default for ClientTuning {
             liveness_timeout: LIVENESS_TIMEOUT,
             min_stable_session: MIN_STABLE_SESSION,
             fail_next_envelope_writes: Arc::new(AtomicU32::new(0)),
+            cursor_flush_interval: CURSOR_FLUSH_INTERVAL,
         }
     }
 }
@@ -958,14 +978,20 @@ fn run_session(
     // sub-threshold flap does not reset the reconnect backoff (0ef.2).
     let authed_at = Instant::now();
 
+    // One gate spans the whole authenticated session (pre-pump re-sends + pump),
+    // coalescing the streamed cursor persists (0ef.11). Flushed on every exit
+    // below so a clean end never loses a cursor.
+    let mut gate = CursorFlushGate::new(tuning.cursor_flush_interval);
+
     // Re-send an envelope whose write failed on the previous session BEFORE any
     // freshly-queued traffic, so its `seq` slots back into the stream contiguously
     // and the phone's dedup never stalls on a gap (0ef.9). If the write fails
     // again, hold it once more for the next session.
     if let Some(out) = pending_in {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sock, identity, state, store, tuning, out)
+            handle_outbound(&mut sock, identity, state, store, &mut gate, tuning, out)
         {
+            gate.flush(store, state);
             return SessionEnd::Ended {
                 authed_for: Some(authed_at.elapsed()),
                 pending: retry,
@@ -977,8 +1003,9 @@ fn run_session(
     // steady-state pump takes over (normally nothing).
     for out in deferred {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sock, identity, state, store, tuning, out)
+            handle_outbound(&mut sock, identity, state, store, &mut gate, tuning, out)
         {
+            gate.flush(store, state);
             return SessionEnd::Ended {
                 authed_for: Some(authed_at.elapsed()),
                 pending: retry,
@@ -996,6 +1023,7 @@ fn run_session(
         outbound_rx,
         stop,
         tuning,
+        &mut gate,
         authed_at,
     )
 }
@@ -1175,6 +1203,71 @@ enum Sent {
     Broke { retry: Option<RemoteOutbound> },
 }
 
+/// Coalesces the high-frequency cursor persists — outbound high-water
+/// (`last_sent_seq`), peer ack (`last_acked_by_peer`), and inbound receipt
+/// (`last_received_seq`) — into at most one `remote.json` rewrite per
+/// [`ClientTuning::cursor_flush_interval`], instead of a full pretty-printed
+/// rewrite + `chmod 0600` per streamed envelope/ack (remote-control-0ef.11).
+///
+/// Only monotonic cursor bumps are debounced; a pairing-lifecycle change
+/// (offer/claim/revoke/unpair/seq-resync) still calls [`RemoteStore::save`]
+/// directly and then [`Self::mark_clean`] to fold any pending bump into that
+/// same durable write. A dirty gate is always flushed on session end (and before
+/// a `Bye`), so a clean teardown never loses a cursor — only a hard crash can,
+/// and only the last interval's worth, which the relay's at-least-once
+/// redelivery tolerates.
+struct CursorFlushGate {
+    /// A cursor advanced in memory since the last disk write.
+    dirty: bool,
+    /// When the last flush (or [`Self::mark_clean`]) happened.
+    last_flush: Instant,
+    /// Minimum spacing between debounced flushes.
+    interval: Duration,
+}
+
+impl CursorFlushGate {
+    fn new(interval: Duration) -> Self {
+        CursorFlushGate {
+            dirty: false,
+            last_flush: Instant::now(),
+            interval,
+        }
+    }
+
+    /// Record that a cursor advanced in memory; the disk write is deferred to the
+    /// next [`Self::maybe_flush`] whose interval has elapsed (or the session-end
+    /// [`Self::flush`]).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Note that the full state was just persisted out-of-band (a lifecycle
+    /// `store.save`), so any pending cursor bump is now on disk too: clear the
+    /// dirty flag and restart the debounce window.
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+        self.last_flush = Instant::now();
+    }
+
+    /// Flush if dirty and the debounce interval has elapsed — called once per pump
+    /// tick.
+    fn maybe_flush(&mut self, store: &dyn RemoteStore, state: &RemoteState) {
+        if self.dirty && self.last_flush.elapsed() >= self.interval {
+            store.save(state);
+            self.mark_clean();
+        }
+    }
+
+    /// Force a flush now if dirty, regardless of the interval — called on every
+    /// session-end path so no cursor is lost on a clean teardown.
+    fn flush(&mut self, store: &dyn RemoteStore, state: &RemoteState) {
+        if self.dirty {
+            store.save(state);
+            self.mark_clean();
+        }
+    }
+}
+
 /// The steady-state loop: drain outbound, fire pings, read inbound frames.
 #[allow(clippy::too_many_arguments)]
 fn pump(
@@ -1186,6 +1279,7 @@ fn pump(
     outbound_rx: &Receiver<RemoteOutbound>,
     stop: &AtomicBool,
     tuning: &ClientTuning,
+    gate: &mut CursorFlushGate,
     authed_at: Instant,
 ) -> SessionEnd {
     let mut last_ping = Instant::now();
@@ -1195,8 +1289,13 @@ fn pump(
     // looping on idle reads forever (remote-control-0ef.1). Seeded at auth so a
     // silent socket is caught even if the very first frame never arrives.
     let mut last_inbound = Instant::now();
-    loop {
+    // The reconnect-ending outcomes break out with a value so the single flush
+    // below persists any debounced cursor before the session ends (0ef.11). The
+    // two stop-and-`Bye` paths flush inline and early-return, since they also
+    // close the socket.
+    let end = 'pump: loop {
         if stop.load(Ordering::Relaxed) {
+            gate.flush(store, state);
             let _ = send_frame(sock, &RelayFrame::Bye { reason: None });
             sock.close();
             return SessionEnd::Stopped;
@@ -1209,7 +1308,7 @@ fn pump(
                 "client LIVENESS timeout ({}s) — tearing down half-open session",
                 tuning.liveness_timeout.as_secs()
             ));
-            return SessionEnd::Ended {
+            break 'pump SessionEnd::Ended {
                 authed_for: Some(authed_at.elapsed()),
                 pending: None,
             };
@@ -1220,9 +1319,9 @@ fn pump(
             match outbound_rx.try_recv() {
                 Ok(out) => {
                     if let Sent::Broke { retry } =
-                        handle_outbound(sock, identity, state, store, tuning, out)
+                        handle_outbound(sock, identity, state, store, gate, tuning, out)
                     {
-                        return SessionEnd::Ended {
+                        break 'pump SessionEnd::Ended {
                             authed_for: Some(authed_at.elapsed()),
                             pending: retry,
                         };
@@ -1231,6 +1330,7 @@ fn pump(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The app dropped its sender (shutting down).
+                    gate.flush(store, state);
                     let _ = send_frame(sock, &RelayFrame::Bye { reason: None });
                     sock.close();
                     return SessionEnd::Stopped;
@@ -1251,7 +1351,7 @@ fn pump(
         match read_frame(sock) {
             Incoming::Idle => {}
             Incoming::Closed => {
-                return SessionEnd::Ended {
+                break 'pump SessionEnd::Ended {
                     authed_for: Some(authed_at.elapsed()),
                     pending: None,
                 }
@@ -1259,15 +1359,22 @@ fn pump(
             Incoming::Frame(frame) => {
                 // Any inbound frame proves the link is alive — reset the deadline.
                 last_inbound = Instant::now();
-                if !handle_frame(sock, state, store, inbound_tx, *frame) {
-                    return SessionEnd::Ended {
+                if !handle_frame(sock, state, store, gate, inbound_tx, *frame) {
+                    break 'pump SessionEnd::Ended {
                         authed_for: Some(authed_at.elapsed()),
                         pending: None,
                     };
                 }
             }
         }
-    }
+
+        // Coalesced cursor persist: at most one `remote.json` rewrite per
+        // interval, folding all the bumps since the last flush (0ef.11).
+        gate.maybe_flush(store, state);
+    };
+    // A reconnect-ending session: persist the final cursor before returning.
+    gate.flush(store, state);
+    end
 }
 
 /// Handle one app→relay message. Returns [`Sent::Broke`] if the socket broke.
@@ -1276,6 +1383,7 @@ fn handle_outbound(
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
+    gate: &mut CursorFlushGate,
     tuning: &ClientTuning,
     out: RemoteOutbound,
 ) -> Sent {
@@ -1336,13 +1444,16 @@ fn handle_outbound(
                 };
             }
             // Commit the high-water mark only once the send succeeded so a failed
-            // write never leaves a gap the peer's dedup would stall on.
+            // write never leaves a gap the peer's dedup would stall on. The disk
+            // write is debounced — under shell streaming this bumps many times a
+            // second, and a rewound outbound cursor self-heals via `seq_violation`
+            // resync, so it need not be durable per envelope (0ef.11).
             if let Some(p) = state.pairing_mut(&key) {
                 if seq > p.last_sent_seq {
                     p.last_sent_seq = seq;
                 }
             }
-            store.save(state);
+            gate.mark_dirty();
             Sent::Ok
         }
         RemoteOutbound::Ack { pairing_id, cursor } => {
@@ -1365,10 +1476,12 @@ fn handle_outbound(
         }
         RemoteOutbound::Unpair { pairing_id } => {
             // Local clear only (no relay-plane unpair frame in v1): drop the
-            // pairing so it is never resumed/activated again.
+            // pairing so it is never resumed/activated again. A lifecycle change —
+            // persist immediately and fold any pending cursor bump into it (0ef.11).
             let key = pairing_id.as_str().to_string();
             state.pairings.retain(|p| p.pairing_id != key);
             store.save(state);
+            gate.mark_clean();
             Sent::Ok
         }
     }
@@ -1379,6 +1492,7 @@ fn handle_frame(
     sock: &mut RelaySocket,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
+    gate: &mut CursorFlushGate,
     inbound_tx: &Sender<RemoteInbound>,
     frame: RelayFrame,
 ) -> bool {
@@ -1402,7 +1516,12 @@ fn handle_frame(
                 if let Some(p) = state.pairing_mut(&key) {
                     p.last_received_seq = env.seq;
                 }
-                store.save(state);
+                // Debounce the receipt-cursor persist (0ef.11). The auto-ack below
+                // is sent immediately, so the relay trims its queue regardless of
+                // when this cursor reaches disk: a hard-crash rewind just asks the
+                // relay (on resume) for envelopes it has already dropped, never
+                // re-delivering a duplicate to the app.
+                gate.mark_dirty();
                 let seq = env.seq;
                 let pairing_id = env.pairing_id.clone();
                 let _ = inbound_tx.send(RemoteInbound::Envelope(env));
@@ -1427,7 +1546,9 @@ fn handle_frame(
             if let Some(p) = state.pairing_mut(pairing_id.as_str()) {
                 if cursor > p.last_acked_by_peer {
                     p.last_acked_by_peer = cursor;
-                    store.save(state);
+                    // Debounced: peer-ack high-water is informational (relay queue
+                    // trimming), safe to lose the last interval on a crash (0ef.11).
+                    gate.mark_dirty();
                 }
             }
             true
@@ -1477,6 +1598,8 @@ fn handle_frame(
                 claim_token,
                 expires_at_ms,
             );
+            // persist_pairing_offer wrote the whole state; fold in any pending bump.
+            gate.mark_clean();
             true
         }
         RelayFrame::PairingClaimed {
@@ -1496,6 +1619,7 @@ fn handle_frame(
                     p.established = true;
                 }
                 store.save(state);
+                gate.mark_clean();
             }
             let _ = inbound_tx.send(RemoteInbound::PairingClaimed {
                 pairing_id,
@@ -1517,6 +1641,7 @@ fn handle_frame(
             let key = pairing_id.as_str().to_string();
             state.pairings.retain(|p| p.pairing_id != key);
             store.save(state);
+            gate.mark_clean();
             let _ = inbound_tx.send(RemoteInbound::PairingRevoked { pairing_id });
             true
         }
@@ -1541,6 +1666,7 @@ fn handle_frame(
                     p.last_sent_seq = 0;
                     p.last_acked_by_peer = 0;
                     store.save(state);
+                    gate.mark_clean();
                 }
                 let _ = inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
             }
