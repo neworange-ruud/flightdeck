@@ -115,8 +115,17 @@ extension Wire {
     /// A single frame on the relay plane. Internally tagged by `type`.
     enum RelayFrame: Codable, Hashable, Sendable {
         /// endpoint -> relay. First frame; opens version negotiation.
+        ///
+        /// `relayPassword` mirrors the Rust `RelayFrame::Hello.relay_password`
+        /// (remote-control-uq7): the OPTIONAL shared relay password. A relay
+        /// configured with a password gates admission on it (constant-time
+        /// compare, `error { auth_failed }` + close on a miss); a relay with no
+        /// password ignores the field. Encoded with `encodeIfPresent` so the
+        /// JSON key `relay_password` is OMITTED when `nil` — matching the Rust
+        /// `#[serde(skip_serializing_if = "Option::is_none")]`, which keeps an
+        /// unconfigured/local relay (and older clients) working unchanged.
         case hello(protocolVersion: UInt16, role: Role, deviceId: DeviceId,
-                   client: ClientInfo)
+                   client: ClientInfo, relayPassword: String?)
         /// relay -> endpoint. Accepts the connection at a negotiated version.
         case helloOk(protocolVersion: UInt16, serverTimeMs: Int64,
                      connectionId: String)
@@ -194,6 +203,7 @@ extension Wire {
         private enum CodingKeys: String, CodingKey {
             case type, role, client, nonce, signature, peer, state, cursor
             case token, environment, code, message, reason
+            case relayPassword = "relay_password"
             case machineName = "machine_name"
             case protocolVersion = "protocol_version"
             case deviceId = "device_id"
@@ -224,7 +234,8 @@ extension Wire {
                     protocolVersion: try c.decode(UInt16.self, forKey: .protocolVersion),
                     role: try c.decode(Role.self, forKey: .role),
                     deviceId: try c.decode(DeviceId.self, forKey: .deviceId),
-                    client: try c.decode(ClientInfo.self, forKey: .client))
+                    client: try c.decode(ClientInfo.self, forKey: .client),
+                    relayPassword: try c.decodeIfPresent(String.self, forKey: .relayPassword))
             case "hello_ok":
                 self = .helloOk(
                     protocolVersion: try c.decode(UInt16.self, forKey: .protocolVersion),
@@ -332,12 +343,17 @@ extension Wire {
         func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             switch self {
-            case let .hello(protocolVersion, role, deviceId, client):
+            case let .hello(protocolVersion, role, deviceId, client, relayPassword):
                 try c.encode("hello", forKey: .type)
                 try c.encode(protocolVersion, forKey: .protocolVersion)
                 try c.encode(role, forKey: .role)
                 try c.encode(deviceId, forKey: .deviceId)
                 try c.encode(client, forKey: .client)
+                // Omit `relay_password` entirely when nil (matches the Rust
+                // `skip_serializing_if`); a configured relay would reject a
+                // present-but-empty value, so absence — not "" — is the
+                // no-password signal an unconfigured relay accepts.
+                try c.encodeIfPresent(relayPassword, forKey: .relayPassword)
             case let .helloOk(protocolVersion, serverTimeMs, connectionId):
                 try c.encode("hello_ok", forKey: .type)
                 try c.encode(protocolVersion, forKey: .protocolVersion)

@@ -109,7 +109,13 @@ struct MainTabView: View {
         #endif
         _feedStore = State(initialValue: feed)
         _feedUnreadStore = State(initialValue: FeedUnreadStore.makeDefault())
-        _connectionBanner = State(initialValue: ReconnectingBannerModel(source: connectionSource ?? store))
+        // The banner reads the phone's live network path (remote-control-0ef.22
+        // / -seo) to tell "offline" from "relay unreachable", and forces an
+        // immediate reconnect of every machine on "Retry now" (remote-control-0ef.21).
+        _connectionBanner = State(initialValue: ReconnectingBannerModel(
+            source: connectionSource ?? store,
+            hasNetworkPath: { coordinator.isOnline },
+            onRetry: { await coordinator.reconnectAll() }))
     }
 
     var body: some View {
@@ -176,8 +182,15 @@ struct MainTabView: View {
             // Foreground → connect every paired machine; background → tear them
             // all down (cancel supervisors, close sockets). APNs push takes over
             // while backgrounded (remote-control-b8d.5 / epic connectivity model).
+            // Only `.background` tears down and only `.active` connects — the
+            // transient `.inactive` phase (Control Center pull, app-switcher
+            // glance, incoming call, Face ID prompt) is left untouched, avoiding
+            // reconnect churn (remote-control-0ef.3). Mirrors RootView's
+            // `.background`-only app-lock arming.
             .onChange(of: scenePhase) { _, phase in
-                Task { await coordinator.setForeground(phase == .active) }
+                if let active = ScenePhaseTransportGate.foregroundIntent(for: phase) {
+                    Task { await coordinator.setForeground(active) }
+                }
             }
             // Runtime add/remove: pairing a new machine spins up only its client;
             // unpairing one stops+disposes only that client (remote-control-b8d.7/.11).
@@ -210,6 +223,20 @@ struct MainTabView: View {
                 if let token = pushCoordinator.deviceTokenHex {
                     registerPushTokenEverywhere(token)
                 }
+                // Register the background wake performer (remote-control-0ef.4):
+                // a silent wake push while backgrounded runs this to reconnect
+                // the torn-down transport, replay queued envelopes, and schedule
+                // their notifications. Capture the live objects (not `self`, a
+                // recreated View value) so the stored closure stays valid.
+                let coordinator = self.coordinator
+                let scheduler = self.notificationScheduler
+                let preferences = self.notificationPreferences
+                pushCoordinator.registerWakeHandler { @MainActor in
+                    await Self.performBackgroundWake(
+                        coordinator: coordinator,
+                        scheduler: scheduler,
+                        preferences: preferences)
+                }
             }
 
             VStack(spacing: 0) {
@@ -230,6 +257,65 @@ struct MainTabView: View {
     /// No-op when nothing is paired.
     private func registerPushTokenEverywhere(_ token: String) {
         coordinator.registerPushToken(token, environment: pushCoordinator.environment)
+    }
+
+    /// The silent-wake-push performer (remote-control-0ef.4), run by
+    /// `PushCoordinator.handleWakePush` while the app is backgrounded and the
+    /// transport has been torn down. It reconnects every paired machine, waits a
+    /// bounded window for `resume`d envelopes to replay, schedules a local
+    /// notification for every freshly-decrypted event across ALL machines
+    /// (deduped by `event_id`, so a later foreground re-ingest is a no-op), then
+    /// tears the transport back down so the next foreground reconnects cleanly.
+    /// Returns whether the link came back live (drives the fetch result).
+    ///
+    /// Static (captures no `View`) so the closure stored on `PushCoordinator`
+    /// outlives any given `MainTabView` value. The reconnect-then-teardown here
+    /// is background-lifecycle behavior that can only be exercised on a real
+    /// device/simulator app-lifecycle, so it is integration-level, not unit
+    /// tested (the pieces it composes — reconnect, resume/snapshot, notification
+    /// scheduling — are each covered on their own).
+    @MainActor
+    private static func performBackgroundWake(
+        coordinator: TransportCoordinator,
+        scheduler: NotificationScheduler,
+        preferences: NotificationPreferences
+    ) async -> Bool {
+        // Reconnect every paired machine (they were stopped on background).
+        await coordinator.startAll()
+
+        // Bounded wait for the sockets to reach `auth_ok` — the background
+        // execution budget is short, so give up rather than hang if the phone
+        // still can't reach the relay.
+        let deadline = ContinuousClock.now + .seconds(12)
+        while ContinuousClock.now < deadline {
+            let stores = coordinator.stores
+            let allLive = !stores.isEmpty && stores.allSatisfy {
+                if case .connected = $0.linkState { return true }
+                return false
+            }
+            if allLive { break }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        // Let any `resume`d envelopes finish folding into `agentEvents`.
+        try? await Task.sleep(for: .milliseconds(500))
+
+        // Schedule notifications for every machine's events, stamped with the
+        // originating pairing so a tap deep-links to it.
+        for handle in coordinator.handles {
+            scheduler.ingest(
+                handle.store.agentEvents,
+                settings: preferences.settings,
+                pairingId: handle.pairingId)
+        }
+
+        let reachedLive = coordinator.stores.contains {
+            if case .connected = $0.linkState { return true }
+            return false
+        }
+        // Still backgrounded — tear back down so the next foreground reconnects
+        // from a clean state (APNs owns the wake in between).
+        await coordinator.stopAll()
+        return reachedLive
     }
 
     /// Whether the currently-selected tab has a chat route pushed (the tab

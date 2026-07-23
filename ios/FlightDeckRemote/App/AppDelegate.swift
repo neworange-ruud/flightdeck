@@ -53,12 +53,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        // A silent *wake* push (spec §11 step 1): the transport's own reconnect
-        // supervisor brings the link back and `resume`s the queued envelope,
-        // after which `NotificationScheduler` renders the real notification.
-        // Nothing content-bearing crosses the relay, so there is nothing to
-        // decode here.
-        completionHandler(.newData)
+        // A silent *wake* push (spec §11 step 1). While backgrounded the
+        // transport was torn down (`stopAll`), so nothing reconnects on its own
+        // — the wake performer must actively bring the link back, `resume` the
+        // queued envelopes, schedule the local notifications, and only THEN
+        // report completion (remote-control-0ef.4). Returning synchronously
+        // here (as before) let iOS re-suspend the app before any of that ran,
+        // making the whole background-notification model inert. Nothing
+        // content-bearing crosses the zero-knowledge relay, so there is nothing
+        // to decode from `userInfo`.
+        Task { @MainActor in
+            let result = await PushCoordinator.shared.handleWakePush()
+            completionHandler(result)
+        }
     }
 
     // MARK: - UNUserNotificationCenterDelegate

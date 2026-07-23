@@ -60,10 +60,11 @@ struct TranscriptRowView: View {
             ActivityPillView(index: row.index, summary: summary, detail: detail,
                              prose: body, kind: kind, isExpanded: isExpanded,
                              onToggle: onToggle)
-        case let .permissionPrompt(_, promptId, kind, command, options, allowFreeText, multiSelect, _):
+        case let .permissionPrompt(_, promptId, kind, command, options, allowFreeText, multiSelect, questions, _):
             PermissionPromptCard(promptId: promptId, kind: kind, command: command,
                                  options: options, allowFreeText: allowFreeText,
                                  multiSelect: multiSelect,
+                                 questions: questions,
                                  isPending: isPending,
                                  actionState: permissionState,
                                  isActionable: permissionActionable,
@@ -260,6 +261,12 @@ struct PermissionPromptCard: View {
     /// Whether the prompt is a checklist (several options selected then submitted
     /// together) rather than a single tap-to-submit choice.
     let multiSelect: Bool
+    /// All questions of a multi-question tabbed form (Claude AskUserQuestion with
+    /// several questions). Empty (or single-element) for a plain single-question
+    /// prompt, in which case the flat `command`/`options`/`multiSelect` fields
+    /// drive the classic rendering. When `count > 1` the card renders a tabbed
+    /// multi-question form with one Submit.
+    let questions: [Wire.PromptQuestion]
     let isPending: Bool
     let actionState: PermissionActionState
     /// Whether the options are live (current prompt + link up + no decision yet).
@@ -274,6 +281,15 @@ struct PermissionPromptCard: View {
     /// The set of option indices toggled on in a multi-select checklist. Local
     /// to the card; a fresh prompt row starts with nothing selected.
     @State private var multiSelected: Set<Int> = []
+    /// The active tab in a multi-question form (index into `questions`).
+    @State private var activeQuestion: Int = 0
+    /// Per-question selected option indices in a multi-question form, keyed by
+    /// question index. Local to the card; a fresh prompt row starts empty.
+    @State private var perQuestionSelected: [Int: Set<Int>] = [:]
+
+    /// Whether this prompt carries several questions to render as a tabbed form
+    /// (vs. the classic single-question rendering driven by the flat fields).
+    private var isMultiQuestion: Bool { questions.count > 1 }
 
     /// Keep the original 2-button horizontal Allow/Deny layout only for the
     /// classic binary permission shape (visual continuity); every other shape
@@ -299,16 +315,21 @@ struct PermissionPromptCard: View {
                 .foregroundStyle(Theme.accent)
                 .textCase(.uppercase)
 
-            Text(command)
-                .typography(kind == .question ? Typography.bodyMedium : Typography.monoMedium)
-                .foregroundStyle(Theme.textPrimary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(Theme.Spacing.sm)
-                .background(
-                    RoundedRectangle(cornerRadius: Theme.Radius.card - 6, style: .continuous)
-                        .fill(Theme.bgField)
-                )
+            // A multi-question form renders each question's text inside the
+            // tabbed form; the flat `command` (which mirrors questions[0]) would
+            // duplicate the first question, so it's only shown single-question.
+            if !isMultiQuestion {
+                Text(command)
+                    .typography(kind == .question ? Typography.bodyMedium : Typography.monoMedium)
+                    .foregroundStyle(Theme.textPrimary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(Theme.Spacing.sm)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Radius.card - 6, style: .continuous)
+                            .fill(Theme.bgField)
+                    )
+            }
 
             resolution
         }
@@ -377,18 +398,193 @@ struct PermissionPromptCard: View {
     /// list for N options — plus the free-text affordance when offered.
     @ViewBuilder
     private var optionsSection: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            if multiSelect {
-                checklist
-            } else if isBinaryPermission {
-                buttons
-            } else {
-                optionList
-            }
-            if allowFreeText {
-                freeTextAffordance
+        if isMultiQuestion {
+            multiQuestionForm
+        } else {
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                if multiSelect {
+                    checklist
+                } else if isBinaryPermission {
+                    buttons
+                } else {
+                    optionList
+                }
+                if allowFreeText {
+                    freeTextAffordance
+                }
             }
         }
+    }
+
+    // MARK: Multi-question tabbed form
+
+    /// Whether a multi-question answer is currently being submitted (drives the
+    /// spinner on the form's Submit button).
+    private var answersInFlight: Bool {
+        if case .sending(.answers) = actionState { return true }
+        return false
+    }
+
+    /// A native tabbed multi-question form: a tab bar (one tab per question,
+    /// checkmarked once answered), the active question's text + options (radio
+    /// for single-select, checkboxes for multi-select), and a single Submit that
+    /// builds one `QuestionAnswer` per question, in the prompt's question order.
+    private var multiQuestionForm: some View {
+        let active = min(max(activeQuestion, 0), questions.count - 1)
+        return VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+            questionTabBar(active: active)
+            questionPane(index: active, question: questions[active])
+            multiQuestionSubmit
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("permission-multi-question")
+    }
+
+    /// The horizontal tab bar. Each tab shows the question's `header` (or
+    /// "Question N") and a check once that question has a selection.
+    private func questionTabBar(active: Int) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Spacing.sm) {
+                ForEach(Array(questions.enumerated()), id: \.offset) { index, question in
+                    let isActive = index == active
+                    let answered = !(perQuestionSelected[index]?.isEmpty ?? true)
+                    Button {
+                        activeQuestion = index
+                    } label: {
+                        HStack(spacing: Theme.Spacing.xxs) {
+                            if answered {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 12))
+                            }
+                            Text(tabLabel(index: index, question: question))
+                                .typography(Typography.captionBold)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, Theme.Spacing.sm)
+                        .padding(.vertical, Theme.Spacing.xs)
+                        .foregroundStyle(isActive ? Theme.bgDeep : Theme.textPrimary)
+                        .background(
+                            RoundedRectangle(cornerRadius: Theme.Radius.card - 6, style: .continuous)
+                                .fill(isActive ? Theme.accent : Theme.bgRaised)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!isActionable)
+                    .accessibilityIdentifier("permission-tab-\(index)")
+                    .accessibilityAddTraits(isActive ? .isSelected : [])
+                }
+            }
+        }
+    }
+
+    private func tabLabel(index: Int, question: Wire.PromptQuestion) -> String {
+        if let header = question.header, !header.isEmpty { return header }
+        return "Question \(index + 1)"
+    }
+
+    /// The active question's text plus its options as a selectable list.
+    private func questionPane(index: Int, question: Wire.PromptQuestion) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Text(question.question)
+                .typography(Typography.bodyMedium)
+                .foregroundStyle(Theme.textPrimary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(question.options, id: \.index) { option in
+                let selected = perQuestionSelected[index]?.contains(option.index) ?? false
+                Button {
+                    toggle(question: index, option: option.index, multiSelect: question.multiSelect)
+                } label: {
+                    HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                        Image(systemName: optionSymbol(selected: selected,
+                                                       multiSelect: question.multiSelect))
+                            .font(.system(size: 20))
+                            .foregroundStyle(selected ? Theme.accent : Theme.textMuted)
+                        VStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                            Text(option.label)
+                                .typography(Typography.bodyMedium)
+                                .foregroundStyle(Theme.textPrimary)
+                                .multilineTextAlignment(.leading)
+                            if let description = option.description, !description.isEmpty {
+                                Text(description)
+                                    .typography(Typography.caption)
+                                    .foregroundStyle(Theme.textMuted)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(Theme.Spacing.sm)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                        .fill(Theme.bgRaised)
+                )
+                .disabled(!isActionable)
+                .accessibilityIdentifier("permission-q\(index)-option-\(option.index)")
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+    }
+
+    /// Symbol for an option row: checkbox for multi-select, radio for single.
+    private func optionSymbol(selected: Bool, multiSelect: Bool) -> String {
+        if multiSelect {
+            return selected ? "checkmark.square.fill" : "square"
+        }
+        return selected ? "largecircle.fill.circle" : "circle"
+    }
+
+    /// Toggle a question's option. Multi-select adds/removes; single-select
+    /// replaces (radio behaviour).
+    private func toggle(question: Int, option: Int, multiSelect: Bool) {
+        var set = perQuestionSelected[question] ?? []
+        if multiSelect {
+            if set.contains(option) { set.remove(option) } else { set.insert(option) }
+        } else {
+            set = [option]
+        }
+        perQuestionSelected[question] = set
+    }
+
+    /// The single control that submits every question's selection as one
+    /// `answers` array (one entry per question, in question order — unanswered
+    /// questions send an empty selection).
+    private var multiQuestionSubmit: some View {
+        Button {
+            let perQuestion: [[Int]] = questions.enumerated().map { index, question in
+                let selected = perQuestionSelected[index] ?? []
+                return question.options.map(\.index).filter { selected.contains($0) }
+            }
+            let labels: [[String]] = questions.enumerated().map { index, question in
+                let selected = perQuestionSelected[index] ?? []
+                return question.options.filter { selected.contains($0.index) }.map(\.label)
+            }
+            onDecide(.answers(perQuestion: perQuestion, labels: labels))
+        } label: {
+            ZStack {
+                Text("Submit answers")
+                    .typography(Typography.bodyMedium)
+                    .opacity(answersInFlight ? 0 : 1)
+                if answersInFlight {
+                    WorkingSpinner(size: 16, lineWidth: 2, color: Theme.bgDeep)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, Theme.Spacing.sm)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Theme.bgDeep)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.card - 4, style: .continuous)
+                .fill(Theme.accent)
+        )
+        .disabled(!isActionable)
+        .accessibilityIdentifier("permission-submit")
     }
 
     /// The answer currently being submitted from the checklist, if any (used to

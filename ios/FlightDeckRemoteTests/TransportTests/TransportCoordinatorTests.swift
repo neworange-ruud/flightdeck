@@ -57,7 +57,27 @@ import CryptoKit
     /// identity + KA key. `pairingStore`, when supplied, arms the machine-name
     /// write-back (remote-control-b8d.9) — omitted by every OTHER test in this
     /// file so their assertions are unaffected.
-    private func makeHarness(pairingIds: [String], cap: Int = 4, pairingStore: PairingStore? = nil) throws -> Harness {
+    /// A test-controllable `NetworkPathMonitoring` — the test drives path
+    /// changes explicitly and can assert start/cancel bookkeeping
+    /// (remote-control-0ef.22).
+    @MainActor
+    final class ControllableNetworkMonitor: NetworkPathMonitoring {
+        var isSatisfied: Bool
+        var onPathChange: (@MainActor (Bool) -> Void)?
+        private(set) var startCount = 0
+        private(set) var cancelCount = 0
+        init(isSatisfied: Bool = true) { self.isSatisfied = isSatisfied }
+        func start() { startCount += 1 }
+        func cancel() { cancelCount += 1 }
+        /// Simulate connectivity restored / a cell↔wifi interface switch.
+        func firePathChange(satisfied: Bool = true) {
+            isSatisfied = satisfied
+            onPathChange?(satisfied)
+        }
+    }
+
+    private func makeHarness(pairingIds: [String], cap: Int = 4, pairingStore: PairingStore? = nil,
+                             networkMonitor: (any NetworkPathMonitoring)? = nil) throws -> Harness {
         let keychain = InMemoryKeychainStore()
         let identity = try DeviceIdentity.loadOrCreate(store: keychain)
         let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
@@ -92,6 +112,7 @@ import CryptoKit
             cap: cap,
             clientConfig: config,
             pairingStore: pairingStore,
+            networkMonitor: networkMonitor,
             now: { 1_752_000_100_000 }
         )
         return Harness(
@@ -300,6 +321,64 @@ import CryptoKit
         #expect(!(await h.book.channels[1].isClosed()))
         let liveB = await h.coordinator.client(for: "pair_b")!.currentLinkState()
         #expect({ if case .connected = liveB { return true }; return false }())
+    }
+
+    // MARK: - Retry now / network-restored reconnect (remote-control-0ef.21/.22)
+
+    @Test func reconnectAllDropsEveryLiveSocket() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // "Retry now" forces every live client to drop its socket and reconnect.
+        await h.coordinator.reconnectAll()
+
+        for index in h.instances.indices {
+            _ = await waitUntil { await h.book.channels[index].isClosed() }
+            #expect(await h.book.channels[index].isClosed())
+        }
+    }
+
+    @Test func networkRestoredForcesReconnectWhileForegrounded() async throws {
+        let monitor = ControllableNetworkMonitor()
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], networkMonitor: monitor)
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        #expect(monitor.startCount >= 1) // monitor armed on foreground
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // Connectivity restored / interface switch → every live socket dropped
+        // and reconnected proactively (remote-control-0ef.22).
+        monitor.firePathChange(satisfied: true)
+        for index in h.instances.indices {
+            _ = await waitUntil { await h.book.channels[index].isClosed() }
+            #expect(await h.book.channels[index].isClosed())
+        }
+
+        await h.coordinator.setForeground(false)
+        #expect(monitor.cancelCount >= 1) // monitor stopped on background
+    }
+
+    @Test func networkChangeWhileBackgroundedDoesNotReconnect() async throws {
+        let monitor = ControllableNetworkMonitor()
+        let h = try makeHarness(pairingIds: ["pair_a"], networkMonitor: monitor)
+        h.coordinator.installInitialInstances(h.instances)
+        // Never foregrounded → the client was never started, so a path change
+        // must not connect or reconnect anything (APNs owns the wake while
+        // backgrounded; the handler is guarded on `isForeground`). The channel
+        // object is created eagerly at handle-build time, but it must have seen
+        // no `connect` activity: no frames sent, not closed.
+        monitor.firePathChange(satisfied: true)
+        try? await Task.sleep(for: .milliseconds(50))
+        for channel in h.book.channels {
+            #expect(await channel.sentFrames().isEmpty)
+            #expect(!(await channel.isClosed()))
+        }
     }
 
     // MARK: - Shared device keys across clients

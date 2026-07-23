@@ -51,6 +51,11 @@ enum PermissionAnswer: Equatable, Sendable {
     /// The selected options of a multi-select (checklist) Question, by index —
     /// `labels` (in the same order as `indices`) are carried for display only.
     case options(indices: [Int], labels: [String])
+    /// The per-question answers of a MULTI-question tabbed form. `perQuestion[i]`
+    /// holds question i's selected 0-based option indices, in the prompt's
+    /// question order (empty leaves that question unanswered); `labels[i]` are
+    /// those options' labels, carried for display only.
+    case answers(perQuestion: [[Int]], labels: [[String]])
     /// A typed "Type your own answer" reply.
     case freeText(String)
 
@@ -64,6 +69,9 @@ enum PermissionAnswer: Equatable, Sendable {
             return "Answered “\(label)” ✓"
         case let .options(_, labels):
             return "Answered “\(labels.joined(separator: ", "))” ✓"
+        case let .answers(_, labels):
+            let parts = labels.map { $0.isEmpty ? "—" : $0.joined(separator: ", ") }
+            return "Answered \(parts.joined(separator: " · ")) ✓"
         case let .freeText(text):
             return "Answered “\(text)” ✓"
         }

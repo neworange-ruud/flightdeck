@@ -143,6 +143,13 @@ final class TransportStore {
         await client.start()
     }
 
+    /// Force an immediate reconnect (remote-control-0ef.21 "Retry now"): resets
+    /// the backoff schedule and drops any stuck/dead socket so the transport
+    /// reconnects now instead of waiting out the current attempt/backoff.
+    func reconnectNow() async {
+        await client.reconnectNow()
+    }
+
     /// Stop the transport and tear down the event bridge.
     func stop() async {
         await client.stop()

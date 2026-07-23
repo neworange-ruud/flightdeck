@@ -135,6 +135,83 @@ import CryptoKit
         #expect(record.salt != secretBytes)
     }
 
+    // MARK: - Shared relay password (remote-control-uq7)
+
+    /// A captured relay password rides the pairing `hello` (pairing runs over
+    /// the relay) and is PERSISTED on success so later reconnects present it.
+    @Test func relayPasswordIsSentInHelloAndPersistedOnSuccess() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        let relayPasswordStore = RelayPasswordStore(store: keychain)
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: recordStore,
+            identityStore: keychain,
+            relayPasswordStore: relayPasswordStore,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5))
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_pw_1"),
+            peerDeviceId: Wire.DeviceId("desk_1"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_pw_1")]))
+
+        _ = try await service.pair(
+            with: .code("4729", relayURL: URL(string: "wss://relay.example/v1")!),
+            relayPassword: "  hunter2 ") // surrounding whitespace must be trimmed
+
+        let sent = await channel.sentFrames()
+        let hello = try #require(sent.first { if case .hello = $0 { return true }; return false })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == "hunter2")
+        // Persisted for reconnects.
+        #expect(relayPasswordStore.load() == "hunter2")
+    }
+
+    /// A blank/absent relay password (local/dev relay) presents NOTHING — the
+    /// hello omits `relay_password` — so an unconfigured relay is unaffected.
+    @Test func noRelayPasswordOmitsItFromHello() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let relayPasswordStore = RelayPasswordStore(store: keychain)
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: PairingRecordStore(store: keychain),
+            identityStore: keychain,
+            relayPasswordStore: relayPasswordStore,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5))
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_pw_2"),
+            peerDeviceId: Wire.DeviceId("desk_2"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_pw_2")]))
+
+        // Blank string → treated as no password.
+        _ = try await service.pair(
+            with: .code("4729", relayURL: URL(string: "wss://relay.example/v1")!),
+            relayPassword: "   ")
+
+        let sent = await channel.sentFrames()
+        let hello = try #require(sent.first { if case .hello = $0 { return true }; return false })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == nil)
+        #expect(relayPasswordStore.load() == nil, "nothing persisted for a no-password relay")
+    }
+
     @Test func codeRejectionMapsToInvalidCode() async throws {
         let keychain = InMemoryKeychainStore()
         let channel = ScriptedChannel()

@@ -43,6 +43,7 @@ final class FakeChatSender: ChatCommandSending {
 @MainActor
 final class FakeConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState
+    var peerConnected: Bool?
     init(_ linkState: RemoteLinkState = .connected(latencyMs: 5)) {
         self.linkState = linkState
     }

@@ -38,6 +38,16 @@ final class PushCoordinator {
     /// owns it.
     weak var router: AppRouter?
 
+    /// The background wake performer, registered by `MainTabView` (which owns
+    /// the live `TransportCoordinator` + `NotificationScheduler`). A silent wake
+    /// push (spec §11 step 1, remote-control-0ef.4) runs this to reconnect the
+    /// backgrounded-and-torn-down transport, let queued envelopes replay,
+    /// schedule their local notifications, and tear back down — all before the
+    /// background execution window closes. `nil` until the paired UI mounts and
+    /// registers it (an unpaired app has nothing to wake). Returns whether any
+    /// new data was fetched (drives the `UIBackgroundFetchResult`).
+    private var wakeHandler: (@MainActor () async -> Bool)?
+
     private let center: UNUserNotificationCenter
 
     init(center: UNUserNotificationCenter = .current()) {
@@ -47,6 +57,23 @@ final class PushCoordinator {
     /// Attach the app's router so notification taps can navigate.
     func attach(router: AppRouter) {
         self.router = router
+    }
+
+    /// Register the background wake performer (remote-control-0ef.4). Called by
+    /// `MainTabView` once its live transport is wired; overwriting on remount is
+    /// fine (the newest coordinator wins). See `wakeHandler`.
+    func registerWakeHandler(_ handler: @escaping @MainActor () async -> Bool) {
+        self.wakeHandler = handler
+    }
+
+    /// Handle a silent wake push (spec §11 step 1, remote-control-0ef.4): run
+    /// the registered wake performer to completion (reconnect → resume/fetch →
+    /// schedule notifications → tear down) and report the fetch result. With no
+    /// handler registered (unpaired, or the UI not yet mounted) there is nothing
+    /// to wake, so `.noData`.
+    func handleWakePush() async -> UIBackgroundFetchResult {
+        guard let wakeHandler else { return .noData }
+        return await wakeHandler() ? .newData : .noData
     }
 
     /// Ask for notification authorization and, if granted, register for remote

@@ -56,6 +56,12 @@ struct PairingView: View {
     }
 
     @State private var code: String = ""
+    /// The OPTIONAL shared relay password (remote-control-uq7). Captured here
+    /// because pairing runs over the relay, so a password-gated relay needs it
+    /// up front (in the pairing `hello`). Blank ⇒ present nothing, so
+    /// local/dev relays with no password keep working — this field never
+    /// gates the "Pair" button.
+    @State private var relayPassword: String = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var isPresentingScanner = false
@@ -105,6 +111,8 @@ struct PairingView: View {
                     codeEntrySection
                         .padding(.top, Theme.Spacing.sm)
                         .modifier(ShakeEffect(animatableData: shakeTrigger))
+
+                    relayPasswordSection
 
                     if let displayedMessage {
                         Text(displayedMessage)
@@ -272,6 +280,34 @@ struct PairingView: View {
             .accessibilityIdentifier("code-digit-box-\(index)")
     }
 
+    /// OPTIONAL relay-password entry (remote-control-uq7). A `SecureField` so
+    /// the shared secret is masked and never captured in a screenshot; left
+    /// blank for a local/dev relay that isn't password-gated. It never gates
+    /// the "Pair" button — an empty value simply presents no password.
+    private var relayPasswordSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            SecureField("Relay password (optional)", text: $relayPassword)
+                .textContentType(.password)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .disabled(isLoading)
+                .typography(Typography.body)
+                .foregroundStyle(Theme.textPrimary)
+                .padding(.horizontal, Theme.Spacing.md)
+                .padding(.vertical, Theme.Spacing.md)
+                .background(Theme.bgField, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                        .strokeBorder(Theme.text.opacity(0.12), lineWidth: 1)
+                )
+                .accessibilityIdentifier("relay-password-field")
+
+            Text("Leave blank unless your relay requires a shared password.")
+                .typography(Typography.caption)
+                .foregroundStyle(Theme.textMutedDark)
+        }
+    }
+
     private var pairButton: some View {
         Button {
             Task { await pair(with: .code(code, relayURL: PairingDefaults.relayURL)) }
@@ -365,7 +401,14 @@ struct PairingView: View {
         defer { isLoading = false }
 
         do {
-            let device = try await service.pair(with: input)
+            // Present the captured relay password (remote-control-uq7) in the
+            // pairing handshake; blank ⇒ nil, so a no-password relay is
+            // unaffected. The real service persists it on success for reconnects.
+            let trimmedPassword = relayPassword.trimmingCharacters(in: .whitespaces)
+            let device = try await service.pair(
+                with: input,
+                relayPassword: trimmedPassword.isEmpty ? nil : trimmedPassword
+            )
             pairingStore.completePairing(with: device)
             // No further UI work for the onboarding case: RootView swaps
             // this screen out the instant `pairingStore.hasAnyPairing` flips

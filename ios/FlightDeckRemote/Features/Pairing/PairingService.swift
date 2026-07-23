@@ -64,7 +64,13 @@ struct PairedDevice: Equatable {
 ///     shows the error's `errorDescription` verbatim (PRD §8 connection
 ///     honesty: no silent/generic failures).
 protocol PairingServicing {
-    func pair(with input: PairingInput) async throws -> PairedDevice
+    /// Redeem `input` against the relay. `relayPassword` is the OPTIONAL shared
+    /// relay password (remote-control-uq7) captured on the pairing screen —
+    /// pairing runs over the relay, so a password-gated relay needs it up front,
+    /// in the pairing `hello`. `nil` (unconfigured/local relay) presents no
+    /// password. A relay-backed implementation persists it (Keychain) so every
+    /// later reconnect can present it too.
+    func pair(with input: PairingInput, relayPassword: String?) async throws -> PairedDevice
 }
 
 /// Stand-in `PairingServicing` used until the relay transport (a separate
@@ -83,7 +89,10 @@ struct MockPairingService: PairingServicing {
     /// Simulated relay round-trip latency.
     var delay: Duration = .seconds(1)
 
-    func pair(with input: PairingInput) async throws -> PairedDevice {
+    /// `relayPassword` is accepted for protocol conformance but ignored — the
+    /// mock never opens a socket, so there is no relay to gate. Defaulted so
+    /// the existing concrete-typed test call sites (`pair(with:)`) still compile.
+    func pair(with input: PairingInput, relayPassword: String? = nil) async throws -> PairedDevice {
         try await Task.sleep(for: delay)
 
         switch input {

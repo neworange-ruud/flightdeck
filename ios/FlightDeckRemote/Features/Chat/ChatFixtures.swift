@@ -97,6 +97,7 @@ enum ChatFixtures {
                 ],
                 allowFreeText: false,
                 multiSelect: false,
+                questions: [],
                 atMs: base + 20 * 60 * 1000 + 8_000),
         ]
     }

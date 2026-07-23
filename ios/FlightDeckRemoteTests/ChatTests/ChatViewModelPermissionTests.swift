@@ -56,13 +56,14 @@ import Foundation
 
         #expect(model.permissionActionState(promptId) == .sending(.choice(.allowOnce)))
         #expect(sender.sends.count == 1)
-        if case let .permissionDecision(sessionId, pid, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body {
+        if case let .permissionDecision(sessionId, pid, choice, optionIndex, optionIndices, freeText, answers) = sender.sends.first?.body {
             #expect(sessionId == Wire.SessionId("s1"))
             #expect(pid == promptId)
             #expect(choice == .allowOnce)
             #expect(optionIndex == nil)
             #expect(optionIndices == nil)
             #expect(freeText == nil)
+            #expect(answers == nil)
         } else {
             Issue.record("expected .permissionDecision")
         }
@@ -120,13 +121,14 @@ import Foundation
         model.decidePermission(promptId: promptId, optionIndex: 2, label: "Redis")
 
         #expect(model.permissionActionState(promptId) == .sending(.option(index: 2, label: "Redis")))
-        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText, answers) = sender.sends.first?.body else {
             Issue.record("expected .permissionDecision"); return
         }
         #expect(choice == nil)
         #expect(optionIndex == 2)
         #expect(optionIndices == nil)
         #expect(freeText == nil)
+        #expect(answers == nil)
     }
 
     @Test func decideOptionIndicesSendsOptionIndicesNotOptionIndex() {
@@ -136,13 +138,14 @@ import Foundation
 
         #expect(model.permissionActionState(promptId)
                 == .sending(.options(indices: [0, 2], labels: ["Tests", "Fmt"])))
-        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText, answers) = sender.sends.first?.body else {
             Issue.record("expected .permissionDecision"); return
         }
         #expect(choice == nil)
         #expect(optionIndex == nil)
         #expect(optionIndices == [0, 2])
         #expect(freeText == nil)
+        #expect(answers == nil)
     }
 
     @Test func decideOptionIndicesIgnoresEmptySelection() {
@@ -158,13 +161,57 @@ import Foundation
 
         #expect(model.permissionActionState(promptId)
                 == .sending(.freeText("Use CockroachDB instead.")))
-        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText) = sender.sends.first?.body else {
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText, answers) = sender.sends.first?.body else {
             Issue.record("expected .permissionDecision"); return
         }
         #expect(choice == nil)
         #expect(optionIndex == nil)
         #expect(optionIndices == nil)
         #expect(freeText == "Use CockroachDB instead.")
+        #expect(answers == nil)
+    }
+
+    // MARK: - Multi-question (tabbed form) decisions
+
+    @Test func decideAnswersSendsAnswersArrayAndNoSingleQuestionFields() {
+        let (model, sender) = makeModel()
+        // Two questions: Q0 single-select picks index 1; Q1 multi-select picks 0 & 2.
+        model.decidePermission(promptId: promptId,
+                               answers: [[1], [0, 2]],
+                               labels: [["SQLite"], ["Tests", "Clippy"]])
+
+        #expect(model.permissionActionState(promptId)
+                == .sending(.answers(perQuestion: [[1], [0, 2]],
+                                     labels: [["SQLite"], ["Tests", "Clippy"]])))
+        guard case let .permissionDecision(_, _, choice, optionIndex, optionIndices, freeText, answers) = sender.sends.first?.body else {
+            Issue.record("expected .permissionDecision"); return
+        }
+        // The multi-question form supersedes every single-question field.
+        #expect(choice == nil)
+        #expect(optionIndex == nil)
+        #expect(optionIndices == nil)
+        #expect(freeText == nil)
+        // One `QuestionAnswer` per question, in question order, carrying that
+        // question's selected indices.
+        #expect(answers == [
+            Wire.QuestionAnswer(optionIndices: [1]),
+            Wire.QuestionAnswer(optionIndices: [0, 2]),
+        ])
+    }
+
+    @Test func decideAnswersPreservesUnansweredQuestionsAsEmpty() {
+        let (model, sender) = makeModel()
+        // Q0 answered, Q1 left unanswered (empty selection).
+        model.decidePermission(promptId: promptId,
+                               answers: [[0], []],
+                               labels: [["Postgres"], []])
+        guard case let .permissionDecision(_, _, _, _, _, _, answers) = sender.sends.first?.body else {
+            Issue.record("expected .permissionDecision"); return
+        }
+        #expect(answers == [
+            Wire.QuestionAnswer(optionIndices: [0]),
+            Wire.QuestionAnswer(optionIndices: []),
+        ])
     }
 
     @Test func decideFreeTextIgnoresBlankText() {

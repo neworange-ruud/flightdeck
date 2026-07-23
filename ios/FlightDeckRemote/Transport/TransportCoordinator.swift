@@ -115,6 +115,12 @@ final class TransportCoordinator {
     private let cacheFactory: @MainActor @Sendable (String) -> SnapshotCache?
     private let clientConfig: TransportClient.Config
     private let now: @Sendable () -> Int64
+    /// Network-path monitor (remote-control-0ef.22): on connectivity restored /
+    /// a cell↔wifi switch it forces an immediate reconnect of every live client
+    /// rather than waiting out the current attempt/backoff. Defaults to a no-op
+    /// (unit tests never touch the system monitor); the production factory
+    /// injects a real `NetworkPathMonitor`.
+    private let networkMonitor: any NetworkPathMonitoring
 
     /// Whether the app is currently foregrounded. Drives whether a newly-added
     /// client starts immediately (`reconcile`) or waits for the next foreground.
@@ -144,6 +150,7 @@ final class TransportCoordinator {
         cap: Int = PairingLimits.maxPairedInstances,
         clientConfig: TransportClient.Config = TransportClient.Config(),
         pairingStore: PairingStore? = nil,
+        networkMonitor: (any NetworkPathMonitoring)? = nil,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
         self.identity = identity
@@ -154,6 +161,7 @@ final class TransportCoordinator {
         self.cap = cap
         self.clientConfig = clientConfig
         self.pairingStore = pairingStore
+        self.networkMonitor = networkMonitor ?? NoopNetworkPathMonitor()
         self.now = now
         // A recordless store (pairingId that can never match a stored record):
         // its client's supervisor loads nothing and stays disconnected.
@@ -173,7 +181,21 @@ final class TransportCoordinator {
         if pairingStore != nil {
             armMachineNameObservation()
         }
+        // Force an immediate reconnect when the network path is restored /
+        // switches (remote-control-0ef.22) — only while foregrounded (the
+        // clients are torn down in the background; APNs push wakes them there).
+        self.networkMonitor.onPathChange = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isForeground else { return }
+                await self.reconnectAll()
+            }
+        }
     }
+
+    /// Whether the phone currently has a usable network path
+    /// (remote-control-0ef.22 / -seo). Read by the reconnect banner to
+    /// distinguish "phone is offline" from "relay unreachable".
+    var isOnline: Bool { networkMonitor.isSatisfied }
 
     // MARK: - Machine-name write-back (remote-control-b8d.9)
 
@@ -344,9 +366,12 @@ final class TransportCoordinator {
     }
 
     /// Start every client's supervisor (connect all). Idempotent — each
-    /// `TransportStore.start()` is a no-op if already started.
+    /// `TransportStore.start()` is a no-op if already started. Also starts the
+    /// network-path monitor (remote-control-0ef.22) so a connectivity change
+    /// while foregrounded forces an immediate reconnect.
     func startAll() async {
         isForeground = true
+        networkMonitor.start()
         for handle in handles {
             await handle.store.start()
         }
@@ -354,10 +379,22 @@ final class TransportCoordinator {
 
     /// Stop every client: cancel supervisors, close every `URLSessionWebSocketTask`,
     /// and tear down each store's event bridge. On return, no socket lingers.
+    /// Also stops the network-path monitor (no proactive reconnects while
+    /// backgrounded — APNs push owns the wake there).
     func stopAll() async {
         isForeground = false
+        networkMonitor.cancel()
         for handle in handles {
             await handle.store.stop()
+        }
+    }
+
+    /// Force an immediate reconnect of every live client (remote-control-0ef.21
+    /// "Retry now" / remote-control-0ef.22 network-restored): resets each
+    /// client's backoff and drops any stuck/dead socket so it reconnects now.
+    func reconnectAll() async {
+        for handle in handles {
+            await handle.store.reconnectNow()
         }
     }
 

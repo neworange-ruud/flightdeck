@@ -110,6 +110,7 @@ final class ScriptedShellCommandSender: ShellCommandSending {
 @MainActor
 final class ShellFixtureConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState
+    var peerConnected: Bool?
     init(linkState: RemoteLinkState = .connected(latencyMs: 8)) {
         self.linkState = linkState
     }

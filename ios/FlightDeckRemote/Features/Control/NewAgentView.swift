@@ -428,6 +428,7 @@ struct NewAgentView: View {
 @MainActor
 private final class NewAgentFallbackConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState = .disconnected
+    var peerConnected: Bool?
 }
 
 #if DEBUG
