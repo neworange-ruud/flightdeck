@@ -93,7 +93,12 @@ enum TransportStoreFactory {
             // `pairingStore` the caller passed in, so a Mac rename +
             // reconnect auto-updates `PairedInstance.machineNameFromDesktop`
             // app-wide (remote-control-b8d.9).
-            pairingStore: pairingStore
+            pairingStore: pairingStore,
+            // Real network-path monitoring (remote-control-0ef.22): a cell↔wifi
+            // switch or connectivity-restored event forces an immediate
+            // reconnect instead of waiting out the backoff. Skipped under
+            // `-uitest*` so tests never depend on the simulator's live path.
+            networkMonitor: isUITestLaunch ? NoopNetworkPathMonitor() : NetworkPathMonitor()
         )
         if !isUITestLaunch {
             seedLegacyInstanceIfNeeded(into: pairingStore, recordStore: recordStore)

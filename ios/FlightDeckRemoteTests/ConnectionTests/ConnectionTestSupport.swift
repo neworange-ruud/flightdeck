@@ -14,8 +14,10 @@ import Foundation
 @MainActor
 final class FakeConnectionStatusSource: ConnectionStatusSource {
     var linkState: RemoteLinkState
+    var peerConnected: Bool?
 
-    init(_ linkState: RemoteLinkState = .disconnected) {
+    init(_ linkState: RemoteLinkState = .disconnected, peerConnected: Bool? = nil) {
         self.linkState = linkState
+        self.peerConnected = peerConnected
     }
 }

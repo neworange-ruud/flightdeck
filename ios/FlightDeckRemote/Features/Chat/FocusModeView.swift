@@ -246,8 +246,8 @@ struct FocusModeView: View {
                 model.decidePermission(promptId: promptId, choice: choice)
             case let .option(index, label):
                 model.decidePermission(promptId: promptId, optionIndex: index, label: label)
-            case .options, .freeText:
-                break // single-tap buttons never carry a multi-select or free-text answer
+            case .options, .answers, .freeText:
+                break // single-tap buttons never carry a multi-select, multi-question, or free-text answer
             }
         } label: {
             ZStack {

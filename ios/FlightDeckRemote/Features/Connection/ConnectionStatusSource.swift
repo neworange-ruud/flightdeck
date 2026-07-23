@@ -18,6 +18,11 @@ import Foundation
 protocol ConnectionStatusSource: AnyObject {
     /// The current relay link state (PRD §5.8/§8: connection honesty).
     var linkState: RemoteLinkState { get }
+    /// Whether the peer (desktop) is currently present, or `nil` if unknown
+    /// (not yet reported, or the phone↔relay link isn't up). Lets the
+    /// reconnecting banner tell "relay reachable but the Mac is absent" apart
+    /// from "the phone can't reach the relay at all" (remote-control-seo).
+    var peerConnected: Bool? { get }
 }
 
 extension TransportStore: ConnectionStatusSource {}

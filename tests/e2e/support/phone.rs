@@ -240,6 +240,7 @@ impl PhoneDriver {
                 platform: "test".into(),
                 os_version: None,
             },
+            relay_password: None,
         });
         match conn.recv_expect(deadline, "hello_ok") {
             RelayFrame::HelloOk {
@@ -557,6 +558,7 @@ mod tests {
                 platform: "test".into(),
                 os_version: None,
             },
+            relay_password: None,
         });
         assert!(matches!(
             desktop.recv_expect(d_deadline, "hello_ok"),

@@ -122,6 +122,48 @@ import CryptoKit
         await client.stop()
     }
 
+    // MARK: - Shared relay password in hello (remote-control-uq7)
+
+    /// On every connect the client presents the stored shared relay password in
+    /// its `hello` (re-read via the injected provider). Nil (local/dev relay)
+    /// omits it — covered by the codec tests; here we assert the value flows
+    /// from the provider into the frame the transport sends.
+    @Test func helloCarriesTheStoredRelayPassword() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            relayPassword: { "hunter2" },
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 })
+        let collector = EventCollector()
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let hello = try #require(await channel.sentFrames().first {
+            if case .hello = $0 { return true }; return false
+        })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == "hunter2")
+
+        await client.stop()
+    }
+
     // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
 
     @Test func revokePairingSendsRevokeFrameWhenLive() async throws {
@@ -405,6 +447,131 @@ import CryptoKit
         }
         #expect(restarted)
         await client.stop()
+    }
+
+    // MARK: - Desktop presence returns → re-request snapshot (remote-control-0ef.19)
+
+    /// The desktop was absent when the phone authenticated, so its post-`auth_ok`
+    /// snapshot request went unanswered. When the desktop later returns
+    /// (`peer_presence` → connected) the client must re-issue resume +
+    /// request_snapshot, otherwise the UI stays stale on deltas alone.
+    @Test func desktopReturningReissuesResumeAndSnapshot() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Post-auth resume + request_snapshot went out once.
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+        }
+        func resumeCount() async -> Int {
+            await channel.sentFrames().filter { if case .resume = $0 { return true }; return false }.count
+        }
+        // request_snapshot rides an outbound phone envelope; no other command is
+        // sent in this test, so phone-envelope count == request_snapshot count.
+        func snapshotRequestCount() async -> Int {
+            await channel.sentFrames().filter {
+                if case let .envelope(e) = $0 { return e.sender == .phone }; return false
+            }.count
+        }
+        let resumesAfterAuth = await resumeCount()
+        let snapshotsAfterAuth = await snapshotRequestCount()
+        #expect(resumesAfterAuth == 1)
+        #expect(snapshotsAfterAuth == 1)
+
+        // Desktop drops, then returns.
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .disconnected, atMs: 1))
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .connected, atMs: 2))
+
+        // A fresh resume + request_snapshot is issued on the return.
+        _ = await waitUntil { await resumeCount() == resumesAfterAuth + 1 }
+        #expect(await resumeCount() == resumesAfterAuth + 1)
+        #expect(await snapshotRequestCount() == snapshotsAfterAuth + 1)
+
+        // A redundant second `connected` presence does NOT re-fire (only the
+        // offline→online transition does).
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .connected, atMs: 3))
+        // Marker pong to prove the presence frame ahead of it was processed.
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+        #expect(await resumeCount() == resumesAfterAuth + 1)
+        #expect(await snapshotRequestCount() == snapshotsAfterAuth + 1)
+
+        await client.stop()
+    }
+
+    // MARK: - Retry now: force an immediate reconnect (remote-control-0ef.21)
+
+    /// `reconnectNow()` must drop the current (possibly silently-dead) socket
+    /// and reconnect immediately — resetting the backoff so the user isn't stuck
+    /// waiting out a long delay. Observed via a fresh channel per connect.
+    @Test func reconnectNowClosesTheSocketAndForcesAFreshConnect() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        // A fresh scripted channel per connect, so a reconnect is observable as a
+        // second channel.
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // First socket goes live.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Force a reconnect.
+        await client.reconnectNow()
+
+        // The live socket is closed and a second connect happens immediately.
+        _ = await waitUntil { await first.isClosed() }
+        #expect(await first.isClosed())
+        _ = await waitUntil { connector.channels.count >= 2 }
+        #expect(connector.channels.count >= 2)
+
+        await client.stop()
+    }
+
+    @Test func reconnectNowIsANoOpWithoutARunningSupervisor() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector,
+                                    config: TransportClient.Config())
+        await client.setEventHandler(collector.handler)
+        // Never started → no supervisor → nothing to reconnect, nothing sent.
+        await client.reconnectNow()
+        #expect(await channel.sentFrames().isEmpty)
+        #expect(await client.currentLinkState() == .disconnected)
     }
 
     // MARK: - No pairing → stays disconnected

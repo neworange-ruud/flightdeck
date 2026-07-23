@@ -77,6 +77,12 @@ actor TransportClient {
     private let targetPairingId: String?
     private let connector: any WebSocketConnecting
     private let clientInfo: Wire.ClientInfo
+    /// Source of the OPTIONAL shared relay password (remote-control-uq7),
+    /// evaluated on EVERY connect so a password captured/changed at pairing is
+    /// picked up without rebuilding the client. Returns `nil` for a
+    /// local/dev relay with no password, in which case the `hello` omits the
+    /// `relay_password` key entirely. Never logged.
+    private let relayPassword: @Sendable () -> String?
     private let config: Config
     private let jitter: @Sendable () -> Double
     private let now: @Sendable () -> Int64
@@ -85,6 +91,13 @@ actor TransportClient {
 
     private var eventHandler: (@Sendable (TransportEvent) -> Void)?
     private var supervisor: Task<Void, Never>?
+    /// The in-progress inter-attempt backoff sleep, held so `reconnectNow()`
+    /// (remote-control-0ef.21 "Retry now") can wake it early. `nil` whenever the
+    /// supervisor isn't currently waiting between attempts.
+    private var backoffTask: Task<Void, Never>?
+    /// Set by `reconnectNow()`: the next supervisor iteration resets the backoff
+    /// attempt counter and reconnects immediately instead of waiting.
+    private var forcedReconnect = false
 
     private var record: PairingRecord?
     private var channel: (any WebSocketChannel)?
@@ -144,6 +157,7 @@ actor TransportClient {
         pairingId: String? = nil,
         connector: any WebSocketConnecting,
         clientInfo: Wire.ClientInfo? = nil,
+        relayPassword: @escaping @Sendable () -> String? = { RelayPasswordStore().load() },
         config: Config = Config(),
         jitter: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) },
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
@@ -158,6 +172,7 @@ actor TransportClient {
             platform: "ios",
             osVersion: nil
         )
+        self.relayPassword = relayPassword
         self.config = config
         self.jitter = jitter
         self.now = now
@@ -178,10 +193,27 @@ actor TransportClient {
         }
     }
 
+    /// Force an immediate reconnect (remote-control-0ef.21 "Retry now"): reset
+    /// the backoff schedule and drop straight into a fresh connect, whether the
+    /// client is mid-backoff or sitting on a silently-dead socket. Closing the
+    /// channel breaks a stuck `runSession` receive loop; cancelling `backoffTask`
+    /// wakes an in-progress backoff wait. No-op if the supervisor isn't running
+    /// (nothing to reconnect — e.g. no pairing record, or backgrounded/stopped).
+    func reconnectNow() async {
+        guard supervisor != nil else { return }
+        forcedReconnect = true
+        backoffTask?.cancel()
+        backoffTask = nil
+        await channel?.close()
+    }
+
     /// Stop the supervisor and tear down the current connection.
     func stop() async {
         supervisor?.cancel()
         supervisor = nil
+        backoffTask?.cancel()
+        backoffTask = nil
+        forcedReconnect = false
         pinger?.cancel()
         pinger = nil
         await channel?.close()
@@ -295,10 +327,39 @@ actor TransportClient {
             let authed = await runSession()
             if Task.isCancelled { break }
             setLink(.disconnected)
+            // A user-requested "Retry now" (remote-control-0ef.21) resets the
+            // backoff and reconnects immediately, skipping the wait entirely.
+            if forcedReconnect {
+                forcedReconnect = false
+                attempt = 0
+                continue
+            }
             attempt = authed ? 0 : attempt + 1
             let delay = Backoff.delay(attempt: attempt, jitterUnit: jitter())
-            try? await Task.sleep(for: delay)
+            await backoffSleep(delay)
+            // "Retry now" during the wait woke it early — reset the schedule so
+            // the immediate attempt starts from a 1s floor again.
+            if forcedReconnect {
+                forcedReconnect = false
+                attempt = 0
+            }
         }
+    }
+
+    /// Wait `delay` between reconnect attempts, staying responsive to BOTH
+    /// supervisor cancellation (`stop()`) and an explicit `reconnectNow()`
+    /// (remote-control-0ef.21). The latter cancels `backoffTask` to wake the
+    /// wait immediately; the cancellation handler forwards a `stop()` cancel to
+    /// the same sleeper so teardown never blocks on a full backoff interval.
+    private func backoffSleep(_ delay: Duration) async {
+        let sleeper = Task<Void, Never> { _ = try? await Task.sleep(for: delay) }
+        backoffTask = sleeper
+        await withTaskCancellationHandler {
+            await sleeper.value
+        } onCancel: {
+            sleeper.cancel()
+        }
+        backoffTask = nil
     }
 
     /// One connection session. Returns whether it reached `auth_ok` (so the
@@ -327,13 +388,16 @@ actor TransportClient {
             return false
         }
 
-        // hello.
+        // hello. Present the shared relay password (remote-control-uq7) if one
+        // is stored — re-read every connect so a change is picked up; nil omits
+        // the `relay_password` key so an unconfigured relay is unaffected.
         do {
             try await ch.send(.hello(
                 protocolVersion: Wire.protocolVersion,
                 role: .phone,
                 deviceId: Wire.DeviceId(identity.deviceId),
-                client: clientInfo
+                client: clientInfo,
+                relayPassword: relayPassword()
             ))
         } catch {
             await ch.close()
@@ -427,7 +491,20 @@ actor TransportClient {
 
         case let .peerPresence(_, peer, state, _):
             let connected = state == .connected
-            if peer == .desktop { peerConnected = connected }
+            if peer == .desktop {
+                let wasConnected = peerConnected
+                peerConnected = connected
+                // The desktop just came back (offline/unknown → online). The
+                // post-`auth_ok` resume+snapshot may have been suppressed while
+                // it was absent (`sendEnvelope` fails fast when
+                // `peerConnected == false`), so the UI would otherwise stay
+                // stale on deltas alone (dropped when `snapshot == nil` —
+                // TransportStore). Re-issue resume + request_snapshot now that
+                // the desktop is reachable (remote-control-0ef.19).
+                if connected, wasConnected != true, phase == .live, let ch = channel {
+                    await requestResumeAndSnapshot(on: ch)
+                }
+            }
             emit(.presence(peer: peer, connected: connected))
             return true
 
@@ -478,9 +555,25 @@ actor TransportClient {
         }
     }
 
-    /// After `auth_ok`: resume from the persisted inbound cursor, then request a
-    /// fresh snapshot so the UI has current state immediately.
+    /// After `auth_ok`: resume from the persisted inbound cursor, request a
+    /// fresh snapshot so the UI has current state immediately, then re-register
+    /// any known push token.
     private func onAuthenticated(_ ch: any WebSocketChannel) async {
+        await requestResumeAndSnapshot(on: ch)
+        // Re-register any known push token (the relay's v1 store may have
+        // dropped it across a restart; spec §5.5 / store.rs module docs), unless
+        // this pairing is muted (in which case nothing is sent).
+        await reconcilePushToken(on: ch)
+    }
+
+    /// Resume from the persisted inbound cursor and (config permitting) request
+    /// a fresh snapshot. Sent after `auth_ok` (`onAuthenticated`) AND again
+    /// whenever the desktop peer transitions back to present
+    /// (remote-control-0ef.19): the initial post-auth snapshot request is
+    /// dropped when the desktop is offline (`sendEnvelope` refuses while
+    /// `peerConnected == false`), so re-issuing it on the peer's return is what
+    /// refreshes an otherwise-stale UI.
+    private func requestResumeAndSnapshot(on ch: any WebSocketChannel) async {
         guard let record else { return }
         try? await ch.send(.resume(
             pairingId: Wire.PairingId(record.pairingId),
@@ -495,10 +588,6 @@ actor TransportClient {
             // A read: don't surface delivery honesty for the implicit refresh.
             await sendEnvelope(for: cmd, track: false)
         }
-        // Re-register any known push token (the relay's v1 store may have
-        // dropped it across a restart; spec §5.5 / store.rs module docs), unless
-        // this pairing is muted (in which case nothing is sent).
-        await reconcilePushToken(on: ch)
     }
 
     /// Bring the relay's push-token state for this pairing in line with our

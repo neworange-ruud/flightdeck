@@ -21,9 +21,14 @@
 //! be tested end to end. Sealed bytes leave as [`RemoteOutbound::SendEnvelope`].
 //!
 //! When no pairing is active the bridge does no sending and produces no
-//! messages — but the transcript is still reconstructed each tick from the
-//! agent's session file via [`RemoteBridge::sync_transcript`], so a phone that
-//! pairs later gets a populated history.
+//! messages — but the transcript is still reconstructed from the agent's
+//! session file via [`RemoteBridge::sync_transcript`], so a phone that pairs
+//! later gets a populated history. While unpaired that reconstruction is
+//! throttled to [`UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`] rather than run every
+//! render tick — nobody is there yet to receive it (remote-control-0ef.13) —
+//! but the instant a pairing becomes active the throttle is bypassed and a
+//! sync runs unconditionally, so a late-pairing phone still gets full history
+//! on that very tick.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +57,17 @@ use flightdeck_remote_protocol::{
 /// the tool_use is written, so the ingest normally wins within a tick or two;
 /// this bound only delays a genuine permission prompt, never a question.
 const PROMPT_SETTLE_MS: u64 = 750;
+
+/// Cadence used to gate [`RemoteBridge::sync_transcript`] while no phone is
+/// paired. Resolving the agent's JSONL path and stat/reading it incrementally
+/// on every render tick is wasted filesystem work when there is no peer to
+/// receive the reconstructed history (remote-control-0ef.13). Once a phone IS
+/// paired the sync runs every tick as before (see the `is_paired()` check in
+/// [`RemoteBridge::tick`]), and that same check unconditionally bypasses this
+/// throttle on the tick a pairing becomes active, so a late-pairing phone
+/// still receives full history immediately rather than waiting out the
+/// window.
+const UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS: i64 = 3_000;
 
 /// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
 /// header the payload will travel under (`seq`, `sent_at_ms`), returns
@@ -158,6 +174,14 @@ pub struct RemoteBridge {
     /// restart with an established pairing, [`Self::install_channel`] seeds this
     /// from the persisted high-water mark so the phone's dedup never stalls.
     out_seq: u64,
+    /// Clock-ms (from the caller-supplied `now_ms`, i.e. the injected clock —
+    /// see [`crate::contracts::Clock`]) of the last transcript sync performed
+    /// while unpaired, throttling [`Self::sync_transcript`] to
+    /// [`UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`] when no phone is present
+    /// (remote-control-0ef.13). `None` before the first unpaired sync, so the
+    /// very first tick always syncs. Irrelevant once paired: `tick()` forces a
+    /// sync every tick while `is_paired()` is true, regardless of this timer.
+    last_unpaired_sync_ms: Option<i64>,
     /// Keystrokes queued to inject into a session's primary PTY after a short
     /// delay: `(session, due_ms, bytes)`. Used for Claude's multi-select submit
     /// Enter, which must arrive AFTER the Tab-driven switch to the Confirm tab
@@ -192,6 +216,7 @@ impl RemoteBridge {
             open,
             home: None,
             out_seq: 0,
+            last_unpaired_sync_ms: None,
             deferred_pty: Vec::new(),
         }
     }
@@ -284,11 +309,14 @@ impl RemoteBridge {
     }
 
     /// Reconstruct a session's transcript from the agent's own conversation
-    /// store, ingesting anything written since the last call. Cheap and always
-    /// safe; builds history even before a phone pairs. A no-op when the home dir
+    /// store, ingesting anything written since the last call. Safe to call
+    /// often; builds history even before a phone pairs. A no-op when the home dir
     /// is unset or the agent has no locatable store (an OpenCode agent on Windows,
     /// an unknown agent, or before the agent has written its first record).
-    /// Called each tick with the session's `agent` kind and absolute `worktree`.
+    /// Called from [`Self::tick`] with the session's `agent` kind and absolute
+    /// `worktree`, gated by `sync_transcripts_this_tick`
+    /// (remote-control-0ef.13) so this filesystem work is throttled while no
+    /// phone is paired rather than run every render tick.
     pub fn sync_transcript(&mut self, session_id: &str, agent: &str, worktree: &Path, now_ms: i64) {
         let Some(home) = self.home.clone() else {
             return;
@@ -448,6 +476,25 @@ impl RemoteBridge {
         now_ms: u64,
         send: &mut dyn FnMut(RemoteOutbound),
     ) {
+        // Whether this tick performs the (filesystem-touching) transcript sync
+        // below. Paired: sync every tick, as before — a phone is actively
+        // receiving history and responsiveness matters. Unpaired: throttle to
+        // `UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`, since nobody is there to
+        // receive it (remote-control-0ef.13). `currently_paired` alone forces
+        // this true on the very tick a pairing becomes active — no separate
+        // "just paired" bookkeeping needed — so a late-pairing phone still
+        // gets a sync (and thus full history) immediately on (re)pair.
+        let now_i64 = now_ms as i64;
+        let currently_paired = self.is_paired();
+        let sync_transcripts_this_tick = currently_paired
+            || match self.last_unpaired_sync_ms {
+                None => true,
+                Some(last) => now_i64.saturating_sub(last) >= UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS,
+            };
+        if sync_transcripts_this_tick && !currently_paired {
+            self.last_unpaired_sync_ms = Some(now_i64);
+        }
+
         // Pre-pass: per-session edge detection (events + needs-input preview).
         let mut events = Vec::new();
         for pv in projects {
@@ -457,8 +504,11 @@ impl RemoteBridge {
                 // Reconstruct the transcript from the agent's session file. Done
                 // here, before the pairing gate below, so a phone that pairs
                 // later still receives the accumulated history (remote-control-72k).
+                // Throttled while unpaired; see `sync_transcripts_this_tick` above.
                 let worktree = pv.state.repo_root.join(&tab.meta.worktree_path_relative);
-                self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_ms as i64);
+                if sync_transcripts_this_tick {
+                    self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_i64);
+                }
 
                 let ds = tab.display_status(now_ms);
                 let interpreted = ds.interpreted;
@@ -891,6 +941,9 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 options,
                 allow_free_text: true,
                 multi_select: parsed.multiple,
+                // OpenCode's sidecar carries a single question; the flat fields
+                // above describe it, so the multi-question list stays empty.
+                questions: Vec::new(),
             })
         }
         // Permissions are binary. Build a structured prompt only when every
@@ -913,6 +966,7 @@ fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
                 allow_free_text: false,
                 // Permissions are always a single binary choice.
                 multi_select: false,
+                questions: Vec::new(),
             })
         }
         _ => None,

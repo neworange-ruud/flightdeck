@@ -36,6 +36,11 @@ struct RealPairingService: PairingServicing {
     private let connector: any WebSocketConnecting
     private let recordStore: PairingRecordStore
     private let identityStore: KeychainStoring
+    /// Secure store for the OPTIONAL shared relay password (remote-control-uq7).
+    /// The password is presented in the pairing `hello` (pairing runs over the
+    /// relay) and persisted here on success so `TransportClient` can present it
+    /// on every later reconnect.
+    private let relayPasswordStore: RelayPasswordStore
     private let clientInfo: Wire.ClientInfo
     private let timeout: Duration
     private let peerName: String
@@ -53,6 +58,7 @@ struct RealPairingService: PairingServicing {
         connector: any WebSocketConnecting = URLSessionWebSocketConnection(),
         recordStore: PairingRecordStore = PairingRecordStore(),
         identityStore: KeychainStoring = KeychainStore(service: DeviceIdentity.service),
+        relayPasswordStore: RelayPasswordStore = RelayPasswordStore(),
         clientInfo: Wire.ClientInfo? = nil,
         timeout: Duration = .seconds(15),
         peerName: String = "Your Mac",
@@ -61,6 +67,7 @@ struct RealPairingService: PairingServicing {
         self.connector = connector
         self.recordStore = recordStore
         self.identityStore = identityStore
+        self.relayPasswordStore = relayPasswordStore
         self.clientInfo = clientInfo ?? Wire.ClientInfo(
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
             platform: "ios",
@@ -71,8 +78,14 @@ struct RealPairingService: PairingServicing {
         self.pairingStore = pairingStore
     }
 
-    func pair(with input: PairingInput) async throws -> PairedDevice {
+    func pair(with input: PairingInput, relayPassword: String? = nil) async throws -> PairedDevice {
         let params = try resolve(input)
+
+        // Normalize the captured relay password: a blank field means "no
+        // password" (local/dev relay), which must present nothing — an
+        // unconfigured relay rejects a present-but-empty value.
+        let trimmedPassword = relayPassword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectivePassword = (trimmedPassword?.isEmpty ?? true) ? nil : trimmedPassword
 
         // Fresh identity + key-agreement key (create-or-load).
         let identity: DeviceIdentity
@@ -97,7 +110,8 @@ struct RealPairingService: PairingServicing {
                 channel: channel,
                 params: params,
                 identity: identity,
-                keyAgreement: keyAgreement
+                keyAgreement: keyAgreement,
+                relayPassword: effectivePassword
             )
         } catch let error as PairingError {
             throw error
@@ -119,13 +133,15 @@ struct RealPairingService: PairingServicing {
         channel: any WebSocketChannel,
         params: Params,
         identity: DeviceIdentity,
-        keyAgreement: KeyAgreementKeys
+        keyAgreement: KeyAgreementKeys,
+        relayPassword: String?
     ) async throws -> PairedDevice {
         try await channel.send(.hello(
             protocolVersion: Wire.protocolVersion,
             role: .phone,
             deviceId: Wire.DeviceId(identity.deviceId),
-            client: clientInfo
+            client: clientInfo,
+            relayPassword: relayPassword
         ))
 
         // hello_ok → auth_challenge (nonce). version_incompatible / error abort.
@@ -164,6 +180,12 @@ struct RealPairingService: PairingServicing {
             relayURL: params.relayURL.absoluteString
         )
         try? recordStore.save(record)
+
+        // Persist the (accepted) shared relay password so every later reconnect
+        // presents it (remote-control-uq7). Only reached after `auth_ok`, so the
+        // relay accepted this password; nil clears any stale value (moving to a
+        // no-password relay). Never logged.
+        try? relayPasswordStore.save(relayPassword)
 
         // Multi-pairing (remote-control-b8d.4): APPEND this pairing's
         // display/prefs metadata rather than replacing whatever's already

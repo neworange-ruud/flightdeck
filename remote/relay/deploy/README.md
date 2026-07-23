@@ -36,12 +36,29 @@ CNAME  relay        -> <app>.<env-suffix>.northeurope.azurecontainerapps.io
 TXT    asuid.relay  -> <customDomainVerificationId>   # az containerapp show … --query properties.customDomainVerificationId
 ```
 
-**Ingress is IP-restricted (deny-by-default allowlist)** — only a fixed set of
-source IPs may reach the relay. Manage the list with
-`az containerapp ingress access-restriction {set,remove,list} -g <rg> -n <app>`.
-All rules must share one action (`Allow`); adding any `Allow` rule denies every
-other source. Note this means clients (including phones) can only connect from
-an allowlisted network.
+**Ingress is open; access is gated by a shared relay password** (remote-control-uq7).
+The relay is reachable from **any** network — deliberately, because a source-IP
+allowlist is incompatible with a roaming phone (a 5G/carrier egress IP is dynamic
+and cannot be allowlisted; that broke "control your Mac from anywhere"). Instead,
+the relay reads `FLIGHTDECK_RELAY_PASSWORD` from its environment and rejects any
+WebSocket `hello` whose `relay_password` is missing or wrong, comparing in
+constant time. A relay with **no** password configured stays open (local/dev).
+
+- Set the secret via CI: add a `FLIGHTDECK_RELAY_PASSWORD` secret to the repo's
+  `production` environment. `relay-deploy.yml` stores it as a Container App secret
+  (`relay-password`) and references it from the `FLIGHTDECK_RELAY_PASSWORD` env
+  var, so it never appears in plaintext in the revision template.
+- Every client presents the same password: the desktop reads it from the
+  `FLIGHTDECK_RELAY_PASSWORD` env var or `[remote].relay_password` in
+  `config.toml` (env wins); the phone captures it at pairing time.
+- The password is a **coarse network-admission gate** in front of — not a
+  replacement for — the per-device pairing auth (spec §5.1) and the end-to-end
+  crypto, both of which still run underneath.
+- The old allowlist was managed with
+  `az containerapp ingress access-restriction {set,remove,list} -g <rg> -n <app>`;
+  the deploy workflow now **removes** any such rules on every deploy. To restore
+  an allowlist you would re-add rules there, but that is no longer the intended
+  posture.
 
 ## Health
 

@@ -2,25 +2,30 @@
 //!
 //! All durable relay state lives behind the [`RelayStore`] trait: registered
 //! device public keys, pairings and their membership, live claim tokens, the
-//! per-`(pairing, sender)` envelope queues, and push tokens. v1 ships one
-//! implementation, [`InMemoryStore`], which keeps everything in process memory
-//! behind a single mutex.
+//! per-`(pairing, sender)` envelope queues, and push tokens. Two
+//! implementations ship: [`InMemoryStore`] (the default) keeps everything in
+//! process memory behind a single mutex; [`SqliteStore`] persists the same state
+//! to a file so it survives a restart/redeploy.
 //!
-//! **Why a trait.** A networked implementation (Redis, Azure Cache / Table
-//! Storage) slots in behind the same async interface so that device
-//! registrations, pairings, and queues survive relay restarts and scale across
-//! replicas — see the "Relay team" notes in `specs/REMOTE_PROTOCOL.md` §12
-//! ("persist per-pairing queues and sequence high-water marks so `resume` works
-//! across relay restarts"). The trait methods are already `async` for exactly
-//! that future; the in-memory impl simply completes synchronously.
+//! **Why a trait.** A persistent implementation slots in behind the same async
+//! interface so that device registrations, pairings, and queues survive relay
+//! restarts and can later scale across replicas — see the "Relay team" notes in
+//! `specs/REMOTE_PROTOCOL.md` §12 ("persist per-pairing queues and sequence
+//! high-water marks so `resume` works across relay restarts"). The trait methods
+//! are already `async` for exactly that future; both shipping impls complete
+//! synchronously (the in-memory one over a mutex, the sqlite one over a mutexed
+//! [`rusqlite::Connection`]).
 //!
-//! **v1 limitation (documented).** Because [`InMemoryStore`] is not persistent,
-//! a relay restart drops all registrations, pairings, and queues. The desktop's
+//! **Backend selection.** [`crate::config::StoreBackend`] chooses the impl from
+//! `FLIGHTDECK_RELAY_STORE` (`memory` — the default — or `sqlite:<path>`).
+//!
+//! **In-memory limitation.** Because [`InMemoryStore`] is not persistent, a
+//! relay restart drops all registrations, pairings, and queues. The desktop's
 //! `pairing_offer` re-registers its key on reconnect, and the phone can re-pair,
 //! but any envelopes queued for an offline peer at restart time are lost — the
-//! sender is responsible for re-queuing (spec §6 amendment). Swapping in a
-//! persistent [`RelayStore`] removes this limitation with no changes to the
-//! connection state machine.
+//! sender is responsible for re-queuing (spec §6 amendment). Selecting
+//! [`SqliteStore`] removes this limitation with no changes to the connection
+//! state machine.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -30,6 +35,9 @@ use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, P
 
 use crate::claims::{ClaimError, ClaimTable, RedeemedClaim};
 use crate::queue::{AppendOutcome, QueueError, ResumeOutcome, SenderQueue};
+
+mod sqlite;
+pub use sqlite::SqliteStore;
 
 /// The desktop + (optional) phone device ids of a pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]

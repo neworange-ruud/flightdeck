@@ -559,6 +559,7 @@ private struct ControlConfirmationSheet: View {
 @MainActor
 private final class ControlFallbackConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState = .disconnected
+    var peerConnected: Bool?
 }
 
 #if DEBUG

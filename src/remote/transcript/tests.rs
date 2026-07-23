@@ -349,6 +349,71 @@ fn ask_user_question_multi_select_sets_the_flag() {
     }
 }
 
+/// An AskUserQuestion carrying TWO questions — the first single-select, the
+/// second multi-select — rendered as a tabbed form.
+const ASK_USER_QUESTION_TWO: &str = r#"{"type":"assistant","uuid":"aq2","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which database should we use?","header":"Database","multiSelect":false,"options":[{"label":"Postgres","description":"Relational"},{"label":"SQLite"}]},{"question":"Which checks should run before merge?","header":"Checks","multiSelect":true,"options":[{"label":"Tests"},{"label":"Clippy"},{"label":"Fmt"}]}]}}]}}"#;
+
+#[test]
+fn ask_user_question_captures_all_questions() {
+    // The parser keeps EVERY question (not just questions[0]): each with its
+    // header, text, options, and multiSelect flag. The flat command/options/
+    // multi_select still mirror the FIRST question for the preview + pre-v4
+    // consumers.
+    let sp = crate::remote::transcript::parse_ask_user_question(
+        &serde_json::from_str::<serde_json::Value>(ASK_USER_QUESTION_TWO)
+            .unwrap()
+            .pointer("/message/content/0/input")
+            .unwrap()
+            .clone(),
+    )
+    .expect("two-question AskUserQuestion parses");
+
+    // Flat fields mirror the first question.
+    assert_eq!(sp.command, "Which database should we use?");
+    assert!(!sp.multi_select, "first question is single-select");
+    assert!(sp.allow_free_text);
+    assert_eq!(sp.options.len(), 2);
+
+    // Both questions are captured, in order, with their own options + flags.
+    assert_eq!(sp.questions.len(), 2, "both questions are captured");
+
+    let q0 = &sp.questions[0];
+    assert_eq!(q0.header.as_deref(), Some("Database"));
+    assert_eq!(q0.question, "Which database should we use?");
+    assert!(!q0.multi_select);
+    assert_eq!(q0.options.len(), 2);
+    assert_eq!(q0.options[0].label, "Postgres");
+    assert_eq!(q0.options[0].description.as_deref(), Some("Relational"));
+    assert_eq!(q0.options[1].label, "SQLite");
+    assert_eq!(q0.options[1].index, 1);
+
+    let q1 = &sp.questions[1];
+    assert_eq!(q1.header.as_deref(), Some("Checks"));
+    assert_eq!(q1.question, "Which checks should run before merge?");
+    assert!(q1.multi_select, "second question is multi-select");
+    assert_eq!(q1.options.len(), 3);
+    let labels: Vec<&str> = q1.options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(labels, ["Tests", "Clippy", "Fmt"]);
+}
+
+/// A single-question AskUserQuestion still populates `questions` with exactly one
+/// entry (mirroring the flat fields) — the single-select regression baseline.
+#[test]
+fn ask_user_question_single_question_has_one_entry() {
+    let sp = crate::remote::transcript::parse_ask_user_question(
+        &serde_json::from_str::<serde_json::Value>(ASK_USER_QUESTION)
+            .unwrap()
+            .pointer("/message/content/0/input")
+            .unwrap()
+            .clone(),
+    )
+    .expect("single-question AskUserQuestion parses");
+    assert_eq!(sp.questions.len(), 1);
+    assert_eq!(sp.questions[0].question, sp.command);
+    assert_eq!(sp.questions[0].options.len(), 3);
+    assert!(!sp.questions[0].multi_select);
+}
+
 #[test]
 fn answering_a_question_lets_a_later_needs_input_edge_prompt_again() {
     // A question surfaced at ingest opens a prompt; a following user turn answers
@@ -447,6 +512,38 @@ fn codex_reconstructs_prose_and_shell_activity() {
             "act[Command]:Ran cargo test",
         ],
         "session_meta is skipped; prose + tool pill reconstructed in order"
+    );
+}
+
+/// Regression for remote-control-72k. Codex and OpenCode are full-screen TUIs:
+/// they paint the alternate screen via absolute cursor positioning (ESC[row;colH
+/// repaints) and never emit `\n`-terminated PTY lines. The original transcript
+/// reconstruction re-parsed the raw PTY byte stream with a line assembler that
+/// only finalized a logical line on `\n`, so these agents produced *zero*
+/// transcript items and the phone chat stayed empty. Reconstructing from the
+/// agent's own session file instead is independent of how the agent paints the
+/// terminal, so an alt-screen turn (here a Codex rollout: user prompt, agent
+/// prose, a shell call — none of it newline-terminated on the PTY) still yields
+/// items. This is the guard that the cursor-addressed path is covered.
+#[test]
+fn cursor_addressed_alt_screen_agent_still_reconstructs_items() {
+    let f = NamedTempFile::new().unwrap();
+    append(&f, &[CX_META, CX_USER, CX_AGENT, CX_SHELL]);
+
+    let b = codex(&f);
+    assert!(
+        b.total() > 0,
+        "a cursor-addressed alt-screen agent must still produce transcript items"
+    );
+    assert_eq!(
+        labels(&b.load(None)),
+        vec![
+            "user:Explain this codebase",
+            "agent:Here is the overview.",
+            "act[Command]:Ran cargo test",
+        ],
+        "the agent's rendered turn is reconstructed from the session file, \
+         not the (newline-free) PTY repaint"
     );
 }
 
@@ -769,6 +866,7 @@ fn clear_open_prompt_lets_the_next_question_surface() {
             }],
             allow_free_text: true,
             multi_select: true,
+            questions: Vec::new(),
         }
     }
 

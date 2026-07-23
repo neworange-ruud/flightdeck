@@ -6,6 +6,7 @@
 //! likely extend `Config`, not replace this pattern.
 
 use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::apns::ApnsConfig;
@@ -18,6 +19,45 @@ pub enum LogFormat {
     /// Structured JSON lines, for container log collection (Container Apps
     /// Log Analytics, etc).
     Json,
+}
+
+/// Which [`crate::store::RelayStore`] backend the relay runs. Selected by the
+/// `FLIGHTDECK_RELAY_STORE` env var; defaults to [`StoreBackend::Memory`] so the
+/// legacy in-process behavior is unchanged unless a deployment opts in.
+///
+/// Accepted values:
+/// - `memory` (or unset / unrecognized) — [`crate::store::InMemoryStore`], lost
+///   on restart. The historical default.
+/// - `sqlite:<path>` — a file-backed [`crate::store::SqliteStore`] at `<path>`.
+///   Device keys, pairings, claim tokens (with TTL), per-pairing sequence
+///   high-water marks, and queued envelopes survive a process restart, so a
+///   previously-paired desktop + phone reconnect without re-pairing
+///   (remote-control-b0f). See the `store` module for the caveat that the path
+///   must live on storage that itself survives a redeploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreBackend {
+    /// Non-persistent, in-process store. Lost on restart.
+    Memory,
+    /// File-backed SQLite store at the given path; survives restart.
+    Sqlite(PathBuf),
+}
+
+impl StoreBackend {
+    /// Parse the `FLIGHTDECK_RELAY_STORE` spec. `None`, `"memory"`, or any
+    /// unrecognized value falls back to [`StoreBackend::Memory`] (matching the
+    /// "malformed optional values default rather than fail startup" convention
+    /// used elsewhere in this module). A `sqlite:<path>` value selects the
+    /// file-backed store; an empty path after the prefix also falls back to
+    /// memory rather than opening an unnamed database.
+    pub fn from_spec(spec: Option<String>) -> Self {
+        match spec {
+            Some(s) => match s.strip_prefix("sqlite:") {
+                Some(path) if !path.is_empty() => StoreBackend::Sqlite(PathBuf::from(path)),
+                _ => StoreBackend::Memory,
+            },
+            None => StoreBackend::Memory,
+        }
+    }
 }
 
 /// Relay service configuration, assembled once at startup.
@@ -85,6 +125,23 @@ pub struct Config {
     /// [`ApnsConfig::from_env`]; never set by [`Config::new`] (test builds) so
     /// tests never need Apple secrets.
     pub apns: Option<ApnsConfig>,
+
+    /// Which durable-state backend to run; see [`StoreBackend`].
+    /// `FLIGHTDECK_RELAY_STORE`, default [`StoreBackend::Memory`].
+    pub store: StoreBackend,
+
+    /// Optional **shared relay password** (remote-control-uq7). `Some(secret)`
+    /// gates access: the relay rejects any `hello` whose `relay_password` is
+    /// missing or does not match (constant-time compare, see
+    /// [`crate::session`]). `None` — the value is unset or empty — preserves the
+    /// historical open behavior so local/dev relays and existing tests keep
+    /// working unchanged. Sourced from `FLIGHTDECK_RELAY_PASSWORD`; an empty
+    /// string is treated as unset (matches the "malformed optional values
+    /// default rather than fail startup" convention of this module). This is a
+    /// coarse network-admission secret that layers *in front of* — never
+    /// replaces — per-device challenge-response auth and the E2E crypto. It
+    /// replaces the deploy-time IP allowlist that blocked roaming phones.
+    pub relay_password: Option<String>,
 }
 
 impl Config {
@@ -104,6 +161,8 @@ impl Config {
             idle_timeout: Duration::from_secs(60),
             claim_sweep_interval: Duration::from_secs(60),
             apns: None,
+            store: StoreBackend::Memory,
+            relay_password: None,
         }
     }
 
@@ -125,6 +184,12 @@ impl Config {
         // APNs is read separately (not through `from_vars`) so the pure-parser
         // tests stay small and no test ever needs Apple credentials.
         config.apns = ApnsConfig::from_env();
+        // The store backend is likewise read outside `from_vars` so the pure
+        // parser stays a fixed arity and its unit tests are unaffected.
+        config.store = StoreBackend::from_spec(env::var("FLIGHTDECK_RELAY_STORE").ok());
+        // The relay password is read outside `from_vars` (like the store/APNs)
+        // so no test ever has to thread a secret through the parser.
+        config.relay_password = parse_relay_password(env::var("FLIGHTDECK_RELAY_PASSWORD").ok());
         config
     }
 
@@ -193,8 +258,22 @@ impl Config {
             idle_timeout,
             claim_sweep_interval,
             apns: None,
+            store: StoreBackend::Memory,
+            relay_password: None,
         }
     }
+}
+
+/// Normalize the `FLIGHTDECK_RELAY_PASSWORD` env value into a gate decision.
+/// An unset value, or a value that is empty/whitespace-only, means "no password
+/// configured" (`None`) so the relay stays open — matching this module's
+/// "malformed/absent optional values default rather than fail startup"
+/// convention. Any other value enables the gate with the secret **verbatim**
+/// (not trimmed): the shared password is compared byte-for-byte, so trimming
+/// interior/edge bytes could silently accept a different secret than the one an
+/// operator set.
+fn parse_relay_password(raw: Option<String>) -> Option<String> {
+    raw.filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -274,5 +353,60 @@ mod tests {
         assert_eq!(config.ping_interval, Duration::from_secs(20));
         assert_eq!(config.idle_timeout, Duration::from_secs(60));
         assert_eq!(config.claim_sweep_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn store_backend_defaults_to_memory() {
+        assert_eq!(StoreBackend::from_spec(None), StoreBackend::Memory);
+        assert_eq!(
+            StoreBackend::from_spec(Some("memory".to_string())),
+            StoreBackend::Memory
+        );
+        // Unrecognized specs fall back to memory rather than failing startup.
+        assert_eq!(
+            StoreBackend::from_spec(Some("redis://nope".to_string())),
+            StoreBackend::Memory
+        );
+        // A `sqlite:` prefix with no path is not a usable database → memory.
+        assert_eq!(
+            StoreBackend::from_spec(Some("sqlite:".to_string())),
+            StoreBackend::Memory
+        );
+    }
+
+    #[test]
+    fn relay_password_absent_or_empty_stays_open() {
+        // Unset → no gate.
+        assert_eq!(parse_relay_password(None), None);
+        // Empty / whitespace-only → treated as unset so the relay stays open.
+        assert_eq!(parse_relay_password(Some(String::new())), None);
+        assert_eq!(parse_relay_password(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn relay_password_present_enables_gate_verbatim() {
+        // A real value enables the gate and is kept byte-for-byte (not trimmed),
+        // so the constant-time compare matches exactly what the operator set.
+        assert_eq!(
+            parse_relay_password(Some("s3cret".to_string())),
+            Some("s3cret".to_string())
+        );
+        assert_eq!(
+            parse_relay_password(Some(" pad ".to_string())),
+            Some(" pad ".to_string())
+        );
+    }
+
+    #[test]
+    fn store_backend_parses_sqlite_path() {
+        assert_eq!(
+            StoreBackend::from_spec(Some("sqlite:/var/lib/relay/state.db".to_string())),
+            StoreBackend::Sqlite(PathBuf::from("/var/lib/relay/state.db"))
+        );
+        // A relative path is preserved verbatim.
+        assert_eq!(
+            StoreBackend::from_spec(Some("sqlite:relay.db".to_string())),
+            StoreBackend::Sqlite(PathBuf::from("relay.db"))
+        );
     }
 }

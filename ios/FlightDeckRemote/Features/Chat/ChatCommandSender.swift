@@ -89,5 +89,6 @@ final class ScriptedChatCommandSender: ChatCommandSending {
 @MainActor
 final class FixtureConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState = .disconnected
+    var peerConnected: Bool?
 }
 #endif

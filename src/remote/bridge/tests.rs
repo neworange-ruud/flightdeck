@@ -497,6 +497,99 @@ fn session_file_flushes_as_transcript_append() {
         .any(|i| matches!(i, TranscriptItem::AgentMessage { text, .. } if text == "Hello from the agent.")));
 }
 
+// --- unpaired transcript-sync throttling (remote-control-0ef.13) -----------
+
+#[test]
+fn unpaired_transcript_sync_is_throttled_and_forced_on_repair() {
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    seed_claude_session(
+        home.path(),
+        worktree,
+        &[
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"first"}]}}"#,
+        ],
+    );
+
+    // NOT paired: `tick()` never sends, but `sync_transcript` still runs on its
+    // own throttled cadence via the caller-supplied (injected-clock) `now_ms`.
+    let mut b = RemoteBridge::passthrough(0);
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    assert!(!b.is_paired());
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let sid = SessionId::new("t1");
+
+    let contains = |b: &RemoteBridge, needle: &str| -> bool {
+        b.transcripts.get(&sid).is_some_and(|builder| {
+            builder.load(None).items.iter().any(
+                |i| matches!(i, TranscriptItem::AgentMessage { text, .. } if text.contains(needle)),
+            )
+        })
+    };
+
+    // Tick 1 (t=0ms): no prior unpaired sync recorded, so the first tick always
+    // syncs even though unpaired.
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 0, &mut |_| {});
+    }
+    assert!(
+        contains(&b, "first"),
+        "first tick must sync unconditionally"
+    );
+
+    // The agent writes a new turn, but we advance the injected clock by only
+    // 500ms — well inside `UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS` (3_000ms).
+    append_claude_line(
+        home.path(),
+        worktree,
+        r#"{"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"second"}]}}"#,
+    );
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 500, &mut |_| {});
+    }
+    assert!(
+        !contains(&b, "second"),
+        "throttled: unpaired sync must not run again before the interval elapses"
+    );
+
+    // Advance the injected clock to exactly the throttle boundary (3_000ms
+    // since the last unpaired sync at t=0) — now due.
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 3_000, &mut |_| {});
+    }
+    assert!(
+        contains(&b, "second"),
+        "past the throttle interval, the unpaired sync must run again"
+    );
+
+    // The agent writes yet another turn, and the phone pairs almost
+    // immediately after the last unpaired sync (t=3_000 -> t=3_050, only 50ms
+    // later — nowhere near due per the throttle). Pairing must force a sync
+    // on this very tick regardless, so a late-pairing phone gets full history.
+    append_claude_line(
+        home.path(),
+        worktree,
+        r#"{"type":"assistant","uuid":"a3","message":{"content":[{"type":"text","text":"third"}]}}"#,
+    );
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    assert!(b.is_paired());
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 3_050, &mut |_| {});
+    }
+    assert!(
+        contains(&b, "third"),
+        "(re)pairing must force an immediate sync, bypassing the unpaired throttle"
+    );
+}
+
 // --- inbound request handling ----------------------------------------------
 
 fn envelope(cmd: &PhoneCommand) -> EncryptedEnvelope {

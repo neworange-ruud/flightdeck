@@ -8,7 +8,37 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Remote: shared relay password replaces the IP allowlist.** The relay's
+  deny-by-default IP allowlist (fundamentally incompatible with a roaming phone
+  on cellular) is removed; the relay now gates the WebSocket `hello` on an
+  optional shared password with a constant-time compare, sourced from
+  `FLIGHTDECK_RELAY_PASSWORD` (wired as a GitHub Actions secret → Container App
+  secret in `relay-deploy.yml`). A relay with no password configured stays open,
+  so local/dev and older clients keep working. The desktop reads the password
+  from `FLIGHTDECK_RELAY_PASSWORD` or `config.toml` `[remote].relay_password`;
+  the iOS pairing screen has an optional relay-password field, stores it in the
+  Keychain, and presents it in the `hello` at pairing and on every reconnect
+  (JSON key `relay_password`, omitted entirely when unset).
+- **Remote: pairings survive relay restarts/redeploys.** The relay gained an
+  optional persistent `RelayStore` (SQLite-backed, behind the existing async
+  trait, selectable via `FLIGHTDECK_RELAY_STORE=memory|sqlite:<path>`; in-memory
+  remains the default). Device pubkeys, pairing membership, claim tokens (with
+  TTL), and per-pairing sequence high-water marks now survive a restart, so a
+  previously-paired desktop and phone reconnect without re-pairing.
+- **Remote: multi-question AskUserQuestion prompts.** Prompts that carry several
+  questions (a tabbed form) can now be answered end-to-end from the phone: the
+  desktop captures every question and drives the real TUI (per-tab navigation +
+  Enter-toggle, then Confirm), the protocol carries the full question list and
+  per-question answers, and iOS renders a native tabbed form with a single
+  Submit. Single-question prompts are unchanged.
+- **iOS Remote: "Retry now" reconnect.** The reconnecting banner now has a
+  "Retry now" button that resets the reconnect backoff (otherwise capped at
+  60s) and forces an immediate reconnect, so the user is never stuck waiting
+  out a long backoff or a silently-dead socket.
+- **iOS Remote: proactive reconnect on network changes.** The transport now
+  watches the phone's network path (`NWPathMonitor`) and forces an immediate
+  reconnect on a cell↔Wi-Fi switch or connectivity-restored event, instead of
+  waiting out the current attempt/backoff.
 
 ### Improvements
 
@@ -16,6 +46,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   and `web/deploy/setup.sh` now grant the deploy identity **Container Registry
   Tasks Contributor** on the registry alongside `AcrPush`, so a from-scratch
   rebuild no longer misses the role that `web-deploy`'s `az acr build` step needs.
+- **Relay: graceful shutdown notifies clients.** On shutdown the relay now sends
+  each connected client a `bye` + WebSocket Close frame (bounded by a grace
+  period that begins only once shutdown is signalled) instead of a hard TCP
+  reset on redeploy, so peers reconnect cleanly (remote-control-0ef.18).
+- **Desktop: transcript sync throttled when no phone is paired.** The bridge no
+  longer resolves + reads each agent's session file on every TUI render tick
+  while no phone is attached; it throttles to a low cadence when unpaired and
+  always syncs on (re)pair so a late-joining phone still gets full history
+  (remote-control-0ef.13).
+- **Remote: honest reconnect-banner copy.** The banner now names the right
+  culprit — when the phone can't reach the relay (offline, or relay unreachable
+  e.g. ingress-blocked on cellular) it points at the phone's own connection, and
+  only asks "is FlightDeck running on your Mac?" when the relay is reachable but
+  the desktop is actually absent.
 
 ### Bug fixes
 
@@ -83,6 +127,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - **Deploy image tags no longer get a trailing dash.** The "Resolve image tag"
   step in `relay-deploy.yml` and `web-deploy.yml` used `echo` into `tr`, whose
   trailing newline became a `-` (e.g. `v1.8.0-`). Switched to `printf '%s'`.
+- **iOS Remote: no reconnect churn on transient interruptions.** The transport
+  is now torn down only when the app truly backgrounds, not on the transient
+  `.inactive` phase (Control Center pull, app-switcher glance, incoming call,
+  Face ID prompt), eliminating needless reconnect/re-auth churn.
+- **iOS Remote: silent wake push now reconnects.** A backgrounded silent wake
+  push now spins up a background task that reconnects the (torn-down) transport,
+  replays queued envelopes, and schedules their local notifications before
+  reporting completion — previously it returned synchronously and never
+  reconnected, making background notifications inert.
+- **iOS Remote: stale UI when the desktop returns.** When the desktop's presence
+  comes back after being absent, the phone now re-issues resume + snapshot so a
+  live link with an online desktop no longer shows stale/empty state.
 
 ## [1.10.1] - 2026-07-21
 

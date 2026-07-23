@@ -7,10 +7,11 @@
 //! `dead_code`-tolerant.
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use flightdeck_relay::{
-    app,
+    app, build,
     config::{Config, LogFormat},
 };
 use flightdeck_remote_protocol::{
@@ -72,6 +73,82 @@ pub async fn spawn_app_with(queue_max: usize, auth_timeout_secs: u64) -> String 
 /// Spawn with defaults suitable for most tests.
 pub async fn spawn_app() -> String {
     spawn_app_with(1000, 10).await
+}
+
+/// Spawn the relay via [`flightdeck_relay::build`] instead of [`app`], also
+/// returning the [`AppState::shutdown_tx`](flightdeck_relay::AppState) handle
+/// so a test can trigger the graceful-shutdown broadcast directly (flip it to
+/// `true`) without waiting on real OS signals (remote-control-0ef.18).
+pub async fn spawn_app_with_shutdown() -> (String, Arc<tokio::sync::watch::Sender<bool>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let config = Config::new(addr.port(), LogFormat::Pretty, "test-sha");
+    let (router, shutdown_tx) = build(config);
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    (format!("http://{addr}"), shutdown_tx)
+}
+
+/// Spawn a relay configured with a shared relay password (remote-control-uq7).
+/// Connections must present a matching `hello.relay_password` or be rejected.
+pub async fn spawn_app_with_password(password: &str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let mut config = Config::new(addr.port(), LogFormat::Pretty, "test-sha");
+    config.relay_password = Some(password.to_string());
+
+    tokio::spawn(async move {
+        axum::serve(listener, app(config)).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+/// Low-level `hello` probe for the relay-password gate: open a raw WebSocket,
+/// send a single `hello` carrying `relay_password`, and return the **first**
+/// frame the relay sends back. Used by the password tests to assert acceptance
+/// (`hello_ok`) vs rejection (`error { auth_failed }`) without the full
+/// handshake helper (which assumes acceptance).
+pub async fn hello_probe(base_url: &str, relay_password: Option<&str>) -> RelayFrame {
+    let ws_url = format!("{}/ws", base_url.replacen("http://", "ws://", 1));
+    let (mut ws, resp) = connect_async(ws_url).await.expect("ws handshake");
+    assert_eq!(resp.status(), 101, "expected protocol switch");
+
+    let hello = RelayFrame::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        role: Role::Desktop,
+        device_id: DeviceId::new("dev_probe"),
+        client: ClientInfo {
+            app_version: "test".into(),
+            platform: "test".into(),
+            os_version: None,
+        },
+        relay_password: relay_password.map(str::to_string),
+    };
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&hello)
+            .expect("serialize hello")
+            .into(),
+    ))
+    .await
+    .expect("ws send");
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("recv timed out")
+        .expect("stream ended")
+        .expect("ws error");
+    match msg {
+        WsMessage::Text(text) => serde_json::from_str(&text).expect("parse frame"),
+        other => panic!("expected text frame, got {other:?}"),
+    }
 }
 
 /// A connected WebSocket client with a P-256 identity, mid-handshake or beyond.
@@ -149,6 +226,7 @@ impl TestClient {
                     platform: "test".into(),
                     os_version: None,
                 },
+                relay_password: None,
             })
             .await;
 
@@ -259,6 +337,18 @@ impl TestClient {
             Err(_) => {} // timed out → idle, as expected
             Ok(other) => panic!("expected no frame, got {other:?}"),
         }
+    }
+
+    /// Receive the next **raw** WebSocket message, unlike [`Self::recv`] this
+    /// does not assume `Text` and does not panic on a `Close` frame or stream
+    /// end — used by tests asserting on the native WS close handshake itself
+    /// (e.g. graceful shutdown), where a relay frame is *not* what's expected
+    /// next. `None` means the stream ended without a further message.
+    pub async fn recv_raw(&mut self) -> Option<WsMessage> {
+        tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+            .await
+            .expect("recv timed out")
+            .map(|r| r.expect("ws error"))
     }
 
     fn sign_nonce(&self) -> String {

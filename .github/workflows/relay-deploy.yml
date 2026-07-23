@@ -73,6 +73,13 @@ jobs:
             echo "::error::Missing Azure deploy config:$missing — see remote/relay/deploy/README.md"
             exit 1
           fi
+          # remote-control-uq7: the relay's network-admission gate is now the
+          # shared FLIGHTDECK_RELAY_PASSWORD (replacing the ingress IP allowlist).
+          # Warn — don't fail — if it isn't set, so an environment mid-migration
+          # can still deploy; the relay simply runs OPEN until the secret exists.
+          if [ -z "${{ secrets.FLIGHTDECK_RELAY_PASSWORD }}" ]; then
+            echo "::warning::FLIGHTDECK_RELAY_PASSWORD secret is not set — the relay will run OPEN (no password gate). Set it in the production environment secrets."
+          fi
 
       - name: Resolve image tag
         id: meta
@@ -109,16 +116,46 @@ jobs:
           docker push "$IMAGE_SHA"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
-      # GIT_SHA is a runtime env var (Config::git_sha → /version), set alongside
-      # the new image so /version reports the revision actually running.
-      - name: Deploy revision
+      # remote-control-uq7: open the ingress by removing any source-IP allowlist.
+      # The relay is now gated by the shared FLIGHTDECK_RELAY_PASSWORD, not by a
+      # deny-by-default IP allowlist — which blocked roaming phones on 5G. This is
+      # idempotent: an ingress with no rules is already open, so a fresh app or a
+      # re-run is a no-op.
+      - name: Open ingress (remove IP allowlist)
         run: |
           set -euo pipefail
+          RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          APP="${{ vars.AZURE_CONTAINERAPP_NAME }}"
+          rules="$(az containerapp ingress access-restriction list -g "$RG" -n "$APP" -o json 2>/dev/null || echo '[]')"
+          echo "$rules" | jq -r '.[].name' | while read -r name; do
+            [ -n "$name" ] || continue
+            echo "removing ingress access-restriction rule: $name"
+            az containerapp ingress access-restriction remove -g "$RG" -n "$APP" --rule-name "$name"
+          done
+
+      # GIT_SHA is a runtime env var (Config::git_sha → /version), set alongside
+      # the new image so /version reports the revision actually running. The
+      # shared relay password (remote-control-uq7) is stored as a Container App
+      # *secret* and referenced by env var, so it never appears in plaintext in
+      # the revision template. Skipped when the secret is unset (relay runs open).
+      - name: Deploy revision
+        env:
+          RELAY_PASSWORD: ${{ secrets.FLIGHTDECK_RELAY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          APP="${{ vars.AZURE_CONTAINERAPP_NAME }}"
+          PW_ENV=""
+          if [ -n "$RELAY_PASSWORD" ]; then
+            az containerapp secret set -g "$RG" -n "$APP" \
+              --secrets "relay-password=$RELAY_PASSWORD"
+            PW_ENV="FLIGHTDECK_RELAY_PASSWORD=secretref:relay-password"
+          fi
           az containerapp update \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name "${{ vars.AZURE_CONTAINERAPP_NAME }}" \
+            --resource-group "$RG" \
+            --name "$APP" \
             --image "$IMAGE" \
-            --set-env-vars "GIT_SHA=${{ github.sha }}"
+            --set-env-vars "GIT_SHA=${{ github.sha }}" $PW_ENV
 
       - name: Verify the new revision is live and healthy
         run: |
@@ -128,12 +165,9 @@ jobs:
           FQDN=$(az containerapp show -g "$RG" -n "$APP" \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "relay: https://$FQDN"
-          # Ingress is deny-by-default IP-restricted (see deploy/README), so a
-          # GitHub runner can't curl /version — it always gets 403. Verify via
-          # the control plane instead (the deploy identity has Contributor on the
-          # app): the latest active revision must be Healthy, running, and carry
-          # the GIT_SHA we just deployed. This confirms the exact revision, which
-          # the old curl couldn't do through the allowlist anyway.
+          # Verify via the control plane (the deploy identity has Contributor on
+          # the app): the latest active revision must be Healthy, running, and
+          # carry the GIT_SHA we just deployed. This confirms the exact revision.
           want="$GITHUB_SHA"
           for i in $(seq 1 30); do
             rev="$(az containerapp revision list -g "$RG" -n "$APP" -o json \
@@ -148,9 +182,24 @@ jobs:
                && [ "$(echo "$rev" | jq -r '.sha')"  = "$want" ] \
                && [ "$(echo "$rev" | jq -r '.running')" != "Stopped" ]; then
               echo "✓ new revision live and healthy (git_sha=$want)"
-              exit 0
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::relay's latest active revision did not become Healthy with git_sha $want after ~150s"
+              exit 1
             fi
             sleep 5
           done
-          echo "::error::relay's latest active revision did not become Healthy with git_sha $want after ~150s"
-          exit 1
+          # remote-control-uq7: the ingress no longer IP-restricts, so this GitHub
+          # runner (a non-allowlisted network) can now reach the relay directly.
+          # Curling /version from here is a live proof that the allowlist is gone
+          # and the relay is reachable from anywhere — the exact property that was
+          # broken for roaming phones. /version and the health probes sit ahead of
+          # the password gate, so no password is needed to reach them.
+          echo "checking public reachability of https://$FQDN/version"
+          code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 --retry 5 --retry-delay 3 "https://$FQDN/version" || true)"
+          if [ "$code" != "200" ]; then
+            echo "::error::relay /version was not publicly reachable (HTTP $code) — ingress may still be IP-restricted"
+            exit 1
+          fi
+          echo "✓ relay reachable from a non-allowlisted network (HTTP 200)"

@@ -311,6 +311,15 @@ final class ChatViewModel {
         decide(promptId: promptId, answer: .options(indices: optionIndices, labels: labels))
     }
 
+    /// Resolve a MULTI-question tabbed form: `perQuestion[i]` carries question
+    /// i's selected 0-based option indices (in the prompt's question order),
+    /// producing one `answers` entry per question. `labels` (paired
+    /// per-question) are carried for display only.
+    func decidePermission(promptId: Wire.PromptId, answers perQuestion: [[Int]],
+                          labels: [[String]]) {
+        decide(promptId: promptId, answer: .answers(perQuestion: perQuestion, labels: labels))
+    }
+
     /// Resolve a Question prompt with a typed "Type your own answer" reply
     /// (sends `free_text`). No-op if `text` is empty.
     func decidePermission(promptId: Wire.PromptId, freeText text: String) {
@@ -347,26 +356,33 @@ final class ChatViewModel {
 
     /// Build the `permission_decision` command body for an answer: `choice`
     /// (binary fast-path), `option_index` (single-select Question), `option_indices`
-    /// (multi-select checklist), or `free_text` (typed answer) — exactly one is
-    /// populated, matching the wire's `skip_serializing_if` convention.
+    /// (single multi-select checklist), `free_text` (typed answer), or `answers`
+    /// (multi-question tabbed form) — exactly one is populated, matching the
+    /// wire's `skip_serializing_if` convention.
     private func commandBody(promptId: Wire.PromptId, answer: PermissionAnswer) -> Wire.CommandBody {
         switch answer {
         case let .choice(choice):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
                                        choice: choice, optionIndex: nil,
-                                       optionIndices: nil, freeText: nil)
+                                       optionIndices: nil, freeText: nil, answers: nil)
         case let .option(index, _):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
                                        choice: nil, optionIndex: index,
-                                       optionIndices: nil, freeText: nil)
+                                       optionIndices: nil, freeText: nil, answers: nil)
         case let .options(indices, _):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
                                        choice: nil, optionIndex: nil,
-                                       optionIndices: indices, freeText: nil)
+                                       optionIndices: indices, freeText: nil, answers: nil)
+        case let .answers(perQuestion, _):
+            // One `QuestionAnswer` per question, in the prompt's question order.
+            let answers = perQuestion.map { Wire.QuestionAnswer(optionIndices: $0) }
+            return .permissionDecision(sessionId: sessionId, promptId: promptId,
+                                       choice: nil, optionIndex: nil,
+                                       optionIndices: nil, freeText: nil, answers: answers)
         case let .freeText(text):
             return .permissionDecision(sessionId: sessionId, promptId: promptId,
                                        choice: nil, optionIndex: nil,
-                                       optionIndices: nil, freeText: text)
+                                       optionIndices: nil, freeText: text, answers: nil)
         }
     }
 

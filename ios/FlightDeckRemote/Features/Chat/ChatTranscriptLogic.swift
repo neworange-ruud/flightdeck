@@ -90,7 +90,7 @@ extension Wire.TranscriptItem {
         case let .userMessage(itemId, _, _): itemId
         case let .agentMessage(itemId, _, _): itemId
         case let .activity(itemId, _, _, _, _, _): itemId
-        case let .permissionPrompt(itemId, _, _, _, _, _, _, _): itemId
+        case let .permissionPrompt(itemId, _, _, _, _, _, _, _, _): itemId
         }
     }
 
@@ -100,13 +100,13 @@ extension Wire.TranscriptItem {
         case let .userMessage(_, _, atMs): atMs
         case let .agentMessage(_, _, atMs): atMs
         case let .activity(_, _, _, _, _, atMs): atMs
-        case let .permissionPrompt(_, _, _, _, _, _, _, atMs): atMs
+        case let .permissionPrompt(_, _, _, _, _, _, _, _, atMs): atMs
         }
     }
 
     /// The pending permission-prompt id, if this item is a prompt.
     var permissionPromptId: Wire.PromptId? {
-        if case let .permissionPrompt(_, promptId, _, _, _, _, _, _) = self { return promptId }
+        if case let .permissionPrompt(_, promptId, _, _, _, _, _, _, _) = self { return promptId }
         return nil
     }
 }

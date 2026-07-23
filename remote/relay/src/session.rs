@@ -49,6 +49,18 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Constant-time byte-slice equality for the shared relay-password gate
+/// (remote-control-uq7). Delegates to [`subtle::ConstantTimeEq`] so the compare
+/// takes the same time whether the presented password is wrong in the first
+/// byte or the last — a naive `==`/`str` compare short-circuits on the first
+/// mismatch and leaks the shared secret to a network attacker over many probes.
+/// Slice length is not itself secret (and `subtle` short-circuits on differing
+/// lengths); the password *contents* are what must not leak via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    a.ct_eq(b).into()
+}
+
 /// Maximum `pairing_claim` attempts a single connection may make before the
 /// relay rate-limits it and closes the socket (spec §5.2 / §12: "rate-limit
 /// `pairing_claim`"). A 4-digit claim token has only ~10^4 of entropy, so this
@@ -294,6 +306,7 @@ impl Connection {
             role,
             device_id,
             client,
+            relay_password,
         } = frame
         else {
             self.send_error(
@@ -304,6 +317,29 @@ impl Connection {
             .await;
             return Flow::Close;
         };
+
+        // Shared relay-password gate (remote-control-uq7). Only enforced when a
+        // password is configured; an unconfigured relay stays open (local/dev,
+        // existing tests). The presented value is compared to the configured one
+        // in constant time so a network attacker cannot recover the secret from
+        // response-timing. On failure the relay reports a plain `auth_failed` and
+        // closes — deliberately identical for a missing vs a wrong password, so
+        // no signal leaks about which was the problem. The secret never appears
+        // in any log line.
+        if let Some(expected) = self.state.config.relay_password.as_deref() {
+            if !relay_password.as_deref().is_some_and(|presented| {
+                constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            }) {
+                tracing::warn!(
+                    conn = %self.connection_id,
+                    ?role,
+                    "hello rejected: missing or incorrect relay password"
+                );
+                self.send_error(RelayErrorCode::AuthFailed, "relay password required", None)
+                    .await;
+                return Flow::Close;
+            }
+        }
 
         let Some(version) = negotiate_version(
             MIN_SUPPORTED_VERSION,

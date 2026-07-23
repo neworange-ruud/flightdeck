@@ -43,6 +43,18 @@ async-trait = "0.1"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 base64 = "0.22"
 getrandom = "0.2"
+# Constant-time byte comparison for the shared relay-password gate
+# (remote-control-uq7). Already in the lockfile as a transitive dep of the
+# `p256`/crypto stack, so declaring it direct adds no new build. Using it (vs a
+# hand-rolled loop) keeps the timing-safe compare auditable in one place.
+subtle = "2"
+# Persistent `RelayStore` backend (`FLIGHTDECK_RELAY_STORE=sqlite:<path>`), so
+# device keys, pairings, claim tokens, and per-pairing sequence high-water marks
+# survive a relay restart/redeploy (remote-control-b0f). `bundled` compiles a
+# vendored SQLite (no system libsqlite3 / C toolchain dependency), keeping the
+# build reproducible on Azure Container Apps and in CI. The in-memory store
+# remains the default, so nothing links against this unless sqlite is selected.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Live APNs HTTP/2 transport only (feature `apns-live`); reqwest is already a
 # dev-dependency below. `http2` for APNs' required protocol, `rustls-tls` to
 # stay pure-Rust (no system OpenSSL).

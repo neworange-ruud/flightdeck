@@ -10,6 +10,13 @@ use crate::ids::SessionId;
 /// v3 adds multi-select (checklist) questions: `PermissionPrompt.multi_select`
 /// and `PermissionDecision.option_indices`. Both are `#[serde(default)]`, so v2
 /// peers still parse v3 frames (missing fields → single-select).
+///
+/// v3 also carries multi-QUESTION forms additively: `PermissionPrompt.questions`
+/// (a list of `PromptQuestion`, each with its own options + `multi_select`) and
+/// `PermissionDecision.answers` (a per-question `QuestionAnswer` list). Both are
+/// `#[serde(default)]` and the flat single-question fields keep mirroring the
+/// first question, so this needs no version bump — a peer that ignores the new
+/// fields sees exactly the single-question prompt it did before.
 pub const PROTOCOL_VERSION: u16 = 3;
 /// Oldest protocol version this build can still interoperate with.
 pub const MIN_SUPPORTED_VERSION: u16 = 1;

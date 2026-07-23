@@ -710,6 +710,37 @@ fn effective_url(cfg: &RemoteConfig, state: &RemoteState) -> String {
     }
 }
 
+/// The shared relay password to present in `hello`, or `None` to present none
+/// (remote-control-uq7). Precedence, highest first:
+///   1. the `FLIGHTDECK_RELAY_PASSWORD` environment variable, when set and
+///      non-empty — lets a deployment inject the secret without persisting it to
+///      `config.toml`, and is the exact source the iOS/relay sides mirror;
+///   2. `[remote].relay_password` from the effective (merged global→project)
+///      `config.toml`.
+///
+/// An empty/whitespace-only value at either layer is treated as unset, so a
+/// local/dev relay with no password configured still connects (the relay stays
+/// open when it has no password). The value is sent verbatim — never trimmed —
+/// so it byte-matches the relay's constant-time compare.
+fn effective_relay_password(cfg: &RemoteConfig) -> Option<String> {
+    resolve_relay_password(
+        std::env::var("FLIGHTDECK_RELAY_PASSWORD").ok(),
+        &cfg.relay_password,
+    )
+}
+
+/// Pure precedence logic behind [`effective_relay_password`], split out so it can
+/// be unit-tested without mutating the process-global `FLIGHTDECK_RELAY_PASSWORD`
+/// env var (which would race across parallel test threads). `env` is the raw env
+/// value; `cfg_value` is `[remote].relay_password`. Empty/whitespace-only at
+/// either layer is treated as unset; a real env value wins over config.
+fn resolve_relay_password(env: Option<String>, cfg_value: &str) -> Option<String> {
+    if let Some(env) = env.filter(|s| !s.trim().is_empty()) {
+        return Some(env);
+    }
+    Some(cfg_value.to_string()).filter(|s| !s.trim().is_empty())
+}
+
 /// One connection session: connect, authenticate, resume, then pump.
 #[allow(clippy::too_many_arguments)]
 fn run_session(
@@ -743,6 +774,7 @@ fn run_session(
         role: Role::Desktop,
         device_id: DeviceId::new(identity.device_id()),
         client: client_info(),
+        relay_password: effective_relay_password(cfg),
     };
     if send_frame(&mut sock, &hello).is_err() {
         return ended_unauthed();

@@ -68,7 +68,8 @@ import CryptoKit
         func connectAndOffer() async throws -> (String, String) {
             try await channel.send(.hello(protocolVersion: 1, role: .desktop,
                 deviceId: Wire.DeviceId(deviceId),
-                client: Wire.ClientInfo(appVersion: "test", platform: "macos", osVersion: nil)))
+                client: Wire.ClientInfo(appVersion: "test", platform: "macos", osVersion: nil),
+                relayPassword: nil))
             _ = try await recvUntil { if case .helloOk = $0 { return true }; return false }
             let challenge = try await recvUntil { if case .authChallenge = $0 { return true }; return false }
             if case let .authChallenge(nonce, _) = challenge { nonceB64 = nonce }

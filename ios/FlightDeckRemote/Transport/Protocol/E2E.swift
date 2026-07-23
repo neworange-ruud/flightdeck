@@ -278,6 +278,79 @@ extension Wire {
         }
     }
 
+    /// One question within a (possibly multi-question) prompt form. A Claude
+    /// `AskUserQuestion` can carry several of these, each rendered as its own
+    /// tab. Mirrors Rust `PromptQuestion`.
+    struct PromptQuestion: Codable, Hashable, Sendable {
+        /// Short tab header (AskUserQuestion `header`), if present.
+        var header: String?
+        /// The question text shown to the human.
+        var question: String
+        /// This question's offered options (>=1), each with a stable 0-based index.
+        var options: [PermissionOption]
+        /// Whether this question accepts MULTIPLE selected options (a checklist).
+        var multiSelect: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case header, question, options
+            case multiSelect = "multi_select"
+        }
+
+        init(header: String? = nil, question: String, options: [PermissionOption],
+             multiSelect: Bool = false) {
+            self.header = header
+            self.question = question
+            self.options = options
+            self.multiSelect = multiSelect
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            header = try c.decodeIfPresent(String.self, forKey: .header)
+            question = try c.decode(String.self, forKey: .question)
+            options = try c.decode([PermissionOption].self, forKey: .options)
+            // `#[serde(default)]` on the Rust side: absent means single-select.
+            multiSelect = try c.decodeIfPresent(Bool.self, forKey: .multiSelect) ?? false
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            // `skip_serializing_if = "Option::is_none"` — omit when absent.
+            try c.encodeIfPresent(header, forKey: .header)
+            try c.encode(question, forKey: .question)
+            try c.encode(options, forKey: .options)
+            try c.encode(multiSelect, forKey: .multiSelect)
+        }
+    }
+
+    /// The phone's answer to ONE question within a multi-question form. Mirrors
+    /// Rust `QuestionAnswer`.
+    struct QuestionAnswer: Codable, Hashable, Sendable {
+        /// The chosen 0-based option indices for this question, in its own
+        /// option order. One entry for a single-select question, several for a
+        /// multi-select (checklist) one; empty leaves the question unanswered.
+        var optionIndices: [Int]
+
+        private enum CodingKeys: String, CodingKey {
+            case optionIndices = "option_indices"
+        }
+
+        init(optionIndices: [Int]) {
+            self.optionIndices = optionIndices
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // `#[serde(default)]` on the Rust side: absent decodes to empty.
+            optionIndices = try c.decodeIfPresent([Int].self, forKey: .optionIndices) ?? []
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(optionIndices, forKey: .optionIndices)
+        }
+    }
+
     /// One item in the cleaned transcript. Internally tagged by `type`.
     enum TranscriptItem: Codable, Hashable, Sendable {
         /// Prose the user sent to the agent.
@@ -291,10 +364,11 @@ extension Wire {
         /// prompt awaiting a decision.
         case permissionPrompt(itemId: ItemId, promptId: PromptId, kind: PromptKind,
                               command: String, options: [PermissionOption],
-                              allowFreeText: Bool, multiSelect: Bool, atMs: Int64)
+                              allowFreeText: Bool, multiSelect: Bool,
+                              questions: [PromptQuestion], atMs: Int64)
 
         private enum CodingKeys: String, CodingKey {
-            case type, text, summary, detail, body, kind, command, options
+            case type, text, summary, detail, body, kind, command, options, questions
             case itemId = "item_id"
             case promptId = "prompt_id"
             case allowFreeText = "allow_free_text"
@@ -337,6 +411,10 @@ extension Wire {
                     // `#[serde(default)]`: absent `multi_select` (a pre-v3
                     // desktop) means a single-select question.
                     multiSelect: try c.decodeIfPresent(Bool.self, forKey: .multiSelect) ?? false,
+                    // `#[serde(default)]`: absent `questions` (a pre-v4 desktop)
+                    // means the phone falls back to the flat single-question
+                    // fields above. The flat fields always mirror `questions[0]`.
+                    questions: try c.decodeIfPresent([PromptQuestion].self, forKey: .questions) ?? [],
                     atMs: try c.decode(Int64.self, forKey: .atMs))
             default:
                 throw DecodingError.dataCorruptedError(
@@ -366,7 +444,7 @@ extension Wire {
                 try c.encode(body, forKey: .body) // explicit null
                 try c.encode(kind, forKey: .kind)
                 try c.encode(atMs, forKey: .atMs)
-            case let .permissionPrompt(itemId, promptId, kind, command, options, allowFreeText, multiSelect, atMs):
+            case let .permissionPrompt(itemId, promptId, kind, command, options, allowFreeText, multiSelect, questions, atMs):
                 try c.encode("permission_prompt", forKey: .type)
                 try c.encode(itemId, forKey: .itemId)
                 try c.encode(promptId, forKey: .promptId)
@@ -375,6 +453,11 @@ extension Wire {
                 try c.encode(options, forKey: .options)
                 try c.encode(allowFreeText, forKey: .allowFreeText)
                 try c.encode(multiSelect, forKey: .multiSelect)
+                // `skip_serializing_if = "Vec::is_empty"` — omit when empty so
+                // the round-trip matches a plain single-question prompt.
+                if !questions.isEmpty {
+                    try c.encode(questions, forKey: .questions)
+                }
                 try c.encode(atMs, forKey: .atMs)
             }
         }
@@ -717,7 +800,8 @@ extension Wire {
         /// (typed "Other" answer) is set.
         case permissionDecision(sessionId: SessionId, promptId: PromptId,
                                 choice: PermissionChoice?, optionIndex: Int?,
-                                optionIndices: [Int]?, freeText: String?)
+                                optionIndices: [Int]?, freeText: String?,
+                                answers: [QuestionAnswer]?)
         /// Launch a new agent session.
         case newAgent(projectId: ProjectId, agentType: AgentType, name: String,
                       baseBranch: String, firstTask: String)
@@ -766,6 +850,7 @@ extension Wire {
             case optionIndex = "option_index"
             case optionIndices = "option_indices"
             case freeText = "free_text"
+            case answers
         }
 
         init(from decoder: Decoder) throws {
@@ -783,7 +868,8 @@ extension Wire {
                     choice: try c.decodeIfPresent(PermissionChoice.self, forKey: .choice),
                     optionIndex: try c.decodeIfPresent(Int.self, forKey: .optionIndex),
                     optionIndices: try c.decodeIfPresent([Int].self, forKey: .optionIndices),
-                    freeText: try c.decodeIfPresent(String.self, forKey: .freeText))
+                    freeText: try c.decodeIfPresent(String.self, forKey: .freeText),
+                    answers: try c.decodeIfPresent([QuestionAnswer].self, forKey: .answers))
             case "new_agent":
                 self = .newAgent(
                     projectId: try c.decode(ProjectId.self, forKey: .projectId),
@@ -857,16 +943,17 @@ extension Wire {
                 try c.encode("reply", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)
                 try c.encode(text, forKey: .text)
-            case let .permissionDecision(sessionId, promptId, choice, optionIndex, optionIndices, freeText):
+            case let .permissionDecision(sessionId, promptId, choice, optionIndex, optionIndices, freeText, answers):
                 try c.encode("permission_decision", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)
                 try c.encode(promptId, forKey: .promptId)
                 // `skip_serializing_if = "Option::is_none"` on the Rust side —
-                // omit whichever of the four is unset (never explicit null).
+                // omit whichever field is unset (never explicit null).
                 try c.encodeIfPresent(choice, forKey: .choice)
                 try c.encodeIfPresent(optionIndex, forKey: .optionIndex)
                 try c.encodeIfPresent(optionIndices, forKey: .optionIndices)
                 try c.encodeIfPresent(freeText, forKey: .freeText)
+                try c.encodeIfPresent(answers, forKey: .answers)
             case let .newAgent(projectId, agentType, name, baseBranch, firstTask):
                 try c.encode("new_agent", forKey: .type)
                 try c.encode(projectId, forKey: .projectId)
