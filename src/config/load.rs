@@ -89,16 +89,22 @@ struct GlobalConfigView<'a> {
 }
 
 /// The explanatory comment injected above the `[remote]` section of any global
-/// `config.toml` we write. It documents that FlightDeck Remote is off by default
-/// and — importantly — that the default relay is **not** open to the public.
+/// `config.toml` we write. It documents that FlightDeck Remote is off by default,
+/// that the default relay requires a shared password that is not published, and
+/// how to supply that password.
 const REMOTE_SECTION_COMMENT: &str = "\
 # FlightDeck Remote (optional phone <-> desktop link). Off by default.
 #
-# NOTE: the default relay URL below (relay.flightdeckai.app) is currently
-# RESTRICTED and is NOT accessible to the public — enabling remote against it
-# will not connect. You may point relay_url at a relay you host yourself, but
-# self-hosting is not supported by the author in any way. See the docs for
-# details: https://flightdeckai.app/remote
+# NOTE: the default relay URL below (relay.flightdeckai.app) is the author's
+# hosted relay. It is reachable from any network but gated by a shared
+# `relay_password` that is not published — enabling remote against it without the
+# password will not connect. You may point relay_url at a relay you host yourself
+# (set its FLIGHTDECK_RELAY_PASSWORD and mirror it in relay_password, or leave
+# both empty for an open relay), but self-hosting is not supported by the author
+# in any way. See the docs for details: https://flightdeckai.app/remote
+#
+# relay_password: shared secret presented to the relay on connect (empty = none).
+# The FLIGHTDECK_RELAY_PASSWORD environment variable overrides this value.
 ";
 
 /// Insert [`REMOTE_SECTION_COMMENT`] directly above the `[remote]` table header
@@ -329,11 +335,13 @@ mod tests {
         assert!(toml.contains("[remote]"), "global: {toml}");
         assert!(toml.contains("enabled = false"), "global: {toml}");
         assert!(toml.contains("relay.flightdeckai.app"), "global: {toml}");
-        // The restriction note is attached as a comment above the section.
+        // The password-gating note is attached as a comment above the section,
+        // and the `relay_password` field is present and documented.
         assert!(
-            toml.contains("RESTRICTED") && toml.contains("NOT accessible to the public"),
+            toml.contains("gated by a shared") && toml.contains("not published"),
             "global: {toml}"
         );
+        assert!(toml.contains("relay_password"), "global: {toml}");
         // It still parses back into a valid config (comment is inert).
         let cfg = parse_config(&toml).unwrap();
         assert!(!cfg.remote.enabled);
@@ -347,7 +355,7 @@ mod tests {
             .parse()
             .unwrap();
         let out = serialize_global_table(&table).unwrap();
-        assert!(out.contains("RESTRICTED"), "out: {out}");
+        assert!(out.contains("relay_password"), "out: {out}");
         // The comment sits directly above the section header.
         let comment_idx = out.find("# FlightDeck Remote").unwrap();
         let header_idx = out.find("[remote]").unwrap();

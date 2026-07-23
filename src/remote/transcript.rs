@@ -53,7 +53,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use flightdeck_remote_protocol::{
-    ActivityKind, PermissionChoice, PermissionOption, PromptKind, TranscriptFeed, TranscriptItem,
+    ActivityKind, PermissionChoice, PermissionOption, PromptKind, PromptQuestion, TranscriptFeed,
+    TranscriptItem,
 };
 use flightdeck_remote_protocol::{ItemId, PromptId, SessionId};
 
@@ -141,6 +142,12 @@ pub struct StructuredPrompt {
     /// Whether the phone may select multiple options (a `multiSelect` /
     /// checklist question). `false` for permissions and single-select questions.
     pub multi_select: bool,
+    /// All questions in the prompt's form, in tab order (a Claude
+    /// `AskUserQuestion` can carry several). Empty for a permission prompt or a
+    /// single implicit question whose flat fields above already describe it; the
+    /// flat `command`/`options`/`multi_select` always mirror `questions[0]` when
+    /// this is non-empty.
+    pub questions: Vec<PromptQuestion>,
 }
 
 /// Reconstructs one session's cleaned transcript by tailing its agent session
@@ -655,6 +662,7 @@ impl TranscriptBuilder {
             options: sp.options,
             allow_free_text: sp.allow_free_text,
             multi_select: sp.multi_select,
+            questions: sp.questions,
             at_ms,
         });
         self.open_prompt = preview.clone();
@@ -703,6 +711,7 @@ impl TranscriptBuilder {
             ],
             allow_free_text: false,
             multi_select: false,
+            questions: Vec::new(),
             at_ms,
         });
         preview
@@ -808,54 +817,76 @@ fn truncate_preview(text: &str) -> Option<String> {
     }
 }
 
-/// Parse a Claude `AskUserQuestion` tool_use `input` into a [`StructuredPrompt`]
-/// (the primary question only, `questions[0]`). Returns `None` — so the
-/// caller falls back to a normal activity pill — when the shape is missing or
-/// oddly typed (no question text, or no options with labels). The question's
-/// `multiSelect` bool becomes [`StructuredPrompt::multi_select`].
+/// Parse a Claude `AskUserQuestion` tool_use `input` into a [`StructuredPrompt`],
+/// capturing ALL of its `questions` (each with its header, question text,
+/// options, and `multiSelect` flag) — not just the first. A single
+/// `AskUserQuestion` can carry several questions rendered as a tabbed form with
+/// a final Confirm tab, so every question is preserved in
+/// [`StructuredPrompt::questions`]; the flat `command`/`options`/`multi_select`
+/// fields mirror the FIRST question so a pre-multi-question consumer (and the
+/// preview) still work.
+///
+/// Returns `None` — so the caller falls back to a normal activity pill — when
+/// the shape is missing or oddly typed (no first question with text, or a
+/// question with no options with labels).
 pub(crate) fn parse_ask_user_question(input: &Value) -> Option<StructuredPrompt> {
-    let question = input
-        .get("questions")
-        .and_then(Value::as_array)
-        .and_then(|qs| qs.first())?;
-    let command = question
-        .get("question")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|t| !t.is_empty())?
-        .to_string();
-    let options: Vec<PermissionOption> = question
-        .get("options")
-        .and_then(Value::as_array)?
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| {
-            let label = o.get("label").and_then(Value::as_str)?.to_string();
-            let description = o
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            Some(PermissionOption {
-                index: i as u32,
-                choice: None,
-                label,
-                description,
+    let raw_questions = input.get("questions").and_then(Value::as_array)?;
+    let mut questions: Vec<PromptQuestion> = Vec::with_capacity(raw_questions.len());
+    for q in raw_questions {
+        let question = q
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())?
+            .to_string();
+        let options: Vec<PermissionOption> = q
+            .get("options")
+            .and_then(Value::as_array)?
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                let label = o.get("label").and_then(Value::as_str)?.to_string();
+                let description = o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Some(PermissionOption {
+                    index: i as u32,
+                    choice: None,
+                    label,
+                    description,
+                })
             })
-        })
-        .collect();
-    if options.is_empty() {
-        return None;
+            .collect();
+        if options.is_empty() {
+            return None;
+        }
+        let header = q
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|h| !h.is_empty());
+        let multi_select = q
+            .get("multiSelect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        questions.push(PromptQuestion {
+            header,
+            question,
+            options,
+            multi_select,
+        });
     }
-    let multi_select = question
-        .get("multiSelect")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // The first question feeds the flat single-question fields (preview + any
+    // consumer that ignores the `questions` list).
+    let first = questions.first()?;
     Some(StructuredPrompt {
         kind: PromptKind::Question,
-        command,
-        options,
+        command: first.question.clone(),
+        options: first.options.clone(),
         allow_free_text: true,
-        multi_select,
+        multi_select: first.multi_select,
+        questions,
     })
 }
 

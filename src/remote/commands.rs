@@ -454,27 +454,49 @@ const DOWN_ARROW: &[u8] = b"\x1b[B";
 /// 50ms main-loop poll means each step rounds up to the next tick.
 pub const MULTI_SELECT_STEP_DELAY_MS: u64 = 150;
 
-/// The spaced keystroke chunks that drive Claude's multi-select form to toggle
-/// exactly `indices` and submit. Each chunk is a single keystroke, delivered one
-/// [`MULTI_SELECT_STEP_DELAY_MS`] apart so Claude's async re-render settles
-/// between them (remote-control-dc9): from the first option, one `Down` per row
-/// to reach each target, `Enter` to toggle it, then `Tab` to the Confirm tab and
-/// `Enter` to submit. `indices` must be sorted + deduplicated by the caller.
-fn claude_multi_select_chunks(indices: &[u32]) -> Vec<Vec<u8>> {
+/// The spaced keystroke chunks that drive a MULTI-question tabbed form (a Claude
+/// `AskUserQuestion` carrying several questions) to answer each tab and submit.
+/// `selections[i]` is the chosen 0-based option indices for question tab `i`
+/// (each already sorted + deduplicated by the caller), in tab order.
+///
+/// Each chunk is one keystroke, delivered one [`MULTI_SELECT_STEP_DELAY_MS`]
+/// apart so an async (Ink/React) TUI re-render settles between them
+/// (remote-control-dc9). Per the verified model (bd memory
+/// `askuserquestion-real-tui-model`): each question is a tab, plus a final
+/// **Confirm** tab that submits. For each question tab, from its first option:
+/// one `Down` per row to reach each chosen option and `Enter` to toggle/select
+/// it; then `Tab` to advance to the next tab. After the LAST question that
+/// final `Tab` lands on the Confirm tab, and a closing `Enter` submits the whole
+/// form. A question with no selected options contributes only its `Tab` (the tab
+/// is skipped, leaving it unanswered).
+fn multi_question_chunks(selections: &[Vec<u32>]) -> Vec<Vec<u8>> {
     let mut chunks: Vec<Vec<u8>> = Vec::new();
-    let mut cursor = 0u32;
-    for &target in indices {
-        // One Down per row: consecutive Downs also race the re-render (each
-        // handler would read the same stale index), so they are separate chunks.
-        for _ in cursor..target {
-            chunks.push(DOWN_ARROW.to_vec());
+    for indices in selections {
+        let mut cursor = 0u32;
+        for &target in indices {
+            // One Down per row: consecutive Downs also race the re-render (each
+            // handler would read the same stale index), so they are separate
+            // chunks.
+            for _ in cursor..target {
+                chunks.push(DOWN_ARROW.to_vec());
+            }
+            chunks.push(b"\r".to_vec()); // Enter toggles/selects the highlighted option.
+            cursor = target;
         }
-        chunks.push(b"\r".to_vec()); // Enter toggles the highlighted option.
-        cursor = target;
+        // Tab to the next question tab — or, after the last question, to Confirm.
+        chunks.push(b"\t".to_vec());
     }
-    chunks.push(b"\t".to_vec()); // Tab to the far-right Confirm tab.
-    chunks.push(b"\r".to_vec()); // Enter submits the whole form.
+    chunks.push(b"\r".to_vec()); // Enter on the Confirm tab submits the whole form.
     chunks
+}
+
+/// The spaced keystroke chunks that drive Claude's SINGLE-question multi-select
+/// form to toggle exactly `indices` and submit. `indices` must be sorted +
+/// deduplicated by the caller. A single-question form is just the one-tab case
+/// of [`multi_question_chunks`]: navigate + toggle within the sole question,
+/// then `Tab` to Confirm and `Enter` to submit.
+fn claude_multi_select_chunks(indices: &[u32]) -> Vec<Vec<u8>> {
+    multi_question_chunks(std::slice::from_ref(&indices.to_vec()))
 }
 
 /// The keystrokes injected to select SEVERAL options of a multi-select
@@ -498,9 +520,9 @@ fn claude_multi_select_chunks(indices: &[u32]) -> Vec<Vec<u8>> {
 /// ([`DOWN_ARROW`], matching the desktop's own key encoding); Tab (`\t`) and
 /// Enter (`\r`) are mode-independent.
 ///
-/// SCOPE: single-question prompts only. A prompt with MULTIPLE question tabs is
-/// not yet handled — the single `Tab` here lands on the next question, not
-/// Confirm, when other questions precede it (remote-control follow-up).
+/// SCOPE: a single question's options. Multi-QUESTION forms are answered via
+/// [`multi_question_keystroke`] / [`multi_question_chunks`], which walk the
+/// question tabs before reaching Confirm.
 ///
 /// **Codex** has no such prompt → `None` (an honest rejection upstream).
 pub fn multi_option_keystroke(backend: StatusBackend, option_indices: &[u32]) -> Option<Vec<u8>> {
@@ -511,23 +533,45 @@ pub fn multi_option_keystroke(backend: StatusBackend, option_indices: &[u32]) ->
         return None;
     }
     match backend {
+        // Both render the same one-question form; emit its chunks as one burst
+        // (OpenCode processes input synchronously, so it needs no spacing).
         StatusBackend::Claude | StatusBackend::OpenCode => {
-            let mut bytes = Vec::new();
-            let mut cursor = 0u32;
-            for &target in &indices {
-                for _ in cursor..target {
-                    bytes.extend_from_slice(DOWN_ARROW);
-                }
-                bytes.push(b'\r'); // Enter toggles the highlighted option.
-                cursor = target;
-            }
-            bytes.push(b'\t'); // Tab to the far-right Confirm tab.
-            bytes.push(b'\r'); // Enter submits the whole form.
-            Some(bytes)
+            Some(multi_question_chunks(std::slice::from_ref(&indices)).concat())
         }
         // Codex has no multi-option prompt; refuse rather than guess.
         StatusBackend::Codex => None,
     }
+}
+
+/// The flattened keystrokes that answer a MULTI-question tabbed form in one
+/// burst (used for OpenCode, which processes input synchronously). `selections`
+/// is the per-question chosen indices in tab order; each inner slice is sorted +
+/// deduplicated here. See [`multi_question_chunks`] for the navigation model.
+/// **Codex** has no such prompt → `None`.
+pub fn multi_question_keystroke(
+    backend: StatusBackend,
+    selections: &[Vec<u32>],
+) -> Option<Vec<u8>> {
+    match backend {
+        StatusBackend::Claude | StatusBackend::OpenCode => {
+            Some(multi_question_chunks(&normalize_selections(selections)).concat())
+        }
+        StatusBackend::Codex => None,
+    }
+}
+
+/// Sort + deduplicate each question's chosen option indices so navigation is
+/// monotonic and each option is toggled at most once per question.
+fn normalize_selections(selections: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    selections
+        .iter()
+        .map(|indices| {
+            let mut v = indices.clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        })
+        .collect()
 }
 
 /// Encode a phone reply exactly as the desktop TUI delivers typed/pasted
@@ -568,6 +612,7 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             option_index,
             option_indices,
             free_text,
+            answers,
         } => {
             let Some(s) = index.session(session_id) else {
                 return reject(format!("unknown session '{session_id}'"));
@@ -597,18 +642,51 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             //                         fields: if a phone somehow sends both, the
             //                         explicit free-text answer wins over a list
             //                         position.
-            //   3. `option_indices` — multi-select (checklist) toggle + submit.
-            //                         Ranked above `option_index` because it is
-            //                         the more specific answer; a phone only
-            //                         populates it for a `multi_select` prompt.
-            //   4. `option_index`   — single-option selection.
-            //   5. otherwise        — nothing actionable; reject honestly.
+            //   3. `answers`        — a MULTI-question tabbed form: per-question
+            //                         selections walked across the question tabs
+            //                         to Confirm. Ranked above the single-question
+            //                         option fields because a phone only populates
+            //                         it for a multi-question prompt.
+            //   4. `option_indices` — single-question multi-select (checklist)
+            //                         toggle + submit. Ranked above `option_index`
+            //                         because it is the more specific answer; a
+            //                         phone only populates it for a `multi_select`
+            //                         prompt.
+            //   5. `option_index`   — single-question single-option selection
+            //                         (the untouched number-key path).
+            //   6. otherwise        — nothing actionable; reject honestly.
             let free_text = free_text.as_deref().filter(|t| !t.is_empty());
+            let answers = answers.as_deref().filter(|a| !a.is_empty());
             let option_indices = option_indices.as_deref().filter(|v| !v.is_empty());
             let bytes = if let Some(choice) = choice {
                 permission_keystroke(backend, *choice).to_vec()
             } else if let Some(text) = free_text {
                 encode_reply(text, s.bracketed_paste)
+            } else if let Some(answers) = answers {
+                // Multi-question tabbed form. For each question tab, navigate to
+                // and toggle the chosen options, Tab to the next tab, then Enter
+                // on the final Confirm tab. Claude's Ink TUI re-renders
+                // asynchronously, so its keystrokes must be spaced out as a timed
+                // sequence (remote-control-dc9); OpenCode processes input
+                // synchronously and takes the whole burst at once.
+                let selections: Vec<Vec<u32>> =
+                    answers.iter().map(|a| a.option_indices.clone()).collect();
+                let selections = normalize_selections(&selections);
+                if backend == StatusBackend::Claude {
+                    return Translation::PtyInputSequence {
+                        project: s.project,
+                        tab: s.tab,
+                        session_id: session_id.clone(),
+                        chunks: multi_question_chunks(&selections),
+                        step_delay_ms: MULTI_SELECT_STEP_DELAY_MS,
+                    };
+                }
+                match multi_question_keystroke(backend, &selections) {
+                    Some(b) => b,
+                    None => {
+                        return reject("this agent does not support multi-question prompts");
+                    }
+                }
             } else if let Some(indices) = option_indices {
                 // Claude's Ink TUI races injected keystrokes against its async
                 // re-render, so navigation + toggle + submit must be spaced out —

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use flightdeck_remote_protocol::{
     AgentStatus, AgentType, CommandAck, CommandBody, CommandId, CommandOutcome, DesktopToPhone,
-    PermissionChoice, ProjectId, PromptId, ShellEventKind, ShellId, StateSnapshot,
+    PermissionChoice, ProjectId, PromptId, ShellEventKind, ShellId, StateSnapshot, TranscriptItem,
 };
 
 use support::desktop::{make_fixture, DesktopHandle};
@@ -137,6 +137,33 @@ impl Harness {
     fn worktree(&self, name: &str) -> PathBuf {
         self.worktrees_root().join(name)
     }
+
+    /// The desktop's sandboxed `$HOME`. Agent session files (which the desktop
+    /// tails to reconstruct the phone transcript, remote-control-72k) resolve
+    /// under here — `~/.claude/projects/<mangled worktree>/…`.
+    fn home(&self) -> &Path {
+        self._desktop.home()
+    }
+}
+
+/// Claude Code's on-disk session directory for a worktree under `home`: the
+/// absolute worktree path with every `/`, `\` and `.` folded to `-`, under
+/// `~/.claude/projects/`. Mirrors `agents::resume::claude_project_dir` so the
+/// test writes a session file exactly where the desktop's reconstruction looks
+/// for it.
+fn claude_project_dir(home: &Path, worktree: &Path) -> PathBuf {
+    let mangled: String = worktree
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '.') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    home.join(".claude").join("projects").join(mangled)
 }
 
 // ===========================================================================
@@ -400,6 +427,7 @@ fn remote_capabilities_end_to_end() {
         option_index: None,
         option_indices: None,
         free_text: None,
+        answers: None,
     });
     let ack = await_ack(&mut h.phone, &perm_cmd, ACK_TIMEOUT);
     assert_eq!(
@@ -468,9 +496,53 @@ fn remote_capabilities_end_to_end() {
     );
 
     // -------------------------------------------------------------------
-    // transcript: request_transcript yields a Transcript feed for the
-    // session (its builder was populated from the fake agent's banner).
+    // transcript reconstruction (remote-control-72k): the desktop tails the
+    // agent's own session file (not the raw PTY, which for a cursor-addressed
+    // full-screen agent carries no newline-terminated prose) and pushes the
+    // reconstructed items to the phone as TranscriptAppend. The fake agent is a
+    // deterministic stub that does not write a real session log, so we drop a
+    // Claude-format session file exactly where the reconstruction looks for it
+    // (~/.claude/projects/<mangled worktree>/<uuid>.jsonl under the desktop's
+    // sandboxed HOME) and assert its agent prose reaches the phone.
     // -------------------------------------------------------------------
+    const AGENT_MARKER: &str = "agent-reply-marker-e2e-7714";
+    let session_dir = claude_project_dir(h.home(), &h.worktree(SESSION_A));
+    std::fs::create_dir_all(&session_dir).expect("create Claude session dir under desktop HOME");
+    let session_jsonl = session_dir.join("11111111-1111-1111-1111-111111111111.jsonl");
+    let user_rec = r#"{"type":"user","uuid":"e2e-u1","message":{"content":"Give me an overview"}}"#;
+    let agent_rec = format!(
+        r#"{{"type":"assistant","uuid":"e2e-a1","message":{{"content":[{{"type":"text","text":"{AGENT_MARKER} — here is the overview."}}]}}}}"#
+    );
+    std::fs::write(&session_jsonl, format!("{user_rec}\n{agent_rec}\n"))
+        .expect("write Claude session JSONL");
+
+    // The desktop reconstructs each tick and proactively flushes new items as
+    // TranscriptAppend — assert the agent's prose (identified by the marker)
+    // reaches the phone as an AgentMessage for session A.
+    let appended = h.phone.recv_until(EFFECT_TIMEOUT, |m| {
+        matches!(m, DesktopToPhone::TranscriptAppend(f)
+            if f.session_id == session_a_id
+            && f.items.iter().any(|it| matches!(it,
+                TranscriptItem::AgentMessage { text, .. } if text.contains(AGENT_MARKER))))
+    });
+    match appended {
+        DesktopToPhone::TranscriptAppend(feed) => {
+            assert_eq!(feed.session_id, session_a_id, "append for session A");
+            assert!(
+                !feed.replace,
+                "an incremental TranscriptAppend has replace = false"
+            );
+            assert!(
+                feed.items.iter().any(|it| matches!(it,
+                    TranscriptItem::AgentMessage { text, .. } if text.contains(AGENT_MARKER))),
+                "the append carries the agent's reconstructed prose; feed: {feed:?}"
+            );
+        }
+        other => unreachable!("recv_until returned a non-append: {other:?}"),
+    }
+
+    // A subsequent request_transcript returns a full (replace = true) load that
+    // now includes the same agent prose.
     h.phone.command(CommandBody::RequestTranscript {
         session_id: session_a_id.clone(),
         from_index: None,
@@ -483,6 +555,11 @@ fn remote_capabilities_end_to_end() {
         DesktopToPhone::Transcript(feed) => {
             assert_eq!(feed.session_id, session_a_id, "transcript for session A");
             assert!(feed.replace, "a full transcript load sets replace = true");
+            assert!(
+                feed.items.iter().any(|it| matches!(it,
+                    TranscriptItem::AgentMessage { text, .. } if text.contains(AGENT_MARKER))),
+                "the full load includes the reconstructed agent prose; feed: {feed:?}"
+            );
         }
         other => unreachable!("recv_until returned a non-transcript: {other:?}"),
     }

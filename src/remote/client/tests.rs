@@ -247,6 +247,7 @@ fn happy_path_auth_resume_ack_and_echo() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -339,6 +340,7 @@ fn auth_failure_reports_disconnected_and_never_connected() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
@@ -395,6 +397,7 @@ fn reconnects_after_socket_drop() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
@@ -495,6 +498,7 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     // Seed a persisted pairing so the client takes the auth-first path.
     let mut seed = RemoteState::default();
@@ -621,6 +625,7 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     let mut pairing = Pairing::new("pair_test");
@@ -762,6 +767,7 @@ fn desktop_announces_machine_name_on_auth() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, _in_rx) = channel();
@@ -811,6 +817,7 @@ fn pairing_revoked_drops_pairing_and_notifies_app() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -892,6 +899,7 @@ fn half_open_socket_is_torn_down_by_liveness_deadline() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        relay_password: String::new(),
     };
     // A persisted pairing makes conn #1 auth-first (no pre-auth offer wait).
     let mut seed = RemoteState::default();
@@ -990,6 +998,7 @@ fn failed_envelope_write_is_held_and_resent_without_a_seq_gap() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        relay_password: String::new(),
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -1057,6 +1066,7 @@ fn version_incompatible_is_terminal_and_stops_reconnecting() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        relay_password: String::new(),
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
@@ -1091,4 +1101,50 @@ fn version_incompatible_is_terminal_and_stops_reconnecting() {
     );
 
     handle.stop();
+}
+
+// --- Relay-password precedence (remote-control-uq7) ------------------------
+
+#[test]
+fn relay_password_env_overrides_config() {
+    // A non-empty env value wins over the config.toml value.
+    assert_eq!(
+        resolve_relay_password(Some("from-env".to_string()), "from-config"),
+        Some("from-env".to_string())
+    );
+}
+
+#[test]
+fn relay_password_falls_back_to_config_when_env_unset_or_empty() {
+    // Env unset → config value is used.
+    assert_eq!(
+        resolve_relay_password(None, "from-config"),
+        Some("from-config".to_string())
+    );
+    // Env present but empty/whitespace → treated as unset, config used.
+    assert_eq!(
+        resolve_relay_password(Some(String::new()), "from-config"),
+        Some("from-config".to_string())
+    );
+    assert_eq!(
+        resolve_relay_password(Some("  ".to_string()), "from-config"),
+        Some("from-config".to_string())
+    );
+}
+
+#[test]
+fn relay_password_none_when_neither_configured() {
+    // Both layers empty → no password presented (local/dev relay stays open).
+    assert_eq!(resolve_relay_password(None, ""), None);
+    assert_eq!(resolve_relay_password(Some("   ".to_string()), "   "), None);
+}
+
+#[test]
+fn relay_password_is_sent_verbatim_not_trimmed() {
+    // A real value is preserved byte-for-byte so it matches the relay's
+    // constant-time compare exactly.
+    assert_eq!(
+        resolve_relay_password(Some(" pad ".to_string()), ""),
+        Some(" pad ".to_string())
+    );
 }

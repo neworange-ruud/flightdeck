@@ -195,6 +195,7 @@ fn decision(prompt: &str, choice: PermissionChoice) -> CommandBody {
         option_index: None,
         option_indices: None,
         free_text: None,
+        answers: None,
     }
 }
 
@@ -206,6 +207,7 @@ fn decision_option(prompt: &str, option_index: u32) -> CommandBody {
         option_index: Some(option_index),
         option_indices: None,
         free_text: None,
+        answers: None,
     }
 }
 
@@ -217,6 +219,7 @@ fn decision_options(prompt: &str, option_indices: Vec<u32>) -> CommandBody {
         option_index: None,
         option_indices: Some(option_indices),
         free_text: None,
+        answers: None,
     }
 }
 
@@ -228,6 +231,27 @@ fn decision_free_text(prompt: &str, text: &str) -> CommandBody {
         option_index: None,
         option_indices: None,
         free_text: Some(text.to_string()),
+        answers: None,
+    }
+}
+
+/// A multi-question answer: `per_question[i]` is the chosen option indices for
+/// question tab `i`.
+fn decision_answers(prompt: &str, per_question: Vec<Vec<u32>>) -> CommandBody {
+    use flightdeck_remote_protocol::QuestionAnswer;
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new(prompt),
+        choice: None,
+        option_index: None,
+        option_indices: None,
+        free_text: None,
+        answers: Some(
+            per_question
+                .into_iter()
+                .map(|option_indices| QuestionAnswer { option_indices })
+                .collect(),
+        ),
     }
 }
 
@@ -464,6 +488,110 @@ fn permission_decision_option_indices_toggles_and_confirms_for_opencode() {
 }
 
 #[test]
+fn permission_decision_answers_claude_is_a_spaced_multi_question_sequence() {
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    // Two question tabs: Q0 single-select option 0, Q1 multi-select options 1 & 2.
+    // Per tab, from the first option: Down to each target + Enter to toggle/select
+    // it, then Tab to the next tab. After the LAST question that Tab lands on
+    // Confirm, and a closing Enter submits.
+    //   Q0: [0]    -> Enter (select 0), Tab (to Q1)
+    //   Q1: [1, 2] -> Down (0->1), Enter (toggle 1), Down (1->2), Enter (toggle 2),
+    //                 Tab (to Confirm)
+    //   Confirm    -> Enter (submit)
+    assert_eq!(
+        translate(
+            &decision_answers("t1:p3", vec![vec![0], vec![1, 2]]),
+            &index
+        ),
+        Translation::PtyInputSequence {
+            project: 0,
+            tab: 0,
+            session_id: SessionId::new("t1"),
+            chunks: vec![
+                b"\r".to_vec(),     // Q0: Enter select option 0
+                b"\t".to_vec(),     // Tab: Q0 -> Q1
+                b"\x1b[B".to_vec(), // Q1: Down 0 -> 1
+                b"\r".to_vec(),     // Q1: Enter toggle option 1
+                b"\x1b[B".to_vec(), // Q1: Down 1 -> 2
+                b"\r".to_vec(),     // Q1: Enter toggle option 2
+                b"\t".to_vec(),     // Tab: Q1 -> Confirm
+                b"\r".to_vec(),     // Enter: submit
+            ],
+            step_delay_ms: crate::remote::commands::MULTI_SELECT_STEP_DELAY_MS,
+        }
+    );
+}
+
+#[test]
+fn permission_decision_answers_opencode_is_one_burst() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    // OpenCode renders the same tabbed form but takes input synchronously, so the
+    // whole sequence is one burst (the spaced chunks concatenated).
+    assert_eq!(
+        translate(
+            &decision_answers("t1:p3", vec![vec![0], vec![1, 2]]),
+            &index
+        ),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\r\t\x1b[B\r\x1b[B\r\t\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_answers_rejected_for_codex() {
+    let index = answerable("t1:p3", StatusBackend::Codex);
+    assert!(matches!(
+        translate(&decision_answers("t1:p3", vec![vec![0], vec![1]]), &index),
+        Translation::Reject { reason } if reason.contains("multi-question")
+    ));
+}
+
+#[test]
+fn permission_decision_answers_dedupes_and_sorts_each_question() {
+    let index = answerable("t1:p3", StatusBackend::OpenCode);
+    // Per-question indices are sorted + deduped before navigation, so [2, 0, 2]
+    // for a single question tab is treated as [0, 2].
+    assert_eq!(
+        translate(&decision_answers("t1:p3", vec![vec![2, 0, 2]]), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            // Q0: Enter (toggle 0), Down, Down, Enter (toggle 2), Tab, Enter.
+            bytes: b"\r\x1b[B\x1b[B\r\t\r".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn permission_decision_single_question_answers_matches_the_single_select_path() {
+    // A single-question form answered via `answers` must produce the SAME spaced
+    // sequence as the existing single-question `option_indices` path — the
+    // multi-question synthesis is a strict generalization.
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    let via_answers = translate(&decision_answers("t1:p3", vec![vec![0, 2]]), &index);
+    let via_indices = translate(&decision_options("t1:p3", vec![0, 2]), &index);
+    assert_eq!(via_answers, via_indices);
+}
+
+#[test]
+fn permission_decision_single_select_number_key_path_unchanged() {
+    // Regression: a single-select single-question prompt answered by option_index
+    // still selects via the Claude number key (select + submit) — untouched.
+    let index = answerable("t1:p3", StatusBackend::Claude);
+    assert_eq!(
+        translate(&decision_option("t1:p3", 2), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"3".to_vec(),
+        }
+    );
+}
+
+#[test]
 fn permission_decision_option_indices_rejected_for_codex() {
     let index = answerable("t1:p3", StatusBackend::Codex);
     assert!(matches!(
@@ -509,6 +637,7 @@ fn permission_decision_free_text_wins_over_option_index() {
         option_index: Some(2),
         option_indices: None,
         free_text: Some("typed instead".to_string()),
+        answers: None,
     };
     assert_eq!(
         translate(&body, &index),
@@ -531,6 +660,7 @@ fn permission_decision_empty_decision_rejected() {
         option_index: None,
         option_indices: None,
         free_text: None,
+        answers: None,
     };
     assert!(matches!(
         translate(&empty, &index),

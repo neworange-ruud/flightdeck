@@ -405,6 +405,17 @@ pub struct RemoteConfig {
     /// "not configured" and keeps the client dormant even if `enabled`.
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
+    /// Shared **relay password** (remote-control-uq7). Presented in the client
+    /// `hello`; the hosted relay gates admission on it (replacing the old IP
+    /// allowlist that blocked roaming phones). Empty means "no password" — the
+    /// client sends none, which suits a local/dev relay that has none configured.
+    /// The `FLIGHTDECK_RELAY_PASSWORD` **environment variable overrides this**
+    /// when set (see `src/remote/client.rs::effective_relay_password`), so a
+    /// deployment can inject the secret without writing it to `config.toml`. This
+    /// is a coarse network-admission secret shared by every client; it never
+    /// replaces the per-device pairing auth or the end-to-end crypto.
+    #[serde(default)]
+    pub relay_password: String,
 }
 
 impl Default for RemoteConfig {
@@ -412,6 +423,7 @@ impl Default for RemoteConfig {
         RemoteConfig {
             enabled: false,
             relay_url: default_relay_url(),
+            relay_password: String::new(),
         }
     }
 }
