@@ -12,7 +12,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **Deploy runbooks capture the ACR Tasks grant.** `remote/relay/deploy/README.md`
+  and `web/deploy/setup.sh` now grant the deploy identity **Container Registry
+  Tasks Contributor** on the registry alongside `AcrPush`, so a from-scratch
+  rebuild no longer misses the role that `web-deploy`'s `az acr build` step needs.
 
 ### Bug fixes
 
@@ -42,6 +45,46 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   snapshot/status/rollup deltas while a phone peer is actually attached; a phone
   that (re)connects still gets a fresh full snapshot the instant it attaches
   (remote-control-uqa).
+- **FlightDeck Remote (relay): dead or slow peers no longer freeze a healthy
+  peer, silently linger, or go undetected.** Three connection-lifecycle fixes on
+  the relay: (1) a slow/half-open receiver can no longer head-of-line-block the
+  sender — the relay now forwards to a peer with a non-blocking `try_send` and
+  lets the buffered envelope be replayed on `resume` instead of awaiting a jammed
+  outbox (remote-control-0ef.6); (2) a reconnecting client now actively
+  supersedes its previous connection (the old reader/writer tasks are signalled
+  to shut down) rather than leaving two same-role legs coexisting
+  (remote-control-0ef.8); (3) authenticated connections are now liveness-checked
+  — the relay sends periodic WebSocket pings and tears a connection down after
+  60s with no inbound traffic, announcing `Disconnected` to the peer, so a
+  half-open socket is reclaimed instead of leaking a session, writer task, and
+  registry handle (remote-control-0ef.1, relay portion).
+- **FlightDeck Remote (relay): pending-queue and claim-table durability.** Three
+  fixes that stop silent data loss and unbounded memory growth on the relay: (1)
+  when a `(pairing, sender)` queue overflows and drop-oldest sheds un-acked
+  envelopes, a resuming receiver is now told to **resync** (request a fresh
+  snapshot) instead of being handed a stream with a permanent hole its
+  gapless-seq enforcement stalls on — an ack-pruned resume is still a clean
+  replay (remote-control-0ef.7); (2) a periodic sweep now evicts expired
+  claim tokens, so an abandoned `pairing_offer` code that is never entered no
+  longer leaks an entry for the life of the process, and an expired-but-unswept
+  token no longer blocks reuse of its 4-digit code (remote-control-0ef.16); (3)
+  revoking a pairing now garbage-collects the device identity and key-agreement
+  keys of any member no surviving pairing still references (remote-control-0ef.17).
+- **FlightDeck Remote (relay): APNs wake pushes are more reliable.** Three fixes
+  to the offline-wake path: (1) the wake push now uses a non-zero
+  `apns-expiration` (a ~5-minute store-and-forward window) instead of
+  deliver-once, so a momentarily-unreachable phone still gets woken
+  (remote-control-0ef.5); (2) a transient push failure is now retried (bounded,
+  with backoff) instead of being dropped, and a permanent `410`/`BadDeviceToken`
+  response purges the dead token so the relay stops firing at it
+  (remote-control-0ef.14); (3) the APNs provider JWT is now cached and refreshed
+  on a ~20-minute cadence rather than minted on every push, avoiding wasted CPU
+  and APNs `TooManyProviderTokenUpdates` (429) under a burst (remote-control-0ef.15).
+- **Deploy image tags no longer get a trailing dash.** The "Resolve image tag"
+  step in `relay-deploy.yml` and `web-deploy.yml` used `echo` into `tr`, whose
+  trailing newline became a `-` (e.g. `v1.8.0-`). Switched to `printf '%s'`.
+
+## [1.10.1] - 2026-07-21
 
 ### New features
 

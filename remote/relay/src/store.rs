@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
 
 use crate::claims::{ClaimError, ClaimTable, RedeemedClaim};
-use crate::queue::{AppendOutcome, QueueError, SenderQueue};
+use crate::queue::{AppendOutcome, QueueError, ResumeOutcome, SenderQueue};
 
 /// The desktop + (optional) phone device ids of a pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,25 +132,32 @@ pub trait RelayStore: Send + Sync {
         expires_at_ms: i64,
     );
 
-    /// Whether `token` is free to issue — i.e. not currently a live claim.
-    /// Backs the `claim_token_hint` honoring in `pairing_offer` (spec §5.2).
-    async fn claim_token_is_free(&self, token: &str) -> bool;
+    /// Whether `token` is free to issue at wall-clock `now_ms` — i.e. not
+    /// currently a **live** (issued, un-redeemed, un-expired) claim. Backs the
+    /// `claim_token_hint` honoring in `pairing_offer` (spec §5.2). An expired
+    /// entry that the sweep has not yet reaped does **not** count as live
+    /// (remote-control-0ef.16).
+    async fn claim_token_is_free(&self, token: &str, now_ms: i64) -> bool;
 
     /// Redeem a claim token at wall-clock `now_ms`.
     async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError>;
+
+    /// Evict every claim-token entry that has expired as of `now_ms`, returning
+    /// how many were removed. Called periodically by the relay's claim-sweep
+    /// task so abandoned `pairing_offer` codes (never redeemed) do not leak
+    /// forever (remote-control-0ef.16).
+    async fn sweep_expired_claims(&self, now_ms: i64) -> usize;
 
     /// Append an outbound envelope to its `(pairing, sender)` queue, enforcing
     /// gapless sequencing and the bound. `Err` means the seq was invalid.
     async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError>;
 
-    /// Envelopes to replay for a `resume { from_seq }`: the `sender` stream of
-    /// `pairing`, `seq > from_seq`, in order.
-    async fn replay(
-        &self,
-        pairing: &PairingId,
-        sender: Role,
-        from_seq: u64,
-    ) -> Vec<EncryptedEnvelope>;
+    /// Service a `resume { from_seq }` against the `sender` stream of `pairing`.
+    /// Returns the envelopes to replay (`seq > from_seq`, in order) or, when a
+    /// drop-oldest overflow shed seqs the receiver still needs,
+    /// [`ResumeOutcome::Resync`] (remote-control-0ef.7). An unknown queue is a
+    /// clean, empty replay.
+    async fn resume(&self, pairing: &PairingId, sender: Role, from_seq: u64) -> ResumeOutcome;
 
     /// Prune the `sender` stream of `pairing` up to and including `cursor`.
     async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64);
@@ -223,6 +230,15 @@ impl InMemoryStore {
         // mutation; poisoning would mean a prior panic mid-mutation, which we
         // surface by unwrapping (a poisoned relay store is unrecoverable).
         self.inner.lock().expect("relay store mutex poisoned")
+    }
+
+    /// Physical number of claim-token entries currently stored, **including**
+    /// expired-but-unswept ones. Distinct from the "live" count — a test hook
+    /// for asserting that the background sweep physically evicted an entry
+    /// (rather than it merely being lazily treated as absent).
+    #[cfg(test)]
+    pub fn claim_entry_count(&self) -> usize {
+        self.lock().claims.len()
     }
 }
 
@@ -321,6 +337,22 @@ impl RelayStore for InMemoryStore {
             .queues
             .remove(&QueueKey::new(pairing.clone(), Role::Phone));
         inner.push_tokens.remove(pairing);
+
+        // GC the identity + key-agreement keys of this pairing's members, but
+        // only for a device no **surviving** pairing still references — a device
+        // can belong to several pairings (a Mac paired with two phones, a phone
+        // that re-paired), and those must keep their keys (remote-control-0ef.17).
+        // Decide first (immutable read of the now-reduced `pairings`), then
+        // remove, so the two field borrows do not overlap.
+        let orphaned: Vec<DeviceId> = [Some(removed.desktop.clone()), removed.phone.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|device| !inner.pairings.values().any(|m| m.contains(device)))
+            .collect();
+        for device in orphaned {
+            inner.devices.remove(&device);
+            inner.key_agreement_keys.remove(&device);
+        }
         RevokeOutcome::Removed(removed)
     }
 
@@ -336,12 +368,16 @@ impl RelayStore for InMemoryStore {
             .issue(token, pairing, desktop, expires_at_ms);
     }
 
-    async fn claim_token_is_free(&self, token: &str) -> bool {
-        !self.lock().claims.contains(token)
+    async fn claim_token_is_free(&self, token: &str, now_ms: i64) -> bool {
+        !self.lock().claims.contains(token, now_ms)
     }
 
     async fn redeem_claim(&self, token: &str, now_ms: i64) -> Result<RedeemedClaim, ClaimError> {
         self.lock().claims.redeem(token, now_ms)
+    }
+
+    async fn sweep_expired_claims(&self, now_ms: i64) -> usize {
+        self.lock().claims.sweep_expired(now_ms)
     }
 
     async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError> {
@@ -355,17 +391,12 @@ impl RelayStore for InMemoryStore {
             .append(env)
     }
 
-    async fn replay(
-        &self,
-        pairing: &PairingId,
-        sender: Role,
-        from_seq: u64,
-    ) -> Vec<EncryptedEnvelope> {
+    async fn resume(&self, pairing: &PairingId, sender: Role, from_seq: u64) -> ResumeOutcome {
         self.lock()
             .queues
             .get(&QueueKey::new(pairing.clone(), sender))
-            .map(|q| q.replay(from_seq))
-            .unwrap_or_default()
+            .map(|q| q.resume(from_seq))
+            .unwrap_or(ResumeOutcome::Replay(Vec::new()))
     }
 
     async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64) {
@@ -404,6 +435,14 @@ mod tests {
             sent_at_ms: 0,
             nonce: "bm9uY2U=".into(),
             ciphertext: "opaque".into(),
+        }
+    }
+
+    /// Unwrap a clean replay's envelopes, failing the test on a resync signal.
+    fn replayed(outcome: ResumeOutcome) -> Vec<EncryptedEnvelope> {
+        match outcome {
+            ResumeOutcome::Replay(v) => v,
+            ResumeOutcome::Resync => panic!("expected a clean replay, got Resync"),
         }
     }
 
@@ -585,9 +624,9 @@ mod tests {
 
         // Pairing and every trace of it are gone.
         assert_eq!(store.pairing_members(&pairing).await, None);
-        assert!(store.claim_token_is_free("tok_live").await);
-        assert!(store.replay(&pairing, Role::Desktop, 0).await.is_empty());
-        assert!(store.replay(&pairing, Role::Phone, 0).await.is_empty());
+        assert!(store.claim_token_is_free("tok_live", 0).await);
+        assert!(replayed(store.resume(&pairing, Role::Desktop, 0).await).is_empty());
+        assert!(replayed(store.resume(&pairing, Role::Phone, 0).await).is_empty());
         assert_eq!(store.push_token(&pairing).await, None);
     }
 
@@ -616,9 +655,9 @@ mod tests {
 
         // Nothing was removed.
         assert!(store.pairing_members(&pairing).await.is_some());
-        assert!(!store.claim_token_is_free("tok_live").await);
+        assert!(!store.claim_token_is_free("tok_live", 0).await);
         assert_eq!(
-            store.replay(&pairing, Role::Desktop, 0).await.len(),
+            replayed(store.resume(&pairing, Role::Desktop, 0).await).len(),
             1,
             "queue must survive a refused revoke"
         );
@@ -648,17 +687,126 @@ mod tests {
         store.enqueue(env("pair", Role::Phone, 1)).await.unwrap();
         store.enqueue(env("pair", Role::Desktop, 2)).await.unwrap();
 
-        let d = store
-            .replay(&PairingId::new("pair"), Role::Desktop, 0)
-            .await;
-        let p = store.replay(&PairingId::new("pair"), Role::Phone, 0).await;
+        let d = replayed(
+            store
+                .resume(&PairingId::new("pair"), Role::Desktop, 0)
+                .await,
+        );
+        let p = replayed(store.resume(&PairingId::new("pair"), Role::Phone, 0).await);
         assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(p.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
 
         store.ack(&PairingId::new("pair"), Role::Desktop, 1).await;
-        let d = store
-            .replay(&PairingId::new("pair"), Role::Desktop, 0)
-            .await;
+        let d = replayed(
+            store
+                .resume(&PairingId::new("pair"), Role::Desktop, 0)
+                .await,
+        );
         assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_claims_removes_only_expired() {
+        let store = InMemoryStore::new(1000);
+        store
+            .issue_claim(
+                "live".into(),
+                PairingId::new("p1"),
+                DeviceId::new("d1"),
+                10_000,
+            )
+            .await;
+        store
+            .issue_claim(
+                "stale".into(),
+                PairingId::new("p2"),
+                DeviceId::new("d2"),
+                5_000,
+            )
+            .await;
+
+        // Before its TTL, an un-redeemed token is not free (still live).
+        assert!(!store.claim_token_is_free("stale", 4_000).await);
+
+        // Lazy expiry: past the TTL the entry no longer counts as live even
+        // before the sweep reaps it (remote-control-0ef.16).
+        assert!(store.claim_token_is_free("stale", 6_000).await);
+        assert!(!store.claim_token_is_free("live", 6_000).await);
+
+        // The sweep at now=6_000 reaps only the expired "stale" entry.
+        assert_eq!(store.sweep_expired_claims(6_000).await, 1);
+        // "live" is still redeemable; "stale" is gone.
+        assert!(store.redeem_claim("live", 6_000).await.is_ok());
+        assert_eq!(
+            store.redeem_claim("stale", 6_000).await,
+            Err(ClaimError::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_gcs_device_keys_only_when_no_pairing_references_them() {
+        // remote-control-0ef.17: a device shared by two pairings keeps its
+        // identity + key-agreement keys until the LAST referencing pairing is
+        // revoked.
+        let store = InMemoryStore::new(1000);
+        let desktop = DeviceId::new("dev_mac");
+        let phone_a = DeviceId::new("dev_phone_a");
+        let phone_b = DeviceId::new("dev_phone_b");
+
+        // One Mac paired with two phones (desktop is shared across pairings).
+        store
+            .register_device(desktop.clone(), "pk_mac".into())
+            .await;
+        store
+            .register_key_agreement_key(desktop.clone(), "ka_mac".into())
+            .await;
+        let pairing_a = store.create_pairing(desktop.clone()).await;
+        let pairing_b = store.create_pairing(desktop.clone()).await;
+
+        store.register_device(phone_a.clone(), "pk_a".into()).await;
+        store
+            .register_key_agreement_key(phone_a.clone(), "ka_a".into())
+            .await;
+        store
+            .add_phone_to_pairing(&pairing_a, phone_a.clone())
+            .await
+            .unwrap();
+        store.register_device(phone_b.clone(), "pk_b".into()).await;
+        store
+            .register_key_agreement_key(phone_b.clone(), "ka_b".into())
+            .await;
+        store
+            .add_phone_to_pairing(&pairing_b, phone_b.clone())
+            .await
+            .unwrap();
+
+        // Revoke the first pairing: phone_a is orphaned and reaped, but the
+        // shared desktop is still referenced by pairing_b, so its keys stay.
+        assert!(matches!(
+            store.revoke_pairing(&pairing_a, &desktop).await,
+            RevokeOutcome::Removed(_)
+        ));
+        assert_eq!(store.device_public_key(&phone_a).await, None);
+        assert_eq!(store.device_key_agreement_key(&phone_a).await, None);
+        assert_eq!(
+            store.device_public_key(&desktop).await,
+            Some("pk_mac".into())
+        );
+        assert_eq!(
+            store.device_key_agreement_key(&desktop).await,
+            Some("ka_mac".into())
+        );
+        // phone_b's keys are untouched.
+        assert_eq!(store.device_public_key(&phone_b).await, Some("pk_b".into()));
+
+        // Revoke the last pairing: now the desktop is unreferenced and reaped.
+        assert!(matches!(
+            store.revoke_pairing(&pairing_b, &desktop).await,
+            RevokeOutcome::Removed(_)
+        ));
+        assert_eq!(store.device_public_key(&desktop).await, None);
+        assert_eq!(store.device_key_agreement_key(&desktop).await, None);
+        assert_eq!(store.device_public_key(&phone_b).await, None);
+        assert_eq!(store.device_key_agreement_key(&phone_b).await, None);
     }
 }

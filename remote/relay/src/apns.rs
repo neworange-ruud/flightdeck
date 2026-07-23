@@ -30,11 +30,14 @@
 //! the offline-delivery decision — is unit-tested without any Apple secret,
 //! using a generated test key and a recording transport.
 
+use crate::store::RelayStore;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use flightdeck_remote_protocol::{AgentEvent, ApnsEnvironment, EventKind, PairingId};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The APNs credentials + topic needed to authenticate and address pushes.
 /// Every field is injected (from the environment, see [`ApnsConfig::from_env`])
@@ -111,6 +114,28 @@ pub enum JwtError {
     /// The `.p8` PEM could not be parsed as a PKCS#8 ECDSA P-256 key.
     BadKey,
 }
+
+/// How long a minted provider JWT is reused before it is re-minted. Apple
+/// accepts a provider token for ~1h and rejects re-minting it more than once
+/// per ~20 min (`TooManyProviderTokenUpdates`, HTTP 429); refreshing at 20 min
+/// stays safely inside both bounds while avoiding a fresh mint per push
+/// (remote-control-0ef.15).
+pub const JWT_REFRESH_SECS: i64 = 20 * 60;
+
+/// Store-and-forward window for the background wake push, in seconds. The
+/// `apns-expiration` header is an *absolute* unix time; a non-zero value tells
+/// APNs to hold and retry delivery to a briefly-unreachable phone rather than
+/// deliver-once-or-discard (`apns-expiration: 0`). Five minutes survives a
+/// short offline/low-power blip while bounding how stale a wake can be
+/// (remote-control-0ef.5).
+pub const WAKE_EXPIRATION_WINDOW_SECS: i64 = 5 * 60;
+
+/// Default number of send attempts (1 initial + retries) for a transient push
+/// failure before giving up (remote-control-0ef.14).
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+/// Default backoff between transient retries. Injectable so tests run with
+/// `Duration::ZERO` (no real sleep).
+const DEFAULT_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Mints an APNs provider-authentication token (a short-lived ES256 JWT) from a
 /// `.p8` key (spec §5.5 "JWT ES256 auth"). Apple accepts a token for ~1 hour
@@ -282,7 +307,11 @@ impl ApnsRequest {
                 "item_id": dl.item_id,
             },
         });
-        let mut headers = base_headers(config, jwt, "alert", "10");
+        // A user-facing alert is immediate (priority 10); it keeps the
+        // deliver-once expiration ("0") — store-and-forward is the wake push's
+        // concern (remote-control-0ef.5), and this typed-alert path is not the
+        // live offline path.
+        let mut headers = base_headers(config, jwt, "alert", "10", "0");
         headers.push(("apns-collapse-id".to_string(), event.event_id.to_string()));
         Self {
             authority: host(environment).to_string(),
@@ -296,37 +325,81 @@ impl ApnsRequest {
     /// live path. No user content — it only nudges the phone to reconnect and
     /// `resume` the queued envelope, after which the phone builds the real
     /// notification locally from the decrypted event.
+    ///
+    /// `now_secs` (unix seconds) sets a **non-zero** `apns-expiration`
+    /// (`now + `[`WAKE_EXPIRATION_WINDOW_SECS`]) so APNs stores and retries the
+    /// wake to a phone that is momentarily unreachable, instead of discarding it
+    /// on the first failed attempt (remote-control-0ef.5).
     pub fn background_wake(
         config: &ApnsConfig,
         jwt: &str,
         device_token: &str,
         environment: ApnsEnvironment,
+        now_secs: i64,
     ) -> Self {
         let body = serde_json::json!({ "aps": { "content-available": 1 } });
+        let expiration = (now_secs + WAKE_EXPIRATION_WINDOW_SECS).to_string();
         Self {
             authority: host(environment).to_string(),
             path: format!("/3/device/{device_token}"),
-            headers: base_headers(config, jwt, "background", "5"),
+            headers: base_headers(config, jwt, "background", "5", &expiration),
             body: serde_json::to_vec(&body).expect("json serialization is infallible here"),
         }
     }
 }
 
 /// The headers common to every APNs request: bearer auth, topic, push type,
-/// priority, and a zero expiration (deliver-once, don't store).
+/// priority, and the `apns-expiration` (as a decimal string — `"0"` for
+/// deliver-once-or-discard, or an absolute unix time for store-and-forward).
 fn base_headers(
     config: &ApnsConfig,
     jwt: &str,
     push_type: &str,
     priority: &str,
+    expiration: &str,
 ) -> Vec<(String, String)> {
     vec![
         ("authorization".to_string(), format!("bearer {jwt}")),
         ("apns-topic".to_string(), config.topic.clone()),
         ("apns-push-type".to_string(), push_type.to_string()),
         ("apns-priority".to_string(), priority.to_string()),
-        ("apns-expiration".to_string(), "0".to_string()),
+        ("apns-expiration".to_string(), expiration.to_string()),
     ]
+}
+
+/// A failed APNs delivery, classified so the caller can decide whether to retry
+/// or purge the token (remote-control-0ef.14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApnsSendError {
+    /// A retryable failure: a transport/connection error, or an APNs status that
+    /// may succeed later (429 `TooManyProviderTokenUpdates`, 5xx). The caller
+    /// retries a bounded number of times.
+    Transient(String),
+    /// A permanent rejection of *this device token* (410 `Unregistered`, or
+    /// 400 `BadDeviceToken`/`DeviceTokenNotForTopic`). Retrying is pointless —
+    /// the caller purges the token so the phone re-registers on next connect.
+    Permanent(String),
+}
+
+/// Classify an APNs failure response by HTTP status + APNs `reason` string
+/// (spec §5.5). Permanent when the device token itself is invalid (status 410,
+/// or reason `BadDeviceToken`/`Unregistered`/`DeviceTokenNotForTopic`);
+/// everything else (429, 5xx, network) is transient and worth a retry.
+pub fn classify_apns_failure(status: u16, reason: Option<&str>) -> ApnsSendError {
+    let permanent = status == 410
+        || matches!(
+            reason,
+            Some("BadDeviceToken") | Some("Unregistered") | Some("DeviceTokenNotForTopic")
+        );
+    let detail = match reason {
+        Some(r) => format!("apns status {status}: {r}"),
+        None => format!("apns status {status}"),
+    };
+    if permanent {
+        ApnsSendError::Permanent(detail)
+    } else {
+        ApnsSendError::Transient(detail)
+    }
 }
 
 /// The seam that actually puts an [`ApnsRequest`] on the wire. The real
@@ -335,10 +408,31 @@ fn base_headers(
 /// double.
 #[async_trait]
 pub trait ApnsTransport: Send + Sync {
-    /// Deliver one request to APNs. Best-effort: a failure is logged by the
-    /// caller and never propagated into the connection state machine (a missed
-    /// wake push is recovered by the phone's own reconnect).
-    async fn send(&self, request: ApnsRequest) -> Result<(), String>;
+    /// Deliver one request to APNs. On failure the error is classified
+    /// (transient vs permanent) so the caller can retry or purge; it is never
+    /// propagated into the connection state machine (a missed wake push is
+    /// recovered by the phone's own reconnect).
+    async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError>;
+}
+
+/// Seam for removing a dead push token from the store when APNs reports it
+/// permanently invalid. Kept as a trait so the live push service can purge
+/// through the store without `apns.rs` depending on a concrete store type, and
+/// so tests assert purges against a recording double (remote-control-0ef.14).
+#[async_trait]
+pub trait TokenPurge: Send + Sync {
+    /// Purge `pairing`'s registered push token so the relay stops firing at a
+    /// dead token; the phone re-registers on its next connect.
+    async fn purge(&self, pairing: &PairingId);
+}
+
+/// Adapts the persistence seam so a live [`ApnsPushService`] can purge a dead
+/// token via [`RelayStore::unregister_push_token`].
+#[async_trait]
+impl TokenPurge for Arc<dyn RelayStore> {
+    async fn purge(&self, pairing: &PairingId) {
+        self.unregister_push_token(pairing).await;
+    }
 }
 
 /// The relay's offline-delivery hook. Fired from the envelope path when a
@@ -368,30 +462,42 @@ impl PushService for NoopPushService {
     }
 }
 
-/// The live [`PushService`]: mints a JWT and sends a background-wake push
-/// through the injected [`ApnsTransport`].
+/// The live [`PushService`]: mints (and caches) a provider JWT and sends a
+/// background-wake push through the injected [`ApnsTransport`], retrying
+/// transient failures and purging a permanently-dead token.
 pub struct ApnsPushService<T: ApnsTransport> {
     config: ApnsConfig,
     transport: T,
     now_secs: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Cached provider JWT + the unix-seconds time it was minted. Shared behind
+    /// `Arc` (the service is cloned across connections), so a `Mutex` keeps the
+    /// mint/reuse decision race-free (remote-control-0ef.15).
+    cached_jwt: Mutex<Option<(String, i64)>>,
+    /// Send attempts (1 initial + retries) before giving up on a transient
+    /// failure (remote-control-0ef.14).
+    max_attempts: u32,
+    /// Backoff between transient retries. `Duration::ZERO` in tests (no sleep).
+    backoff: Duration,
+    /// Where to purge a dead token on a permanent APNs rejection. `None` leaves
+    /// the token in place (still stops retrying) (remote-control-0ef.14).
+    purge: Option<Arc<dyn TokenPurge>>,
 }
 
 impl<T: ApnsTransport> ApnsPushService<T> {
-    /// Build a push service over `transport` with the default wall-clock.
+    /// Build a push service over `transport` with the default wall-clock,
+    /// default bounded retry, and no token-purge hook (wire one with
+    /// [`ApnsPushService::with_purge`]).
     pub fn new(config: ApnsConfig, transport: T) -> Self {
-        Self {
-            config,
-            transport,
-            now_secs: Box::new(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
-            }),
-        }
+        Self::with_clock(config, transport, || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
     }
 
-    /// Build with an injected clock (tests).
+    /// Build with an injected clock (tests). Deterministic: the same `now_secs`
+    /// drives both JWT caching and the wake expiration.
     pub fn with_clock(
         config: ApnsConfig,
         transport: T,
@@ -401,24 +507,90 @@ impl<T: ApnsTransport> ApnsPushService<T> {
             config,
             transport,
             now_secs: Box::new(now_secs),
+            cached_jwt: Mutex::new(None),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            backoff: DEFAULT_BACKOFF,
+            purge: None,
         }
+    }
+
+    /// Attach the store-backed token-purge hook (used by the live wiring).
+    pub fn with_purge(mut self, purge: impl TokenPurge + 'static) -> Self {
+        self.purge = Some(Arc::new(purge));
+        self
+    }
+
+    /// Override the bounded-retry policy (tests use `Duration::ZERO` for the
+    /// backoff so no real time passes).
+    pub fn with_retry(mut self, max_attempts: u32, backoff: Duration) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self.backoff = backoff;
+        self
+    }
+
+    /// Return a valid provider JWT, minting one on first use and re-minting only
+    /// once [`JWT_REFRESH_SECS`] have elapsed since the last mint; otherwise the
+    /// cached token is reused (remote-control-0ef.15). `now` is unix seconds.
+    fn provider_jwt(&self, now: i64) -> Result<String, JwtError> {
+        let mut guard = self.cached_jwt.lock().expect("jwt cache mutex poisoned");
+        if let Some((token, minted_at)) = guard.as_ref() {
+            if now.saturating_sub(*minted_at) < JWT_REFRESH_SECS {
+                return Ok(token.clone());
+            }
+        }
+        let token = build_jwt(&self.config, now)?;
+        *guard = Some((token.clone(), now));
+        Ok(token)
     }
 }
 
 #[async_trait]
 impl<T: ApnsTransport> PushService for ApnsPushService<T> {
     async fn notify_offline(&self, pairing: &PairingId, token: &str, environment: ApnsEnvironment) {
-        let jwt = match build_jwt(&self.config, (self.now_secs)()) {
+        let now = (self.now_secs)();
+        let jwt = match self.provider_jwt(now) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(?e, %pairing, "apns: could not mint JWT; skipping wake push");
                 return;
             }
         };
-        let request = ApnsRequest::background_wake(&self.config, &jwt, token, environment);
-        if let Err(err) = self.transport.send(request).await {
-            // Best-effort: the phone's own reconnect recovers a missed wake.
-            tracing::warn!(%err, %pairing, "apns: wake push failed");
+        let request = ApnsRequest::background_wake(&self.config, &jwt, token, environment, now);
+
+        for attempt in 1..=self.max_attempts {
+            match self.transport.send(request.clone()).await {
+                Ok(()) => return,
+                Err(ApnsSendError::Permanent(reason)) => {
+                    // The token is dead: stop firing at it and purge so the
+                    // phone is prompted to re-register (remote-control-0ef.14).
+                    tracing::warn!(
+                        %reason, %pairing,
+                        "apns: token permanently rejected; purging (no retry)"
+                    );
+                    if let Some(purge) = &self.purge {
+                        purge.purge(pairing).await;
+                    }
+                    return;
+                }
+                Err(ApnsSendError::Transient(reason)) => {
+                    if attempt >= self.max_attempts {
+                        // Best-effort: the phone's own reconnect recovers a
+                        // missed wake.
+                        tracing::warn!(
+                            %reason, %pairing, attempts = self.max_attempts,
+                            "apns: wake push failed after retries; giving up"
+                        );
+                        return;
+                    }
+                    tracing::debug!(
+                        %reason, %pairing, attempt,
+                        "apns: transient wake push failure; retrying"
+                    );
+                    if !self.backoff.is_zero() {
+                        tokio::time::sleep(self.backoff).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -429,7 +601,7 @@ impl<T: ApnsTransport> PushService for ApnsPushService<T> {
 /// all request *shape* (JWT, headers, body, path) is built and tested above.
 #[cfg(feature = "apns-live")]
 pub mod live {
-    use super::{ApnsRequest, ApnsTransport};
+    use super::{classify_apns_failure, ApnsRequest, ApnsSendError, ApnsTransport};
     use async_trait::async_trait;
 
     /// APNs over HTTP/2 using `reqwest` (ALPN negotiates h2 with Apple).
@@ -450,18 +622,30 @@ pub mod live {
 
     #[async_trait]
     impl ApnsTransport for HttpApnsTransport {
-        async fn send(&self, request: ApnsRequest) -> Result<(), String> {
+        async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError> {
             let url = format!("https://{}{}", request.authority, request.path);
             let mut req = self.client.post(url).body(request.body);
             for (name, value) in request.headers {
                 req = req.header(name, value);
             }
-            let resp = req.send().await.map_err(|e| e.to_string())?;
+            // A network/connection failure is transient — the phone may just be
+            // a blip away; let the caller retry.
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| ApnsSendError::Transient(e.to_string()))?;
             if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!("apns responded {}", resp.status()))
+                return Ok(());
             }
+            // On failure APNs returns a JSON body `{"reason":"..."}`; parse it so
+            // a dead token (410/BadDeviceToken) is classified permanent and the
+            // caller purges it rather than retrying forever.
+            let status = resp.status().as_u16();
+            let body = resp.bytes().await.unwrap_or_default();
+            let reason = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from));
+            Err(classify_apns_failure(status, reason.as_deref()))
         }
     }
 }
@@ -470,7 +654,7 @@ pub mod live {
 // impl so an `Arc<T: ApnsTransport>` satisfies the trait in wiring/tests.
 #[async_trait]
 impl<T: ApnsTransport + ?Sized> ApnsTransport for std::sync::Arc<T> {
-    async fn send(&self, request: ApnsRequest) -> Result<(), String> {
+    async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError> {
         (**self).send(request).await
     }
 }
@@ -482,6 +666,7 @@ mod tests {
     use p256::ecdsa::{signature::Verifier, VerifyingKey};
     use p256::pkcs8::EncodePrivateKey;
     use p256::SecretKey;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// Generate a throwaway P-256 `.p8`-shaped PEM + its verifying key, so JWT
@@ -648,8 +833,13 @@ mod tests {
     #[test]
     fn background_wake_carries_no_content() {
         let (config, _) = test_config();
-        let req =
-            ApnsRequest::background_wake(&config, "jwt-xyz", "tok", ApnsEnvironment::Production);
+        let req = ApnsRequest::background_wake(
+            &config,
+            "jwt-xyz",
+            "tok",
+            ApnsEnvironment::Production,
+            1_752_412_802,
+        );
         assert_eq!(req.authority, "api.push.apple.com");
         let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
         assert_eq!(headers["apns-push-type"], "background");
@@ -662,8 +852,60 @@ mod tests {
         );
     }
 
-    /// Recording transport: captures every request so tests can assert on the
-    /// live push service's behavior without any network or Apple secret.
+    /// remote-control-0ef.5: the wake push must use a non-zero, future
+    /// `apns-expiration` so APNs stores and retries to a briefly-offline phone.
+    #[test]
+    fn background_wake_has_nonzero_future_expiration() {
+        let (config, _) = test_config();
+        let now = 1_752_412_802;
+        let req = ApnsRequest::background_wake(
+            &config,
+            "jwt-xyz",
+            "tok",
+            ApnsEnvironment::Production,
+            now,
+        );
+        let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
+        let expiration: i64 = headers["apns-expiration"].parse().unwrap();
+        assert_ne!(expiration, 0, "must not be deliver-once-or-discard");
+        assert!(expiration > now, "expiration is a future unix time");
+        assert_eq!(expiration, now + WAKE_EXPIRATION_WINDOW_SECS);
+    }
+
+    #[test]
+    fn classify_permanent_and_transient_failures() {
+        // 410 is always permanent regardless of reason.
+        assert!(matches!(
+            classify_apns_failure(410, Some("Unregistered")),
+            ApnsSendError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_apns_failure(410, None),
+            ApnsSendError::Permanent(_)
+        ));
+        // Permanent-by-reason on a 400.
+        assert!(matches!(
+            classify_apns_failure(400, Some("BadDeviceToken")),
+            ApnsSendError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_apns_failure(400, Some("DeviceTokenNotForTopic")),
+            ApnsSendError::Permanent(_)
+        ));
+        // 429 (TooManyProviderTokenUpdates) and 5xx are transient.
+        assert!(matches!(
+            classify_apns_failure(429, Some("TooManyProviderTokenUpdates")),
+            ApnsSendError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_apns_failure(503, None),
+            ApnsSendError::Transient(_)
+        ));
+    }
+
+    /// Recording transport: captures every request (and always succeeds) so
+    /// tests can assert on the live push service's behavior without any network
+    /// or Apple secret.
     #[derive(Default)]
     struct RecordingTransport {
         sent: Mutex<Vec<ApnsRequest>>,
@@ -671,9 +913,50 @@ mod tests {
 
     #[async_trait]
     impl ApnsTransport for RecordingTransport {
-        async fn send(&self, request: ApnsRequest) -> Result<(), String> {
+        async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError> {
             self.sent.lock().unwrap().push(request);
             Ok(())
+        }
+    }
+
+    /// Scripted transport: returns a queued outcome per call (front to back),
+    /// then `Ok` once the script is exhausted. Counts calls so a test can prove
+    /// exactly how many send attempts happened.
+    struct ScriptedTransport {
+        outcomes: Mutex<std::collections::VecDeque<Result<(), ApnsSendError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedTransport {
+        fn new(outcomes: Vec<Result<(), ApnsSendError>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ApnsTransport for ScriptedTransport {
+        async fn send(&self, _request: ApnsRequest) -> Result<(), ApnsSendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    /// Recording purge hook: remembers which pairings were purged.
+    #[derive(Default)]
+    struct RecordingPurge {
+        purged: Mutex<Vec<PairingId>>,
+    }
+
+    #[async_trait]
+    impl TokenPurge for Arc<RecordingPurge> {
+        async fn purge(&self, pairing: &PairingId) {
+            self.purged.lock().unwrap().push(pairing.clone());
         }
     }
 
@@ -693,5 +976,142 @@ mod tests {
         let headers: std::collections::HashMap<_, _> = sent[0].headers.iter().cloned().collect();
         assert_eq!(headers["apns-push-type"], "background");
         assert!(headers["authorization"].starts_with("bearer "));
+    }
+
+    /// remote-control-0ef.15: the provider JWT is minted once, reused within the
+    /// refresh window, and re-minted only after it elapses. The clock is driven
+    /// explicitly — no real time passes.
+    #[tokio::test]
+    async fn jwt_is_cached_and_refreshed_on_cadence() {
+        let (config, _) = test_config();
+        let transport = std::sync::Arc::new(RecordingTransport::default());
+        // Advance the injected clock only when the test says so.
+        let now = std::sync::Arc::new(AtomicUsize::new(1_000_000));
+        let now_reader = now.clone();
+        let service = ApnsPushService::with_clock(config, transport.clone(), move || {
+            now_reader.load(Ordering::SeqCst) as i64
+        });
+
+        let pairing = PairingId::new("pair_1");
+        // First push mints.
+        service
+            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .await;
+        // A second push a minute later reuses (inside the 20-min window).
+        now.store(1_000_000 + 60, Ordering::SeqCst);
+        service
+            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .await;
+        // A push past the window re-mints.
+        now.store(1_000_000 + JWT_REFRESH_SECS as usize + 1, Ordering::SeqCst);
+        service
+            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .await;
+
+        let sent = transport.sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        let jwt = |req: &ApnsRequest| {
+            req.headers
+                .iter()
+                .find(|(k, _)| k == "authorization")
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(jwt(&sent[0]), jwt(&sent[1]), "reused within the window");
+        assert_ne!(jwt(&sent[1]), jwt(&sent[2]), "re-minted past the window");
+    }
+
+    /// remote-control-0ef.14: a transient failure is retried (with zero backoff)
+    /// until it succeeds; the token is not purged.
+    #[tokio::test]
+    async fn transient_failure_is_retried_then_succeeds() {
+        let (config, _) = test_config();
+        let transport = std::sync::Arc::new(ScriptedTransport::new(vec![
+            Err(ApnsSendError::Transient("blip".into())),
+            Err(ApnsSendError::Transient("blip".into())),
+            Ok(()),
+        ]));
+        let purge = std::sync::Arc::new(RecordingPurge::default());
+        let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802)
+            .with_retry(3, Duration::ZERO)
+            .with_purge(purge.clone());
+
+        service
+            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+            .await;
+
+        assert_eq!(transport.calls(), 3, "two retries then success");
+        assert!(
+            purge.purged.lock().unwrap().is_empty(),
+            "transient failure never purges"
+        );
+    }
+
+    /// remote-control-0ef.14: exhausting the retry budget on persistent
+    /// transient failures gives up without purging.
+    #[tokio::test]
+    async fn transient_failure_gives_up_after_max_attempts() {
+        let (config, _) = test_config();
+        let transport = std::sync::Arc::new(ScriptedTransport::new(vec![
+            Err(ApnsSendError::Transient("blip".into())),
+            Err(ApnsSendError::Transient("blip".into())),
+            Err(ApnsSendError::Transient("blip".into())),
+            Err(ApnsSendError::Transient("blip".into())),
+        ]));
+        let purge = std::sync::Arc::new(RecordingPurge::default());
+        let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802)
+            .with_retry(3, Duration::ZERO)
+            .with_purge(purge.clone());
+
+        service
+            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+            .await;
+
+        assert_eq!(transport.calls(), 3, "capped at max_attempts");
+        assert!(purge.purged.lock().unwrap().is_empty());
+    }
+
+    /// remote-control-0ef.14: a permanent 410/BadDeviceToken purges the token
+    /// and does *not* retry.
+    #[tokio::test]
+    async fn permanent_failure_purges_and_does_not_retry() {
+        let (config, _) = test_config();
+        let transport = std::sync::Arc::new(ScriptedTransport::new(vec![Err(
+            ApnsSendError::Permanent("apns status 410: Unregistered".into()),
+        )]));
+        let purge = std::sync::Arc::new(RecordingPurge::default());
+        let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802)
+            .with_retry(3, Duration::ZERO)
+            .with_purge(purge.clone());
+
+        let pairing = PairingId::new("pair_1");
+        service
+            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .await;
+
+        assert_eq!(transport.calls(), 1, "permanent failure is not retried");
+        assert_eq!(
+            *purge.purged.lock().unwrap(),
+            vec![pairing],
+            "the dead token's pairing is purged"
+        );
+    }
+
+    /// A permanent failure with no purge hook wired still stops (no retry, no
+    /// panic) — purging is best-effort.
+    #[tokio::test]
+    async fn permanent_failure_without_purge_hook_is_safe() {
+        let (config, _) = test_config();
+        let transport = std::sync::Arc::new(ScriptedTransport::new(vec![Err(
+            ApnsSendError::Permanent("apns status 410: BadDeviceToken".into()),
+        )]));
+        let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802)
+            .with_retry(3, Duration::ZERO);
+
+        service
+            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+            .await;
+
+        assert_eq!(transport.calls(), 1);
     }
 }

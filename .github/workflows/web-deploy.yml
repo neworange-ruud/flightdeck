@@ -75,7 +75,7 @@ jobs:
           # On a tag push there's no release payload — use the tag itself.
           if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then TAG="${{ github.ref_name }}"; fi
           [ -n "$TAG" ] || TAG="${GITHUB_SHA::7}"
-          TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
+          TAG="$(printf '%s' "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
           echo "tag=$TAG"             >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
