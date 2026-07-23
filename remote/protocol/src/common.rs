@@ -17,6 +17,15 @@ use crate::ids::SessionId;
 /// `#[serde(default)]` and the flat single-question fields keep mirroring the
 /// first question, so this needs no version bump — a peer that ignores the new
 /// fields sees exactly the single-question prompt it did before.
+///
+/// **Deliberately kept at v3 (remote-control-ssw).** Now that both desktop and
+/// iOS produce and consume the multi-question fields, we reviewed whether to bump
+/// to v4. Decision: no. The fields are `#[serde(default)]` and wire-compatible in
+/// both directions, so a v3↔v3 exchange is fully correct and a mixed-build peer
+/// degrades cleanly to the single-question view. Bumping would signal a
+/// capability the wire format does not actually gate on, and would force a
+/// lockstep update of the relay's `max_supported` compatibility assertion for no
+/// interop benefit. Revisit only if a future field is *not* backward-compatible.
 pub const PROTOCOL_VERSION: u16 = 3;
 /// Oldest protocol version this build can still interoperate with.
 pub const MIN_SUPPORTED_VERSION: u16 = 1;
