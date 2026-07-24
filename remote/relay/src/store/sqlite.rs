@@ -29,20 +29,26 @@
 //! expired while the relay was down still fails redemption after reload — expired
 //! tokens never resurrect.
 //!
-//! **Persistence caveat (out of scope here).** SQLite persists to whatever file
-//! path it is given; whether that path survives a redeploy is a *deployment*
-//! concern. On Azure Container Apps the container filesystem is ephemeral, so a
-//! deployer must point `FLIGHTDECK_RELAY_STORE=sqlite:<path>` at a mounted
-//! Azure Files volume (or move to a networked store) for state to outlive a
-//! revision swap. This module only guarantees survival across a process restart
-//! on stable storage.
+//! **Persistence caveat (a *deployment* concern).** SQLite persists to whatever
+//! file path it is given; whether that path survives a redeploy is up to the
+//! deployment. On Azure Container Apps the container filesystem is ephemeral, so
+//! the live deployment points `FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db` at a
+//! mounted Azure Files volume (see `deploy/README.md` → "Persistent store").
+//! Because that mount is a network filesystem — which does not implement the
+//! byte-range locking SQLite normally relies on — [`SqliteStore::open`] opens the
+//! database with the no-locking `unix-none` VFS and a rollback journal (not WAL,
+//! whose shared-memory index is also unsupported on a network FS). That is safe
+//! only because the relay holds a single connection at `maxReplicas: 1`; there is
+//! never a second accessor. This module only guarantees survival across a process
+//! restart on stable storage; the volume is what makes that storage stable across
+//! revision swaps.
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::claims::{ClaimError, ClaimRecord, ClaimTable, RedeemedClaim};
 use crate::queue::{AppendOutcome, QueueError, ResumeOutcome, SenderQueue};
@@ -263,12 +269,24 @@ impl SqliteStore {
     /// schema exists. Queues each hold at most `queue_max_per_pairing` un-acked
     /// envelopes, matching [`super::InMemoryStore::new`].
     pub fn open(path: impl AsRef<Path>, queue_max_per_pairing: usize) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        // WAL keeps writes durable while allowing the single writer to proceed
-        // without blocking readers; `synchronous = NORMAL` is the standard,
-        // crash-safe pairing with WAL.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Open with the no-locking `unix-none` VFS. The live deployment stores
+        // this file on a network-mounted Azure Files volume so state survives a
+        // Container Apps revision swap / node reschedule (see the deployment note
+        // above). Network filesystems (SMB/NFS) do not implement the byte-range
+        // locking SQLite normally uses, so any lock attempt fails with a spurious
+        // "database is locked". Skipping locking entirely is safe *here* — and
+        // only here — because the relay holds exactly one `Connection` (this
+        // `Mutex`) and runs at `maxReplicas: 1`, so there is never a second
+        // accessor to coordinate with. `maxReplicas: 1` is load-bearing for this.
+        let conn = Connection::open_with_flags_and_vfs(path, OpenFlags::default(), "unix-none")?;
+        // Rollback journal (SQLite's default `DELETE` mode) — durable for a
+        // single writer and, unlike WAL, needs no shared-memory (`-shm`) index,
+        // which is itself unsupported on a network FS. WAL would buy nothing here
+        // anyway: every store access is already serialized by the `Mutex`, so
+        // there are no concurrent readers for WAL to unblock. `synchronous = FULL`
+        // fsyncs on commit (negligible at the relay's volume) so a committed
+        // pairing is on the share before the call returns.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),

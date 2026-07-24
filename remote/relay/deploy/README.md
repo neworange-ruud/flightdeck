@@ -17,10 +17,66 @@ here — this is a public repo. They live in the repo's Actions **variables** an
 | Pull identity | user-assigned MI with **AcrPull** on the registry |
 | Deploy identity | user-assigned MI, GitHub-OIDC federated, **AcrPush** + **Container Registry Tasks Contributor** on the registry (the latter is required for web-deploy's `az acr build` step) + **Contributor** on the app only |
 
-**`maxReplicas: 1` is required, not a tuning choice** — routing state is in
-process memory (`store::InMemoryStore`), so both legs of a pairing must land on
-the same replica. Scaling out needs a shared `RelayStore` (Redis / Azure Table)
-first. See `../src/store.rs`.
+**`maxReplicas: 1` is required, not a tuning choice** — two reasons. (1) A
+pairing's two legs must land on the same replica, since routing is per-process.
+(2) The persistent store (below) is a single SQLite file opened with locking
+*disabled* (the `unix-none` VFS), which is only safe with one writer — a second
+replica would race the file and corrupt it. Scaling out needs a networked
+`RelayStore` (Redis / Azure Table) first. See `../src/store.rs`.
+
+## Persistent store
+
+State (device registrations, pairings, claim tokens, per-pairing seq high-water
+marks) lives in a **`RelayStore`**. The default is in-memory, which is wiped on
+every process restart *and every node reschedule* — a plain Container Apps
+platform event that silently drops all pairings and leaves already-paired
+devices stuck on "unknown device" auth failures (remote-control-bbf). The live
+app therefore runs the file-backed `SqliteStore` on an **Azure Files** volume so
+state outlives a revision swap or reschedule:
+
+- `FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db` selects the store and path.
+- `/data` is an Azure Files SMB share mounted into the container (declared in
+  `containerapp.yaml` under `volumes` / `volumeMounts`, referencing a storage
+  definition registered on the managed *environment*).
+- `SqliteStore` opens the DB with the no-locking `unix-none` VFS and a rollback
+  journal (not WAL) — required because the mount is a network filesystem, which
+  lacks the byte-range locking SQLite needs (an SMB lock attempt fails with a
+  spurious "database is locked") and cannot host WAL's mmap'd shared-memory
+  index; safe because there is a single connection at `maxReplicas: 1` (see
+  `../src/store/sqlite.rs`).
+
+One-time setup (idempotent; fill placeholders as in "Reproducing the setup"):
+
+```bash
+SA=<STORAGE_ACCOUNT>       # 3–24 lowercase alphanumeric, globally unique
+SHARE=relay-data           # Azure Files share name
+STORAGE=relaydata          # CA env storage definition name (no hyphens)
+
+# 1. Standard SMB storage account + a small file share.
+az storage account create -n "$SA" -g "$RG" -l "$REGION" \
+  --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 \
+  --allow-blob-public-access false
+KEY=$(az storage account keys list -n "$SA" -g "$RG" --query '[0].value' -o tsv)
+az storage share-rm create --storage-account "$SA" -g "$RG" -n "$SHARE" --quota 5
+
+# 2. Register the share on the managed environment as ReadWrite storage.
+az containerapp env storage set -g "$RG" -n "$ENVNAME" \
+  --storage-name "$STORAGE" \
+  --azure-file-account-name "$SA" --azure-file-account-key "$KEY" \
+  --azure-file-share-name "$SHARE" --access-mode ReadWrite
+
+# 3. Mount it + select the store on the app. Volumes have no dedicated `az`
+#    flag, so patch via YAML: `az containerapp show -o yaml > app.yaml`, add the
+#    `volumes` / `volumeMounts` / `FLIGHTDECK_RELAY_STORE` blocks (see
+#    containerapp.yaml for the exact shape), then `az containerapp update
+#    --yaml app.yaml`. relay-deploy.yml re-asserts the env var on every deploy;
+#    the volume, once mounted, is preserved across `--set-env-vars` updates.
+```
+
+The SMB share mounts world-writable (`0777`), so the container's non-root user
+(distroless `:nonroot`, uid 65532) can write to it — no extra permission wiring.
+Cost: a tiny standard file share is a few cents/month (billed on used GB +
+transactions).
 
 The Container Apps ingress serves a managed TLS cert on both the
 `*.azurecontainerapps.io` hostname (retrieve with
@@ -175,7 +231,8 @@ pull path on managed identity (no PAT to rotate).
 
 ## Not addressed yet
 
-- **Persistent `RelayStore`** — removes `maxReplicas: 1` and survives restarts
-  without dropping pairings/queues (`../src/store.rs`).
-- **Pinned custom domain** (`relay.flightdeck.app`) + wiring the desktop's
-  `relay_url` config to it.
+- **Horizontal scale (`maxReplicas > 1`)** — the persistent store (see above)
+  survives restarts/reschedules but is a single exclusive-locked SQLite file, so
+  it does not yet enable multiple replicas. That needs a networked `RelayStore`
+  (Redis / Azure Table) so both legs of a pairing can land on different replicas
+  (`../src/store.rs`).

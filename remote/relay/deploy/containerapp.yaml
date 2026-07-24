@@ -57,6 +57,19 @@ properties:
           # .github/workflows/relay.yml. Falls back to "unknown" if absent.
           - name: GIT_SHA
             value: <GIT_SHA>
+          # Persistent store: point SQLite at the mounted Azure Files volume
+          # (see `volumeMounts` / `volumes` below) so device registrations,
+          # pairings, claim tokens and per-pairing seq high-water marks survive
+          # a revision swap or node reschedule. Without this the relay defaults
+          # to an in-memory store and every reschedule silently drops all
+          # pairings, leaving paired devices stuck on "unknown device" auth
+          # failures (remote-control-bbf / remote-control-vp2). `SqliteStore`
+          # opens the DB with the no-locking `unix-none` VFS and a rollback
+          # journal — required because the mount is a network filesystem (SMB/NFS
+          # lack the byte-range locking SQLite needs); safe because there is one
+          # connection at maxReplicas: 1 (see store/sqlite.rs).
+          - name: FLIGHTDECK_RELAY_STORE
+            value: sqlite:/data/relay.db
           # RUST_LOG is left unset here to take the crate's `info` default;
           # override per-environment if more verbosity is needed.
 
@@ -64,9 +77,15 @@ properties:
           # Smallest valid Container Apps combo (Consumption profile requires
           # memory Gi == 2 × vCPU). The relay is a thin ciphertext forwarder
           # with negligible compute; this is what the live app runs. Revisit
-          # only if a persistent store / higher pairing volume lands.
+          # only if a higher pairing volume lands.
           cpu: 0.25
           memory: 0.5Gi
+
+        # Mount the Azure Files share (declared under `volumes` below) at /data,
+        # where FLIGHTDECK_RELAY_STORE points the SQLite file.
+        volumeMounts:
+          - mountPath: /data
+            volumeName: relay-data
 
         # Liveness/readiness probes wired to the scaffold's health surface
         # (see `src/handlers.rs`). Startup uses the liveness path with a more
@@ -95,11 +114,26 @@ properties:
     # Per PRD §9.1: desktop keeps a long-lived outbound connection and phones
     # connect in, so the relay is never truly idle while any pairing is
     # active. minReplicas: 1 avoids cold-start on every reconnect.
-    # maxReplicas: 1 is REQUIRED, not conservative: routing state lives in
-    # process memory (store::InMemoryStore), so a pairing's two legs must land
-    # on the same replica. A second replica would silently break routing for
-    # any pairing split across them. Lifting this needs a shared/externalized
-    # RelayStore (Redis / Azure Table) first — see store.rs and the README.
+    # maxReplicas: 1 is REQUIRED, not conservative. Two reasons: (1) routing
+    # state — a pairing's two legs must land on the same replica; and (2) the
+    # persistent SqliteStore opens its database with locking DISABLED (the
+    # `unix-none` VFS — see store/sqlite.rs), which is only safe with a single
+    # writer; a second replica would race the SQLite file and corrupt it.
+    # Scaling out needs a networked RelayStore (Redis / Azure Table) first —
+    # see store.rs.
     scale:
       minReplicas: 1
       maxReplicas: 1
+
+    # Azure Files volume backing the persistent store. `storageName` refers to
+    # a storage definition registered on the *managed environment* (one-time,
+    # out of band — see deploy/README.md → "Persistent store"):
+    #   az containerapp env storage set … --storage-name relaydata \
+    #     --azure-file-account-name <SA> --azure-file-account-key <KEY> \
+    #     --azure-file-share-name relay-data --access-mode ReadWrite
+    # The SMB share mounts world-writable (0777), so the container's non-root
+    # user (distroless :nonroot, uid 65532 — see Dockerfile) can write to it.
+    volumes:
+      - name: relay-data
+        storageType: AzureFile
+        storageName: relaydata

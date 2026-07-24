@@ -1,0 +1,9 @@
+# Build context for relay/Dockerfile is this `remote/` workspace root. The
+# Dockerfile only COPYs the Cargo manifests and `*/src`, so `target/` (~1GB of
+# local build artifacts) is dead weight in the context upload and must never
+# leak into the image build. Keep this list conservative — exclude only what is
+# never part of a build.
+target/
+**/target/
+.git/
+**/*.rs.bk

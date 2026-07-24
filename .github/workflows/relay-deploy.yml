@@ -151,11 +151,17 @@ jobs:
               --secrets "relay-password=$RELAY_PASSWORD"
             PW_ENV="FLIGHTDECK_RELAY_PASSWORD=secretref:relay-password"
           fi
+          # FLIGHTDECK_RELAY_STORE re-asserts the persistent SQLite store on
+          # every deploy (remote-control-vp2). The /data volume + mount live in
+          # the app template (registered once — see deploy/README.md) and are
+          # preserved across `--set-env-vars` updates; re-setting the env var
+          # here guarantees the store selection can never silently regress to
+          # in-memory (which would drop all pairings on the next reschedule).
           az containerapp update \
             --resource-group "$RG" \
             --name "$APP" \
             --image "$IMAGE" \
-            --set-env-vars "GIT_SHA=${{ github.sha }}" $PW_ENV
+            --set-env-vars "GIT_SHA=${{ github.sha }}" "FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db" $PW_ENV
 
       - name: Verify the new revision is live and healthy
         run: |
