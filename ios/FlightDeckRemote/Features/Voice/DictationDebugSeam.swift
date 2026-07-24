@@ -39,15 +39,21 @@ enum DictationDebugSeam {
 
     /// The recognizer `DictationController` should use: a scripted one under the
     /// seam args, otherwise the real `SystemSpeechDictator`.
+    ///
+    /// - Parameter locale: the recognition locale for the real fallback. This is
+    ///   a DEBUG build too (Xcode → device), so the chosen `SpeechLanguage` MUST
+    ///   flow through here — otherwise the recognizer silently follows the
+    ///   device locale and the language toggle has no effect. The scripted
+    ///   recognizers ignore it (they emit canned text, no microphone).
     @MainActor
-    static func makeRecognizer() -> any SpeechDictating {
+    static func makeRecognizer(locale: @escaping () -> Locale = { Locale.current }) -> any SpeechDictating {
         if deniedRequested() {
             return ScriptedSpeechDictator(transcript: "", authorization: .denied)
         }
         if let scripted = scriptedTranscript() {
             return ScriptedSpeechDictator(transcript: scripted, authorization: .authorized)
         }
-        return SystemSpeechDictator()
+        return SystemSpeechDictator(locale: locale)
     }
 }
 

@@ -55,12 +55,18 @@ final class DictationController {
         }
     }
 
+    /// - Parameter locale: the recognition locale for the real recognizer,
+    ///   resolved fresh on each hold. Defaults to the user's persisted
+    ///   `SpeechLanguage` (English until they choose otherwise), so a Settings
+    ///   change applies on the next hold without recreating this controller.
+    ///   Ignored when a `recognizer` is injected (tests / the DEBUG seam).
     init(recognizer: (any SpeechDictating)? = nil,
+         locale: @escaping () -> Locale = { UserDefaultsSpeechLanguageStore().load().locale },
          now: @escaping () -> Date = Date.init) {
         #if DEBUG
-        self.recognizer = recognizer ?? DictationDebugSeam.makeRecognizer()
+        self.recognizer = recognizer ?? DictationDebugSeam.makeRecognizer(locale: locale)
         #else
-        self.recognizer = recognizer ?? SystemSpeechDictator()
+        self.recognizer = recognizer ?? SystemSpeechDictator(locale: locale)
         #endif
         self.now = now
         self.recognizer.onTranscript = { [weak self] text in
