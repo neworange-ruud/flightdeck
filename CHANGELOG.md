@@ -20,7 +20,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Remote: pairings survive a relay restart or node reschedule.** The hosted
+  relay ran an in-memory store with no persistent volume, so an Azure Container
+  Apps node reschedule (a routine platform event) silently wiped every pairing —
+  after which already-paired devices looped forever on "unknown device" auth
+  failures until they re-paired (remote-control-bbf / remote-control-vp2). The
+  live relay now runs the file-backed `SqliteStore` on a mounted Azure Files
+  volume (`FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db`), so device
+  registrations, pairings, claim tokens and per-pairing sequence high-water marks
+  outlive a revision swap or reschedule. Because the volume is a network
+  filesystem (which lacks the byte-range locking SQLite needs), `SqliteStore`
+  opens the database with the no-locking `unix-none` VFS and a rollback journal —
+  safe at the relay's `maxReplicas: 1` single-writer guarantee. Deployment is
+  documented in `remote/relay/deploy/README.md` and re-asserted on every deploy
+  in `relay-deploy.yml`.
 
 ## [1.11.0] - 2026-07-23
 
