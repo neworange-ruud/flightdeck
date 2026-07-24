@@ -27,10 +27,34 @@ final class SystemSpeechDictator: SpeechDictating {
     var onTranscript: ((String) -> Void)?
     var onFailure: ((String) -> Void)?
 
-    private let recognizer = SFSpeechRecognizer()
+    /// The recognition locale for the next hold, resolved fresh each time so a
+    /// language change in Settings takes effect without recreating this object.
+    private let localeProvider: () -> Locale
+    private var recognizer: SFSpeechRecognizer?
+    private var recognizerLocaleId: String?
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+
+    /// - Parameter locale: the recognition locale provider. Defaults to the
+    ///   device locale (the historical implicit behavior); the app injects the
+    ///   user's chosen `SpeechLanguage`. Called on each authorization/record so
+    ///   a switch applies on the next hold.
+    init(locale: @escaping () -> Locale = { Locale.current }) {
+        self.localeProvider = locale
+    }
+
+    /// The recognizer for the currently-selected language, (re)built lazily when
+    /// the language changes. `SFSpeechRecognizer(locale:)` returns `nil` for a
+    /// locale the device can't recognize, which surfaces as `.unavailable`.
+    private func currentRecognizer() -> SFSpeechRecognizer? {
+        let wanted = localeProvider()
+        if recognizer == nil || recognizerLocaleId != wanted.identifier {
+            recognizer = SFSpeechRecognizer(locale: wanted)
+            recognizerLocaleId = wanted.identifier
+        }
+        return recognizer
+    }
 
     func requestAuthorization() async -> DictationAuthorization {
         // Speech recognition first, then the microphone — either denial fails.
@@ -40,7 +64,7 @@ final class SystemSpeechDictator: SpeechDictating {
         guard speech == .authorized else {
             return speech == .notDetermined ? .unavailable : .denied
         }
-        guard recognizer?.isAvailable == true else { return .unavailable }
+        guard currentRecognizer()?.isAvailable == true else { return .unavailable }
 
         let mic = await withCheckedContinuation { continuation in
             AVAudioApplication.requestRecordPermission { continuation.resume(returning: $0) }
@@ -70,7 +94,7 @@ final class SystemSpeechDictator: SpeechDictating {
         audioEngine.prepare()
         try audioEngine.start()
 
-        guard let recognizer else {
+        guard let recognizer = currentRecognizer() else {
             onFailure?("recognizer unavailable")
             return
         }

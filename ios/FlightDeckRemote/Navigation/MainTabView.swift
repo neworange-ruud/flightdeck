@@ -87,6 +87,10 @@ struct MainTabView: View {
     // by the same `agentEvents` stream as the Feed's unread source, and the shared push
     // coordinator whose APNs token we register with the transport.
     @State private var notificationPreferences = NotificationPreferences()
+    // Push-to-talk dictation language (PRD §7). Owned here so the Settings
+    // toggle and the chat's `DictationController` observe the same persisted
+    // choice; the recognizer reads the persisted value when it builds.
+    @State private var speechLanguage = SpeechLanguagePreference()
     @State private var notificationScheduler = NotificationScheduler()
     @State private var pushCoordinator = PushCoordinator.shared
 
@@ -435,7 +439,8 @@ struct MainTabView: View {
                 router: router,
                 transportStore: transportStore,
                 coordinator: coordinator,
-                notificationPreferences: notificationPreferences)
+                notificationPreferences: notificationPreferences,
+                speechLanguage: speechLanguage)
         }
     }
 }

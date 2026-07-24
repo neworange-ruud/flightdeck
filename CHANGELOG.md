@@ -8,7 +8,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Remote: choose the dictation input language.** The push-to-talk mic in
+  chat used to transcribe in whatever language the phone's locale implied
+  (English for most users). Settings → Voice now offers an explicit language
+  picker (English / Nederlands); the choice is persisted and applies to the
+  next hold. Adding more languages is a one-line change to `SpeechLanguage`.
 
 ### Improvements
 

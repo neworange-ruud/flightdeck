@@ -65,6 +65,7 @@ struct SettingsView: View {
     var pairingRecordStore: PairingRecordStore
     var biometricAuthenticator: BiometricAuthenticating
     var notificationPreferences: NotificationPreferences
+    var speechLanguage: SpeechLanguagePreference
     private let unpairService: SettingsUnpairing
     private let pairingUnpairService: PairingUnpairing
 
@@ -96,6 +97,7 @@ struct SettingsView: View {
         pairingRecordStore: PairingRecordStore = PairingRecordStore(),
         biometricAuthenticator: BiometricAuthenticating = LAContextBiometricAuthenticator(),
         notificationPreferences: NotificationPreferences,
+        speechLanguage: SpeechLanguagePreference,
         unpairService: SettingsUnpairing? = nil,
         pairingUnpairService: PairingUnpairing? = nil
     ) {
@@ -105,6 +107,7 @@ struct SettingsView: View {
         self.pairingRecordStore = pairingRecordStore
         self.biometricAuthenticator = biometricAuthenticator
         self.notificationPreferences = notificationPreferences
+        self.speechLanguage = speechLanguage
         self.unpairService = unpairService
             ?? DefaultSettingsUnpairService(transportStore: transportStore, pairingRecordStore: pairingRecordStore)
         self.pairingUnpairService = pairingUnpairService
@@ -117,6 +120,7 @@ struct SettingsView: View {
                 connectionSection
                 machinesSection
                 securitySection
+                voiceSection
                 notificationsSection
                 aboutSection
             }
@@ -376,6 +380,57 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Voice (PRD §7)
+
+    /// Push-to-talk dictation language. Selecting a language repoints the
+    /// speech recognizer (`SpeechLanguage.locale` → `SFSpeechRecognizer`); the
+    /// change applies on the next hold. A radio-style list (mirrors the mute
+    /// list) rather than a `Picker`, so it matches the card styling.
+    private var voiceSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            sectionHeader("Voice")
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(SpeechLanguage.allCases.enumerated()), id: \.element) { index, language in
+                    if index != 0 { rowDivider }
+                    languageRow(for: language)
+                }
+            }
+            .cardStyle()
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("settings-language-card")
+
+            Text("Language used for push-to-talk dictation (the mic in chat).")
+                .typography(Typography.caption)
+                .foregroundStyle(Theme.textMutedDark)
+                .padding(.horizontal, Theme.Spacing.xs)
+        }
+    }
+
+    private func languageRow(for language: SpeechLanguage) -> some View {
+        let isSelected = speechLanguage.language == language
+        return Button {
+            speechLanguage.language = language
+        } label: {
+            HStack {
+                Text(language.displayName)
+                    .typography(Typography.body)
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer(minLength: Theme.Spacing.sm)
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(Theme.Spacing.lg)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityIdentifier("settings-language-\(language.rawValue)")
+    }
+
     // MARK: - Notifications (PRD §5.6/§9.2)
 
     @ViewBuilder
@@ -574,6 +629,7 @@ struct SettingsView: View {
         router: router,
         transportStore: transportStore,
         coordinator: coordinator,
-        notificationPreferences: NotificationPreferences())
+        notificationPreferences: NotificationPreferences(),
+        speechLanguage: SpeechLanguagePreference())
         .environment(AppLockController())
 }
