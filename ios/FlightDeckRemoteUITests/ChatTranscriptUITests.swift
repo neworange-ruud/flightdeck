@@ -28,10 +28,8 @@ final class ChatTranscriptUITests: XCTestCase {
         app.launchArguments += ["-uitest-reset-pairing", "-uitest-fixture-transcript"]
         app.launch()
 
-        // Cross into the paired tab container.
-        let toggle = element(app, "debug-toggle-paired-button")
-        XCTAssertTrue(toggle.waitForExistence(timeout: 5), "Expected the DEBUG pairing toggle")
-        toggle.tap()
+        // Cross into the paired tab container (the fixture arg auto-pushes chat).
+        crossIntoPairedApp(app, expecting: "AgentChatView")
         return app
     }
 
@@ -76,9 +74,11 @@ final class ChatTranscriptUITests: XCTestCase {
         let deny = element(app, "permission-deny")
         XCTAssertTrue(allow.exists)
         XCTAssertTrue(deny.exists)
-        // Buttons are rendered but disabled this task (chat-permission wires them).
-        XCTAssertFalse(allow.isEnabled, "Allow should be disabled this task")
-        XCTAssertFalse(deny.isEnabled, "Deny should be disabled this task")
+        // The buttons are wired (see ChatComposeUITests) but this fixture launch
+        // passes no `-uitest-linkstate`, so `FixtureConnectionSource` leaves the
+        // link down and they render disabled behind the commands-paused gate.
+        XCTAssertFalse(allow.isEnabled, "Allow should be disabled while the link is down")
+        XCTAssertFalse(deny.isEnabled, "Deny should be disabled while the link is down")
         XCTAssertTrue(element(app, "permission-voice-hint").exists,
                       "Expected the voice hint line")
     }

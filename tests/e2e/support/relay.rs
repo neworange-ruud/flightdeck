@@ -32,6 +32,10 @@ const HEALTHZ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay between healthz poll attempts.
 const HEALTHZ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long [`RelayHandle::restart`] waits for the killed relay to stop
+/// answering on its port before rebinding it.
+const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A running `flightdeck-relay` subprocess, bound to `127.0.0.1:<port>`.
 ///
 /// Kills the relay process on [`Drop`], so a test that spawns one and lets it
@@ -40,6 +44,18 @@ const HEALTHZ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct RelayHandle {
     child: Child,
     port: u16,
+    /// The `FLIGHTDECK_RELAY_STORE` spec this relay runs with, or `None` for the
+    /// default in-memory store. Replayed verbatim by [`Self::restart`] so a
+    /// persistent relay comes back up on the same database.
+    store_spec: Option<String>,
+    /// Owns the persistent store's directory for the handle's whole lifetime,
+    /// including across a [`Self::restart`] — dropping it would delete the very
+    /// database the restart is supposed to reopen.
+    _store_dir: Option<tempfile::TempDir>,
+    /// Path to the SQLite database backing this relay, when it runs the
+    /// persistent store. Exposed so a test can simulate partial state loss
+    /// (see [`Self::db_path`]).
+    db_path: Option<PathBuf>,
 }
 
 impl RelayHandle {
@@ -61,24 +77,78 @@ impl RelayHandle {
     /// then runs the prebuilt binary with `PORT=<port>` and polls `/healthz`
     /// until it answers `ok` or [`HEALTHZ_TIMEOUT`] elapses.
     pub fn spawn_on(port: u16) -> Self {
-        let bin = ensure_relay_built();
+        Self::spawn_inner(port, None, None)
+    }
 
-        let child = Command::new(&bin)
-            .env("PORT", port.to_string())
-            .stdin(Stdio::null())
-            // Inherited (not piped): the relay's tracing output is useful on
-            // test failure, and piping would require a drain thread to avoid
-            // the child blocking once the pipe buffer fills.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap_or_else(|err| {
-                panic!("failed to spawn relay binary at {}: {err}", bin.display())
-            });
+    /// Spawn the relay with the **persistent** SQLite store
+    /// (`FLIGHTDECK_RELAY_STORE=sqlite:<tmp>/relay.db`), on an OS-chosen free
+    /// port. This is what the hosted relay runs (remote-control-vp2), and it is
+    /// the only mode in which [`Self::restart`] can preserve pairings, claim
+    /// tokens and per-stream seq watermarks across the restart.
+    pub fn spawn_persistent() -> Self {
+        let dir = tempfile::tempdir().expect("create temp dir for the relay's sqlite store");
+        let db = dir.path().join("relay.db");
+        let spec = format!("sqlite:{}", db.display());
+        Self::spawn_inner(pick_free_port(), Some(spec), Some((dir, db)))
+    }
 
-        let handle = RelayHandle { child, port };
+    /// Shared spawn path: run the prebuilt binary with `PORT` (plus the store
+    /// spec, when persistent) and block until `/healthz` answers `ok`.
+    fn spawn_inner(
+        port: u16,
+        store_spec: Option<String>,
+        store: Option<(tempfile::TempDir, PathBuf)>,
+    ) -> Self {
+        let child = spawn_child(port, store_spec.as_deref());
+        let (store_dir, db_path) = match store {
+            Some((dir, db)) => (Some(dir), Some(db)),
+            None => (None, None),
+        };
+        let handle = RelayHandle {
+            child,
+            port,
+            store_spec,
+            _store_dir: store_dir,
+            db_path,
+        };
         handle.wait_for_healthz();
         handle
+    }
+
+    /// Kill this relay and bring a fresh process back up **on the same port**,
+    /// with the same store spec — the test-harness equivalent of a container
+    /// reschedule / redeploy (remote-control-bbf).
+    ///
+    /// The port is deliberately reused: the desktop under test has the relay URL
+    /// baked into its `.flightdeck/config.toml` (see `support::desktop`), so a
+    /// new port would look like a permanently-dead relay rather than a restarted
+    /// one. Blocks until the old process has stopped answering and the new one
+    /// answers `/healthz`.
+    pub fn restart(&mut self) {
+        self.stop();
+        self.child = spawn_child(self.port, self.store_spec.as_deref());
+        self.wait_for_healthz();
+    }
+
+    /// Kill the relay process and block until its port is free again, leaving the
+    /// relay **down**. Idempotent. Between a `stop` and a [`Self::restart`] the
+    /// store file is not open by anyone, which is the only safe window for a test
+    /// to edit it (see [`Self::db_path`]).
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.wait_for_port_release();
+    }
+
+    /// Path to the relay's SQLite database, for a relay spawned via
+    /// [`Self::spawn_persistent`]. Only meaningful while the relay process is
+    /// **stopped** (between a kill and a restart): the store opens the file with
+    /// the no-locking `unix-none` VFS, so concurrent outside writes are unsafe.
+    /// Used to simulate partial state loss across a redeploy.
+    pub fn db_path(&self) -> &Path {
+        self.db_path
+            .as_deref()
+            .expect("db_path is only available for a relay spawned with spawn_persistent()")
     }
 
     /// The port the relay is bound to.
@@ -123,6 +193,50 @@ impl RelayHandle {
             self.port, HEALTHZ_TIMEOUT
         );
     }
+
+    /// Block until nothing answers on this relay's port, so the replacement
+    /// process can bind it. Called after the kill in [`Self::restart`]: the OS
+    /// releases a listening socket as soon as the owning process dies, so this
+    /// normally returns on the first poll — it exists to turn a slow teardown
+    /// into a wait rather than an "address already in use" flake.
+    fn wait_for_port_release(&self) {
+        let deadline = Instant::now() + PORT_RELEASE_TIMEOUT;
+        while Instant::now() < deadline {
+            if TcpStream::connect_timeout(
+                &(std::net::Ipv4Addr::LOCALHOST, self.port).into(),
+                Duration::from_millis(200),
+            )
+            .is_err()
+            {
+                return;
+            }
+            std::thread::sleep(HEALTHZ_POLL_INTERVAL);
+        }
+        panic!(
+            "port {} was still accepting connections {:?} after the relay was killed",
+            self.port, PORT_RELEASE_TIMEOUT
+        );
+    }
+}
+
+/// Launch one relay child process on `port`, optionally with a
+/// `FLIGHTDECK_RELAY_STORE` spec. Does not wait for readiness — callers poll
+/// `/healthz`.
+fn spawn_child(port: u16, store_spec: Option<&str>) -> Child {
+    let bin = ensure_relay_built();
+    let mut cmd = Command::new(&bin);
+    cmd.env("PORT", port.to_string())
+        .stdin(Stdio::null())
+        // Inherited (not piped): the relay's tracing output is useful on
+        // test failure, and piping would require a drain thread to avoid
+        // the child blocking once the pipe buffer fills.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(spec) = store_spec {
+        cmd.env("FLIGHTDECK_RELAY_STORE", spec);
+    }
+    cmd.spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn relay binary at {}: {err}", bin.display()))
 }
 
 impl Drop for RelayHandle {

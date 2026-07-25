@@ -31,12 +31,32 @@ extension View {
 private struct ChatFixtureAutoPushModifier: ViewModifier {
     @Binding var path: [ProjectsRoute]
 
+    /// How many turns to keep re-trying the push, and the gap between them.
+    /// ~2s total is far longer than the transition needs, and every attempt
+    /// after the first one that sticks is a cheap `isEmpty` check.
+    private let maxAttempts = 20
+    private let retryGap = Duration.milliseconds(100)
+
     func body(content: Content) -> some View {
-        content.onAppear {
-            guard ProcessInfo.processInfo.arguments.contains("-uitest-fixture-transcript"),
-                  path.isEmpty
+        content.task {
+            guard ProcessInfo.processInfo.arguments.contains("-uitest-fixture-transcript")
             else { return }
-            path.append(.chat(projectId: "fixture-project", sessionId: "fixture-session", pairingId: nil))
+            // Retry rather than push once. UI tests reach this by flipping the
+            // DEBUG pairing toggle, which swaps the app root from PairingView to
+            // MainTabView — and an append that lands in the same transaction
+            // that installs the tab's `NavigationStack` is silently dropped, so
+            // a single `onAppear` push left the chat route unreachable for the
+            // rest of the run (~20% of ChatTranscriptUITests runs, which then
+            // timed out waiting for `AgentChatView` — remote-control-7lo).
+            // A dropped append leaves `path` empty, so re-checking it both
+            // detects the drop and makes a successful push idempotent.
+            for _ in 0..<maxAttempts {
+                if !path.isEmpty { return }
+                path.append(.chat(projectId: "fixture-project",
+                                  sessionId: "fixture-session",
+                                  pairingId: nil))
+                try? await Task.sleep(for: retryGap)
+            }
         }
     }
 }

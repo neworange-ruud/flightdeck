@@ -53,6 +53,11 @@ struct AgentChatView: View {
     @State private var isNearBottom = true
     @State private var userScrolled = false
     @State private var didInitialScroll = false
+    /// Bumped every time the user sends, to scroll their own message into view
+    /// unconditionally. The compose bar is a sibling of the transcript, so it has
+    /// no `ScrollViewProxy`; this pulse carries the intent across
+    /// (remote-control-7lo).
+    @State private var sendScrollPulse = 0
 
     private let bottomAnchor = "chat-bottom-anchor"
 
@@ -102,7 +107,7 @@ struct AgentChatView: View {
                 ChatComposeBar(sessionName: model.sessionName,
                                text: $model.draft,
                                commandsPaused: commandsPaused,
-                               onSend: { model.send() },
+                               onSend: { sendAndFollow() },
                                isListening: dictation.isListening,
                                onHoldBegin: { dictation.beginHold() },
                                onHoldEnd: { dictation.endHold() })
@@ -144,6 +149,24 @@ struct AgentChatView: View {
 
     /// A snapshot of outgoing send states keyed by their local render id, read
     /// in `body`'s tracked scope so per-row lookups don't re-track lazily.
+    /// Send the draft and follow the conversation to the bottom.
+    ///
+    /// Sending is an explicit "I am here, at the end of this conversation"
+    /// action, so it always cancels scroll-follow suppression. Without this the
+    /// optimistic message could be appended *below the fold* and never scrolled
+    /// to — and because the transcript is a `LazyVStack`, an off-screen row is
+    /// never even realized, so the sender saw no trace of their own message.
+    /// That happened routinely rather than rarely: entering a session with a
+    /// pending permission prompt scrolls to that prompt (`anchor: .center`), which
+    /// leaves the view *not* near the bottom, so `shouldAutoScroll` refused to
+    /// follow the very next send (remote-control-7lo).
+    private func sendAndFollow() {
+        userScrolled = false
+        isNearBottom = true
+        model.send()
+        sendScrollPulse += 1
+    }
+
     private func sendStateMap() -> [Wire.ItemId: OutgoingState] {
         var map: [Wire.ItemId: OutgoingState] = [:]
         for msg in model.outgoing { map[msg.localId] = msg.state }
@@ -285,6 +308,13 @@ struct AgentChatView: View {
             }
             .onChange(of: rows.count) { _, count in
                 if count > 0 { performInitialScroll(proxy: proxy) }
+            }
+            // The user just sent something: scroll to it unconditionally, without
+            // consulting the follow heuristic (see `sendAndFollow`).
+            .onChange(of: sendScrollPulse) { _, _ in
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(bottomAnchor, anchor: .bottom)
+                }
             }
             .onAppear {
                 performInitialScroll(proxy: proxy)

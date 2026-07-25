@@ -55,6 +55,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   bill at 10x. The UI test target stays excluded: `ShellUITests` alone takes
   ~25 minutes (remote-control-7lr), so UI regressions are still only caught by
   running `ios/scripts/test.sh` locally.
+- **Remote: relay restarts are now covered end to end.** The "phone prompt runs
+  on the desktop but nothing ever comes back" stall (remote-control-bbf) was
+  fixed across all three tiers in 1.10.0, but only by unit tests on each side —
+  nothing exercised a real relay actually restarting mid-pairing, which is how
+  the bug reached users in the first place. The Tier A E2E suite now restarts the
+  real relay binary under a live pairing and asserts the phone keeps receiving
+  the desktop feed: once with the persistent store (everything survives, the
+  stream continues), and once with the desktop→phone sequence state deliberately
+  wiped, which reproduces the original divergence and proves the full recovery
+  path — relay reports `seq_violation`, desktop re-syncs from a fresh snapshot,
+  phone accepts the stream reset. The phone driver also mirrors the iOS receive
+  cursor (persisted across reconnects, dedup + reset acceptance), so a
+  regression on any tier fails the suite instead of only showing up in
+  production.
 
 ### Bug fixes
 
@@ -71,6 +85,27 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   entitlement has to match, or codesign fails. A Release build now carries
   `production`, which is what TestFlight and App Store builds are signed
   against.
+- **Remote: your own reply now scrolls into view when you send it.** Opening a
+  session that was waiting on a permission prompt scrolls the transcript to that
+  prompt — which leaves the view parked away from the bottom, so the scroll-follow
+  heuristic refused to follow the very next message you sent. Because the
+  transcript renders lazily, that message was never even laid out: you typed a
+  reply, tapped Send, and the screen showed no trace of it (the reply *was* sent —
+  only its row was invisible), leaving no way to tell a sent message from a
+  dropped one. Sending now always follows the conversation to the bottom, and
+  re-enables follow for the agent's answer. This was the real cause behind the
+  two chat-compose UI tests that had been failing on the iOS 26 simulator
+  (remote-control-7lo) — the compose field and the send path were never at fault.
+- **Remote: the UI-test fixture chat route survives the paired-app root swap.**
+  The DEBUG `-uitest-fixture-transcript` seam pushed its route once from
+  `onAppear` behind an `isEmpty` guard, so an append landing in the same
+  transaction that installs the tab's `NavigationStack` — which is exactly what
+  the pairing toggle's root swap provokes — was silently dropped, and the guard
+  made the loss permanent for the rest of the run. It now retries briefly and
+  re-checks the path, so a dropped push is recovered and a successful one stays
+  idempotent. This cut the `ChatTranscriptUITests` timeout rate from 2-in-9 to
+  1-in-9; the remaining share is still under investigation (remote-control-7lo).
+  DEBUG-only — no Release behaviour changes.
 - **Remote: pairings survive a relay restart or node reschedule.** The hosted
   relay ran an in-memory store with no persistent volume, so an Azure Container
   Apps node reschedule (a routine platform event) silently wiped every pairing —
