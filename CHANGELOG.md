@@ -21,13 +21,56 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   (English for most users). Settings → Voice now offers an explicit language
   picker (English / Nederlands); the choice is persisted and applies to the
   next hold. Adding more languages is a one-line change to `SpeechLanguage`.
+- **Remote: the iOS app can be shipped to TestFlight.** The project had never
+  been configured for distribution — no signing team, no privacy manifest, no
+  export-compliance declaration — so no build could reach App Store Connect at
+  all. It now signs against team `7NKCS4AZS9` with automatic signing, ships an
+  `aps-environment` entitlement per configuration (development for Debug,
+  production for Release, which is what TestFlight builds need), declares its
+  required-reason API use in `PrivacyInfo.xcprivacy`, and answers export
+  compliance once via `ITSAppUsesNonExemptEncryption`. `ios/scripts/archive.sh`
+  archives, exports and optionally uploads a build;
+  `FlightDeckRemoteTests/DistributionMetadataTests.swift` guards the bundle
+  metadata that only fails at upload time. See `ios/README.md`
+  "Distribution (TestFlight)".
+- **A published privacy policy, linked from the app.**
+  <https://www.flightdeckai.app/privacy> documents what actually leaves the
+  device: messages are end-to-end encrypted and the relay holds only ciphertext,
+  but it does see device ids, pairing ids, push tokens, machine names and
+  message timing, and voice dictation goes to Apple's speech recognition rather
+  than staying on-device. Settings → About links it, and App Store Connect
+  requires it.
 
 ### Improvements
 
-- None yet.
+- **Remote: the iOS app reports a real version.** It claimed `1.0 (1)`
+  regardless of the release it shipped from. The marketing version now tracks
+  the FlightDeck release train (`1.11.0`), and `scripts/release` rewrites
+  `ios/project.yml` alongside `Cargo.toml` so the phone and the desktop can no
+  longer drift apart.
+- **CI builds and tests the iOS app.** Nothing under `ios/` was covered by any
+  workflow. A new `iOS` workflow runs the unit suite on a simulator and — the
+  part that matters — compiles the Release configuration for a device, which is
+  what TestFlight ships. It is path-filtered to `ios/**` because macOS runners
+  bill at 10x. The UI test target stays excluded: `ShellUITests` alone takes
+  ~25 minutes (remote-control-7lr), so UI regressions are still only caught by
+  running `ios/scripts/test.sh` locally.
 
 ### Bug fixes
 
+- **Remote: the iOS app compiles in the Release configuration.** Every
+  `#Preview` body referencing a DEBUG-only fixture broke the Release build,
+  because the `#Preview` macro expands regardless of `ENABLE_PREVIEWS` while
+  `DebugFixtures.swift` is wrapped in `#if DEBUG`. Debug and the simulator test
+  suite stayed green throughout, so nothing surfaced it — the app simply could
+  not be archived. All 31 preview blocks are now `#if DEBUG`-guarded, and CI
+  builds Release for a device so it cannot regress.
+- **Remote: the shipped `aps-environment` matches the signing profile.** The
+  committed entitlement hardcoded `development` on the assumption that a
+  distribution profile would override it at signing time; it does not — the
+  entitlement has to match, or codesign fails. A Release build now carries
+  `production`, which is what TestFlight and App Store builds are signed
+  against.
 - **Remote: pairings survive a relay restart or node reschedule.** The hosted
   relay ran an in-memory store with no persistent volume, so an Azure Container
   Apps node reschedule (a routine platform event) silently wiped every pairing —
