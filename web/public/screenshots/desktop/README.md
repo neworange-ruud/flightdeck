@@ -4,25 +4,25 @@ These images illustrate the desktop-app docs pages. Each file is referenced by
 name from the MDX under `web/docs/`, so **to update a screenshot, just replace
 the PNG in place with the same filename** — no doc edits needed.
 
-- `main-layout.png` is a **real** capture (the app's main screen).
-- Every other file is a **branded placeholder** (dark frame with a monitor
-  glyph). Replace each with a real capture when you can.
+**Every file here is now a real capture** — there are no placeholders left. Keep
+it that way when refreshing one: replace the PNG in place and match the existing
+look.
 
-Aim for a window around **1137×822** (the ratio the placeholders and hero use)
-so mixed real/placeholder pages stay visually consistent. A dark terminal theme
-matches the docs best.
+Full-window captures are **1303×757**; the three cropped ones (`config-manager`,
+`child-terminals`, `multiple-projects`) are tight crops of just their region. A
+dark terminal theme matches the docs best.
 
-## What to capture
+## What each file shows
 
 | File | Page | Capture |
 | --- | --- | --- |
-| `main-layout.png` | Overview, Interface | ✅ Already provided — the main screen: logo header, project tabs, Agents sidebar with live status, active agent terminal, Git info bar, status bar. |
+| `main-layout.png` | Overview, Interface | The main screen: logo header, project tabs, Agents sidebar with live status, active agent terminal, Git info bar, status bar. |
 | `new-tab-agent-menu.png` | Agent Tabs & Worktrees | The agent picker shown after `Ctrl-n` (choose which configured agent to launch). |
 | `command-palette.png` | The Interface | The command palette open (`Ctrl-g`), showing the searchable action list. |
-| `config-manager.png` | Configuration | The configuration manager (palette → *Open Configuration*), showing settings with their origin labels and the Global/Project header. |
-| `git-status.png` | Git Workflow | The *Show Git Status* panel — ideally a worktree that has been pushed so the PR compare URL is visible. |
-| `multiple-projects.png` | Multiple Projects | The project tab row with several projects open, showing mixed status dots (red/cyan/dim). |
-| `child-terminals.png` | Terminals & Split View | An agent tab with the terminal tab row showing `agent | shell 1 | shell 2` and the `+ agent` / `+ shell` buttons. |
+| `config-manager.png` | Configuration | The configuration manager (palette → *Open Configuration*), showing settings with their origin labels and the Global/Project header. Cropped to the panel. |
+| `git-status.png` | Git Workflow, Remote Control | The *Show Git Status* panel on a pushed worktree, so the PR compare URL is visible. |
+| `multiple-projects.png` | Multiple Projects | The project tab row with several projects open and their status dots. Cropped to the row. |
+| `child-terminals.png` | Terminals & Split View | The terminal tab row (`agent | shell 1 | shell 2 | shell 3`) above a live shell. Cropped to the row. |
 | `split-view.png` | Terminals & Split View | Split view (`Ctrl-b`): the agent terminal and a shell side by side. |
 
 
