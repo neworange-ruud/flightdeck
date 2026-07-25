@@ -61,9 +61,11 @@ struct StaleBanner: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     ZStack(alignment: .top) {
         Theme.bgDeep.ignoresSafeArea()
         StaleBanner()
     }
 }
+#endif

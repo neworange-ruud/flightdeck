@@ -265,6 +265,7 @@ struct SessionsListView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     NavigationStack {
         SessionsListView(
@@ -281,3 +282,4 @@ struct SessionsListView: View {
         )
     }
 }
+#endif

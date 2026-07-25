@@ -308,6 +308,7 @@ struct FeedView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     let pairingStore = PairingStore()
     let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: pairingStore)
@@ -322,3 +323,4 @@ struct FeedView: View {
         )
     }
 }
+#endif

@@ -290,6 +290,7 @@ struct ReconnectingBanner: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     ZStack(alignment: .top) {
         Theme.bgDeep.ignoresSafeArea()
@@ -299,3 +300,4 @@ struct ReconnectingBanner: View {
         )
     }
 }
+#endif

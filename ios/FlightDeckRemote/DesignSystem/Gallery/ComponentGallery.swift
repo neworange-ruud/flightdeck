@@ -277,6 +277,8 @@ private struct GalleryFlow: Layout {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     ComponentGallery()
 }
+#endif

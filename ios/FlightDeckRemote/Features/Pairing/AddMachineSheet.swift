@@ -48,6 +48,8 @@ struct AddMachineSheet: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     AddMachineSheet(pairingStore: PairingStore())
 }
+#endif

@@ -61,6 +61,7 @@ extension ButtonStyle where Self == CardButtonStyle {
     static var card: CardButtonStyle { CardButtonStyle() }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack(spacing: 16) {
         VStack(alignment: .leading, spacing: 4) {
@@ -86,3 +87,4 @@ extension ButtonStyle where Self == CardButtonStyle {
     .padding(24)
     .background(Theme.bgDeep)
 }
+#endif

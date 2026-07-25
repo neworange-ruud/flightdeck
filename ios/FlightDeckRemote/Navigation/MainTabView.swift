@@ -449,6 +449,8 @@ struct MainTabView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     MainTabView(router: AppRouter(pairingStore: PairingStore()))
 }
+#endif

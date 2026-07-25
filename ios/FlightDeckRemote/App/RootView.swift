@@ -68,6 +68,8 @@ struct RootView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview("Pairing") {
     RootView(router: AppRouter(pairingStore: PairingStore()))
 }
+#endif

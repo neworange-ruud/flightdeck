@@ -87,6 +87,7 @@ struct AppLockView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview("Locked") {
     AppLockView(appLock: AppLockController(
         settings: PreviewLockedSettingsProvider(),
@@ -100,3 +101,4 @@ private struct PreviewLockedSettingsProvider: AppLockSettingsProviding {
     func loadIsLockEnabled() -> Bool { true }
     func saveIsLockEnabled(_ isEnabled: Bool) {}
 }
+#endif

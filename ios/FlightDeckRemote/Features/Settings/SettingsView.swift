@@ -616,6 +616,7 @@ struct SettingsView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     let router = AppRouter(pairingStore: PairingStore())
     router.pairingStore.completePairing(
@@ -633,3 +634,4 @@ struct SettingsView: View {
         speechLanguage: SpeechLanguagePreference())
         .environment(AppLockController())
 }
+#endif
