@@ -8,6 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Remote: start a new agent on any paired machine.** The New-Agent sheet's
+  project picker only ever listed projects from a single machine, so a session
+  could only be launched on that one Mac — every project on your other paired
+  machines was silently unreachable. The picker now aggregates projects across
+  every paired machine (matching the Projects tab), tags each with a
+  machine-name indicator so same-named projects stay distinguishable, and routes
+  the launch — and the commands-paused gate — to the selected project's own
+  machine (remote-control-cyj).
 - **Remote: choose the dictation input language.** The push-to-talk mic in
   chat used to transcribe in whatever language the phone's locale implied
   (English for most users). Settings → Voice now offers an explicit language

@@ -21,6 +21,32 @@
 
 import SwiftUI
 
+// MARK: - Aggregated project option (one project on one machine)
+
+/// One selectable project in the New-Agent picker, tagged with the machine
+/// (pairing) it lives on so the launch command routes to that machine's store
+/// (remote-control-cyj). Aggregating across every paired machine mirrors the
+/// Projects tab (remote-control-aj2), which otherwise silently hid every
+/// project on all but one machine. `pairingId == nil` / `machineName == nil` in
+/// the single-store fallback (no coordinator handles — previews, UI-test
+/// fixtures, an unpaired device), where there is only ever one machine to pick.
+struct NewAgentProjectOption: Identifiable {
+    /// The pairing this project belongs to (`nil` in the single-store fallback).
+    let pairingId: String?
+    /// The resolved machine chip label (override > desktop-reported > fallback),
+    /// or `nil` when there is only one machine and no indicator is needed.
+    let machineName: String?
+    let project: Wire.ProjectState
+    /// The transport to send this project's `new_agent` command through.
+    let store: TransportStore
+    /// The base branch to default to for this project (its machine's git status,
+    /// else `main`).
+    let defaultBaseBranch: String
+
+    /// Stable across machines even when two machines share a project id.
+    var id: String { (pairingId ?? "-") + "\u{1f}" + project.projectId.rawValue }
+}
+
 // MARK: - Form model (pure state + validation, unit-tested)
 
 @MainActor
@@ -31,6 +57,11 @@ final class NewAgentFormModel {
     var baseBranch: String = "main"
     var firstTask: String = ""
     var selectedProjectId: Wire.ProjectId?
+    /// The pairing of the selected project (remote-control-cyj): projects are
+    /// aggregated across machines, so a project id alone no longer identifies a
+    /// selection — the machine it lives on picks the store the launch routes to.
+    /// `nil` in the single-store fallback (only one machine to launch on).
+    var selectedPairingId: String?
 
     /// The desktop's slug for the typed name (worktree + branch leaf).
     var slug: String { BranchSlug.slugify(name) }
@@ -75,6 +106,9 @@ final class NewAgentFormModel {
     /// Seed defaults from the live snapshot: select the first project (when
     /// none picked yet) and default the base branch to the selected project's
     /// known base (from any session's git status detail), else keep `main`.
+    ///
+    /// Single-store path (previews, UI-test fixtures, unpaired device). The
+    /// multi-machine path is `applyDefaults(options:)`.
     func applyDefaults(snapshot: Wire.StateSnapshot?,
                        gitStatus: [Wire.SessionId: Wire.GitStatusDetail]) {
         if selectedProjectId == nil {
@@ -83,12 +117,37 @@ final class NewAgentFormModel {
         guard let projectId = selectedProjectId,
               let project = snapshot?.projects.first(where: { $0.projectId == projectId })
         else { return }
+        baseBranch = Self.defaultBaseBranch(project: project, gitStatus: gitStatus)
+    }
+
+    /// Seed defaults across projects aggregated from every paired machine
+    /// (remote-control-cyj): select the first option (project+machine) when none
+    /// is picked yet, then adopt the selected option's known base branch. Keeps
+    /// an explicit selection (matched by BOTH project id and pairing, since a
+    /// project id can repeat across machines).
+    func applyDefaults(options: [NewAgentProjectOption]) {
+        if selectedProjectId == nil, let first = options.first {
+            selectedProjectId = first.project.projectId
+            selectedPairingId = first.pairingId
+        }
+        guard let option = options.first(where: {
+            $0.project.projectId == selectedProjectId && $0.pairingId == selectedPairingId
+        }) else { return }
+        baseBranch = option.defaultBaseBranch
+    }
+
+    /// The base branch to default to for `project`: the first non-empty
+    /// `baseBranch` across its sessions' git status details, else `main`.
+    static func defaultBaseBranch(
+        project: Wire.ProjectState,
+        gitStatus: [Wire.SessionId: Wire.GitStatusDetail]
+    ) -> String {
         for session in project.sessions {
             if let base = gitStatus[session.sessionId]?.baseBranch, !base.isEmpty {
-                baseBranch = base
-                return
+                return base
             }
         }
+        return "main"
     }
 }
 
@@ -96,27 +155,67 @@ final class NewAgentFormModel {
 
 struct NewAgentView: View {
     private let store: TransportStore?
+    /// When set with live handles, the picker AGGREGATES projects across every
+    /// paired machine (remote-control-cyj) and the launch routes to the selected
+    /// project's own machine — otherwise New-Agent could only ever create on one
+    /// machine, silently hiding every project on all the others. `nil` in
+    /// previews/tests keeps the simple single-`store` behaviour.
+    private let coordinator: TransportCoordinator?
+    /// Resolves each machine's display name (override > desktop > fallback) for
+    /// the per-project machine indicator; `nil` falls back to each handle's own
+    /// `instance.displayName`.
+    private let pairingStore: PairingStore?
 
     @Environment(\.dismiss) private var dismiss
-    @State private var model = NewAgentFormModel()
+    @State private var model: NewAgentFormModel
     @State private var gate: CommandsPausedGate
     @State private var runner: CommandRunner
     @FocusState private var isTaskFocused: Bool
 
-    init(store: TransportStore? = nil) {
+    init(store: TransportStore? = nil,
+         coordinator: TransportCoordinator? = nil,
+         pairingStore: PairingStore? = nil) {
         self.store = store
-        let source: any ConnectionStatusSource = store ?? NewAgentFallbackConnectionSource()
-        let gate = CommandsPausedGate(source: source)
+        self.coordinator = coordinator
+        self.pairingStore = pairingStore
+
+        let model = NewAgentFormModel()
+        _model = State(initialValue: model)
+
+        // Resolve the transport for the currently-selected project's machine.
+        // Aggregating (live handles) → the selected pairing's store, else the
+        // live primary; otherwise the single `store`. Reads observable state
+        // (`handles`, `selectedPairingId`, each store's `linkState`), so the
+        // gate/runner below re-evaluate as the selection or a link changes.
+        let resolveStore: @MainActor () -> TransportStore? = {
+            if let coordinator, !coordinator.handles.isEmpty {
+                if let pairingId = model.selectedPairingId,
+                   let selected = coordinator.store(for: pairingId) {
+                    return selected
+                }
+                return coordinator.primaryStore
+            }
+            return store
+        }
+
+        let source: any ConnectionStatusSource
         let sender: any ControlCommandSending
-        if let store {
-            sender = store
+        if coordinator != nil || store != nil {
+            source = ResolvingConnectionSource(
+                resolve: resolveStore,
+                fallback: store ?? NewAgentFallbackConnectionSource())
+            sender = ResolvingControlCommandSender(
+                resolve: resolveStore,
+                fallback: store ?? UnavailableControlCommandSender())
         } else {
+            source = NewAgentFallbackConnectionSource()
             #if DEBUG
             sender = ScriptedControlCommandSender()
             #else
             sender = UnavailableControlCommandSender()
             #endif
         }
+        let gate = CommandsPausedGate(source: source)
         _gate = State(initialValue: gate)
         _runner = State(initialValue: CommandRunner(sender: sender,
                                                     isPaused: { gate.commandsPaused }))
@@ -124,12 +223,61 @@ struct NewAgentView: View {
 
     private var commandsPaused: Bool { gate.commandsPaused }
 
-    private var projects: [Wire.ProjectState] {
-        store?.snapshot?.projects ?? []
+    /// Every selectable project, aggregated across paired machines when a
+    /// coordinator with live handles is present (remote-control-cyj), otherwise
+    /// the single `store`'s projects. Each option carries the machine it belongs
+    /// to so a launch routes to that machine's transport.
+    private var projectOptions: [NewAgentProjectOption] {
+        if let coordinator, !coordinator.handles.isEmpty {
+            let multipleMachines = coordinator.handles.count > 1
+            return coordinator.handles.flatMap { handle in
+                (handle.store.snapshot?.projects ?? []).map { project in
+                    NewAgentProjectOption(
+                        pairingId: handle.pairingId,
+                        machineName: multipleMachines ? machineName(for: handle) : nil,
+                        project: project,
+                        store: handle.store,
+                        defaultBaseBranch: NewAgentFormModel.defaultBaseBranch(
+                            project: project, gitStatus: handle.store.gitStatus))
+                }
+            }
+        }
+        guard let store else { return [] }
+        return (store.snapshot?.projects ?? []).map { project in
+            NewAgentProjectOption(
+                pairingId: nil, machineName: nil, project: project, store: store,
+                defaultBaseBranch: NewAgentFormModel.defaultBaseBranch(
+                    project: project, gitStatus: store.gitStatus))
+        }
     }
 
-    private var selectedProject: Wire.ProjectState? {
-        projects.first { $0.projectId == model.selectedProjectId }
+    private var selectedOption: NewAgentProjectOption? {
+        projectOptions.first {
+            $0.project.projectId == model.selectedProjectId
+                && $0.pairingId == model.selectedPairingId
+        }
+    }
+
+    /// The machine label for a handle: the live `PairingStore` name (override >
+    /// desktop-reported > fallback) when available, else the handle's own
+    /// instance name — matching the feed's chip resolution.
+    private func machineName(for handle: TransportCoordinator.ClientHandle) -> String {
+        if let pairingStore,
+           let instance = pairingStore.instances.first(where: { $0.pairingId == handle.pairingId }) {
+            return instance.displayName
+        }
+        return handle.instance.displayName
+    }
+
+    /// Re-seed defaults from the current source (aggregated when a coordinator
+    /// with handles is present, else the single store).
+    private func applyDefaults() {
+        if let coordinator, !coordinator.handles.isEmpty {
+            model.applyDefaults(options: projectOptions)
+        } else {
+            model.applyDefaults(snapshot: store?.snapshot,
+                                gitStatus: store?.gitStatus ?? [:])
+        }
     }
 
     private var isInFlight: Bool { runner.phase == .inFlight }
@@ -146,7 +294,7 @@ struct NewAgentView: View {
                             .accessibilityIdentifier("new-agent-paused-label")
                     }
 
-                    if projects.count > 1 { projectPicker }
+                    if projectOptions.count > 1 { projectPicker }
 
                     field(label: "Agent") { agentTypePicker }
                     field(label: "Session name") { nameField }
@@ -169,10 +317,7 @@ struct NewAgentView: View {
         .background(Theme.bgDeep)
         .presentationDragIndicator(.visible)
         .presentationBackground(Theme.bgDeep)
-        .onAppear {
-            model.applyDefaults(snapshot: store?.snapshot,
-                                gitStatus: store?.gitStatus ?? [:])
-        }
+        .onAppear { applyDefaults() }
         .onChange(of: runner.phase) { _, phase in
             // `accepted`/`applied` = creation started on the desktop (async):
             // show "Launching…" briefly, then dismiss — the session arrives
@@ -220,18 +365,34 @@ struct NewAgentView: View {
     private var projectPicker: some View {
         field(label: "Project") {
             Menu {
-                ForEach(projects, id: \.projectId) { project in
-                    Button(project.name) {
-                        model.selectedProjectId = project.projectId
-                        model.applyDefaults(snapshot: store?.snapshot,
-                                            gitStatus: store?.gitStatus ?? [:])
+                ForEach(projectOptions) { option in
+                    Button {
+                        model.selectedProjectId = option.project.projectId
+                        model.selectedPairingId = option.pairingId
+                        applyDefaults()
+                    } label: {
+                        // A machine-qualified label so two machines' same-named
+                        // projects stay distinguishable in the menu (cyj).
+                        if let machine = option.machineName {
+                            Text("\(option.project.name) — \(machine)")
+                        } else {
+                            Text(option.project.name)
+                        }
                     }
                 }
             } label: {
                 HStack {
-                    Text(selectedProject?.name ?? "Choose a project")
-                        .typography(Typography.body)
-                        .foregroundStyle(Theme.textPrimary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(selectedOption?.project.name ?? "Choose a project")
+                            .typography(Typography.body)
+                            .foregroundStyle(Theme.textPrimary)
+                        if let machine = selectedOption?.machineName {
+                            Text(machine)
+                                .typography(Typography.caption)
+                                .foregroundStyle(Theme.textDim)
+                                .accessibilityIdentifier("new-agent-project-machine")
+                        }
+                    }
                     Spacer(minLength: Theme.Spacing.sm)
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 12, weight: .semibold))
@@ -429,6 +590,49 @@ struct NewAgentView: View {
 private final class NewAgentFallbackConnectionSource: ConnectionStatusSource {
     var linkState: RemoteLinkState = .disconnected
     var peerConnected: Bool?
+}
+
+/// A `ConnectionStatusSource` that reads the link of whichever machine is
+/// currently selected (remote-control-cyj): the commands-paused gate must
+/// reflect the SELECTED project's machine, not a fixed one, so switching to an
+/// offline machine pauses the launch honestly. Reads observable state on each
+/// access, so the gate re-evaluates as the selection or a link changes; falls
+/// back when no machine resolves yet.
+@MainActor
+private final class ResolvingConnectionSource: ConnectionStatusSource {
+    private let resolve: @MainActor () -> TransportStore?
+    private let fallback: any ConnectionStatusSource
+
+    init(resolve: @escaping @MainActor () -> TransportStore?,
+         fallback: any ConnectionStatusSource) {
+        self.resolve = resolve
+        self.fallback = fallback
+    }
+
+    var linkState: RemoteLinkState { (resolve() ?? fallback).linkState }
+    var peerConnected: Bool? { (resolve() ?? fallback).peerConnected }
+}
+
+/// A `ControlCommandSending` that forwards each send to the SELECTED project's
+/// machine (remote-control-cyj), so a `new_agent` is created on the machine the
+/// chosen project lives on rather than always the primary one. Falls back when
+/// no machine resolves (nothing paired / no selection yet).
+@MainActor
+private final class ResolvingControlCommandSender: ControlCommandSending {
+    private let resolve: @MainActor () -> TransportStore?
+    private let fallback: any ControlCommandSending
+
+    init(resolve: @escaping @MainActor () -> TransportStore?,
+         fallback: any ControlCommandSending) {
+        self.resolve = resolve
+        self.fallback = fallback
+    }
+
+    @discardableResult
+    func sendControlCommand(_ body: Wire.CommandBody,
+                            commandId: Wire.CommandId?) -> CommandHandle {
+        (resolve() ?? fallback).sendControlCommand(body, commandId: commandId)
+    }
 }
 
 #if DEBUG

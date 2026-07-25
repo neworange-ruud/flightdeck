@@ -158,10 +158,14 @@ struct MainTabView: View {
             }
             .background(Theme.bgDeep)
             .sheet(isPresented: $isPresentingNewAgentSheet) {
-                // Target the live instance (see `primaryStore`), not the frozen
-                // init-time capture, so a new agent is created on a connected
-                // desktop rather than a stuck/orphaned pairing (remote-control-aj2).
-                NewAgentView(store: coordinator.primaryStore)
+                // Aggregate projects across EVERY paired machine and route the
+                // launch to the selected project's own machine (remote-control-cyj),
+                // instead of only ever creating on the primary. `store` stays the
+                // live primary (see `primaryStore`) for the single-machine fallback
+                // and the connection-source seed.
+                NewAgentView(store: coordinator.primaryStore,
+                             coordinator: coordinator,
+                             pairingStore: router.pairingStore)
             }
             .onChange(of: transportStore.agentEvents) { _, newEvents in
                 // Unread is folded in reactively across EVERY machine by
