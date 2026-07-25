@@ -87,8 +87,10 @@ fn relay_boots_and_healthz_ok() {
 /// A fully paired harness: real relay + real desktop-in-PTY + paired phone
 /// driver, plus the fixture repo path and the temp dirs that must stay alive.
 struct Harness {
-    /// Held only for its kill-on-drop lifetime; the phone talks to it by URL.
-    _relay: RelayHandle,
+    /// Kept alive for the whole test (kill-on-drop). The phone talks to it by
+    /// URL; the relay-restart test also drives it directly to simulate a
+    /// redeploy, so this is not an `_`-prefixed lifetime-only field.
+    relay: RelayHandle,
     /// Held only for its kill-on-drop lifetime (the real desktop under a PTY).
     _desktop: DesktopHandle,
     phone: PhoneDriver,
@@ -101,7 +103,18 @@ impl Harness {
     /// Stand up relay → fixture → desktop, wait for the pairing code to render,
     /// then pair the phone. Panics with a descriptive message on any failure.
     fn boot() -> Self {
-        let relay = RelayHandle::spawn();
+        Self::boot_with(RelayHandle::spawn())
+    }
+
+    /// Like [`Self::boot`] but on a relay running the **persistent** SQLite store
+    /// — the hosted relay's configuration, and the prerequisite for restarting it
+    /// mid-pairing without losing the pairing itself.
+    fn boot_persistent() -> Self {
+        Self::boot_with(RelayHandle::spawn_persistent())
+    }
+
+    /// Shared boot path against an already-running `relay`.
+    fn boot_with(relay: RelayHandle) -> Self {
         let (fixture, fixture_dir) = make_fixture(relay.port());
         let mut desktop = DesktopHandle::spawn(&fixture);
 
@@ -120,7 +133,7 @@ impl Harness {
         let phone = PhoneDriver::pair(&relay.ws_url(), CLAIM_TOKEN);
 
         Harness {
-            _relay: relay,
+            relay,
             _desktop: desktop,
             phone,
             fixture,
@@ -835,4 +848,202 @@ fn remote_capabilities_end_to_end() {
 
     // Clean teardown (explicit for clarity; Drop does this anyway).
     drop(h);
+}
+
+// ===========================================================================
+// Relay restart / redeploy — desktop->phone delivery must resume
+// (remote-control-bbf).
+// ===========================================================================
+
+/// Budget for the desktop to notice a dead relay, reconnect, and resume feeding
+/// the phone. The client reconnects with exponential backoff + jitter (1s..60s);
+/// a session that stayed up for `MIN_STABLE_SESSION` resets the backoff to its
+/// ~1s base, which [`settle_for_stable_session`] guarantees. Generous anyway, so
+/// an unlucky backoff can't flake the suite.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The desktop client only resets its reconnect backoff after a session that
+/// stayed authenticated for at least its `MIN_STABLE_SESSION` (10s, see
+/// `src/remote/client.rs`). Sleeping past that before killing the relay keeps the
+/// post-restart reconnect at the ~1s base delay instead of a multi-second
+/// backoff, which keeps these tests fast and their timeouts meaningful.
+const STABLE_SESSION_SETTLE: Duration = Duration::from_secs(12);
+
+/// Hold the pairing open long enough that the desktop's current relay session
+/// counts as "stable" (see [`STABLE_SESSION_SETTLE`]), keeping the feed busy
+/// meanwhile so both directions stay warm.
+fn settle_for_stable_session(phone: &mut PhoneDriver) {
+    let deadline = Instant::now() + STABLE_SESSION_SETTLE;
+    while Instant::now() < deadline {
+        let _ = request_snapshot(phone, ACK_TIMEOUT);
+        sleep(POLL);
+    }
+}
+
+/// A relay restart with the **persistent** store: pairings, claim state and the
+/// per-stream seq high-water marks all survive, so the desktop simply reconnects
+/// and the phone keeps receiving. This is the deployed configuration
+/// (remote-control-vp2), and the regression guard for the reported symptom —
+/// "phone prompt executes on the desktop but nothing ever comes back to the
+/// phone" after the hosted relay was rescheduled (remote-control-bbf).
+#[test]
+fn relay_restart_resumes_desktop_to_phone_delivery() {
+    let mut h = Harness::boot_persistent();
+
+    // Warm both directions and drive all three seq cursors above zero.
+    let snap = request_snapshot(&mut h.phone, ACK_TIMEOUT);
+    let _project = only_project_id(&snap);
+    settle_for_stable_session(&mut h.phone);
+
+    let cursor_before = h.phone.last_received_seq();
+    assert!(
+        cursor_before > 0,
+        "phone should hold a non-zero receive cursor before the restart, \
+         otherwise the test cannot detect a seq divergence"
+    );
+
+    // --- The redeploy: same port, same database, brand-new process. ---
+    h.relay.restart();
+    // The phone's socket died with the old process; a real phone reconnects and
+    // resumes from its persisted cursor.
+    h.phone.reconnect();
+
+    // The load-bearing assertion: a phone command reaches the desktop AND the
+    // desktop's reply reaches the phone. Both legs must survive the restart —
+    // the reported bug had inbound working while the feed stalled forever.
+    let snap_after = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_after.projects.len(),
+        1,
+        "post-restart snapshot should still describe the fixture project: {snap_after:?}"
+    );
+
+    // Delivery must keep flowing, not just produce one lucky replayed frame: a
+    // second round trip has to complete on the post-restart connection too.
+    let snap_again = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_again.projects.len(),
+        1,
+        "a second post-restart snapshot request should also be answered: {snap_again:?}"
+    );
+
+    // With nothing lost on the relay side, the stream continues monotonically:
+    // the cursor advanced and no stream reset was needed.
+    assert!(
+        h.phone.last_received_seq() > cursor_before,
+        "phone receive cursor should have advanced past {cursor_before} after the restart, \
+         got {}",
+        h.phone.last_received_seq()
+    );
+    assert_eq!(
+        h.phone.stream_resets(),
+        0,
+        "a persistent-store restart preserves the relay's seq watermark, so the desktop \
+         should never have had to restart its outbound stream"
+    );
+
+    drop(h);
+}
+
+/// The original failure mechanism, reproduced end-to-end: the relay comes back up
+/// still knowing the pairing but having **lost the desktop->phone stream's seq
+/// watermark**. The desktop's next envelope is then non-monotonic from the
+/// relay's point of view, which used to be a fatal `bad_frame` reconnect loop
+/// with the feed stalled forever (remote-control-bbf).
+///
+/// Recovery now spans all three tiers, and this test exercises them together:
+/// the relay reports `seq_violation` instead of a fatal frame error, the desktop
+/// treats it as a resync (zeroing its outbound cursor and re-sending a full
+/// snapshot from seq 1 rather than tearing down), and the phone accepts that
+/// seq-1 envelope as a stream reset instead of dropping it as a duplicate of a
+/// seq it has already seen.
+#[test]
+fn relay_losing_desktop_stream_seq_state_recovers_via_stream_reset() {
+    let mut h = Harness::boot_persistent();
+
+    let snap = request_snapshot(&mut h.phone, ACK_TIMEOUT);
+    let _project = only_project_id(&snap);
+    settle_for_stable_session(&mut h.phone);
+
+    let cursor_before = h.phone.last_received_seq();
+    assert!(
+        cursor_before > 1,
+        "the phone must be well past seq 1 before the restart, or accepting a seq-1 \
+         reset afterwards would prove nothing; cursor = {cursor_before}"
+    );
+
+    // --- The redeploy that loses *part* of its state. ---
+    // Stop the relay first: the store opens its database with the no-locking
+    // `unix-none` VFS, so editing it while the relay runs is unsafe.
+    h.relay.stop();
+    let wiped = wipe_desktop_stream_seq_state(h.relay.db_path());
+    assert!(
+        wiped > 0,
+        "expected to wipe at least one desktop->phone queue stream row; if this is 0 the \
+         schema or the sender tag changed and this test is no longer reproducing the bug \
+         (see remote/relay/src/store/sqlite.rs)"
+    );
+    h.relay.restart();
+    h.phone.reconnect();
+
+    // Despite the divergence, the feed must come back: the desktop resyncs from
+    // seq 1 and the phone accepts the reset.
+    let snap_after = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_after.projects.len(),
+        1,
+        "post-resync snapshot should still describe the fixture project: {snap_after:?}"
+    );
+    assert!(
+        h.phone.stream_resets() > 0,
+        "the desktop should have restarted its outbound stream from seq 1 (and the phone \
+         accepted it) — without that, recovery happened by some other route and the \
+         seq-divergence path is untested"
+    );
+
+    // And it must keep flowing on the fresh stream epoch, not stall after the
+    // single reset frame.
+    let epoch_cursor = h.phone.last_received_seq();
+    let snap_again = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_again.projects.len(),
+        1,
+        "the feed must keep delivering after the stream reset: {snap_again:?}"
+    );
+    assert!(
+        h.phone.last_received_seq() > epoch_cursor,
+        "the reset stream must advance monotonically from its new epoch \
+         (cursor was {epoch_cursor}, now {})",
+        h.phone.last_received_seq()
+    );
+
+    drop(h);
+}
+
+/// Delete the relay's persisted **desktop->phone** stream state (its seq
+/// high-water mark, ack cursor, and any buffered envelopes) from a stopped
+/// relay's SQLite store, leaving the pairing itself and the phone->desktop
+/// stream intact. Returns the number of `queue_streams` rows removed.
+///
+/// This reproduces exactly the asymmetry reported in remote-control-bbf — the
+/// desktop's outbound cursor diverges from the relay's while inbound keeps
+/// working. `sender = 0` is the desktop direction; see `sender_tag` in
+/// `remote/relay/src/store/sqlite.rs` (the caller asserts the delete matched
+/// rows, so a change to that mapping fails the test loudly).
+fn wipe_desktop_stream_seq_state(db: &Path) -> usize {
+    const DESKTOP_SENDER_TAG: i64 = 0;
+    let conn = rusqlite::Connection::open(db)
+        .unwrap_or_else(|e| panic!("open the relay's sqlite store at {}: {e}", db.display()));
+    let streams = conn
+        .execute(
+            "DELETE FROM queue_streams WHERE sender = ?1",
+            [DESKTOP_SENDER_TAG],
+        )
+        .expect("delete desktop queue_streams rows");
+    conn.execute(
+        "DELETE FROM queue_envelopes WHERE sender = ?1",
+        [DESKTOP_SENDER_TAG],
+    )
+    .expect("delete desktop queue_envelopes rows");
+    streams
 }

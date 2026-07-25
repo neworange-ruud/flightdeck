@@ -207,6 +207,25 @@ pub struct PhoneDriver {
     next_seq: u64,
     /// Monotonic counter behind the auto-generated command ids.
     next_command: u64,
+    /// Relay URL this driver paired against, so [`Self::reconnect`] can dial the
+    /// same relay again after it restarts.
+    relay_ws_url: String,
+    /// The relay-auth signing key, retained so a reconnect can answer a fresh
+    /// `auth_challenge` without re-pairing (the iOS Secure-Enclave key equivalent).
+    identity: SigningKey,
+    /// This driver's device id, presented on every (re)connect.
+    device_id: DeviceId,
+    /// Highest desktop->phone `seq` accepted so far — the driver's mirror of the
+    /// iOS `PairingRecord.lastReceivedSeq`, which is **persisted** on the phone
+    /// and therefore survives a reconnect. Sent as `resume.from_seq` and used to
+    /// dedup replays (spec §6.4).
+    last_received_seq: u64,
+    /// How many desktop **stream resets** this driver has accepted: an envelope
+    /// with `seq == 1` arriving while the cursor was already higher, i.e. the
+    /// desktop restarting its outbound stream after a relay seq divergence
+    /// (remote-control-bbf). Lets a test assert that recovery path actually ran
+    /// rather than inferring it from a cursor value that later traffic moves.
+    stream_resets: u32,
 }
 
 impl PhoneDriver {
@@ -283,7 +302,7 @@ impl PhoneDriver {
         // 3. auth_response over the challenge -> auth_ok (mirror authenticate).
         let signature: Signature = identity.sign(&nonce);
         conn.send(&RelayFrame::AuthResponse {
-            device_id,
+            device_id: device_id.clone(),
             signature: STANDARD.encode(signature.to_bytes()),
             pairing_ids: vec![pairing_id.clone()],
             machine_name: None,
@@ -318,12 +337,96 @@ impl PhoneDriver {
             pairing_id,
             next_seq: 1,
             next_command: 1,
+            relay_ws_url: relay_ws_url.to_string(),
+            identity,
+            device_id,
+            last_received_seq: 0,
+            stream_resets: 0,
         }
     }
 
     /// The pairing id shared with the desktop.
     pub fn pairing_id(&self) -> &PairingId {
         &self.pairing_id
+    }
+
+    /// Highest desktop->phone `seq` this driver has accepted. Mirrors the iOS
+    /// persisted receive cursor; a test uses it to assert the three seq cursors
+    /// (desktop out, relay high-water, phone in) stayed aligned.
+    pub fn last_received_seq(&self) -> u64 {
+        self.last_received_seq
+    }
+
+    /// How many desktop stream resets (see [`Self::stream_resets`]) this driver
+    /// has accepted.
+    pub fn stream_resets(&self) -> u32 {
+        self.stream_resets
+    }
+
+    /// Reconnect to the same relay on an **existing** pairing — the phone-side
+    /// resume path (no `pairing_claim`; the claim token is single-use and already
+    /// spent). Mirrors what the iOS `TransportClient` does after the socket drops
+    /// or the relay restarts: re-`hello`, re-sign a fresh `auth_challenge`,
+    /// re-activate the pairing via `auth_response.pairing_ids`, then ask the relay
+    /// to replay anything above the persisted receive cursor.
+    ///
+    /// The derived [`E2eChannel`], the outbound `seq`, and the receive cursor are
+    /// all retained across the reconnect — exactly the state that survives on a
+    /// real phone, and what makes a seq divergence observable if one occurs.
+    pub fn reconnect(&mut self) {
+        let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+        let mut conn = Conn::connect(&self.relay_ws_url);
+
+        conn.send(&RelayFrame::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            role: Role::Phone,
+            device_id: self.device_id.clone(),
+            client: ClientInfo {
+                app_version: "e2e-phone".into(),
+                platform: "test".into(),
+                os_version: None,
+            },
+            relay_password: None,
+        });
+        match conn.recv_expect(deadline, "hello_ok") {
+            RelayFrame::HelloOk {
+                protocol_version, ..
+            } => assert_eq!(protocol_version, PROTOCOL_VERSION, "negotiated version"),
+            other => panic!("expected hello_ok on reconnect, got {other:?}"),
+        }
+        let nonce = match conn.recv_expect(deadline, "auth_challenge") {
+            RelayFrame::AuthChallenge { nonce, .. } => STANDARD
+                .decode(&nonce)
+                .unwrap_or_else(|e| panic!("challenge nonce not base64: {e}")),
+            other => panic!("expected auth_challenge on reconnect, got {other:?}"),
+        };
+
+        let signature: Signature = self.identity.sign(&nonce);
+        conn.send(&RelayFrame::AuthResponse {
+            device_id: self.device_id.clone(),
+            signature: STANDARD.encode(signature.to_bytes()),
+            pairing_ids: vec![self.pairing_id.clone()],
+            machine_name: None,
+        });
+        match conn.recv_expect(deadline, "auth_ok") {
+            RelayFrame::AuthOk { pairing_ids } => assert!(
+                pairing_ids.contains(&self.pairing_id),
+                "auth_ok did not re-activate our pairing on reconnect (got {pairing_ids:?}) — \
+                 the relay lost the pairing across the restart"
+            ),
+            RelayFrame::Error { code, message, .. } => {
+                panic!("reconnect auth rejected: {code:?} — {message}")
+            }
+            other => panic!("expected auth_ok on reconnect, got {other:?}"),
+        }
+
+        // Replay anything the relay still holds above our persisted cursor.
+        conn.send(&RelayFrame::Resume {
+            pairing_id: self.pairing_id.clone(),
+            from_seq: self.last_received_seq,
+        });
+
+        self.conn = conn;
     }
 
     /// Seal and send a fully-formed [`PhoneCommand`]. The command's own
@@ -373,7 +476,27 @@ impl PhoneDriver {
                 .recv(deadline)
                 .expect("timed out waiting for a desktop envelope");
             match frame {
-                RelayFrame::Envelope(env) => return self.open(env),
+                RelayFrame::Envelope(env) => {
+                    // Mirror the iOS receive gate (`TransportClient.handleEnvelope`)
+                    // so this driver drops and accepts exactly what a real phone
+                    // would: a strictly-newer `seq` is normal (§6.4 dedup), and a
+                    // `seq` of 1 while we already hold a higher cursor is the
+                    // desktop restarting its outbound stream after the relay lost
+                    // its seq watermark — accepted as a stream reset, which moves
+                    // the cursor backwards (remote-control-bbf). Anything else is a
+                    // duplicate/replay and is skipped without advancing.
+                    let is_reset = env.seq == 1 && self.last_received_seq >= 1;
+                    if env.seq <= self.last_received_seq && !is_reset {
+                        continue;
+                    }
+                    let seq = env.seq;
+                    let msg = self.open(env);
+                    self.last_received_seq = seq;
+                    if is_reset {
+                        self.stream_resets += 1;
+                    }
+                    return msg;
+                }
                 // Relay-plane acks/errors are not application messages; an
                 // error frame is worth surfacing loudly.
                 RelayFrame::Ack { .. } => {}
