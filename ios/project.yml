@@ -18,11 +18,19 @@ settings:
     SUPPORTS_MACCATALYST: NO
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
     ENABLE_PREVIEWS: YES
-    DEVELOPMENT_TEAM: ""
+    # DotTech Holding B.V. — the team that owns the
+    # agency.neworange.flightdeck.remote bundle id and the APNs auth key the
+    # relay signs with. A team id is not a secret (it ships inside every signed
+    # binary), so it is committed to keep archive builds reproducible on any
+    # machine or CI runner. Automatic signing lets Xcode mint the development or
+    # distribution certificate + profile it needs per configuration.
+    DEVELOPMENT_TEAM: "7NKCS4AZS9"
     CODE_SIGN_STYLE: Automatic
-    CODE_SIGNING_REQUIRED: NO
+    # Signing is left ENABLED here so `xcodebuild archive` produces a signed,
+    # uploadable app. The simulator test/build path opts out explicitly on the
+    # command line instead (`CODE_SIGNING_ALLOWED=NO`, see scripts/test.sh and
+    # the CI job), which keeps that path working without a certificate.
     CODE_SIGNING_ALLOWED: YES
-    CODE_SIGN_IDENTITY: ""
 
 packages:
   SwiftTerm:
@@ -39,12 +47,28 @@ targets:
         excludes:
           - "Info.plist"
           - "FlightDeckRemote.entitlements"
+          - "FlightDeckRemote-Release.entitlements"
     info:
       path: FlightDeckRemote/Info.plist
       properties:
         CFBundleDisplayName: "FlightDeck Remote"
-        CFBundleShortVersionString: "1.0"
+        # Marketing version tracks the FlightDeck release train (Cargo.toml's
+        # `version`); `scripts/release` rewrites both together so the phone and
+        # the desktop never claim different versions. Surfaced in Settings →
+        # About.
+        CFBundleShortVersionString: "1.11.0"
+        # Build number. Must strictly increase on EVERY App Store Connect
+        # upload, independently of the marketing version — reusing one is
+        # rejected. Bump this by hand per submitted build (or override it at
+        # archive time with `CURRENT_PROJECT_VERSION`); `scripts/release` resets
+        # it to 1 when the marketing version changes.
         CFBundleVersion: "1"
+        # Export compliance (App Store Connect asks on every upload until this
+        # is declared). All cryptography in the app is Apple's own CryptoKit
+        # (X25519, HKDF-SHA256, ChaCha20-Poly1305) — no proprietary or
+        # non-standard algorithms — which falls under the exemption for apps
+        # using only encryption provided by the operating system.
+        ITSAppUsesNonExemptEncryption: false
         # Hosted relay endpoint (remote-control-2mk). Committed here so the relay
         # address is a one-line plist edit, not a Swift source change. Read at
         # runtime via PairingDefaults.relayURL (Bundle.main). Points at the stable
@@ -91,11 +115,17 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_EMIT_LOC_STRINGS: YES
-        # APNs entitlement (aps-environment). Only consumed by the codesign step,
-        # which is skipped under CODE_SIGNING_ALLOWED=NO — so the unsigned
-        # simulator build stays green; a signed device build needs a
-        # DEVELOPMENT_TEAM (see ios/README / the report's manual-credential note).
-        CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
+      # APNs entitlement (aps-environment), per configuration. It must MATCH the
+      # environment the signing profile grants — development profiles grant
+      # `development`, App Store / TestFlight distribution profiles grant
+      # `production` — so Debug and Release cannot share one file. Only consumed
+      # by the codesign step, which is skipped under CODE_SIGNING_ALLOWED=NO, so
+      # the unsigned simulator build is unaffected either way.
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote-Release.entitlements
     dependencies:
       - package: SwiftTerm
     scheme:
