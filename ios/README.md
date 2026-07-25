@@ -26,7 +26,7 @@ xcodegen generate
 xcodebuild build \
   -project FlightDeckRemote.xcodeproj \
   -scheme FlightDeckRemote \
-  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.4' \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
   -derivedDataPath .derived \
   CODE_SIGNING_ALLOWED=NO
 ```
@@ -45,7 +45,7 @@ xcodegen generate
 xcodebuild test \
   -project FlightDeckRemote.xcodeproj \
   -scheme FlightDeckRemote \
-  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.4' \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
   -derivedDataPath .derived \
   -skipPackagePluginValidation \
   CODE_SIGNING_ALLOWED=NO
