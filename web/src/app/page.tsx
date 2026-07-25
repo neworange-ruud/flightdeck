@@ -14,6 +14,7 @@ const mono = JetBrains_Mono({
 const MONO = "var(--font-mono), monospace";
 const GITHUB_URL = "https://github.com/neworange-ruud/flightdeck";
 const DOCS_URL = "/docs";
+const PRIVACY_URL = "/privacy";
 
 export default function HomePage() {
   return (
@@ -546,6 +547,9 @@ export default function HomePage() {
           <a href={GITHUB_URL} style={{ color: "#8b98a8" }}>
             GitHub
           </a>
+          <Link href={PRIVACY_URL} style={{ color: "#8b98a8" }}>
+            Privacy
+          </Link>
         </div>
         <div style={{ fontFamily: MONO, fontSize: 11.5, color: "#4f6070" }}>
           MIT · macOS · Linux · Windows
