@@ -29,11 +29,7 @@ final class ChatComposeUITests: XCTestCase {
         app.launchArguments += ["-uitest-reset-pairing", "-uitest-fixture-transcript",
                                 "-uitest-linkstate", linkState]
         app.launch()
-        let toggle = element(app, "debug-toggle-paired-button")
-        XCTAssertTrue(toggle.waitForExistence(timeout: 5), "Expected the DEBUG pairing toggle")
-        toggle.tap()
-        XCTAssertTrue(element(app, "AgentChatView").waitForExistence(timeout: 5),
-                      "Expected the chat screen to auto-open")
+        crossIntoPairedApp(app, expecting: "AgentChatView")
         return app
     }
 
@@ -112,10 +108,7 @@ final class ChatComposeUITests: XCTestCase {
                                 "-uitest-linkstate", "connected:20",
                                 "-uitest-dictation-transcript", transcript]
         app.launch()
-        let toggle = element(app, "debug-toggle-paired-button")
-        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-        toggle.tap()
-        XCTAssertTrue(element(app, "AgentChatView").waitForExistence(timeout: 5))
+        crossIntoPairedApp(app, expecting: "AgentChatView")
         return app
     }
 
