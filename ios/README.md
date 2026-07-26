@@ -132,12 +132,24 @@ pass `FD_BUILD_NUMBER=n` to `scripts/archive.sh`.
 pushes a version tag, and the `TestFlight` workflow
 (`.github/workflows/ios-testflight.yml`) archives, signs, exports and uploads —
 the same trigger the relay and web deploys use, so the phone build never lags
-the desktop release. `CFBundleVersion` comes from the workflow run number, which
-is monotonic across the repository and therefore can never collide with a
-build number App Store Connect has already seen.
+the desktop release.
 
-To re-upload a tag that failed processing: Actions → TestFlight → Run workflow,
-with the tag as the ref.
+`CFBundleVersion` comes from `github.run_number`, which increments on every run
+of *this workflow* (it is per-workflow, not repository-wide) and so strictly
+increases as required. The one way to defeat it is to upload a build **by hand**
+that is numbered at or above the current run count — App Store Connect then
+accepts the transfer and silently discards it as a redundant binary, which
+looks exactly like a successful upload. If that happens, pass a higher number
+explicitly:
+
+```
+Actions → TestFlight → Run workflow → build_number: 42
+```
+
+To re-upload a tag that failed processing, run the workflow with that tag as the
+ref. Note that dispatching only works for refs that already contain this
+workflow file — GitHub reads the workflow definition from the target ref, so tags
+cut before it existed cannot be dispatched.
 
 Locally, the same script the workflow runs:
 
