@@ -21,6 +21,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY protocol/Cargo.toml protocol/Cargo.toml
 COPY relay/Cargo.toml relay/Cargo.toml
 
+# `apns-live` compiles in the real HTTP/2 APNs transport (and pulls in reqwest).
+# It is off by default so the crate builds and unit-tests without it, which means
+# the deployed image MUST opt in explicitly — without it the push sender is a
+# silent no-op and an offline phone is simply never woken. Both build invocations
+# need the same feature set or the second one recompiles from scratch, defeating
+# the dependency cache this two-pass structure exists for.
+#
 # Cargo needs *some* source present to resolve and build the workspace, even
 # for a dependencies-only pass. Stub it out, build once to warm the
 # dependency cache, then discard the stubs — real source replaces them below
@@ -29,7 +36,7 @@ RUN mkdir -p protocol/src relay/src \
     && echo "" > protocol/src/lib.rs \
     && echo "" > relay/src/lib.rs \
     && echo "fn main() {}" > relay/src/main.rs \
-    && cargo build --release --locked -p flightdeck-relay \
+    && cargo build --release --locked -p flightdeck-relay --features apns-live \
     && rm -rf protocol/src relay/src
 
 COPY protocol/src protocol/src
@@ -39,7 +46,7 @@ COPY relay/src relay/src
 # real source for the (older-content, but possibly same-or-newer-mtime) stubs
 # it already compiled.
 RUN touch protocol/src/lib.rs relay/src/lib.rs relay/src/main.rs \
-    && cargo build --release --locked -p flightdeck-relay
+    && cargo build --release --locked -p flightdeck-relay --features apns-live
 
 # --- Runtime ----------------------------------------------------------------
 # Distroless: no shell, no package manager, minimal attack surface. `:nonroot`

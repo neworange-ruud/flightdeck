@@ -74,27 +74,44 @@ impl std::fmt::Debug for ApnsConfig {
 
 impl ApnsConfig {
     /// Read the APNs config from the environment, returning `None` (push
-    /// disabled) unless *all* required pieces are present. The auth key is read
-    /// from the file named by `APNS_AUTH_KEY_PATH` (the `.p8` file). Missing or
-    /// unreadable pieces disable push rather than failing relay startup — the
-    /// relay still routes and queues; it just cannot wake an offline phone.
+    /// disabled) unless *all* required pieces are present. Missing or unreadable
+    /// pieces disable push rather than failing relay startup — the relay still
+    /// routes and queues; it just cannot wake an offline phone.
     ///
-    /// Required: `APNS_TEAM_ID`, `APNS_KEY_ID`, `APNS_TOPIC`,
-    /// `APNS_AUTH_KEY_PATH`. Optional: `APNS_ENVIRONMENT`
-    /// (`sandbox` | `production`, default `production`).
+    /// Required: `APNS_TEAM_ID`, `APNS_KEY_ID`, `APNS_TOPIC`, and the auth key
+    /// via **either** `APNS_AUTH_KEY_PEM` (the `.p8` contents inline) or
+    /// `APNS_AUTH_KEY_PATH` (a path to it). The inline form wins when both are
+    /// set: it is what a container platform can inject from a secret store
+    /// without also provisioning a volume, which is how the deployed relay is
+    /// configured. The path form stays for local runs, where the key is a file
+    /// on disk anyway.
+    ///
+    /// Optional: `APNS_ENVIRONMENT` (`sandbox` | `production`, default
+    /// `production`). Note this is only the fallback for tokens that arrive
+    /// without one — the phone reports its own environment per token, so a
+    /// Debug build and a TestFlight build are routed correctly regardless.
     pub fn from_env() -> Option<Self> {
-        let team_id = std::env::var("APNS_TEAM_ID")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let key_id = std::env::var("APNS_KEY_ID")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let topic = std::env::var("APNS_TOPIC").ok().filter(|s| !s.is_empty())?;
-        let path = std::env::var("APNS_AUTH_KEY_PATH")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let auth_key_pem = std::fs::read_to_string(&path).ok()?;
-        let default_environment = match std::env::var("APNS_ENVIRONMENT").ok().as_deref() {
+        Self::from_vars(|key| std::env::var(key).ok())
+    }
+
+    /// The body of [`Self::from_env`], with the environment lookup injected.
+    ///
+    /// Split out to be testable without mutating process environment, which is
+    /// global state shared by every test in the binary. Returning `None` here is
+    /// what silently disables push in production, so it is worth asserting
+    /// directly rather than inferring from a relay that simply never wakes a
+    /// phone.
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let non_empty = |key: &str| var(key).filter(|s| !s.trim().is_empty());
+
+        let team_id = non_empty("APNS_TEAM_ID")?;
+        let key_id = non_empty("APNS_KEY_ID")?;
+        let topic = non_empty("APNS_TOPIC")?;
+        let auth_key_pem = match non_empty("APNS_AUTH_KEY_PEM") {
+            Some(pem) => pem,
+            None => std::fs::read_to_string(non_empty("APNS_AUTH_KEY_PATH")?).ok()?,
+        };
+        let default_environment = match non_empty("APNS_ENVIRONMENT").as_deref() {
             Some(v) if v.eq_ignore_ascii_case("sandbox") => ApnsEnvironment::Sandbox,
             _ => ApnsEnvironment::Production,
         };
@@ -686,6 +703,132 @@ mod tests {
             default_environment: ApnsEnvironment::Production,
         };
         (config, verifying)
+    }
+
+    /// A complete, valid set of the variables the deployed relay injects.
+    fn full_vars() -> std::collections::HashMap<&'static str, &'static str> {
+        std::collections::HashMap::from([
+            ("APNS_TEAM_ID", "7NKCS4AZS9"),
+            ("APNS_KEY_ID", "DH74K2J4CN"),
+            ("APNS_TOPIC", "agency.neworange.flightdeck.remote"),
+            ("APNS_AUTH_KEY_PEM", "-----BEGIN PRIVATE KEY-----\nx\n"),
+        ])
+    }
+
+    fn from_map(
+        vars: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Option<ApnsConfig> {
+        ApnsConfig::from_vars(|key| vars.get(key).map(|v| (*v).to_string()))
+    }
+
+    /// The inline key is what the container platform injects from its secret
+    /// store; no file, no volume.
+    #[test]
+    fn config_reads_the_inline_auth_key() {
+        let config = from_map(&full_vars()).expect("complete config should enable push");
+        assert_eq!(config.team_id, "7NKCS4AZS9");
+        assert_eq!(config.key_id, "DH74K2J4CN");
+        assert_eq!(config.topic, "agency.neworange.flightdeck.remote");
+        assert!(config
+            .auth_key_pem
+            .starts_with("-----BEGIN PRIVATE KEY-----"));
+        // Unset APNS_ENVIRONMENT must mean production: a sandbox default would
+        // send TestFlight pushes to the wrong APNs host and fail as
+        // BadDeviceToken.
+        assert_eq!(config.default_environment, ApnsEnvironment::Production);
+    }
+
+    /// Each variable is individually load-bearing. Dropping any one disables
+    /// push *silently* — which is how the deployed relay ran without APNs
+    /// configured until 1.12.0 — so assert every one of them is required.
+    #[test]
+    fn config_requires_every_variable() {
+        for missing in ["APNS_TEAM_ID", "APNS_KEY_ID", "APNS_TOPIC"] {
+            let mut vars = full_vars();
+            vars.remove(missing);
+            assert!(
+                from_map(&vars).is_none(),
+                "push should be disabled when {missing} is unset"
+            );
+        }
+        // No key material at all, by either route.
+        let mut vars = full_vars();
+        vars.remove("APNS_AUTH_KEY_PEM");
+        assert!(
+            from_map(&vars).is_none(),
+            "push should be disabled with no auth key"
+        );
+    }
+
+    /// An empty or whitespace value is what an unset CI variable expands to, and
+    /// must be treated as absent rather than accepted as a blank credential.
+    #[test]
+    fn config_rejects_blank_values() {
+        for blank in ["", "   ", "\n"] {
+            let mut vars = full_vars();
+            vars.insert("APNS_KEY_ID", blank);
+            assert!(
+                from_map(&vars).is_none(),
+                "blank APNS_KEY_ID ({blank:?}) should disable push"
+            );
+        }
+    }
+
+    #[test]
+    fn config_honours_sandbox_environment_override() {
+        let mut vars = full_vars();
+        vars.insert("APNS_ENVIRONMENT", "SandBox");
+        let config = from_map(&vars).expect("config should still be complete");
+        assert_eq!(config.default_environment, ApnsEnvironment::Sandbox);
+    }
+
+    /// The path form has to keep working for local runs, where the `.p8` is a
+    /// file on disk. A path that does not exist disables push rather than
+    /// panicking at startup.
+    #[test]
+    fn config_falls_back_to_the_key_path() {
+        let dir = std::env::temp_dir().join(format!("fd-apns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("AuthKey_TEST.p8");
+        std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\nfile\n").unwrap();
+
+        let mut vars = full_vars();
+        vars.remove("APNS_AUTH_KEY_PEM");
+        let path = key.to_str().unwrap().to_string();
+        let config = ApnsConfig::from_vars(|k| {
+            if k == "APNS_AUTH_KEY_PATH" {
+                Some(path.clone())
+            } else {
+                vars.get(k).map(|v| (*v).to_string())
+            }
+        })
+        .expect("a readable key path should enable push");
+        assert!(config.auth_key_pem.contains("file"));
+
+        let missing = dir.join("nope.p8").to_str().unwrap().to_string();
+        assert!(
+            ApnsConfig::from_vars(|k| {
+                if k == "APNS_AUTH_KEY_PATH" {
+                    Some(missing.clone())
+                } else {
+                    vars.get(k).map(|v| (*v).to_string())
+                }
+            })
+            .is_none(),
+            "an unreadable key path should disable push, not panic"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both forms set: the inline key wins, so a stale file cannot shadow what
+    /// the secret store injected.
+    #[test]
+    fn inline_key_takes_precedence_over_path() {
+        let mut vars = full_vars();
+        vars.insert("APNS_AUTH_KEY_PATH", "/nonexistent/AuthKey.p8");
+        let config = from_map(&vars).expect("inline key should be used");
+        assert!(config.auth_key_pem.contains('x'));
     }
 
     fn needs_input_event() -> AgentEvent {
