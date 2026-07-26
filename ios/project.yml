@@ -59,10 +59,16 @@ targets:
         CFBundleShortVersionString: "1.12.0"
         # Build number. Must strictly increase on EVERY App Store Connect
         # upload, independently of the marketing version — reusing one is
-        # rejected. Bump this by hand per submitted build (or override it at
-        # archive time with `CURRENT_PROJECT_VERSION`); `scripts/release` resets
-        # it to 1 when the marketing version changes.
-        CFBundleVersion: "1"
+        # rejected.
+        #
+        # This MUST stay a `$(...)` reference rather than a literal. A literal
+        # here is baked straight into the Info.plist, and no build setting —
+        # command line, xcconfig or otherwise — can then override it: passing
+        # `CURRENT_PROJECT_VERSION=99` silently produced a build still numbered
+        # 1, so CI could only ever upload the same number. The default lives in
+        # the target's CURRENT_PROJECT_VERSION below, which `scripts/release`
+        # resets and CI overrides per run.
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Export compliance (App Store Connect asks on every upload until this
         # is declared). All cryptography in the app is Apple's own CryptoKit
         # (X25519, HKDF-SHA256, ChaCha20-Poly1305) — no proprietary or
@@ -118,6 +124,10 @@ targets:
         # declaring UIDeviceFamily [1, 2]. That pulled it into Apple's iPad
         # multitasking rules and got uploads rejected with ITMS-90474.
         TARGETED_DEVICE_FAMILY: "1"
+        # Backs CFBundleVersion (see the info.properties comment). `scripts/release`
+        # resets this to 1 on a version bump; the TestFlight workflow overrides it
+        # per run so every upload gets a fresh, strictly increasing number.
+        CURRENT_PROJECT_VERSION: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO

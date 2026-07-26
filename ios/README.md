@@ -134,13 +134,23 @@ pushes a version tag, and the `TestFlight` workflow
 the same trigger the relay and web deploys use, so the phone build never lags
 the desktop release.
 
-`CFBundleVersion` comes from `github.run_number`, which increments on every run
-of *this workflow* (it is per-workflow, not repository-wide) and so strictly
-increases as required. The one way to defeat it is to upload a build **by hand**
-that is numbered at or above the current run count — App Store Connect then
-accepts the transfer and silently discards it as a redundant binary, which
-looks exactly like a successful upload. If that happens, pass a higher number
-explicitly:
+### Build numbers
+
+`CFBundleVersion` in `project.yml` is `"$(CURRENT_PROJECT_VERSION)"` — a
+reference, never a literal. That distinction is the whole mechanism: a literal is
+baked into the generated Info.plist and **no build setting can override it**.
+Passing `CURRENT_PROJECT_VERSION=99` against a literal produced a build still
+numbered 1, with no warning, which meant every CI upload carried the same build
+number. `DistributionMetadataTests.buildNumberIsAPositiveInteger` guards it: an
+unsubstituted `$(...)` or a missing default fails there rather than at upload.
+
+The default (`1`) lives in the app target's `CURRENT_PROJECT_VERSION`;
+`scripts/release` resets it on a version bump — note it rewrites *that* setting,
+not `CFBundleVersion`, for the same reason.
+
+CI overrides it with `github.run_number`, which increments on every run of this
+workflow (per-workflow, not repository-wide) and so strictly increases. To pick a
+number explicitly — after a manual upload has got ahead of the run count, say:
 
 ```
 Actions → TestFlight → Run workflow → build_number: 42
