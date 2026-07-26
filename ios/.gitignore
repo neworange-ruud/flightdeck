@@ -14,6 +14,9 @@ xcuserdata/
 .derived*/
 DerivedData/
 build/
+# scripts/archive.sh output: the .xcarchive, the exported .ipa and a signed
+# ExportOptions.plist. Hundreds of megabytes, and the .ipa is a signed binary.
+.build-archive/
 
 # SwiftPM
 .swiftpm/

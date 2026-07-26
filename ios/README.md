@@ -128,10 +128,123 @@ pass `FD_BUILD_NUMBER=n` to `scripts/archive.sh`.
 
 ## Distribution (TestFlight)
 
+**A tagged release ships a TestFlight build automatically.** `scripts/release`
+pushes a version tag, and the `TestFlight` workflow
+(`.github/workflows/ios-testflight.yml`) archives, signs, exports and uploads —
+the same trigger the relay and web deploys use, so the phone build never lags
+the desktop release. `CFBundleVersion` comes from the workflow run number, which
+is monotonic across the repository and therefore can never collide with a
+build number App Store Connect has already seen.
+
+To re-upload a tag that failed processing: Actions → TestFlight → Run workflow,
+with the tag as the ref.
+
+Locally, the same script the workflow runs:
+
 ```bash
 ios/scripts/archive.sh            # archive + export a .ipa
 ios/scripts/archive.sh --upload   # ...and send it to App Store Connect
 ```
+
+It reads a gitignored `.env` at the repo root for credentials, so nothing needs
+exporting by hand:
+
+```sh
+FD_ASC_KEY_ID="XXXXXXXXXX"
+FD_ASC_ISSUER_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+FD_ASC_KEY_PATH="/Users/you/.private_keys/AuthKey_XXXXXXXXXX.p8"
+```
+
+### Credentials
+
+Signing needs two independent things, and it is worth being clear about why
+neither replaces the other:
+
+- **An App Store Connect API key** (`FD_ASC_*`) — authenticates the *upload*,
+  and is also handed to `xcodebuild` so automatic signing can fetch the App
+  Store provisioning profile without an Apple Account signed in to Xcode. Get
+  one from App Store Connect → Users and Access → Integrations → App Store
+  Connect API. The `.p8` downloads exactly once.
+- **An Apple Distribution certificate** — the private key that actually signs
+  the binary. The API key cannot substitute for it: unless the key holds the
+  Admin role, Xcode's cloud signing fails with `Cloud signing permission error`
+  / `No signing certificate "iOS Distribution" found`, and the archive silently
+  falls back to the development identity, which then cannot be exported for the
+  App Store.
+- **An App Store provisioning profile** naming that certificate. Xcode's own
+  managed profile is not usable here for the same reason, and a cached one
+  created *before* the certificate existed fails as `Provisioning profile
+  "..." doesn't include signing certificate "..."`.
+
+Release therefore signs **manually**, against a profile we manage explicitly:
+`CODE_SIGN_STYLE: Manual`, `CODE_SIGN_IDENTITY: Apple Distribution` and
+`PROVISIONING_PROFILE_SPECIFIER: FlightDeck Remote App Store` on the app
+target's Release configuration in `project.yml`. Debug stays automatic, so
+local device runs need no profile management.
+
+Those settings live on the *target*, not on `archive.sh`'s command line, and
+must stay there: command-line build settings apply to every target in the
+build, including SwiftTerm's SwiftPM resource bundle, which then fails with
+`Signing for "SwiftTerm_SwiftTerm" requires a development team`.
+
+CI gets all of it as repository secrets:
+
+| Secret | Contents |
+| --- | --- |
+| `FD_ASC_KEY_ID` | API key id |
+| `FD_ASC_ISSUER_ID` | API issuer id |
+| `FD_ASC_KEY_P8` | base64 of the `AuthKey_*.p8` |
+| `APPLE_DISTRIBUTION_CERT` | base64 of a `.p12` (certificate + private key) |
+| `APPLE_DISTRIBUTION_CERT_PASSWORD` | the `.p12` export password |
+| `APPLE_APP_STORE_PROFILE` | base64 of the App Store `.mobileprovision` |
+
+These are distinct from the existing `CODESIGN_*` secrets, which hold the
+*Developer ID* certificate used to notarize the macOS desktop binary — a
+different certificate for a different store.
+
+### Rotating the certificate and profile
+
+Both expire after a year, and Apple caps distribution certificates at a small
+number per team — renew rather than accumulate. The certificate was created from
+a locally generated keypair via the App Store Connect API rather than through
+Keychain Access, which is what lets it be exported to a `.p12` without a GUI
+prompt:
+
+```bash
+# 1. Keypair + CSR, kept outside the keychain.
+openssl req -new -newkey rsa:2048 -nodes -keyout dist.key -out dist.csr \
+  -subj "/emailAddress=you@example.com/CN=FlightDeck Distribution/C=NL"
+
+# 2. POST dist.csr to /v1/certificates with certificateType=DISTRIBUTION,
+#    base64-decode the returned certificateContent into dist.cer, then:
+openssl x509 -inform DER -in dist.cer -out dist.pem
+curl -sfLO https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+openssl x509 -inform DER -in AppleWWDRCAG3.cer -out wwdr.pem
+
+# 3. Bundle leaf + intermediate + key. The chain does not validate without WWDR.
+openssl pkcs12 -export -inkey dist.key -in dist.pem -certfile wwdr.pem \
+  -legacy -passout "pass:$P12_PASS" -out dist.p12
+
+# 4. POST /v1/profiles with profileType=IOS_APP_STORE, the bundle id and the new
+#    certificate id, named exactly "FlightDeck Remote App Store"; base64-decode
+#    profileContent into appstore.mobileprovision.
+
+# 5. Push all three.
+base64 -i dist.p12 | tr -d '\n' \
+  | gh secret set APPLE_DISTRIBUTION_CERT --repo neworange-ruud/flightdeck
+printf '%s' "$P12_PASS" \
+  | gh secret set APPLE_DISTRIBUTION_CERT_PASSWORD --repo neworange-ruud/flightdeck
+base64 -i appstore.mobileprovision | tr -d '\n' \
+  | gh secret set APPLE_APP_STORE_PROFILE --repo neworange-ruud/flightdeck
+```
+
+Locally, point `FD_PROFILE_PATH` at the `.mobileprovision` and `archive.sh`
+installs it into `~/Library/Developer/Xcode/UserData/Provisioning Profiles`
+(Xcode 26's location — the older `~/Library/MobileDevice/Provisioning Profiles`
+is root-owned on some machines and unwritable).
+
+If the profile is regenerated, it must keep the same name — `project.yml`'s
+`PROVISIONING_PROFILE_SPECIFIER` refers to it by name.
 
 Internal TestFlight testing (up to 100 App Store Connect team members) needs
 **no App Review** — a build is available to testers minutes after processing.
