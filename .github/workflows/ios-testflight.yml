@@ -1,0 +1,166 @@
+name: TestFlight
+
+# Archive, sign and upload FlightDeck Remote to App Store Connect when a version
+# tag is pushed, so a TestFlight build ships from the same `scripts/release` run
+# that cuts the desktop release — the phone and the desktop stay on one train.
+#
+# Signing needs two credentials that OIDC cannot replace (unlike the relay/web
+# deploys, Apple has no federated-identity story here):
+#
+#   APPLE_DISTRIBUTION_CERT           base64 of a .p12 holding the Apple
+#                                     Distribution certificate + private key
+#   APPLE_DISTRIBUTION_CERT_PASSWORD  the .p12 export password
+#   APPLE_APP_STORE_PROFILE           base64 of the App Store .mobileprovision
+#
+# and three that also drive the upload:
+#
+#   FD_ASC_KEY_ID / FD_ASC_ISSUER_ID  App Store Connect API key identifiers
+#   FD_ASC_KEY_P8                     base64 of the AuthKey_*.p8
+#
+# Signing is manual on purpose: automatic ("cloud") signing needs an Apple
+# Account in Xcode, which a runner has none of, or an API key holding the Admin
+# role. The certificate and the profile are therefore both supplied as secrets —
+# the API key cannot substitute for either, since the .p12 carries a private key
+# that only exists on the machine that generated it. See ios/README.md
+# "Distribution (TestFlight)" for how to rotate them.
+#
+# NOTE: `release` events always run the workflow file as it exists on the
+# repository's DEFAULT branch — this file must be on `main` for release
+# publishes to trigger it.
+
+on:
+  # A release published by cargo-dist is created with GITHUB_TOKEN, which by
+  # design does NOT fire `release: published` — so the tag push is what actually
+  # triggers the upload on a real release. Same pattern as release.yml.
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  release:
+    types: [published]
+  # Re-upload a tag that failed processing, or ship a build off a branch. Run it
+  # against the tag you want: Actions -> TestFlight -> Run workflow -> pick the
+  # tag as the ref.
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "CFBundleVersion (defaults to the workflow run number)"
+        required: false
+
+concurrency:
+  # Uploads are not cancel-safe: a killed altool run can leave a half-delivered
+  # build that burns its build number. Queue instead.
+  group: ios-testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    runs-on: macos-latest
+    # An archive plus SwiftPM resolution plus two altool round-trips; well under
+    # this, but far under GitHub's 360-minute default if something wedges.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        # The .xcodeproj is generated, not committed (see ios/README.md).
+        run: brew install xcodegen
+
+      - name: Import the Apple Distribution certificate
+        env:
+          CERT_P12: ${{ secrets.APPLE_DISTRIBUTION_CERT }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERT_P12" ]; then
+            echo "::error::APPLE_DISTRIBUTION_CERT is not set — see this workflow's header."
+            exit 1
+          fi
+
+          # A dedicated, throwaway keychain rather than the login keychain: it is
+          # unlocked with a known password, it is the only one xcodebuild will
+          # search, and it dies with the runner.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          # -A would let any binary use the key without prompting; -T scopes that
+          # to the two tools that actually need it.
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" \
+            -t cert -f pkcs12 \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on a UI prompt that no one can answer.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+
+          # Prepend rather than replace: the system roots live in the default
+          # search list and the chain will not validate without them.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+
+          echo "Imported identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Write the App Store Connect API key
+        env:
+          FD_ASC_KEY_P8: ${{ secrets.FD_ASC_KEY_P8 }}
+          FD_ASC_KEY_ID: ${{ secrets.FD_ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FD_ASC_KEY_P8" ] || [ -z "$FD_ASC_KEY_ID" ]; then
+            echo "::error::FD_ASC_KEY_P8 / FD_ASC_KEY_ID are not set — see this workflow's header."
+            exit 1
+          fi
+          # ~/.private_keys is one of the fixed directories altool searches; the
+          # archive script also passes the path to xcodebuild explicitly.
+          mkdir -p "$HOME/.private_keys"
+          KEY_PATH="$HOME/.private_keys/AuthKey_${FD_ASC_KEY_ID}.p8"
+          echo "$FD_ASC_KEY_P8" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "FD_ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Write the App Store provisioning profile
+        env:
+          PROFILE: ${{ secrets.APPLE_APP_STORE_PROFILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROFILE" ]; then
+            echo "::error::APPLE_APP_STORE_PROFILE is not set — see this workflow's header."
+            exit 1
+          fi
+          # archive.sh installs it into the directory Xcode indexes, keyed by the
+          # profile's own UUID; it only needs a path.
+          echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/appstore.mobileprovision"
+          echo "FD_PROFILE_PATH=$RUNNER_TEMP/appstore.mobileprovision" >> "$GITHUB_ENV"
+
+      - name: Archive and upload to TestFlight
+        env:
+          FD_ASC_KEY_ID: ${{ secrets.FD_ASC_KEY_ID }}
+          FD_ASC_ISSUER_ID: ${{ secrets.FD_ASC_ISSUER_ID }}
+          # App Store Connect rejects a reused build number, and `scripts/release`
+          # resets CFBundleVersion to 1 on every version bump — so a second
+          # upload of the same version would collide. The run number is
+          # monotonic across the whole repository, which makes that impossible.
+          FD_BUILD_NUMBER: ${{ inputs.build_number || github.run_number }}
+        run: ios/scripts/archive.sh --upload
+
+      - name: Upload the archive for debugging
+        # A failed upload is usually a signing or metadata problem, and the
+        # answer is in the archive's Info.plist / embedded profile. Keep it on
+        # failure only: an .xcarchive is hundreds of megabytes.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcarchive
+          path: ios/.build-archive/FlightDeckRemote.xcarchive
+          retention-days: 5

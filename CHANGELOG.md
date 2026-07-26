@@ -8,11 +8,43 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Tagging a release now ships a TestFlight build.** Getting the iOS app to
+  testers was a manual sequence — archive, export, upload — that only worked on
+  one Mac with the right credentials in its keychain, so in practice the phone
+  build drifted behind the desktop release. A `TestFlight` workflow now runs on
+  the same version-tag push that triggers the relay and web deploys: it imports
+  the Apple Distribution certificate into a throwaway keychain, installs the App
+  Store provisioning profile, and archives, exports and uploads.
+  `CFBundleVersion` comes from the workflow run number — monotonic across the
+  repository, so it can never collide with a build App Store Connect has already
+  accepted. See `ios/README.md` "Distribution (TestFlight)".
 
 ### Improvements
 
-- None yet.
+- **`ios/scripts/archive.sh` reads credentials from `.env`.** It required three
+  `FD_ASC_*` variables exported by hand, and passed none of them to
+  `xcodebuild` — so archiving depended on whichever Apple Account happened to be
+  signed in to Xcode, and on a machine with no distribution certificate it
+  quietly signed with the development identity and only failed later at export.
+  It now loads a gitignored root `.env`, expands a `~` in the key path, fails
+  fast if the `.p8` is missing, and authenticates `xcodebuild` with the same API
+  key it uses for the upload. That is also what makes the CI path possible.
+- **`.env`, `*.p8`, `*.p12` and `*.mobileprovision` are gitignored.** None of
+  them were, and the App Store Connect key lands at the repo root by
+  convention.
+
+### Bug fixes
+
+- **Remote: the iOS app really is iPhone-only now.** `project.yml` said "iPhone
+  only, v1" and set `TARGETED_DEVICE_FAMILY` project-wide, but XcodeGen gives
+  every iOS target a default of `"1,2"` and a target-level setting beats a
+  project-level one — so the value never took effect and the app shipped
+  declaring `UIDeviceFamily [1, 2]`. Being iPad-capable put it under Apple's
+  iPad multitasking rules, which require all four interface orientations, and
+  the first TestFlight upload was rejected with ITMS-90474. The setting now sits
+  on the app target, the pointless `UISupportedInterfaceOrientations~ipad`
+  override is gone, and two `DistributionMetadataTests` assert both so it cannot
+  regress into another upload-time failure.
 
 ### Bug fixes
 

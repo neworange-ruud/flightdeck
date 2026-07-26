@@ -14,3 +14,13 @@
 
 .claude/worktrees
 .flightdeck/hooks.toml
+
+# Local credential files. `.env` holds the App Store Connect API key id/issuer
+# and the path to the .p8 (see ios/README.md "Distribution (TestFlight)"); the
+# .p8 itself lives outside the repo. Never commit either.
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision

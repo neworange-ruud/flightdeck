@@ -63,6 +63,39 @@ struct DistributionMetadataTests {
         #expect(exempt == false)
     }
 
+    // MARK: - Device family
+
+    /// The app is iPhone-only, and saying so is not cosmetic: an iPad-capable
+    /// bundle is held to Apple's multitasking rules, which demand all four
+    /// interface orientations and reject the upload with ITMS-90474 otherwise.
+    ///
+    /// This is worth asserting because the setting is easy to lose. XcodeGen
+    /// defaults every iOS target to `TARGETED_DEVICE_FAMILY = "1,2"`, and a
+    /// target-level setting overrides the project-level one — so the value in
+    /// `project.yml`'s project-wide `settings.base` was silently ineffective and
+    /// the app shipped as iPad-compatible until an upload failed.
+    @Test func targetsIPhoneOnly() throws {
+        let families = try #require(
+            info["UIDeviceFamily"] as? [Int],
+            "UIDeviceFamily missing from the built Info.plist")
+        #expect(
+            families == [1],
+            """
+            UIDeviceFamily is \(families), expected [1] (iPhone only). \
+            2 means iPad, which triggers ITMS-90474 unless all four orientations \
+            are declared. Set TARGETED_DEVICE_FAMILY on the app *target*.
+            """)
+    }
+
+    /// Guards the pairing that actually produces ITMS-90474: an `~ipad`
+    /// orientation list that omits upside-down. With the app iPhone-only there
+    /// should be no `~ipad` variant at all.
+    @Test func noIPadOrientationOverride() {
+        #expect(
+            info["UISupportedInterfaceOrientations~ipad"] == nil,
+            "iPhone-only app should not declare iPad orientations")
+    }
+
     // MARK: - Privacy manifest
 
     /// A missing manifest is an ITMS-91053 upload rejection.

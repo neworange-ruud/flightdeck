@@ -33,6 +33,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IOS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$IOS_DIR/.." && pwd)"
+
+# A gitignored .env at the repo root is the convenient place to keep the three
+# FD_ASC_* values locally, so they need not be exported by hand on every run.
+# CI has no .env — it injects the same names from repository secrets.
+if [ -f "$REPO_ROOT/.env" ]; then
+  echo "==> Loading credentials from .env"
+  set -a
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/.env"
+  set +a
+fi
 
 SCHEME="FlightDeckRemote"
 PROJECT="$IOS_DIR/FlightDeckRemote.xcodeproj"
@@ -41,6 +53,12 @@ ARCHIVE_PATH="$BUILD_DIR/$SCHEME.xcarchive"
 EXPORT_PATH="$BUILD_DIR/export"
 EXPORT_OPTIONS="$BUILD_DIR/ExportOptions.plist"
 TEAM_ID="7NKCS4AZS9"
+BUNDLE_ID="agency.neworange.flightdeck.remote"
+# The App Store provisioning profile is managed explicitly rather than by Xcode.
+# Create or rotate it from the App Store Connect API (see ios/README.md
+# "Credentials"); its name is the contract between that profile and this script.
+PROFILE_NAME="FlightDeck Remote App Store"
+SIGN_IDENTITY="Apple Distribution"
 
 UPLOAD=false
 if [ "${1:-}" = "--upload" ]; then
@@ -52,6 +70,59 @@ mkdir -p "$BUILD_DIR"
 
 echo "==> Generating Xcode project (xcodegen)"
 (cd "$IOS_DIR" && xcodegen generate)
+
+# Signing is MANUAL, deliberately. Automatic ("cloud") signing wants to mint the
+# certificate and profile itself, which needs either an Apple Account signed in to
+# Xcode — a CI runner has none — or an API key holding the Admin role. With an
+# App Manager key it fails as `Cloud signing permission error` and, worse, the
+# archive step silently falls back to the *development* identity and only blows
+# up later at export. Pinning the identity and the profile removes that whole
+# class of failure: the same inputs sign the same way on any machine.
+if [ -n "${FD_PROFILE_PATH:-}" ]; then
+  FD_PROFILE_PATH="${FD_PROFILE_PATH/#\~\//$HOME/}"
+  if [ ! -f "$FD_PROFILE_PATH" ]; then
+    echo "FD_PROFILE_PATH is set but no profile is there: $FD_PROFILE_PATH" >&2
+    exit 1
+  fi
+  # Xcode 26 reads managed profiles from UserData, not the older
+  # ~/Library/MobileDevice/Provisioning Profiles (which is root-owned on some
+  # machines and unwritable). Install by UUID, which is how xcodebuild indexes.
+  PROFILE_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+  mkdir -p "$PROFILE_DIR"
+  PROFILE_UUID="$(security cms -D -i "$FD_PROFILE_PATH" 2>/dev/null \
+    | plutil -extract UUID raw - -o -)"
+  if [ -z "$PROFILE_UUID" ]; then
+    echo "Could not read a UUID out of $FD_PROFILE_PATH" >&2
+    exit 1
+  fi
+  cp "$FD_PROFILE_PATH" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
+  echo "==> Installed provisioning profile $PROFILE_UUID"
+fi
+
+# NOTE: the manual-signing build settings themselves live in project.yml on the
+# app target's Release configuration, NOT here. Passing them on the command line
+# applies them to every target in the build — including SwiftTerm's SwiftPM
+# resource bundle, which has no team or profile and fails the archive outright.
+
+# The API key still authenticates the upload, and xcodebuild accepts it for the
+# provisioning lookups it does even under manual signing.
+AUTH_ARGS=()
+if [ -n "${FD_ASC_KEY_PATH:-}" ] && [ -n "${FD_ASC_KEY_ID:-}" ] && [ -n "${FD_ASC_ISSUER_ID:-}" ]; then
+  # A `~` written in .env arrives literal — sourcing a file does not expand it.
+  FD_ASC_KEY_PATH="${FD_ASC_KEY_PATH/#\~\//$HOME/}"
+  if [ ! -f "$FD_ASC_KEY_PATH" ]; then
+    echo "FD_ASC_KEY_PATH is set but no key is there: $FD_ASC_KEY_PATH" >&2
+    exit 1
+  fi
+  # -authenticationKeyPath insists on an absolute path.
+  ASC_KEY_ABS="$(cd "$(dirname "$FD_ASC_KEY_PATH")" && pwd)/$(basename "$FD_ASC_KEY_PATH")"
+  AUTH_ARGS+=(
+    -authenticationKeyPath "$ASC_KEY_ABS"
+    -authenticationKeyID "$FD_ASC_KEY_ID"
+    -authenticationKeyIssuerID "$FD_ASC_ISSUER_ID"
+  )
+  echo "==> Authenticating to App Store Connect with API key $FD_ASC_KEY_ID"
+fi
 
 # An explicit build number override, for when the marketing version has not
 # changed but a new build has to go up.
@@ -70,6 +141,7 @@ xcodebuild archive \
   -archivePath "$ARCHIVE_PATH" \
   -skipPackagePluginValidation \
   -allowProvisioningUpdates \
+  "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" \
   "${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"}"
 
 # `app-store-connect` is the current name for what used to be `app-store`.
@@ -88,6 +160,15 @@ cat > "$EXPORT_OPTIONS" <<PLIST
 	<true/>
 	<key>destination</key>
 	<string>export</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>$SIGN_IDENTITY</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>$BUNDLE_ID</key>
+		<string>$PROFILE_NAME</string>
+	</dict>
 </dict>
 </plist>
 PLIST
@@ -97,7 +178,8 @@ xcodebuild -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_PATH" \
   -exportOptionsPlist "$EXPORT_OPTIONS" \
-  -allowProvisioningUpdates
+  -allowProvisioningUpdates \
+  "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}"
 
 IPA="$(find "$EXPORT_PATH" -name '*.ipa' -maxdepth 1 | head -1)"
 if [ -z "$IPA" ]; then

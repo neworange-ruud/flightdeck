@@ -81,11 +81,11 @@ targets:
         # (spec §11); the relay's push is content-available (zero-knowledge).
         UIBackgroundModes:
           - remote-notification
+        # No `~ipad` variant: the app is iPhone-only (see the target's
+        # TARGETED_DEVICE_FAMILY). Declaring iPad orientations while omitting
+        # UIInterfaceOrientationPortraitUpsideDown is what App Store Connect
+        # rejects as ITMS-90474 — iPad multitasking requires all four.
         UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
@@ -111,6 +111,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote
+        # iPhone only, v1. This has to be repeated here even though the project's
+        # `settings.base` sets it: XcodeGen gives every iOS target a default of
+        # "1,2", and a target-level setting beats a project-level one — so the
+        # project-wide value alone was silently ineffective and the app shipped
+        # declaring UIDeviceFamily [1, 2]. That pulled it into Apple's iPad
+        # multitasking rules and got uploads rejected with ITMS-90474.
+        TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
@@ -126,6 +133,22 @@ targets:
           CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
         Release:
           CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote-Release.entitlements
+          # Release signs MANUALLY against an explicitly managed App Store
+          # profile. Automatic ("cloud") signing needs either an Apple Account in
+          # Xcode — CI has none — or an API key with the Admin role; with a
+          # lesser key it fails as `Cloud signing permission error` after
+          # silently archiving with the *development* identity.
+          #
+          # These live on the app target rather than on the command line because
+          # command-line build settings apply to EVERY target, including
+          # SwiftTerm's SwiftPM resource bundle, which then fails with "Signing
+          # for SwiftTerm_SwiftTerm requires a development team". Debug is left
+          # automatic so local device runs need no profile management.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+          # Must match the profile name created via the App Store Connect API —
+          # see ios/README.md "Credentials".
+          PROVISIONING_PROFILE_SPECIFIER: "FlightDeck Remote App Store"
     dependencies:
       - package: SwiftTerm
     scheme:
