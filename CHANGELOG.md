@@ -46,10 +46,17 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   on the app target, the pointless `UISupportedInterfaceOrientations~ipad`
   override is gone, and two `DistributionMetadataTests` assert both so it cannot
   regress into another upload-time failure.
-
-### Bug fixes
-
-- None yet.
+- **Remote: the iOS build number can actually be overridden now.**
+  `ios/project.yml` wrote `CFBundleVersion` as a literal `"1"`, and a literal is
+  baked into the generated Info.plist where no build setting can reach it — so
+  `FD_BUILD_NUMBER` (and `CURRENT_PROJECT_VERSION` generally) was a silent
+  no-op. Building with `CURRENT_PROJECT_VERSION=99` produced a build still
+  numbered 1, which means every CI upload would have carried the same build
+  number, and App Store Connect refuses a reused one. `CFBundleVersion` is now
+  `"$(CURRENT_PROJECT_VERSION)"`, the default sits on the app target, and
+  `scripts/release` resets that setting rather than rewriting the reference into
+  a literal again. `DistributionMetadataTests.buildNumberIsAPositiveInteger`
+  already covered the shape and now catches an unsubstituted reference too.
 
 ## [1.12.0] - 2026-07-26
 

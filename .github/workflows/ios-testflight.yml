@@ -147,16 +147,14 @@ jobs:
         env:
           FD_ASC_KEY_ID: ${{ secrets.FD_ASC_KEY_ID }}
           FD_ASC_ISSUER_ID: ${{ secrets.FD_ASC_ISSUER_ID }}
-          # `scripts/release` resets CFBundleVersion to 1 on every version bump,
-          # so a second upload of the same version would reuse a build number.
-          # run_number increments on every run of THIS workflow (it is
-          # per-workflow, not repository-wide) and so strictly increases.
+          # `scripts/release` resets the build number to 1 on every version bump,
+          # so a second upload of one version would otherwise reuse it.
+          # run_number increments on every run of THIS workflow (per-workflow,
+          # not repository-wide) and so strictly increases.
           #
-          # It is not collision-proof against a build uploaded BY HAND at or
-          # above the current run count: App Store Connect accepts that transfer
-          # and then discards it as a redundant binary, which is indistinguishable
-          # from success in the log. Use the build_number input to jump ahead when
-          # that happens.
+          # This only works because project.yml's CFBundleVersion is a
+          # `$(CURRENT_PROJECT_VERSION)` reference — against a literal the
+          # override is silently ignored. See ios/README.md "Build numbers".
           FD_BUILD_NUMBER: ${{ inputs.build_number || github.run_number }}
         run: ios/scripts/archive.sh --upload
 
