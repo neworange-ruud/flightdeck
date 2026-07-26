@@ -141,6 +141,10 @@ jobs:
       - name: Deploy revision
         env:
           RELAY_PASSWORD: ${{ secrets.FLIGHTDECK_RELAY_PASSWORD }}
+          APNS_AUTH_KEY: ${{ secrets.APNS_AUTH_KEY }}
+          APNS_KEY_ID: ${{ vars.APNS_KEY_ID }}
+          APNS_TEAM_ID: ${{ vars.APNS_TEAM_ID }}
+          APNS_TOPIC: ${{ vars.APNS_TOPIC }}
         run: |
           set -euo pipefail
           RG="${{ vars.AZURE_RESOURCE_GROUP }}"
@@ -150,6 +154,31 @@ jobs:
             az containerapp secret set -g "$RG" -n "$APP" \
               --secrets "relay-password=$RELAY_PASSWORD"
             PW_ENV="FLIGHTDECK_RELAY_PASSWORD=secretref:relay-password"
+          fi
+
+          # APNs. Like the relay password, the .p8 is held as a Container App
+          # secret and referenced by env var so it never lands in the revision
+          # template in plaintext. The relay reads it inline via
+          # APNS_AUTH_KEY_PEM rather than from a file, which avoids provisioning
+          # a secret volume just to hold one key.
+          #
+          # Re-asserted on every deploy for the same reason as
+          # FLIGHTDECK_RELAY_STORE: without these four the relay's push sender
+          # degrades to a silent no-op — it keeps routing and queueing, so
+          # nothing looks broken until someone notices their phone is never
+          # woken. That is exactly how this went unnoticed until 1.12.0.
+          APNS_ENV=""
+          if [ -n "$APNS_AUTH_KEY" ] && [ -n "$APNS_KEY_ID" ] \
+             && [ -n "$APNS_TEAM_ID" ] && [ -n "$APNS_TOPIC" ]; then
+            az containerapp secret set -g "$RG" -n "$APP" \
+              --secrets "apns-auth-key=$APNS_AUTH_KEY"
+            APNS_ENV="APNS_AUTH_KEY_PEM=secretref:apns-auth-key"
+            APNS_ENV="$APNS_ENV APNS_KEY_ID=$APNS_KEY_ID"
+            APNS_ENV="$APNS_ENV APNS_TEAM_ID=$APNS_TEAM_ID"
+            APNS_ENV="$APNS_ENV APNS_TOPIC=$APNS_TOPIC"
+            echo "APNs push: configured (key $APNS_KEY_ID, topic $APNS_TOPIC)"
+          else
+            echo "::warning::APNs push is NOT configured — offline phones will not be woken. Set the APNS_AUTH_KEY secret and the APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC variables."
           fi
           # FLIGHTDECK_RELAY_STORE re-asserts the persistent SQLite store on
           # every deploy (remote-control-vp2). The /data volume + mount live in
@@ -161,7 +190,7 @@ jobs:
             --resource-group "$RG" \
             --name "$APP" \
             --image "$IMAGE" \
-            --set-env-vars "GIT_SHA=${{ github.sha }}" "FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db" $PW_ENV
+            --set-env-vars "GIT_SHA=${{ github.sha }}" "FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db" $PW_ENV $APNS_ENV
 
       - name: Verify the new revision is live and healthy
         run: |

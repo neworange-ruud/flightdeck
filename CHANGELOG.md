@@ -19,6 +19,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   per workflow run — `scripts/release` resets the value in `project.yml` to `1`
   on every version bump, so a second upload of one version would otherwise
   collide. See `ios/README.md` "Distribution (TestFlight)".
+- **Remote: push notifications actually reach the phone now.** The relay has
+  never been able to wake an offline phone. Two things were missing, and both
+  failed silently: the deployed image was built without the `apns-live` feature,
+  which compiles the APNs transport out and leaves a no-op sender in its place;
+  and the container app had none of the four `APNS_*` variables, so
+  `ApnsConfig::from_env` returned `None` — a deliberate "disable push rather than
+  fail startup" choice that, with nothing reporting the decision, looked exactly
+  like a healthy relay. The 1.10.0 notes said push "requires an Apple APNs auth
+  key + signing team"; the signing team arrived in 1.12.0, the key half never
+  did. The Dockerfile now builds with the feature, `relay-deploy.yml` injects and
+  re-asserts the config on every deploy (and raises a workflow warning rather
+  than quietly shipping a mute relay), and the auth key is injected inline from a
+  secret via `APNS_AUTH_KEY_PEM` instead of needing a mounted volume for one
+  file. Verified against Apple's production endpoint. See
+  `remote/relay/deploy/README.md` "Push notifications (APNs)".
 
 ### Improvements
 

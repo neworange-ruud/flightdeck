@@ -121,6 +121,51 @@ constant time. A relay with **no** password configured stays open (local/dev).
 - `GET /healthz` → `ok` (liveness) · `GET /readyz` → `ok` (readiness)
 - `GET /version` → `{"version":"…","git_sha":"…"}` — `git_sha` is the deployed revision.
 
+## Push notifications (APNs)
+
+Waking an offline phone needs **two** things, and getting either wrong disables
+push *silently* — the relay keeps routing and queueing, so nothing looks broken
+until someone notices their phone is never woken. That is exactly how the relay
+ran without APNs from 1.10.0 to 1.12.0.
+
+1. **The image must be built with `--features apns-live`.** The feature is off by
+   default so the crate builds and unit-tests without Apple credentials; without
+   it the push sender is compiled out and replaced by a no-op
+   (`lib.rs::push_sender`). `remote/relay/Dockerfile` passes it on both `cargo
+   build` invocations.
+2. **All four config variables must be present.** `ApnsConfig::from_env` returns
+   `None` — push disabled — unless it has `APNS_TEAM_ID`, `APNS_KEY_ID`,
+   `APNS_TOPIC` and the auth key. `relay-deploy.yml` re-asserts them on every
+   deploy for the same reason it re-asserts `FLIGHTDECK_RELAY_STORE`, and logs a
+   workflow warning when they are missing rather than deploying a mute relay.
+
+The auth key is an **APNs auth key** (Apple Developer portal → Keys → Apple Push
+Notification service) — a different key from the App Store Connect API key used
+to upload builds. It is held as a Container App *secret* and injected inline via
+`APNS_AUTH_KEY_PEM`, which avoids provisioning a secret volume for one file.
+`APNS_AUTH_KEY_PATH` still works for local runs.
+
+`APNS_ENVIRONMENT` is deliberately left unset: it is only the fallback for tokens
+that arrive without one, and the phone reports its own environment per token
+(`development` for Debug builds, `production` for TestFlight/App Store). Debug
+and TestFlight installs are therefore routed to the right APNs host
+simultaneously, from one key.
+
+To verify the credentials without a device, mint a provider JWT and POST to a
+bogus token — `BadDeviceToken` means the key, key id, team and topic are all
+good, whereas `403 InvalidProviderToken` means they are not:
+
+```bash
+curl -s --http2 -H "authorization: bearer $JWT" \
+  -H "apns-topic: agency.neworange.flightdeck.remote" \
+  -H "apns-push-type: background" -d '{"aps":{"content-available":1}}' \
+  "https://api.push.apple.com/3/device/$(printf '0%.0s' {1..64})"
+```
+
+Once live, `az containerapp logs show -g <rg> -n <app>` surfaces the APNs
+response, so a token registered against the wrong environment shows up as
+`BadDeviceToken` rather than silence.
+
 ## How deploys happen
 
 `.github/workflows/relay-deploy.yml` runs when a **GitHub Release is published**
@@ -141,9 +186,12 @@ credential trusts exactly `repo:<owner>/<repo>:environment:production`, and
 ### GitHub configuration
 
 Repo **variables**: `AZURE_RESOURCE_GROUP`, `AZURE_ACR_NAME`,
-`AZURE_CONTAINERAPP_NAME`.
-Repo **secrets** (OIDC identifiers, not credentials): `AZURE_CLIENT_ID` (the
-deploy identity's client id), `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`.
+`AZURE_CONTAINERAPP_NAME`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`
+(none of these three are secrets — the team id ships inside every signed binary
+and the topic is the bundle id).
+Repo **secrets**: `AZURE_CLIENT_ID` (the deploy identity's client id),
+`AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` — OIDC identifiers, not credentials —
+plus `FLIGHTDECK_RELAY_PASSWORD` and `APNS_AUTH_KEY` (the `.p8` contents).
 
 ## Reproducing the setup
 
