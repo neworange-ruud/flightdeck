@@ -3,12 +3,23 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  APNs entitlement (PRD §9.1). `development` targets the sandbox APNs; a
-	  Release/App Store build's provisioning profile overrides this to
-	  production. This entitlement only takes effect in a SIGNED build (needs an
-	  Apple Developer team); the unsigned simulator build
-	  (CODE_SIGNING_ALLOWED=NO) skips the codesign step entirely, so it is inert
-	  there and does not break that build.
+	  APNs entitlement (PRD §9.1) — Debug/development builds.
+
+	  `aps-environment` must MATCH what the signing provisioning profile grants;
+	  the profile does not override it. A development profile grants
+	  `development`; an App Store / TestFlight distribution profile grants
+	  `production`, and signing a distribution build with `development` here
+	  fails ("provisioning profile does not match the entitlements"). Release
+	  builds therefore use FlightDeckRemote-Release.entitlements, wired
+	  per-configuration in project.yml.
+
+	  The Swift side agrees: `PushEnvironment.current` reports `.sandbox` in
+	  DEBUG and `.production` otherwise, and the relay picks the APNs host from
+	  whatever the device reports (`apns.rs`).
+
+	  This entitlement only takes effect in a SIGNED build. The unsigned
+	  simulator build (CODE_SIGNING_ALLOWED=NO) skips codesign entirely, so it is
+	  inert there and does not break that build.
 	-->
 	<key>aps-environment</key>
 	<string>development</string>

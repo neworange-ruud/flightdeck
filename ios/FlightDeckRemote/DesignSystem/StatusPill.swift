@@ -43,6 +43,7 @@ extension StatusPill {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack(spacing: 16) {
         HStack(spacing: 10) {
@@ -62,3 +63,4 @@ extension StatusPill {
     .padding(40)
     .background(Theme.bgDeep)
 }
+#endif

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  APNs entitlement (PRD §9.1) — Release builds (TestFlight + App Store).
+
+	  TestFlight and App Store builds are signed with a distribution profile,
+	  which grants `aps-environment: production`. This file must say the same or
+	  codesign fails. See FlightDeckRemote.entitlements for the Debug counterpart
+	  and the full rationale.
+
+	  Getting this wrong is SILENT at build time and only shows up as "testers
+	  never receive notifications": a Release build's `PushEnvironment.current`
+	  reports `.production`, so the relay pushes to api.push.apple.com, and a
+	  token minted under the sandbox environment would be rejected there.
+	-->
+	<key>aps-environment</key>
+	<string>production</string>
+</dict>
+</plist>

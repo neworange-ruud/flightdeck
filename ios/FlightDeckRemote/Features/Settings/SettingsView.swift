@@ -541,14 +541,35 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
             sectionHeader("About")
 
-            HStack {
-                Text("Version")
-                    .typography(Typography.body)
-                    .foregroundStyle(Theme.textPrimary)
-                Spacer()
-                Text(Self.appVersionString)
-                    .typography(Typography.body)
-                    .foregroundStyle(Theme.textMuted)
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                HStack {
+                    Text("Version")
+                        .typography(Typography.body)
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer()
+                    Text(Self.appVersionString)
+                        .typography(Typography.body)
+                        .foregroundStyle(Theme.textMuted)
+                }
+
+                Divider().overlay(Theme.bgDeep)
+
+                // App Store Connect requires a reachable privacy policy URL, and
+                // the app must link it too. Opens in Safari rather than an
+                // in-app sheet: it is a legal document, not app content, and
+                // the address bar lets the reader confirm the origin.
+                Link(destination: Self.privacyPolicyURL) {
+                    HStack {
+                        Text("Privacy Policy")
+                            .typography(Typography.body)
+                            .foregroundStyle(Theme.textPrimary)
+                        Spacer()
+                        Image(systemName: "arrow.up.right")
+                            .font(.footnote)
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                }
+                .accessibilityIdentifier("settings-privacy-policy-link")
             }
             .padding(Theme.Spacing.lg)
             .cardStyle()
@@ -608,6 +629,12 @@ struct SettingsView: View {
         return formatter
     }()
 
+    /// The published privacy policy (`web/src/app/privacy/page.tsx`). The same
+    /// URL goes in App Store Connect's privacy-policy field, so if this moves,
+    /// update it in both places. `www` is the site's canonical host — the apex
+    /// only 301s to it at the registrar (see `web/deploy/README.md`).
+    private static let privacyPolicyURL = URL(string: "https://www.flightdeckai.app/privacy")!
+
     private static var appVersionString: String {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -616,6 +643,7 @@ struct SettingsView: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     let router = AppRouter(pairingStore: PairingStore())
     router.pairingStore.completePairing(
@@ -633,3 +661,4 @@ struct SettingsView: View {
         speechLanguage: SpeechLanguagePreference())
         .environment(AppLockController())
 }
+#endif

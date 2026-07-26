@@ -141,6 +141,7 @@ struct CustomTabBar: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack {
         Spacer()
@@ -153,3 +154,4 @@ struct CustomTabBar: View {
     }
     .background(Theme.bgDeep)
 }
+#endif

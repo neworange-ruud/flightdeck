@@ -93,6 +93,7 @@ struct ConnectionIndicator: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack(alignment: .leading, spacing: 20) {
         ConnectionIndicator(linkState: .connected(latencyMs: 42))
@@ -110,3 +111,4 @@ struct ConnectionIndicator: View {
     .padding(40)
     .background(Theme.bgDeep)
 }
+#endif

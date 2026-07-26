@@ -53,6 +53,7 @@ struct GitIndicatorText: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack(alignment: .leading, spacing: 10) {
         GitIndicatorText(kind: .diff(modified: 3, drift: 2))
@@ -64,3 +65,4 @@ struct GitIndicatorText: View {
     .padding(24)
     .background(Theme.bgDeep)
 }
+#endif

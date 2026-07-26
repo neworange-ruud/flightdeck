@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Apple privacy manifest. Required for App Store Connect uploads (TestFlight
+  included) — a missing or incomplete manifest is rejected at upload with an
+  ITMS-91053 "Missing API declaration" notice, before any review happens.
+
+  Keep this in sync with the published policy at
+  https://www.flightdeckai.app/privacy (web/src/app/privacy/page.tsx) and with
+  the App Privacy answers in App Store Connect. All three must agree.
+-->
+<dict>
+	<!--
+	  No tracking: the app has no analytics, attribution, advertising or
+	  crash-reporting SDKs, does not use IDFA, and never links data to
+	  third-party data for advertising. SwiftTerm (terminal rendering) is the
+	  only third-party dependency and performs no data collection.
+	-->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+
+	<!--
+	  Data collected by the developer. "Collect" in Apple's sense means data
+	  transmitted off-device in a way we could access.
+
+	  Deliberately NOT listed:
+	  - Message/agent content, prompts, code, terminal output: end-to-end
+	    encrypted (X25519 + HKDF-SHA256 + ChaCha20-Poly1305). The relay only
+	    holds ciphertext it cannot read, so it is not "collected" by us.
+	  - Voice recordings: audio goes to Apple's speech recognition framework,
+	    never to our servers, and is not retained by us.
+	  - Camera frames: QR pairing codes are decoded on-device and never leave it.
+	-->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<!--
+		  Device ID: the app's own device identifier + public keys, and the APNs
+		  push token, are held by the relay to route and authenticate messages
+		  and to wake the app. Tied to the install, not to a person, and used
+		  only to run the service.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  Other data types: the paired machine's name, stored unencrypted on the
+		  relay so the app can label which Mac is which. It is a user-chosen
+		  device name that often contains a person's name ("Ruud's MacBook Pro"),
+		  so it is declared rather than treated as anonymous.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherDataTypes</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
+
+	<!--
+	  Required-reason API declarations. Each entry must name a reason code from
+	  Apple's list; an undeclared use of one of these APIs is what triggers
+	  ITMS-91053.
+	-->
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<!--
+		  UserDefaults (AppLockController, PairingStore, NotificationPreferences,
+		  SpeechLanguagePreference). CA92.1 = access only to this app's own
+		  defaults, never an app-group's or another app's.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

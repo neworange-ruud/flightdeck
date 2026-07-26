@@ -77,6 +77,7 @@ struct NotificationCell: View {
 
 extension NotificationCell.Kind: Equatable {}
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     VStack(spacing: 14) {
         NotificationCell(
@@ -95,3 +96,4 @@ extension NotificationCell.Kind: Equatable {}
     .padding(20)
     .background(Theme.bgDeep)
 }
+#endif

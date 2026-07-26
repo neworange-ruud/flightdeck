@@ -42,6 +42,7 @@ struct MachineChip: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     HStack(spacing: 12) {
         MachineChip(displayName: "Ruud's MacBook Pro")
@@ -50,3 +51,4 @@ struct MachineChip: View {
     .padding(40)
     .background(Theme.bgDeep)
 }
+#endif

@@ -444,6 +444,8 @@ private struct ShakeEffect: GeometryEffect {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     PairingView(pairingStore: PairingStore())
 }
+#endif

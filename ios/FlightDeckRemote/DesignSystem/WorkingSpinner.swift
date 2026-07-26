@@ -32,6 +32,7 @@ struct WorkingSpinner: View {
     }
 }
 
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
 #Preview {
     HStack(spacing: 24) {
         WorkingSpinner(size: 14)
@@ -41,3 +42,4 @@ struct WorkingSpinner: View {
     .padding(40)
     .background(Theme.bgDeep)
 }
+#endif
