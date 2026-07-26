@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.12.0] - 2026-07-26
+
+### New features
+
 - **Remote: start a new agent on any paired machine.** The New-Agent sheet's
   project picker only ever listed projects from a single machine, so a session
   could only be launched on that one Mac — every project on your other paired
