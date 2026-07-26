@@ -15,9 +15,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   the same version-tag push that triggers the relay and web deploys: it imports
   the Apple Distribution certificate into a throwaway keychain, installs the App
   Store provisioning profile, and archives, exports and uploads.
-  `CFBundleVersion` comes from the workflow run number — monotonic across the
-  repository, so it can never collide with a build App Store Connect has already
-  accepted. See `ios/README.md` "Distribution (TestFlight)".
+  `CFBundleVersion` comes from the workflow run number, which strictly increases
+  per workflow run — `scripts/release` resets the value in `project.yml` to `1`
+  on every version bump, so a second upload of one version would otherwise
+  collide. See `ios/README.md` "Distribution (TestFlight)".
 
 ### Improvements
 
