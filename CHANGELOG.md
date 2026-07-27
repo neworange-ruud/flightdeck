@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.13.0] - 2026-07-27
+
+### New features
+
 - **Tagging a release now ships a TestFlight build.** Getting the iOS app to
   testers was a manual sequence — archive, export, upload — that only worked on
   one Mac with the right credentials in its keychain, so in practice the phone
