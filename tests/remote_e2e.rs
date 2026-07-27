@@ -951,14 +951,22 @@ fn relay_restart_resumes_desktop_to_phone_delivery() {
 /// relay's point of view, which used to be a fatal `bad_frame` reconnect loop
 /// with the feed stalled forever (remote-control-bbf).
 ///
-/// Recovery now spans all three tiers, and this test exercises them together:
-/// the relay reports `seq_violation` instead of a fatal frame error, the desktop
-/// treats it as a resync (zeroing its outbound cursor and re-sending a full
-/// snapshot from seq 1 rather than tearing down), and the phone accepts that
-/// seq-1 envelope as a stream reset instead of dropping it as a duplicate of a
-/// seq it has already seen.
+/// Recovery is now silent. The relay treats its watermark as a *cache* of the
+/// sender's cursor rather than an independent authority, so a stream it has no
+/// record of adopts whatever seq the next envelope carries
+/// (remote-control-arg) — the desktop and phone cursors already agree with each
+/// other, and the relay simply falls in behind them.
+///
+/// That deliberately replaces the older recovery, where the relay answered
+/// `seq_violation`, the desktop zeroed its outbound cursor and restarted from
+/// seq 1, and the phone accepted the seq-1 envelope as a stream reset. That
+/// dance worked only because the relay's watermark was volatile; once the store
+/// persisted it, the desktop's restart at seq 1 was rejected by a watermark that
+/// was genuinely ahead, which drove another rewind — the livelock in
+/// remote-control-arg. So this test now asserts the feed recovers *without* a
+/// renumbering, and `stream_resets() == 0` is the regression guard.
 #[test]
-fn relay_losing_desktop_stream_seq_state_recovers_via_stream_reset() {
+fn relay_losing_desktop_stream_seq_state_recovers_by_adopting_the_cursor() {
     let mut h = Harness::boot_persistent();
 
     let snap = request_snapshot(&mut h.phone, ACK_TIMEOUT);
@@ -968,8 +976,9 @@ fn relay_losing_desktop_stream_seq_state_recovers_via_stream_reset() {
     let cursor_before = h.phone.last_received_seq();
     assert!(
         cursor_before > 1,
-        "the phone must be well past seq 1 before the restart, or accepting a seq-1 \
-         reset afterwards would prove nothing; cursor = {cursor_before}"
+        "the phone must be well past seq 1 before the restart, or a relay that wrongly \
+         demanded a restart at seq 1 would look identical to one that adopted the \
+         cursor; cursor = {cursor_before}"
     );
 
     // --- The redeploy that loses *part* of its state. ---
@@ -986,33 +995,39 @@ fn relay_losing_desktop_stream_seq_state_recovers_via_stream_reset() {
     h.relay.restart();
     h.phone.reconnect();
 
-    // Despite the divergence, the feed must come back: the desktop resyncs from
-    // seq 1 and the phone accepts the reset.
+    // Despite the divergence, the feed must come back — the relay adopts the
+    // desktop's cursor for the stream it no longer knows.
     let snap_after = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
     assert_eq!(
         snap_after.projects.len(),
         1,
-        "post-resync snapshot should still describe the fixture project: {snap_after:?}"
+        "post-restart snapshot should still describe the fixture project: {snap_after:?}"
+    );
+    assert_eq!(
+        h.phone.stream_resets(),
+        0,
+        "the relay must adopt the desktop's existing cursor, not make it renumber the \
+         stream from seq 1 — that renumbering is what livelocked against a relay whose \
+         watermark was genuinely ahead (remote-control-arg)"
     );
     assert!(
-        h.phone.stream_resets() > 0,
-        "the desktop should have restarted its outbound stream from seq 1 (and the phone \
-         accepted it) — without that, recovery happened by some other route and the \
-         seq-divergence path is untested"
+        h.phone.last_received_seq() > cursor_before,
+        "the adopted stream must continue above the phone's pre-restart cursor \
+         (was {cursor_before}, now {})",
+        h.phone.last_received_seq()
     );
 
-    // And it must keep flowing on the fresh stream epoch, not stall after the
-    // single reset frame.
+    // And it must keep flowing, not stall after the first post-restart frame.
     let epoch_cursor = h.phone.last_received_seq();
     let snap_again = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
     assert_eq!(
         snap_again.projects.len(),
         1,
-        "the feed must keep delivering after the stream reset: {snap_again:?}"
+        "the feed must keep delivering after the restart: {snap_again:?}"
     );
     assert!(
         h.phone.last_received_seq() > epoch_cursor,
-        "the reset stream must advance monotonically from its new epoch \
+        "the adopted stream must advance monotonically \
          (cursor was {epoch_cursor}, now {})",
         h.phone.last_received_seq()
     );

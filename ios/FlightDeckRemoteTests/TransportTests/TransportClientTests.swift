@@ -384,13 +384,24 @@ import CryptoKit
         await client.stop()
     }
 
-    /// After a relay restart the phone's own outbound command seq is ahead of the
-    /// fresh relay, which rejects it with `seq_violation`. The client must NOT
-    /// tear the link down; it re-syncs its outbound cursor so the next command
-    /// restarts at seq 1 (which a fresh relay accepts).
-    @Test func resyncsOutboundCursorOnSeqViolation() async throws {
+    /// A `seq_violation` advisory means the phone's INBOUND cursor is stale. The
+    /// client must not tear the link down; it drops `lastReceivedSeq`, re-resumes
+    /// from 0, and leaves its OUTBOUND stream counting up.
+    ///
+    /// Rewinding `lastSentSeq` here is the reported P0 (remote-control-arg /
+    /// -h1y): against a relay that persists its watermark at 60, restarting at
+    /// seq 1 is rejected, which drives another rewind to 1, at reconnect speed,
+    /// forever — while inbound keeps working, so it looks like a connectivity
+    /// flap rather than every outbound command dying.
+    @Test func seqViolationResyncsInboundAndLeavesTheOutboundStreamAlone() async throws {
         let keychain = InMemoryKeychainStore()
-        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain, lastSentSeq: 5)
+        // A non-zero INBOUND cursor too, so "dropped it and re-resumed from 0" is
+        // distinguishable from the ordinary post-`auth_ok` resume.
+        let (peer, ka) = try TransportFixtures.makePeer(
+            keychain: keychain,
+            lastReceivedSeq: 40,
+            lastSentSeq: 5
+        )
         let channel = ScriptedChannel()
         let collector = EventCollector()
         var config = TransportClient.Config()
@@ -414,8 +425,7 @@ import CryptoKit
         await client.start()
         await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
 
-        // First command goes out at seq 6 (persisted lastSentSeq 5). The fresh
-        // relay rejects it as non-monotonic.
+        // First command goes out at seq 6 (persisted lastSentSeq 5).
         let id1 = Wire.CommandId("cmd_1")
         await client.send(Wire.PhoneCommand(commandId: id1, issuedAtMs: 1,
                                             body: .reply(sessionId: Wire.SessionId("s"), text: "a")))
@@ -425,27 +435,44 @@ import CryptoKit
             }
         }
         try await channel.push(.error(code: .seqViolation,
-                                      message: "envelope seq is not gapless/monotonic",
+                                      message: "peer restarted its stream; drop your inbound cursor",
                                       pairingId: Wire.PairingId("pair_test_1")))
 
-        // The cursor re-syncs to 0 (recovery), and the link stays up.
-        _ = await waitUntil { (try? recordStore.load())?.lastSentSeq == 0 }
-        #expect((try? recordStore.load())?.lastSentSeq == 0)
+        // The INBOUND cursor is dropped and the link stays up.
+        _ = await waitUntil { (try? recordStore.load())?.lastReceivedSeq == 0 }
+        #expect((try? recordStore.load())?.lastReceivedSeq == 0)
         #expect(await client.currentLinkState() != .disconnected)
 
-        // The next command restarts the outbound stream at seq 1.
+        // It re-resumes from 0 to pull whatever the relay still holds.
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .resume(_, from) = $0 { return from == 0 }; return false
+            }
+        }
+        let reResumed = await channel.sentFrames().contains {
+            if case let .resume(_, from) = $0 { return from == 0 }; return false
+        }
+        #expect(reResumed, "a resync must re-resume from scratch")
+
+        // The OUTBOUND cursor was never touched: the next command is seq 7, not a
+        // restart at 1. A regression here is the livelock.
+        #expect((try? recordStore.load())?.lastSentSeq == 6)
         let id2 = Wire.CommandId("cmd_2")
         await client.send(Wire.PhoneCommand(commandId: id2, issuedAtMs: 2,
                                             body: .reply(sessionId: Wire.SessionId("s"), text: "b")))
         _ = await waitUntil {
             await channel.sentFrames().contains {
-                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 7 }; return false
             }
         }
+        let continued = await channel.sentFrames().contains {
+            if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 7 }; return false
+        }
+        #expect(continued, "the outbound stream must keep counting up, never restart at 1")
         let restarted = await channel.sentFrames().contains {
             if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
         }
-        #expect(restarted)
+        #expect(!restarted, "renumbering the outbound stream is what livelocked it")
         await client.stop()
     }
 

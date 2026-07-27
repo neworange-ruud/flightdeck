@@ -54,6 +54,16 @@ enum TransportEvent: Sendable {
     case machineName(String)
 }
 
+extension Duration {
+    /// This duration in whole milliseconds, for comparison against the
+    /// millisecond clocks the transport uses (`TransportClient.now`). Truncates
+    /// sub-millisecond precision, which none of these thresholds care about.
+    var milliseconds: Int64 {
+        let (seconds, attoseconds) = components
+        return seconds * 1_000 + attoseconds / 1_000_000_000_000_000
+    }
+}
+
 /// The reconnect backoff schedule (REMOTE_PROTOCOL §5.3): exponential from a 1s
 /// floor, capped at 60s, plus up to +25% jitter — byte-for-byte the desktop's
 /// `backoff_delay`. Pure and unit-tested.

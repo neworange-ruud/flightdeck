@@ -183,23 +183,22 @@ final class PairingRecordStore {
         return record
     }
 
-    /// Force `pairingId`'s outbound cursor back to 0 after the relay rejected our
-    /// stream as non-monotonic — it lost its in-memory watermark (restart/
-    /// redeploy) while we kept ours (remote-control-bbf). Unlike `setLastSentSeq`
-    /// this is NOT monotonic: it deliberately rewinds so the next command
-    /// restarts at seq 1, which a fresh relay accepts.
-    @discardableResult
-    func resetOutboundCursor(pairingId: String) throws -> PairingRecord? {
-        guard var record = try load(pairingId: pairingId) else { return nil }
-        record.lastSentSeq = 0
-        try save(record)
-        return record
-    }
+    // There is deliberately no `resetOutboundCursor`. Rewinding `lastSentSeq` to
+    // 0 was the old response to a relay `seq_violation` (remote-control-bbf),
+    // written for a relay that came back from a restart with an empty in-memory
+    // watermark. Against a relay that *persists* its watermark it never
+    // terminates — the relay expects seq 60, the phone restarts at 1, the relay
+    // rejects it, the phone rewinds and restarts at 1 again (remote-control-arg,
+    // and the "cursors lost on an app update" symptom in remote-control-h1y).
+    // The relay now adopts an unknown stream's starting seq and absorbs a genuine
+    // rewind itself, so nothing on the phone should ever renumber a stream it is
+    // successfully sending. `setLastSentSeq` is monotonic on purpose.
 
     /// Force `pairingId`'s inbound cursor to `seq`, rewinding it if necessary,
-    /// when the desktop restarts its outbound stream after a relay seq reset.
+    /// when the desktop restarts its outbound stream, or when the relay tells us
+    /// our inbound cursor is stale (`seq_violation` → reset to 0 and re-resume).
     /// Unlike `setLastReceivedSeq` this is NOT monotonic — the new epoch
-    /// legitimately begins below the old cursor (remote-control-bbf).
+    /// legitimately begins below the old cursor (remote-control-bbf/-arg).
     @discardableResult
     func resetInboundCursor(to seq: UInt64, pairingId: String) throws -> PairingRecord? {
         guard var record = try load(pairingId: pairingId) else { return nil }
@@ -236,12 +235,6 @@ final class PairingRecordStore {
     func setLastReceivedSeq(_ seq: UInt64) throws -> PairingRecord? {
         guard let pairingId = try loadAll().first?.pairingId else { return nil }
         return try setLastReceivedSeq(seq, pairingId: pairingId)
-    }
-
-    @discardableResult
-    func resetOutboundCursor() throws -> PairingRecord? {
-        guard let pairingId = try loadAll().first?.pairingId else { return nil }
-        return try resetOutboundCursor(pairingId: pairingId)
     }
 
     @discardableResult

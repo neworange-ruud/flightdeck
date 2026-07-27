@@ -212,7 +212,7 @@ async fn sqlite_store_survives_a_restart() {
     // divergence bug (remote-control-bbf) after an in-memory relay restart.
     assert_eq!(
         store.enqueue(envelope(&pairing, Role::Desktop, 5)).await,
-        Err(QueueError::SeqViolation {
+        Err(QueueError::Gap {
             expected: 4,
             got: 5
         }),

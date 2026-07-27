@@ -5,11 +5,23 @@
 //! from the relay's side. One [`SenderQueue`] holds the outbound envelopes of a
 //! single `(pairing_id, sender_role)` stream:
 //!
-//! - **Gapless monotonic seq (§6.1).** Envelopes carry a per-stream `seq`
-//!   starting at 1. The relay accepts `seq == high_water + 1`, tolerates a
-//!   re-send of the current high-water `seq` as an idempotent no-op (reconnect
-//!   races), and rejects anything else as a protocol error (see the §6 v1
-//!   amendment in `specs/REMOTE_PROTOCOL.md`).
+//! - **Gapless monotonic seq (§6.1).** Envelopes carry a per-stream `seq`. The
+//!   relay accepts `seq == high_water + 1`, tolerates a re-send of the current
+//!   high-water `seq` as an idempotent no-op (reconnect races), and rejects a
+//!   forward *gap* as a protocol error (see the §6 v1 amendment in
+//!   `specs/REMOTE_PROTOCOL.md`).
+//! - **The sender owns its cursor; the relay follows it.** Two cases would
+//!   otherwise deadlock a sender against the relay's watermark, so neither is an
+//!   error (remote-control-arg):
+//!   - a stream the relay has never seen (`high_water == 0`) **adopts** whatever
+//!     `seq` the first envelope carries, instead of demanding 1. This is the
+//!     relay-restarted-with-an-empty-store case: the sender kept its persisted
+//!     cursor at 59 and the receiver kept its matching one, so starting the
+//!     relay's watermark at 60 is exactly right — and demanding 1 would reject
+//!     every envelope forever.
+//!   - a sender whose `seq` **rewinds** below the watermark lost its cursor
+//!     (reinstall, restored backup) and restarted its stream. [`SenderQueue::reset`]
+//!     abandons the old epoch so the restarted one is accepted.
 //! - **Hold while offline / un-acked.** Accepted envelopes are buffered so a
 //!   peer that reconnects can [`SenderQueue::replay`] them.
 //! - **Cumulative ack (§6.2).** [`SenderQueue::ack`] prunes everything `<=
@@ -28,13 +40,32 @@ use flightdeck_remote_protocol::EncryptedEnvelope;
 /// Why an inbound envelope was refused by a [`SenderQueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
-    /// `seq` regressed below, or skipped past, the expected next value. The
-    /// stream's gapless invariant would be broken; the envelope is dropped and
-    /// the sender should receive a `bad_frame` error.
-    SeqViolation {
+    /// `seq` skipped **past** the expected next value on a stream the relay is
+    /// already tracking: the sender is ahead of us and the envelopes in between
+    /// never arrived. Delivering this one would break the stream's gapless
+    /// invariant, so it is dropped and the sender is told to re-sync.
+    Gap {
         /// The `seq` the relay expected (`high_water + 1`).
         expected: u64,
         /// The `seq` that actually arrived.
+        got: u64,
+    },
+    /// `seq` fell **below** the watermark: the sender lost its outbound cursor
+    /// (reinstall, restored backup, cleared state) and restarted its stream from
+    /// the beginning. Not a client bug and **not** recoverable by telling the
+    /// sender to re-sync — it has no cursor left to drop and nothing to move
+    /// forward to, so it would restart at the same low `seq` forever
+    /// (remote-control-arg).
+    ///
+    /// The caller must instead abandon the old epoch on the relay's side —
+    /// [`SenderQueue::reset`], reached through
+    /// [`RelayStore::reset_stream`][crate::store::RelayStore::reset_stream] —
+    /// and re-append, then tell the *peer* to drop its now-stale inbound cursor
+    /// so it does not dedup the restarted seqs away.
+    Rewind {
+        /// The `seq` the relay expected (`high_water + 1`).
+        expected: u64,
+        /// The `seq` that actually arrived — the restarted stream's first.
         got: u64,
     },
 }
@@ -143,7 +174,18 @@ impl SenderQueue {
     /// Accept (or reject / dedup) an inbound envelope by its `seq`.
     pub fn append(&mut self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError> {
         let expected = self.high_water + 1;
-        if env.seq == expected {
+        // seq 0 is not a valid stream position — §6.1 streams start at 1. Reject
+        // it up front: the adoption path below would otherwise underflow on
+        // `env.seq - 1`. Reported as a gap (never a rewind) so a malformed frame
+        // can never talk the relay into discarding a live stream's epoch.
+        if env.seq == 0 {
+            return Err(QueueError::Gap { expected, got: 0 });
+        }
+        // A stream we have never seen adopts the sender's cursor rather than
+        // demanding it start at 1 (see the module docs): the relay's watermark
+        // is a follower of the sender's, not an independent authority.
+        let adopting = self.high_water == 0;
+        if env.seq == expected || adopting {
             let overflow = self.buf.len() >= self.max_len;
             if overflow {
                 // Drop the oldest un-acked envelope to make room. The dropped
@@ -152,17 +194,49 @@ impl SenderQueue {
                 self.buf.pop_front();
             }
             self.high_water = env.seq;
+            if adopting {
+                // Adopting mid-stream means everything below the adopted seq is
+                // neither held nor owed: park the ack cursor just under it so
+                // `resume` reads the buffer's front as contiguous rather than as
+                // an overflow-shed hole. Only on adoption — doing this on every
+                // accept would drag `ack_cursor` along with `high_water` and
+                // make `ack` a no-op.
+                self.ack_cursor = self.ack_cursor.max(env.seq - 1);
+            }
             self.buf.push_back(env);
             Ok(AppendOutcome::Accepted { overflow })
-        } else if self.high_water > 0 && env.seq == self.high_water {
+        } else if env.seq == self.high_water {
             // Idempotent re-send of the current head; tolerate silently.
             Ok(AppendOutcome::Duplicate)
+        } else if env.seq < self.high_water {
+            Err(QueueError::Rewind {
+                expected,
+                got: env.seq,
+            })
         } else {
-            Err(QueueError::SeqViolation {
+            Err(QueueError::Gap {
                 expected,
                 got: env.seq,
             })
         }
+    }
+
+    /// Abandon this stream's current epoch and restart it at `next_seq`: discard
+    /// every buffered envelope from the old epoch and park both cursors just
+    /// below `next_seq`, so the very next [`Self::append`] of `next_seq` is
+    /// accepted as the new epoch's first envelope.
+    ///
+    /// Used when a sender's `seq` [rewinds][QueueError::Rewind] — it lost its
+    /// cursor and started over, so the envelopes we still hold belong to a
+    /// stream that no longer exists. Dropping them is deliberate: the peer is
+    /// told to re-sync and pulls a fresh snapshot, which supersedes anything the
+    /// abandoned epoch was still carrying. `next_seq` of 0 is treated as 1 (a
+    /// stream's first seq is 1); no envelope can carry seq 0.
+    pub fn reset(&mut self, next_seq: u64) {
+        let floor = next_seq.max(1) - 1;
+        self.high_water = floor;
+        self.ack_cursor = floor;
+        self.buf.clear();
     }
 
     /// The retained (un-acked, un-dropped) envelopes in ascending-`seq` order —
@@ -202,6 +276,21 @@ impl SenderQueue {
     /// zeroes its cursor for this pairing and asks its peer for a fresh
     /// snapshot (restarting the peer's stream), so no new wire frame is needed.
     pub fn resume(&self, from_seq: u64) -> ResumeOutcome {
+        // The receiver's cursor sits ABOVE everything this stream has ever
+        // accepted. That means the sender restarted its stream under the
+        // receiver (a [`Self::reset`] after a rewind) while the receiver kept
+        // the old epoch's cursor, so every seq the new epoch will ever emit
+        // looks like a duplicate to it and gets deduped away forever
+        // (remote-control-arg). Tell it to resync instead of handing back an
+        // empty replay that reads as "you're up to date".
+        //
+        // Guarded on a stream we actually know: `high_water == 0` is a stream
+        // the relay has never seen, which adopts the sender's cursor on its
+        // first envelope — a receiver resuming from 59 there is about to be
+        // matched by a sender adopting 60, so nothing is stale.
+        if self.high_water > 0 && from_seq > self.high_water {
+            return ResumeOutcome::Resync;
+        }
         if let Some(front) = self.buf.front() {
             // The front can sit above `ack_cursor + 1` in exactly one case:
             // drop-oldest overflow shed un-acked seqs (see [`Self::append`]).
@@ -258,6 +347,15 @@ mod tests {
         }
     }
 
+    /// The seqs a `Replay` carries; panics on a `Resync` so a test that expected
+    /// a clean replay fails loudly rather than comparing against an empty vec.
+    fn replayed_seqs(outcome: ResumeOutcome) -> Vec<u64> {
+        match outcome {
+            ResumeOutcome::Replay(v) => v.iter().map(|e| e.seq).collect(),
+            ResumeOutcome::Resync => panic!("expected a clean replay, got Resync"),
+        }
+    }
+
     #[test]
     fn accepts_gapless_sequence_from_one() {
         let mut q = SenderQueue::new(100);
@@ -277,7 +375,7 @@ mod tests {
         assert!(q.append(env(1)).is_ok());
         assert_eq!(
             q.append(env(3)),
-            Err(QueueError::SeqViolation {
+            Err(QueueError::Gap {
                 expected: 2,
                 got: 3
             })
@@ -287,17 +385,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_regression() {
+    fn reports_a_regression_as_rewind_not_gap() {
+        // remote-control-arg: a sender BEHIND the watermark lost its cursor and
+        // restarted. That is a different failure from a sender ahead of us, and
+        // the caller must be able to tell them apart — a gap asks the sender to
+        // re-sync, a rewind asks the RELAY to abandon its epoch.
         let mut q = SenderQueue::new(100);
         assert!(q.append(env(1)).is_ok());
         assert!(q.append(env(2)).is_ok());
+        assert!(q.append(env(3)).is_ok());
         assert_eq!(
             q.append(env(1)),
-            Err(QueueError::SeqViolation {
-                expected: 3,
+            Err(QueueError::Rewind {
+                expected: 4,
                 got: 1
             })
         );
+        // Nothing was mutated by the rejection.
+        assert_eq!(q.high_water(), 3);
+        assert_eq!(q.len(), 3);
     }
 
     #[test]
@@ -311,15 +417,151 @@ mod tests {
     }
 
     #[test]
-    fn first_envelope_must_be_one() {
+    fn unknown_stream_adopts_the_senders_cursor() {
+        // remote-control-arg: a relay that came up with an empty store has no
+        // watermark, but the sender and receiver still hold matching cursors
+        // from before. Demanding seq 1 would reject every envelope the sender
+        // will ever send. Adopt its cursor instead.
         let mut q = SenderQueue::new(100);
         assert_eq!(
-            q.append(env(5)),
-            Err(QueueError::SeqViolation {
-                expected: 1,
-                got: 5
+            q.append(env(60)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(q.high_water(), 60);
+        // The stream then continues gaplessly from the adopted point.
+        assert_eq!(
+            q.append(env(61)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(
+            q.append(env(63)),
+            Err(QueueError::Gap {
+                expected: 62,
+                got: 63
             })
         );
+        // A receiver that resumes from the matching pre-existing cursor gets a
+        // clean replay of the adopted epoch, NOT a spurious resync: adoption
+        // parked `ack_cursor` at 59, so the front is contiguous.
+        assert_eq!(
+            replayed_seqs(q.resume(59)),
+            vec![60, 61],
+            "an adopted stream must replay cleanly to the matching cursor"
+        );
+    }
+
+    #[test]
+    fn seq_zero_is_rejected_as_a_gap_on_any_stream() {
+        // seq 0 is not a valid position. On a FRESH stream it must not reach the
+        // adoption path (which would underflow computing `seq - 1`), and on a
+        // live stream it must not be mistaken for a rewind — a malformed frame
+        // must never talk the relay into discarding a real epoch.
+        let mut fresh = SenderQueue::new(100);
+        assert_eq!(
+            fresh.append(env(0)),
+            Err(QueueError::Gap {
+                expected: 1,
+                got: 0
+            })
+        );
+        assert_eq!(fresh.high_water(), 0, "a rejected frame changes nothing");
+
+        let mut live = SenderQueue::new(100);
+        for seq in 1..=5 {
+            live.append(env(seq)).unwrap();
+        }
+        assert_eq!(
+            live.append(env(0)),
+            Err(QueueError::Gap {
+                expected: 6,
+                got: 0
+            })
+        );
+        assert_eq!(live.high_water(), 5);
+        assert_eq!(live.len(), 5);
+    }
+
+    #[test]
+    fn reset_abandons_the_epoch_and_restarts_the_stream() {
+        // remote-control-arg: the sender lost its cursor and restarted at 1. The
+        // envelopes we hold belong to an epoch that no longer exists.
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=60 {
+            q.append(env(seq)).unwrap();
+        }
+        assert_eq!(q.high_water(), 60);
+
+        q.reset(1);
+        assert_eq!(q.high_water(), 0);
+        assert_eq!(q.ack_cursor(), 0);
+        assert!(
+            q.is_empty(),
+            "the abandoned epoch's envelopes are discarded"
+        );
+
+        // The restarted stream is now accepted from its first envelope.
+        assert_eq!(
+            q.append(env(1)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(
+            q.append(env(2)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(q.high_water(), 2);
+    }
+
+    #[test]
+    fn reset_to_a_mid_stream_seq_parks_the_cursors_just_below_it() {
+        // A sender whose cursor came back at 4 restarts at 5, not 1.
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=60 {
+            q.append(env(seq)).unwrap();
+        }
+        q.reset(5);
+        assert_eq!(q.high_water(), 4);
+        assert_eq!(q.ack_cursor(), 4);
+        assert_eq!(
+            q.append(env(5)),
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        // And a seq below the reset point is still a rewind, not silently taken.
+        assert_eq!(
+            q.append(env(2)),
+            Err(QueueError::Rewind {
+                expected: 6,
+                got: 2
+            })
+        );
+    }
+
+    #[test]
+    fn resume_above_high_water_signals_resync() {
+        // remote-control-arg: after a reset the receiver still holds the OLD
+        // epoch's cursor. Every seq the new epoch emits looks like a duplicate
+        // to it, so an empty replay ("you're up to date") strands it forever.
+        let mut q = SenderQueue::new(100);
+        for seq in 1..=60 {
+            q.append(env(seq)).unwrap();
+        }
+        q.ack(60);
+        q.reset(1);
+        q.append(env(1)).unwrap();
+
+        // The peer's cursor (60) is above everything this stream now holds.
+        assert_eq!(q.resume(60), ResumeOutcome::Resync);
+        // A receiver in step with the new epoch is served normally.
+        assert_eq!(replayed_seqs(q.resume(0)), vec![1]);
+        assert_eq!(q.resume(1), ResumeOutcome::Replay(vec![]));
+    }
+
+    #[test]
+    fn resume_above_high_water_on_an_unseen_stream_is_clean() {
+        // The guard must not fire for a stream the relay has never seen: the
+        // sender is about to ADOPT a cursor that matches this receiver's, so
+        // there is nothing stale to resync.
+        let q = SenderQueue::new(100);
+        assert_eq!(q.resume(59), ResumeOutcome::Replay(vec![]));
     }
 
     #[test]

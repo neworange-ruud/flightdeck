@@ -157,8 +157,21 @@ pub trait RelayStore: Send + Sync {
     async fn sweep_expired_claims(&self, now_ms: i64) -> usize;
 
     /// Append an outbound envelope to its `(pairing, sender)` queue, enforcing
-    /// gapless sequencing and the bound. `Err` means the seq was invalid.
+    /// gapless sequencing and the bound. `Err` means the seq was invalid — see
+    /// [`QueueError`] for the two cases and their different recoveries.
     async fn enqueue(&self, env: EncryptedEnvelope) -> Result<AppendOutcome, QueueError>;
+
+    /// Abandon the `sender` stream of `pairing` and restart it at `next_seq`,
+    /// discarding every envelope still buffered from the old epoch
+    /// ([`SenderQueue::reset`]).
+    ///
+    /// The recovery for [`QueueError::Rewind`]: a sender that lost its cursor
+    /// restarted its stream, so the relay's watermark — and the envelopes it
+    /// holds — describe a stream that no longer exists. Telling the *sender* to
+    /// re-sync cannot work (it has no cursor left to drop), so the relay drops
+    /// its own instead (remote-control-arg). The peer must separately be told to
+    /// re-sync so it does not dedup the restarted seqs away.
+    async fn reset_stream(&self, pairing: &PairingId, sender: Role, next_seq: u64);
 
     /// Service a `resume { from_seq }` against the `sender` stream of `pairing`.
     /// Returns the envelopes to replay (`seq > from_seq`, in order) or, when a
@@ -397,6 +410,16 @@ impl RelayStore for InMemoryStore {
             .entry(key)
             .or_insert_with(|| SenderQueue::new(max))
             .append(env)
+    }
+
+    async fn reset_stream(&self, pairing: &PairingId, sender: Role, next_seq: u64) {
+        let mut inner = self.lock();
+        let max = self.queue_max_per_pairing;
+        inner
+            .queues
+            .entry(QueueKey::new(pairing.clone(), sender))
+            .or_insert_with(|| SenderQueue::new(max))
+            .reset(next_seq);
     }
 
     async fn resume(&self, pairing: &PairingId, sender: Role, from_seq: u64) -> ResumeOutcome {
@@ -711,6 +734,101 @@ mod tests {
                 .await,
         );
         assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn reset_stream_abandons_the_epoch_and_leaves_the_peer_direction_alone() {
+        // remote-control-arg: the primitive backing the rewind recovery. It must
+        // wipe ONE direction's buffered epoch and touch nothing else.
+        let store = InMemoryStore::new(1000);
+        let pairing = PairingId::new("pair");
+        for seq in 1..=5 {
+            store.enqueue(env("pair", Role::Phone, seq)).await.unwrap();
+        }
+        store.enqueue(env("pair", Role::Desktop, 1)).await.unwrap();
+
+        store.reset_stream(&pairing, Role::Phone, 1).await;
+
+        // The abandoned epoch's envelopes are gone and the restarted stream is
+        // accepted from its first seq.
+        assert_eq!(
+            store.enqueue(env("pair", Role::Phone, 1)).await,
+            Ok(AppendOutcome::Accepted { overflow: false }),
+            "the restarted stream's first envelope must be accepted"
+        );
+        let p = replayed(store.resume(&pairing, Role::Phone, 0).await);
+        assert_eq!(
+            p.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1],
+            "only the new epoch's envelope is held"
+        );
+
+        // The opposite direction is untouched.
+        let d = replayed(store.resume(&pairing, Role::Desktop, 0).await);
+        assert_eq!(d.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn reset_stream_leaves_a_stale_peer_cursor_asking_for_a_resync() {
+        // The peer that was on the old epoch must not be told "you're up to
+        // date" — its cursor is above everything the reset stream now holds.
+        let store = InMemoryStore::new(1000);
+        let pairing = PairingId::new("pair");
+        for seq in 1..=60 {
+            store.enqueue(env("pair", Role::Phone, seq)).await.unwrap();
+        }
+        store.ack(&pairing, Role::Phone, 60).await;
+
+        store.reset_stream(&pairing, Role::Phone, 1).await;
+        store.enqueue(env("pair", Role::Phone, 1)).await.unwrap();
+
+        assert_eq!(
+            store.resume(&pairing, Role::Phone, 60).await,
+            ResumeOutcome::Resync,
+            "a peer still on the abandoned epoch must be told to resync"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_stream_on_an_unknown_stream_is_a_harmless_no_op() {
+        let store = InMemoryStore::new(1000);
+        let pairing = PairingId::new("pair");
+        store.reset_stream(&pairing, Role::Phone, 1).await;
+        assert_eq!(
+            store.enqueue(env("pair", Role::Phone, 1)).await,
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewound_sender_is_reported_as_rewind_not_gap() {
+        // The signal the session keys its recovery off (remote-control-arg).
+        let store = InMemoryStore::new(1000);
+        for seq in 1..=60 {
+            store.enqueue(env("pair", Role::Phone, seq)).await.unwrap();
+        }
+        assert_eq!(
+            store.enqueue(env("pair", Role::Phone, 1)).await,
+            Err(QueueError::Rewind {
+                expected: 61,
+                got: 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_stream_adopts_the_senders_cursor() {
+        // A relay that came up with an empty store must not demand seq 1 from a
+        // sender whose persisted cursor is at 59 (remote-control-arg).
+        let store = InMemoryStore::new(1000);
+        assert_eq!(
+            store.enqueue(env("pair", Role::Phone, 60)).await,
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
+        assert_eq!(
+            store.enqueue(env("pair", Role::Phone, 61)).await,
+            Ok(AppendOutcome::Accepted { overflow: false })
+        );
     }
 
     #[tokio::test]

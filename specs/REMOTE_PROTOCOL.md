@@ -370,11 +370,42 @@ Application payloads are carried by `envelope` frames wrapping an
   for a peer that is currently disconnected (bounded by "the Mac must be
   running" — PRD §9).
 - **Seq-gap enforcement (v1 amendment).** The relay rejects an inbound envelope
-  whose `seq` is not exactly `high_water + 1` for its (pairing, sender) — a
-  regression or a gap is a `bad_frame` error and the envelope is not queued. A
-  duplicate re-send of the current high-water `seq` is tolerated as an idempotent
-  no-op (reconnect races), not an error. This makes the queue's ordering
-  guarantee exact rather than best-effort.
+  whose `seq` is **greater** than `high_water + 1` for its (pairing, sender) — a
+  forward gap means envelopes went missing, so it is answered with
+  `error { code: seq_violation }` and not queued. A duplicate re-send of the
+  current high-water `seq` is tolerated as an idempotent no-op (reconnect races),
+  not an error. This makes the queue's ordering guarantee exact rather than
+  best-effort.
+- **The sender owns its cursor; the relay follows it (v1 amendment,
+  remote-control-arg).** The relay's `high_water` is a *cache* of the sender's
+  cursor, not an independent authority, so the two cases where they legitimately
+  disagree are not errors:
+  - **Unknown stream.** The first envelope on a (pairing, sender) the relay has
+    no record of is accepted at whatever `seq` it carries, and `high_water`
+    adopts it. A relay that came up with an empty store must not demand `seq 1`
+    from endpoints that both still hold matching cursors from before — that
+    rejects every envelope the sender will ever send.
+  - **Rewind.** A `seq` *below* `high_water` means the sender lost its cursor
+    (reinstall, restored backup) and restarted its stream. The relay abandons its
+    own epoch for that direction — discarding the envelopes it still holds, which
+    belong to a stream that no longer exists — adopts the restarted cursor, and
+    accepts the envelope. `seq_violation` is **not** the right answer here: the
+    sender has no cursor left to drop and nothing to move forward to, so it
+    restarts at the same low `seq` and is rejected again, forever.
+
+  Because the relay absorbs both, **an endpoint must never renumber an outbound
+  stream it is successfully sending.** Rewinding `last_sent_seq` was the v1
+  response to `seq_violation`; against a relay that *persists* `high_water` it
+  livelocks (remote-control-arg).
+- **`seq_violation` means "your INBOUND cursor is stale".** It is sent to a
+  receiver whose view of a stream is no longer serviceable: its peer restarted
+  the stream (above), or a drop-oldest overflow shed envelopes it still needs
+  (§6.3). The receiver drops its `last_received_seq` for that pairing,
+  re-`resume`s from 0, and requests a fresh snapshot. It never changes the
+  receiver's own outbound sequencing. When a rewind resets a stream, the relay
+  sends this advisory to the peer *before* forwarding the restarted envelope, so
+  the peer's dedup does not discard the new epoch's seqs as duplicates; a peer
+  that is offline or misses it is caught by the `resume` rule in §6.3.
 - **Queue bound & overflow (v1 amendment).** Each (pairing, sender) buffer is
   bounded to `QUEUE_MAX_PER_PAIRING` un-acked envelopes (default 1000). On
   overflow the relay drops the **oldest** buffered envelope to make room for the
@@ -400,6 +431,21 @@ After (re)connecting and authenticating, a client sends
 envelope with `seq > from_seq`, in order, then resumes live delivery. A fresh
 install / first connect sends `from_seq: 0`.
 
+The relay answers `error { code: seq_violation }` instead of a replay when the
+resume cannot be served without stranding the receiver:
+
+- `from_seq` precedes the oldest envelope still buffered, because a drop-oldest
+  overflow shed the ones in between. Replaying would hand the receiver a stream
+  with a permanent hole its gapless enforcement stalls on.
+- `from_seq` is **above** the stream's `high_water` on a stream the relay knows.
+  The sender restarted underneath this receiver (§6.1 rewind) while it kept the
+  old epoch's cursor, so every `seq` the new epoch emits would be deduped away as
+  a duplicate. An empty replay here reads as "you are up to date" and strands the
+  receiver silently — the failure mode in remote-control-arg.
+
+Either way the receiver applies the §6.1 `seq_violation` recovery: drop
+`last_received_seq`, re-`resume` from 0, request a fresh snapshot.
+
 ### 6.4 Dedup / idempotency (normative)
 
 Redelivery is expected (reconnect races, at-least-once relay). Receivers must be
@@ -407,7 +453,12 @@ idempotent:
 
 - **Envelope dedup:** a receiver tracks the highest processed `seq` per
   (pairing, sender) and **ignores any envelope whose `seq` is ≤ that**. Ordered,
-  gapless `seq` makes this exact, not best-effort.
+  gapless `seq` makes this exact, not best-effort. **Exception — stream
+  restart:** a `seq` of 1 while the receiver holds a cursor ≥ 1 is not a
+  duplicate. A healthy stream is monotonic and never re-emits 1, so this can only
+  be the peer having lost its cursor and restarted (§6.1 rewind, which the relay
+  adopts). Deduping it discards the recovered stream silently and forever, so the
+  receiver must accept it and reset its cursor to the new epoch.
 - **Command idempotency:** every `PhoneCommand` carries a client-generated
   `command_id`. The desktop keeps a record of processed command IDs. Re-receiving
   a known `command_id` must be a **no-op that re-emits the original outcome** —
