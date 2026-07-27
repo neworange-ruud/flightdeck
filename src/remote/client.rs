@@ -1512,7 +1512,15 @@ fn handle_frame(
                 .pairing(&key)
                 .map(|p| p.last_received_seq)
                 .unwrap_or(0);
-            if env.seq > last {
+            // Accept a strictly-newer seq (normal dedup, spec §6.4), OR an
+            // explicit stream restart: seq 1 while we hold a higher cursor is the
+            // peer having lost its outbound cursor and started over, which the
+            // relay adopts rather than rejecting (remote-control-arg). A healthy
+            // stream is monotonic and never re-emits seq 1, so this can only be a
+            // genuine restart — dedup it away and the recovered feed is dropped
+            // silently, forever. Mirrors the phone's rule in `TransportClient`.
+            let is_reset = env.seq == 1 && last >= 1;
+            if env.seq > last || is_reset {
                 if let Some(p) = state.pairing_mut(&key) {
                     p.last_received_seq = env.seq;
                 }
@@ -1654,20 +1662,37 @@ fn handle_frame(
                 "client RECV error seq_violation pairing={:?}",
                 pairing_id.as_ref().map(|p| p.as_str())
             ));
-            // The relay is ahead-of-us on this pairing's outbound seq — it lost
-            // its in-memory watermark (restart/redeploy) while we kept ours. Do
-            // NOT tear the connection down (that just reconnects into the same
-            // rejection forever). Re-sync: zero this pairing's persisted outbound
-            // cursor and tell the bridge to restart its stream from seq 1 with a
-            // fresh snapshot (remote-control-bbf). A `seq_violation` without a
-            // pairing id can't be targeted, so it is ignored (non-fatal).
+            // `seq_violation` means exactly one thing: our INBOUND cursor for
+            // this pairing is stale — the peer restarted its outbound stream (or
+            // the relay shed envelopes we still needed), so the seqs now arriving
+            // sit below what we last saw and our dedup would throw them away.
+            // Drop the cursor, re-resume from scratch to pull whatever the relay
+            // still holds, and ask for a fresh snapshot. Never fatal: tearing the
+            // connection down just reconnects into the same advisory forever.
+            //
+            // It does NOT mean "rewind your outbound cursor". It used to
+            // (remote-control-bbf, when a restarted relay came back with an empty
+            // in-memory watermark), and that is precisely what livelocked a phone
+            // against a *persistent* relay: the relay's watermark was at 60, the
+            // endpoint restarted at 1, and each rejection drove another rewind to
+            // 1 (remote-control-arg). The relay now adopts an unknown stream's
+            // starting seq and absorbs a genuine rewind itself, so an endpoint
+            // never needs to renumber a stream it is successfully sending.
+            //
+            // A `seq_violation` without a pairing id can't be targeted → ignored.
             if let Some(pid) = pairing_id {
                 if let Some(p) = state.pairing_mut(pid.as_str()) {
-                    p.last_sent_seq = 0;
-                    p.last_acked_by_peer = 0;
+                    p.last_received_seq = 0;
                     store.save(state);
                     gate.mark_clean();
                 }
+                let _ = send_frame(
+                    sock,
+                    &RelayFrame::Resume {
+                        pairing_id: pid.clone(),
+                        from_seq: 0,
+                    },
+                );
                 let _ = inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
             }
             true

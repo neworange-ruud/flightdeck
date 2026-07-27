@@ -109,11 +109,14 @@ import Foundation
         #expect(try store.load(pairingId: "pair_b")?.lastSentSeq == 3)
         #expect(try store.load(pairingId: "pair_b")?.lastReceivedSeq == 9)
 
-        // Non-monotonic reset rewinds only the targeted pairing.
-        try store.resetOutboundCursor(pairingId: "pair_a")
+        // The non-monotonic inbound reset rewinds only the targeted pairing.
         try store.resetInboundCursor(to: 2, pairingId: "pair_a")
-        #expect(try store.load(pairingId: "pair_a")?.lastSentSeq == 0)
         #expect(try store.load(pairingId: "pair_a")?.lastReceivedSeq == 2)
+        #expect(try store.load(pairingId: "pair_b")?.lastReceivedSeq == 9)
+        // The OUTBOUND cursor has no reset at all and stays put: rewinding it is
+        // what livelocked the phone against a persistent relay
+        // (remote-control-arg / -h1y).
+        #expect(try store.load(pairingId: "pair_a")?.lastSentSeq == 7)
         #expect(try store.load(pairingId: "pair_b")?.lastSentSeq == 3)
     }
 

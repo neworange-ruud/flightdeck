@@ -47,4 +47,15 @@ import Foundation
             }
         }
     }
+
+    /// `Duration.milliseconds` backs the "did this session actually last?" check
+    /// that bounds the reconnect loop (remote-control-arg), so it has to agree
+    /// with the hand-rolled conversion the rest of this suite uses.
+    @Test func durationMillisecondsMatchesComponentMath() {
+        #expect(Duration.seconds(30).milliseconds == 30_000)
+        #expect(Duration.milliseconds(1_500).milliseconds == 1_500)
+        #expect(Duration.zero.milliseconds == 0)
+        #expect(ms(Backoff.delay(attempt: 3, jitterUnit: 0))
+                == Backoff.delay(attempt: 3, jitterUnit: 0).milliseconds)
+    }
 }

@@ -122,17 +122,22 @@ pub enum RemoteInbound {
         /// The pairing the phone revoked.
         pairing_id: PairingId,
     },
-    /// The relay rejected an outbound envelope with `seq_violation`: our outbound
-    /// cursor is ahead of the relay's expected next `seq`, almost always because
-    /// the relay lost its in-memory per-pairing watermark across a restart while
-    /// we kept our persisted one (remote-control-bbf). The client has already
-    /// reset this pairing's persisted `last_sent_seq` to 0; the outbound bridge
-    /// must reset its live `out_seq` to 0 and re-send a full snapshot so the
-    /// stream restarts gaplessly from `seq = 1` (which a fresh relay accepts, and
-    /// which the phone treats as an explicit stream reset). Recovering this way
-    /// avoids the infinite fatal-reconnect loop the rejection used to cause.
+    /// The relay sent a `seq_violation` advisory for this pairing: our **inbound**
+    /// cursor is stale, because the peer restarted its outbound stream or the
+    /// relay shed envelopes we still needed. The client has already zeroed this
+    /// pairing's persisted `last_received_seq` and re-issued `resume { from_seq:
+    /// 0 }`; the outbound bridge must re-send a full snapshot so the peer's view
+    /// is rebuilt from a known-good state rather than from deltas it may have
+    /// missed.
+    ///
+    /// The outbound stream is **not** renumbered. It was, once
+    /// (remote-control-bbf), back when a restarted relay came back with an empty
+    /// in-memory watermark — and against a *persistent* relay that rewind is what
+    /// deadlocked the stream (remote-control-arg). The relay now adopts an
+    /// unknown stream's starting seq and absorbs a peer's rewind itself, so
+    /// `out_seq` keeps counting up.
     SeqResync {
-        /// The pairing whose outbound stream must restart from `seq = 1`.
+        /// The pairing that must re-send a full snapshot.
         pairing_id: PairingId,
     },
 }

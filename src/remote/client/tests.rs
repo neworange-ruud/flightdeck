@@ -658,18 +658,20 @@ fn wait_for_connected(in_rx: &std::sync::mpsc::Receiver<RemoteInbound>) {
     panic!("client never reported Connected");
 }
 
-/// A restarted relay loses its in-memory per-pairing seq watermark while the
-/// desktop keeps its persisted outbound cursor. The desktop's next envelope
-/// (seq ahead of the fresh relay's 0) is rejected with `seq_violation`. The
-/// client must NOT tear the connection down and reconnect into the same
-/// rejection forever (remote-control-bbf); it must re-sync — zero the persisted
-/// outbound cursor and emit `SeqResync` — so the bridge restarts the stream from
-/// seq 1, which the fresh relay accepts. This is the desktop→phone
-/// "delivery resumes across a relay restart mid-pairing" acceptance: the mock
-/// only ever accepts ONE connection, so a fatal-reconnect regression could never
-/// deliver the resynced envelope and this test would fail.
+/// A `seq_violation` advisory means our INBOUND cursor is stale (the peer
+/// restarted its stream, or the relay shed envelopes we needed). The client must
+/// NOT tear the connection down and reconnect into the same advisory forever
+/// (remote-control-bbf); it must zero `last_received_seq`, re-`resume` from 0,
+/// and emit `SeqResync` so the bridge re-snapshots.
+///
+/// Critically it must NOT renumber the outbound stream. That rewind was the old
+/// recovery, and against a relay that persists its watermark it never
+/// terminates: restart at seq 1 → rejected → rewind → restart at seq 1
+/// (remote-control-arg). The mock only ever accepts ONE connection, so a
+/// fatal-reconnect regression could never deliver the follow-up envelope and
+/// this test would fail.
 #[test]
-fn seq_violation_triggers_resync_and_delivery_resumes() {
+fn seq_violation_resyncs_inbound_without_renumbering_the_outbound_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -690,27 +692,44 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
         }
 
         // The desktop sends its next outbound envelope at seq 6 (it persisted
-        // last_sent_seq = 5). A freshly-restarted relay expects seq 1 → reject.
+        // last_sent_seq = 5). The relay answers the resync advisory — about the
+        // desktop's INBOUND direction, not this envelope.
         let first = ws_recv_envelope(&mut ws);
         assert_eq!(first.seq, 6, "desktop resumes from its persisted cursor");
         ws_send(
             &mut ws,
             &RelayFrame::Error {
                 code: RelayErrorCode::SeqViolation,
-                message: "envelope seq is not gapless/monotonic".to_string(),
+                message: "peer restarted its stream; drop your inbound cursor and resync"
+                    .to_string(),
                 pairing_id: Some(PairingId::new("pair_test")),
             },
         );
 
-        // After re-syncing, the desktop restarts the stream from seq 1 on the
-        // SAME connection — a fresh relay accepts it; delivery has resumed.
+        // The desktop re-resumes from 0 to pull whatever the relay still holds.
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume {
+                pairing_id,
+                from_seq,
+            }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+                assert_eq!(from_seq, 0, "a resync re-resumes from scratch");
+            }
+            other => panic!("expected a re-resume, got {other:?}"),
+        }
+
+        // Delivery continues on the SAME connection, at the NEXT seq — the
+        // stream is never renumbered.
         let resynced = ws_recv_envelope(&mut ws);
-        assert_eq!(resynced.seq, 1, "stream restarts gaplessly from seq 1");
+        assert_eq!(
+            resynced.seq, 7,
+            "the outbound stream continues gaplessly; it must NOT restart at 1"
+        );
         ws_send(
             &mut ws,
             &RelayFrame::Ack {
                 pairing_id: PairingId::new("pair_test"),
-                cursor: 1,
+                cursor: 7,
             },
         );
     });
@@ -770,11 +789,12 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
     );
     assert!(!disconnected, "recovery must not tear the connection down");
 
-    // Play the bridge's resync response: restart the stream from seq 1.
+    // Play the bridge's resync response: re-snapshot on the SAME stream, which
+    // keeps counting up rather than restarting.
     out_tx
         .send(RemoteOutbound::SendEnvelope {
             pairing_id: PairingId::new("pair_test"),
-            seq: 1,
+            seq: 7,
             sent_at_ms: 2_000,
             nonce: "bg==".to_string(),
             ciphertext: "Y2lwaGVy".to_string(),
@@ -783,9 +803,9 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
 
     mock.join().unwrap();
 
-    // The persisted outbound cursor was zeroed on resync, then advanced to 1 as
-    // the fresh stream's first envelope was sent (the bridge owns the live
-    // counter; this is the client's persisted mirror for the next launch).
+    // The persisted OUTBOUND cursor advanced normally — the resync never touched
+    // it. Rewinding it here is exactly what livelocked the phone in
+    // remote-control-arg.
     let mut settled = 0;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -795,16 +815,112 @@ fn seq_violation_triggers_resync_and_delivery_resumes() {
             .pairing("pair_test")
             .map(|p| p.last_sent_seq)
             .unwrap_or(0);
-        if settled == 1 {
+        if settled == 7 {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
-        settled, 1,
-        "outbound cursor resets on resync then advances from seq 1"
+        settled, 7,
+        "a resync must leave the outbound cursor advancing, never rewind it"
     );
 
+    // ...while the INBOUND cursor was dropped, so the peer's restarted stream is
+    // not deduped away on the next launch.
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_received_seq),
+        Some(0),
+        "a resync drops the stale inbound cursor"
+    );
+
+    handle.stop();
+}
+
+/// The peer lost its outbound cursor and restarted its stream at seq 1 while we
+/// hold a much higher inbound cursor. Plain `seq > last` dedup throws every
+/// envelope of the restarted stream away — silently, forever — so the phone's
+/// commands would never reach the desktop again (remote-control-arg). A seq of 1
+/// under a non-zero cursor can only be a genuine restart (a healthy stream is
+/// monotonic and never re-emits 1), so it must be accepted. Mirrors the rule the
+/// phone already applies to the desktop's stream.
+#[test]
+fn a_peers_restarted_stream_is_accepted_not_deduped_away() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume, got {other:?}"),
+        }
+
+        // The peer restarted: its stream now begins again at seq 1, well below
+        // our persisted inbound cursor of 40.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_test"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 3_000,
+                nonce: "bg==".to_string(),
+                ciphertext: "Y2lwaGVy".to_string(),
+            }),
+        );
+
+        // Accepting it means auto-acking it. A dedup regression sends nothing
+        // and this read times out.
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Ack { cursor, .. }) => {
+                assert_eq!(cursor, 1, "the restarted envelope must be acked");
+            }
+            other => panic!("expected an ack for the restarted stream, got {other:?}"),
+        }
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut pairing = Pairing::new("pair_test");
+    pairing.last_received_seq = 40; // we are far ahead of the peer's restart
+    seed.pairings.push(pairing);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    wait_for_connected(&in_rx);
+
+    // The restarted envelope must reach the app, not be swallowed by dedup.
+    let mut delivered = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !delivered {
+        if let Ok(RemoteInbound::Envelope(env)) = in_rx.recv_timeout(Duration::from_millis(250)) {
+            assert_eq!(env.seq, 1);
+            delivered = true;
+        }
+    }
+    assert!(
+        delivered,
+        "a peer's restarted stream must be delivered, not deduped away"
+    );
+
+    mock.join().unwrap();
     handle.stop();
 }
 

@@ -778,18 +778,24 @@ fn switching_pairing_restarts_outbound_seq() {
     );
 }
 
-/// A `SeqResync` (the relay rejected our outbound seq after losing its watermark)
-/// restarts the active pairing's outbound stream from seq 1 with a fresh full
-/// snapshot, so a restarted relay accepts it and the phone re-syncs.
+/// A `SeqResync` (the peer's inbound cursor is stale) re-sends a fresh full
+/// snapshot on the active pairing — WITHOUT renumbering the outbound stream.
+///
+/// The rewind this used to do (remote-control-bbf) is what livelocked the stream
+/// against a relay that persists its watermark: the restart at seq 1 was
+/// rejected, which drove another resync, which rewound again
+/// (remote-control-arg). The relay now absorbs a rewind itself, so `out_seq`
+/// must keep ascending.
 #[test]
-fn seq_resync_restarts_stream_from_seq_1_with_snapshot() {
+fn seq_resync_resnapshots_without_renumbering_the_stream() {
     let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
     let cache = GitStatusCache::new();
     let views = vec![view("proj", &app, &cache)];
 
     let mut b = paired_bridge();
     let first = collect_raw(&mut b, &views, 1_000);
-    assert!(first.iter().map(seq_of).max().unwrap() >= 1);
+    let high = first.iter().map(seq_of).max().unwrap();
+    assert!(high >= 1);
 
     b.handle_inbound(RemoteInbound::SeqResync {
         pairing_id: PairingId::new("pair-1"),
@@ -797,8 +803,8 @@ fn seq_resync_restarts_stream_from_seq_1_with_snapshot() {
     let after = collect_raw(&mut b, &views, 2_000);
     assert_eq!(
         seq_of(&after[0]),
-        1,
-        "resynced stream restarts gaplessly from seq 1"
+        high + 1,
+        "the resynced stream continues gaplessly; it must NOT restart at seq 1"
     );
     assert!(
         matches!(decode(&after[0]), DesktopToPhone::Snapshot(_)),

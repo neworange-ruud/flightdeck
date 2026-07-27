@@ -485,6 +485,218 @@ async fn envelope_seq_gap_is_rejected() {
     ));
 }
 
+#[tokio::test]
+async fn a_phone_whose_seq_rewinds_is_adopted_instead_of_looping_forever() {
+    // remote-control-arg, the reported P0. A phone came back from an app update
+    // having lost its outbound cursor and restarted at seq 1 while the relay's
+    // persisted watermark for that direction was far ahead. The relay answered
+    // `seq_violation` — "drop your stale cursor and resync" — but the phone had
+    // no cursor left to drop, so it restarted at 1 and was rejected again, at
+    // reconnect speed, forever. Every outbound message died while inbound kept
+    // working, which is why it looked like a connectivity flap.
+    //
+    // The relay must instead recognise a REWIND (as opposed to a forward gap),
+    // abandon its own epoch, and take the restarted stream.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // The phone's stream runs normally and the desktop consumes it, so the
+    // relay's phone→desktop watermark is genuinely ahead.
+    for seq in 1..=6 {
+        phone
+            .send(envelope(&pairing, Role::Phone, seq, "before-update"))
+            .await;
+    }
+    for expected in 1..=6 {
+        let f = desktop.recv_until(is_envelope).await;
+        assert_eq!(env_seq(&f), expected);
+    }
+    desktop
+        .send(RelayFrame::Ack {
+            pairing_id: pairing.clone(),
+            cursor: 6,
+        })
+        .await;
+
+    // The app updates; the phone comes back with its cursor at zero and
+    // restarts its stream from seq 1.
+    phone
+        .send(envelope(&pairing, Role::Phone, 1, "after-update"))
+        .await;
+
+    // It must NOT be rejected. The envelope is delivered to the desktop...
+    let forwarded = desktop.recv_until(is_envelope).await;
+    assert_eq!(
+        env_seq(&forwarded),
+        1,
+        "the restarted stream's first envelope must reach the peer"
+    );
+    match forwarded {
+        RelayFrame::Envelope(e) => assert_eq!(e.ciphertext, "after-update"),
+        other => panic!("expected an envelope, got {other:?}"),
+    }
+
+    // ...and the phone is never told its own stream is broken. (Presence and
+    // other housekeeping frames are fine; an `Error` is what the livelock was.)
+    phone
+        .expect_no_frame_matching(200, |f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+
+    // The restarted stream then continues normally, which is the part the
+    // livelock never reached.
+    phone
+        .send(envelope(&pairing, Role::Phone, 2, "still-working"))
+        .await;
+    let next = desktop.recv_until(is_envelope).await;
+    assert_eq!(env_seq(&next), 2);
+}
+
+#[tokio::test]
+async fn a_rewind_tells_the_peer_to_drop_its_stale_inbound_cursor() {
+    // The other half of remote-control-arg. Accepting the restarted stream is
+    // not enough: the PEER's inbound cursor is still on the abandoned epoch, so
+    // every seq of the new one looks like a duplicate it should dedup away. The
+    // relay must advise it to resync — and the advisory has to arrive BEFORE the
+    // restarted envelope, or the peer drops that envelope on the way past.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    for seq in 1..=6 {
+        phone
+            .send(envelope(&pairing, Role::Phone, seq, "old"))
+            .await;
+    }
+    for expected in 1..=6 {
+        assert_eq!(env_seq(&desktop.recv_until(is_envelope).await), expected);
+    }
+
+    phone.send(envelope(&pairing, Role::Phone, 1, "new")).await;
+
+    // The next two frames the desktop sees, in order: the resync advisory, then
+    // the restarted envelope.
+    let advisory = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. } | RelayFrame::Envelope(_)))
+        .await;
+    match advisory {
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            ref pairing_id,
+            ..
+        } => assert_eq!(pairing_id.as_ref(), Some(&pairing)),
+        other => panic!("expected the resync advisory first, got {other:?}"),
+    }
+    assert_eq!(env_seq(&desktop.recv_until(is_envelope).await), 1);
+}
+
+#[tokio::test]
+async fn a_peer_that_missed_the_advisory_is_resynced_on_its_next_resume() {
+    // The advisory is best-effort (non-blocking, and the peer may be offline
+    // entirely). A desktop that was away during the rewind must still learn its
+    // cursor is stale rather than being told "you're up to date" forever.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    for seq in 1..=6 {
+        phone
+            .send(envelope(&pairing, Role::Phone, seq, "old"))
+            .await;
+    }
+    for expected in 1..=6 {
+        assert_eq!(env_seq(&desktop.recv_until(is_envelope).await), expected);
+    }
+
+    // The desktop goes away, then the phone rewinds while it is gone.
+    let desktop_key = desktop.key();
+    desktop.close().await;
+    phone.send(envelope(&pairing, Role::Phone, 1, "new")).await;
+
+    // It reconnects (same device identity) and resumes from the old cursor.
+    let mut desktop =
+        TestClient::connect_with_key(&base, Role::Desktop, "dev_mac", desktop_key).await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    desktop
+        .send(RelayFrame::Resume {
+            pairing_id: pairing.clone(),
+            from_seq: 6,
+        })
+        .await;
+
+    let frame = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. } | RelayFrame::Envelope(_)))
+        .await;
+    match frame {
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            ..
+        } => {}
+        other => panic!("a resume above the reset stream must resync, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_relay_with_no_record_of_a_stream_adopts_the_senders_cursor() {
+    // The inverse case, and the reason endpoints no longer need to rewind their
+    // own cursor to recover (remote-control-bbf → remote-control-arg): a relay
+    // that came up with an empty store has no watermark, while the desktop and
+    // phone both still hold matching cursors from before. Demanding seq 1 would
+    // reject every envelope the desktop will ever send.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // First envelope this relay has ever seen for the stream, at seq 60.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 60, "resumed"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 60);
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 61, "next"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 61);
+
+    // A genuine forward gap on the now-known stream is still rejected.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 63, "gap"))
+        .await;
+    let err = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    assert!(matches!(
+        err,
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            ..
+        }
+    ));
+}
+
 // ── queue overflow ──────────────────────────────────────────────────────────
 
 #[tokio::test]

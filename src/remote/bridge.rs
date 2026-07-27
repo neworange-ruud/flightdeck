@@ -351,13 +351,20 @@ impl RemoteBridge {
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
             }
-            // The relay lost our outbound seq watermark (restart/redeploy) and
-            // rejected an envelope as non-monotonic. Restart this pairing's
-            // outbound stream from seq 1 with a fresh full snapshot so a fresh
-            // relay accepts it and the phone re-syncs (remote-control-bbf).
+            // The peer's view of this pairing is stale (it restarted its stream,
+            // or the relay shed envelopes it needed). Re-send a full snapshot so
+            // it rebuilds from known-good state instead of from deltas it may
+            // have missed.
+            //
+            // `out_seq` is deliberately left alone. Rewinding it to 0 here was
+            // the old recovery for a relay that came back with an empty
+            // watermark (remote-control-bbf); against a relay that *persists* its
+            // watermark the rewind is rejected, which drove another resync, which
+            // rewound again — the livelock in remote-control-arg. The relay now
+            // adopts an unknown stream's starting seq, so continuing to count up
+            // is both correct and the only thing that terminates.
             RemoteInbound::SeqResync { pairing_id } => {
                 if self.pairing.as_ref() == Some(&pairing_id) {
-                    self.out_seq = 0;
                     self.snapshot_needed = true;
                 }
             }

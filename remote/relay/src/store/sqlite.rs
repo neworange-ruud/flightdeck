@@ -588,6 +588,19 @@ impl RelayStore for SqliteStore {
         Ok(outcome)
     }
 
+    async fn reset_stream(&self, pairing: &PairingId, sender: Role, next_seq: u64) {
+        let mut conn = self.lock();
+        let tx = conn.transaction().expect(DB_ERR);
+        // Same shape as every other mutation here: rehydrate the canonical queue,
+        // let it make the decision, persist the snapshot. `save_queue` rewrites
+        // the stream's envelope rows wholesale, so the abandoned epoch's rows are
+        // deleted by the empty write-back rather than needing their own DELETE.
+        let mut queue = load_queue(&tx, pairing, sender, self.queue_max_per_pairing);
+        queue.reset(next_seq);
+        save_queue(&tx, pairing, sender, &queue);
+        tx.commit().expect(DB_ERR);
+    }
+
     async fn resume(&self, pairing: &PairingId, sender: Role, from_seq: u64) -> ResumeOutcome {
         // An absent stream rehydrates as an empty queue, whose `resume` is a clean
         // empty replay — so no special-casing is needed. The overflow-gap vs.
@@ -754,7 +767,7 @@ mod tests {
         // Gap is rejected, high-water unchanged.
         assert_eq!(
             s.enqueue(env(&pairing, Role::Desktop, 5)).await,
-            Err(QueueError::SeqViolation {
+            Err(QueueError::Gap {
                 expected: 4,
                 got: 5
             })
@@ -846,6 +859,68 @@ mod tests {
         assert_eq!(
             s.resume(&PairingId::new("nope"), Role::Phone, 0).await,
             ResumeOutcome::Replay(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_stream_clears_the_persisted_epoch() {
+        // remote-control-arg: the durable half of the rewind recovery. The
+        // abandoned epoch's envelope ROWS must go, not just the in-memory copy —
+        // otherwise a relay restart resurrects the watermark that caused the
+        // livelock in the first place.
+        let tmp = tempdir();
+        let path = tmp.join("relay.db");
+        let pairing = PairingId::new("pair_1");
+        {
+            let s = SqliteStore::open(&path, 1000).expect("open");
+            for seq in 1..=60 {
+                s.enqueue(env(&pairing, Role::Phone, seq)).await.unwrap();
+            }
+            s.reset_stream(&pairing, Role::Phone, 1).await;
+            s.enqueue(env(&pairing, Role::Phone, 1)).await.unwrap();
+        }
+
+        // Reopen: the reset must have survived as durably as the writes it undid.
+        let s = SqliteStore::open(&path, 1000).expect("reopen");
+        assert_eq!(
+            replayed(s.resume(&pairing, Role::Phone, 0).await)
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the abandoned epoch's rows must not survive the reset"
+        );
+        assert_eq!(
+            s.enqueue(env(&pairing, Role::Phone, 2)).await,
+            Ok(AppendOutcome::Accepted { overflow: false }),
+            "the restarted stream continues from the reset point after a restart"
+        );
+        // And a peer still on the old epoch is told to resync, not stranded.
+        assert_eq!(
+            s.resume(&pairing, Role::Phone, 60).await,
+            ResumeOutcome::Resync
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewound_sender_is_reported_as_rewind_not_gap() {
+        let tmp = tempdir();
+        let s = store(&tmp);
+        let pairing = PairingId::new("pair_1");
+        for seq in 1..=60 {
+            s.enqueue(env(&pairing, Role::Phone, seq)).await.unwrap();
+        }
+        assert_eq!(
+            s.enqueue(env(&pairing, Role::Phone, 1)).await,
+            Err(QueueError::Rewind {
+                expected: 61,
+                got: 1
+            })
+        );
+        // The rejection rolled back cleanly — the epoch is intact.
+        assert_eq!(
+            s.enqueue(env(&pairing, Role::Phone, 61)).await,
+            Ok(AppendOutcome::Accepted { overflow: false })
         );
     }
 

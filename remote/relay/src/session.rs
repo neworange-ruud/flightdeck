@@ -981,16 +981,59 @@ impl Connection {
         }
 
         let pairing_id = env.pairing_id.clone();
-        match self.state.store.enqueue(env.clone()).await {
-            Err(QueueError::SeqViolation { expected, got }) => {
+        let mut outcome = self.state.store.enqueue(env.clone()).await;
+
+        // A sender whose seq REWOUND lost its outbound cursor and restarted its
+        // stream (reinstall, restored backup). Answering `SeqViolation` — "drop
+        // your stale cursor and resync" — cannot help: it has no cursor left to
+        // drop and nothing to move forward to, so it restarts at the same low
+        // seq and is rejected again, forever (remote-control-arg). The relay
+        // holds the stale state here, so the relay is what must give way:
+        // abandon our epoch, adopt the sender's, and take the envelope.
+        if let Err(QueueError::Rewind { expected, got }) = outcome {
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                expected, got, "DIAG sender seq REWOUND; resetting stream to its epoch"
+            );
+            self.state.store.reset_stream(&pairing_id, role, got).await;
+            // Tell the PEER before the restarted envelope reaches it. Both go
+            // through the peer's single outbound channel in order, so the
+            // advisory is guaranteed to land first — which matters, because the
+            // peer's inbound cursor is still on the abandoned epoch and would
+            // otherwise dedup every seq of the new one away as a duplicate.
+            self.advise_peer(
+                &pairing_id,
+                role,
+                "peer restarted its stream; drop your inbound cursor and resync",
+            );
+            outcome = self.state.store.enqueue(env.clone()).await;
+        }
+
+        match outcome {
+            Err(QueueError::Gap { expected, got }) => {
                 tracing::info!(
                     conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
                     expected, got, "DIAG envelope REJECTED (seq_violation)"
                 );
                 // Recoverable, not a client bug: the endpoint's outbound cursor
-                // is ahead of our (possibly restart-reset, in-memory) watermark.
+                // ran ahead of ours and the envelopes in between never arrived.
                 // Signal `SeqViolation` so the sender re-syncs instead of looping
                 // on a fatal reconnect (remote-control-bbf).
+                self.send_error(
+                    RelayErrorCode::SeqViolation,
+                    "envelope seq is not gapless/monotonic",
+                    Some(pairing_id),
+                )
+                .await;
+            }
+            // Unreachable: the rewind branch above resets the stream so the
+            // re-enqueue accepts `got`. Handled as a gap rather than panicking so
+            // a future change here degrades to the old advisory, not a crash.
+            Err(QueueError::Rewind { expected, got }) => {
+                tracing::warn!(
+                    conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                    expected, got, "DIAG rewind survived a stream reset"
+                );
                 self.send_error(
                     RelayErrorCode::SeqViolation,
                     "envelope seq is not gapless/monotonic",
@@ -1120,6 +1163,36 @@ impl Connection {
             pairing_id,
         })
         .await;
+    }
+
+    /// Send a `SeqViolation` advisory to the *peer* of `role` on `pairing_id` —
+    /// "your inbound cursor for this pairing is stale; drop it and resync".
+    ///
+    /// Non-blocking ([`ConnHandle::try_send`]) for the same reason the envelope
+    /// forward is (remote-control-0ef.6): this runs on the *sender's* read loop,
+    /// and awaiting a jammed peer's outbox here would let a stuck receiver
+    /// back-pressure a healthy sender. A peer that is offline, full, or wedged
+    /// simply misses the advisory — [`SenderQueue::resume`] catches it on the
+    /// peer's next `resume`, whose `from_seq` now sits above the reset stream's
+    /// high-water and so returns `Resync`.
+    ///
+    /// [`ConnHandle::try_send`]: crate::router::ConnHandle::try_send
+    /// [`SenderQueue::resume`]: crate::queue::SenderQueue::resume
+    fn advise_peer(&self, pairing_id: &PairingId, role: Role, message: &str) {
+        let Some(peer) = self.state.registry.peer(pairing_id, role) else {
+            return;
+        };
+        let outcome = peer.try_send(RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            message: message.to_string(),
+            pairing_id: Some(pairing_id.clone()),
+        });
+        if outcome != TrySendOutcome::Sent {
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                ?outcome, "DIAG peer resync advisory not delivered; resume will catch it"
+            );
+        }
     }
 
     /// Detach from the registry and announce a disconnect to connected peers.

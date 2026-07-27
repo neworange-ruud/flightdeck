@@ -339,6 +339,26 @@ impl TestClient {
         }
     }
 
+    /// Assert that no frame matching `pred` arrives within `ms`, while tolerating
+    /// unrelated traffic (presence announcements, replays). Use this instead of
+    /// [`Self::expect_idle`] when the assertion is "the relay never says X",
+    /// not "the relay says nothing at all".
+    pub async fn expect_no_frame_matching(&mut self, ms: u64, pred: impl Fn(&RelayFrame) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+                Err(_) => return, // deadline passed with no match → as expected
+                Ok(Some(Ok(WsMessage::Text(txt)))) => {
+                    let frame: RelayFrame =
+                        serde_json::from_str(&txt).expect("relay sent an undecodable frame");
+                    assert!(!pred(&frame), "unexpected frame: {frame:?}");
+                }
+                // Non-text / close / stream end: nothing to match against.
+                Ok(_) => return,
+            }
+        }
+    }
+
     /// Receive the next **raw** WebSocket message, unlike [`Self::recv`] this
     /// does not assume `Text` and does not panic on a `Close` frame or stream
     /// end — used by tests asserting on the native WS close handshake itself

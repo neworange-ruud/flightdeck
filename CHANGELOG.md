@@ -51,6 +51,44 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Remote: a phone that lost its send cursor no longer reconnects forever.**
+  Installing a TestFlight build over an existing one left a phone whose pairing,
+  keys and inbound feed all still worked, but whose every outbound command died
+  — presenting as "reconnecting…" roughly 25×/second rather than as a rejection
+  loop, because desktop→phone traffic kept flowing the whole time. The relay
+  expected envelope seq 60 and the phone sent 1, so the relay answered
+  `seq_violation`, whose contract is "drop your stale cursor and resync" — but a
+  phone that already lost its cursor has nothing to drop and nothing to move
+  forward to, so it restarted at 1 and was rejected again, at reconnect speed,
+  indefinitely.
+
+  The root cause was a single overloaded signal. `seq_violation` is emitted for
+  two unrelated conditions — "your outbound seq is wrong" and, from the `resume`
+  path, "your *inbound* cursor is stale" — and both endpoints responded to
+  either by rewinding their **outbound** cursor to 0. So a phone that had simply
+  been offline long enough for the desktop→phone queue to pass its 1000-envelope
+  bound would destroy a perfectly good send cursor on its next reconnect. That
+  rewind was correct against the original in-memory relay, which came back from
+  a restart with no watermark at all; against the SQLite relay, which persists
+  its watermark, it cannot terminate.
+
+  The relay now treats its `high_water` as a cache of the sender's cursor rather
+  than an independent authority. A stream it has no record of adopts whatever
+  seq the first envelope carries (the relay-restart case, handled without any
+  endpoint rewind), and a seq *below* the watermark is recognised as a sender
+  that restarted: the relay abandons its own epoch for that direction, adopts
+  the restarted cursor, and tells the peer to drop its now-stale inbound cursor
+  before forwarding — otherwise the peer dedups the whole new epoch away as
+  duplicates. A peer that was offline for that advisory is caught on its next
+  `resume`, which now reports a resync when the cursor sits above the stream.
+  Only a genuine forward gap is still rejected. `seq_violation` means exactly
+  one thing on both endpoints now — "your inbound cursor is stale" — and neither
+  ever renumbers a stream it is successfully sending. Both also accept a peer's
+  restart at seq 1 instead of deduping it away; the phone already did, the
+  desktop did not. Reconnect backoff additionally requires a session to *last*
+  30s, not merely reach `auth_ok`, before it clears the schedule — a session
+  that authenticates and dies instantly used to pin the retry at its 1s floor.
+  See `specs/REMOTE_PROTOCOL.md` §6.1/§6.3/§6.4.
 - **Remote: the iOS app really is iPhone-only now.** `project.yml` said "iPhone
   only, v1" and set `TARGETED_DEVICE_FAMILY` project-wide, but XcodeGen gives
   every iOS target a default of `"1,2"` and a target-level setting beats a

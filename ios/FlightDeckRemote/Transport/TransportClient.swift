@@ -57,6 +57,17 @@ actor TransportClient {
         var commandTimeout: Duration = .seconds(10)
         /// Whether to request a fresh snapshot right after `resume`.
         var requestSnapshotOnResume: Bool = true
+        /// How long a session must survive past `auth_ok` before it counts as
+        /// genuinely good and resets the reconnect backoff (remote-control-arg).
+        ///
+        /// Reaching `auth_ok` is far too weak a signal on its own: a session that
+        /// authenticates and then immediately dies — a relay that accepts the
+        /// hello and drops the leg, a supersede race, a peer rejecting every
+        /// envelope — resets the schedule to its 1s floor on every attempt and
+        /// hammers a live relay indefinitely. Requiring the session to *last*
+        /// means a connection that cannot make progress escalates 1s → 2 → 4 →
+        /// … → 60s like any other failure.
+        var minimumGoodSession: Duration = .seconds(30)
 
         init() {}
     }
@@ -324,6 +335,7 @@ actor TransportClient {
         var attempt = 0
         while !Task.isCancelled {
             setLink(.connecting)
+            let startedAt = now()
             let authed = await runSession()
             if Task.isCancelled { break }
             setLink(.disconnected)
@@ -334,7 +346,15 @@ actor TransportClient {
                 attempt = 0
                 continue
             }
-            attempt = authed ? 0 : attempt + 1
+            // Only a session that authenticated AND lasted counts as good enough
+            // to clear the backoff. `auth_ok` alone is not progress: a session
+            // that authenticates and dies instantly would otherwise pin the
+            // schedule at its 1s floor and reconnect against a live relay
+            // forever (remote-control-arg). Escalate on anything shorter.
+            let lastedMs = max(0, now() - startedAt)
+            let goodSession = authed
+                && lastedMs >= config.minimumGoodSession.milliseconds
+            attempt = goodSession ? 0 : attempt + 1
             let delay = Backoff.delay(attempt: attempt, jitterUnit: jitter())
             await backoffSleep(delay)
             // "Retry now" during the wait woke it early — reset the schedule so
@@ -530,11 +550,10 @@ actor TransportClient {
             return true
 
         case let .error(code, _, pairingId):
-            // A `seq_violation` is recoverable, not fatal: the relay lost its
-            // outbound watermark for us (restart) and our command seq ran ahead.
-            // Re-sync our outbound cursor so the next command restarts at seq 1
-            // rather than reconnecting into the same rejection forever (bbf).
-            if code == .seqViolation { await handleSeqViolation(pairingId) }
+            // A `seq_violation` is recoverable, not fatal: our INBOUND cursor is
+            // stale. Drop it and re-sync rather than reconnecting into the same
+            // advisory forever (bbf).
+            if code == .seqViolation { await handleSeqViolation(pairingId, on: ch) }
             return !isFatal(code)
 
         case .bye:
@@ -810,17 +829,35 @@ actor TransportClient {
         }
     }
 
-    /// The relay rejected one of our outbound command envelopes as non-monotonic:
-    /// it lost its in-memory seq watermark (restart/redeploy) while we kept our
-    /// persisted outbound cursor (remote-control-bbf). Rewind the cursor to 0 so
-    /// the next command restarts at seq 1, which a fresh relay accepts. In-flight
-    /// commands time out to "not delivered — retry"; a retry re-sends at the new
-    /// low seq under the same command id (the desktop dedups idempotently).
-    private func handleSeqViolation(_ pairingId: Wire.PairingId?) async {
+    /// The relay sent a `seq_violation` advisory for this pairing. It means our
+    /// **inbound** cursor is stale — the desktop restarted its outbound stream,
+    /// or the relay shed queued envelopes we still needed — so the seqs now
+    /// arriving sit below `lastReceivedSeq` and our dedup would discard them.
+    /// Drop the cursor, re-`resume` from scratch to pull whatever the relay still
+    /// holds, and request a fresh snapshot.
+    ///
+    /// It does **not** mean "rewind your outbound cursor", and this used to do
+    /// exactly that (remote-control-bbf, written for a relay that came back from
+    /// a restart with an empty in-memory watermark). Against a relay that
+    /// *persists* its watermark, that rewind is what produced the reported P0
+    /// (remote-control-arg): the relay expected seq 60, we restarted at 1, it
+    /// rejected us, we rewound to 0 and restarted at 1 again — at reconnect
+    /// speed, forever. Inbound kept working the whole time, so it presented as a
+    /// connectivity flap rather than as every outbound command dying.
+    ///
+    /// Worse, the advisory also arrives for a resume-resync, which is purely an
+    /// inbound concern — so a phone that had been offline long enough for the
+    /// desktop→phone queue to overflow would destroy a perfectly good outbound
+    /// cursor on its next reconnect. That is remote-control-h1y's "cursors lost
+    /// on an in-place app update": nothing was lost in the Keychain; the cursor
+    /// was zeroed here, by us. The relay now adopts an unknown stream's starting
+    /// seq and absorbs a genuine rewind itself, so `lastSentSeq` is left alone.
+    private func handleSeqViolation(_ pairingId: Wire.PairingId?, on ch: any WebSocketChannel) async {
         guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
-        record.lastSentSeq = 0
+        record.lastReceivedSeq = 0
         self.record = record
-        _ = try? recordStore.resetOutboundCursor(pairingId: record.pairingId)
+        _ = try? recordStore.resetInboundCursor(to: 0, pairingId: record.pairingId)
+        await requestResumeAndSnapshot(on: ch)
     }
 
     private func shortToken() -> String {
