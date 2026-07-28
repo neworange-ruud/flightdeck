@@ -195,6 +195,7 @@ final class TransportCoordinator {
         )
         if pairingStore != nil {
             armMachineNameObservation()
+            armRevocationObservation()
         }
         // Force an immediate reconnect when the network path is restored /
         // switches (remote-control-0ef.22) — only while foregrounded (the
@@ -250,6 +251,40 @@ final class TransportCoordinator {
         }
     }
 
+    // MARK: - Revoked-pairing pruning (remote-control-4wk)
+
+    /// Arm a self-perpetuating observation over every handle's `isRevoked` (and
+    /// the handle set), mirroring `armMachineNameObservation`'s shape. When the
+    /// relay reports a pairing gone — the desktop retiring a superseded pairing
+    /// to this same phone — its `PairedInstance` is removed, which drives a
+    /// `reconcile` that stops and disposes only that client. Without this the
+    /// phone would keep a record the relay no longer knows and reconnect it
+    /// forever, never reaching `auth_ok`.
+    private func armRevocationObservation() {
+        withObservationTracking {
+            for handle in handles {
+                _ = handle.store.isRevoked
+            }
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pruneRevokedPairings()
+                self.armRevocationObservation()
+            }
+        }
+    }
+
+    /// Drop the `PairedInstance` for every handle the relay has told us is
+    /// revoked. Removing it from the `PairingStore` is what `MainTabView`'s
+    /// instances observer turns into a `reconcile`, so the client is torn down
+    /// through the normal membership path rather than by a special case here.
+    private func pruneRevokedPairings() {
+        guard let pairingStore else { return }
+        for handle in handles where handle.store.isRevoked {
+            pairingStore.remove(pairingId: handle.pairingId)
+        }
+    }
+
     // MARK: - Lookup (downstream API: b8d.6 feed, b8d.12 detail views)
 
     /// The pairing ids of every live instance, oldest first.
@@ -284,11 +319,32 @@ final class TransportCoordinator {
     /// to the live store the moment a handle finishes connecting. Fully replaced
     /// by per-`pairingId` / aggregated resolution in remote-control-b8d.12.
     var primaryStore: TransportStore {
-        if let live = handles.first(where: {
+        let connected = handles.filter {
             if case .connected = $0.store.linkState { return true } else { return false }
-        }) {
-            return live.store
         }
+        // Prefer the connected pairing that most recently RECEIVED something
+        // (remote-control-4wk). Being connected is not enough to identify the
+        // pairing the desktop is serving: the desktop bridge feeds exactly one
+        // pairing (`send_msg` drops everything for any other), so when a phone
+        // holds several pairings to the SAME Mac — the normal residue of
+        // re-pairing — the unserved ones still reach `auth_ok` and look healthy
+        // while receiving nothing. `handles` is ordered oldest-first, so the
+        // plain "first connected" rule reliably picked the stale duplicate and
+        // pinned the Projects tab to a list that could never refresh, with
+        // pull-to-refresh silently unable to help (the desktop can only answer
+        // on the pairing it feeds).
+        //
+        // Newest-inbound rather than a sticky "has ever received" flag, so a
+        // desktop that switches which pairing it feeds is followed correctly.
+        if let served = connected
+            .filter({ $0.store.lastInboundAtMs != nil })
+            .max(by: { ($0.store.lastInboundAtMs ?? 0) < ($1.store.lastInboundAtMs ?? 0) }) {
+            return served.store
+        }
+        // Nothing has received yet (a fresh launch, mid-connect): fall back to
+        // the first connected pairing, then to the first handle's last-known
+        // cache (honestly flagged stale), then to the recordless fallback.
+        if let firstConnected = connected.first { return firstConnected.store }
         return handles.first?.store ?? fallbackStore
     }
 

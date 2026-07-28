@@ -52,6 +52,15 @@ final class TransportStore {
     private(set) var latencyMs: Int = 0
     /// Whether the peer (desktop) is currently present (nil = unknown).
     private(set) var peerConnected: Bool?
+    /// When this pairing last received ANY desktop→phone message, or `nil` if it
+    /// never has in this run (remote-control-4wk). The discriminator between a
+    /// pairing the desktop is actually feeding and a zombie duplicate that
+    /// authenticates fine and is served nothing — see `fold`.
+    private(set) var lastInboundAtMs: Int64?
+    /// Whether the relay has told us this pairing was revoked and no longer
+    /// exists (spec §10.2, remote-control-4wk). Observed by
+    /// `TransportCoordinator`, which removes the corresponding `PairedInstance`.
+    private(set) var isRevoked = false
     /// The desktop's most recently announced machine name for this pairing
     /// (REMOTE_PROTOCOL §5.7, remote-control-b8d.9) — already sanitized/
     /// bounded by `TransportClient`. `nil` until the first post-auth
@@ -265,6 +274,12 @@ final class TransportStore {
             peerConnected = connected
         case let .machineName(name):
             machineName = name
+        case .pairingRevoked:
+            // The relay says this pairing no longer exists (remote-control-4wk).
+            // Surfaced as observable state rather than acted on here: removing a
+            // `PairedInstance` is the `PairingStore`'s job, and this store has no
+            // reference to it. `TransportCoordinator` observes this and prunes.
+            isRevoked = true
         case let .delivery(commandId, state):
             commandHandles[commandId]?.delivery = state
         case let .message(message):
@@ -273,6 +288,15 @@ final class TransportStore {
     }
 
     private func fold(_ message: Wire.DesktopToPhone) {
+        // Any desktop→phone message proves this pairing is the one the desktop
+        // is actually serving (remote-control-4wk). The desktop bridge feeds
+        // exactly ONE pairing, so when several pairings to the same Mac are live
+        // the others authenticate perfectly well and then receive nothing —
+        // indistinguishable from a healthy link by `linkState` alone.
+        // `TransportCoordinator.primaryStore` uses this to pick the served
+        // pairing instead of merely the oldest connected one. Deliberately NOT
+        // set by `seedFromCache`: cached bytes are not evidence of a live feed.
+        lastInboundAtMs = now()
         switch message {
         case let .snapshot(snap):
             snapshot = snap

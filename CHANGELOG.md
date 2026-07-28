@@ -16,6 +16,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Remote: a second pairing to the same Mac no longer strands the phone on a
+  dead session list.** Re-pairing a phone left the older pairing behind, and both
+  stayed live: the Mac still had it, the relay still authenticated it, and the
+  phone still opened a connection for it. But the desktop feeds exactly one
+  pairing, so the leftover received nothing — while looking perfectly healthy,
+  because it connected and authenticated like any other. The phone preferred the
+  oldest connected pairing, which was reliably the leftover, so the Projects tab
+  bound to a session list that could never update; pull-to-refresh couldn't help
+  either, since the Mac can only answer on the pairing it feeds. Claiming a new
+  pairing now retires any earlier one to the same phone — locally and at the relay
+  — and the phone drops a pairing the relay reports as revoked. The phone also
+  picks the pairing that is actually receiving data rather than the oldest one
+  that merely connected, so an existing duplicate stops causing harm immediately,
+  and it resolves that choice live instead of freezing the pre-connect answer.
+  Pairing several *different* phones is unaffected.
 - **Remote: the phone no longer shows agents for sessions that are gone.** After
   a reconnect the session list could stay frozen on whatever it last saw — an
   agent for a deleted worktree stayed on screen indefinitely — while the statuses

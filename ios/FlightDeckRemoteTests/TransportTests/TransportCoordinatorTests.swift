@@ -338,6 +338,91 @@ import CryptoKit
         #expect({ if case .connected = liveB { return true }; return false }())
     }
 
+    // MARK: - Duplicate pairings to one Mac (remote-control-4wk)
+
+    /// The reported bug: two pairings to the SAME Mac, both connected, but the
+    /// desktop bridge feeds only one. `primaryStore` must resolve to the pairing
+    /// actually being served, not merely the oldest connected one — otherwise the
+    /// Projects tab pins to a list nothing can ever refresh.
+    @Test func primaryStorePrefersTheServedPairingOverAnOlderSilentOne() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        // BOTH authenticate — the zombie duplicate is not distinguishable by
+        // link state alone (this is why the aj2 "never reaches auth_ok" guard
+        // does not catch it).
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        // Oldest-first ordering means the plain "first connected" rule picks A.
+        #expect(h.coordinator.handles.first?.pairingId == "pair_a")
+
+        // Only pair_b is actually fed: a real snapshot arrives on it.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"),
+                "primaryStore must follow the pairing the desktop is serving")
+        #expect(h.coordinator.store(for: "pair_a")?.lastInboundAtMs == nil,
+                "the silent duplicate must stay marked as never-received")
+    }
+
+    /// Before anything has been received, `primaryStore` still resolves to a
+    /// connected handle (a fresh launch must not fall through to the fallback).
+    @Test func primaryStoreFallsBackToTheFirstConnectedBeforeAnyInboundArrives() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A desktop that switches which pairing it feeds must be followed, so the
+    /// signal is newest-inbound rather than a sticky "has ever received" flag.
+    @Test func primaryStoreFollowsTheDesktopSwitchingWhichPairingItFeeds() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        // First B is fed…
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"))
+        // …then the desktop re-pairs/switches and feeds A instead.
+        try await h.book.channels[0].push(h.peers[0].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_a")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A relay `pairing_revoked` for a pairing this phone did NOT revoke — the
+    /// desktop retiring a superseded duplicate — must drop the `PairedInstance`,
+    /// so the phone stops fanning a client out to a pairing the relay no longer
+    /// knows. Only that pairing is affected.
+    @Test func aRelayRevokedPairingIsPrunedAndLeavesTheOtherAlone() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], pairingStore: pairingStore)
+        for instance in h.instances { pairingStore.add(instance) }
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(pairingStore.instances.count == 2)
+
+        // The relay revokes pair_a (the desktop retired it as superseded).
+        await h.book.channels[0].push(.pairingRevoked(pairingId: Wire.PairingId("pair_a")))
+
+        _ = await waitUntilMain { pairingStore.instances.count == 1 }
+        #expect(pairingStore.instances.map(\.pairingId) == ["pair_b"],
+                "only the revoked pairing is dropped")
+    }
+
     // MARK: - Background wake vs. foreground ownership (remote-control-aew)
 
     /// A wake that runs while genuinely backgrounded connects, then tears back

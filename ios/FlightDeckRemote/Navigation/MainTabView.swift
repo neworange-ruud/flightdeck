@@ -74,7 +74,15 @@ struct MainTabView: View {
     // (single-store, transitional — out of scope for remote-control-b8d.12,
     // which only finalizes the FEED tab's per-pairingId navigation below).
     @State private var coordinator: TransportCoordinator
-    @State private var transportStore: TransportStore
+    /// The transitional single-store bridge, resolved LIVE on every body pass
+    /// rather than captured once at `init` (remote-control-4wk). `primaryStore`
+    /// only learns which pairing the desktop is actually serving once inbound
+    /// traffic arrives, which is necessarily after `init` — a pinned `@State`
+    /// froze this on the pre-connect answer, which with a duplicate pairing was
+    /// the stale one, and no later resolution could dislodge it. (The Projects
+    /// tab already read `coordinator.primaryStore` directly; this brings the
+    /// stale banner, event ingestion, Shell and Settings onto the same answer.)
+    private var transportStore: TransportStore { coordinator.primaryStore }
     // Unified multi-pairing feed (remote-control-b8d.8): the aggregation over
     // the SAME coordinator's handles, folded with `router.pairingStore` for
     // display-name/online-flag resolution (remote-control-b8d.6). Owned here
@@ -99,8 +107,12 @@ struct MainTabView: View {
         self.connectionSource = connectionSource
         let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: router.pairingStore)
         _coordinator = State(initialValue: coordinator)
+        // Only the banner captures a store at init (its `ConnectionStatusSource`
+        // is stored, not re-resolved). That is fine for its purpose: it reports
+        // whether the link is down, and every pairing to the same relay goes
+        // up/down together — unlike the CONTENT, which is per-pairing and must
+        // follow `primaryStore` live (see `transportStore`).
         let store = coordinator.primaryStore
-        _transportStore = State(initialValue: store)
         let feed = FeedStore(coordinator: coordinator, pairingStore: router.pairingStore)
         #if DEBUG
         // A device "paired" via the DEBUG toggle has no live coordinator
