@@ -16,7 +16,56 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Remote: a second pairing to the same Mac no longer strands the phone on a
+  dead session list.** Re-pairing a phone left the older pairing behind, and both
+  stayed live: the Mac still had it, the relay still authenticated it, and the
+  phone still opened a connection for it. But the desktop feeds exactly one
+  pairing, so the leftover received nothing — while looking perfectly healthy,
+  because it connected and authenticated like any other. The phone preferred the
+  oldest connected pairing, which was reliably the leftover, so the Projects tab
+  bound to a session list that could never update; pull-to-refresh couldn't help
+  either, since the Mac can only answer on the pairing it feeds. Claiming a new
+  pairing now retires any earlier one to the same phone — locally and at the relay
+  — and the phone drops a pairing the relay reports as revoked. The phone also
+  picks the pairing that is actually receiving data rather than the oldest one
+  that merely connected, so an existing duplicate stops causing harm immediately,
+  and it resolves that choice live instead of freezing the pre-connect answer.
+  Pairing several *different* phones is unaffected.
+- **Remote: the phone no longer shows agents for sessions that are gone.** After
+  a reconnect the session list could stay frozen on whatever it last saw — an
+  agent for a deleted worktree stayed on screen indefinitely — while the statuses
+  of sessions it already knew kept updating live, which made it look like a
+  rendering quirk rather than a sync failure. A full snapshot is the only message
+  that can add or remove a session (a `status_update` can only change sessions
+  the phone already knows), and two separate holes stopped one from being sent.
+  On the desktop, a fresh snapshot was armed only when a phone went from absent
+  to present; but when a phone's socket dies half-open — the normal case when iOS
+  suspends the app — the relay holds the stale leg until its idle timeout, and the
+  reconnecting phone supersedes it, which by design produces no disconnect. The
+  desktop therefore saw "connected" with the phone already marked present, found
+  no edge, and sent nothing. On the phone, the desktop's presence was remembered
+  across sockets instead of per session, which defeated the backstop from both
+  directions: a stale "absent" made the post-authentication snapshot request fail
+  fast as *peer unavailable*, and a stale "present" made the desktop's return look
+  like no change and skip the re-request. Every phone connection now re-arms the
+  snapshot, and peer presence resets with each session.
+- **Remote: opening the phone app after a while no longer flaps between
+  "Reconnecting…" and a one-second connection.** Reopening the app after it had
+  been idle put it in a loop: connected for about a second, back to
+  "Reconnecting…", over and over, indefinitely. The silent APNs wake was the
+  culprit. iOS delivers `content-available` pushes to a *foregrounded* app too,
+  and the wake performer ended with an unconditional teardown of the whole
+  transport — so a wake that landed as the user opened the app killed the link
+  they were looking at. That detached the phone's leg at the relay, and the relay
+  pushes a wake for every desktop→phone envelope that arrives with no peer
+  attached, so each new event triggered another wake: connect, tear down,
+  connect, tear down. Nothing broke the cycle, because the wake also claimed the
+  foreground flag on its way in, which made the real foreground transition a
+  no-op, and its teardown cancelled the network-path monitor that would otherwise
+  have forced a reconnect. The wake is now bracketed by a begin/end pair that
+  declines outright while the app is foregrounded and skips its teardown if the
+  app came to the foreground mid-wake; foreground ownership of the transport now
+  belongs to the scene-phase lifecycle alone.
 
 ## [1.13.0] - 2026-07-27
 

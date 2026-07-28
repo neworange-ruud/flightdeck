@@ -52,6 +52,13 @@ enum TransportEvent: Sendable {
     /// by the time it's emitted — see `TransportClient`'s `machine_name`
     /// handling. The new DEFAULT display name; a user override still wins.
     case machineName(String)
+    /// The relay confirmed this pairing no longer exists (spec §10.2,
+    /// remote-control-4wk). Emitted only for a revoke this phone did NOT
+    /// initiate — the desktop retiring a superseded pairing to this same phone —
+    /// so the app can drop the now-dead `PairedInstance` instead of fanning a
+    /// client out to it forever. A revoke the phone itself sent needs no event:
+    /// it removes the pairing eagerly and never waits for the confirmation.
+    case pairingRevoked
 }
 
 extension Duration {

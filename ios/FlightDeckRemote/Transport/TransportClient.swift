@@ -397,6 +397,18 @@ actor TransportClient {
         channel = ch
         sessionAuthed = false
         phase = .awaitingHelloOk
+        // The peer's presence is per-SESSION knowledge: a fresh socket knows
+        // nothing about the desktop until the relay says so. Carrying the last
+        // session's belief over broke refresh-on-reconnect in both directions
+        // (remote-control-e9l):
+        //  - a stale `false` made the post-`auth_ok` `request_snapshot` fail
+        //    fast as "peer unavailable", so the desktop was never asked;
+        //  - a stale `true` made the compensating re-issue below
+        //    (`connected, wasConnected != true`) look like a no-op change and
+        //    skip, because it thought the desktop had never left.
+        // `nil` (unknown) lets the send through and makes the first real
+        // `peer_presence` frame a genuine transition.
+        peerConnected = nil
 
         // Derive the E2E channel for this pairing up front (needed the instant a
         // replayed envelope arrives after resume).
@@ -559,17 +571,28 @@ actor TransportClient {
         case .bye:
             return false
 
+        // The relay says this pairing is gone. The phone removes its own pairing
+        // state eagerly when IT revokes (best-effort, idempotent —
+        // remote-control-b8d.11), so this is normally just a confirmation of
+        // something already done. But a revoke can also come from the DESKTOP
+        // retiring a superseded pairing to this same phone (remote-control-4wk),
+        // and there the phone must act: otherwise it keeps a record for a pairing
+        // the relay no longer knows and reconnects it forever without ever
+        // reaching `auth_ok`. Surfacing it is safe in both cases — dropping an
+        // already-dropped pairing is a no-op. End the session: this client has
+        // nothing left to do.
+        case let .pairingRevoked(pairingId):
+            guard record?.pairingId == pairingId.rawValue else { return true }
+            emit(.pairingRevoked)
+            return false
+
         // Frames the phone never receives in steady state, or handshake
-        // restatements: ignore and keep the session alive.
-        // `pairingRevoked` (the relay's confirmation of our own `revoke`) and
-        // `revoke` (phone→relay only) are ignored here: the phone removes its
-        // local pairing state eagerly when it sends the revoke (best-effort,
-        // idempotent — remote-control-b8d.11), so it never gates removal on this
-        // confirmation. If it arrives after teardown this client is already gone.
+        // restatements: ignore and keep the session alive. `revoke` is
+        // phone→relay only.
         case .ack, .resume, .ping, .hello, .authResponse,
              .pairingOffer, .pairingOfferOk, .pairingClaim, .pairingClaimed,
              .registerPushToken, .unregisterPushToken, .pushTokenAck,
-             .revoke, .pairingRevoked:
+             .revoke:
             return true
         }
     }

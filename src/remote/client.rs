@@ -1488,6 +1488,41 @@ fn handle_outbound(
 }
 
 /// Handle one relay→client frame. Returns `false` on a fatal frame (reconnect).
+/// Remove every pairing that `keeping` supersedes — any OTHER pairing to the
+/// SAME phone — from `state`, and return their ids so the caller can tell the
+/// relay to revoke them (remote-control-4wk).
+///
+/// A second pairing to one phone is dead weight the moment a newer one is
+/// claimed: [`RemoteBridge`](crate::remote::bridge::RemoteBridge) feeds exactly
+/// one pairing, so the older one is served nothing while still authenticating at
+/// the relay — and the phone still fans a client out to it and can end up
+/// showing ITS stale, unrefreshable session list. Retiring it here is what stops
+/// the duplicate accumulating in the first place.
+///
+/// Identity is `peer_device_id`: `None` retires nothing, because without knowing
+/// which phone claimed this pairing we cannot tell a duplicate of the same phone
+/// from a legitimate SECOND phone. Pairings whose `peer_device_id` is unknown are
+/// likewise left alone.
+fn retire_superseded_pairings(
+    state: &mut RemoteState,
+    keeping: &str,
+    peer_device_id: Option<&str>,
+) -> Vec<String> {
+    let Some(device) = peer_device_id else {
+        return Vec::new();
+    };
+    let superseded: Vec<String> = state
+        .pairings
+        .iter()
+        .filter(|p| p.pairing_id != keeping && p.peer_device_id.as_deref() == Some(device))
+        .map(|p| p.pairing_id.clone())
+        .collect();
+    state
+        .pairings
+        .retain(|p| !superseded.contains(&p.pairing_id));
+    superseded
+}
+
 fn handle_frame(
     sock: &mut RelaySocket,
     state: &mut RemoteState,
@@ -1625,6 +1660,38 @@ fn handle_frame(
                 if let Some(ka) = &peer_key_agreement_public_key {
                     p.peer_key_agreement_public_key = Some(ka.clone());
                     p.established = true;
+                }
+                store.save(state);
+                gate.mark_clean();
+            }
+            // Retire any OLDER pairing to this same phone (remote-control-4wk).
+            // The bridge feeds exactly one pairing, so a second pairing to the
+            // same device is dead weight the moment this one is claimed: it
+            // still authenticates at the relay and the phone still fans a client
+            // out to it, which then displays a session list nothing will ever
+            // refresh. Revoking is membership-checked, not role-checked, so a
+            // desktop may revoke its own pairing (relay `on_revoke`), and the
+            // relay tells the phone via `pairing_revoked` so it drops its record
+            // too. Idempotent and best-effort: the local drop below is what
+            // matters for THIS desktop, and a failed send is retried by the next
+            // claim.
+            let superseded = retire_superseded_pairings(
+                state,
+                pairing_id.as_str(),
+                peer_device_id.as_ref().map(|d| d.as_str()),
+            );
+            if !superseded.is_empty() {
+                for stale in &superseded {
+                    crate::remote::debuglog::log(&format!(
+                        "client REVOKE superseded pairing={stale} (same phone as {})",
+                        pairing_id.as_str()
+                    ));
+                    let _ = send_frame(
+                        sock,
+                        &RelayFrame::Revoke {
+                            pairing_id: PairingId::new(stale.clone()),
+                        },
+                    );
                 }
                 store.save(state);
                 gate.mark_clean();

@@ -396,7 +396,20 @@ impl RemoteBridge {
                 if peer == Role::Phone {
                     let now_present =
                         matches!(state, flightdeck_remote_protocol::PresenceState::Connected);
-                    if now_present && !self.peer_present {
+                    // Every `Connected` re-arms, not just a false→true edge
+                    // (remote-control-e9l). A repeat `Connected` means a NEW
+                    // phone leg superseded the old one in the relay's registry,
+                    // and the relay deliberately sends no `Disconnected` for a
+                    // superseded leg (it would libel the newer leg — see
+                    // `Registry::detach`). So a phone whose socket died
+                    // half-open — the normal case when iOS suspends the app —
+                    // reattaches with `peer_present` still `true` here and,
+                    // under an edge-triggered re-arm, never got a fresh
+                    // snapshot. It then sat on whatever session set it last
+                    // saw: `status_update` deltas can only change sessions the
+                    // phone already knows, never add or remove one, and nothing
+                    // else re-arms periodically.
+                    if now_present {
                         self.snapshot_needed = true;
                     }
                     self.peer_present = now_present;

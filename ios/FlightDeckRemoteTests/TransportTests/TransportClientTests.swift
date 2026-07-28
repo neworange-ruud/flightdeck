@@ -538,6 +538,135 @@ import CryptoKit
         await client.stop()
     }
 
+    // MARK: - Peer presence is per-session state (remote-control-e9l)
+
+    /// A session that ended with the desktop marked ABSENT must not poison the
+    /// next session: `peerConnected` is per-session knowledge, and carrying a
+    /// stale `false` across a reconnect made the post-`auth_ok`
+    /// `request_snapshot` fail fast as "peer unavailable". The desktop was then
+    /// never asked for a snapshot, and since a `status_update` can only change
+    /// sessions the phone already knows — never add or remove one — the phone
+    /// kept showing a stale session list.
+    @Test func aNewSessionDoesNotInheritTheLastSessionsAbsentPeer() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        // Left ON: the post-auth request_snapshot is exactly what we're asserting.
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // Session 1 goes live, then the desktop is announced ABSENT.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+        await client.registerPushToken("tok", environment: .sandbox) // marker traffic
+        await first.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                       peer: .desktop, state: .disconnected, atMs: 1))
+        _ = await waitUntil {
+            collector.events.contains {
+                if case let .presence(p, connected) = $0 { return p == .desktop && !connected }
+                return false
+            }
+        }
+
+        // Reconnect into session 2.
+        await client.reconnectNow()
+        _ = await waitUntil { connector.channels.count >= 2 }
+        let second = connector.channels[1]
+        await handshake(second, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // The fresh session must issue its post-auth request_snapshot (a phone
+        // envelope) — it must NOT be suppressed by the previous session's
+        // "desktop absent" belief.
+        func phoneEnvelopes(_ channel: ScriptedChannel) async -> Int {
+            await channel.sentFrames().filter {
+                if case let .envelope(e) = $0 { return e.sender == .phone }; return false
+            }.count
+        }
+        _ = await waitUntil { await phoneEnvelopes(second) >= 1 }
+        #expect(await phoneEnvelopes(second) >= 1,
+                "a new session must send its request_snapshot, not inherit 'peer unavailable'")
+
+        await client.stop()
+    }
+
+    /// The mirror case: a stale `true` made the desktop's return look like "no
+    /// change" and skipped the compensating resume+snapshot re-issue. In a fresh
+    /// session, peer presence is unknown, so the first `connected` frame IS a
+    /// transition and does re-issue.
+    @Test func aConnectedPresenceInAFreshSessionCountsAsATransition() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // Session 1: the desktop is present.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+        await first.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                       peer: .desktop, state: .connected, atMs: 1))
+        _ = await waitUntil {
+            collector.events.contains {
+                if case let .presence(p, connected) = $0 { return p == .desktop && connected }
+                return false
+            }
+        }
+
+        // Session 2: the relay announces the desktop present again (this is what
+        // a supersede-reattach looks like). It must be treated as a transition.
+        await client.reconnectNow()
+        _ = await waitUntil { connector.channels.count >= 2 }
+        let second = connector.channels[1]
+        await handshake(second, client: client, nonceB64: TransportFixtures.nonceB64())
+        func resumeCount() async -> Int {
+            await second.sentFrames().filter { if case .resume = $0 { return true }; return false }.count
+        }
+        _ = await waitUntil { await resumeCount() >= 1 }
+        let afterAuth = await resumeCount()
+
+        await second.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                        peer: .desktop, state: .connected, atMs: 2))
+        _ = await waitUntil { await resumeCount() > afterAuth }
+        #expect(await resumeCount() > afterAuth,
+                "a fresh session's first `connected` frame must re-issue resume+snapshot")
+
+        await client.stop()
+    }
+
     // MARK: - Retry now: force an immediate reconnect (remote-control-0ef.21)
 
     /// `reconnectNow()` must drop the current (possibly silently-dead) socket

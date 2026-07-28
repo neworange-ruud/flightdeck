@@ -1364,3 +1364,91 @@ fn relay_password_is_sent_verbatim_not_trimmed() {
         Some(" pad ".to_string())
     );
 }
+
+// --- retiring superseded pairings (remote-control-4wk) ---------------------
+
+fn pairing_for(id: &str, device: Option<&str>) -> crate::remote::Pairing {
+    let mut p = crate::remote::Pairing::new(id);
+    p.peer_device_id = device.map(|d| d.to_string());
+    p.established = true;
+    p
+}
+
+#[test]
+fn a_new_pairing_retires_the_older_one_to_the_same_phone() {
+    // The exact state found on Ruud's Mac: two established pairings, same
+    // peer_device_id, the older one served nothing by the single-pairing bridge.
+    let mut state = RemoteState::default();
+    state
+        .pairings
+        .push(pairing_for("pair_0004", Some("phone_a")));
+    state
+        .pairings
+        .push(pairing_for("pair_0005", Some("phone_a")));
+
+    let retired = retire_superseded_pairings(&mut state, "pair_0005", Some("phone_a"));
+
+    assert_eq!(retired, vec!["pair_0004".to_string()]);
+    assert_eq!(
+        state.pairing_ids(),
+        vec!["pair_0005".to_string()],
+        "only the newly-claimed pairing survives"
+    );
+}
+
+#[test]
+fn a_second_different_phone_is_never_retired() {
+    // Multi-phone pairing is a real feature; only DUPLICATES of one phone go.
+    let mut state = RemoteState::default();
+    state
+        .pairings
+        .push(pairing_for("pair_phone_a", Some("phone_a")));
+    state
+        .pairings
+        .push(pairing_for("pair_phone_b", Some("phone_b")));
+
+    let retired = retire_superseded_pairings(&mut state, "pair_phone_b", Some("phone_b"));
+
+    assert!(retired.is_empty(), "a different phone is not a duplicate");
+    assert_eq!(state.pairings.len(), 2);
+}
+
+#[test]
+fn an_unknown_peer_device_id_retires_nothing() {
+    // Without knowing which phone claimed this pairing we cannot distinguish a
+    // duplicate from a legitimate second phone, so we must not guess.
+    let mut state = RemoteState::default();
+    state
+        .pairings
+        .push(pairing_for("pair_old", Some("phone_a")));
+    state.pairings.push(pairing_for("pair_new", None));
+
+    let retired = retire_superseded_pairings(&mut state, "pair_new", None);
+
+    assert!(retired.is_empty());
+    assert_eq!(state.pairings.len(), 2);
+
+    // Nor is a pairing with an unknown device id ever collateral damage.
+    let mut state = RemoteState::default();
+    state.pairings.push(pairing_for("pair_unknown", None));
+    state
+        .pairings
+        .push(pairing_for("pair_new", Some("phone_a")));
+    let retired = retire_superseded_pairings(&mut state, "pair_new", Some("phone_a"));
+    assert!(retired.is_empty());
+    assert_eq!(state.pairings.len(), 2);
+}
+
+#[test]
+fn retiring_is_idempotent_and_keeps_the_claimed_pairing() {
+    // Re-claiming the SAME pairing (a resume / repeat claim) must not retire it.
+    let mut state = RemoteState::default();
+    state
+        .pairings
+        .push(pairing_for("pair_only", Some("phone_a")));
+
+    let retired = retire_superseded_pairings(&mut state, "pair_only", Some("phone_a"));
+
+    assert!(retired.is_empty());
+    assert_eq!(state.pairing_ids(), vec!["pair_only".to_string()]);
+}

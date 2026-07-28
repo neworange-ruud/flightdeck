@@ -39,6 +39,20 @@ import CryptoKit
             return ScriptedConnector(channel: channel)
         }
 
+        /// A connector that mints a FRESH channel on every `connect`, for tests
+        /// that reconnect after a teardown: `ScriptedChannel.close()` latches
+        /// permanently, so the fixed-channel `connector()` above hands a
+        /// reconnect a dead socket. Channels still land in `channels` in
+        /// creation order, but the first one only appears once the client
+        /// actually connects (there is nothing to create up front).
+        func reconnectingConnector() -> any WebSocketConnecting {
+            ScriptedConnector(factory: { [self] in
+                let channel = ScriptedChannel()
+                lock.lock(); _channels.append(channel); lock.unlock()
+                return channel
+            })
+        }
+
         var channels: [ScriptedChannel] {
             lock.lock(); defer { lock.unlock() }; return _channels
         }
@@ -77,7 +91,8 @@ import CryptoKit
     }
 
     private func makeHarness(pairingIds: [String], cap: Int = 4, pairingStore: PairingStore? = nil,
-                             networkMonitor: (any NetworkPathMonitoring)? = nil) throws -> Harness {
+                             networkMonitor: (any NetworkPathMonitoring)? = nil,
+                             reconnecting: Bool = false) throws -> Harness {
         let keychain = InMemoryKeychainStore()
         let identity = try DeviceIdentity.loadOrCreate(store: keychain)
         let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
@@ -108,7 +123,7 @@ import CryptoKit
             identity: identity,
             keyAgreement: keyAgreement,
             recordStore: recordStore,
-            connectorFactory: { book.connector() },
+            connectorFactory: { reconnecting ? book.reconnectingConnector() : book.connector() },
             cap: cap,
             clientConfig: config,
             pairingStore: pairingStore,
@@ -321,6 +336,203 @@ import CryptoKit
         #expect(!(await h.book.channels[1].isClosed()))
         let liveB = await h.coordinator.client(for: "pair_b")!.currentLinkState()
         #expect({ if case .connected = liveB { return true }; return false }())
+    }
+
+    // MARK: - Duplicate pairings to one Mac (remote-control-4wk)
+
+    /// The reported bug: two pairings to the SAME Mac, both connected, but the
+    /// desktop bridge feeds only one. `primaryStore` must resolve to the pairing
+    /// actually being served, not merely the oldest connected one — otherwise the
+    /// Projects tab pins to a list nothing can ever refresh.
+    @Test func primaryStorePrefersTheServedPairingOverAnOlderSilentOne() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        // BOTH authenticate — the zombie duplicate is not distinguishable by
+        // link state alone (this is why the aj2 "never reaches auth_ok" guard
+        // does not catch it).
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        // Oldest-first ordering means the plain "first connected" rule picks A.
+        #expect(h.coordinator.handles.first?.pairingId == "pair_a")
+
+        // Only pair_b is actually fed: a real snapshot arrives on it.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"),
+                "primaryStore must follow the pairing the desktop is serving")
+        #expect(h.coordinator.store(for: "pair_a")?.lastInboundAtMs == nil,
+                "the silent duplicate must stay marked as never-received")
+    }
+
+    /// Before anything has been received, `primaryStore` still resolves to a
+    /// connected handle (a fresh launch must not fall through to the fallback).
+    @Test func primaryStoreFallsBackToTheFirstConnectedBeforeAnyInboundArrives() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A desktop that switches which pairing it feeds must be followed, so the
+    /// signal is newest-inbound rather than a sticky "has ever received" flag.
+    @Test func primaryStoreFollowsTheDesktopSwitchingWhichPairingItFeeds() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        // First B is fed…
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"))
+        // …then the desktop re-pairs/switches and feeds A instead.
+        try await h.book.channels[0].push(h.peers[0].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_a")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A relay `pairing_revoked` for a pairing this phone did NOT revoke — the
+    /// desktop retiring a superseded duplicate — must drop the `PairedInstance`,
+    /// so the phone stops fanning a client out to a pairing the relay no longer
+    /// knows. Only that pairing is affected.
+    @Test func aRelayRevokedPairingIsPrunedAndLeavesTheOtherAlone() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], pairingStore: pairingStore)
+        for instance in h.instances { pairingStore.add(instance) }
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(pairingStore.instances.count == 2)
+
+        // The relay revokes pair_a (the desktop retired it as superseded).
+        await h.book.channels[0].push(.pairingRevoked(pairingId: Wire.PairingId("pair_a")))
+
+        _ = await waitUntilMain { pairingStore.instances.count == 1 }
+        #expect(pairingStore.instances.map(\.pairingId) == ["pair_b"],
+                "only the revoked pairing is dropped")
+    }
+
+    // MARK: - Background wake vs. foreground ownership (remote-control-aew)
+
+    /// A wake that runs while genuinely backgrounded connects, then tears back
+    /// down — the intended remote-control-0ef.4 shape.
+    @Test func backgroundWakeConnectsThenTearsBackDownWhileBackgrounded() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        await h.coordinator.endBackgroundWake()
+
+        for index in h.instances.indices {
+            #expect(await h.book.channels[index].isClosed())
+        }
+    }
+
+    /// iOS delivers `content-available` pushes to a FOREGROUNDED app too. The
+    /// wake must decline outright there — running it used to end in a
+    /// `stopAll()` that killed the live socket the user was looking at.
+    @Test func backgroundWakeIsDeclinedWhileForegroundedAndLeavesTheLinkUp() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        #expect(!(await h.coordinator.beginBackgroundWake()))
+        // Declining must be a true no-op: an unpaired `endBackgroundWake` (the
+        // caller `guard`s, but be defensive) still may not drop the live link.
+        await h.coordinator.endBackgroundWake()
+
+        for (index, instance) in h.instances.enumerated() {
+            #expect(!(await h.book.channels[index].isClosed()))
+            let live = await h.coordinator.client(for: instance.pairingId)!.currentLinkState()
+            #expect({ if case .connected = live { return true }; return false }())
+        }
+    }
+
+    /// The exact reported flap (remote-control-aew): a wake is in flight when
+    /// the user opens the app. The foreground now owns the link, so the wake's
+    /// trailing teardown must be skipped — otherwise it drops the fresh socket,
+    /// detaches the phone at the relay, and the relay's next envelope pushes
+    /// another wake, forever.
+    @Test func foregroundingDuringAWakeKeepsTheLinkUp() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        // The user opens the app mid-wake.
+        await h.coordinator.setForeground(true)
+        await h.coordinator.endBackgroundWake()
+
+        #expect(!(await h.book.channels[0].isClosed()))
+        let live = await client.currentLinkState()
+        #expect({ if case .connected = live { return true }; return false }())
+    }
+
+    /// A chatty desktop lands several wakes in one background window (the relay
+    /// pushes per undelivered envelope). Overlapping wakes tore down each
+    /// other's transport, so a second wake is declined while one is in flight —
+    /// and declining it must not disarm the first one's teardown.
+    @Test func aSecondWakeIsDeclinedWhileOneIsAlreadyInFlight() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        // A second push lands mid-wake: declined, and a no-op on the live link.
+        #expect(!(await h.coordinator.beginBackgroundWake()))
+        #expect(!(await h.book.channels[0].isClosed()))
+
+        // The first wake still tears down normally when it finishes.
+        await h.coordinator.endBackgroundWake()
+        #expect(await h.book.channels[0].isClosed())
+    }
+
+    /// A wake must not claim foreground ownership: going through `startAll()`
+    /// set `isForeground`, which then made the next real `setForeground(true)`
+    /// a no-op (its `active != isForeground` guard) — so after the wake's
+    /// teardown nothing ever reconnected until another push arrived.
+    @Test func aCompletedWakeStillLetsTheNextForegroundConnect() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"], reconnecting: true)
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        // The wake connects WITHOUT flipping the foreground flag.
+        #expect(!h.coordinator.isForegroundActive)
+        _ = await waitUntilMain { h.book.channels.count >= 1 }
+        await h.coordinator.endBackgroundWake()
+        #expect(!h.coordinator.isForegroundActive)
+        #expect(await h.book.channels[0].isClosed())
+
+        // Now the user opens the app: this must actually connect a new socket.
+        await h.coordinator.setForeground(true)
+        #expect(h.coordinator.isForegroundActive)
+        #expect(await waitUntilMain { h.book.channels.count >= 2 })
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[1], client: client)
+        let live = await client.currentLinkState()
+        #expect({ if case .connected = live { return true }; return false }())
     }
 
     // MARK: - Retry now / network-restored reconnect (remote-control-0ef.21/.22)

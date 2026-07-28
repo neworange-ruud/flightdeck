@@ -124,7 +124,22 @@ final class TransportCoordinator {
 
     /// Whether the app is currently foregrounded. Drives whether a newly-added
     /// client starts immediately (`reconcile`) or waits for the next foreground.
+    ///
+    /// Owned **solely** by `setForeground` / `startAll` / `stopAll` — the
+    /// scenePhase lifecycle. The background-wake path deliberately does not
+    /// touch it (see `beginBackgroundWake`).
     private var isForeground = false
+
+    /// Whether a silent-push background wake is currently running
+    /// (remote-control-0ef.4): `beginBackgroundWake` returned `true` and
+    /// `endBackgroundWake` hasn't run yet.
+    private var wakeInFlight = false
+
+    /// Set when the app foregrounds *while* a wake is in flight. The wake's
+    /// trailing `endBackgroundWake` then leaves the transport up — the live link
+    /// now belongs to the foreground, and tearing it down would drop the socket
+    /// the user is looking at (remote-control-aew).
+    private var wakeSuperseded = false
 
     /// The most recent APNs device token handed over by `PushCoordinator`
     /// (remote-control-b8d.10), remembered so a machine added at runtime
@@ -180,6 +195,7 @@ final class TransportCoordinator {
         )
         if pairingStore != nil {
             armMachineNameObservation()
+            armRevocationObservation()
         }
         // Force an immediate reconnect when the network path is restored /
         // switches (remote-control-0ef.22) — only while foregrounded (the
@@ -235,6 +251,40 @@ final class TransportCoordinator {
         }
     }
 
+    // MARK: - Revoked-pairing pruning (remote-control-4wk)
+
+    /// Arm a self-perpetuating observation over every handle's `isRevoked` (and
+    /// the handle set), mirroring `armMachineNameObservation`'s shape. When the
+    /// relay reports a pairing gone — the desktop retiring a superseded pairing
+    /// to this same phone — its `PairedInstance` is removed, which drives a
+    /// `reconcile` that stops and disposes only that client. Without this the
+    /// phone would keep a record the relay no longer knows and reconnect it
+    /// forever, never reaching `auth_ok`.
+    private func armRevocationObservation() {
+        withObservationTracking {
+            for handle in handles {
+                _ = handle.store.isRevoked
+            }
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pruneRevokedPairings()
+                self.armRevocationObservation()
+            }
+        }
+    }
+
+    /// Drop the `PairedInstance` for every handle the relay has told us is
+    /// revoked. Removing it from the `PairingStore` is what `MainTabView`'s
+    /// instances observer turns into a `reconcile`, so the client is torn down
+    /// through the normal membership path rather than by a special case here.
+    private func pruneRevokedPairings() {
+        guard let pairingStore else { return }
+        for handle in handles where handle.store.isRevoked {
+            pairingStore.remove(pairingId: handle.pairingId)
+        }
+    }
+
     // MARK: - Lookup (downstream API: b8d.6 feed, b8d.12 detail views)
 
     /// The pairing ids of every live instance, oldest first.
@@ -269,11 +319,32 @@ final class TransportCoordinator {
     /// to the live store the moment a handle finishes connecting. Fully replaced
     /// by per-`pairingId` / aggregated resolution in remote-control-b8d.12.
     var primaryStore: TransportStore {
-        if let live = handles.first(where: {
+        let connected = handles.filter {
             if case .connected = $0.store.linkState { return true } else { return false }
-        }) {
-            return live.store
         }
+        // Prefer the connected pairing that most recently RECEIVED something
+        // (remote-control-4wk). Being connected is not enough to identify the
+        // pairing the desktop is serving: the desktop bridge feeds exactly one
+        // pairing (`send_msg` drops everything for any other), so when a phone
+        // holds several pairings to the SAME Mac — the normal residue of
+        // re-pairing — the unserved ones still reach `auth_ok` and look healthy
+        // while receiving nothing. `handles` is ordered oldest-first, so the
+        // plain "first connected" rule reliably picked the stale duplicate and
+        // pinned the Projects tab to a list that could never refresh, with
+        // pull-to-refresh silently unable to help (the desktop can only answer
+        // on the pairing it feeds).
+        //
+        // Newest-inbound rather than a sticky "has ever received" flag, so a
+        // desktop that switches which pairing it feeds is followed correctly.
+        if let served = connected
+            .filter({ $0.store.lastInboundAtMs != nil })
+            .max(by: { ($0.store.lastInboundAtMs ?? 0) < ($1.store.lastInboundAtMs ?? 0) }) {
+            return served.store
+        }
+        // Nothing has received yet (a fresh launch, mid-connect): fall back to
+        // the first connected pairing, then to the first handle's last-known
+        // cache (honestly flagged stale), then to the recordless fallback.
+        if let firstConnected = connected.first { return firstConnected.store }
         return handles.first?.store ?? fallbackStore
     }
 
@@ -359,9 +430,71 @@ final class TransportCoordinator {
         guard active != isForeground else { return }
         isForeground = active
         if active {
+            // A wake still in flight no longer owns the transport: from here the
+            // link is the foreground's, so the wake must not tear it back down
+            // when it finishes (remote-control-aew).
+            if wakeInFlight { wakeSuperseded = true }
             await startAll()
         } else {
             await stopAll()
+        }
+    }
+
+    /// Whether the transport is currently under foreground (scenePhase)
+    /// ownership. Read by the background-wake path so it never fights the
+    /// foreground lifecycle.
+    var isForegroundActive: Bool { isForeground }
+
+    // MARK: - Background wake (remote-control-0ef.4 / -aew)
+
+    /// Bring every client up for a silent APNs wake while backgrounded, WITHOUT
+    /// claiming foreground ownership. Returns whether the wake may proceed; the
+    /// caller must pair a `true` with exactly one `endBackgroundWake()`.
+    ///
+    /// Returns `false` — having done nothing at all — when the app is
+    /// foregrounded. iOS delivers `content-available` pushes to a foregrounded
+    /// app too, and the transport there is already live and owned by the
+    /// scenePhase lifecycle. Running a wake over it used to be actively
+    /// destructive (remote-control-aew): the wake's trailing teardown killed the
+    /// socket the user was looking at, which detached the phone's leg at the
+    /// relay, which made the relay push a wake for the *next* desktop envelope
+    /// (`deliver_or_push` pushes whenever no peer is attached) — a self-
+    /// sustaining connect-for-a-second-then-"Reconnecting…" flap that only ended
+    /// when the desktop went quiet.
+    ///
+    /// Also `false` when a wake is ALREADY in flight. A chatty desktop can land
+    /// several wakes in one background window (the relay pushes per undelivered
+    /// envelope), and overlapping wakes tear down each other's transport: the
+    /// first one's teardown lands mid-wait for the second, which then sits on a
+    /// dead link and tears it down again. One wake already drains the whole
+    /// queue, so the later pushes have nothing left to do.
+    ///
+    /// Deliberately does NOT go through `startAll()`: that would set
+    /// `isForeground`, which then swallows the next real `setForeground(true)`
+    /// (its `active != isForeground` guard) and leaves the app permanently
+    /// disconnected after the wake's teardown. The network-path monitor stays
+    /// off too — proactive reconnects are a foreground behavior.
+    func beginBackgroundWake() async -> Bool {
+        guard !isForeground, !wakeInFlight else { return false }
+        wakeInFlight = true
+        wakeSuperseded = false
+        for handle in handles {
+            await handle.store.start()
+        }
+        return true
+    }
+
+    /// Finish a wake started by `beginBackgroundWake()`: tear the clients back
+    /// down so the next foreground reconnects from a clean state — *unless* the
+    /// app foregrounded while the wake was running, in which case the live link
+    /// belongs to the foreground now and is left alone.
+    func endBackgroundWake() async {
+        let superseded = wakeSuperseded || isForeground
+        wakeInFlight = false
+        wakeSuperseded = false
+        guard !superseded else { return }
+        for handle in handles {
+            await handle.store.stop()
         }
     }
 
