@@ -202,6 +202,61 @@ fn no_deltas_sealed_or_sent_while_no_phone_peer_attached() {
     );
 }
 
+#[test]
+fn a_repeat_phone_connected_presence_still_rearms_the_snapshot() {
+    // remote-control-e9l: when a phone's socket dies half-open (iOS suspending
+    // the app), the relay keeps the stale leg until its idle timeout. The phone
+    // reconnecting SUPERSEDES that leg, and the relay deliberately sends no
+    // `Disconnected` for a superseded leg — so the desktop sees `Connected`
+    // again with `peer_present` already true, i.e. no false→true edge. An
+    // edge-triggered re-arm left that phone with no fresh snapshot, and
+    // `status_update` deltas can never add or remove a session, so it sat on a
+    // stale session list indefinitely.
+    let mut b = paired_bridge();
+    let cache = GitStatusCache::new();
+
+    // Baseline: the phone has seen this world.
+    let app = app_with_tabs(vec![tab_state("t1", "connection-issues", "claude")]);
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let msgs = collect(&mut b, &views, 1_000);
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, DesktopToPhone::Snapshot(_))));
+    }
+
+    // The session set changes while the phone is away, and the desktop's
+    // baseline advances past it (the forced snapshot goes to a leg that is
+    // already dead, and the relay can shed it from the queue).
+    let app = app_with_tabs(vec![tab_state("t2", "connection-issues-v2", "claude")]);
+    {
+        let views = vec![view("proj", &app, &cache)];
+        let _ = collect(&mut b, &views, 2_000);
+    }
+
+    // The phone reattaches by superseding: `Connected` with no intervening
+    // `Disconnected`. It must still be handed a full snapshot.
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new("pair-1"),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
+    let views = vec![view("proj", &app, &cache)];
+    let msgs = collect(&mut b, &views, 3_000);
+    let snap = msgs
+        .iter()
+        .find_map(|m| match m {
+            DesktopToPhone::Snapshot(s) => Some(s),
+            _ => None,
+        })
+        .expect("a resupersede-attached phone must get a fresh snapshot");
+    assert_eq!(snap.projects[0].sessions.len(), 1);
+    assert_eq!(
+        snap.projects[0].sessions[0].name, "connection-issues-v2",
+        "the snapshot must carry the CURRENT session set, not the stale one"
+    );
+}
+
 // --- snapshot on connect ---------------------------------------------------
 
 #[test]

@@ -16,6 +16,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Remote: the phone no longer shows agents for sessions that are gone.** After
+  a reconnect the session list could stay frozen on whatever it last saw — an
+  agent for a deleted worktree stayed on screen indefinitely — while the statuses
+  of sessions it already knew kept updating live, which made it look like a
+  rendering quirk rather than a sync failure. A full snapshot is the only message
+  that can add or remove a session (a `status_update` can only change sessions
+  the phone already knows), and two separate holes stopped one from being sent.
+  On the desktop, a fresh snapshot was armed only when a phone went from absent
+  to present; but when a phone's socket dies half-open — the normal case when iOS
+  suspends the app — the relay holds the stale leg until its idle timeout, and the
+  reconnecting phone supersedes it, which by design produces no disconnect. The
+  desktop therefore saw "connected" with the phone already marked present, found
+  no edge, and sent nothing. On the phone, the desktop's presence was remembered
+  across sockets instead of per session, which defeated the backstop from both
+  directions: a stale "absent" made the post-authentication snapshot request fail
+  fast as *peer unavailable*, and a stale "present" made the desktop's return look
+  like no change and skip the re-request. Every phone connection now re-arms the
+  snapshot, and peer presence resets with each session.
 - **Remote: opening the phone app after a while no longer flaps between
   "Reconnecting…" and a one-second connection.** Reopening the app after it had
   been idle put it in a loop: connected for about a second, back to

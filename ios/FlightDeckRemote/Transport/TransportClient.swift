@@ -397,6 +397,18 @@ actor TransportClient {
         channel = ch
         sessionAuthed = false
         phase = .awaitingHelloOk
+        // The peer's presence is per-SESSION knowledge: a fresh socket knows
+        // nothing about the desktop until the relay says so. Carrying the last
+        // session's belief over broke refresh-on-reconnect in both directions
+        // (remote-control-e9l):
+        //  - a stale `false` made the post-`auth_ok` `request_snapshot` fail
+        //    fast as "peer unavailable", so the desktop was never asked;
+        //  - a stale `true` made the compensating re-issue below
+        //    (`connected, wasConnected != true`) look like a no-op change and
+        //    skip, because it thought the desktop had never left.
+        // `nil` (unknown) lets the send through and makes the first real
+        // `peer_presence` frame a genuine transition.
+        peerConnected = nil
 
         // Derive the E2E channel for this pairing up front (needed the instant a
         // replayed envelope arrives after resume).
