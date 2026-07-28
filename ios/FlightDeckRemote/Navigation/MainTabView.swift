@@ -276,12 +276,21 @@ struct MainTabView: View {
     /// tears the transport back down so the next foreground reconnects cleanly.
     /// Returns whether the link came back live (drives the fetch result).
     ///
+    /// Bracketed by `beginBackgroundWake()`/`endBackgroundWake()` rather than
+    /// `startAll()`/`stopAll()` (remote-control-aew): iOS delivers silent pushes
+    /// to a FOREGROUNDED app too, and the foreground transport is not this
+    /// path's to stop. `begin` declines the wake outright while foregrounded,
+    /// and `end` skips its teardown if the app foregrounded mid-wake — without
+    /// either guard, a wake arriving as the user opens the app kills the fresh
+    /// link, which detaches the phone at the relay, which makes the relay push
+    /// again for the next envelope: an endless connect/"Reconnecting…" flap.
+    ///
     /// Static (captures no `View`) so the closure stored on `PushCoordinator`
     /// outlives any given `MainTabView` value. The reconnect-then-teardown here
     /// is background-lifecycle behavior that can only be exercised on a real
     /// device/simulator app-lifecycle, so it is integration-level, not unit
-    /// tested (the pieces it composes — reconnect, resume/snapshot, notification
-    /// scheduling — are each covered on their own).
+    /// tested (the pieces it composes — the wake bracket, reconnect,
+    /// resume/snapshot, notification scheduling — are each covered on their own).
     @MainActor
     private static func performBackgroundWake(
         coordinator: TransportCoordinator,
@@ -289,7 +298,10 @@ struct MainTabView: View {
         preferences: NotificationPreferences
     ) async -> Bool {
         // Reconnect every paired machine (they were stopped on background).
-        await coordinator.startAll()
+        // Declined while foregrounded — the link is already live and owned by
+        // the scenePhase lifecycle, so there is nothing to wake and nothing
+        // fetched that the live transport isn't already ingesting.
+        guard await coordinator.beginBackgroundWake() else { return false }
 
         // Bounded wait for the sockets to reach `auth_ok` — the background
         // execution budget is short, so give up rather than hang if the phone
@@ -320,9 +332,11 @@ struct MainTabView: View {
             if case .connected = $0.linkState { return true }
             return false
         }
-        // Still backgrounded — tear back down so the next foreground reconnects
-        // from a clean state (APNs owns the wake in between).
-        await coordinator.stopAll()
+        // Tear back down so the next foreground reconnects from a clean state
+        // (APNs owns the wake in between) — unless the app foregrounded while
+        // this wake ran, in which case the link is the foreground's now and
+        // `endBackgroundWake` leaves it up.
+        await coordinator.endBackgroundWake()
         return reachedLive
     }
 

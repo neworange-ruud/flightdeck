@@ -16,7 +16,23 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Remote: opening the phone app after a while no longer flaps between
+  "Reconnecting…" and a one-second connection.** Reopening the app after it had
+  been idle put it in a loop: connected for about a second, back to
+  "Reconnecting…", over and over, indefinitely. The silent APNs wake was the
+  culprit. iOS delivers `content-available` pushes to a *foregrounded* app too,
+  and the wake performer ended with an unconditional teardown of the whole
+  transport — so a wake that landed as the user opened the app killed the link
+  they were looking at. That detached the phone's leg at the relay, and the relay
+  pushes a wake for every desktop→phone envelope that arrives with no peer
+  attached, so each new event triggered another wake: connect, tear down,
+  connect, tear down. Nothing broke the cycle, because the wake also claimed the
+  foreground flag on its way in, which made the real foreground transition a
+  no-op, and its teardown cancelled the network-path monitor that would otherwise
+  have forced a reconnect. The wake is now bracketed by a begin/end pair that
+  declines outright while the app is foregrounded and skips its teardown if the
+  app came to the foreground mid-wake; foreground ownership of the transport now
+  belongs to the scene-phase lifecycle alone.
 
 ## [1.13.0] - 2026-07-27
 
