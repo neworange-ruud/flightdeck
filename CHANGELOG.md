@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.14.0] - 2026-07-28
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - **Remote: a second pairing to the same Mac no longer strands the phone on a
   dead session list.** Re-pairing a phone left the older pairing behind, and both
   stayed live: the Mac still had it, the relay still authenticated it, and the
