@@ -136,16 +136,23 @@ each project's own mode, so background projects — which never reach
 same helper rather than deciding independently:
 
 - `render::draw` — `chrome_for(area, state.mode())`; also skips drawing the
-  project row, info divider, and info bar when collapsed, and branches the
-  sidebar renderer.
+  info divider and info bar when collapsed, and branches the sidebar
+  renderer. It does not draw the project row at all — that is the event
+  loop's job (below).
 - `render::hit_test` — same derivation; branches `sidebar_hit`.
 - `lib.rs` render loop (project tab row), `handle_mouse` (project tab hit test),
   `terminal_at`, `viewport_for_target`, `sync_terminal_sizes` (split path),
-  `viewport_pty_size`.
+  `viewport_pty_size`. The render loop's `draw_project_tab_bar` call carries
+  its own explicit zero-area guard (see below) since it does not derive its
+  sub-rects purely from `area`.
 
-In `handle_mouse` and the render loop the project row is zero-height when
-collapsed, so its hit test returns `None` and its draw is a no-op without any
-special casing.
+In `handle_mouse` the project row is zero-height when collapsed, so its hit
+test returns `None` without any special casing. Draws do not get this for
+free: a zero-height rect only makes a *hit test* a no-op automatically. A
+*draw* still needs an explicit guard unless every widget it renders derives
+its own rect from `area`. `draw_project_tab_bar` builds a fixed-height
+sub-rect for its "+ project" button, so it carries an explicit zero-area
+guard in the render loop's draw call.
 
 Split view is unaffected: `split_region` and `split_columns` derive from
 `MainLayout` and simply receive a larger region.

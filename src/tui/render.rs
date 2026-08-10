@@ -788,6 +788,13 @@ pub fn draw_project_tab_bar(
     active: usize,
     now_ms: u64,
 ) {
+    // A zero-height (or zero-width) area means the row is collapsed. Bail out
+    // before building any sub-rect: `project_new_button` derives a fixed
+    // height of 1 for its rect regardless of `area`, so without this guard it
+    // would paint onto whatever row follows the collapsed project tab row.
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let mut spans: Vec<Span> = Vec::new();
     for (i, p) in projects.iter().enumerate() {
         if i > 0 {
@@ -2752,9 +2759,9 @@ mod tests {
         // Row 0 is tab 0 (idle → dot), row 1 the selection arrow, row 2 a spinner.
         assert_eq!(strip_glyph(&buffer, 0), "●");
         assert_eq!(strip_glyph(&buffer, 1), "▸");
-        assert_ne!(
+        assert_eq!(
             strip_glyph(&buffer, 2),
-            "●",
+            spinner_frame(0).to_string(),
             "a tab being created shows a spinner, not a status dot"
         );
         // No heading: there is no room for the word "Agents".
@@ -2834,6 +2841,93 @@ mod tests {
 
         assert!(all.contains("Agents"), "app mode keeps the full sidebar");
         assert!(all.contains('⎇'), "app mode keeps the git info bar");
+    }
+
+    /// Reproduces the event loop's draw order (src/lib.rs, around line 1253):
+    /// `draw_project_tab_bar` is called first with the layout's
+    /// `project_tabs` rect, then `draw` is called with the full area — `draw`
+    /// recomputes the same chrome and layout internally and paints the
+    /// divider row on top of whatever `draw_project_tab_bar` left behind.
+    fn draw_composition(
+        term: &mut Terminal<TestBackend>,
+        state: &AppState,
+        projects: &[ProjectTabInfo],
+    ) {
+        term.draw(|frame| {
+            let area = frame.area();
+            let chrome = layout::chrome_for(area, state.mode());
+            let ml = layout::compute(area, chrome, mode_style::border_enabled(&state.config.ui));
+            draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
+            draw(frame, state, &empty_cache(), &UiOverlay::None, 0);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn collapsed_composition_leaves_the_divider_row_clean() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_terminal();
+        assert_eq!(
+            layout::chrome_for(Rect::new(0, 0, w, h), state.mode()),
+            layout::Chrome::Collapsed
+        );
+
+        let projects = vec![ProjectTabInfo {
+            name: "alpha".to_string(),
+            attention: false,
+            busy: false,
+        }];
+        let mut term = test_terminal(w, h);
+        draw_composition(&mut term, &state, &projects);
+        let buffer = term.backend().buffer().clone();
+
+        // The divider sits at row 1 when collapsed: header row 0, divider row
+        // 1, no project tab row in between. No cell in it may carry the
+        // "+ project" button's background — that background surviving means
+        // the button's fixed-height rect painted through onto the divider
+        // underneath it.
+        for x in 0..w {
+            assert_ne!(
+                buffer[(x, 1)].bg,
+                PROJECT_TAB_ACTIVE_BG,
+                "divider row cell ({x}, 1) carries the project-tab button's background"
+            );
+        }
+    }
+
+    #[test]
+    fn full_composition_leaves_the_divider_row_clean() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_app();
+        assert_eq!(
+            layout::chrome_for(Rect::new(0, 0, w, h), state.mode()),
+            layout::Chrome::Full
+        );
+
+        let projects = vec![ProjectTabInfo {
+            name: "alpha".to_string(),
+            attention: false,
+            busy: false,
+        }];
+        let mut term = test_terminal(w, h);
+        draw_composition(&mut term, &state, &projects);
+        let buffer = term.backend().buffer().clone();
+
+        // The project tab row (row 1, below the header) renders normally...
+        let tab_row: String = (0..w)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
+        assert!(tab_row.contains("alpha"), "project tab row: {tab_row:?}");
+        // ...and the divider row below it (row 2) is still clean.
+        for x in 0..w {
+            assert_ne!(
+                buffer[(x, 2)].bg,
+                PROJECT_TAB_ACTIVE_BG,
+                "divider row cell ({x}, 2) carries the project-tab button's background"
+            );
+        }
     }
 
     #[test]

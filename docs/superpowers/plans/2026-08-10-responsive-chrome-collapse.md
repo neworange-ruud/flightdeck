@@ -1071,6 +1071,6 @@ Report the result to the user and get approval before opening a PR.
 | PTY sizing (`viewport_pty_size` mode param, per-frame re-derive, `Event::Resize` per project) | 5 |
 | Test plan (chrome truth table, layout geometry, degenerate areas, hit-testing, rendering, PTY sizing) | 1, 2, 3, 4, 5 |
 
-The project tab row is drawn from `src/lib.rs`, not `render::draw`, so it needs no explicit skip — Task 1 gives it a zero-height rect and Task 4 makes the wiring layer derive the same chrome, which makes both its draw and its hit test no-ops when collapsed.
+The project tab row is drawn from `src/lib.rs`, not `render::draw`. Task 1 gives it a zero-height rect, and Task 4 makes the wiring layer derive the same chrome; together these make its *hit test* a no-op for free when collapsed. Its *draw* does not get this for free: `draw_project_tab_bar` builds a fixed-height sub-rect for its "+ project" button, so it needs an explicit zero-area guard even though it derives its rect from `MainLayout`.
 
 **Type consistency:** `Chrome`, `chrome_for`, `COLLAPSED_SIDEBAR_WIDTH`, `MIN_FULL_ROWS`, `MIN_FULL_COLS` are defined in Task 1 and used with the same names in Tasks 2–5. `draw_sidebar` and `sidebar_hit` take `chrome` in the same position (before the trailing arguments) everywhere. `viewport_pty_size(full, mode)` is defined and called consistently in Task 5.
