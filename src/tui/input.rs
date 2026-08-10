@@ -242,6 +242,12 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
                 Selector::Index(idx),
             )))
         }
+        // Alt-o: open the selected worktree in the OS file manager. Global so it
+        // works with a terminal focused (the common case). Alt-O is not a
+        // standard readline/agent binding, so the PTY loses nothing.
+        KeyCode::Char('o') if alt && !ctrl && !shift => {
+            Some(KeyAction::Dispatch(Command::OpenWorktreeInFileManager))
+        }
         _ => None,
     }
 }
@@ -709,6 +715,28 @@ mod tests {
         assert_eq!(
             map_key(InputMode::App, key(KeyCode::Enter)),
             KeyAction::FocusTerminal
+        );
+    }
+
+    #[test]
+    fn alt_o_opens_the_file_manager_in_both_modes() {
+        // Global binding: the common case is hitting it while the agent
+        // terminal has focus, so it must not be App-mode only.
+        assert_eq!(
+            map_key(InputMode::App, alt(KeyCode::Char('o'))),
+            KeyAction::Dispatch(Command::OpenWorktreeInFileManager)
+        );
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Char('o'))),
+            KeyAction::Dispatch(Command::OpenWorktreeInFileManager)
+        );
+    }
+
+    #[test]
+    fn plain_o_still_passes_through_to_the_terminal() {
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::Char('o'))),
+            KeyAction::Passthrough(vec![b'o'])
         );
     }
 

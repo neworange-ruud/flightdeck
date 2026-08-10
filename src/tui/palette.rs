@@ -111,6 +111,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
     },
     PaletteEntry {
+        group: "Worktree",
+        label: "Open Worktree in File Manager",
+        action: PaletteAction::Dispatch(Command::OpenWorktreeInFileManager),
+    },
+    PaletteEntry {
         group: "Git",
         label: "Push Branch",
         action: PaletteAction::Dispatch(Command::PushBranch { confirm: None }),
@@ -189,11 +194,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
 /// View", "Rebase Worktree", and "Pull Base" commands, the in-session agent
-/// actions ("New Agent" / "Close Agent"), and "Open Configuration". (The `.env`
-/// files are now symlinked into new worktrees automatically, so the "Copy
-/// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
-/// command remains.)
-pub const REQUIRED_ACTION_COUNT: usize = 26;
+/// actions ("New Agent" / "Close Agent"), "Open Configuration", and "Open
+/// Worktree in File Manager". (The `.env` files are now symlinked into new
+/// worktrees automatically, so the "Copy .env(.local)" entry is hidden from the
+/// palette; the [`Command::CopyEnvFile`] command remains.)
+pub const REQUIRED_ACTION_COUNT: usize = 27;
 
 /// The command palette model (SPECS §22).
 ///
@@ -369,6 +374,19 @@ mod tests {
             .expect("rebase worktree action present");
         assert_eq!(rebase.group, "Worktree");
         assert!(ALL_ENTRIES.iter().all(|e| !e.group.is_empty()));
+    }
+
+    #[test]
+    fn open_in_file_manager_entry_exists_in_the_worktree_group() {
+        let entry = ALL_ENTRIES
+            .iter()
+            .find(|e| e.label == "Open Worktree in File Manager")
+            .expect("palette must offer the file-manager action");
+        assert_eq!(entry.group, "Worktree");
+        assert_eq!(
+            entry.action,
+            PaletteAction::Dispatch(Command::OpenWorktreeInFileManager)
+        );
     }
 
     #[test]
