@@ -130,6 +130,25 @@ reachable through the existing `$EDITOR` path.
 - Help overlay (`draw_help_overlay` in `src/tui/render.rs`): a shortcut row.
 - `CHANGELOG.md`: entry added when the pull request is opened, per `AGENTS.md`.
 
+### `specs/SPECS.md`
+
+`specs/SPECS.md` is the project's living specification and must describe this
+feature once it ships. The implementation plan carries a task for each edit
+below, so the spec is never left behind:
+
+- **§8 Config File** — add `file_manager = ""` to the `[ui]` block of the
+  example global base, with a note that empty means the per-OS default.
+- **§22 Interaction Model** — add `Open Worktree in File Manager` to the
+  required command-palette actions list.
+- **§23 Keyboard Modes** — add `Alt-O  Open selected worktree in the OS file
+  manager` to the `Global` group of the required-shortcuts block.
+- **§26 Testing Requirements** — add the launcher-resolution unit tests to the
+  required unit-test areas.
+
+This document (`docs/superpowers/specs/`) records the design and the reasoning
+behind it; `specs/SPECS.md` records what the shipped product does. Both are
+updated — they are not duplicates of each other.
+
 ## Out of scope
 
 - Following the live working directory of the focused terminal (would require
