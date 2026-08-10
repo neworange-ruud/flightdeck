@@ -70,6 +70,10 @@ New module `src/tui/file_manager.rs`:
   corrupt the alternate screen. Returns `Err` with a human-readable message when
   the spawn itself fails.
 
+The spawned child is handed to a short-lived detached thread that only waits on
+it, so a quickly-exiting `xdg-open` is reaped rather than left as a zombie for
+the lifetime of the FlightDeck process. The thread's result is discarded.
+
 **We spawn without waiting for exit.** A configured GUI file manager (`nautilus`
 with no already-running instance, for one) stays in the foreground for the life
 of its window; waiting on it would freeze the TUI. The consequence is that
