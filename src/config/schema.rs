@@ -58,6 +58,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            file_manager: String::new(),
         },
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
@@ -163,6 +164,14 @@ mod tests {
     fn default_config_uses_platform_leave_focus_key() {
         let cfg = default_config("my-project", "main");
         assert!(!cfg.ui.use_f2_to_leave_terminal_focus);
+    }
+
+    #[test]
+    fn default_config_leaves_file_manager_empty() {
+        // Empty means "use the per-OS default launcher" (open / explorer.exe /
+        // xdg-open); the key is still written so the global config documents it.
+        let cfg = default_config("my-project", "main");
+        assert_eq!(cfg.ui.file_manager, "");
     }
 
     #[test]

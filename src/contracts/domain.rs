@@ -269,6 +269,13 @@ pub struct UiConfig {
     /// terminal focus. Off by default.
     #[serde(default)]
     pub use_f2_to_leave_terminal_focus: bool,
+    /// Command used to open a worktree directory in the OS file manager.
+    /// Empty (the default) means the per-OS default: `open` on macOS,
+    /// `explorer.exe` on Windows, `xdg-open` elsewhere. A non-empty value is
+    /// split on whitespace into a program plus arguments (no shell), so
+    /// `flatpak run org.gnome.Nautilus` works.
+    #[serde(default)]
+    pub file_manager: String,
 }
 
 impl Default for UiConfig {
@@ -277,6 +284,7 @@ impl Default for UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            file_manager: String::new(),
         }
     }
 }
