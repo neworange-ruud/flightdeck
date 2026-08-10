@@ -338,7 +338,8 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), col, row).unwrap_or(HitTarget::Sidebar),
+            sidebar_hit(ml.sidebar, state.tabs.len(), layout::Chrome::Full, col, row)
+                .unwrap_or(HitTarget::Sidebar),
         );
     }
     if state.split_view {
@@ -391,24 +392,37 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
 /// Map a click in the sidebar `area` to an agent tab hit: the `✕` close control
 /// (on the name row, at the far right) or the tab row itself. Returns `None` for
 /// clicks that are not on a tab (header/heading/empty space below the tabs).
-fn sidebar_hit(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<HitTarget> {
+/// In the collapsed strip each agent occupies a single row and there is no close control.
+fn sidebar_hit(
+    area: Rect,
+    tab_count: usize,
+    chrome: layout::Chrome,
+    col: u16,
+    row: u16,
+) -> Option<HitTarget> {
     let inner = Block::default().borders(Borders::RIGHT).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
-    let first = inner.y.saturating_add(SIDEBAR_HEADER_ROWS);
+    // The collapsed strip is one row per agent with no heading above it.
+    let (header_rows, rows_per_tab) = match chrome {
+        layout::Chrome::Full => (SIDEBAR_HEADER_ROWS, SIDEBAR_ROWS_PER_TAB),
+        layout::Chrome::Collapsed => (0, 1),
+    };
+    let first = inner.y.saturating_add(header_rows);
     if row < first {
         return None;
     }
     let rel = row - first;
-    let idx = (rel / SIDEBAR_ROWS_PER_TAB) as usize;
+    let idx = (rel / rows_per_tab) as usize;
     if idx >= tab_count {
         return None;
     }
-    // Within a tab block the rows are: divider(0), name(1), agent(2), git(3).
-    // The `✕` lives on the name row at the far right; give it a forgiving
-    // 3-column target so it stays easy to click.
-    if rel % SIDEBAR_ROWS_PER_TAB == 1 {
+    // Within a full tab block the rows are: divider(0), name(1), agent(2),
+    // git(3). The `✕` lives on the name row at the far right; give it a
+    // forgiving 3-column target so it stays easy to click. The collapsed strip
+    // has no close control — use APP mode to close an agent.
+    if chrome == layout::Chrome::Full && rel % rows_per_tab == 1 {
         let close_col = inner.x.saturating_add(inner.width).saturating_sub(1);
         if col >= close_col.saturating_sub(2) {
             return Some(HitTarget::CloseAgentTab(idx));
@@ -548,7 +562,14 @@ pub fn draw(
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
-    draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
+    draw_sidebar(
+        frame,
+        state,
+        cache,
+        ml.sidebar,
+        layout::Chrome::Full,
+        now_ms,
+    );
     if state.split_view {
         // Split view reclaims the tab-bar row and lays the selected tab's
         // terminals out side by side in equal-width columns.
@@ -829,8 +850,14 @@ pub fn draw_sidebar(
     state: &AppState,
     cache: &GitStatusCache,
     area: Rect,
+    chrome: layout::Chrome,
     now_ms: u64,
 ) {
+    if chrome == layout::Chrome::Collapsed {
+        draw_sidebar_collapsed(frame, state, area, now_ms);
+        return;
+    }
+
     // When the live-pane border feature is on, the focused pane's frame
     // already supplies the separating vertical line, so the sidebar's own
     // right divider is suppressed here — otherwise two adjacent vertical
@@ -965,6 +992,68 @@ pub fn draw_sidebar(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draw the collapsed agent strip: one indicator glyph per agent, no heading
+/// and no close control, for windows too small to afford the full sidebar.
+fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
+    let block = Block::default().borders(Borders::RIGHT);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = state
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            Line::from(collapsed_agent_span(
+                tab,
+                state.selected_tab == Some(i),
+                now_ms,
+            ))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The single-cell indicator for one agent in the collapsed strip: the
+/// selection arrow, a spinner while it works, or its status dot. Same glyphs
+/// and colours the full sidebar draws on each agent's name line, with the text
+/// removed.
+fn collapsed_agent_span(
+    tab: &crate::app::state::RuntimeTab,
+    selected: bool,
+    now_ms: u64,
+) -> Span<'static> {
+    use crate::contracts::InterpretedStatus::{Running, Starting, Working};
+
+    if selected {
+        return Span::styled(
+            "▸",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let spinner = || {
+        Span::styled(
+            spinner_frame(now_ms).to_string(),
+            Style::default().fg(Color::Red),
+        )
+    };
+    if tab.phase == TabPhase::Creating {
+        return spinner();
+    }
+    let ds = tab.display_status(now_ms);
+    if matches!(ds.interpreted, Starting | Running | Working) {
+        return spinner();
+    }
+    let color = ds
+        .manual
+        .map(|_| Color::Cyan)
+        .unwrap_or_else(|| status_label_color(ds.interpreted).1);
+    Span::styled("●", Style::default().fg(color))
 }
 
 /// Build a sidebar tab name line: `<marker><lead><name>` on the left with a
@@ -2624,6 +2713,71 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(hit_test(area, &state, 2, 3), Some(HitTarget::Sidebar));
         assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::Sidebar));
+    }
+
+    // --- Collapsed chrome (small windows in terminal mode) -----------------
+
+    /// Read the glyph in the first column of `row` from a rendered buffer.
+    fn strip_glyph(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        buffer[(0, row)].symbol().to_string()
+    }
+
+    #[test]
+    fn collapsed_sidebar_draws_one_glyph_per_agent() {
+        let mut state = state_with_tabs(3);
+        state.selected_tab = Some(1);
+        // Tab 2 is mid-creation, so it must show a spinner rather than a dot.
+        state.tabs[2].phase = TabPhase::Creating;
+
+        let mut term = test_terminal(layout::COLLAPSED_SIDEBAR_WIDTH, 6);
+        term.draw(|frame| {
+            draw_sidebar(
+                frame,
+                &state,
+                &empty_cache(),
+                Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6),
+                layout::Chrome::Collapsed,
+                0,
+            )
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+
+        // Row 0 is tab 0 (idle → dot), row 1 the selection arrow, row 2 a spinner.
+        assert_eq!(strip_glyph(&buffer, 0), "●");
+        assert_eq!(strip_glyph(&buffer, 1), "▸");
+        assert_ne!(
+            strip_glyph(&buffer, 2),
+            "●",
+            "a tab being created shows a spinner, not a status dot"
+        );
+        // No heading: there is no room for the word "Agents".
+        let all: String = (0..6_u16)
+            .flat_map(|y| (0..layout::COLLAPSED_SIDEBAR_WIDTH).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!all.contains("Agents"));
+    }
+
+    #[test]
+    fn collapsed_sidebar_hit_maps_one_row_per_agent_and_never_closes() {
+        let area = Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6);
+        // One row per tab, starting at the sidebar's first row — no heading offset.
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 0),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 2),
+            Some(HitTarget::AgentTab(2))
+        );
+        // Past the last agent resolves to nothing (the caller falls back to chrome).
+        assert_eq!(sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 3), None);
+        // The rightmost inner column selects; it is never a close control.
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 1, 1),
+            Some(HitTarget::AgentTab(1))
+        );
     }
 
     #[test]
