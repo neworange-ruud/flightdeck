@@ -1619,9 +1619,10 @@ fn event_loop(
         terminal
             .draw(|frame| {
                 let area = frame.area();
+                let chrome = crate::tui::layout::chrome_for(area, p.state.mode());
                 let ml = crate::tui::layout::compute(
                     area,
-                    crate::tui::layout::Chrome::Full,
+                    chrome,
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
@@ -2727,9 +2728,10 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
     // The project tab row (workspace-level) is checked before the active
     // project's own layout: a click switches/opens/closes a project.
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        let chrome = crate::tui::layout::chrome_for(area, workspace.active_project().state.mode());
         let ml = crate::tui::layout::compute(
             area,
-            crate::tui::layout::Chrome::Full,
+            chrome,
             crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
@@ -2994,7 +2996,7 @@ fn active_target(state: &AppState) -> ChildTarget {
 fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(ChildTarget, Rect)> {
     let ml = crate::tui::layout::compute(
         area,
-        crate::tui::layout::Chrome::Full,
+        crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if state.split_view {
@@ -3018,7 +3020,7 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
 fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Option<Rect> {
     let ml = crate::tui::layout::compute(
         area,
-        crate::tui::layout::Chrome::Full,
+        crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if !state.split_view {
@@ -5007,7 +5009,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
-            crate::tui::layout::Chrome::Full,
+            crate::tui::layout::chrome_for(area, state.mode()),
             crate::tui::mode_style::border_enabled(&state.config.ui),
         );
         let region = crate::tui::layout::split_region(&ml);
@@ -5525,6 +5527,31 @@ mod tests {
         let framed = viewport_pty_size(full, true);
         assert_eq!(framed.cols, plain.cols - 2);
         assert_eq!(framed.rows, plain.rows - 2);
+    }
+
+    #[test]
+    fn terminal_at_follows_the_collapsed_sidebar_in_terminal_mode() {
+        use crate::persistence::project_state::default_state;
+
+        let mut state = AppState::new(
+            Config::default(),
+            default_state("main"),
+            "/repo",
+            "/repo/state.json",
+        );
+        // Below both collapse thresholds (108 cols, 32 rows).
+        let area = Rect::new(0, 0, 100, 24);
+
+        // App mode keeps the 28-column sidebar, so column 5 is not the terminal.
+        state.focus_app();
+        assert!(terminal_at(area, &state, 5, 10).is_none());
+
+        // Terminal mode collapses the sidebar to a 3-column strip, so the same
+        // point is now inside the viewport.
+        state.focus_terminal();
+        let (_, viewport) =
+            terminal_at(area, &state, 5, 10).expect("collapsed viewport covers column 5");
+        assert_eq!(viewport.x, crate::tui::layout::COLLAPSED_SIDEBAR_WIDTH);
     }
 
     #[test]
