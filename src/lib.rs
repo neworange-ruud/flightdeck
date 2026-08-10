@@ -247,16 +247,13 @@ pub fn run() -> Result<()> {
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width — for every open project.
     if let Ok(size) = terminal.size() {
-        let reserve =
-            crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui);
-        let vp = viewport_pty_size(
-            PtySize {
-                rows: size.height,
-                cols: size.width,
-            },
-            reserve,
-        );
+        let full = PtySize {
+            rows: size.height,
+            cols: size.width,
+        };
         for p in workspace.projects.iter_mut() {
+            let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
+            let vp = viewport_pty_size(full, p.state.mode(), reserve);
             p.state.set_pty_size(vp);
         }
     }
@@ -1655,13 +1652,12 @@ fn event_loop(
                 handle_paste(data, workspace, env, &mut ui)?;
             }
             Event::Resize(cols, rows) => {
-                let reserve = crate::tui::mode_style::border_enabled(
-                    &workspace.active_project().state.config.ui,
-                );
-                let size = viewport_pty_size(PtySize { rows, cols }, reserve);
+                let full = PtySize { rows, cols };
                 // Resize every project's sessions so a background agent's output
                 // wraps correctly the moment the user switches back to it.
                 for p in workspace.projects.iter_mut() {
+                    let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
+                    let size = viewport_pty_size(full, p.state.mode(), reserve);
                     p.state.set_pty_size(size);
                     resize_sessions(&mut p.state, size);
                 }
@@ -2673,11 +2669,13 @@ fn spawn_status_refresh(
 
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents
 /// must wrap at the viewport width (total minus the sidebar/borders), not the
-/// whole screen.
-fn viewport_pty_size(full: PtySize, reserve_border: bool) -> PtySize {
+/// whole screen. `mode` matters because collapsed chrome hands the sidebar's
+/// columns and the hidden bars' rows to the viewport.
+fn viewport_pty_size(full: PtySize, mode: InputMode, reserve_border: bool) -> PtySize {
+    let area = Rect::new(0, 0, full.cols, full.rows);
     let ml = crate::tui::layout::compute(
-        Rect::new(0, 0, full.cols, full.rows),
-        crate::tui::layout::Chrome::Full,
+        area,
+        crate::tui::layout::chrome_for(area, mode),
         reserve_border,
     );
     PtySize {
@@ -5000,7 +4998,19 @@ fn resize_if_changed(term: &mut crate::terminal::session::Terminal, size: PtySiz
 /// Idempotent via [`resize_if_changed`], so calling it every frame is cheap and
 /// transparently handles every transition (toggle, tab switch, child add/close,
 /// terminal resize) without threading resize calls through each command.
+///
+/// Also re-derives `state.pty_size` from the current mode, so toggling between
+/// APP and TERMINAL resizes the agent PTY to match the chrome that is drawn.
 fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
+    // Collapse follows the input mode, not just the window size, so re-derive
+    // the viewport every frame rather than only on `Event::Resize`.
+    // `resize_if_changed` below makes the frames where nothing moved free.
+    state.pty_size = viewport_pty_size(
+        full,
+        state.mode(),
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
+
     let Some(idx) = state.selected_tab else {
         return;
     };
@@ -5511,7 +5521,7 @@ mod tests {
             rows: 40,
             cols: 120,
         };
-        let vp = viewport_pty_size(full, false);
+        let vp = viewport_pty_size(full, InputMode::App, false);
         assert!(vp.cols < full.cols, "viewport narrower than full screen");
         assert!(vp.rows < full.rows, "viewport shorter than full screen");
         assert!(vp.cols >= 1 && vp.rows >= 1);
@@ -5523,10 +5533,36 @@ mod tests {
             rows: 40,
             cols: 120,
         };
-        let plain = viewport_pty_size(full, false);
-        let framed = viewport_pty_size(full, true);
+        let plain = viewport_pty_size(full, InputMode::App, false);
+        let framed = viewport_pty_size(full, InputMode::App, true);
         assert_eq!(framed.cols, plain.cols - 2);
         assert_eq!(framed.rows, plain.rows - 2);
+    }
+
+    #[test]
+    fn collapsed_viewport_is_larger_only_where_the_window_is_small() {
+        // Below both thresholds: terminal mode collapses and reclaims space.
+        let small = PtySize {
+            rows: 24,
+            cols: 100,
+        };
+        let app = viewport_pty_size(small, InputMode::App, false);
+        let terminal = viewport_pty_size(small, InputMode::Terminal, false);
+        assert!(terminal.rows > app.rows, "collapsing reclaims chrome rows");
+        assert!(
+            terminal.cols > app.cols,
+            "collapsing reclaims sidebar columns"
+        );
+
+        // A large window never collapses, so both modes agree exactly.
+        let large = PtySize {
+            rows: 50,
+            cols: 200,
+        };
+        assert_eq!(
+            viewport_pty_size(large, InputMode::App, false),
+            viewport_pty_size(large, InputMode::Terminal, false)
+        );
     }
 
     #[test]

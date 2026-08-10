@@ -8,7 +8,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Collapse FlightDeck's chrome in small windows while in terminal focus: the
+  project tab row and git info bar hide and the agents sidebar shrinks to a
+  one-glyph strip, giving the agent three more rows and 25 more columns.
+  Switching to app mode restores everything.
 
 ### Improvements
 
