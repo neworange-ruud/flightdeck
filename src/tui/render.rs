@@ -326,9 +326,10 @@ pub enum HitTarget {
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
+    let chrome = layout::chrome_for(area, state.mode());
     let ml = layout::compute(
         area,
-        layout::Chrome::Full,
+        chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if rect_contains(ml.sidebar, col, row) {
@@ -338,7 +339,7 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), layout::Chrome::Full, col, row)
+            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, col, row)
                 .unwrap_or(HitTarget::Sidebar),
         );
     }
@@ -553,23 +554,17 @@ pub fn draw(
     now_ms: u64,
 ) {
     let area = frame.area();
+    let chrome = layout::chrome_for(area, state.mode());
     let ml = layout::compute(
         area,
-        layout::Chrome::Full,
+        chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
-    draw_sidebar(
-        frame,
-        state,
-        cache,
-        ml.sidebar,
-        layout::Chrome::Full,
-        now_ms,
-    );
+    draw_sidebar(frame, state, cache, ml.sidebar, chrome, now_ms);
     if state.split_view {
         // Split view reclaims the tab-bar row and lays the selected tab's
         // terminals out side by side in equal-width columns.
@@ -611,9 +606,13 @@ pub fn draw(
         }
     }
 
-    let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
-    frame.render_widget(info_divider, ml.info_divider);
-    draw_info_bar(frame, state, cache, ml.info_bar);
+    // Collapsed chrome gives the git info bar's rows to the terminal; git
+    // details stay reachable through the git status overlay.
+    if chrome == layout::Chrome::Full {
+        let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
+        frame.render_widget(info_divider, ml.info_divider);
+        draw_info_bar(frame, state, cache, ml.info_bar);
+    }
     let status_divider = Paragraph::new(divider_line(ml.status_divider.width as usize));
     frame.render_widget(status_divider, ml.status_divider);
     draw_status_bar(frame, state, ml.status_bar);
@@ -2722,6 +2721,13 @@ mod tests {
         buffer[(0, row)].symbol().to_string()
     }
 
+    /// Read a full row of a rendered buffer as a string.
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
     #[test]
     fn collapsed_sidebar_draws_one_glyph_per_agent() {
         let mut state = state_with_tabs(3);
@@ -2778,6 +2784,82 @@ mod tests {
             sidebar_hit(area, 3, layout::Chrome::Collapsed, 1, 1),
             Some(HitTarget::AgentTab(1))
         );
+    }
+
+    /// A window below both thresholds, so terminal mode collapses the chrome.
+    const SMALL: (u16, u16) = (100, 24);
+
+    #[test]
+    fn small_window_in_terminal_mode_hides_the_info_bar_and_narrows_the_sidebar() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+        state.focus_terminal();
+
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let all: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        // The sidebar heading and the git info bar are both gone. "⎇" is the
+        // info bar's branch marker and appears nowhere else in the main view.
+        assert!(!all.contains("Agents"), "collapsed sidebar has no heading");
+        assert!(!all.contains('⎇'), "collapsed layout has no git info bar");
+        // The status bar stays — it carries the mode and the command hints.
+        assert!(
+            !buffer_row(&buffer, h - 1).trim().is_empty(),
+            "the status bar must still be drawn when collapsed"
+        );
+    }
+
+    #[test]
+    fn same_small_window_in_app_mode_keeps_full_chrome() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+        state.focus_app();
+
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let all: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        assert!(all.contains("Agents"), "app mode keeps the full sidebar");
+        assert!(all.contains('⎇'), "app mode keeps the git info bar");
+    }
+
+    #[test]
+    fn hit_test_uses_the_collapsed_strip_in_a_small_terminal_mode_window() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, w, h);
+
+        // Body starts at row 2 (header row 0, divider row 1) — no project row.
+        assert_eq!(hit_test(area, &state, 0, 2), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 0, 3), Some(HitTarget::AgentTab(1)));
+        // The strip's border column is sidebar chrome, not an agent.
+        assert_eq!(
+            hit_test(area, &state, layout::COLLAPSED_SIDEBAR_WIDTH - 1, 2),
+            Some(HitTarget::Sidebar)
+        );
+        // Just past the strip is the main pane, not the sidebar.
+        assert_ne!(
+            hit_test(area, &state, layout::COLLAPSED_SIDEBAR_WIDTH, 2),
+            Some(HitTarget::Sidebar)
+        );
+
+        // App mode restores the full sidebar geometry on the same window.
+        state.focus_app();
+        assert_eq!(hit_test(area, &state, 0, 2), None);
     }
 
     #[test]
