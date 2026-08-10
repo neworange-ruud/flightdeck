@@ -1621,6 +1621,7 @@ fn event_loop(
                 let area = frame.area();
                 let ml = crate::tui::layout::compute(
                     area,
+                    crate::tui::layout::Chrome::Full,
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
@@ -2673,7 +2674,11 @@ fn spawn_status_refresh(
 /// must wrap at the viewport width (total minus the sidebar/borders), not the
 /// whole screen.
 fn viewport_pty_size(full: PtySize, reserve_border: bool) -> PtySize {
-    let ml = crate::tui::layout::compute(Rect::new(0, 0, full.cols, full.rows), reserve_border);
+    let ml = crate::tui::layout::compute(
+        Rect::new(0, 0, full.cols, full.rows),
+        crate::tui::layout::Chrome::Full,
+        reserve_border,
+    );
     PtySize {
         rows: ml.terminal.height.max(1),
         cols: ml.terminal.width.max(1),
@@ -2724,6 +2729,7 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
         let ml = crate::tui::layout::compute(
             area,
+            crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
@@ -2988,6 +2994,7 @@ fn active_target(state: &AppState) -> ChildTarget {
 fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(ChildTarget, Rect)> {
     let ml = crate::tui::layout::compute(
         area,
+        crate::tui::layout::Chrome::Full,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if state.split_view {
@@ -3011,6 +3018,7 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
 fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Option<Rect> {
     let ml = crate::tui::layout::compute(
         area,
+        crate::tui::layout::Chrome::Full,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if !state.split_view {
@@ -4999,6 +5007,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
+            crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&state.config.ui),
         );
         let region = crate::tui::layout::split_region(&ml);
@@ -5034,6 +5043,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
+            crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&state.config.ui),
         );
         let size = PtySize {

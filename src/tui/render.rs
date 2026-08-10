@@ -328,6 +328,7 @@ pub enum HitTarget {
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
     let ml = layout::compute(
         area,
+        layout::Chrome::Full,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if rect_contains(ml.sidebar, col, row) {
@@ -540,6 +541,7 @@ pub fn draw(
     let area = frame.area();
     let ml = layout::compute(
         area,
+        layout::Chrome::Full,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
 
@@ -2901,7 +2903,7 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area, false));
+        let region = layout::split_region(&layout::compute(area, layout::Chrome::Full, false));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
@@ -3263,7 +3265,11 @@ mod tests {
         state.focus_terminal();
 
         let area = Rect::new(0, 0, 120, 40);
-        let ml = layout::compute(area, mode_style::border_enabled(&state.config.ui));
+        let ml = layout::compute(
+            area,
+            layout::Chrome::Full,
+            mode_style::border_enabled(&state.config.ui),
+        );
         let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
         let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
 
