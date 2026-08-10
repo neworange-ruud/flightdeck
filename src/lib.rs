@@ -244,6 +244,21 @@ pub fn run() -> Result<()> {
     let _ =
         save_and_set_terminal_title(&format!("flightdeck — {}", derive_project_name(&repo_root)));
 
+    // Undo the modes above if we panic. `ratatui::try_init` installs a hook that
+    // leaves raw mode and the alternate screen, but it knows nothing about the
+    // mouse capture, bracketed paste, keyboard flags, or title we enabled after
+    // it — and the teardown below is unwound straight past. Without this, a panic
+    // drops the user at a shell whose every mouse movement arrives as escape
+    // sequences printed as text. Chained ahead of ratatui's hook, which still
+    // restores the screen and prints the panic afterwards.
+    {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal_modes(keyboard_enhanced);
+            previous(info);
+        }));
+    }
+
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width — for every open project.
     if let Ok(size) = terminal.size() {
@@ -303,12 +318,7 @@ pub fn run() -> Result<()> {
     // because `ratatui::restore` `eprintln!`s on failure, and `eprintln!` itself
     // panics when stderr is gone (the exact Konsole-close case), which would
     // abort the process. `try_restore` just returns the error for us to ignore.
-    if keyboard_enhanced {
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    let _ = restore_terminal_title();
+    restore_terminal_modes(keyboard_enhanced);
     let _ = ratatui::try_restore();
     // Show the cursor ourselves, then skip the `Terminal`'s own `Drop`. ratatui's
     // Drop `eprintln!`s when showing the cursor fails, and `eprintln!` panics when
@@ -2665,6 +2675,21 @@ fn spawn_status_refresh(
         let _ = tx.send(StatusMsg::Done);
     });
     true
+}
+
+/// Undo every terminal mode FlightDeck turned on after `ratatui::try_init`.
+///
+/// Shared by the normal teardown and the panic hook so the two can never drift:
+/// a panic that skipped any of these leaves the user's shell echoing mouse
+/// escape sequences as text. All best effort — a terminal that ignored the
+/// enable will ignore the disable.
+fn restore_terminal_modes(keyboard_enhanced: bool) {
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = restore_terminal_title();
 }
 
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents

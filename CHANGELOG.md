@@ -19,7 +19,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Stop FlightDeck crashing when the window is resized very small while an agent
+  is printing. The terminal parser panics on grids narrower than a few columns
+  once wide characters (emoji, CJK) are involved, so each terminal's grid is now
+  held at a floor of 4 rows by 20 columns and the agent's view is clipped
+  instead. A panic no longer leaves the terminal echoing mouse movement as text:
+  mouse capture, bracketed paste, and keyboard flags are now restored on the
+  panic path as well as on a clean exit.
 
 ## [1.16.0] - 2026-08-24
 
