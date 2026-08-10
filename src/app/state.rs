@@ -223,6 +223,7 @@ fn requires_ready_tab(cmd: &Command) -> bool {
             | Command::RestartAgent
             | Command::RenameAgentTab { .. }
             | Command::ShowGitStatus
+            | Command::OpenWorktreeInFileManager
     )
 }
 
@@ -767,6 +768,7 @@ impl AppState {
             Command::SetManualStatus(status) => self.cmd_set_manual_status(status, services),
             Command::RestartAgent => self.cmd_restart_agent(services),
             Command::ShowGitStatus => self.cmd_show_git_status(services),
+            Command::OpenWorktreeInFileManager => Ok(self.cmd_open_in_file_manager()),
             Command::ShowHelp => Ok(Effect::ShowHelp),
             Command::ToggleSplitView => {
                 self.toggle_split_view();
@@ -1908,6 +1910,21 @@ impl AppState {
         })
     }
 
+    /// Resolve the directory to reveal in the OS file manager: the selected
+    /// tab's worktree, or the project's repo root when no tab is selected (a
+    /// freshly opened project). Performs no I/O — the TUI layer spawns the
+    /// launcher (SPECS §27).
+    fn cmd_open_in_file_manager(&self) -> Effect {
+        let path = match self.selected() {
+            Some(tab) => to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative)),
+            None => self.repo_root.clone(),
+        };
+        Effect::OpenInFileManager {
+            path,
+            command: self.config.ui.file_manager.clone(),
+        }
+    }
+
     /// After removing the tab at `removed`, clamp `selected_tab` so it stays
     /// valid and points at a sensible neighbour (SPECS §26 "maintains selected
     /// tab").
@@ -2994,6 +3011,90 @@ mod tests {
         assert_eq!(app.mode(), InputMode::Terminal);
         app.toggle_mode();
         assert_eq!(app.mode(), InputMode::App);
+    }
+
+    #[test]
+    fn open_in_file_manager_targets_the_selected_worktree() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        let effect = app
+            .dispatch(Command::OpenWorktreeInFileManager, &svc)
+            .unwrap();
+        match effect {
+            Effect::OpenInFileManager { path, command } => {
+                let expected = to_absolute(
+                    &app.repo_root,
+                    Path::new(&app.tabs[0].meta.worktree_path_relative),
+                );
+                assert_eq!(path, expected);
+                // Nothing configured → the launcher module picks the per-OS default.
+                assert_eq!(command, "");
+            }
+            other => panic!("expected OpenInFileManager, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_in_file_manager_falls_back_to_the_repo_root_without_tabs() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        assert!(app.tabs.is_empty(), "no tabs in a fresh project");
+
+        let effect = app
+            .dispatch(Command::OpenWorktreeInFileManager, &svc)
+            .unwrap();
+        match effect {
+            Effect::OpenInFileManager { path, .. } => assert_eq!(path, Path::new(REPO)),
+            other => panic!("expected OpenInFileManager, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_in_file_manager_passes_the_configured_launcher_through() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let mut config = config_with_agent(agent);
+        config.ui.file_manager = "nautilus".to_string();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let effect = app
+            .dispatch(Command::OpenWorktreeInFileManager, &svc)
+            .unwrap();
+        match effect {
+            Effect::OpenInFileManager { command, .. } => assert_eq!(command, "nautilus"),
+            other => panic!("expected OpenInFileManager, got {other:?}"),
+        }
     }
 
     #[test]

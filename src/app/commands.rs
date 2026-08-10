@@ -173,6 +173,9 @@ pub enum Command {
     /// Toggle split view: lay the selected tab's terminals (agent + shells) out
     /// side by side in equal-width columns instead of as horizontal tabs.
     ToggleSplitView,
+    /// Open the selected tab's worktree directory in the OS file manager.
+    /// Falls back to the project's repo root when no tab is selected.
+    OpenWorktreeInFileManager,
     /// Quit FlightDeck (signals clean teardown to the wiring layer, SPECS §23).
     Quit,
 }
@@ -195,6 +198,15 @@ pub enum Effect {
     Refused(String),
     /// A GitHub PR compare URL the user should open (SPECS §14).
     PrUrl(String),
+    /// A directory the UI should open in the OS file manager. `command` is the
+    /// configured `ui.file_manager` override (empty = per-OS default); the TUI
+    /// layer resolves and spawns it (SPECS §27 — the core never spawns).
+    OpenInFileManager {
+        /// Absolute directory to reveal.
+        path: std::path::PathBuf,
+        /// Configured launcher command, verbatim from `ui.file_manager`.
+        command: String,
+    },
     /// The push warning + the plan that triggered it; the UI offers the options
     /// and re-dispatches `PushBranch { confirm: Some(..) }` (SPECS §14).
     PushWarning(PushPlan),
