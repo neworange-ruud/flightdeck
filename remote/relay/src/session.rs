@@ -21,6 +21,7 @@
 //! **verbatim**; this module never base64-decodes or otherwise inspects
 //! `ciphertext` (PRD §9.1).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -148,8 +149,20 @@ pub struct Connection {
     /// The same `Arc` is cloned into every [`ConnHandle`] this connection
     /// registers, so superseding any leg wakes the whole connection.
     shutdown: Arc<Notify>,
+    /// Consecutive `seq_violation` rejections per pairing on this connection,
+    /// reset by the first accepted envelope. A healthy realignment shows up as a
+    /// streak of 1; anything sustained means the sender is not acting on the
+    /// advisory, which is the failure that went unnoticed for 65k rejections
+    /// across 17 days (remote-control-zv3). Escalated to WARN so it is visible
+    /// without turning on per-envelope diagnostics.
+    seq_reject_streak: HashMap<String, u64>,
     phase: Phase,
 }
+
+/// Streak length at which a sender that keeps ignoring the realign advisory is
+/// escalated from INFO to WARN, and every multiple thereafter. High enough that
+/// a normal one-round-trip realignment never warns.
+const SEQ_REJECT_WARN_EVERY: u64 = 50;
 
 impl Connection {
     /// Create a connection in its initial state.
@@ -161,6 +174,7 @@ impl Connection {
             role: None,
             claim_attempts: 0,
             shutdown: Arc::new(Notify::new()),
+            seq_reject_streak: HashMap::new(),
             phase: Phase::AwaitingHello,
         }
     }
@@ -227,6 +241,7 @@ impl Connection {
                             code: RelayErrorCode::NotAuthenticated,
                             message: "authentication timed out".into(),
                             pairing_id: None,
+                            expected_seq: None,
                         })
                         .await;
                         break;
@@ -1017,14 +1032,12 @@ impl Connection {
                 );
                 // Recoverable, not a client bug: the endpoint's outbound cursor
                 // ran ahead of ours and the envelopes in between never arrived.
-                // Signal `SeqViolation` so the sender re-syncs instead of looping
-                // on a fatal reconnect (remote-control-bbf).
-                self.send_error(
-                    RelayErrorCode::SeqViolation,
-                    "envelope seq is not gapless/monotonic",
-                    Some(pairing_id),
-                )
-                .await;
+                // Hand back the seq we will accept so the sender can realign in
+                // one round trip (remote-control-zv3); a bare advisory left it
+                // guessing, and it guessed "reset my inbound cursor", which for a
+                // runaway sender is a no-op — so the stream never recovered.
+                self.note_seq_rejection(&pairing_id, role, expected, got);
+                self.send_seq_realign(pairing_id, expected).await;
             }
             // Unreachable: the rewind branch above resets the stream so the
             // re-enqueue accepts `got`. Handled as a gap rather than panicking so
@@ -1045,6 +1058,9 @@ impl Connection {
                 // Already held; the peer has it (or will via replay). Drop.
             }
             Ok(AppendOutcome::Accepted { overflow }) => {
+                // The stream is moving again — stop counting toward the wedged
+                // -stream WARN so a recovered pairing does not keep escalating.
+                self.clear_seq_rejection(&pairing_id);
                 if overflow {
                     // Advisory back-pressure: oldest un-acked envelope shed.
                     self.send_error(
@@ -1161,6 +1177,55 @@ impl Connection {
             code,
             message: message.to_string(),
             pairing_id,
+            expected_seq: None,
+        })
+        .await;
+    }
+
+    /// Count a `seq_violation` for `pairing_id` and escalate a sustained streak.
+    ///
+    /// One rejection is normal — it is how a realignment starts. A streak means
+    /// the sender is not applying `expected_seq`, i.e. the stream is wedged, and
+    /// that is worth a WARN: the previous build emitted only INFO per envelope,
+    /// so a permanently dead pairing looked identical to routine chatter.
+    fn note_seq_rejection(&mut self, pairing_id: &PairingId, role: Role, expected: u64, got: u64) {
+        let n = self
+            .seq_reject_streak
+            .entry(pairing_id.as_str().to_string())
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+        if n.is_multiple_of(SEQ_REJECT_WARN_EVERY) {
+            tracing::warn!(
+                conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                expected, got, streak = *n,
+                "sender is not realigning to expected_seq; stream is wedged"
+            );
+        }
+    }
+
+    /// Clear the rejection streak for `pairing_id` — called when an envelope is
+    /// accepted, so a recovered stream stops counting toward the WARN.
+    fn clear_seq_rejection(&mut self, pairing_id: &PairingId) {
+        self.seq_reject_streak.remove(pairing_id.as_str());
+    }
+
+    /// Tell the SENDER its outbound stream has run ahead of ours and hand it the
+    /// exact `seq` we will accept next (`high_water + 1`).
+    ///
+    /// This is the recovery `send_error(SeqViolation, ..)` could never provide.
+    /// A bare advisory is ambiguous — endpoints implemented it as "my *inbound*
+    /// cursor is stale", which does nothing for a sender that is ahead — so a
+    /// forward gap wedged the stream permanently: we kept demanding
+    /// `high_water + 1`, the sender kept incrementing past it, and neither side
+    /// was allowed to move (remote-control-zv3). Naming `expected` makes the
+    /// realignment terminate in one round trip: the sender jumps exactly here,
+    /// the next envelope matches, and `high_water` advances again.
+    async fn send_seq_realign(&self, pairing_id: PairingId, expected: u64) {
+        self.send(RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            message: format!("envelope seq is not gapless/monotonic; resume at {expected}"),
+            pairing_id: Some(pairing_id),
+            expected_seq: Some(expected),
         })
         .await;
     }
@@ -1186,6 +1251,10 @@ impl Connection {
             code: RelayErrorCode::SeqViolation,
             message: message.to_string(),
             pairing_id: Some(pairing_id.clone()),
+            // Receiver-side advisory: this peer's INBOUND cursor is stale. The
+            // sender-side realignment carries `expected_seq`; this one must not,
+            // or the peer would rewind an outbound stream that is perfectly fine.
+            expected_seq: None,
         });
         if outcome != TrySendOutcome::Sent {
             tracing::info!(

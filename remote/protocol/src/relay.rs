@@ -58,9 +58,25 @@ pub enum RelayErrorCode {
     /// [`Self::BadFrame`] this is **recoverable**, not a client bug: the usual
     /// cause is the relay losing its in-memory per-pairing seq watermark across a
     /// restart/redeploy while the endpoint kept its persisted cursor. The
-    /// endpoint should re-sync by resetting its outbound stream (restart at
-    /// `seq = 1` with a fresh full snapshot) rather than tearing the connection
-    /// down and reconnecting into the same rejection forever (remote-control-bbf).
+    /// This advisory covers **two different faults**, told apart by whether
+    /// [`RelayFrame::Error::expected_seq`] is present:
+    ///
+    /// - `expected_seq: Some(n)` — raised on the *enqueue* path. The SENDER's
+    ///   outbound numbering diverged; it must resume sending at `n`. Realigning
+    ///   to a relay-*specified* position always terminates: `n` is the relay's
+    ///   own `high_water + 1`, so the very next envelope is accepted, and
+    ///   `high_water` only ever advances on an accept. This is expressly not the
+    ///   blind "restart at `seq = 1`" that livelocked against a relay which
+    ///   persists its watermark (remote-control-arg) — that rewind was rejected,
+    ///   which drove another rewind, forever.
+    /// - `expected_seq: None` — raised on the *resume* path. The RECEIVER's
+    ///   inbound cursor sits above anything this stream holds; it should drop
+    ///   the cursor and ask its peer for a fresh snapshot (remote-control-bbf).
+    ///
+    /// Before `expected_seq` existed both faults shared one code, and endpoints
+    /// only ever implemented the receiver half — so a sender that ran ahead was
+    /// never told to come back and both directions wedged permanently
+    /// (remote-control-zv3).
     SeqViolation,
     /// An unexpected relay-side failure.
     Internal,
@@ -439,6 +455,19 @@ pub enum RelayFrame {
         message: String,
         /// The pairing the error relates to, if any.
         pairing_id: Option<PairingId>,
+        /// For [`RelayErrorCode::SeqViolation`] raised on the **enqueue** path:
+        /// the `seq` the relay will accept next on the sender's stream, i.e.
+        /// `high_water + 1`. Present only when the sender's OUTBOUND numbering
+        /// is what diverged; absent when the advisory is about the receiver's
+        /// stale INBOUND cursor (the `resume` path). The sender realigns its
+        /// outbound counter to this value — see the [`RelayErrorCode::SeqViolation`]
+        /// docs for why an unconditional rewind is not safe but this is
+        /// (remote-control-zv3).
+        ///
+        /// Optional and omitted when absent, so an endpoint built before this
+        /// field existed simply sees the advisory it already understood.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_seq: Option<u64>,
     },
 
     /// Both directions. Graceful shutdown notice before closing the socket.

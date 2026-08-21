@@ -18,7 +18,27 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Remote: the phone no longer goes permanently silent until you re-pair.** A
+  pairing could reach a state where the relay and the endpoint disagreed about
+  where the envelope stream had got to, and nothing was allowed to fix it. The
+  relay only ever adopts a sender's numbering for a stream it has never seen
+  before; past that it insists on exactly the next sequence number. Both the Mac
+  and the phone, meanwhile, were forbidden from renumbering a stream they were
+  already sending — a deliberate rule, because blindly restarting at 1 against a
+  relay that remembers its position is what caused an earlier livelock. So once a
+  sender got ahead, the relay rejected every envelope, the sender counted merrily
+  past it, and the gap grew without bound: one live pairing was found with the
+  relay waiting for number 98 while the Mac had reached 38,315, and 65,379
+  consecutive rejections over 17 days. Both directions could wedge independently,
+  so the phone showed nothing and sent nothing while its connection, its
+  authentication and its "connected" indicator all looked perfectly healthy. Only
+  re-pairing helped, and only until it happened again — each fresh pairing
+  survived about a hundred envelopes. The relay now names the sequence number it
+  will accept next when it rejects one, and the Mac and the phone realign to it
+  and re-send a full snapshot. Realigning to a position the relay itself supplied
+  always converges on the very next envelope, which is what makes it safe where
+  the old blind restart was not. A sender that keeps ignoring the correction is
+  now logged as a wedged stream instead of passing for routine chatter.
 
 ## [1.14.0] - 2026-07-28
 

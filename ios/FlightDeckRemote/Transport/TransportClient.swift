@@ -561,11 +561,22 @@ actor TransportClient {
             setLink(.connected(latencyMs: latencyMs))
             return true
 
-        case let .error(code, _, pairingId):
-            // A `seq_violation` is recoverable, not fatal: our INBOUND cursor is
-            // stale. Drop it and re-sync rather than reconnecting into the same
-            // advisory forever (bbf).
-            if code == .seqViolation { await handleSeqViolation(pairingId, on: ch) }
+        case let .error(code, _, pairingId, expectedSeq):
+            // `seq_violation` is recoverable, not fatal — but it covers two
+            // opposite faults, told apart by `expectedSeq`:
+            //   present -> OUR OUTBOUND seq ran ahead; realign to what the relay
+            //              named and re-request a snapshot (remote-control-zv3).
+            //   absent  -> our INBOUND cursor is stale; drop it and re-sync (bbf).
+            // Conflating them is what left a runaway sender with no way back:
+            // only the inbound half was implemented, so the outbound stream
+            // stayed wedged and every command died silently.
+            if code == .seqViolation {
+                if let next = expectedSeq {
+                    await handleSeqRealign(pairingId, nextSeq: next, on: ch)
+                } else {
+                    await handleSeqViolation(pairingId, on: ch)
+                }
+            }
             return !isFatal(code)
 
         case .bye:
@@ -875,6 +886,31 @@ actor TransportClient {
     /// on an in-place app update": nothing was lost in the Keychain; the cursor
     /// was zeroed here, by us. The relay now adopts an unknown stream's starting
     /// seq and absorbs a genuine rewind itself, so `lastSentSeq` is left alone.
+    /// The relay rejected our outbound envelopes because our `seq` ran ahead of
+    /// its watermark, and named the seq it will accept next. Realign
+    /// `lastSentSeq` so the next envelope is exactly `nextSeq`, then re-resume
+    /// and ask for a fresh snapshot — everything we sent while ahead was dropped
+    /// by the relay and never reached the desktop.
+    ///
+    /// Deliberately does NOT touch `lastReceivedSeq`: this fault is entirely
+    /// about our outbound numbering, and zeroing a healthy inbound cursor here is
+    /// the remote-control-h1y mistake in the opposite direction.
+    private func handleSeqRealign(
+        _ pairingId: Wire.PairingId?, nextSeq: UInt64, on ch: any WebSocketChannel
+    ) async {
+        guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
+        // `nextSeq` is the relay's high_water + 1, so the next `lastSentSeq + 1`
+        // must land on it.
+        let realigned = nextSeq > 0 ? nextSeq - 1 : 0
+        transportDiag.notice(
+            "FDDIAG seq realign: lastSentSeq \(record.lastSentSeq, privacy: .public) -> \(realigned, privacy: .public) (relay expects \(nextSeq, privacy: .public))"
+        )
+        record.lastSentSeq = realigned
+        self.record = record
+        _ = try? recordStore.realignOutboundCursor(to: realigned, pairingId: record.pairingId)
+        await requestResumeAndSnapshot(on: ch)
+    }
+
     private func handleSeqViolation(_ pairingId: Wire.PairingId?, on ch: any WebSocketChannel) async {
         guard var record, pairingId == nil || pairingId?.rawValue == record.pairingId else { return }
         record.lastReceivedSeq = 0

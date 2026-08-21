@@ -436,7 +436,11 @@ import CryptoKit
         }
         try await channel.push(.error(code: .seqViolation,
                                       message: "peer restarted its stream; drop your inbound cursor",
-                                      pairingId: Wire.PairingId("pair_test_1")))
+                                      pairingId: Wire.PairingId("pair_test_1"),
+                                      // No `expectedSeq`: this is the receiver-side
+                                      // advisory, so it must keep exercising the
+                                      // inbound-cursor path only.
+                                      expectedSeq: nil))
 
         // The INBOUND cursor is dropped and the link stays up.
         _ = await waitUntil { (try? recordStore.load())?.lastReceivedSeq == 0 }
@@ -473,6 +477,87 @@ import CryptoKit
             if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
         }
         #expect(!restarted, "renumbering the outbound stream is what livelocked it")
+        await client.stop()
+    }
+
+    /// The mirror-image fault (remote-control-zv3): the relay rejects OUR
+    /// outbound envelopes because our seq ran ahead of its watermark, and names
+    /// the seq it will accept next via `expected_seq`.
+    ///
+    /// Here the outbound cursor is the thing that is wrong, so it MUST be
+    /// realigned — and the inbound cursor, which is fine, must be left alone.
+    /// Handling this as an ordinary resync (the only behaviour that existed
+    /// before) does neither, which is why a runaway phone stream stayed wedged
+    /// and every command it sent died silently until the user re-paired.
+    @Test func seqViolationWithExpectedSeqRealignsTheOutboundStream() async throws {
+        let keychain = InMemoryKeychainStore()
+        // Healthy inbound cursor; outbound has run far past the relay.
+        let (peer, ka) = try TransportFixtures.makePeer(
+            keychain: keychain,
+            lastReceivedSeq: 40,
+            lastSentSeq: 5_534
+        )
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .seconds(30)
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let id1 = Wire.CommandId("cmd_1")
+        await client.send(Wire.PhoneCommand(commandId: id1, issuedAtMs: 1,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "a")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 5_535 }; return false
+            }
+        }
+
+        // The relay holds high_water = 8 for this stream and says so.
+        try await channel.push(.error(code: .seqViolation,
+                                      message: "envelope seq is not gapless/monotonic; resume at 9",
+                                      pairingId: Wire.PairingId("pair_test_1"),
+                                      expectedSeq: 9))
+
+        // The outbound cursor is realigned so the NEXT envelope is exactly 9.
+        _ = await waitUntil { (try? recordStore.load())?.lastSentSeq == 8 }
+        #expect((try? recordStore.load())?.lastSentSeq == 8,
+                "the outbound cursor must be realigned to expected_seq - 1")
+        #expect(await client.currentLinkState() != .disconnected)
+
+        // The healthy inbound cursor is untouched — this fault was never about it.
+        #expect((try? recordStore.load())?.lastReceivedSeq == 40,
+                "a sender-side realign must not drop a good inbound cursor")
+
+        let id2 = Wire.CommandId("cmd_2")
+        await client.send(Wire.PhoneCommand(commandId: id2, issuedAtMs: 2,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "b")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 9 }; return false
+            }
+        }
+        let resumedAtExpected = await channel.sentFrames().contains {
+            if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 9 }; return false
+        }
+        #expect(resumedAtExpected,
+                "the first envelope after realigning must use the seq the relay named")
         await client.stop()
     }
 

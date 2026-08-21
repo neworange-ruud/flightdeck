@@ -1723,6 +1723,48 @@ fn handle_frame(
         RelayFrame::Error {
             code: RelayErrorCode::SeqViolation,
             pairing_id,
+            expected_seq: Some(next_seq),
+            ..
+        } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV error seq_violation (realign) pairing={:?} next_seq={next_seq}",
+                pairing_id.as_ref().map(|p| p.as_str())
+            ));
+            // The relay is telling us our OUTBOUND numbering ran ahead of its
+            // watermark and naming the seq it will accept next. This is the
+            // sender-side fault, so nothing about our inbound cursor is wrong —
+            // do not touch it, and do not `Resume`. Just realign and re-send a
+            // full snapshot, because the peer missed everything we emitted while
+            // we were ahead.
+            //
+            // Rewinding here is safe precisely because `next_seq` comes from the
+            // relay: it is `high_water + 1`, so the very next envelope matches
+            // and the stream advances. The livelock this used to cause
+            // (remote-control-arg) came from rewinding blindly to 1 against a
+            // relay whose watermark was already higher — that rewind could never
+            // be accepted, so it repeated forever (remote-control-zv3).
+            if let Some(pid) = pairing_id {
+                // Persist the realigned cursor durably, and NOT through the
+                // monotonic bump in `SendEnvelope` (which would refuse to lower
+                // it): otherwise `remote.json` keeps the runaway value, and the
+                // next launch floors `out_seq` right back to it via
+                // `install_channel`, re-entering the rejected state and paying a
+                // needless reject→realign round trip on every start.
+                if let Some(p) = state.pairing_mut(pid.as_str()) {
+                    p.last_sent_seq = next_seq.saturating_sub(1);
+                    store.save(state);
+                    gate.mark_clean();
+                }
+                let _ = inbound_tx.send(RemoteInbound::SeqRealign {
+                    pairing_id: pid,
+                    next_seq,
+                });
+            }
+            true
+        }
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            pairing_id,
             ..
         } => {
             crate::remote::debuglog::log(&format!(
@@ -1768,6 +1810,7 @@ fn handle_frame(
             code,
             ref message,
             ref pairing_id,
+            ..
         } => {
             crate::remote::debuglog::log(&format!(
                 "client RECV error code={:?} pairing={:?} fatal={} msg={}",
