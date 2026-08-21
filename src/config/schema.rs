@@ -192,6 +192,14 @@ mod tests {
     }
 
     #[test]
+    fn default_config_leaves_file_manager_empty() {
+        // Empty means "use the per-OS default launcher" (open / explorer.exe /
+        // xdg-open); the key is still written so the global config documents it.
+        let cfg = default_config("my-project", "main");
+        assert_eq!(cfg.ui.file_manager, "");
+    }
+
+    #[test]
     fn default_config_enables_update_check() {
         let cfg = default_config("my-project", "main");
         assert!(cfg.update.check);

@@ -403,6 +403,35 @@ default_agent = "opencode"
     }
 
     #[test]
+    fn existing_ui_config_defaults_file_manager_to_empty() {
+        let cfg = parse_config(
+            r#"
+[ui]
+agent_tab_position = "left"
+default_agent = "opencode"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.ui.file_manager, "");
+    }
+
+    #[test]
+    fn ui_config_reads_file_manager_override() {
+        let cfg = parse_config(
+            r#"
+[ui]
+agent_tab_position = "left"
+default_agent = "opencode"
+file_manager = "nautilus"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.ui.file_manager, "nautilus");
+    }
+
+    #[test]
     fn load_config_reads_from_fakefs() {
         let cfg = default_config("fakefs-proj", "main");
         let toml_str = serialize_config(&cfg).unwrap();

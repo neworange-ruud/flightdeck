@@ -125,6 +125,10 @@ Open the **configuration manager** from the command palette
   `config.toml` in `$EDITOR` for the full surface (containers, agents, git, …).
 - **Use F2 to leave terminal focus** replaces the platform-default modified-Esc
   shortcut for terminals that cannot distinguish it from bare `Esc`.
+- `ui.file_manager` (raw config only, via `e`) overrides the command used by
+  **Open Worktree in File Manager**. Empty means the per-OS default (`open`,
+  `explorer.exe`, `xdg-open`); set e.g. `file_manager = "nautilus"` or
+  `file_manager = "explorer.exe"` under WSL.
 
 ### Hooks
 
@@ -222,7 +226,8 @@ finish/local-merge · `Ctrl-k` close tab · `Alt-↑/↓` previous/next **agent 
 · `Alt-1..9` jump to agent tab ·
 `Ctrl-t` new child terminal · `Ctrl-w` close child · `Alt-←/→` cycle the
 **terminal tabs** (agent + shells) · `Ctrl-s` set manual status · `Ctrl-r`
-restart agent. The `Alt`- and `Shift`-modified navigation works in **both**
+restart agent · `Alt-o` open the worktree in your file manager. The `Alt`- and
+`Shift`-modified navigation works in **both**
 modes, so you can switch projects and tabs without leaving terminal focus; in
 App mode the bare arrow keys also work (handy because some terminals intercept
 `Alt`+arrows). The full table is in the in-app help (`?`).

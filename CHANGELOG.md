@@ -8,7 +8,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Open the selected agent session tab's worktree in the OS file manager, from
+  the command palette or `Alt-O` (works with a terminal focused). Override the
+  launcher with `ui.file_manager` in `config.toml`.
 
 ### Improvements
 

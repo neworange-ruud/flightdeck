@@ -353,6 +353,7 @@ branch_prefix = "flightdeck/"
 agent_tab_position = "left"
 default_agent = "opencode"
 use_f2_to_leave_terminal_focus = false
+file_manager = ""
 
 [agents.opencode]
 display_name = "OpenCode"
@@ -370,6 +371,11 @@ command = "codex"
 args = []
 
 ```
+
+`ui.file_manager` overrides the command used to open a worktree in the OS file
+manager. Empty (the default) means the per-OS default: `open` on macOS,
+`explorer.exe` on Windows, `xdg-open` elsewhere. A non-empty value is split on
+whitespace into a program plus arguments; no shell is involved.
 
 Supported initial agents:
 
@@ -799,6 +805,7 @@ Close Agent Tab
 Push Branch
 Finish / Local Merge
 Abandon Worktree
+Open Worktree in File Manager
 New Child Terminal
 Close Child Terminal
 Switch Agent Tab
@@ -882,6 +889,7 @@ Global
   Ctrl-p          Push current branch
   Ctrl-f          Finish current Agent Tab
   Ctrl-k          Close current Agent Tab
+  Alt-o           Open selected worktree in the OS file manager
   ?               Help / keybindings
 
 Agent Tab Navigation
@@ -1079,6 +1087,12 @@ App state:
 - Closes tab
 - Maintains selected tab and selected child terminal
 - Preserves state after save/load
+
+File-manager launcher:
+
+- Empty config falls back to the per-OS default
+- A configured value is split into program plus arguments
+- A missing program produces an error naming the command
 
 TUI rendering:
 

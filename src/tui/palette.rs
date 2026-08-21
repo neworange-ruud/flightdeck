@@ -116,6 +116,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::Dispatch(Command::AbandonWorktree { confirm: false }),
     },
     PaletteEntry {
+        group: "Worktree",
+        label: "Open Worktree in File Manager",
+        action: PaletteAction::Dispatch(Command::OpenWorktreeInFileManager),
+    },
+    PaletteEntry {
         group: "Git",
         label: "Push Branch",
         action: PaletteAction::Dispatch(Command::PushBranch { confirm: None }),
@@ -213,8 +218,9 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// files are now symlinked into new worktrees automatically, so the "Copy
 /// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
-/// Phone") bring the total to 28, plus "About FlightDeck" makes 29.
-pub const REQUIRED_ACTION_COUNT: usize = 29;
+/// Phone") bring the total to 28, plus "About FlightDeck" makes 29, plus "Open
+/// Worktree in File Manager" makes 30.
+pub const REQUIRED_ACTION_COUNT: usize = 30;
 
 /// The command palette model (SPECS §22).
 ///
@@ -421,6 +427,19 @@ mod tests {
             .expect("rebase worktree action present");
         assert_eq!(rebase.group, "Worktree");
         assert!(ALL_ENTRIES.iter().all(|e| !e.group.is_empty()));
+    }
+
+    #[test]
+    fn open_in_file_manager_entry_exists_in_the_worktree_group() {
+        let entry = ALL_ENTRIES
+            .iter()
+            .find(|e| e.label == "Open Worktree in File Manager")
+            .expect("palette must offer the file-manager action");
+        assert_eq!(entry.group, "Worktree");
+        assert_eq!(
+            entry.action,
+            PaletteAction::Dispatch(Command::OpenWorktreeInFileManager)
+        );
     }
 
     #[test]

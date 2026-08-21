@@ -1881,6 +1881,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         shortcut_line("  Ctrl-u", "Pull base (git pull --rebase)"),
         shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
         shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
+        shortcut_line("  Alt-o", "Open worktree in file manager"),
         shortcut_line("  ?", "Help / keybindings"),
         Line::raw(""),
         Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),

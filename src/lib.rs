@@ -3420,6 +3420,12 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         Effect::Warning(m) => ui.message(format!("WARNING: {m}")),
         Effect::Refused(m) => ui.message(format!("Refused: {m}")),
         Effect::PrUrl(url) => ui.message(format!("PR: {url}")),
+        Effect::OpenInFileManager { path, command } => {
+            // Success is silent — the file-manager window is the feedback.
+            if let Err(e) = crate::tui::file_manager::open(&path, &command) {
+                ui.message(format!("Refused: {e}"));
+            }
+        }
         Effect::AttachedExisting { branch } => {
             ui.message(format!("Attached to existing branch {branch}"))
         }
@@ -4392,6 +4398,12 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
         Effect::Warning(m) => ui.message(format!("WARNING: {m}")),
         Effect::Refused(m) => ui.message(format!("Refused: {m}")),
         Effect::PrUrl(url) => ui.message(format!("PR: {url}")),
+        Effect::OpenInFileManager { path, command } => {
+            // Success is silent — the file-manager window is the feedback.
+            if let Err(e) = crate::tui::file_manager::open(&path, &command) {
+                ui.message(format!("Refused: {e}"));
+            }
+        }
         Effect::AttachedExisting { branch } => {
             ui.message(format!("Attached to existing branch {branch}"))
         }
