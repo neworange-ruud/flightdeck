@@ -985,6 +985,29 @@ fn seq_violation_with_expected_seq_realigns_the_outbound_stream() {
         "a realign must not disturb a perfectly good inbound cursor"
     );
 
+    // The realigned OUTBOUND cursor is persisted at the lowered value, then
+    // advances normally. If the realign were left to `SendEnvelope`'s monotonic
+    // bump this would still read 24_999 — and the next launch would floor
+    // `out_seq` straight back into the rejected range.
+    let mut settled = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        settled = shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_sent_seq)
+            .unwrap_or(0);
+        if settled == 98 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        settled, 98,
+        "the realigned cursor must be persisted, not left at the runaway value"
+    );
+
     handle.stop();
 }
 

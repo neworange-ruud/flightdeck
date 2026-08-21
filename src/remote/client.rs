@@ -1744,6 +1744,17 @@ fn handle_frame(
             // relay whose watermark was already higher — that rewind could never
             // be accepted, so it repeated forever (remote-control-zv3).
             if let Some(pid) = pairing_id {
+                // Persist the realigned cursor durably, and NOT through the
+                // monotonic bump in `SendEnvelope` (which would refuse to lower
+                // it): otherwise `remote.json` keeps the runaway value, and the
+                // next launch floors `out_seq` right back to it via
+                // `install_channel`, re-entering the rejected state and paying a
+                // needless reject→realign round trip on every start.
+                if let Some(p) = state.pairing_mut(pid.as_str()) {
+                    p.last_sent_seq = next_seq.saturating_sub(1);
+                    store.save(state);
+                    gate.mark_clean();
+                }
                 let _ = inbound_tx.send(RemoteInbound::SeqRealign {
                     pairing_id: pid,
                     next_seq,
