@@ -140,6 +140,23 @@ pub enum RemoteInbound {
         /// The pairing that must re-send a full snapshot.
         pairing_id: PairingId,
     },
+    /// The relay rejected our **outbound** envelopes because our `seq` ran ahead
+    /// of its watermark, and told us the seq it will accept next. The outbound
+    /// bridge must realign `out_seq` so the next envelope is `next_seq`, and
+    /// re-send a full snapshot — everything emitted while we were ahead was
+    /// dropped by the relay and never reached the peer.
+    ///
+    /// Distinct from [`Self::SeqResync`], which is the mirror-image fault: there
+    /// our *inbound* cursor is stale and our outbound stream is fine. Both used
+    /// to arrive as the same bare `seq_violation`, and because only the inbound
+    /// half was ever implemented, a runaway sender was never corrected and the
+    /// pairing wedged permanently (remote-control-zv3).
+    SeqRealign {
+        /// The pairing whose outbound stream must be realigned.
+        pairing_id: PairingId,
+        /// The `seq` the relay will accept next; the next envelope must use it.
+        next_seq: u64,
+    },
 }
 
 /// A message from the app to the relay-client thread.

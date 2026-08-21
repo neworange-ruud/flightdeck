@@ -251,7 +251,7 @@ struct RealPairingService: PairingServicing {
         switch frame {
         case .versionIncompatible:
             throw PairingError.unknown("This app is out of date. Update to pair.")
-        case let .error(code, _, _):
+        case let .error(code, _, _, _):
             switch code {
             case .pairingClaimRejected:
                 if case .qr = input { throw PairingError.expiredOrUsedToken }

@@ -425,6 +425,7 @@ fn auth_failure_reports_disconnected_and_never_connected() {
                 code: RelayErrorCode::AuthFailed,
                 message: "bad key".to_string(),
                 pairing_id: None,
+                expected_seq: None,
             },
         );
         // Drop the listener/socket; the client will keep retrying.
@@ -583,6 +584,7 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
                     code: RelayErrorCode::AuthFailed,
                     message: "unknown device".to_string(),
                     pairing_id: None,
+                    expected_seq: None,
                 },
             );
         }
@@ -703,6 +705,9 @@ fn seq_violation_resyncs_inbound_without_renumbering_the_outbound_stream() {
                 message: "peer restarted its stream; drop your inbound cursor and resync"
                     .to_string(),
                 pairing_id: Some(PairingId::new("pair_test")),
+                // Receiver-side advisory: no `expected_seq`, so this keeps
+                // exercising the inbound-cursor path specifically.
+                expected_seq: None,
             },
         );
 
@@ -835,6 +840,149 @@ fn seq_violation_resyncs_inbound_without_renumbering_the_outbound_stream() {
             .map(|p| p.last_received_seq),
         Some(0),
         "a resync drops the stale inbound cursor"
+    );
+
+    handle.stop();
+}
+
+/// The mirror-image fault: the relay rejects our OUTBOUND envelopes because our
+/// `seq` ran ahead of its watermark, and names the seq it will accept next by
+/// putting `expected_seq` on the advisory.
+///
+/// The client must surface that as `SeqRealign` — NOT as `SeqResync`. Treating
+/// it as a resync is what left the stream wedged: it zeroes a perfectly good
+/// inbound cursor and re-resumes, neither of which does anything about the
+/// outbound counter that is actually wrong, so the relay keeps rejecting and the
+/// desktop keeps counting (remote-control-zv3).
+#[test]
+fn seq_violation_with_expected_seq_realigns_the_outbound_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { pairing_id, .. }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+            }
+            other => panic!("expected resume, got {other:?}"),
+        }
+
+        // We are far ahead of the relay: it holds high_water = 97.
+        let first = ws_recv_envelope(&mut ws);
+        assert_eq!(first.seq, 25_000);
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::SeqViolation,
+                message: "envelope seq is not gapless/monotonic; resume at 98".to_string(),
+                pairing_id: Some(PairingId::new("pair_test")),
+                expected_seq: Some(98),
+            },
+        );
+
+        // Acting as the bridge, the test re-sends at the named seq. It must
+        // arrive on the SAME connection, at exactly 98.
+        let realigned = ws_recv_envelope(&mut ws);
+        assert_eq!(
+            realigned.seq, 98,
+            "the realigned stream must resume at the seq the relay named"
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 98,
+            },
+        );
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut pairing = Pairing::new("pair_test");
+    pairing.last_sent_seq = 24_999;
+    pairing.last_received_seq = 42; // healthy inbound cursor: must survive
+    seed.pairings.push(pairing);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let tuning = ClientTuning {
+        cursor_flush_interval: Duration::ZERO,
+        ..ClientTuning::default()
+    };
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
+
+    wait_for_connected(&in_rx);
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_test"),
+            seq: 25_000,
+            sent_at_ms: 1_000,
+            nonce: "bg==".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+        })
+        .unwrap();
+
+    let mut realigned_to = None;
+    let mut resynced = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && realigned_to.is_none() {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::SeqRealign {
+                pairing_id,
+                next_seq,
+            }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+                realigned_to = Some(next_seq);
+            }
+            Ok(RemoteInbound::SeqResync { .. }) => resynced = true,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        realigned_to,
+        Some(98),
+        "an advisory carrying expected_seq must surface as SeqRealign"
+    );
+    assert!(
+        !resynced,
+        "a sender-side realign must not be reported as an inbound resync"
+    );
+
+    // Play the bridge's response: resume the stream at the named seq.
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_test"),
+            seq: 98,
+            sent_at_ms: 2_000,
+            nonce: "bg==".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+        })
+        .unwrap();
+
+    mock.join().unwrap();
+
+    // The healthy INBOUND cursor is untouched — this fault was never about it.
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_received_seq),
+        Some(42),
+        "a realign must not disturb a perfectly good inbound cursor"
     );
 
     handle.stop();

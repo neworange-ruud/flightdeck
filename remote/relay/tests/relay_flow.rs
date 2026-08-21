@@ -486,6 +486,116 @@ async fn envelope_seq_gap_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_forward_gap_advisory_names_the_seq_the_relay_will_accept() {
+    // remote-control-zv3. A bare `seq_violation` is ambiguous: endpoints read it
+    // as "your INBOUND cursor is stale", which does nothing for a sender whose
+    // OUTBOUND cursor is the thing that ran ahead. The advisory must carry the
+    // relay's `high_water + 1` so the sender knows where to come back to.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 1, "one"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 1);
+
+    // Run far ahead, exactly as the wedged desktop did in production.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 38_315, "runaway"))
+        .await;
+
+    let err = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    match err {
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            expected_seq,
+            ref pairing_id,
+            ..
+        } => {
+            assert_eq!(pairing_id.as_ref(), Some(&pairing));
+            assert_eq!(
+                expected_seq,
+                Some(2),
+                "the advisory must name high_water + 1 so the sender can realign"
+            );
+        }
+        other => panic!("expected a seq_violation carrying expected_seq, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_runaway_sender_recovers_by_realigning_to_expected_seq() {
+    // The end-to-end shape of the production outage: the desktop's outbound seq
+    // ran tens of thousands past the relay's watermark, every envelope was
+    // rejected, and nothing on either side was allowed to close the gap — so the
+    // phone received nothing until the user re-paired. Realigning to the seq the
+    // advisory names must restore delivery on the very next envelope.
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    for seq in 1..=97 {
+        desktop
+            .send(envelope(&pairing, Role::Desktop, seq, "ok"))
+            .await;
+    }
+    for expected in 1..=97 {
+        assert_eq!(env_seq(&phone.recv_until(is_envelope).await), expected);
+    }
+
+    // Diverge, then keep counting — the behaviour that made the gap unbounded.
+    for seq in 25_000..25_005 {
+        desktop
+            .send(envelope(&pairing, Role::Desktop, seq, "rejected"))
+            .await;
+    }
+
+    let err = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Error { .. }))
+        .await;
+    let next = match err {
+        RelayFrame::Error {
+            code: RelayErrorCode::SeqViolation,
+            expected_seq: Some(n),
+            ..
+        } => n,
+        other => panic!("expected a realign advisory, got {other:?}"),
+    };
+    assert_eq!(next, 98);
+
+    // Act on it exactly as the endpoints now do.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, next, "realigned"))
+        .await;
+    assert_eq!(
+        env_seq(&phone.recv_until(is_envelope).await),
+        98,
+        "the first envelope after realigning must reach the peer"
+    );
+
+    // And the stream keeps advancing normally from there.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, next + 1, "after"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 99);
+}
+
+#[tokio::test]
 async fn a_phone_whose_seq_rewinds_is_adopted_instead_of_looping_forever() {
     // remote-control-arg, the reported P0. A phone came back from an app update
     // having lost its outbound cursor and restarted at seq 1 while the relay's

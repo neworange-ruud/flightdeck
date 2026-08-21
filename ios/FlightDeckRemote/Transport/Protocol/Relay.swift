@@ -196,7 +196,13 @@ extension Wire {
         /// treated as a non-fatal advisory rather than a gate on removal.
         case pairingRevoked(pairingId: PairingId)
         /// relay -> endpoint. A relay-plane error.
-        case error(code: RelayErrorCode, message: String, pairingId: PairingId?)
+        /// A relay-plane error. `expectedSeq` is present only when the relay is
+        /// telling the SENDER its outbound `seq` ran ahead and naming the value
+        /// it will accept next; absent when the advisory concerns this side's
+        /// stale inbound cursor (remote-control-zv3).
+        case error(
+            code: RelayErrorCode, message: String, pairingId: PairingId?,
+            expectedSeq: UInt64?)
         /// Both directions. Graceful shutdown notice.
         case bye(reason: String?)
 
@@ -223,6 +229,7 @@ extension Wire {
             case atMs = "at_ms"
             case fromSeq = "from_seq"
             case clientTimeMs = "client_time_ms"
+            case expectedSeq = "expected_seq"
         }
 
         init(from decoder: Decoder) throws {
@@ -330,7 +337,8 @@ extension Wire {
                 self = .error(
                     code: try c.decode(RelayErrorCode.self, forKey: .code),
                     message: try c.decode(String.self, forKey: .message),
-                    pairingId: try c.decodeIfPresent(PairingId.self, forKey: .pairingId))
+                    pairingId: try c.decodeIfPresent(PairingId.self, forKey: .pairingId),
+                    expectedSeq: try c.decodeIfPresent(UInt64.self, forKey: .expectedSeq))
             case "bye":
                 self = .bye(reason: try c.decodeIfPresent(String.self, forKey: .reason))
             default:
@@ -446,11 +454,14 @@ extension Wire {
             case let .pairingRevoked(pairingId):
                 try c.encode("pairing_revoked", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
-            case let .error(code, message, pairingId):
+            case let .error(code, message, pairingId, expectedSeq):
                 try c.encode("error", forKey: .type)
                 try c.encode(code, forKey: .code)
                 try c.encode(message, forKey: .message)
                 try c.encode(pairingId, forKey: .pairingId) // explicit null
+                // Omitted when absent so the frame stays byte-identical to what a
+                // relay without this field would emit.
+                try c.encodeIfPresent(expectedSeq, forKey: .expectedSeq)
             case let .bye(reason):
                 try c.encode("bye", forKey: .type)
                 try c.encode(reason, forKey: .reason) // explicit null

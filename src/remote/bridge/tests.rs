@@ -902,6 +902,83 @@ fn seq_resync_for_other_pairing_is_ignored() {
     );
 }
 
+/// The mirror image of `SeqResync`: the relay rejected our OUTBOUND envelopes
+/// because our seq ran ahead of its watermark, and named the seq it will accept
+/// next. Here `out_seq` MUST move — it is the thing that is wrong.
+///
+/// Before this existed the two faults shared one bare advisory and only the
+/// inbound half was implemented, so a runaway sender was never corrected: the
+/// relay kept demanding `high_water + 1`, the desktop kept counting past it, and
+/// the pairing wedged until the user re-paired (remote-control-zv3).
+#[test]
+fn seq_realign_renumbers_the_outbound_stream_to_the_relays_expected_seq() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let high = collect_raw(&mut b, &views, 1_000)
+        .iter()
+        .map(seq_of)
+        .max()
+        .unwrap();
+    assert!(high >= 1);
+
+    // The relay is far behind us and will only accept 98 next.
+    b.handle_inbound(RemoteInbound::SeqRealign {
+        pairing_id: PairingId::new("pair-1"),
+        next_seq: 98,
+    });
+
+    let after = collect_raw(&mut b, &views, 2_000);
+    assert_eq!(
+        seq_of(&after[0]),
+        98,
+        "the next envelope must be exactly the seq the relay asked for"
+    );
+    assert!(
+        matches!(decode(&after[0]), DesktopToPhone::Snapshot(_)),
+        "realigning must lead with a fresh full snapshot: the peer missed \
+         everything sent while we were ahead"
+    );
+}
+
+/// A realign advisory for a pairing we are no longer feeding must not rewind the
+/// live stream — a late frame for a replaced pairing would otherwise reintroduce
+/// exactly the divergence this fixes.
+#[test]
+fn seq_realign_for_other_pairing_is_ignored() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    let high = collect_raw(&mut b, &views, 1_000)
+        .iter()
+        .map(seq_of)
+        .max()
+        .unwrap();
+
+    b.handle_inbound(RemoteInbound::SeqRealign {
+        pairing_id: PairingId::new("other-pairing"),
+        next_seq: 5,
+    });
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let next = collect_raw(&mut b, &views, 2_000)
+        .iter()
+        .map(seq_of)
+        .min()
+        .unwrap();
+    assert_eq!(
+        next,
+        high + 1,
+        "an unrelated realign must not renumber the live stream"
+    );
+}
+
 // --- OpenCode prompt sidecar (remote-control-tdv) --------------------------
 
 /// Write `<worktree>/.flightdeck/agent-prompt.json` with `body`, returning the

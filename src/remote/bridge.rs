@@ -368,6 +368,28 @@ impl RemoteBridge {
                     self.snapshot_needed = true;
                 }
             }
+            // Our outbound stream ran ahead of the relay's watermark and every
+            // envelope since has been dropped. Realign to the seq the relay named
+            // so the next one is accepted, and re-arm a full snapshot: the peer
+            // missed everything we sent while we were ahead, and a `status_update`
+            // delta can only mutate sessions it already knows.
+            //
+            // `next_seq` is the relay's `high_water + 1`, so assigning
+            // `out_seq = next_seq - 1` makes the next envelope exactly `next_seq`.
+            // Unlike `SeqResync` this deliberately DOES move `out_seq`, because
+            // here the outbound counter is the thing that is wrong — the whole
+            // reason the stream could never recover before (remote-control-zv3).
+            // Guarded on the active pairing so a late advisory for a pairing we
+            // have already replaced cannot rewind the live one.
+            RemoteInbound::SeqRealign {
+                pairing_id,
+                next_seq,
+            } => {
+                if self.pairing.as_ref() == Some(&pairing_id) {
+                    self.out_seq = next_seq.saturating_sub(1);
+                    self.snapshot_needed = true;
+                }
+            }
             // The offer (code shown) does not itself activate a pairing for the
             // outbound feed — the phone has not joined yet. Handled by the
             // pairing overlay, not the bridge.

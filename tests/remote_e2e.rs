@@ -1062,3 +1062,96 @@ fn wipe_desktop_stream_seq_state(db: &Path) -> usize {
     .expect("delete desktop queue_envelopes rows");
     streams
 }
+
+/// Rewind the relay's persisted **desktop->phone** `high_water` to `to`, leaving
+/// the stream row in place. Returns the number of rows updated.
+///
+/// This is the production wedge from remote-control-zv3, and it is deliberately
+/// NOT the same as [`wipe_desktop_stream_seq_state`]: wiping the row leaves
+/// `high_water == 0`, which the relay treats as "a stream I have never seen" and
+/// adopts. A row that survives with a *low but non-zero* watermark gets no
+/// adoption — the relay demands `high_water + 1` forever while the desktop keeps
+/// counting up, which is exactly how a live pairing died with the relay expecting
+/// 98 and the desktop sending 38,315.
+fn rewind_desktop_stream_high_water(db: &Path, to: i64) -> usize {
+    const DESKTOP_SENDER_TAG: i64 = 0;
+    let conn = rusqlite::Connection::open(db)
+        .unwrap_or_else(|e| panic!("open the relay's sqlite store at {}: {e}", db.display()));
+    let rows = conn
+        .execute(
+            "UPDATE queue_streams SET high_water = ?1, ack_cursor = ?1 WHERE sender = ?2",
+            [to, DESKTOP_SENDER_TAG],
+        )
+        .expect("rewind desktop queue_streams high_water");
+    // Buffered envelopes above the new watermark would be replayed out of band.
+    conn.execute(
+        "DELETE FROM queue_envelopes WHERE sender = ?1",
+        [DESKTOP_SENDER_TAG],
+    )
+    .expect("delete desktop queue_envelopes rows");
+    rows
+}
+
+/// The production outage end to end (remote-control-zv3): the relay's watermark
+/// for the desktop->phone stream sits far BELOW the desktop's outbound cursor,
+/// and the row survives, so the adoption path never fires. Every envelope is
+/// rejected with `seq_violation`, and before the fix neither side was allowed to
+/// close the gap — the desktop kept counting up (to ~38k in the field) and the
+/// phone received nothing until the user re-paired.
+///
+/// The desktop must now realign to the seq the relay names and delivery must
+/// resume, without a re-pair and without tearing the link down.
+#[test]
+fn a_desktop_ahead_of_the_relays_watermark_realigns_instead_of_wedging() {
+    let mut h = Harness::boot_persistent();
+
+    let snap = request_snapshot(&mut h.phone, ACK_TIMEOUT);
+    let _project = only_project_id(&snap);
+    settle_for_stable_session(&mut h.phone);
+
+    let cursor_before = h.phone.last_received_seq();
+    assert!(
+        cursor_before > 1,
+        "the desktop must be well past seq 1 before we rewind the relay, or there is no          gap to recover from; cursor = {cursor_before}"
+    );
+
+    // Rewind the relay behind the desktop, keeping the stream row so the relay
+    // will NOT adopt. Stop it first: the store uses the no-locking `unix-none`
+    // VFS, so editing the file under a running relay is unsafe.
+    h.relay.stop();
+    let rewound = rewind_desktop_stream_high_water(h.relay.db_path(), 1);
+    assert!(
+        rewound > 0,
+        "expected to rewind at least one desktop->phone queue stream row; if this is 0 the          schema or the sender tag changed and this test is no longer reproducing the bug          (see remote/relay/src/store/sqlite.rs)"
+    );
+    h.relay.restart();
+    h.phone.reconnect();
+
+    // The feed must come back on its own. Before the fix this hung forever: the
+    // relay answered every envelope with a bare `seq_violation`, which the
+    // desktop read as "my INBOUND cursor is stale" — a no-op for a sender that
+    // is ahead — so it never renumbered and nothing was ever delivered again.
+    let snap_after = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_after.projects.len(),
+        1,
+        "the realigned feed must still describe the fixture project: {snap_after:?}"
+    );
+
+    // And it keeps flowing, rather than delivering one frame and stalling.
+    let epoch_cursor = h.phone.last_received_seq();
+    let snap_again = request_snapshot(&mut h.phone, RESUME_TIMEOUT);
+    assert_eq!(
+        snap_again.projects.len(),
+        1,
+        "the feed must keep delivering after realigning: {snap_again:?}"
+    );
+    assert!(
+        h.phone.last_received_seq() > epoch_cursor,
+        "the realigned stream must advance monotonically \
+         (cursor was {epoch_cursor}, now {})",
+        h.phone.last_received_seq()
+    );
+
+    drop(h);
+}

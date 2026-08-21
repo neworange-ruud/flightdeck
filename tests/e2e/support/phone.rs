@@ -52,7 +52,7 @@ use base64::Engine as _;
 use flightdeck::remote::crypto::E2eChannel;
 use flightdeck_remote_protocol::{
     ClientInfo, CommandBody, CommandId, DesktopToPhone, DeviceId, EncryptedEnvelope, PairingId,
-    PhoneCommand, RelayFrame, Role, PROTOCOL_VERSION,
+    PhoneCommand, RelayErrorCode, RelayFrame, Role, PROTOCOL_VERSION,
 };
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
@@ -503,6 +503,25 @@ impl PhoneDriver {
                 // The desktop announces its machine name on connect (spec §5.7);
                 // it is relay-plane metadata, not an application message — skip it.
                 RelayFrame::MachineName { .. } => {}
+                // A `seq_violation` WITHOUT `expected_seq` is the receiver-side
+                // advisory: our inbound cursor is stale, so drop it and re-resume
+                // exactly as `TransportClient.handleSeqViolation` does. Panicking
+                // here would make this driver stricter than a real phone and
+                // would mask the recovery it is meant to observe. The
+                // sender-side variant (`expected_seq: Some`) is addressed to the
+                // desktop, never to us.
+                RelayFrame::Error {
+                    code: RelayErrorCode::SeqViolation,
+                    expected_seq: None,
+                    ..
+                } => {
+                    self.last_received_seq = 0;
+                    self.stream_resets += 1;
+                    self.conn.send(&RelayFrame::Resume {
+                        pairing_id: self.pairing_id.clone(),
+                        from_seq: 0,
+                    });
+                }
                 RelayFrame::Error { code, message, .. } => {
                     panic!("relay error while awaiting desktop feed: {code:?} — {message}")
                 }

@@ -219,7 +219,8 @@ import CryptoKit
 
         await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
         await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
-        await channel.push(.error(code: .pairingClaimRejected, message: "bad token", pairingId: nil))
+        await channel.push(.error(code: .pairingClaimRejected, message: "bad token", pairingId: nil,
+                                  expectedSeq: nil))
 
         await #expect(throws: PairingError.self) {
             _ = try await service.pair(with: .code("0000", relayURL: URL(string: "wss://relay.example/v1")!))
@@ -233,7 +234,8 @@ import CryptoKit
 
         await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
         await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
-        await channel.push(.error(code: .pairingClaimRejected, message: "expired", pairingId: nil))
+        await channel.push(.error(code: .pairingClaimRejected, message: "expired", pairingId: nil,
+                                  expectedSeq: nil))
 
         let payload = PairingQRPayload(
             claimToken: "clm_abc",

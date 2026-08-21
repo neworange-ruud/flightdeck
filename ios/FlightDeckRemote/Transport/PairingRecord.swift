@@ -183,16 +183,39 @@ final class PairingRecordStore {
         return record
     }
 
-    // There is deliberately no `resetOutboundCursor`. Rewinding `lastSentSeq` to
-    // 0 was the old response to a relay `seq_violation` (remote-control-bbf),
-    // written for a relay that came back from a restart with an empty in-memory
-    // watermark. Against a relay that *persists* its watermark it never
-    // terminates — the relay expects seq 60, the phone restarts at 1, the relay
-    // rejects it, the phone rewinds and restarts at 1 again (remote-control-arg,
-    // and the "cursors lost on an app update" symptom in remote-control-h1y).
-    // The relay now adopts an unknown stream's starting seq and absorbs a genuine
-    // rewind itself, so nothing on the phone should ever renumber a stream it is
-    // successfully sending. `setLastSentSeq` is monotonic on purpose.
+    // There is deliberately no *unconditional* outbound rewind. Rewinding
+    // `lastSentSeq` to 0 was the old response to a relay `seq_violation`
+    // (remote-control-bbf), written for a relay that came back from a restart
+    // with an empty in-memory watermark. Against a relay that *persists* its
+    // watermark it never terminates — the relay expects seq 60, the phone
+    // restarts at 1, the relay rejects it, the phone rewinds and restarts at 1
+    // again (remote-control-arg, and the "cursors lost on an app update" symptom
+    // in remote-control-h1y). `setLastSentSeq` is monotonic on purpose, and
+    // nothing may renumber a stream it is successfully sending.
+    //
+    // `realignOutboundCursor` below is the one narrow exception, and it is the
+    // opposite case: the relay has told us the exact seq it will accept next.
+
+    /// Force `pairingId`'s OUTBOUND cursor to `seq` — the only sanctioned rewind
+    /// of `lastSentSeq`, used when the relay reports `seq_violation` carrying an
+    /// `expected_seq`.
+    ///
+    /// Safe where a blind rewind is not, because the target comes from the relay
+    /// rather than from us: it is that stream's `high_water`, so the next
+    /// envelope we send is exactly what the relay is waiting for and the stream
+    /// advances on the first try. The remote-control-arg livelock came from
+    /// guessing 1 and being rejected forever; there is no guess here.
+    ///
+    /// Without this, a phone whose outbound seq ran ahead of the relay had no way
+    /// back: every command it sent was rejected, it kept incrementing, and the
+    /// gap grew without bound (remote-control-zv3).
+    @discardableResult
+    func realignOutboundCursor(to seq: UInt64, pairingId: String) throws -> PairingRecord? {
+        guard var record = try load(pairingId: pairingId) else { return nil }
+        record.lastSentSeq = seq
+        try save(record)
+        return record
+    }
 
     /// Force `pairingId`'s inbound cursor to `seq`, rewinding it if necessary,
     /// when the desktop restarts its outbound stream, or when the relay tells us
@@ -235,6 +258,13 @@ final class PairingRecordStore {
     func setLastReceivedSeq(_ seq: UInt64) throws -> PairingRecord? {
         guard let pairingId = try loadAll().first?.pairingId else { return nil }
         return try setLastReceivedSeq(seq, pairingId: pairingId)
+    }
+
+    /// Single-record shim for [`realignOutboundCursor(to:pairingId:)`].
+    @discardableResult
+    func realignOutboundCursor(to seq: UInt64) throws -> PairingRecord? {
+        guard let existing = try load() else { return nil }
+        return try realignOutboundCursor(to: seq, pairingId: existing.pairingId)
     }
 
     @discardableResult
