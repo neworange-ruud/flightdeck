@@ -1,0 +1,121 @@
+---
+label: Working with Agents
+section: Desktop Guide
+order: 21
+---
+
+# Working with Agents
+
+FlightDeck launches and supervises AI coding agents. This page covers the
+built-in backends, how to add your own, the live status system, and restarting.
+
+## Built-in agents
+
+Three agents ship pre-configured, and **OpenCode** is the default:
+
+| Agent | Config key |
+| --- | --- |
+| OpenCode | `opencode` |
+| Claude Code | `claude` |
+| Codex CLI | `codex` |
+
+When you create a tab you pick which agent runs in it, so you can mix agents —
+Claude Code in one tab, OpenCode in another. If only one agent is configured,
+the picker is skipped.
+
+<Callout type="note">
+  FlightDeck launches agents but does not install them. Make sure each agent's
+  CLI is installed and on your `PATH` — FlightDeck checks this before creating a
+  tab and fails cleanly if it's missing.
+</Callout>
+
+## Add or customize an agent
+
+Agents are just config. Each lives under an `[agents.<key>]` table in
+`config.toml` with a display name, command, and arguments:
+
+```toml
+[agents.claude]
+display_name = "Claude Code"
+command = "claude"
+args = []
+```
+
+Add your own by adding another `[agents.<key>]` table, and change the default
+tab agent with `ui.default_agent`. See the
+[Configuration reference](/reference/configuration) for the full schema.
+
+<Callout type="info">
+  FlightDeck does not inject an initial prompt — the task name is only a label.
+  Give the agent its first instruction yourself once its terminal is focused.
+</Callout>
+
+## Live status indicators
+
+Every agent tab shows a one-cell status indicator next to its name, mirrored in
+the sidebar and summarized on the project tab:
+
+- 🔴 **working** — a red animated spinner while the backend reports an active
+  turn,
+- 🟢 **idle** — a green dot while it waits for a prompt,
+- 🔵 **manual** — a status you set yourself (see below), shown in cyan; it never
+  hides the real process state.
+
+<Callout type="success">
+  Status comes from each agent's own **lifecycle events**, never from scraping
+  terminal output — so typing into a prompt can't falsely mark an agent as
+  working, and a quiet agent won't be mistaken for a busy one.
+</Callout>
+
+### How the status bridge works
+
+At launch, FlightDeck injects a small, launch-scoped integration for each
+built-in backend that writes `working` / `idle` / `waiting` events to a status
+file in the worktree:
+
+- **Claude Code** — prompt/stop hooks via a launch-scoped plugin,
+- **Codex CLI** — prompt/stop hooks,
+- **OpenCode** — its native `session.status` events.
+
+Generated bridge files live under the ignored `.flightdeck/runtime/` directory.
+Unsupported custom agents stay **neutral** rather than being guessed — they
+never show a false status.
+
+<Callout type="warning">
+  **Codex** requires you to review and trust its non-managed hooks once. If you
+  see a hook warning, run `/hooks` inside Codex and trust the FlightDeck
+  lifecycle hooks — until then FlightDeck deliberately stays idle and emits no
+  completion alert.
+</Callout>
+
+### Reusable global status integrations
+
+The automatic per-launch bridge is normally all you need. To generate
+standalone hooks for agent sessions launched *outside* FlightDeck, run:
+
+```bash
+flightdeck setup-status
+```
+
+This writes ready-to-wire artifacts to `.flightdeck/integrations/` (with a
+`README.md` explaining how to merge each into your Claude Code, Codex, or
+OpenCode config). The hooks are gated on `.flightdeck/` existing, so they're a
+no-op outside FlightDeck worktrees.
+
+## Manual status
+
+Press **`Ctrl-s`** (palette → *Set Manual Status*) to attach a manual label to a
+tab: *In progress*, *Waiting*, *Blocked*, *Done*, or *Clear*. It shows in cyan
+and sits alongside — never on top of — the real process state, so it's a note to
+yourself, not a lie about what the agent is doing.
+
+## Restart an agent
+
+Press **`Ctrl-r`** (palette → *Restart Agent*) to relaunch the primary agent in
+the same worktree and branch. Use it after changing config, when an agent
+crashes, or to resume a tab that was recovered but not auto-started.
+
+## OS notifications
+
+FlightDeck can post a native notification the moment an agent finishes or needs
+you — see [Notifications](/desktop/notifications).

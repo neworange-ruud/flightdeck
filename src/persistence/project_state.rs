@@ -56,6 +56,8 @@ mod tests {
             manual_status: None,
             containerized: false,
             container_image: None,
+            runs_on_base: false,
+            resume_args: Vec::new(),
         }
     }
 

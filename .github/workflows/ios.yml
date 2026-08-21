@@ -1,0 +1,103 @@
+name: iOS
+
+# The iOS app is an independent Xcode project (`ios/`), unrelated to the Rust
+# workspaces — only run when something under `ios/` (or this workflow file)
+# actually changed. macOS runners bill at 10x the Linux rate, so an unconditional
+# job here would dominate the repo's CI cost.
+# Push on main only (post-merge); PRs own feature-branch CI. See ci.yml for the
+# same rationale.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: ios
+
+jobs:
+  test:
+    runs-on: macos-latest
+    # Backstop against a hung simulator or a test waiting on a socket that never
+    # connects: fail in minutes rather than parking an expensive runner for
+    # GitHub's 360-minute default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        # The .xcodeproj is generated, not committed (see ios/README.md), so this
+        # is a hard prerequisite rather than a convenience.
+        run: brew install xcodegen
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodegen --version
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build and run unit tests
+        # Destination pins a device family but NOT an OS version: pinning a
+        # runtime breaks the moment the runner image ships a new Xcode and drops
+        # the old simulator runtime.
+        #
+        # SCOPE: this runs the unit test target ONLY. The UI test target
+        # (FlightDeckRemoteUITests) is deliberately excluded — ShellUITests alone
+        # takes ~25 minutes and would blow the timeout and the macOS minute
+        # budget (tracked as remote-control-7lr). UI tests therefore remain a
+        # local `ios/scripts/test.sh` responsibility until that is fixed, which
+        # means UI regressions are NOT caught by this job.
+        run: |
+          xcodebuild test \
+            -project FlightDeckRemote.xcodeproj \
+            -scheme FlightDeckRemote \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            -derivedDataPath .derived \
+            -skipPackagePluginValidation \
+            -only-testing:FlightDeckRemoteTests \
+            CODE_SIGNING_ALLOWED=NO
+
+  # Verifies the app still compiles for a real device in the Release
+  # configuration — the configuration TestFlight actually ships. Catches
+  # Release-only breakage (dead code stripped differently, `#if DEBUG` seams that
+  # do not compile out cleanly, the Release entitlements file going missing)
+  # without needing any signing credentials in CI.
+  release-build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build (Release, unsigned, device SDK)
+        run: |
+          xcodebuild build \
+            -project FlightDeckRemote.xcodeproj \
+            -scheme FlightDeckRemote \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .derived-release \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_STYLE=Automatic \
+            PROVISIONING_PROFILE_SPECIFIER=""

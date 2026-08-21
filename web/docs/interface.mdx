@@ -1,0 +1,123 @@
+---
+label: The Interface
+section: Get Started
+order: 11
+icon: layout
+---
+
+# The Interface
+
+FlightDeck is a full-screen terminal app. This page is a tour of what's on
+screen and how the keyboard model works. For the exhaustive shortcut list, see
+the [Keyboard Shortcuts reference](/reference/keyboard).
+
+![The FlightDeck layout: logo header, project tabs, the Agents sidebar, the active terminal, the Git info bar, and the status bar.](/screenshots/desktop/main-layout.png)
+
+*Every region of the FlightDeck screen, top to bottom.*
+
+## Screen layout
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ░░░▒▒▒▓▓▓██████   F · L · I · G · H · T · D · E · C · K   ██████▓▓▓▒▒▒░░░ │  logo header
+│ ● flightdeck ✕ | ● api ✕ | ● web ✕                              + project │  project tabs
+├──────────────────────────────────────────────────────────────────────────┤
+│ Agents          │ agent | shell 1 | shell 2                                │  terminal tabs
+│  ▸ fix-login    │                                                          │
+│    add-tests    │            active terminal (agent or shell)              │
+│                 ├──────────────────────────────────────────────────────────┤
+│                 │ ⎇ flightdeck/fix-login │ +3 ~2 -1 (6 files) │ ↑0 ↓0 │ …  │  git info bar
+│                 ├──────────────────────────────────────────────────────────┤
+│                 │ MODE: TERMINAL | Shift+Esc: app commands | Ctrl-g: …      │  status bar
+└─────────────────┴──────────────────────────────────────────────────────────┘
+```
+
+- **Logo header** — a branded title row that shrinks on narrow terminals.
+- **Project tabs** — one tab per open [project](/desktop/projects), each with a
+  status dot (red = needs attention, cyan = working, dim = idle) and a `✕`.
+  `+ project` opens another.
+- **Agents sidebar** — the list of agent tabs, each showing its agent, status,
+  and Git indicators. Move it to the right with the `ui.agent_tab_position`
+  setting.
+- **Terminal tabs** — within the selected agent tab, the primary `agent`
+  terminal plus any child shells (`shell 1`, `shell 2`, …), with `+ agent` /
+  `+ shell` buttons.
+- **Git info bar** — a one-line summary of the selected tab's worktree: branch,
+  change counts, ahead/behind, base drift, and base branch. See
+  [Git Workflow](/desktop/git).
+- **Status bar** — the current input mode and the most useful shortcuts for it.
+
+## Two input modes
+
+FlightDeck is keyboard-first and always in one of two modes. The status bar
+always tells you which.
+
+<Callout type="info">
+  **Terminal mode** — your keystrokes go to the agent or shell. **App mode** —
+  your keystrokes control FlightDeck.
+</Callout>
+
+### Terminal mode
+
+Keys are sent to the focused terminal, so agents and shells behave exactly as
+they would normally. Bare `Esc` passes straight through to the hosted agent.
+
+To leave terminal focus and enter app mode:
+
+- **`Alt+Esc`** on macOS,
+- **`Shift+Esc`** on Windows and Linux,
+- or **`F2`**, if you enable *Use F2 to leave terminal focus* in the
+  [configuration manager](/desktop/configuration) — useful for terminals that
+  can't distinguish a modified `Esc`.
+
+### App mode
+
+Keys control FlightDeck: create tabs, switch agents, push, and so on. Press
+`Enter` to jump back into the terminal, or `?` to show the keybindings help.
+
+<Callout type="note">
+  Navigation shortcuts that use `Alt` or `Shift` (switch agent, switch project,
+  cycle terminals) work in **both** modes, so you can move around without
+  leaving terminal focus.
+</Callout>
+
+## The command palette
+
+Because terminal shortcut collisions are unavoidable, the **command palette** is
+FlightDeck's dependable fallback: press **`Ctrl-g`** from either mode to open a
+searchable list of *every* action. Type to filter, use the arrow keys to move,
+and press `Enter` to run.
+
+![The command palette lists every FlightDeck action in a searchable two-column layout.](/screenshots/desktop/command-palette.png)
+
+*The command palette — reachable with `Ctrl-g` and grouped by area.*
+
+Anything you can do with a shortcut, you can also do from the palette — and a
+few actions (Rebase Worktree, Show Git Status, Open Configuration, Pair Phone)
+live *only* there.
+
+## Mouse support
+
+FlightDeck also responds to the mouse: click a project tab to switch (or its
+`✕` to close), click an agent in the sidebar to select it, click a terminal tab
+to switch terminals, and use the `+ project` / `+ agent` / `+ shell` buttons.
+You can select text in the viewport and scroll with the wheel.
+
+## The most useful shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl-g` | Command palette |
+| `Ctrl-n` | New agent session tab |
+| `Ctrl-t` | New child terminal |
+| `Alt-↑` / `Alt-↓` | Previous / next agent tab |
+| `Alt-1..9` | Jump to agent tab by number |
+| `Shift-←` / `Shift-→` | Previous / next project |
+| `Ctrl-p` | Push branch |
+| `Ctrl-s` | Set manual status |
+| `Ctrl-r` | Restart agent |
+| `?` | Keybindings help |
+| `Ctrl-q` | Quit |
+
+The [full table](/reference/keyboard) lists every binding, including which mode
+each works in.

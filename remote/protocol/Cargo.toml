@@ -1,0 +1,15 @@
+# Shared phone<->desktop wire-protocol types. Depended on (by path) from both
+# the relay service and the FlightDeck desktop app; the iOS app mirrors these
+# types in Swift and is kept honest by the golden JSON fixtures in tests/.
+[package]
+name = "flightdeck-remote-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]

@@ -1,0 +1,24 @@
+{
+  "type": "git_status",
+  "session_id": "sess_fix_login",
+  "branch": "flightdeck/fix-login",
+  "base_branch": "main",
+  "has_upstream": true,
+  "ahead": 1,
+  "behind": 0,
+  "drift": 2,
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "status": "modified",
+      "added_lines": 18,
+      "removed_lines": 4
+    },
+    {
+      "path": "src/session.ts",
+      "status": "added",
+      "added_lines": 30,
+      "removed_lines": 0
+    }
+  ]
+}

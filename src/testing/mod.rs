@@ -6,11 +6,12 @@
 //! real filesystem mutation outside tempdirs, no real PTY.
 
 use crate::contracts::domain::{
-    ContainerState, MergeOutcome, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+    CommandOutcome, ContainerState, MergeOutcome, ProcessState, PtySize, RebaseOutcome,
+    WorktreeInfo,
 };
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::traits::{
-    Clock, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
+    Clock, CommandRunner, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -214,6 +215,13 @@ struct FakeGitState {
     merge_outcome: Option<MergeOutcome>,
     rebase_outcome: Option<RebaseOutcome>,
     pull_base_outcome: Option<RebaseOutcome>,
+    /// Whether [`GitExecutor::stash_push`] reports it created an entry. Defaults
+    /// to `true`; set `false` to simulate an untracked-only dirty tree where
+    /// there is nothing tracked to stash.
+    stash_created: bool,
+    /// Whether [`GitExecutor::stash_apply`] applies cleanly. Defaults to `true`;
+    /// set `false` to simulate a conflict re-applying the stash after a pull.
+    stash_apply_ok: bool,
     /// When set, [`GitExecutor::remove_worktree`] fails with this `Git` message
     /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
     remove_worktree_error: Option<String>,
@@ -226,6 +234,9 @@ struct FakeGitState {
     merges: Vec<(String, PathBuf)>,
     rebases: Vec<(String, PathBuf)>,
     pull_bases: Vec<PathBuf>,
+    stash_pushes: Vec<PathBuf>,
+    stash_applies: Vec<PathBuf>,
+    stash_drops: Vec<PathBuf>,
 }
 
 impl Default for FakeGit {
@@ -246,6 +257,8 @@ impl Default for FakeGit {
                 merge_outcome: None,
                 rebase_outcome: None,
                 pull_base_outcome: None,
+                stash_created: true,
+                stash_apply_ok: true,
                 remove_worktree_error: None,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
@@ -255,6 +268,9 @@ impl Default for FakeGit {
                 merges: Vec::new(),
                 rebases: Vec::new(),
                 pull_bases: Vec::new(),
+                stash_pushes: Vec::new(),
+                stash_applies: Vec::new(),
+                stash_drops: Vec::new(),
             }),
         }
     }
@@ -382,6 +398,18 @@ impl FakeGit {
         self.inner.lock().unwrap().pull_base_outcome = Some(outcome);
     }
 
+    /// Set whether [`GitExecutor::stash_push`] reports it created a stash entry
+    /// (`false` simulates an untracked-only dirty tree with nothing to stash).
+    pub fn set_stash_created(&self, created: bool) {
+        self.inner.lock().unwrap().stash_created = created;
+    }
+
+    /// Set whether [`GitExecutor::stash_apply`] applies cleanly (`false`
+    /// simulates a conflict re-applying the stash after a pull).
+    pub fn set_stash_apply_ok(&self, ok: bool) {
+        self.inner.lock().unwrap().stash_apply_ok = ok;
+    }
+
     /// Make [`GitExecutor::remove_worktree`] fail with the given `Git` message,
     /// simulating git refusing a path it does not track as a worktree.
     pub fn set_remove_worktree_error(&self, message: impl Into<String>) {
@@ -428,6 +456,21 @@ impl FakeGit {
     /// Base-folder pulls performed via [`GitExecutor::pull_base`], as `cwd`.
     pub fn pull_bases(&self) -> Vec<PathBuf> {
         self.inner.lock().unwrap().pull_bases.clone()
+    }
+
+    /// Stashes pushed via [`GitExecutor::stash_push`], as `cwd`.
+    pub fn stash_pushes(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_pushes.clone()
+    }
+
+    /// Stashes re-applied via [`GitExecutor::stash_apply`], as `cwd`.
+    pub fn stash_applies(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_applies.clone()
+    }
+
+    /// Stashes dropped via [`GitExecutor::stash_drop`], as `cwd`.
+    pub fn stash_drops(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().stash_drops.clone()
     }
 }
 
@@ -575,6 +618,24 @@ impl GitExecutor for FakeGit {
             conflicted: false,
             message: "pulled base".to_string(),
         }))
+    }
+
+    fn stash_push(&self, cwd: &Path) -> Result<bool> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_pushes.push(cwd.to_path_buf());
+        Ok(st.stash_created)
+    }
+
+    fn stash_apply(&self, cwd: &Path) -> Result<bool> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_applies.push(cwd.to_path_buf());
+        Ok(st.stash_apply_ok)
+    }
+
+    fn stash_drop(&self, cwd: &Path) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        st.stash_drops.push(cwd.to_path_buf());
+        Ok(())
     }
 }
 
@@ -934,6 +995,76 @@ impl ContainerRuntime for FakeContainerRuntime {
 // ===========================================================================
 // FakeClock — fixed time
 // ===========================================================================
+
+// ===========================================================================
+// FakeCommandRunner — records hook command invocations
+// ===========================================================================
+
+/// [`CommandRunner`] that records every `(script, cwd)` it was asked to run and
+/// returns success by default. Per-script outcomes can be overridden to simulate
+/// a failing hook command.
+#[derive(Debug, Clone, Default)]
+pub struct FakeCommandRunner {
+    inner: Arc<Mutex<FakeRunnerState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeRunnerState {
+    /// Recorded invocations as `(script, cwd)`.
+    invocations: Vec<(String, String)>,
+    /// Per-script outcome overrides (default is success with empty output).
+    results: HashMap<String, CommandOutcome>,
+    /// When set, `run_shell` returns this error instead of running (simulates a
+    /// shell that could not be launched).
+    launch_error: Option<String>,
+}
+
+impl FakeCommandRunner {
+    /// Create a runner that succeeds for every command.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the outcome returned for `script`.
+    pub fn set_result(&self, script: impl Into<String>, outcome: CommandOutcome) {
+        self.inner
+            .lock()
+            .unwrap()
+            .results
+            .insert(script.into(), outcome);
+    }
+
+    /// Make `run_shell` fail to launch (returns an `Err`) for every command.
+    pub fn fail_to_launch(&self, message: impl Into<String>) {
+        self.inner.lock().unwrap().launch_error = Some(message.into());
+    }
+
+    /// The recorded `(script, cwd)` invocations, in order.
+    pub fn invocations(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().invocations.clone()
+    }
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome> {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .invocations
+            .push((script.to_string(), cwd.to_string_lossy().to_string()));
+        if let Some(msg) = &state.launch_error {
+            return Err(FlightDeckError::Io(msg.clone()));
+        }
+        Ok(state
+            .results
+            .get(script)
+            .cloned()
+            .unwrap_or(CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            }))
+    }
+}
 
 /// [`Clock`] returning a fixed timestamp and a settable millisecond counter.
 #[derive(Debug, Clone)]

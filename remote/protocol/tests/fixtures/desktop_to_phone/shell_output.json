@@ -1,0 +1,8 @@
+{
+  "type": "shell_output",
+  "session_id": "sess_fix_login",
+  "shell_id": "shell_01",
+  "stream": "stdout",
+  "seq": 7,
+  "data": "\u001b[32mPASS\u001b[0m src/auth.test.ts (42 tests)\n"
+}

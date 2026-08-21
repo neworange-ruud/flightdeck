@@ -51,8 +51,8 @@ mod tests {
             ui: UiConfig {
                 default_agent: "opencode".to_string(),
                 agent_tab_position: "left".to_string(),
-                use_f2_to_leave_terminal_focus: false,
-                file_manager: String::new(),
+                auto_continue: true,
+                ..UiConfig::default()
             },
             ..Config::default()
         };

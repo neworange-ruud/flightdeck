@@ -14,6 +14,10 @@ pub const WORKTREES_IGNORE_ENTRY: &str = ".flightdeck/worktrees/";
 pub const STATUS_IGNORE_ENTRY: &str = ".flightdeck/agent-status";
 /// Generated launch-scoped hook/plugin artifacts.
 pub const STATUS_RUNTIME_IGNORE_ENTRY: &str = ".flightdeck/runtime/";
+/// Per-repo worktree lifecycle hooks. Gitignored by default so hooks only affect
+/// the machine that opts in; a user un-ignores and commits it to share with their
+/// team (SPECS §7).
+pub const HOOKS_IGNORE_ENTRY: &str = ".flightdeck/hooks.toml";
 
 /// Ensure a single entry is present in `<repo_root>/.gitignore`, appending it
 /// only if missing (same append-only contract as
@@ -66,6 +70,7 @@ pub fn ensure_flightdeck_gitignore(
         WORKTREES_IGNORE_ENTRY,
         STATUS_IGNORE_ENTRY,
         STATUS_RUNTIME_IGNORE_ENTRY,
+        HOOKS_IGNORE_ENTRY,
     ];
     let missing: Vec<&str> = required
         .iter()
@@ -123,10 +128,12 @@ mod tests {
                 WORKTREES_IGNORE_ENTRY,
                 STATUS_IGNORE_ENTRY,
                 STATUS_RUNTIME_IGNORE_ENTRY,
+                HOOKS_IGNORE_ENTRY,
             ]
         );
         assert!(contents.contains(STATE_IGNORE_ENTRY));
         assert!(contents.contains(WORKTREES_IGNORE_ENTRY));
+        assert!(contents.contains(HOOKS_IGNORE_ENTRY));
     }
 
     // §26: appends missing entries when .gitignore lacks them
@@ -143,6 +150,7 @@ mod tests {
                 WORKTREES_IGNORE_ENTRY,
                 STATUS_IGNORE_ENTRY,
                 STATUS_RUNTIME_IGNORE_ENTRY,
+                HOOKS_IGNORE_ENTRY,
             ]
         );
         assert!(contents.contains(STATE_IGNORE_ENTRY));
@@ -164,6 +172,7 @@ mod tests {
                 WORKTREES_IGNORE_ENTRY,
                 STATUS_IGNORE_ENTRY,
                 STATUS_RUNTIME_IGNORE_ENTRY,
+                HOOKS_IGNORE_ENTRY,
             ]
         );
 
@@ -179,7 +188,7 @@ mod tests {
     #[test]
     fn no_change_when_both_already_present() {
         let initial = format!(
-            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n{HOOKS_IGNORE_ENTRY}\n"
         );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let (update, _) = run(&fs);
@@ -257,20 +266,21 @@ mod tests {
             ensure_flightdeck_gitignore(&fs, Path::new(REPO_ROOT)).expect("should not fail");
 
         assert!(update.changed);
-        assert_eq!(update.added.len(), 4);
+        assert_eq!(update.added.len(), 5);
         assert!(update.added.contains(&STATE_IGNORE_ENTRY.to_string()));
         assert!(update.added.contains(&WORKTREES_IGNORE_ENTRY.to_string()));
         assert!(update.added.contains(&STATUS_IGNORE_ENTRY.to_string()));
         assert!(update
             .added
             .contains(&STATUS_RUNTIME_IGNORE_ENTRY.to_string()));
+        assert!(update.added.contains(&HOOKS_IGNORE_ENTRY.to_string()));
     }
 
     // §26: changed=false, added=[] when nothing to do
     #[test]
     fn returns_no_change_when_nothing_to_do() {
         let initial = format!(
-            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+            "{STATE_IGNORE_ENTRY}\n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n{HOOKS_IGNORE_ENTRY}\n"
         );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let update =
@@ -285,7 +295,7 @@ mod tests {
     fn trimmed_match_prevents_duplicate() {
         // Entry present with leading/trailing spaces — should still be detected.
         let initial = format!(
-            "  {STATE_IGNORE_ENTRY}  \n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n"
+            "  {STATE_IGNORE_ENTRY}  \n{WORKTREES_IGNORE_ENTRY}\n{STATUS_IGNORE_ENTRY}\n{STATUS_RUNTIME_IGNORE_ENTRY}\n{HOOKS_IGNORE_ENTRY}\n"
         );
         let fs = FakeFs::new().with_file(GITIGNORE, initial.as_str());
         let (update, _) = run(&fs);

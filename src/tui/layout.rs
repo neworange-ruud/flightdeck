@@ -81,6 +81,11 @@ pub struct MainLayout {
     pub status_divider: Rect,
     /// Status/action bar (bottom of the main pane).
     pub status_bar: Rect,
+    /// Outer rect to draw the sidebar's live-pane border on, when a border is
+    /// reserved. `None` when `mode_border = off`.
+    pub sidebar_frame: Option<Rect>,
+    /// Outer rect to draw the terminal's live-pane border on, when reserved.
+    pub terminal_frame: Option<Rect>,
 }
 
 /// Compute the main layout from a total `area` (SPECS §20).
@@ -92,7 +97,7 @@ pub struct MainLayout {
 ///
 /// If the area is too small (e.g. less than the minimum heights/widths),
 /// sub-rects may be zero-sized — callers must handle this gracefully.
-pub fn compute(area: Rect) -> MainLayout {
+pub fn compute(area: Rect, reserve_border: bool) -> MainLayout {
     // Full-width top band: header (logo) | project tabs | divider | body.
     let [header, project_tabs, divider, body] = Layout::vertical([
         Constraint::Length(HEADER_HEIGHT),
@@ -119,18 +124,43 @@ pub fn compute(area: Rect) -> MainLayout {
         ])
         .areas(main);
 
+    // Reserve a 1-cell ring around the sidebar and the terminal viewport for the
+    // live-pane border (SPECS §23). The inset depends only on the static setting,
+    // never the current mode, so the PTY size is stable across mode switches.
+    let (sidebar_inner, sidebar_frame) = inset_pane(sidebar, reserve_border);
+    let (terminal_inner, terminal_frame) = inset_pane(terminal, reserve_border);
+
     MainLayout {
         header,
         project_tabs,
         divider,
-        sidebar,
+        sidebar: sidebar_inner,
         child_tabs,
-        terminal,
+        terminal: terminal_inner,
         info_divider,
         info_bar,
         status_divider,
         status_bar,
+        sidebar_frame,
+        terminal_frame,
     }
+}
+
+/// Shrink `pane` by one cell on every side when a border is reserved, returning
+/// the inner content rect and the outer frame rect. When not reserved, the pane
+/// is returned unchanged with no frame. Degrades safely on tiny panes (never
+/// underflows): if the pane is too small to inset, the border is skipped.
+fn inset_pane(pane: Rect, reserve: bool) -> (Rect, Option<Rect>) {
+    if !reserve || pane.width < 3 || pane.height < 3 {
+        return (pane, None);
+    }
+    let inner = Rect {
+        x: pane.x + 1,
+        y: pane.y + 1,
+        width: pane.width - 2,
+        height: pane.height - 2,
+    };
+    (inner, Some(pane))
 }
 
 /// Height of each split-view column's header row (the terminal's label).
@@ -236,7 +266,7 @@ mod tests {
     #[test]
     fn header_project_tabs_and_divider_span_full_width_at_top() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         // Header is the very first row, full width.
         assert_eq!(layout.header.y, 0);
         assert_eq!(layout.header.x, 0);
@@ -259,7 +289,7 @@ mod tests {
 
     #[test]
     fn sidebar_has_correct_width() {
-        let layout = compute(full_terminal());
+        let layout = compute(full_terminal(), false);
         assert_eq!(layout.sidebar.width, SIDEBAR_WIDTH);
         assert_eq!(layout.sidebar.x, 0);
         assert_eq!(layout.sidebar.y, TOP_BAND);
@@ -268,14 +298,14 @@ mod tests {
     #[test]
     fn sidebar_fills_remaining_height_below_top_band() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
     }
 
     #[test]
     fn main_pane_starts_after_sidebar() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         assert_eq!(layout.child_tabs.x, SIDEBAR_WIDTH);
         assert_eq!(layout.terminal.x, SIDEBAR_WIDTH);
         assert_eq!(layout.status_bar.x, SIDEBAR_WIDTH);
@@ -285,7 +315,7 @@ mod tests {
     fn main_pane_fills_remaining_width() {
         let area = full_terminal();
         let expected_main_w = area.width - SIDEBAR_WIDTH;
-        let layout = compute(area);
+        let layout = compute(area, false);
         assert_eq!(layout.child_tabs.width, expected_main_w);
         assert_eq!(layout.terminal.width, expected_main_w);
         assert_eq!(layout.info_bar.width, expected_main_w);
@@ -295,7 +325,7 @@ mod tests {
     #[test]
     fn info_bar_sits_directly_above_status_bar() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         assert_eq!(layout.info_bar.height, INFO_BAR_HEIGHT);
         assert_eq!(layout.info_bar.x, SIDEBAR_WIDTH);
         // A divider row now sits between the info bar and the status bar.
@@ -310,7 +340,7 @@ mod tests {
 
     #[test]
     fn child_tabs_bar_height() {
-        let layout = compute(full_terminal());
+        let layout = compute(full_terminal(), false);
         assert_eq!(layout.child_tabs.height, CHILD_TAB_BAR_HEIGHT);
         // The child tab bar is the first row of the body, below the top band.
         assert_eq!(layout.child_tabs.y, TOP_BAND);
@@ -319,7 +349,7 @@ mod tests {
     #[test]
     fn status_bar_height_and_at_bottom() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         assert_eq!(layout.status_bar.height, STATUS_BAR_HEIGHT);
         assert_eq!(
             layout.status_bar.y,
@@ -331,7 +361,7 @@ mod tests {
     #[test]
     fn terminal_viewport_fills_remaining() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         // top band (2) + child_tabs (1) + terminal (?) + info_divider (1)
         // + info_bar (1) + status_divider (1) + status (1).
         let expected_h = area.height
@@ -347,7 +377,7 @@ mod tests {
 
     #[test]
     fn rects_do_not_overlap() {
-        let layout = compute(full_terminal());
+        let layout = compute(full_terminal(), false);
         // Sidebar and main pane must not overlap horizontally.
         assert!(layout.sidebar.right() <= layout.terminal.left());
         // Vertical panes must not overlap within main pane.
@@ -361,7 +391,7 @@ mod tests {
     #[test]
     fn total_area_accounted_for() {
         let area = full_terminal();
-        let layout = compute(area);
+        let layout = compute(area, false);
         // Sidebar spans the full height below the top band.
         assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
         // Width sum: sidebar + main pane columns.
@@ -382,9 +412,9 @@ mod tests {
     #[test]
     fn minimum_area_does_not_panic() {
         // Degenerate area: should produce valid (possibly zero-sized) rects.
-        let _ = compute(Rect::new(0, 0, 0, 0));
-        let _ = compute(Rect::new(0, 0, 1, 1));
-        let _ = compute(Rect::new(0, 0, 10, 3));
+        let _ = compute(Rect::new(0, 0, 0, 0), false);
+        let _ = compute(Rect::new(0, 0, 1, 1), false);
+        let _ = compute(Rect::new(0, 0, 10, 3), false);
     }
 
     #[test]
@@ -409,7 +439,7 @@ mod tests {
 
     #[test]
     fn split_region_reclaims_the_tab_bar_row() {
-        let ml = compute(full_terminal());
+        let ml = compute(full_terminal(), false);
         let region = split_region(&ml);
         // Starts at the tab bar row and spans both it and the terminal viewport.
         assert_eq!(region.x, ml.child_tabs.x);
@@ -469,5 +499,31 @@ mod tests {
         assert!(split_columns(Rect::new(0, 0, 40, 10), 0).is_empty());
         // Very narrow region with many columns: no panic, widths may be zero.
         let _ = split_columns(Rect::new(0, 0, 2, 4), 5);
+    }
+
+    #[test]
+    fn compute_without_border_matches_legacy_geometry() {
+        let area = Rect::new(0, 0, 120, 40);
+        let ml = compute(area, false);
+        assert!(ml.sidebar_frame.is_none());
+        assert!(ml.terminal_frame.is_none());
+        // Terminal keeps full width (sidebar is SIDEBAR_WIDTH columns).
+        assert_eq!(ml.terminal.width, 120 - SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn compute_with_border_insets_panes_by_one() {
+        let area = Rect::new(0, 0, 120, 40);
+        let plain = compute(area, false);
+        let framed = compute(area, true);
+        // Frames are the pre-inset outer rects.
+        assert_eq!(framed.terminal_frame, Some(plain.terminal));
+        assert_eq!(framed.sidebar_frame, Some(plain.sidebar));
+        // Inner content shrinks by 1 on each side (2 total per axis).
+        assert_eq!(framed.terminal.width, plain.terminal.width - 2);
+        assert_eq!(framed.terminal.height, plain.terminal.height - 2);
+        assert_eq!(framed.terminal.x, plain.terminal.x + 1);
+        assert_eq!(framed.terminal.y, plain.terminal.y + 1);
+        assert_eq!(framed.sidebar.width, plain.sidebar.width - 2);
     }
 }

@@ -1,0 +1,482 @@
+//
+//  MainTabView.swift
+//  FlightDeckRemote
+//
+//  The paired app's tab container: Feed · Projects · [+ FAB] · Shell ·
+//  Settings, rendered as a bottom-bar overlay + switch on
+//  `router.selectedTab` (see `CustomTabBar`'s doc comment for why this isn't
+//  a plain `TabView`). The separate Activity tab was folded into the unified
+//  `.feed` (remote-control-fa8) — one surface, carrying unread tracking +
+//  attention + error surfacing + event deep-links across every machine.
+//
+//  Hook points for later feature tasks:
+//  - `projectsNav.path` (`ProjectsNavModel`, typed `[ProjectsRoute]`) — the
+//    Projects tab's `NavigationStack` path, for pushing sessions/chat.
+//  - `feedUnreadStore` — the unified Feed's multi-machine unread source; its
+//    `unreadCount(items:)` drives the Feed tab's badge, and it is fed by every
+//    machine's `agentEvents` (armed in `.task`, see `armIngestion`).
+//  - the FAB's sheet (`NewAgentView`, Features/Control) — the real "type +
+//    name + base + first task" flow (PRD §5.5); the presentation plumbing
+//    (`isPresentingNewAgentSheet`)
+//    stays the same. The Sessions screen's "New agent session" CTA also
+//    presents this same sheet (via the binding passed down to it) rather
+//    than rebuilding its own.
+//  - `connectionSource` (`ConnectionStatusSource`, `Features/Connection`) —
+//    an externally-supplied override for the reconnecting banner (e.g. a
+//    test double); defaults to `nil`, in which case the banner reads
+//    `transportStore` below — the app's single live `TransportStore`
+//    (`TransportStoreFactory`), which the Projects/Sessions screens also
+//    bind to.
+//  - the `StaleBanner` overlay (PRD §9.2) shows whenever the store's data is
+//    cache-seeded (`TransportStore.isCacheStale`) and the link isn't a live
+//    `.connected` session — mounted below the (louder) `ReconnectingBanner`.
+//    `isCacheStaleOffline` is also published into the environment so
+//    sibling screens can read it later without further plumbing.
+//
+
+import SwiftUI
+
+struct MainTabView: View {
+    var router: AppRouter
+    var connectionSource: (any ConnectionStatusSource)?
+
+    @State private var projectsNav = ProjectsNavModel()
+    // The Feed tab's own `NavigationStack` path (remote-control-b8d.8) —
+    // reuses `ProjectsNavModel`/`ProjectsRoute` rather than inventing a
+    // parallel type, since a feed row pushes into the SAME `SessionsListView`/
+    // `AgentChatView` surfaces the Projects tab already does (see `tabContent`'s
+    // `.feed` case). Each pushed route now carries its OWN `pairingId`
+    // (remote-control-b8d.12), resolved to a store per-destination via
+    // `coordinator.detailStore(for:)` — there is no separate "which machine
+    // is active" state to go stale as the stack grows or a different row is
+    // tapped later.
+    @State private var feedNav = ProjectsNavModel()
+    // The unified Feed's unread source (remote-control-fa8), replacing the
+    // removed Activity tab's single-machine store: per-item (pairingId+projectId)
+    // watermarks fed by EVERY paired machine's `agentEvents` (armed reactively
+    // over the coordinator in `.task`, never mutated during view construction —
+    // reentrancy hazard). Drives the Feed tab's unread badge + per-row dots.
+    @State private var feedUnreadStore: FeedUnreadStore
+    @State private var isPresentingNewAgentSheet = false
+    // Measured height of the custom tab bar, published into `tabContent`'s
+    // environment (`\.tabBarHeight`) so screens pushed inside the
+    // Projects/Feed `NavigationStack`s — which do NOT inherit the tab bar's
+    // `.safeAreaInset` — can reserve matching bottom space and keep their
+    // bottom-pinned controls above (and hittable, not under) the bar.
+    @State private var tabBarHeight: CGFloat = 0
+    @State private var connectionBanner: ReconnectingBannerModel
+    // Multi-pairing transport (remote-control-b8d.5): the coordinator owns one
+    // live client+store per paired machine and is driven foreground→connect-all
+    // / background→teardown by the `scenePhase` observer below. `transportStore`
+    // is the transitional single-store bridge (`coordinator.primaryStore` — the
+    // first paired instance, or a recordless fallback when unpaired) that the
+    // Projects/Shell/Settings tabs deliberately KEEP binding to
+    // (single-store, transitional — out of scope for remote-control-b8d.12,
+    // which only finalizes the FEED tab's per-pairingId navigation below).
+    @State private var coordinator: TransportCoordinator
+    /// The transitional single-store bridge, resolved LIVE on every body pass
+    /// rather than captured once at `init` (remote-control-4wk). `primaryStore`
+    /// only learns which pairing the desktop is actually serving once inbound
+    /// traffic arrives, which is necessarily after `init` — a pinned `@State`
+    /// froze this on the pre-connect answer, which with a duplicate pairing was
+    /// the stale one, and no later resolution could dislodge it. (The Projects
+    /// tab already read `coordinator.primaryStore` directly; this brings the
+    /// stale banner, event ingestion, Shell and Settings onto the same answer.)
+    private var transportStore: TransportStore { coordinator.primaryStore }
+    // Unified multi-pairing feed (remote-control-b8d.8): the aggregation over
+    // the SAME coordinator's handles, folded with `router.pairingStore` for
+    // display-name/online-flag resolution (remote-control-b8d.6). Owned here
+    // (not by `FeedView` itself) so it's built exactly once, alongside
+    // `coordinator`, rather than re-built on every `.feed` tab selection.
+    @State private var feedStore: FeedStore
+    @Environment(\.scenePhase) private var scenePhase
+    // Push wiring (PRD §5.2/§9.1): the notification prefs the Settings screen
+    // binds to (also gating presentation), the local-notification scheduler fed
+    // by the same `agentEvents` stream as the Feed's unread source, and the shared push
+    // coordinator whose APNs token we register with the transport.
+    @State private var notificationPreferences = NotificationPreferences()
+    // Push-to-talk dictation language (PRD §7). Owned here so the Settings
+    // toggle and the chat's `DictationController` observe the same persisted
+    // choice; the recognizer reads the persisted value when it builds.
+    @State private var speechLanguage = SpeechLanguagePreference()
+    @State private var notificationScheduler = NotificationScheduler()
+    @State private var pushCoordinator = PushCoordinator.shared
+
+    init(router: AppRouter, connectionSource: (any ConnectionStatusSource)? = nil) {
+        self.router = router
+        self.connectionSource = connectionSource
+        let coordinator = TransportStoreFactory.makeCoordinator(pairingStore: router.pairingStore)
+        _coordinator = State(initialValue: coordinator)
+        // Only the banner captures a store at init (its `ConnectionStatusSource`
+        // is stored, not re-resolved). That is fine for its purpose: it reports
+        // whether the link is down, and every pairing to the same relay goes
+        // up/down together — unlike the CONTENT, which is per-pairing and must
+        // follow `primaryStore` live (see `transportStore`).
+        let store = coordinator.primaryStore
+        let feed = FeedStore(coordinator: coordinator, pairingStore: router.pairingStore)
+        #if DEBUG
+        // A device "paired" via the DEBUG toggle has no live coordinator
+        // handles, so the Feed would render empty; under -uitest-fixture-activity
+        // seed the canned multi-variant source so UI tests can exercise the
+        // unified Feed's unread rows/badge, error styling, and deep-links.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-fixture-activity") {
+            feed.debugFixtureSources = [FeedStore.Fixture.source()]
+        }
+        #endif
+        _feedStore = State(initialValue: feed)
+        _feedUnreadStore = State(initialValue: FeedUnreadStore.makeDefault())
+        // The banner reads the phone's live network path (remote-control-0ef.22
+        // / -seo) to tell "offline" from "relay unreachable", and forces an
+        // immediate reconnect of every machine on "Retry now" (remote-control-0ef.21).
+        _connectionBanner = State(initialValue: ReconnectingBannerModel(
+            source: connectionSource ?? store,
+            hasNetworkPath: { coordinator.isOnline },
+            onRetry: { await coordinator.reconnectAll() }))
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            ZStack {
+                tabContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .environment(\.isCacheStaleOffline, isStaleBannerVisible)
+                    .environment(\.tabBarHeight, isChatRouteActive ? 0 : tabBarHeight)
+                    // `.safeAreaInset` (rather than overlaying the tab bar as a
+                    // ZStack sibling drawn on top) folds the bar's own height
+                    // into `tabContent`'s bottom safe area. That matters for
+                    // tabs with a fixed, non-scrolling bottom control — e.g.
+                    // the Shell tab's `ShellKeyBar` (mounted via its own
+                    // `.safeAreaInset(edge: .bottom)` in `ShellView`) — since
+                    // nested safe-area insets stack: without this, the tab
+                    // bar's opaque background + buttons render *on top of*
+                    // whatever sits at the bottom of `tabContent`, at the same
+                    // z-order priority a plain overlay would occupy, making
+                    // that control unhittable. Hide the inset entirely while a
+                    // chat conversation is open: the chat screen's compose bar
+                    // (PRD §5.3) owns the bottom edge there instead.
+                    .safeAreaInset(edge: .bottom) {
+                        if !isChatRouteActive {
+                            CustomTabBar(
+                                selectedTab: router.selectedTab,
+                                unreadFeedCount: feedUnreadStore.unreadCount(items: feedStore.items),
+                                onSelectTab: { router.selectedTab = $0 },
+                                onTapFAB: { isPresentingNewAgentSheet = true }
+                            )
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                                tabBarHeight = height
+                            }
+                        }
+                    }
+            }
+            .background(Theme.bgDeep)
+            .sheet(isPresented: $isPresentingNewAgentSheet) {
+                // Aggregate projects across EVERY paired machine and route the
+                // launch to the selected project's own machine (remote-control-cyj),
+                // instead of only ever creating on the primary. `store` stays the
+                // live primary (see `primaryStore`) for the single-machine fallback
+                // and the connection-source seed.
+                NewAgentView(store: coordinator.primaryStore,
+                             coordinator: coordinator,
+                             pairingStore: router.pairingStore)
+            }
+            .onChange(of: transportStore.agentEvents) { _, newEvents in
+                // Unread is folded in reactively across EVERY machine by
+                // `feedUnreadStore.armIngestion` (see `.task`), not here — this
+                // handler stays purely the local-notification bridge.
+                // Same stream drives local notifications (deduped by event_id,
+                // gated by the user's toggles + per-project mute). Stamp the
+                // originating machine so a tap deep-links to it (multi-pairing
+                // push, remote-control-b8d.10). The transitional single-store
+                // bridge feeds the primary (first) machine's events until
+                // remote-control-b8d.12 fans notifications per-instance.
+                notificationScheduler.ingest(
+                    newEvents,
+                    settings: notificationPreferences.settings,
+                    pairingId: coordinator.activePairingIds.first)
+            }
+            .onChange(of: pushCoordinator.deviceTokenHex) { _, token in
+                if let token {
+                    registerPushTokenEverywhere(token)
+                }
+            }
+            // Foreground → connect every paired machine; background → tear them
+            // all down (cancel supervisors, close sockets). APNs push takes over
+            // while backgrounded (remote-control-b8d.5 / epic connectivity model).
+            // Only `.background` tears down and only `.active` connects — the
+            // transient `.inactive` phase (Control Center pull, app-switcher
+            // glance, incoming call, Face ID prompt) is left untouched, avoiding
+            // reconnect churn (remote-control-0ef.3). Mirrors RootView's
+            // `.background`-only app-lock arming.
+            .onChange(of: scenePhase) { _, phase in
+                if let active = ScenePhaseTransportGate.foregroundIntent(for: phase) {
+                    Task { await coordinator.setForeground(active) }
+                }
+            }
+            // Runtime add/remove: pairing a new machine spins up only its client;
+            // unpairing one stops+disposes only that client (remote-control-b8d.7/.11).
+            .onChange(of: router.pairingStore.instances) { _, instances in
+                Task { await coordinator.reconcile(with: instances) }
+            }
+            // `.contain` first: an accessibility identifier applied to a plain
+            // container view propagates onto every accessibility element inside
+            // it, clobbering the tab buttons' own identifiers. Making the view a
+            // container element scopes the identifier to the container itself.
+            // The reconnecting banner sits *outside* this scope (below) so its
+            // own identifiers aren't swallowed by "MainTabView" either.
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("MainTabView")
+            .task {
+                // Arm multi-machine unread ingestion BEFORE connecting: the
+                // reactive observation (over every handle's `agentEvents` + the
+                // handle set) folds newly-synced events in, and the initial
+                // `ingestAll` catches any cache-seeded events already present.
+                // Deferred here (a `.task`, post-body) rather than in init/body
+                // so it never mutates the @Observable store during view
+                // construction (reentrancy hang — see `FeedUnreadStore`'s notes).
+                feedUnreadStore.armIngestion(coordinator: coordinator)
+                feedUnreadStore.ingestAll(coordinator: coordinator)
+                // Connect every paired machine on mount (scenePhase is `.active`
+                // here); the `scenePhase` observer drives subsequent transitions.
+                await coordinator.setForeground(true)
+                // Register any token that already arrived before the transport
+                // started (onChange covers tokens that arrive afterwards).
+                if let token = pushCoordinator.deviceTokenHex {
+                    registerPushTokenEverywhere(token)
+                }
+                // Register the background wake performer (remote-control-0ef.4):
+                // a silent wake push while backgrounded runs this to reconnect
+                // the torn-down transport, replay queued envelopes, and schedule
+                // their notifications. Capture the live objects (not `self`, a
+                // recreated View value) so the stored closure stays valid.
+                let coordinator = self.coordinator
+                let scheduler = self.notificationScheduler
+                let preferences = self.notificationPreferences
+                pushCoordinator.registerWakeHandler { @MainActor in
+                    await Self.performBackgroundWake(
+                        coordinator: coordinator,
+                        scheduler: scheduler,
+                        preferences: preferences)
+                }
+            }
+
+            VStack(spacing: 0) {
+                ReconnectingBanner(model: connectionBanner, isPaired: router.pairingStore.isPaired)
+                if isStaleBannerVisible {
+                    StaleBanner()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: isStaleBannerVisible)
+        }
+    }
+
+    /// Register the APNs token with every live per-machine client, applying
+    /// each machine's mute preference (remote-control-b8d.10): an unmuted
+    /// machine registers its own per-pairing token; a muted one is (kept)
+    /// deregistered. Idempotent — safe to call on every token refresh / mount.
+    /// No-op when nothing is paired.
+    private func registerPushTokenEverywhere(_ token: String) {
+        coordinator.registerPushToken(token, environment: pushCoordinator.environment)
+    }
+
+    /// The silent-wake-push performer (remote-control-0ef.4), run by
+    /// `PushCoordinator.handleWakePush` while the app is backgrounded and the
+    /// transport has been torn down. It reconnects every paired machine, waits a
+    /// bounded window for `resume`d envelopes to replay, schedules a local
+    /// notification for every freshly-decrypted event across ALL machines
+    /// (deduped by `event_id`, so a later foreground re-ingest is a no-op), then
+    /// tears the transport back down so the next foreground reconnects cleanly.
+    /// Returns whether the link came back live (drives the fetch result).
+    ///
+    /// Bracketed by `beginBackgroundWake()`/`endBackgroundWake()` rather than
+    /// `startAll()`/`stopAll()` (remote-control-aew): iOS delivers silent pushes
+    /// to a FOREGROUNDED app too, and the foreground transport is not this
+    /// path's to stop. `begin` declines the wake outright while foregrounded,
+    /// and `end` skips its teardown if the app foregrounded mid-wake — without
+    /// either guard, a wake arriving as the user opens the app kills the fresh
+    /// link, which detaches the phone at the relay, which makes the relay push
+    /// again for the next envelope: an endless connect/"Reconnecting…" flap.
+    ///
+    /// Static (captures no `View`) so the closure stored on `PushCoordinator`
+    /// outlives any given `MainTabView` value. The reconnect-then-teardown here
+    /// is background-lifecycle behavior that can only be exercised on a real
+    /// device/simulator app-lifecycle, so it is integration-level, not unit
+    /// tested (the pieces it composes — the wake bracket, reconnect,
+    /// resume/snapshot, notification scheduling — are each covered on their own).
+    @MainActor
+    private static func performBackgroundWake(
+        coordinator: TransportCoordinator,
+        scheduler: NotificationScheduler,
+        preferences: NotificationPreferences
+    ) async -> Bool {
+        // Reconnect every paired machine (they were stopped on background).
+        // Declined while foregrounded — the link is already live and owned by
+        // the scenePhase lifecycle, so there is nothing to wake and nothing
+        // fetched that the live transport isn't already ingesting.
+        guard await coordinator.beginBackgroundWake() else { return false }
+
+        // Bounded wait for the sockets to reach `auth_ok` — the background
+        // execution budget is short, so give up rather than hang if the phone
+        // still can't reach the relay.
+        let deadline = ContinuousClock.now + .seconds(12)
+        while ContinuousClock.now < deadline {
+            let stores = coordinator.stores
+            let allLive = !stores.isEmpty && stores.allSatisfy {
+                if case .connected = $0.linkState { return true }
+                return false
+            }
+            if allLive { break }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        // Let any `resume`d envelopes finish folding into `agentEvents`.
+        try? await Task.sleep(for: .milliseconds(500))
+
+        // Schedule notifications for every machine's events, stamped with the
+        // originating pairing so a tap deep-links to it.
+        for handle in coordinator.handles {
+            scheduler.ingest(
+                handle.store.agentEvents,
+                settings: preferences.settings,
+                pairingId: handle.pairingId)
+        }
+
+        let reachedLive = coordinator.stores.contains {
+            if case .connected = $0.linkState { return true }
+            return false
+        }
+        // Tear back down so the next foreground reconnects from a clean state
+        // (APNs owns the wake in between) — unless the app foregrounded while
+        // this wake ran, in which case the link is the foreground's now and
+        // `endBackgroundWake` leaves it up.
+        await coordinator.endBackgroundWake()
+        return reachedLive
+    }
+
+    /// Whether the currently-selected tab has a chat route pushed (the tab
+    /// bar hides there — see the comment at the `CustomTabBar` mount). Checks
+    /// both stacks that can push `.chat` — Projects' own and the Feed tab's
+    /// (remote-control-b8d.8) — since either can land on `AgentChatView`.
+    private var isChatRouteActive: Bool {
+        let path: [ProjectsRoute]
+        switch router.selectedTab {
+        case .projects: path = projectsNav.path
+        case .feed: path = feedNav.path
+        case .shell, .settings: return false
+        }
+        return path.contains {
+            if case .chat = $0 { return true }
+            return false
+        }
+    }
+
+    /// The link state driving the stale banner: the DEBUG `-uitest-linkstate`
+    /// forced state wins (mirrors `ReconnectingBannerModel`/`CommandsPausedGate`'s
+    /// own DEBUG seam), so UI tests can drive it deterministically without a
+    /// real relay connection.
+    private var effectiveLinkStateForStaleBanner: RemoteLinkState {
+        #if DEBUG
+        if let forced = ConnectionDebugSeam.forcedLinkState() { return forced }
+        #endif
+        return transportStore.linkState
+    }
+
+    /// PRD §9.2: cache-seeded data, shown only while the link isn't a live
+    /// `.connected` session — reuses `ReconnectingBannerModel.isDown` rather
+    /// than redefining "down".
+    private var isStaleBannerVisible: Bool {
+        transportStore.isCacheStale && ReconnectingBannerModel.isDown(effectiveLinkStateForStaleBanner)
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch router.selectedTab {
+        case .feed:
+            // Unified multi-pairing feed (remote-control-b8d.8): its own
+            // `NavigationStack`/`navigationDestination`, structured exactly
+            // like the Projects tab's below (same `ProjectsRoute` shape,
+            // same `SessionsListView`/`AgentChatView` destinations) — the
+            // only difference is which store those destinations bind to,
+            // resolved per-route via `coordinator.detailStore(for:)` (see
+            // its doc comment) rather than always `transportStore`.
+            NavigationStack(path: $feedNav.path) {
+                FeedView(
+                    feedStore: feedStore,
+                    feedUnreadStore: feedUnreadStore,
+                    coordinator: coordinator,
+                    router: router,
+                    nav: feedNav
+                )
+                .navigationDestination(for: ProjectsRoute.self) { route in
+                    switch route {
+                    case let .sessions(projectId, pairingId):
+                        SessionsListView(
+                            projectId: Wire.ProjectId(projectId),
+                            transportStore: coordinator.detailStore(for: pairingId),
+                            nav: feedNav,
+                            isPresentingNewAgentSheet: $isPresentingNewAgentSheet,
+                            pairingId: pairingId
+                        )
+                    case let .chat(projectId, sessionId, pairingId):
+                        AgentChatView(projectId: projectId, sessionId: sessionId,
+                                      store: coordinator.detailStore(for: pairingId))
+                    }
+                }
+            }
+        case .projects:
+            NavigationStack(path: $projectsNav.path) {
+                ProjectsListView(
+                    transportStore: coordinator.primaryStore,
+                    coordinator: coordinator,
+                    router: router,
+                    nav: projectsNav
+                )
+                    .navigationDestination(for: ProjectsRoute.self) { route in
+                        switch route {
+                        case let .sessions(projectId, pairingId):
+                            // The Projects tab now AGGREGATES across machines
+                            // (remote-control-aj2), so each row carries the
+                            // pairingId of the machine it belongs to. Bind the
+                            // detail screen to THAT machine's store (falling back
+                            // to the live primary when the route has no pairingId,
+                            // e.g. a deep link).
+                            SessionsListView(
+                                projectId: Wire.ProjectId(projectId),
+                                transportStore: coordinator.detailStore(for: pairingId),
+                                nav: projectsNav,
+                                isPresentingNewAgentSheet: $isPresentingNewAgentSheet,
+                                pairingId: pairingId
+                            )
+                        case let .chat(projectId, sessionId, pairingId):
+                            // Bind Chat to the store of the machine this session
+                            // belongs to (remote-control-aj2), falling back to the
+                            // live primary when the route carries no pairingId.
+                            // Threading the real (connected) store is also what
+                            // lets ChatViewModel.bind run so the commands-paused
+                            // gate reflects the true link instead of defaulting to
+                            // "paused — reconnecting" (remote-control-9yv). UI-test
+                            // fixtures are unaffected (loadFixtureIfRequested wins
+                            // before the store is bound — see AgentChatView.task).
+                            AgentChatView(projectId: projectId, sessionId: sessionId,
+                                          store: coordinator.detailStore(for: pairingId))
+                        }
+                    }
+                    .chatFixtureAutoPush(path: $projectsNav.path)
+            }
+        case .shell:
+            ShellTabView(transportStore: transportStore)
+        case .settings:
+            SettingsView(
+                router: router,
+                transportStore: transportStore,
+                coordinator: coordinator,
+                notificationPreferences: notificationPreferences,
+                speechLanguage: speechLanguage)
+        }
+    }
+}
+
+#if DEBUG  // previews are Debug-only — see ios/README.md "Notable decisions".
+#Preview {
+    MainTabView(router: AppRouter(pairingStore: PairingStore()))
+}
+#endif

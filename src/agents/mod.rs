@@ -3,5 +3,6 @@
 
 pub mod adapter;
 pub mod registry;
+pub mod resume;
 pub mod setup;
 pub mod status;

@@ -1,0 +1,6 @@
+{
+  "command_id": "cmd_00000004",
+  "issued_at_ms": 1752412813000,
+  "type": "restart_agent",
+  "session_id": "sess_fix_login"
+}

@@ -116,6 +116,15 @@ impl Terminal {
         self.parser.screen().bracketed_paste()
     }
 
+    /// Whether the hosted application has enabled application cursor keys mode
+    /// (DECCKM / DECSET 1). When true, the arrow keys are encoded as `ESC O A/B/
+    /// C/D` (SS3) rather than the normal `ESC [ A/B/C/D` (CSI) — full-screen
+    /// TUIs (Claude Code, OpenCode) typically enable it, so a synthesized arrow
+    /// keystroke must match this mode or the app ignores it (remote-control-qa1).
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
     /// Scroll the viewport `lines` rows up into the VT100 scrollback. Used for
     /// plain (non-mouse-aware) output; clamped to the available scrollback.
     pub fn scroll_up(&mut self, lines: usize) {

@@ -276,6 +276,36 @@ pub struct UiConfig {
     /// `flatpak run org.gnome.Nautilus` works.
     #[serde(default)]
     pub file_manager: String,
+    /// Auto-continuation: capture an agent's on-exit resume command and replay
+    /// it on restart/recovery so a tab continues its previous session. On by
+    /// default. Turn it off (`auto_continue = false`) to disable both halves —
+    /// nothing is captured from output and nothing is replayed on start; tabs
+    /// simply start fresh. Agent termination on shutdown is unaffected.
+    #[serde(default = "default_true")]
+    pub auto_continue: bool,
+    /// Color of the TERMINAL-mode cue (chip + live-pane border). One of:
+    /// green, cyan, blue, magenta, yellow, red, white.
+    #[serde(default = "default_terminal_mode_color")]
+    pub terminal_mode_color: String,
+    /// Color of the APP-mode cue (chip + live-pane border). Same value set.
+    #[serde(default = "default_app_mode_color")]
+    pub app_mode_color: String,
+    /// Live-pane border brightness: off, dim, normal, bright.
+    #[serde(default = "default_mode_border")]
+    pub mode_border: String,
+    /// Dim the terminal viewport while in APP mode (it is not receiving keys).
+    #[serde(default = "default_true")]
+    pub dim_terminal_in_app_mode: bool,
+}
+
+fn default_terminal_mode_color() -> String {
+    "green".to_string()
+}
+fn default_app_mode_color() -> String {
+    "cyan".to_string()
+}
+fn default_mode_border() -> String {
+    "off".to_string()
 }
 
 impl Default for UiConfig {
@@ -285,6 +315,11 @@ impl Default for UiConfig {
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
             file_manager: String::new(),
+            auto_continue: true,
+            terminal_mode_color: default_terminal_mode_color(),
+            app_mode_color: default_app_mode_color(),
+            mode_border: default_mode_border(),
+            dim_terminal_in_app_mode: true,
         }
     }
 }
@@ -351,6 +386,53 @@ pub struct UpdateConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         UpdateConfig { check: true }
+    }
+}
+
+/// Default relay endpoint for FlightDeck Remote: the stable custom domain
+/// (`relay.flightdeckai.app`, remote-control-edn) fronting the hosted relay on
+/// Azure Container Apps, so the URL survives any rename/recreate of the
+/// underlying Azure resources. Overridable in `config.toml` (or per-device in
+/// `~/.flightdeck/remote.json`). An empty `relay_url` is treated as "no relay
+/// configured" and disables the client even when `enabled = true`.
+fn default_relay_url() -> String {
+    "wss://relay.flightdeckai.app/ws".to_string()
+}
+
+/// `[remote]` config section: FlightDeck Remote, the phone <-> desktop link over
+/// a hosted relay. **Off by default** — the desktop opens no outbound connection
+/// and behaves bit-for-bit as before until `enabled = true`. When enabled, a
+/// background thread (see `src/remote/`) maintains one WebSocket to `relay_url`,
+/// authenticates with the per-device key, and reports link state to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Master switch for the relay client. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay WebSocket URL (`wss://…`, or `ws://…` for local dev). Empty means
+    /// "not configured" and keeps the client dormant even if `enabled`.
+    #[serde(default = "default_relay_url")]
+    pub relay_url: String,
+    /// Shared **relay password** (remote-control-uq7). Presented in the client
+    /// `hello`; the hosted relay gates admission on it (replacing the old IP
+    /// allowlist that blocked roaming phones). Empty means "no password" — the
+    /// client sends none, which suits a local/dev relay that has none configured.
+    /// The `FLIGHTDECK_RELAY_PASSWORD` **environment variable overrides this**
+    /// when set (see `src/remote/client.rs::effective_relay_password`), so a
+    /// deployment can inject the secret without writing it to `config.toml`. This
+    /// is a coarse network-admission secret shared by every client; it never
+    /// replaces the per-device pairing auth or the end-to-end crypto.
+    #[serde(default)]
+    pub relay_password: String,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        RemoteConfig {
+            enabled: false,
+            relay_url: default_relay_url(),
+            relay_password: String::new(),
+        }
     }
 }
 
@@ -488,6 +570,9 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// FlightDeck Remote (phone link). Absent table → disabled → no relay.
+    #[serde(default)]
+    pub remote: RemoteConfig,
     /// Container execution (SPECS §31). Absent table → disabled → local model.
     /// Accepts the legacy `[execution]` section name as a deprecated alias.
     #[serde(default, alias = "execution")]
@@ -528,6 +613,18 @@ pub struct TabState {
     /// The image the container was launched from, for provenance (SPECS §31).
     #[serde(default)]
     pub container_image: Option<String>,
+    /// Whether this tab runs directly on the base branch in the project root
+    /// (no dedicated worktree). Such a tab shares the repo root with FlightDeck
+    /// itself, so worktree-destructive ops (abandon/merge/rebase) are refused
+    /// and no `git worktree add`/`remove` is ever run for it.
+    #[serde(default)]
+    pub runs_on_base: bool,
+    /// Args to relaunch the agent so it resumes its previous session, captured
+    /// from the agent's on-exit resume hint (e.g. `["--resume", "<uuid>"]` for
+    /// Claude, `["resume", "<uuid>"]` for Codex). Empty = start fresh. Replayed
+    /// in place of the configured base args on resume/restart.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
 }
 
 fn default_last_known_status() -> String {
@@ -585,6 +682,19 @@ pub struct RebaseOutcome {
     pub conflicted: bool,
     /// Human-readable detail.
     pub message: String,
+}
+
+/// Outcome of running one hook command through the shell (SPECS §7 hooks).
+/// Combined stdout+stderr is captured (never inherited) so hook output can never
+/// corrupt the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutcome {
+    /// True if the command exited zero.
+    pub success: bool,
+    /// The exit code, if the process exited normally (None if killed by signal).
+    pub code: Option<i32>,
+    /// Combined stdout + stderr, captured (may be empty).
+    pub output: String,
 }
 
 /// Terminal dimensions for a PTY.

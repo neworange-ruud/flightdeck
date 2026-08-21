@@ -1,0 +1,266 @@
+//
+//  RealPairingServiceTests.swift
+//  FlightDeckRemoteTests
+//
+//  Drives `RealPairingService` against a scripted relay: the happy path
+//  (claim → claimed → auth → persisted `PairingRecord`) and rejection mapping
+//  to typed `PairingError`s (REMOTE_PROTOCOL §5.2).
+//
+
+import Testing
+import Foundation
+import CryptoKit
+@testable import FlightDeckRemote
+
+@Suite struct RealPairingServiceTests {
+
+    private func desktopKAPublicB64() -> String {
+        P256.KeyAgreement.PrivateKey().publicKey.x963Representation.base64EncodedString()
+    }
+
+    private func makeService(keychain: InMemoryKeychainStore, channel: ScriptedChannel) -> (RealPairingService, PairingRecordStore) {
+        let recordStore = PairingRecordStore(store: keychain)
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: recordStore,
+            identityStore: keychain,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5)
+        )
+        return (service, recordStore)
+    }
+
+    @Test func codePathHappyPathPersistsRecord() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let (service, recordStore) = makeService(keychain: keychain, channel: channel)
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_real_1"),
+            peerDeviceId: Wire.DeviceId("desk_1"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_real_1")]))
+
+        let relayURL = URL(string: "wss://relay.example/v1")!
+        let device = try await service.pair(with: .code("4729", relayURL: relayURL))
+
+        #expect(device.pairingId == "pair_real_1")
+        #expect(!device.peerName.isEmpty)
+
+        let record = try #require(try recordStore.load())
+        #expect(record.pairingId == "pair_real_1")
+        #expect(record.peerDeviceId == "desk_1")
+        #expect(record.peerKeyAgreementPublicKeyB64 == desktopKA)
+        #expect(record.relayURL == relayURL.absoluteString)
+        // Code path: salt is the claim-token (== the code) UTF-8 bytes.
+        #expect(record.salt == Data("4729".utf8))
+
+        // The wire frames the phone emitted: hello, pairing_claim, auth_response.
+        let sent = await channel.sentFrames()
+        #expect(sent.contains { if case .hello = $0 { return true }; return false })
+        let claim = try #require(sent.first { if case .pairingClaim = $0 { return true }; return false })
+        if case let .pairingClaim(token, _, devPub, kaPub, role) = claim {
+            #expect(token == "4729")
+            #expect(role == .phone)
+            #expect(devPub != kaPub) // identity key ≠ key-agreement key (§5.2)
+        }
+        #expect(sent.contains { if case .authResponse = $0 { return true }; return false })
+    }
+
+    /// Multi-pairing (remote-control-b8d.4): a successful `pair(with:)`
+    /// APPENDS a `PairedInstance` to the injected `PairingStore` — pairing
+    /// with a second Mac must not evict the first.
+    @Test func successfulPairAppendsToPairingStoreWithoutEvictingExisting() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        pairingStore.add(PairedInstance(pairingId: "pre-existing", relayURL: URL(string: "wss://relay.example/other")!))
+
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: recordStore,
+            identityStore: keychain,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5),
+            pairingStore: pairingStore
+        )
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_real_2"),
+            peerDeviceId: Wire.DeviceId("desk_2"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_real_2")]))
+
+        let relayURL = URL(string: "wss://relay.example/v1")!
+        _ = try await service.pair(with: .code("4729", relayURL: relayURL))
+
+        #expect(pairingStore.list.map(\.pairingId) == ["pre-existing", "pair_real_2"], "pairing appends rather than replacing what was already paired")
+        let appended = try #require(pairingStore.list.first { $0.pairingId == "pair_real_2" })
+        #expect(appended.relayURL == relayURL)
+        #expect(appended.lastKnownOnline == true)
+    }
+
+    @Test func qrPathAlsoUsesClaimTokenAsSalt() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let (service, recordStore) = makeService(keychain: keychain, channel: channel)
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_qr_1"),
+            peerDeviceId: Wire.DeviceId("desk_1"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_qr_1")]))
+
+        let secretBytes = Data((0..<32).map { UInt8($0) })
+        let payload = PairingQRPayload(
+            claimToken: "clm_abc",
+            pairingSecret: secretBytes.base64URLEncodedStringNoPadding(),
+            relayURL: URL(string: "wss://relay.example/v1")!)
+
+        _ = try await service.pair(with: .qr(payload))
+        let record = try #require(try recordStore.load())
+        // §7.1 reconciled contract: the salt is the claim-token UTF-8 bytes on
+        // BOTH paths; the QR pairing_secret is wire-compat only.
+        #expect(record.salt == Data("clm_abc".utf8))
+        #expect(record.salt != secretBytes)
+    }
+
+    // MARK: - Shared relay password (remote-control-uq7)
+
+    /// A captured relay password rides the pairing `hello` (pairing runs over
+    /// the relay) and is PERSISTED on success so later reconnects present it.
+    @Test func relayPasswordIsSentInHelloAndPersistedOnSuccess() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        let relayPasswordStore = RelayPasswordStore(store: keychain)
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: recordStore,
+            identityStore: keychain,
+            relayPasswordStore: relayPasswordStore,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5))
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_pw_1"),
+            peerDeviceId: Wire.DeviceId("desk_1"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_pw_1")]))
+
+        _ = try await service.pair(
+            with: .code("4729", relayURL: URL(string: "wss://relay.example/v1")!),
+            relayPassword: "  hunter2 ") // surrounding whitespace must be trimmed
+
+        let sent = await channel.sentFrames()
+        let hello = try #require(sent.first { if case .hello = $0 { return true }; return false })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == "hunter2")
+        // Persisted for reconnects.
+        #expect(relayPasswordStore.load() == "hunter2")
+    }
+
+    /// A blank/absent relay password (local/dev relay) presents NOTHING — the
+    /// hello omits `relay_password` — so an unconfigured relay is unaffected.
+    @Test func noRelayPasswordOmitsItFromHello() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let relayPasswordStore = RelayPasswordStore(store: keychain)
+        let service = RealPairingService(
+            connector: ScriptedConnector(channel: channel),
+            recordStore: PairingRecordStore(store: keychain),
+            identityStore: keychain,
+            relayPasswordStore: relayPasswordStore,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            timeout: .seconds(5))
+        let desktopKA = desktopKAPublicB64()
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.pairingClaimed(
+            pairingId: Wire.PairingId("pair_pw_2"),
+            peerDeviceId: Wire.DeviceId("desk_2"),
+            peerKeyAgreementPublicKey: desktopKA))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_pw_2")]))
+
+        // Blank string → treated as no password.
+        _ = try await service.pair(
+            with: .code("4729", relayURL: URL(string: "wss://relay.example/v1")!),
+            relayPassword: "   ")
+
+        let sent = await channel.sentFrames()
+        let hello = try #require(sent.first { if case .hello = $0 { return true }; return false })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == nil)
+        #expect(relayPasswordStore.load() == nil, "nothing persisted for a no-password relay")
+    }
+
+    @Test func codeRejectionMapsToInvalidCode() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let (service, _) = makeService(keychain: keychain, channel: channel)
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.error(code: .pairingClaimRejected, message: "bad token", pairingId: nil))
+
+        await #expect(throws: PairingError.self) {
+            _ = try await service.pair(with: .code("0000", relayURL: URL(string: "wss://relay.example/v1")!))
+        }
+    }
+
+    @Test func qrRejectionMapsToExpiredOrUsedToken() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let (service, _) = makeService(keychain: keychain, channel: channel)
+
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.error(code: .pairingClaimRejected, message: "expired", pairingId: nil))
+
+        let payload = PairingQRPayload(
+            claimToken: "clm_abc",
+            pairingSecret: Data((0..<32).map { UInt8($0) }).base64URLEncodedStringNoPadding(),
+            relayURL: URL(string: "wss://relay.example/v1")!)
+
+        do {
+            _ = try await service.pair(with: .qr(payload))
+            Issue.record("expected rejection")
+        } catch let error as PairingError {
+            #expect(error == .expiredOrUsedToken)
+        }
+    }
+
+    @Test func malformedQRIsRejectedBeforeAnyNetwork() async throws {
+        let keychain = InMemoryKeychainStore()
+        let channel = ScriptedChannel()
+        let (service, _) = makeService(keychain: keychain, channel: channel)
+        // Empty claim token → rejected during input resolution, no frames sent.
+        let payload = PairingQRPayload(claimToken: "", pairingSecret: "abc", relayURL: URL(string: "wss://relay.example/v1")!)
+        do {
+            _ = try await service.pair(with: .qr(payload))
+            Issue.record("expected malformed rejection")
+        } catch let error as PairingError {
+            #expect(error == .malformedQRPayload)
+        }
+        let sent = await channel.sentFrames()
+        #expect(sent.isEmpty)
+    }
+}

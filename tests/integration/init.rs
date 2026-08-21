@@ -10,7 +10,7 @@ use flightdeck::config::init::{ensure_global_config, initialize};
 use flightdeck::config::load::{load_layered_config, parse_config};
 use flightdeck::contracts::{FileSystem, RealFs};
 use flightdeck::fs::ignore::{
-    ensure_flightdeck_gitignore, STATE_IGNORE_ENTRY, STATUS_IGNORE_ENTRY,
+    ensure_flightdeck_gitignore, HOOKS_IGNORE_ENTRY, STATE_IGNORE_ENTRY, STATUS_IGNORE_ENTRY,
     STATUS_RUNTIME_IGNORE_ENTRY, WORKTREES_IGNORE_ENTRY,
 };
 use std::path::Path;
@@ -120,6 +120,7 @@ fn ensure_gitignore_adds_both_entries_and_is_idempotent() {
             WORKTREES_IGNORE_ENTRY,
             STATUS_IGNORE_ENTRY,
             STATUS_RUNTIME_IGNORE_ENTRY,
+            HOOKS_IGNORE_ENTRY,
         ]
     );
 
@@ -128,6 +129,7 @@ fn ensure_gitignore_adds_both_entries_and_is_idempotent() {
     assert!(contents.contains(WORKTREES_IGNORE_ENTRY));
     assert!(contents.contains(STATUS_IGNORE_ENTRY));
     assert!(contents.contains(STATUS_RUNTIME_IGNORE_ENTRY));
+    assert!(contents.contains(HOOKS_IGNORE_ENTRY));
     // Prior content preserved and still first.
     assert_eq!(contents.lines().next(), Some("/target"));
 

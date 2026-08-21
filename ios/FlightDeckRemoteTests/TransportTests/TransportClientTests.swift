@@ -1,0 +1,857 @@
+//
+//  TransportClientTests.swift
+//  FlightDeckRemoteTests
+//
+//  Drives the `TransportClient` state machine against a scripted WebSocket:
+//  the full happy path (hello → auth → resume → snapshot), auth-signature
+//  validity, resume cursor, inbound dedup + cumulative ack, outbound seal +
+//  gapless seq, and delivery-honesty (ack vs. timeout).
+//
+
+import Testing
+import Foundation
+import CryptoKit
+@testable import FlightDeckRemote
+
+@Suite struct TransportClientTests {
+
+    // MARK: - Builders
+
+    private func makeClient(
+        keychain: InMemoryKeychainStore,
+        peer: DesktopPeer,
+        keyAgreement: KeyAgreementKeys,
+        channel: ScriptedChannel,
+        collector: EventCollector,
+        config: TransportClient.Config
+    ) throws -> TransportClient {
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let connector = ScriptedConnector(channel: channel)
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: keyAgreement,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        return client
+    }
+
+    private func verifySignature(_ frame: Wire.RelayFrame, identityPublicKeyB64: String, nonceB64: String) -> Bool {
+        guard case let .authResponse(_, signature, _) = frame,
+              let pub = Data(base64Encoded: identityPublicKeyB64),
+              let sig = Data(base64Encoded: signature),
+              let nonce = Data(base64Encoded: nonceB64),
+              let key = try? P256.Signing.PublicKey(x963Representation: pub),
+              let ecdsa = try? P256.Signing.ECDSASignature(rawRepresentation: sig)
+        else { return false }
+        return key.isValidSignature(ecdsa, for: nonce)
+    }
+
+    /// Push the scripted handshake and wait until the client reaches `.live`.
+    private func handshake(_ channel: ScriptedChannel, client: TransportClient, nonceB64: String) async {
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c1"))
+        await channel.push(.authChallenge(nonce: nonceB64, serverTimeMs: 1))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_test_1")]))
+        _ = await waitUntil { if case .connected = await client.currentLinkState() { return true }; return false }
+    }
+
+    // MARK: - Happy path
+
+    @Test func fullHappyPathHandshakeResumeAndSnapshot() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        // resume + request_snapshot were sent after auth_ok.
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+        }
+        let sent = await channel.sentFrames()
+
+        // Frame order: hello, auth_response, resume, envelope(request_snapshot).
+        #expect({ if case .hello = sent.first { return true }; return false }())
+        let authResp = try #require(sent.first { if case .authResponse = $0 { return true }; return false })
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        #expect(verifySignature(authResp, identityPublicKeyB64: identity.publicKeyBase64, nonceB64: nonce))
+
+        let resume = try #require(sent.first { if case .resume = $0 { return true }; return false })
+        if case let .resume(pairingId, fromSeq) = resume {
+            #expect(pairingId.rawValue == "pair_test_1")
+            #expect(fromSeq == 0)
+        }
+
+        // The request_snapshot rides an outbound envelope at gapless seq 1.
+        let snapEnvelope = try #require(sent.compactMap { frame -> Wire.EncryptedEnvelope? in
+            if case let .envelope(e) = frame { return e }; return nil
+        }.first)
+        #expect(snapEnvelope.seq == 1)
+        #expect(snapEnvelope.sender == .phone)
+        let decoded = try peer.openCommand(snapEnvelope)
+        if case .requestSnapshot = decoded.body { } else { Issue.record("expected request_snapshot") }
+
+        // Desktop replies with a snapshot at inbound seq 1 → folded + acked.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await channel.push(peer.envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntil { collector.messages.contains { if case .snapshot = $0 { return true }; return false } }
+
+        #expect(collector.messages.contains { if case .snapshot = $0 { return true }; return false })
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case let .ack(_, cursor) = $0 { return cursor == 1 }; return false }
+        }
+        let acks = await channel.sentFrames().compactMap { frame -> UInt64? in
+            if case let .ack(_, cursor) = frame { return cursor }; return nil
+        }
+        #expect(acks.contains(1))
+
+        await client.stop()
+    }
+
+    // MARK: - Shared relay password in hello (remote-control-uq7)
+
+    /// On every connect the client presents the stored shared relay password in
+    /// its `hello` (re-read via the injected provider). Nil (local/dev relay)
+    /// omits it — covered by the codec tests; here we assert the value flows
+    /// from the provider into the frame the transport sends.
+    @Test func helloCarriesTheStoredRelayPassword() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            relayPassword: { "hunter2" },
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 })
+        let collector = EventCollector()
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let hello = try #require(await channel.sentFrames().first {
+            if case .hello = $0 { return true }; return false
+        })
+        guard case let .hello(_, _, _, _, relayPassword) = hello else {
+            Issue.record("expected .hello"); return
+        }
+        #expect(relayPassword == "hunter2")
+
+        await client.stop()
+    }
+
+    // MARK: - Unpair / revoke (§5.8, remote-control-b8d.11)
+
+    @Test func revokePairingSendsRevokeFrameWhenLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let sent = await client.revokePairing()
+        #expect(sent == true)
+
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .revoke = $0 { return true }; return false }
+        }
+        let revoke = try #require(await channel.sentFrames().first {
+            if case .revoke = $0 { return true }; return false
+        })
+        if case let .revoke(pairingId) = revoke {
+            #expect(pairingId == Wire.PairingId("pair_test_1"))
+        }
+        await client.stop()
+    }
+
+    @Test func revokePairingIsNoOpWhenNotLive() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector,
+                                    config: TransportClient.Config())
+        await client.setEventHandler(collector.handler)
+        // Never started / never reached auth_ok → relay effectively unreachable.
+
+        let sent = await client.revokePairing()
+        #expect(sent == false, "no live session → best-effort revoke sends nothing")
+        #expect(await channel.sentFrames().isEmpty)
+    }
+
+    // MARK: - Resume cursor
+
+    @Test func resumeUsesPersistedInboundCursor() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain, lastReceivedSeq: 7)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+        }
+        let resume = try #require(await channel.sentFrames().first { if case .resume = $0 { return true }; return false })
+        if case let .resume(_, fromSeq) = resume { #expect(fromSeq == 7) }
+        await client.stop()
+    }
+
+    // MARK: - Dedup
+
+    @Test func inboundDedupIgnoresReplayedSeq() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let event = Wire.AgentEvent(
+            eventId: Wire.EventId("evt1"),
+            kind: .needsInput(preview: "?"),
+            deepLink: Wire.DeepLink(projectId: Wire.ProjectId("p"), sessionId: Wire.SessionId("s"), itemId: nil),
+            occurredAtMs: 1,
+            title: "t"
+        )
+        // First delivery at seq 5 is accepted; two replays are ignored.
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 5))
+        _ = await waitUntil { collector.messages.count == 1 }
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 5))
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 3))
+        // Give the client a beat to (not) process the replays.
+        try? await Task.sleep(for: .milliseconds(150))
+
+        #expect(collector.messages.count == 1)
+        let acks = await channel.sentFrames().compactMap { frame -> UInt64? in
+            if case let .ack(_, cursor) = frame { return cursor }; return nil
+        }
+        #expect(acks == [5]) // exactly one ack, for the one accepted envelope
+        await client.stop()
+    }
+
+    // MARK: - Delivery honesty
+
+    @Test func deliveryTimesOutToFailedWithoutAck() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .milliseconds(150)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let id = Wire.CommandId("cmd_reply_1")
+        let command = Wire.PhoneCommand(commandId: id, issuedAtMs: 1, body: .reply(sessionId: Wire.SessionId("s"), text: "hi"))
+        await client.send(command)
+
+        _ = await waitUntil { collector.deliveries(for: id).contains(.failed(reason: "timed out")) }
+        let states = collector.deliveries(for: id)
+        #expect(states.first == .sending)
+        #expect(states.contains(.failed(reason: "timed out")))
+
+        // The outbound envelope was sealed at gapless seq 1 and decodes back.
+        let env = try #require(await channel.sentFrames().compactMap { frame -> Wire.EncryptedEnvelope? in
+            if case let .envelope(e) = frame { return e }; return nil
+        }.first)
+        #expect(env.seq == 1)
+        let decoded = try peer.openCommand(env)
+        #expect(decoded.commandId == id)
+        await client.stop()
+    }
+
+    @Test func deliveryResolvesToDeliveredOnCommandAck() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .seconds(30)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        let id = Wire.CommandId("cmd_reply_2")
+        let command = Wire.PhoneCommand(commandId: id, issuedAtMs: 1, body: .reply(sessionId: Wire.SessionId("s"), text: "go"))
+        await client.send(command)
+        _ = await waitUntil { collector.deliveries(for: id).contains(.sending) }
+
+        let ack = Wire.CommandAck(commandId: id, outcome: .applied, message: nil)
+        try await channel.push(peer.envelopeFrame(.commandAck(ack), seq: 1))
+
+        _ = await waitUntil { collector.deliveries(for: id).contains(.delivered(.applied)) }
+        #expect(collector.deliveries(for: id).contains(.delivered(.applied)))
+        await client.stop()
+    }
+
+    // MARK: - Relay-restart seq recovery (remote-control-bbf)
+
+    /// The relay lost its per-pairing seq state (restart/redeploy) and the desktop
+    /// restarts its outbound stream from seq 1. The phone already holds a higher
+    /// receive cursor, but must accept the reset instead of dropping seq 1 as a
+    /// duplicate — otherwise the recovered agent feed never reaches the screen.
+    @Test func acceptsDesktopStreamResetAfterRelayRestart() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain, lastReceivedSeq: 5)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Desktop restarts its stream from seq 1 while our cursor is 5.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await channel.push(peer.envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntil { collector.messages.contains { if case .snapshot = $0 { return true }; return false } }
+        #expect(collector.messages.contains { if case .snapshot = $0 { return true }; return false })
+
+        // The following seq 2 continues normally — proving the cursor reset to 1.
+        let event = Wire.AgentEvent(
+            eventId: Wire.EventId("e1"),
+            kind: .finished(summary: "done", filesChanged: 0, readyToPush: false),
+            deepLink: Wire.DeepLink(projectId: Wire.ProjectId("p"), sessionId: Wire.SessionId("s"), itemId: nil),
+            occurredAtMs: 1,
+            title: "t"
+        )
+        try await channel.push(peer.envelopeFrame(.event(event), seq: 2))
+        _ = await waitUntil { collector.messages.count == 2 }
+        #expect(collector.messages.count == 2)
+
+        // It acked the reset stream at cursor 1.
+        let acks = await channel.sentFrames().compactMap { f -> UInt64? in
+            if case let .ack(_, c) = f { return c }; return nil
+        }
+        #expect(acks.contains(1))
+        await client.stop()
+    }
+
+    /// A `seq_violation` advisory means the phone's INBOUND cursor is stale. The
+    /// client must not tear the link down; it drops `lastReceivedSeq`, re-resumes
+    /// from 0, and leaves its OUTBOUND stream counting up.
+    ///
+    /// Rewinding `lastSentSeq` here is the reported P0 (remote-control-arg /
+    /// -h1y): against a relay that persists its watermark at 60, restarting at
+    /// seq 1 is rejected, which drives another rewind to 1, at reconnect speed,
+    /// forever — while inbound keeps working, so it looks like a connectivity
+    /// flap rather than every outbound command dying.
+    @Test func seqViolationResyncsInboundAndLeavesTheOutboundStreamAlone() async throws {
+        let keychain = InMemoryKeychainStore()
+        // A non-zero INBOUND cursor too, so "dropped it and re-resumed from 0" is
+        // distinguishable from the ordinary post-`auth_ok` resume.
+        let (peer, ka) = try TransportFixtures.makePeer(
+            keychain: keychain,
+            lastReceivedSeq: 40,
+            lastSentSeq: 5
+        )
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        config.commandTimeout = .seconds(30)
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // First command goes out at seq 6 (persisted lastSentSeq 5).
+        let id1 = Wire.CommandId("cmd_1")
+        await client.send(Wire.PhoneCommand(commandId: id1, issuedAtMs: 1,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "a")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 6 }; return false
+            }
+        }
+        try await channel.push(.error(code: .seqViolation,
+                                      message: "peer restarted its stream; drop your inbound cursor",
+                                      pairingId: Wire.PairingId("pair_test_1")))
+
+        // The INBOUND cursor is dropped and the link stays up.
+        _ = await waitUntil { (try? recordStore.load())?.lastReceivedSeq == 0 }
+        #expect((try? recordStore.load())?.lastReceivedSeq == 0)
+        #expect(await client.currentLinkState() != .disconnected)
+
+        // It re-resumes from 0 to pull whatever the relay still holds.
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .resume(_, from) = $0 { return from == 0 }; return false
+            }
+        }
+        let reResumed = await channel.sentFrames().contains {
+            if case let .resume(_, from) = $0 { return from == 0 }; return false
+        }
+        #expect(reResumed, "a resync must re-resume from scratch")
+
+        // The OUTBOUND cursor was never touched: the next command is seq 7, not a
+        // restart at 1. A regression here is the livelock.
+        #expect((try? recordStore.load())?.lastSentSeq == 6)
+        let id2 = Wire.CommandId("cmd_2")
+        await client.send(Wire.PhoneCommand(commandId: id2, issuedAtMs: 2,
+                                            body: .reply(sessionId: Wire.SessionId("s"), text: "b")))
+        _ = await waitUntil {
+            await channel.sentFrames().contains {
+                if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 7 }; return false
+            }
+        }
+        let continued = await channel.sentFrames().contains {
+            if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 7 }; return false
+        }
+        #expect(continued, "the outbound stream must keep counting up, never restart at 1")
+        let restarted = await channel.sentFrames().contains {
+            if case let .envelope(e) = $0 { return e.sender == .phone && e.seq == 1 }; return false
+        }
+        #expect(!restarted, "renumbering the outbound stream is what livelocked it")
+        await client.stop()
+    }
+
+    // MARK: - Desktop presence returns → re-request snapshot (remote-control-0ef.19)
+
+    /// The desktop was absent when the phone authenticated, so its post-`auth_ok`
+    /// snapshot request went unanswered. When the desktop later returns
+    /// (`peer_presence` → connected) the client must re-issue resume +
+    /// request_snapshot, otherwise the UI stays stale on deltas alone.
+    @Test func desktopReturningReissuesResumeAndSnapshot() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Post-auth resume + request_snapshot went out once.
+        _ = await waitUntil {
+            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+        }
+        func resumeCount() async -> Int {
+            await channel.sentFrames().filter { if case .resume = $0 { return true }; return false }.count
+        }
+        // request_snapshot rides an outbound phone envelope; no other command is
+        // sent in this test, so phone-envelope count == request_snapshot count.
+        func snapshotRequestCount() async -> Int {
+            await channel.sentFrames().filter {
+                if case let .envelope(e) = $0 { return e.sender == .phone }; return false
+            }.count
+        }
+        let resumesAfterAuth = await resumeCount()
+        let snapshotsAfterAuth = await snapshotRequestCount()
+        #expect(resumesAfterAuth == 1)
+        #expect(snapshotsAfterAuth == 1)
+
+        // Desktop drops, then returns.
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .disconnected, atMs: 1))
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .connected, atMs: 2))
+
+        // A fresh resume + request_snapshot is issued on the return.
+        _ = await waitUntil { await resumeCount() == resumesAfterAuth + 1 }
+        #expect(await resumeCount() == resumesAfterAuth + 1)
+        #expect(await snapshotRequestCount() == snapshotsAfterAuth + 1)
+
+        // A redundant second `connected` presence does NOT re-fire (only the
+        // offline→online transition does).
+        await channel.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                         peer: .desktop, state: .connected, atMs: 3))
+        // Marker pong to prove the presence frame ahead of it was processed.
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+        #expect(await resumeCount() == resumesAfterAuth + 1)
+        #expect(await snapshotRequestCount() == snapshotsAfterAuth + 1)
+
+        await client.stop()
+    }
+
+    // MARK: - Peer presence is per-session state (remote-control-e9l)
+
+    /// A session that ended with the desktop marked ABSENT must not poison the
+    /// next session: `peerConnected` is per-session knowledge, and carrying a
+    /// stale `false` across a reconnect made the post-`auth_ok`
+    /// `request_snapshot` fail fast as "peer unavailable". The desktop was then
+    /// never asked for a snapshot, and since a `status_update` can only change
+    /// sessions the phone already knows — never add or remove one — the phone
+    /// kept showing a stale session list.
+    @Test func aNewSessionDoesNotInheritTheLastSessionsAbsentPeer() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        // Left ON: the post-auth request_snapshot is exactly what we're asserting.
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // Session 1 goes live, then the desktop is announced ABSENT.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+        await client.registerPushToken("tok", environment: .sandbox) // marker traffic
+        await first.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                       peer: .desktop, state: .disconnected, atMs: 1))
+        _ = await waitUntil {
+            collector.events.contains {
+                if case let .presence(p, connected) = $0 { return p == .desktop && !connected }
+                return false
+            }
+        }
+
+        // Reconnect into session 2.
+        await client.reconnectNow()
+        _ = await waitUntil { connector.channels.count >= 2 }
+        let second = connector.channels[1]
+        await handshake(second, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // The fresh session must issue its post-auth request_snapshot (a phone
+        // envelope) — it must NOT be suppressed by the previous session's
+        // "desktop absent" belief.
+        func phoneEnvelopes(_ channel: ScriptedChannel) async -> Int {
+            await channel.sentFrames().filter {
+                if case let .envelope(e) = $0 { return e.sender == .phone }; return false
+            }.count
+        }
+        _ = await waitUntil { await phoneEnvelopes(second) >= 1 }
+        #expect(await phoneEnvelopes(second) >= 1,
+                "a new session must send its request_snapshot, not inherit 'peer unavailable'")
+
+        await client.stop()
+    }
+
+    /// The mirror case: a stale `true` made the desktop's return look like "no
+    /// change" and skipped the compensating resume+snapshot re-issue. In a fresh
+    /// session, peer presence is unknown, so the first `connected` frame IS a
+    /// transition and does re-issue.
+    @Test func aConnectedPresenceInAFreshSessionCountsAsATransition() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // Session 1: the desktop is present.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+        await first.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                       peer: .desktop, state: .connected, atMs: 1))
+        _ = await waitUntil {
+            collector.events.contains {
+                if case let .presence(p, connected) = $0 { return p == .desktop && connected }
+                return false
+            }
+        }
+
+        // Session 2: the relay announces the desktop present again (this is what
+        // a supersede-reattach looks like). It must be treated as a transition.
+        await client.reconnectNow()
+        _ = await waitUntil { connector.channels.count >= 2 }
+        let second = connector.channels[1]
+        await handshake(second, client: client, nonceB64: TransportFixtures.nonceB64())
+        func resumeCount() async -> Int {
+            await second.sentFrames().filter { if case .resume = $0 { return true }; return false }.count
+        }
+        _ = await waitUntil { await resumeCount() >= 1 }
+        let afterAuth = await resumeCount()
+
+        await second.push(.peerPresence(pairingId: Wire.PairingId("pair_test_1"),
+                                        peer: .desktop, state: .connected, atMs: 2))
+        _ = await waitUntil { await resumeCount() > afterAuth }
+        #expect(await resumeCount() > afterAuth,
+                "a fresh session's first `connected` frame must re-issue resume+snapshot")
+
+        await client.stop()
+    }
+
+    // MARK: - Retry now: force an immediate reconnect (remote-control-0ef.21)
+
+    /// `reconnectNow()` must drop the current (possibly silently-dead) socket
+    /// and reconnect immediately — resetting the backoff so the user isn't stuck
+    /// waiting out a long delay. Observed via a fresh channel per connect.
+    @Test func reconnectNowClosesTheSocketAndForcesAFreshConnect() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        config.requestSnapshotOnResume = false
+        let recordStore = PairingRecordStore(store: keychain)
+        try recordStore.save(peer.record)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        // A fresh scripted channel per connect, so a reconnect is observable as a
+        // second channel.
+        let connector = ScriptedConnector(factory: { ScriptedChannel() })
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: recordStore,
+            connector: connector,
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            config: config,
+            jitter: { 0 },
+            now: { 1_752_000_100_000 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+
+        // First socket goes live.
+        _ = await waitUntil { connector.channels.count >= 1 }
+        let first = connector.channels[0]
+        await handshake(first, client: client, nonceB64: TransportFixtures.nonceB64())
+
+        // Force a reconnect.
+        await client.reconnectNow()
+
+        // The live socket is closed and a second connect happens immediately.
+        _ = await waitUntil { await first.isClosed() }
+        #expect(await first.isClosed())
+        _ = await waitUntil { connector.channels.count >= 2 }
+        #expect(connector.channels.count >= 2)
+
+        await client.stop()
+    }
+
+    @Test func reconnectNowIsANoOpWithoutARunningSupervisor() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector,
+                                    config: TransportClient.Config())
+        await client.setEventHandler(collector.handler)
+        // Never started → no supervisor → nothing to reconnect, nothing sent.
+        await client.reconnectNow()
+        #expect(await channel.sentFrames().isEmpty)
+        #expect(await client.currentLinkState() == .disconnected)
+    }
+
+    // MARK: - No pairing → stays disconnected
+
+    @Test func withNoPairingRecordStaysDisconnected() async throws {
+        let keychain = InMemoryKeychainStore()
+        let ka = try KeyAgreementKeys.loadOrCreate(store: keychain)
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        let client = TransportClient(
+            identity: identity,
+            keyAgreement: ka,
+            recordStore: PairingRecordStore(store: keychain),
+            connector: ScriptedConnector(channel: channel),
+            clientInfo: Wire.ClientInfo(appVersion: "test", platform: "ios", osVersion: nil),
+            jitter: { 0 }
+        )
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        try? await Task.sleep(for: .milliseconds(100))
+        let state = await client.currentLinkState()
+        #expect(state == .disconnected)
+        let sent = await channel.sentFrames()
+        #expect(sent.isEmpty)
+        await client.stop()
+    }
+
+    // MARK: - Machine name (REMOTE_PROTOCOL §5.7, remote-control-b8d.9)
+
+    @Test func machineNameFrameEmitsSanitizedEventForOurPairing() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        await channel.push(.machineName(
+            pairingId: Wire.PairingId("pair_test_1"),
+            machineName: "  Ruud's MacBook Pro  "))
+        _ = await waitUntil { collector.machineNames.contains("Ruud's MacBook Pro") }
+
+        #expect(collector.machineNames == ["Ruud's MacBook Pro"])
+        await client.stop()
+    }
+
+    @Test func machineNameFrameForADifferentPairingIsIgnored() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        // This client is bound to "pair_test_1" (via its loaded record) — a
+        // frame announced for some OTHER pairing must never leak in.
+        await channel.push(.machineName(pairingId: Wire.PairingId("some_other_pairing"), machineName: "Not Ours"))
+        // Follow with a pong carrying a NON-zero round trip (500ms earlier
+        // than the fixed `now: { 1_752_000_100_000 }` clock) so its distinct
+        // `.connected(latencyMs: 500)` state is a reliable "the frame ahead
+        // of me in this single actor's serial receive loop has already been
+        // handled" signal, without depending on wall-clock sleeps.
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+
+        #expect(collector.machineNames.isEmpty)
+        await client.stop()
+    }
+
+    @Test func machineNameFrameIsBoundedToSixtyFourCharacters() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        let longName = String(repeating: "x", count: 100)
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: longName))
+        _ = await waitUntil { !collector.machineNames.isEmpty }
+
+        #expect(collector.machineNames.first?.count == 64)
+        #expect(collector.machineNames.first == String(repeating: "x", count: 64))
+        await client.stop()
+    }
+
+    @Test func machineNameFrameThatIsAllWhitespaceIsDropped() async throws {
+        let keychain = InMemoryKeychainStore()
+        let (peer, ka) = try TransportFixtures.makePeer(keychain: keychain)
+        let channel = ScriptedChannel()
+        let collector = EventCollector()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let client = try makeClient(keychain: keychain, peer: peer, keyAgreement: ka,
+                                    channel: channel, collector: collector, config: config)
+        await client.setEventHandler(collector.handler)
+        await client.start()
+        let nonce = TransportFixtures.nonceB64()
+        await handshake(channel, client: client, nonceB64: nonce)
+
+        await channel.push(.machineName(pairingId: Wire.PairingId("pair_test_1"), machineName: "   "))
+        await channel.push(.pong(clientTimeMs: 1_752_000_099_500, serverTimeMs: 1))
+        _ = await waitUntil { await client.currentLinkState() == .connected(latencyMs: 500) }
+
+        #expect(collector.machineNames.isEmpty)
+        await client.stop()
+    }
+}

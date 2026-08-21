@@ -4,11 +4,13 @@
 //! The non-trivial real implementations live with their owning modules:
 //! `GitExecutor` → [`crate::git`], `PtyBackend` → [`crate::terminal`].
 
+use crate::contracts::domain::CommandOutcome;
 use crate::contracts::error::{FlightDeckError, Result};
-use crate::contracts::traits::{Clock, FileSystem};
+use crate::contracts::traits::{Clock, CommandRunner, FileSystem};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `std::fs`-backed [`FileSystem`].
@@ -33,7 +35,23 @@ impl FileSystem for RealFs {
     }
 
     fn write(&self, p: &Path, contents: &str) -> Result<()> {
-        fs::write(p, contents).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
+        // Atomic full-file write: stage into a sibling temp file, then rename it
+        // over the destination. `rename` is atomic on POSIX and Windows, so a
+        // crash/kill during the write leaves the destination either fully intact
+        // (old) or fully replaced (new) — never truncated. This protects
+        // `state.json` from corruption on an abrupt shutdown mid-write.
+        let tmp = atomic_temp_path(p);
+        let staged = fs::write(&tmp, contents)
+            .map_err(|e| FlightDeckError::Io(format!("{}: {e}", tmp.display())));
+        if let Err(e) = staged {
+            // Best-effort cleanup of a partial temp; leave the destination alone.
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, p).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            FlightDeckError::Io(format!("{}: {e}", p.display()))
+        })
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
@@ -116,6 +134,63 @@ fn remove_dir_all_resilient(p: &Path) -> Result<()> {
     fs::remove_dir_all(p).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
 }
 
+/// The sibling temp path used for an atomic write of `p`: same directory (so the
+/// final `rename` stays on one filesystem and is atomic), hidden, distinctive.
+fn atomic_temp_path(p: &Path) -> PathBuf {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "tmp".to_string());
+    p.with_file_name(format!(".{name}.fdtmp"))
+}
+
+/// Shells out through the platform shell to run repository hook commands
+/// (SPECS §7 hooks). A stateless unit struct so it is trivially `Clone`/`Copy`
+/// and can be constructed wherever a worktree job needs one (including the
+/// background worktree worker).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome> {
+        // Unix: `sh -c <script>`; Windows: `cmd /C <script>`. The whole script is
+        // passed as a single argument so a multi-line (triple-quoted TOML) command
+        // runs as one shell script.
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(script);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        };
+
+        let output = cmd
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| FlightDeckError::Io(format!("failed to run hook command: {e}")))?;
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+
+        Ok(CommandOutcome {
+            success: output.status.success(),
+            code: output.status.code(),
+            output: combined,
+        })
+    }
+}
+
 /// System-clock-backed [`Clock`] producing UTC ISO-8601 timestamps.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealClock;
@@ -170,6 +245,45 @@ fn format_iso8601_utc(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_is_atomic_and_preserves_destination_when_temp_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.json");
+        let fs = RealFs;
+        fs.write(&dest, "OLD").unwrap();
+
+        // Sabotage the temp step: occupy the temp path with a directory so the
+        // temp write cannot succeed. An atomic write must fail without touching
+        // the existing destination; a naive truncate-in-place write would lose
+        // "OLD".
+        std::fs::create_dir(atomic_temp_path(&dest)).unwrap();
+
+        let result = fs.write(&dest, "NEW");
+        assert!(
+            result.is_err(),
+            "write should fail when the temp step fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "OLD",
+            "destination must be preserved when the write fails"
+        );
+    }
+
+    #[test]
+    fn write_replaces_content_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.json");
+        let fs = RealFs;
+        fs.write(&dest, "first").unwrap();
+        fs.write(&dest, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "second");
+        assert!(
+            !atomic_temp_path(&dest).exists(),
+            "no temp file should remain after a successful write"
+        );
+    }
 
     #[test]
     fn formats_unix_epoch() {

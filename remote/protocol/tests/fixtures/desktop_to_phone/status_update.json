@@ -1,0 +1,24 @@
+{
+  "type": "status_update",
+  "updates": [
+    {
+      "session_id": "sess_fix_login",
+      "project_id": "proj_flightdeck",
+      "status": {
+        "state": "idle"
+      },
+      "running_time_secs": 540,
+      "pending_question": null
+    },
+    {
+      "session_id": "sess_add_tests",
+      "project_id": "proj_flightdeck",
+      "status": {
+        "state": "manual",
+        "label": "reviewing by hand"
+      },
+      "running_time_secs": null,
+      "pending_question": null
+    }
+  ]
+}

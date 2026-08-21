@@ -1,0 +1,17 @@
+{
+  "type": "event",
+  "event_id": "evt_7788",
+  "kind": {
+    "type": "finished",
+    "summary": "18 files changed · ready to push",
+    "files_changed": 18,
+    "ready_to_push": true
+  },
+  "deep_link": {
+    "project_id": "proj_flightdeck",
+    "session_id": "sess_add_tests",
+    "item_id": "item_0042"
+  },
+  "occurred_at_ms": 1752412800000,
+  "title": "add-tests finished its turn"
+}

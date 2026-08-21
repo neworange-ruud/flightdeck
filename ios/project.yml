@@ -1,0 +1,194 @@
+name: FlightDeckRemote
+options:
+  bundleIdPrefix: agency.neworange.flightdeck
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    TARGETED_DEVICE_FAMILY: "1" # iPhone only, v1
+    SWIFT_VERSION: "5.0" # see ios/README.md "Swift language mode" note
+    SUPPORTS_MACCATALYST: NO
+    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    ENABLE_PREVIEWS: YES
+    # DotTech Holding B.V. — the team that owns the
+    # agency.neworange.flightdeck.remote bundle id and the APNs auth key the
+    # relay signs with. A team id is not a secret (it ships inside every signed
+    # binary), so it is committed to keep archive builds reproducible on any
+    # machine or CI runner. Automatic signing lets Xcode mint the development or
+    # distribution certificate + profile it needs per configuration.
+    DEVELOPMENT_TEAM: "7NKCS4AZS9"
+    CODE_SIGN_STYLE: Automatic
+    # Signing is left ENABLED here so `xcodebuild archive` produces a signed,
+    # uploadable app. The simulator test/build path opts out explicitly on the
+    # command line instead (`CODE_SIGNING_ALLOWED=NO`, see scripts/test.sh and
+    # the CI job), which keeps that path working without a certificate.
+    CODE_SIGNING_ALLOWED: YES
+
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: 1.14.0
+
+targets:
+  FlightDeckRemote:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemote
+        excludes:
+          - "Info.plist"
+          - "FlightDeckRemote.entitlements"
+          - "FlightDeckRemote-Release.entitlements"
+    info:
+      path: FlightDeckRemote/Info.plist
+      properties:
+        CFBundleDisplayName: "FlightDeck Remote"
+        # Marketing version tracks the FlightDeck release train (Cargo.toml's
+        # `version`); `scripts/release` rewrites both together so the phone and
+        # the desktop never claim different versions. Surfaced in Settings →
+        # About.
+        CFBundleShortVersionString: "1.14.0"
+        # Build number. Must strictly increase on EVERY App Store Connect
+        # upload, independently of the marketing version — reusing one is
+        # rejected.
+        #
+        # This MUST stay a `$(...)` reference rather than a literal. A literal
+        # here is baked straight into the Info.plist, and no build setting —
+        # command line, xcconfig or otherwise — can then override it: passing
+        # `CURRENT_PROJECT_VERSION=99` silently produced a build still numbered
+        # 1, so CI could only ever upload the same number. The default lives in
+        # the target's CURRENT_PROJECT_VERSION below, which `scripts/release`
+        # resets and CI overrides per run.
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Export compliance (App Store Connect asks on every upload until this
+        # is declared). All cryptography in the app is Apple's own CryptoKit
+        # (X25519, HKDF-SHA256, ChaCha20-Poly1305) — no proprietary or
+        # non-standard algorithms — which falls under the exemption for apps
+        # using only encryption provided by the operating system.
+        ITSAppUsesNonExemptEncryption: false
+        # Hosted relay endpoint (remote-control-2mk). Committed here so the relay
+        # address is a one-line plist edit, not a Swift source change. Read at
+        # runtime via PairingDefaults.relayURL (Bundle.main). Points at the stable
+        # custom domain (remote-control-edn) fronting the Azure Container Apps
+        # relay, so it survives any rename/recreate of the Azure resources.
+        FlightDeckRelayURL: "wss://relay.flightdeckai.app/ws"
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        # Wake the app on a silent APNs push to reconnect + resume queued events
+        # (spec §11); the relay's push is content-available (zero-knowledge).
+        UIBackgroundModes:
+          - remote-notification
+        # No `~ipad` variant: the app is iPhone-only (see the target's
+        # TARGETED_DEVICE_FAMILY). Declaring iPad orientations while omitting
+        # UIInterfaceOrientationPortraitUpsideDown is what App Store Connect
+        # rejects as ITMS-90474 — iPad multitasking requires all four.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          # Permit ws:// to localhost / 127.0.0.1 for local relay dev and the
+          # transport integration test. Does not relax ATS for any real host.
+          NSAllowsLocalNetworking: true
+        NSFaceIDUsageDescription: "Unlock FlightDeck Remote"
+        NSCameraUsageDescription: "FlightDeck Remote uses the camera to scan the pairing QR code shown on your Mac."
+        NSMicrophoneUsageDescription: "FlightDeck Remote uses the microphone so you can reply to agents by voice."
+        NSSpeechRecognitionUsageDescription: "FlightDeck Remote uses speech recognition to turn your voice into a reply you can review before sending."
+        UIAppFonts:
+          - Geist-Regular.ttf
+          - Geist-Medium.ttf
+          - Geist-SemiBold.ttf
+          - Geist-Bold.ttf
+          - GeistMono-Regular.ttf
+          - GeistMono-Medium.ttf
+        CFBundleURLTypes:
+          - CFBundleURLName: agency.neworange.flightdeck.remote
+            CFBundleURLSchemes:
+              - flightdeck-remote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote
+        # iPhone only, v1. This has to be repeated here even though the project's
+        # `settings.base` sets it: XcodeGen gives every iOS target a default of
+        # "1,2", and a target-level setting beats a project-level one — so the
+        # project-wide value alone was silently ineffective and the app shipped
+        # declaring UIDeviceFamily [1, 2]. That pulled it into Apple's iPad
+        # multitasking rules and got uploads rejected with ITMS-90474.
+        TARGETED_DEVICE_FAMILY: "1"
+        # Backs CFBundleVersion (see the info.properties comment). `scripts/release`
+        # resets this to 1 on a version bump; the TestFlight workflow overrides it
+        # per run so every upload gets a fresh, strictly increasing number.
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_EMIT_LOC_STRINGS: YES
+      # APNs entitlement (aps-environment), per configuration. It must MATCH the
+      # environment the signing profile grants — development profiles grant
+      # `development`, App Store / TestFlight distribution profiles grant
+      # `production` — so Debug and Release cannot share one file. Only consumed
+      # by the codesign step, which is skipped under CODE_SIGNING_ALLOWED=NO, so
+      # the unsigned simulator build is unaffected either way.
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: FlightDeckRemote/FlightDeckRemote-Release.entitlements
+          # Release signs MANUALLY against an explicitly managed App Store
+          # profile. Automatic ("cloud") signing needs either an Apple Account in
+          # Xcode — CI has none — or an API key with the Admin role; with a
+          # lesser key it fails as `Cloud signing permission error` after
+          # silently archiving with the *development* identity.
+          #
+          # These live on the app target rather than on the command line because
+          # command-line build settings apply to EVERY target, including
+          # SwiftTerm's SwiftPM resource bundle, which then fails with "Signing
+          # for SwiftTerm_SwiftTerm requires a development team". Debug is left
+          # automatic so local device runs need no profile management.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+          # Must match the profile name created via the App Store Connect API —
+          # see ios/README.md "Credentials".
+          PROVISIONING_PROFILE_SPECIFIER: "FlightDeck Remote App Store"
+    dependencies:
+      - package: SwiftTerm
+    scheme:
+      testTargets:
+        - FlightDeckRemoteTests
+        - FlightDeckRemoteUITests
+      gatherCoverageData: true
+
+  FlightDeckRemoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemoteTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: FlightDeckRemote
+
+  FlightDeckRemoteUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckRemoteUITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote.uitests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: FlightDeckRemote

@@ -1,0 +1,7 @@
+{
+  "type": "peer_presence",
+  "pairing_id": "pair_ruud_mbp",
+  "peer": "desktop",
+  "state": "connected",
+  "at_ms": 1752412801000
+}

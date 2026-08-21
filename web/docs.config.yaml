@@ -1,0 +1,25 @@
+siteTitle: Flightdeck Documentation
+repositoryUrl: https://github.com/neworange-ruud/flightdeck
+contentRoot: docs
+mountPath: /docs
+
+theme:
+  defaultColorMode: system
+  allowToggle: true
+
+search:
+  enabled: true
+
+navigation:
+  collapsible: true
+
+mdxComponents:
+  enabled:
+    - Callout
+    - CardGrid
+    - Card
+    - Badge
+
+codeBlocks:
+  lineNumbers: optional
+  copyButton: true

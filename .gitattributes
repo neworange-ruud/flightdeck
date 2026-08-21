@@ -1,0 +1,7 @@
+# Byte-exact cross-language test vectors: never EOL-convert them. GitHub's
+# Windows runners default to core.autocrlf=true, which rewrites checked-in LF
+# files to CRLF on checkout — that breaks the vectors-lock test in
+# remote::crypto::tests, which reads the file verbatim and compares it against
+# its own '\n'-joined output. Treating the fixtures as binary keeps their bytes
+# identical on every platform.
+remote/protocol/tests/fixtures/e2e_crypto/** -text

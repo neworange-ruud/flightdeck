@@ -132,7 +132,34 @@ else
   VERSION="$version" perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m' Cargo.toml
 fi
 
+update_ios_version() {
+  # The iOS app's marketing version tracks this same release train, so that a
+  # build in TestFlight and the desktop binary never claim different versions.
+  # It lives in ios/project.yml (the XcodeGen spec), which is the source of
+  # truth for the generated Info.plist.
+  #
+  # The build number resets to 1: App Store Connect requires build numbers to be
+  # unique within a marketing version, so a new version starts a fresh train.
+  # It is reset via CURRENT_PROJECT_VERSION, which is what CFBundleVersion
+  # references — rewriting CFBundleVersion itself would replace that reference
+  # with a literal and silently break every override (CI included).
+  if [ ! -f ios/project.yml ]; then
+    printf 'ios/project.yml not found; skipping iOS version bump.\n' >&2
+    return 0
+  fi
+
+  VERSION="$version" perl -0pi -e '
+    my $before = $_;
+    s/^(\s*CFBundleShortVersionString:\s*")[^"]+(")/$1$ENV{VERSION}$2/m
+      or die "ios/project.yml: no CFBundleShortVersionString to bump\n";
+    s/^(\s*CURRENT_PROJECT_VERSION:\s*")[^"]+(")/${1}1$2/m
+      or die "ios/project.yml: no CURRENT_PROJECT_VERSION to reset\n";
+    print STDERR "ios/project.yml: already at $ENV{VERSION}\n" if $before eq $_;
+  ' ios/project.yml
+}
+
 update_changelog
+update_ios_version
 
 cargo metadata --format-version 1 >/dev/null
 
@@ -142,7 +169,7 @@ cargo test --locked
 dist generate --check
 dist plan --tag "$tag" --allow-dirty
 
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md ios/project.yml
 if git diff --cached --quiet; then
   printf 'No version-file changes to commit; tagging current HEAD.\n'
 else

@@ -1,0 +1,6 @@
+{
+  "command_id": "cmd_00000007",
+  "issued_at_ms": 1752412816000,
+  "type": "clear_manual_status",
+  "session_id": "sess_fix_login"
+}

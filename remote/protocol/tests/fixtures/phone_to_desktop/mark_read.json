@@ -1,0 +1,9 @@
+{
+  "command_id": "cmd_00000011",
+  "issued_at_ms": 1752412826000,
+  "type": "mark_read",
+  "event_ids": [
+    "evt_7788",
+    "evt_7789"
+  ]
+}

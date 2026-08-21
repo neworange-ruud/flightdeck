@@ -8,7 +8,8 @@
 //! the guarded rebase carve-out (`rebase_onto`/`pull_base`) documented below.
 
 use crate::contracts::domain::{
-    ContainerState, MergeOutcome, Notification, ProcessState, PtySize, RebaseOutcome, WorktreeInfo,
+    CommandOutcome, ContainerState, MergeOutcome, Notification, ProcessState, PtySize,
+    RebaseOutcome, WorktreeInfo,
 };
 use crate::contracts::error::Result;
 use std::path::{Path, PathBuf};
@@ -82,6 +83,24 @@ pub trait GitExecutor {
     /// Must only be reached after the clean-tree precondition check in the git
     /// workflow layer.
     fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome>;
+    /// Stash the working tree's *tracked* uncommitted changes (`git stash push`)
+    /// so a subsequent [`pull_base`](GitExecutor::pull_base) can run on a clean
+    /// tree, then be restored with [`stash_apply`](GitExecutor::stash_apply).
+    /// Returns `true` if a stash entry was actually created, `false` if there
+    /// was nothing to stash (e.g. the tree was dirty only with untracked files,
+    /// which do not block a rebase). Stashing does not touch commit history, so
+    /// it is not a SPECS §5 history-rewriting op — it only ever preserves and
+    /// restores the user's own uncommitted changes around Pull base (§5.2).
+    fn stash_push(&self, cwd: &Path) -> Result<bool>;
+    /// Re-apply the most recent stash entry (`git stash apply`, keeping the
+    /// entry) after a [`pull_base`](GitExecutor::pull_base). Returns `true` if
+    /// it applied cleanly, `false` on conflict — in which case the caller leaves
+    /// the entry in place so the user can recover their changes by hand.
+    fn stash_apply(&self, cwd: &Path) -> Result<bool>;
+    /// Drop the most recent stash entry (`git stash drop`). Called only after a
+    /// clean [`stash_apply`](GitExecutor::stash_apply) to remove the now-restored
+    /// entry.
+    fn stash_drop(&self, cwd: &Path) -> Result<()>;
 }
 
 /// Abstraction over filesystem operations (SPECS §26).
@@ -137,6 +156,22 @@ pub trait PtySession: Send {
     fn process_state(&self) -> ProcessState;
     /// Force-terminate the whole process tree (SPECS §25 force path).
     fn terminate_tree(&mut self) -> Result<()>;
+}
+
+/// Runs non-interactive shell commands for repository lifecycle hooks (SPECS §7
+/// hooks). A seam like [`GitExecutor`]: the real impl shells out through the
+/// platform shell, tests record the invocations.
+///
+/// This is only for the fire-and-collect hook commands in `.flightdeck/hooks.toml`
+/// (worktree setup / update). Interactive agent and shell processes go through
+/// [`PtyBackend`], never here — a hook must capture its output so it can never
+/// write to the terminal FlightDeck is drawing on.
+pub trait CommandRunner {
+    /// Run `script` through the platform shell (`sh -c` on Unix, `cmd /C` on
+    /// Windows) with `cwd` as the working directory, capturing combined
+    /// stdout+stderr. Returns a [`CommandOutcome`]; an `Err` means the shell
+    /// itself could not be launched, not that the script exited non-zero.
+    fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome>;
 }
 
 /// Posts OS notifications when an agent finishes a running task (SPECS §24).

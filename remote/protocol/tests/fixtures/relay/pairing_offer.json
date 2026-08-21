@@ -1,0 +1,8 @@
+{
+  "type": "pairing_offer",
+  "device_id": "dev_mac_7b21",
+  "device_public_key": "BExampleDesktopSec1PublicKeyBase64WouldBe65DecodedBytesQ2pV8Yb3Nz7Wt1Rk4Xh6Zg9Mm0Aa5Bb2Cc4Dd6Ee8f==",
+  "key_agreement_public_key": "BExampleDesktopKeyAgreementSec1PubKeyBase64Would65BytesTt3Uu5Vv7Ww9Xx1Yy3Zz5Aa7Bb9Cc1Dd3Ee5Ff7g==",
+  "role": "desktop",
+  "claim_token_hint": "4729"
+}

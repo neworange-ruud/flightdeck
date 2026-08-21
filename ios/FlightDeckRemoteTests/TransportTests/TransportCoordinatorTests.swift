@@ -1,0 +1,844 @@
+//
+//  TransportCoordinatorTests.swift
+//  FlightDeckRemoteTests
+//
+//  Covers the multi-pairing `TransportCoordinator` (remote-control-b8d.5):
+//   - spinning N clients from N `PairedInstance`s, each resolvable by pairingId;
+//   - `reconcile` adds/removes only the affected client, leaving others intact;
+//   - `setForeground(true)` connects all, `setForeground(false)` tears all down
+//     (supervisors cancelled, every scripted socket closed, links `.disconnected`);
+//   - all clients reuse the phone's ONE device identity + KA key (both clients'
+//     auth signatures verify against the same device key, and both decrypt their
+//     own desktop's E2E snapshot — proving the shared key-agreement key derived
+//     each per-pairing channel);
+//   - the fan-out is bounded by `cap`.
+//
+
+import Testing
+import Foundation
+import CryptoKit
+@testable import FlightDeckRemote
+
+@MainActor
+@Suite struct TransportCoordinatorTests {
+
+    // MARK: - Test connector: one scripted channel per client, creation order
+
+    /// Hands out a fresh `ScriptedChannel` (wrapped in a `ScriptedConnector`) on
+    /// every `connector()` call. `TransportCoordinator` calls the factory once
+    /// per client at handle-creation time, so `channels[i]` is client `i`'s
+    /// socket. The recordless fallback store uses its own never-connecting
+    /// connector, so it does NOT perturb this 1:1 mapping.
+    final class ChannelBook: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _channels: [ScriptedChannel] = []
+
+        func connector() -> any WebSocketConnecting {
+            let channel = ScriptedChannel()
+            lock.lock(); _channels.append(channel); lock.unlock()
+            return ScriptedConnector(channel: channel)
+        }
+
+        /// A connector that mints a FRESH channel on every `connect`, for tests
+        /// that reconnect after a teardown: `ScriptedChannel.close()` latches
+        /// permanently, so the fixed-channel `connector()` above hands a
+        /// reconnect a dead socket. Channels still land in `channels` in
+        /// creation order, but the first one only appears once the client
+        /// actually connects (there is nothing to create up front).
+        func reconnectingConnector() -> any WebSocketConnecting {
+            ScriptedConnector(factory: { [self] in
+                let channel = ScriptedChannel()
+                lock.lock(); _channels.append(channel); lock.unlock()
+                return channel
+            })
+        }
+
+        var channels: [ScriptedChannel] {
+            lock.lock(); defer { lock.unlock() }; return _channels
+        }
+    }
+
+    private struct Harness {
+        let coordinator: TransportCoordinator
+        let book: ChannelBook
+        let peers: [DesktopPeer]
+        let instances: [PairedInstance]
+        let identityPublicKeyB64: String
+    }
+
+    /// Build a coordinator over an in-memory keychain with one saved
+    /// `PairingRecord` + `PairedInstance` per id, all sharing the phone's single
+    /// identity + KA key. `pairingStore`, when supplied, arms the machine-name
+    /// write-back (remote-control-b8d.9) — omitted by every OTHER test in this
+    /// file so their assertions are unaffected.
+    /// A test-controllable `NetworkPathMonitoring` — the test drives path
+    /// changes explicitly and can assert start/cancel bookkeeping
+    /// (remote-control-0ef.22).
+    @MainActor
+    final class ControllableNetworkMonitor: NetworkPathMonitoring {
+        var isSatisfied: Bool
+        var onPathChange: (@MainActor (Bool) -> Void)?
+        private(set) var startCount = 0
+        private(set) var cancelCount = 0
+        init(isSatisfied: Bool = true) { self.isSatisfied = isSatisfied }
+        func start() { startCount += 1 }
+        func cancel() { cancelCount += 1 }
+        /// Simulate connectivity restored / a cell↔wifi interface switch.
+        func firePathChange(satisfied: Bool = true) {
+            isSatisfied = satisfied
+            onPathChange?(satisfied)
+        }
+    }
+
+    private func makeHarness(pairingIds: [String], cap: Int = 4, pairingStore: PairingStore? = nil,
+                             networkMonitor: (any NetworkPathMonitoring)? = nil,
+                             reconnecting: Bool = false) throws -> Harness {
+        let keychain = InMemoryKeychainStore()
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
+        let recordStore = PairingRecordStore(store: keychain)
+
+        var peers: [DesktopPeer] = []
+        var instances: [PairedInstance] = []
+        for (index, pairingId) in pairingIds.enumerated() {
+            let (peer, _) = try TransportFixtures.makePeer(
+                keychain: keychain,
+                pairingId: pairingId,
+                salt: Data("salt-\(pairingId)-000000000000".utf8),
+                relayURL: "wss://relay.example/\(pairingId)"
+            )
+            try recordStore.save(peer.record)
+            peers.append(peer)
+            instances.append(PairedInstance(
+                pairingId: pairingId,
+                relayURL: URL(string: peer.record.relayURL)!,
+                pairedAt: Date(timeIntervalSince1970: TimeInterval(1_000 + index))
+            ))
+        }
+
+        let book = ChannelBook()
+        var config = TransportClient.Config()
+        config.pingInterval = .seconds(999)
+        let coordinator = TransportCoordinator(
+            identity: identity,
+            keyAgreement: keyAgreement,
+            recordStore: recordStore,
+            connectorFactory: { reconnecting ? book.reconnectingConnector() : book.connector() },
+            cap: cap,
+            clientConfig: config,
+            pairingStore: pairingStore,
+            networkMonitor: networkMonitor,
+            now: { 1_752_000_100_000 }
+        )
+        return Harness(
+            coordinator: coordinator, book: book, peers: peers,
+            instances: instances, identityPublicKeyB64: identity.publicKeyBase64
+        )
+    }
+
+    private func handshake(_ channel: ScriptedChannel, client: TransportClient) async {
+        await channel.push(.helloOk(protocolVersion: 1, serverTimeMs: 1, connectionId: "c"))
+        await channel.push(.authChallenge(nonce: TransportFixtures.nonceB64(), serverTimeMs: 1))
+        await channel.push(.authOk(pairingIds: [Wire.PairingId(client.pairingId ?? "")]))
+        _ = await waitUntil { if case .connected = await client.currentLinkState() { return true }; return false }
+    }
+
+    private func verifySignature(
+        _ frame: Wire.RelayFrame,
+        identityPublicKeyB64: String,
+        nonceB64: String = TransportFixtures.nonceB64()
+    ) -> Bool {
+        guard case let .authResponse(_, signature, _) = frame,
+              let pub = Data(base64Encoded: identityPublicKeyB64),
+              let sig = Data(base64Encoded: signature),
+              let nonce = Data(base64Encoded: nonceB64),
+              let key = try? P256.Signing.PublicKey(x963Representation: pub),
+              let ecdsa = try? P256.Signing.ECDSASignature(rawRepresentation: sig)
+        else { return false }
+        return key.isValidSignature(ecdsa, for: nonce)
+    }
+
+    // MARK: - N clients from N instances
+
+    @Test func spinsOneClientPerInstanceResolvableByPairingId() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b", "pair_c"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(h.coordinator.handles.count == 3)
+        #expect(h.coordinator.activePairingIds == ["pair_a", "pair_b", "pair_c"])
+        #expect(h.coordinator.stores.count == 3)
+
+        // Each pairing resolves to its own store + client.
+        #expect(h.coordinator.store(for: "pair_b") != nil)
+        #expect(h.coordinator.client(for: "pair_c") != nil)
+        #expect(h.coordinator.store(for: "unknown") == nil)
+
+        // Distinct store objects per pairing (not one shared store).
+        let sA = try #require(h.coordinator.store(for: "pair_a"))
+        let sB = try #require(h.coordinator.store(for: "pair_b"))
+        #expect(sA !== sB)
+        // And the client bound the right pairing.
+        #expect(h.coordinator.client(for: "pair_b")?.pairingId == "pair_b")
+    }
+
+    @Test func primaryStoreIsFirstInstanceOrFallbackWhenEmpty() throws {
+        let empty = try makeHarness(pairingIds: [])
+        // No instances installed → primaryStore is the recordless fallback.
+        #expect(empty.coordinator.primaryStore === empty.coordinator.fallbackStore)
+
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    @Test func primaryStorePrefersAConnectedInstanceOverAStuckFirstOne() throws {
+        // The first pairing is stuck offline (e.g. an orphaned pairing the relay
+        // no longer knows, which never reaches auth_ok yet keeps re-seeding its
+        // stale cached snapshot); a later pairing is live. The Projects tab —
+        // which reads `primaryStore` dynamically — must follow the LIVE instance
+        // rather than stranding on the stale first one (remote-control-aj2).
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // All disconnected right after install → falls back to the first.
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+
+        // pair_b connects; pair_a stays disconnected.
+        let snap = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        h.coordinator.handles[1].store.debugSeed(snapshot: snap, linkState: .connected(latencyMs: 5))
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"))
+    }
+
+    // MARK: - Per-instance detail binding (remote-control-b8d.12)
+    //
+    // `detailStore(for:)` is what `MainTabView`'s Feed-tab `.navigationDestination`
+    // calls with the `pairingId` carried on the PUSHED `ProjectsRoute` — never
+    // off any separately-mutable "active machine" state — so these prove the
+    // exact resolution a feed-originated session/chat detail relies on.
+
+    @Test func detailStoreForAPairingIdReturnsThatInstancesOwnStore() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        let resolvedA = h.coordinator.detailStore(for: "pair_a")
+        #expect(resolvedA === h.coordinator.store(for: "pair_a"))
+        #expect(resolvedA !== h.coordinator.store(for: "pair_b"))
+    }
+
+    @Test func twoFeedItemsOnDifferentMachinesResolveToDifferentStores() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b", "pair_c"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // Mirrors two `FeedItem`s (remote-control-b8d.6) on different
+        // machines, each tapped into its own `.sessions(pairingId:)` route.
+        let storeForItemOnA = h.coordinator.detailStore(for: "pair_a")
+        let storeForItemOnB = h.coordinator.detailStore(for: "pair_b")
+        let storeForItemOnC = h.coordinator.detailStore(for: "pair_c")
+
+        #expect(storeForItemOnA !== storeForItemOnB)
+        #expect(storeForItemOnB !== storeForItemOnC)
+        #expect(storeForItemOnA !== storeForItemOnC)
+    }
+
+    @Test func detailPinnedToMachineAStaysOnAEvenAfterResolvingB() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // A detail screen pushed for machine A captures its resolved store
+        // once, at push time (the route's `pairingId` is immutable thereafter).
+        let pinnedToA = h.coordinator.detailStore(for: "pair_a")
+
+        // The user backs out and taps a DIFFERENT row (machine B) — resolving
+        // B's store must not retroactively change what A's already-pushed
+        // detail resolved to (no shared mutable "active pairing" to go stale).
+        _ = h.coordinator.detailStore(for: "pair_b")
+
+        #expect(h.coordinator.detailStore(for: "pair_a") === pinnedToA)
+        #expect(pinnedToA === h.coordinator.store(for: "pair_a"))
+    }
+
+    @Test func detailStoreFallsBackToPrimaryForNilOrUnknownPairingId() throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        // `nil` — the Projects tab's single-store transitional routes.
+        #expect(h.coordinator.detailStore(for: nil) === h.coordinator.primaryStore)
+        // A pairingId that's no longer active (e.g. unpaired while its detail
+        // screen was still on-screen) — never crashes, falls back instead.
+        #expect(h.coordinator.detailStore(for: "gone") === h.coordinator.primaryStore)
+    }
+
+    // MARK: - Runtime add / remove
+
+    @Test func reconcileAddsAndRemovesOnlyTheAffectedClient() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        await h.coordinator.reconcile(with: h.instances)
+        #expect(h.coordinator.activePairingIds == ["pair_a", "pair_b"])
+
+        let storeBBefore = try #require(h.coordinator.store(for: "pair_b"))
+
+        // Remove pair_a only.
+        await h.coordinator.reconcile(with: [h.instances[1]])
+        #expect(h.coordinator.activePairingIds == ["pair_b"])
+        #expect(h.coordinator.store(for: "pair_a") == nil)
+        // pair_b's live handle is untouched (same store object).
+        #expect(h.coordinator.store(for: "pair_b") === storeBBefore)
+
+        // Add pair_a back → a fresh handle, pair_b still the same object.
+        await h.coordinator.reconcile(with: h.instances)
+        #expect(Set(h.coordinator.activePairingIds) == ["pair_a", "pair_b"])
+        #expect(h.coordinator.store(for: "pair_b") === storeBBefore)
+        #expect(h.coordinator.store(for: "pair_a") !== storeBBefore)
+    }
+
+    // MARK: - Foreground connect-all / background teardown
+
+    @Test func foregroundConnectsAllBackgroundTearsAllDown() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        await h.coordinator.setForeground(true)
+
+        // Each client connects on its own socket.
+        for (index, instance) in h.instances.enumerated() {
+            let client = try #require(h.coordinator.client(for: instance.pairingId))
+            await handshake(h.book.channels[index], client: client)
+            let live = await client.currentLinkState()
+            #expect({ if case .connected = live { return true }; return false }())
+        }
+        #expect(h.book.channels.count == 2)
+
+        // Background → tear everything down.
+        await h.coordinator.setForeground(false)
+
+        for (index, instance) in h.instances.enumerated() {
+            // No lingering socket.
+            #expect(await h.book.channels[index].isClosed())
+            // Link reported disconnected.
+            let client = try #require(h.coordinator.client(for: instance.pairingId))
+            #expect(await client.currentLinkState() == .disconnected)
+        }
+    }
+
+    @Test func stopOnePairingLeavesOthersConnected() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        await h.coordinator.stop(pairingId: "pair_a")
+
+        #expect(await h.book.channels[0].isClosed())
+        #expect(await h.coordinator.client(for: "pair_a")?.currentLinkState() == .disconnected)
+        // pair_b untouched.
+        #expect(!(await h.book.channels[1].isClosed()))
+        let liveB = await h.coordinator.client(for: "pair_b")!.currentLinkState()
+        #expect({ if case .connected = liveB { return true }; return false }())
+    }
+
+    // MARK: - Duplicate pairings to one Mac (remote-control-4wk)
+
+    /// The reported bug: two pairings to the SAME Mac, both connected, but the
+    /// desktop bridge feeds only one. `primaryStore` must resolve to the pairing
+    /// actually being served, not merely the oldest connected one — otherwise the
+    /// Projects tab pins to a list nothing can ever refresh.
+    @Test func primaryStorePrefersTheServedPairingOverAnOlderSilentOne() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        // BOTH authenticate — the zombie duplicate is not distinguishable by
+        // link state alone (this is why the aj2 "never reaches auth_ok" guard
+        // does not catch it).
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        // Oldest-first ordering means the plain "first connected" rule picks A.
+        #expect(h.coordinator.handles.first?.pairingId == "pair_a")
+
+        // Only pair_b is actually fed: a real snapshot arrives on it.
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"),
+                "primaryStore must follow the pairing the desktop is serving")
+        #expect(h.coordinator.store(for: "pair_a")?.lastInboundAtMs == nil,
+                "the silent duplicate must stay marked as never-received")
+    }
+
+    /// Before anything has been received, `primaryStore` still resolves to a
+    /// connected handle (a fresh launch must not fall through to the fallback).
+    @Test func primaryStoreFallsBackToTheFirstConnectedBeforeAnyInboundArrives() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A desktop that switches which pairing it feeds must be followed, so the
+    /// signal is newest-inbound rather than a sticky "has ever received" flag.
+    @Test func primaryStoreFollowsTheDesktopSwitchingWhichPairingItFeeds() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        let snapshot = Wire.StateSnapshot(serverTimeMs: 1, projects: [])
+        // First B is fed…
+        try await h.book.channels[1].push(h.peers[1].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_b")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_b"))
+        // …then the desktop re-pairs/switches and feeds A instead.
+        try await h.book.channels[0].push(h.peers[0].envelopeFrame(.snapshot(snapshot), seq: 1))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_a")?.lastInboundAtMs != nil }
+        #expect(h.coordinator.primaryStore === h.coordinator.store(for: "pair_a"))
+    }
+
+    /// A relay `pairing_revoked` for a pairing this phone did NOT revoke — the
+    /// desktop retiring a superseded duplicate — must drop the `PairedInstance`,
+    /// so the phone stops fanning a client out to a pairing the relay no longer
+    /// knows. Only that pairing is affected.
+    @Test func aRelayRevokedPairingIsPrunedAndLeavesTheOtherAlone() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], pairingStore: pairingStore)
+        for instance in h.instances { pairingStore.add(instance) }
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+        #expect(pairingStore.instances.count == 2)
+
+        // The relay revokes pair_a (the desktop retired it as superseded).
+        await h.book.channels[0].push(.pairingRevoked(pairingId: Wire.PairingId("pair_a")))
+
+        _ = await waitUntilMain { pairingStore.instances.count == 1 }
+        #expect(pairingStore.instances.map(\.pairingId) == ["pair_b"],
+                "only the revoked pairing is dropped")
+    }
+
+    // MARK: - Background wake vs. foreground ownership (remote-control-aew)
+
+    /// A wake that runs while genuinely backgrounded connects, then tears back
+    /// down — the intended remote-control-0ef.4 shape.
+    @Test func backgroundWakeConnectsThenTearsBackDownWhileBackgrounded() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        await h.coordinator.endBackgroundWake()
+
+        for index in h.instances.indices {
+            #expect(await h.book.channels[index].isClosed())
+        }
+    }
+
+    /// iOS delivers `content-available` pushes to a FOREGROUNDED app too. The
+    /// wake must decline outright there — running it used to end in a
+    /// `stopAll()` that killed the live socket the user was looking at.
+    @Test func backgroundWakeIsDeclinedWhileForegroundedAndLeavesTheLinkUp() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        #expect(!(await h.coordinator.beginBackgroundWake()))
+        // Declining must be a true no-op: an unpaired `endBackgroundWake` (the
+        // caller `guard`s, but be defensive) still may not drop the live link.
+        await h.coordinator.endBackgroundWake()
+
+        for (index, instance) in h.instances.enumerated() {
+            #expect(!(await h.book.channels[index].isClosed()))
+            let live = await h.coordinator.client(for: instance.pairingId)!.currentLinkState()
+            #expect({ if case .connected = live { return true }; return false }())
+        }
+    }
+
+    /// The exact reported flap (remote-control-aew): a wake is in flight when
+    /// the user opens the app. The foreground now owns the link, so the wake's
+    /// trailing teardown must be skipped — otherwise it drops the fresh socket,
+    /// detaches the phone at the relay, and the relay's next envelope pushes
+    /// another wake, forever.
+    @Test func foregroundingDuringAWakeKeepsTheLinkUp() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        // The user opens the app mid-wake.
+        await h.coordinator.setForeground(true)
+        await h.coordinator.endBackgroundWake()
+
+        #expect(!(await h.book.channels[0].isClosed()))
+        let live = await client.currentLinkState()
+        #expect({ if case .connected = live { return true }; return false }())
+    }
+
+    /// A chatty desktop lands several wakes in one background window (the relay
+    /// pushes per undelivered envelope). Overlapping wakes tore down each
+    /// other's transport, so a second wake is declined while one is in flight —
+    /// and declining it must not disarm the first one's teardown.
+    @Test func aSecondWakeIsDeclinedWhileOneIsAlreadyInFlight() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"])
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        // A second push lands mid-wake: declined, and a no-op on the live link.
+        #expect(!(await h.coordinator.beginBackgroundWake()))
+        #expect(!(await h.book.channels[0].isClosed()))
+
+        // The first wake still tears down normally when it finishes.
+        await h.coordinator.endBackgroundWake()
+        #expect(await h.book.channels[0].isClosed())
+    }
+
+    /// A wake must not claim foreground ownership: going through `startAll()`
+    /// set `isForeground`, which then made the next real `setForeground(true)`
+    /// a no-op (its `active != isForeground` guard) — so after the wake's
+    /// teardown nothing ever reconnected until another push arrived.
+    @Test func aCompletedWakeStillLetsTheNextForegroundConnect() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a"], reconnecting: true)
+        h.coordinator.installInitialInstances(h.instances)
+
+        #expect(await h.coordinator.beginBackgroundWake())
+        // The wake connects WITHOUT flipping the foreground flag.
+        #expect(!h.coordinator.isForegroundActive)
+        _ = await waitUntilMain { h.book.channels.count >= 1 }
+        await h.coordinator.endBackgroundWake()
+        #expect(!h.coordinator.isForegroundActive)
+        #expect(await h.book.channels[0].isClosed())
+
+        // Now the user opens the app: this must actually connect a new socket.
+        await h.coordinator.setForeground(true)
+        #expect(h.coordinator.isForegroundActive)
+        #expect(await waitUntilMain { h.book.channels.count >= 2 })
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[1], client: client)
+        let live = await client.currentLinkState()
+        #expect({ if case .connected = live { return true }; return false }())
+    }
+
+    // MARK: - Retry now / network-restored reconnect (remote-control-0ef.21/.22)
+
+    @Test func reconnectAllDropsEveryLiveSocket() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // "Retry now" forces every live client to drop its socket and reconnect.
+        await h.coordinator.reconnectAll()
+
+        for index in h.instances.indices {
+            _ = await waitUntil { await h.book.channels[index].isClosed() }
+            #expect(await h.book.channels[index].isClosed())
+        }
+    }
+
+    @Test func networkRestoredForcesReconnectWhileForegrounded() async throws {
+        let monitor = ControllableNetworkMonitor()
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], networkMonitor: monitor)
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        #expect(monitor.startCount >= 1) // monitor armed on foreground
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // Connectivity restored / interface switch → every live socket dropped
+        // and reconnected proactively (remote-control-0ef.22).
+        monitor.firePathChange(satisfied: true)
+        for index in h.instances.indices {
+            _ = await waitUntil { await h.book.channels[index].isClosed() }
+            #expect(await h.book.channels[index].isClosed())
+        }
+
+        await h.coordinator.setForeground(false)
+        #expect(monitor.cancelCount >= 1) // monitor stopped on background
+    }
+
+    @Test func networkChangeWhileBackgroundedDoesNotReconnect() async throws {
+        let monitor = ControllableNetworkMonitor()
+        let h = try makeHarness(pairingIds: ["pair_a"], networkMonitor: monitor)
+        h.coordinator.installInitialInstances(h.instances)
+        // Never foregrounded → the client was never started, so a path change
+        // must not connect or reconnect anything (APNs owns the wake while
+        // backgrounded; the handler is guarded on `isForeground`). The channel
+        // object is created eagerly at handle-build time, but it must have seen
+        // no `connect` activity: no frames sent, not closed.
+        monitor.firePathChange(satisfied: true)
+        try? await Task.sleep(for: .milliseconds(50))
+        for channel in h.book.channels {
+            #expect(await channel.sentFrames().isEmpty)
+            #expect(!(await channel.isClosed()))
+        }
+    }
+
+    // MARK: - Shared device keys across clients
+
+    @Test func allClientsReuseSharedDeviceIdentityAndKeyAgreementKeys() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // Shared identity: every client's auth_response verifies against the ONE
+        // device public key.
+        for index in h.instances.indices {
+            let sent = await h.book.channels[index].sentFrames()
+            let authResp = try #require(sent.first { if case .authResponse = $0 { return true }; return false })
+            #expect(verifySignature(authResp, identityPublicKeyB64: h.identityPublicKeyB64))
+        }
+
+        // Shared KA key: each desktop peer seals a snapshot under its OWN pairing
+        // channel; that its client opens+folds it proves the client derived the
+        // right per-pairing E2E channel from the shared key-agreement key.
+        for index in h.instances.indices {
+            let snap = Wire.StateSnapshot(serverTimeMs: Int64(index + 1), projects: [])
+            try await h.book.channels[index].push(h.peers[index].envelopeFrame(.snapshot(snap), seq: 1))
+        }
+        for instance in h.instances {
+            let store = try #require(h.coordinator.store(for: instance.pairingId))
+            _ = await waitUntilMain { store.snapshot != nil }
+            #expect(store.snapshot != nil)
+        }
+    }
+
+    // MARK: - Cap
+
+    @Test func fanOutIsBoundedByCap() throws {
+        let h = try makeHarness(pairingIds: ["p1", "p2", "p3", "p4", "p5"], cap: 3)
+        h.coordinator.installInitialInstances(h.instances)
+        #expect(h.coordinator.handles.count == 3)
+        #expect(h.coordinator.activePairingIds == ["p1", "p2", "p3"])
+    }
+
+    /// remote-control-b8d.7: the cap is a SINGLE shared constant
+    /// (`PairingLimits.maxPairedInstances`) — `TransportCoordinator`'s default
+    /// `cap` must read it rather than hardcoding its own literal, so this and
+    /// `PairingStore.isAtPairingCap` can never drift out of sync.
+    @Test func defaultCapReadsTheSharedPairingLimit() throws {
+        let keychain = InMemoryKeychainStore()
+        let identity = try DeviceIdentity.loadOrCreate(store: keychain)
+        let keyAgreement = try KeyAgreementKeys.loadOrCreate(store: keychain)
+        let recordStore = PairingRecordStore(store: keychain)
+        let book = ChannelBook()
+
+        let coordinator = TransportCoordinator(
+            identity: identity,
+            keyAgreement: keyAgreement,
+            recordStore: recordStore,
+            connectorFactory: { book.connector() }
+        )
+
+        #expect(coordinator.cap == PairingLimits.maxPairedInstances)
+    }
+
+    // MARK: - Machine-name write-back into PairingStore (remote-control-b8d.9)
+
+    @Test func desktopAnnouncedNameWritesBackIntoPairingStoreAsTheDefault() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(
+            pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Ruud's MacBook Pro"
+        }
+        let instance = try #require(pairingStore.list.first { $0.pairingId == "pair_a" })
+        #expect(instance.machineNameFromDesktop == "Ruud's MacBook Pro")
+        #expect(instance.displayName == "Ruud's MacBook Pro")
+    }
+
+    @Test func reconnectWithANewDesktopNameUpdatesTheDefaultAgain() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "Old Name"))
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Old Name"
+        }
+
+        // The Mac was renamed and re-announces on its next connect (§5.7)
+        // simulated here on the SAME live session for brevity — the client
+        // handles it identically whether it arrives on this session or a
+        // fresh one after a real reconnect.
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "New Name"))
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "New Name"
+        }
+
+        #expect(pairingStore.list.first { $0.pairingId == "pair_a" }?.displayName == "New Name")
+    }
+
+    @Test func userOverridePersistsAndWinsEvenAfterADesktopRename() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a"], pairingStore: pairingStore)
+        pairingStore.add(h.instances[0])
+        pairingStore.setOverrideName(pairingId: "pair_a", "Home Studio Mac")
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(
+            pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+        // The desktop default DOES still update underneath (it's a separate
+        // field) — wait for that write, then assert the override still wins.
+        _ = await waitUntilMain {
+            pairingStore.list.first { $0.pairingId == "pair_a" }?.machineNameFromDesktop == "Ruud's MacBook Pro"
+        }
+
+        let instance = try #require(pairingStore.list.first { $0.pairingId == "pair_a" })
+        #expect(instance.userOverrideName == "Home Studio Mac")
+        #expect(instance.displayName == "Home Studio Mac", "a user override must always win over the desktop name")
+
+        // Clearing the override falls back to the (already-updated) desktop name.
+        pairingStore.setOverrideName(pairingId: "pair_a", nil)
+        #expect(pairingStore.list.first { $0.pairingId == "pair_a" }?.displayName == "Ruud's MacBook Pro")
+    }
+
+    @Test func withNoPairingStoreSuppliedMachineNameIsNeverWrittenBack() async throws {
+        // Every other test in this file omits `pairingStore:` — this just
+        // makes the "opt-in, no-op otherwise" contract explicit and exercises
+        // it against a live machine_name frame instead of only by omission.
+        let h = try makeHarness(pairingIds: ["pair_a"]) // no pairingStore
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        let client = try #require(h.coordinator.client(for: "pair_a"))
+        await handshake(h.book.channels[0], client: client)
+
+        try await h.book.channels[0].push(.machineName(pairingId: Wire.PairingId("pair_a"), machineName: "Ruud's MacBook Pro"))
+        _ = await waitUntilMain { h.coordinator.store(for: "pair_a")?.machineName == "Ruud's MacBook Pro" }
+
+        // The per-instance store still folds it locally...
+        #expect(h.coordinator.store(for: "pair_a")?.machineName == "Ruud's MacBook Pro")
+        // ...but with no `PairingStore` to write back into, nothing crashes
+        // and there's simply nowhere for it to persist (verified indirectly:
+        // the coordinator's own `handles[0].instance` snapshot, refreshed only
+        // by `reconcile`, is untouched).
+        #expect(h.coordinator.handles.first?.instance.machineNameFromDesktop == nil)
+    }
+
+    // MARK: - Per-machine push mute (remote-control-b8d.10)
+
+    private func registerCount(_ frames: [Wire.RelayFrame]) -> Int {
+        frames.filter { if case .registerPushToken = $0 { return true }; return false }.count
+    }
+
+    private func unregisterCount(_ frames: [Wire.RelayFrame]) -> Int {
+        frames.filter { if case .unregisterPushToken = $0 { return true }; return false }.count
+    }
+
+    @Test func registerPushTokenRegistersEveryLiveMachineWithItsOwnToken() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+
+        // Both machines register their OWN token against their OWN pairingId.
+        for index in h.instances.indices {
+            _ = await waitUntil { await self.registerCount(h.book.channels[index].sentFrames()) == 1 }
+        }
+        for (index, instance) in h.instances.enumerated() {
+            let frames = await h.book.channels[index].sentFrames()
+            let reg = try #require(frames.first { if case .registerPushToken = $0 { return true }; return false })
+            guard case let .registerPushToken(pairingId, token, env) = reg else { return }
+            #expect(pairingId.rawValue == instance.pairingId)
+            #expect(token == "tok_hex")
+            #expect(env == .sandbox)
+        }
+    }
+
+    @Test func mutingOneMachineDeregistersOnlyItAndLeavesOthersRegistered() async throws {
+        let pairingStore = PairingStore(instancesStorage: InMemoryPairedInstancesProvider())
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"], pairingStore: pairingStore)
+        for instance in h.instances { pairingStore.add(instance) }
+        h.coordinator.installInitialInstances(h.instances)
+        await h.coordinator.setForeground(true)
+        for (index, instance) in h.instances.enumerated() {
+            await handshake(h.book.channels[index], client: try #require(h.coordinator.client(for: instance.pairingId)))
+        }
+
+        // Both registered.
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+        for index in h.instances.indices {
+            _ = await waitUntil { await self.registerCount(h.book.channels[index].sentFrames()) == 1 }
+        }
+        #expect(await registerCount(h.book.channels[0].sentFrames()) == 1)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+
+        // Mute pair_a only — the mute flips in the store and reconcile applies it.
+        pairingStore.setMutePush(pairingId: "pair_a", true)
+        await h.coordinator.reconcile(with: pairingStore.list)
+
+        // pair_a (channel 0) deregisters exactly once; pair_b (channel 1) never does.
+        let aDeregistered = await waitUntil { await self.unregisterCount(h.book.channels[0].sentFrames()) == 1 }
+        #expect(aDeregistered)
+        // Give pair_b a chance to (wrongly) deregister before asserting it didn't.
+        _ = await waitUntil { await self.unregisterCount(h.book.channels[1].sentFrames()) > 0 }
+        #expect(await unregisterCount(h.book.channels[1].sentFrames()) == 0)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+
+        // Unmuting pair_a re-registers only it (register count 1 → 2), pair_b unchanged.
+        pairingStore.setMutePush(pairingId: "pair_a", false)
+        await h.coordinator.reconcile(with: pairingStore.list)
+        let aReRegistered = await waitUntil { await self.registerCount(h.book.channels[0].sentFrames()) == 2 }
+        #expect(aReRegistered)
+        #expect(await registerCount(h.book.channels[1].sentFrames()) == 1)
+    }
+
+    @Test func aMachineAddedAfterTheTokenArrivedIsRegisteredToo() async throws {
+        let h = try makeHarness(pairingIds: ["pair_a", "pair_b"])
+        // Start with only pair_a live and registered.
+        await h.coordinator.reconcile(with: [h.instances[0]])
+        await h.coordinator.setForeground(true)
+        await handshake(h.book.channels[0], client: try #require(h.coordinator.client(for: "pair_a")))
+        h.coordinator.registerPushToken("tok_hex", environment: .sandbox)
+        _ = await waitUntil { await self.registerCount(h.book.channels[0].sentFrames()) == 1 }
+
+        // Now add pair_b — the coordinator remembered the token and registers it
+        // once its socket goes live, without a fresh token refresh.
+        await h.coordinator.reconcile(with: h.instances)
+        await handshake(h.book.channels[1], client: try #require(h.coordinator.client(for: "pair_b")))
+        let bRegistered = await waitUntil { await self.registerCount(h.book.channels[1].sentFrames()) == 1 }
+        #expect(bRegistered)
+    }
+}

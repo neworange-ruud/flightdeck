@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "code": "peer_unavailable",
+  "message": "desktop is not currently connected; frames will be queued",
+  "pairing_id": "pair_ruud_mbp"
+}

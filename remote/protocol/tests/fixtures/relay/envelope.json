@@ -1,0 +1,9 @@
+{
+  "type": "envelope",
+  "pairing_id": "pair_ruud_mbp",
+  "seq": 42,
+  "sender": "desktop",
+  "sent_at_ms": 1752412802000,
+  "nonce": "YmFzZTY0bm9uY2UxMjM0NQ==",
+  "ciphertext": "3q2+7wq83vv3q2+7wq83vv3q2+7wq83vv3q2+7w="
+}

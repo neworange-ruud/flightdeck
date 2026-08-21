@@ -1,0 +1,7 @@
+{
+  "command_id": "cmd_0000000e",
+  "issued_at_ms": 1752412823000,
+  "type": "shell_close",
+  "session_id": "sess_fix_login",
+  "shell_id": "shell_01"
+}

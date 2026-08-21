@@ -8,7 +8,8 @@ pub mod traits;
 
 pub use domain::*;
 pub use error::{FlightDeckError, Result};
-pub use real::{RealClock, RealFs};
+pub use real::{RealClock, RealFs, SystemCommandRunner};
 pub use traits::{
-    Clock, ContainerRuntime, FileSystem, GitExecutor, Notifier, PtyBackend, PtySession,
+    Clock, CommandRunner, ContainerRuntime, FileSystem, GitExecutor, Notifier, PtyBackend,
+    PtySession,
 };

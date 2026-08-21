@@ -191,6 +191,7 @@ FlightDeck stores project-specific files here:
 project-root/
   .flightdeck/
     config.toml
+    hooks.toml
     state.json
     worktrees/
       add-auth-tests/
@@ -203,11 +204,12 @@ Committed:
 .flightdeck/config.toml
 ```
 
-Ignored:
+Ignored (including `hooks.toml`, which is opt-in per machine — see §7.1):
 
 ```text
 .flightdeck/state.json
 .flightdeck/worktrees/
+.flightdeck/hooks.toml
 ```
 
 Required `.gitignore` entries:
@@ -215,6 +217,9 @@ Required `.gitignore` entries:
 ```gitignore
 .flightdeck/state.json
 .flightdeck/worktrees/
+.flightdeck/agent-status
+.flightdeck/runtime/
+.flightdeck/hooks.toml
 ```
 
 On first run, FlightDeck may update `.gitignore` automatically.
@@ -243,11 +248,40 @@ Startup flow:
 5. Create `.flightdeck/config.toml` if missing.
 6. Create `.flightdeck/state.json` if missing.
 7. Create `.flightdeck/worktrees/` if missing.
-8. Append required `.gitignore` entries if missing.
-9. Load project state.
-10. Recover known worktrees.
+8. Create `.flightdeck/hooks.toml` (empty, only commented) if missing.
+9. Append required `.gitignore` entries if missing.
+10. Load project state.
+11. Recover known worktrees.
 
 Future CLI support for `flightdeck init` is acceptable, but not required for MVP.
+
+### 7.1 Hooks
+
+A repository may define shell commands to run at points in a worktree's
+lifecycle, in a per-repo `.flightdeck/hooks.toml`. It is created empty (only
+commented) on first run and is `.gitignore`d by default, so a hook — which runs
+arbitrary commands — only affects the machine that opts in. A user un-ignores and
+commits the file to share hooks with their team.
+
+Supported hooks (each a `commands` array):
+
+- `[worktree_created]` — runs in a new worktree right after it is materialized
+  for an Agent Tab. Does not run when an existing worktree is reused, or for a
+  base-branch tab (which creates no worktree).
+- `[worktree_update]` — runs in an Agent Tab's worktree after it is rebased onto
+  an updated base branch (§5.1).
+
+Execution rules:
+
+- Commands run sequentially, in the hook's worktree, through the platform shell
+  (`sh -c`, or `cmd /C` on Windows). A command may span multiple lines using TOML
+  triple-quoted strings; the whole block runs as one script.
+- If a command exits non-zero, the remaining commands for that hook are skipped.
+- Hooks are **best-effort**: a failing hook is surfaced as a warning but never
+  fails or rolls back the worktree (the worktree already exists; §5 forbids
+  throwing away work). Output is captured, never streamed to the terminal.
+- Unknown hooks in the file are ignored, so a `hooks.toml` from a newer FlightDeck
+  still loads on an older one.
 
 ---
 
@@ -821,6 +855,29 @@ layout:
   terminal label) focuses the terminal → **TERMINAL** mode.
 
 This is in addition to the keyboard focus controls (Esc / Enter) above.
+
+### Mode visibility
+
+Because typing in the wrong mode is jarring, the current mode is shown by three
+reinforcing cues, all configurable in `[ui]`:
+
+- **Mode chip** — the `MODE: …` chip in the status bar, colored by the mode.
+- **Live-pane border** — when `ui.mode_border` is `dim`/`normal`/`bright`, the
+  pane receiving keystrokes is framed: the terminal viewport in TERMINAL mode,
+  the sidebar in APP mode. Colors come from `ui.terminal_mode_color` /
+  `ui.app_mode_color`. Border space is reserved statically so switching modes
+  never resizes the terminal. Default `off`.
+- **Terminal dimming** — when `ui.dim_terminal_in_app_mode` is `true` (default),
+  the terminal viewport dims in APP mode, signalling it is not listening.
+
+Settings (`[ui]`):
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `terminal_mode_color` | green, cyan, blue, magenta, yellow, red, white | green |
+| `app_mode_color` | (same set) | cyan |
+| `mode_border` | off, dim, normal, bright | off |
+| `dim_terminal_in_app_mode` | true / false | true |
 
 Required shortcuts:
 

@@ -10,7 +10,7 @@ workflows.
 
 > Each Agent Tab = 1 Worktree = 1 Branch = 1 Primary Agent Process + Optional Shell Processes
 
-![FlightDeck screenshot](specs/screenshot.png)
+![FlightDeck: project tabs across the top to switch between repositories, one row per agent in the sidebar, the active agent's terminal in the main pane, and a live Git summary along the bottom](specs/screenshot.png)
 
 ## Quick start
 
@@ -76,18 +76,20 @@ On first run FlightDeck auto-initializes (no `flightdeck init` needed):
 your-repo/
   .flightdeck/
     config.toml        # committed, human-editable
+    hooks.toml         # ignored by default (opt-in lifecycle hooks)
     state.json         # ignored (runtime state)
     worktrees/         # ignored (managed worktrees)
 ```
 
-It also appends two entries to your `.gitignore` (append-only — existing content
-is preserved):
+It also appends these entries to your `.gitignore` (append-only — existing
+content is preserved):
 
 ```gitignore
 .flightdeck/state.json
 .flightdeck/worktrees/
 .flightdeck/agent-status
 .flightdeck/runtime/
+.flightdeck/hooks.toml
 ```
 
 Configured agents live in the config (OpenCode is the default; Claude Code and
@@ -127,6 +129,29 @@ Open the **configuration manager** from the command palette
   **Open Worktree in File Manager**. Empty means the per-OS default (`open`,
   `explorer.exe`, `xdg-open`); set e.g. `file_manager = "nautilus"` or
   `file_manager = "explorer.exe"` under WSL.
+
+### Hooks
+
+A repository can run shell commands automatically at points in a worktree's
+lifecycle via a per-repo `.flightdeck/hooks.toml` (created empty and commented on
+first run):
+
+```toml
+# Runs in a new worktree right after it is created for an Agent Tab.
+[worktree_created]
+commands = ["npm install"]
+
+# Runs in an Agent Tab's worktree after it is rebased onto an updated base branch.
+[worktree_update]
+commands = ["npm install"]
+```
+
+Commands run sequentially in the worktree through your shell (`sh -c`, or `cmd /C`
+on Windows), stopping at the first non-zero exit. A command may span multiple
+lines using TOML triple-quoted strings — the whole block runs as one script.
+Hooks are best-effort: a failing hook is surfaced as a warning but never rolls
+back the worktree. The file is `.gitignore`d by default so hooks stay opt-in per
+machine; un-ignore and commit it to share hooks with your team.
 
 ## Running agents in containers (optional)
 

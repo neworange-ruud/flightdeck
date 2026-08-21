@@ -1,0 +1,286 @@
+# Deploying the relay to Azure Container Apps
+
+The FlightDeck Remote relay runs on **Azure Container Apps**. This document is
+the runbook: the shape of the resources and how deploys happen. Concrete values
+(subscription/tenant ids, the live app URL, resource names) are **not** committed
+here — this is a public repo. They live in the repo's Actions **variables** and
+**secrets** (below) and in the Azure portal.
+
+## Topology
+
+| Thing | Notes |
+|---|---|
+| Resource group | one RG holds everything |
+| Container Registry | ACR **Basic**, managed-identity pull (no registry password) |
+| Container Apps env | Consumption profile. **Prefer North Europe** — West Europe has repeatedly returned `ManagedEnvironmentCapacityHeavyUsageError` for new environments. |
+| Container App | `0.25 vCPU / 0.5 GiB`, `minReplicas: 1`, `maxReplicas: 1` |
+| Pull identity | user-assigned MI with **AcrPull** on the registry |
+| Deploy identity | user-assigned MI, GitHub-OIDC federated, **AcrPush** + **Container Registry Tasks Contributor** on the registry (the latter is required for web-deploy's `az acr build` step) + **Contributor** on the app only |
+
+**`maxReplicas: 1` is required, not a tuning choice** — two reasons. (1) A
+pairing's two legs must land on the same replica, since routing is per-process.
+(2) The persistent store (below) is a single SQLite file opened with locking
+*disabled* (the `unix-none` VFS), which is only safe with one writer — a second
+replica would race the file and corrupt it. Scaling out needs a networked
+`RelayStore` (Redis / Azure Table) first. See `../src/store.rs`.
+
+## Persistent store
+
+State (device registrations, pairings, claim tokens, per-pairing seq high-water
+marks) lives in a **`RelayStore`**. The default is in-memory, which is wiped on
+every process restart *and every node reschedule* — a plain Container Apps
+platform event that silently drops all pairings and leaves already-paired
+devices stuck on "unknown device" auth failures (remote-control-bbf). The live
+app therefore runs the file-backed `SqliteStore` on an **Azure Files** volume so
+state outlives a revision swap or reschedule:
+
+- `FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db` selects the store and path.
+- `/data` is an Azure Files SMB share mounted into the container (declared in
+  `containerapp.yaml` under `volumes` / `volumeMounts`, referencing a storage
+  definition registered on the managed *environment*).
+- `SqliteStore` opens the DB with the no-locking `unix-none` VFS and a rollback
+  journal (not WAL) — required because the mount is a network filesystem, which
+  lacks the byte-range locking SQLite needs (an SMB lock attempt fails with a
+  spurious "database is locked") and cannot host WAL's mmap'd shared-memory
+  index; safe because there is a single connection at `maxReplicas: 1` (see
+  `../src/store/sqlite.rs`).
+
+One-time setup (idempotent; fill placeholders as in "Reproducing the setup"):
+
+```bash
+SA=<STORAGE_ACCOUNT>       # 3–24 lowercase alphanumeric, globally unique
+SHARE=relay-data           # Azure Files share name
+STORAGE=relaydata          # CA env storage definition name (no hyphens)
+
+# 1. Standard SMB storage account + a small file share.
+az storage account create -n "$SA" -g "$RG" -l "$REGION" \
+  --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 \
+  --allow-blob-public-access false
+KEY=$(az storage account keys list -n "$SA" -g "$RG" --query '[0].value' -o tsv)
+az storage share-rm create --storage-account "$SA" -g "$RG" -n "$SHARE" --quota 5
+
+# 2. Register the share on the managed environment as ReadWrite storage.
+az containerapp env storage set -g "$RG" -n "$ENVNAME" \
+  --storage-name "$STORAGE" \
+  --azure-file-account-name "$SA" --azure-file-account-key "$KEY" \
+  --azure-file-share-name "$SHARE" --access-mode ReadWrite
+
+# 3. Mount it + select the store on the app. Volumes have no dedicated `az`
+#    flag, so patch via YAML: `az containerapp show -o yaml > app.yaml`, add the
+#    `volumes` / `volumeMounts` / `FLIGHTDECK_RELAY_STORE` blocks (see
+#    containerapp.yaml for the exact shape), then `az containerapp update
+#    --yaml app.yaml`. relay-deploy.yml re-asserts the env var on every deploy;
+#    the volume, once mounted, is preserved across `--set-env-vars` updates.
+```
+
+The SMB share mounts world-writable (`0777`), so the container's non-root user
+(distroless `:nonroot`, uid 65532) can write to it — no extra permission wiring.
+Cost: a tiny standard file share is a few cents/month (billed on used GB +
+transactions).
+
+The Container Apps ingress serves a managed TLS cert on both the
+`*.azurecontainerapps.io` hostname (retrieve with
+`az containerapp show … --query properties.configuration.ingress.fqdn`) and the
+**pinned custom domain `relay.flightdeckai.app`** (remote-control-edn) — the
+stable endpoint the desktop + iOS apps use, so a rename/recreate of the Azure
+resources no longer orphans pairings. Rebinding the custom domain after such a
+move is `bind-custom-domain.sh` (it re-issues the ACA managed cert via CNAME
+validation); the two DNS records it needs on `flightdeckai.app` are:
+
+```
+CNAME  relay        -> <app>.<env-suffix>.northeurope.azurecontainerapps.io
+TXT    asuid.relay  -> <customDomainVerificationId>   # az containerapp show … --query properties.customDomainVerificationId
+```
+
+**Ingress is open; access is gated by a shared relay password** (remote-control-uq7).
+The relay is reachable from **any** network — deliberately, because a source-IP
+allowlist is incompatible with a roaming phone (a 5G/carrier egress IP is dynamic
+and cannot be allowlisted; that broke "control your Mac from anywhere"). Instead,
+the relay reads `FLIGHTDECK_RELAY_PASSWORD` from its environment and rejects any
+WebSocket `hello` whose `relay_password` is missing or wrong, comparing in
+constant time. A relay with **no** password configured stays open (local/dev).
+
+- Set the secret via CI: add a `FLIGHTDECK_RELAY_PASSWORD` secret to the repo's
+  `production` environment. `relay-deploy.yml` stores it as a Container App secret
+  (`relay-password`) and references it from the `FLIGHTDECK_RELAY_PASSWORD` env
+  var, so it never appears in plaintext in the revision template.
+- Every client presents the same password: the desktop reads it from the
+  `FLIGHTDECK_RELAY_PASSWORD` env var or `[remote].relay_password` in
+  `config.toml` (env wins); the phone captures it at pairing time.
+- The password is a **coarse network-admission gate** in front of — not a
+  replacement for — the per-device pairing auth (spec §5.1) and the end-to-end
+  crypto, both of which still run underneath.
+- The old allowlist was managed with
+  `az containerapp ingress access-restriction {set,remove,list} -g <rg> -n <app>`;
+  the deploy workflow now **removes** any such rules on every deploy. To restore
+  an allowlist you would re-add rules there, but that is no longer the intended
+  posture.
+
+## Health
+
+- `GET /healthz` → `ok` (liveness) · `GET /readyz` → `ok` (readiness)
+- `GET /version` → `{"version":"…","git_sha":"…"}` — `git_sha` is the deployed revision.
+
+## Push notifications (APNs)
+
+Waking an offline phone needs **two** things, and getting either wrong disables
+push *silently* — the relay keeps routing and queueing, so nothing looks broken
+until someone notices their phone is never woken. That is exactly how the relay
+ran without APNs from 1.10.0 to 1.12.0.
+
+1. **The image must be built with `--features apns-live`.** The feature is off by
+   default so the crate builds and unit-tests without Apple credentials; without
+   it the push sender is compiled out and replaced by a no-op
+   (`lib.rs::push_sender`). `remote/relay/Dockerfile` passes it on both `cargo
+   build` invocations.
+2. **All four config variables must be present.** `ApnsConfig::from_env` returns
+   `None` — push disabled — unless it has `APNS_TEAM_ID`, `APNS_KEY_ID`,
+   `APNS_TOPIC` and the auth key. `relay-deploy.yml` re-asserts them on every
+   deploy for the same reason it re-asserts `FLIGHTDECK_RELAY_STORE`, and logs a
+   workflow warning when they are missing rather than deploying a mute relay.
+
+The auth key is an **APNs auth key** (Apple Developer portal → Keys → Apple Push
+Notification service) — a different key from the App Store Connect API key used
+to upload builds. It is held as a Container App *secret* and injected inline via
+`APNS_AUTH_KEY_PEM`, which avoids provisioning a secret volume for one file.
+`APNS_AUTH_KEY_PATH` still works for local runs.
+
+`APNS_ENVIRONMENT` is deliberately left unset: it is only the fallback for tokens
+that arrive without one, and the phone reports its own environment per token
+(`development` for Debug builds, `production` for TestFlight/App Store). Debug
+and TestFlight installs are therefore routed to the right APNs host
+simultaneously, from one key.
+
+To verify the credentials without a device, mint a provider JWT and POST to a
+bogus token — `BadDeviceToken` means the key, key id, team and topic are all
+good, whereas `403 InvalidProviderToken` means they are not:
+
+```bash
+curl -s --http2 -H "authorization: bearer $JWT" \
+  -H "apns-topic: agency.neworange.flightdeck.remote" \
+  -H "apns-push-type: background" -d '{"aps":{"content-available":1}}' \
+  "https://api.push.apple.com/3/device/$(printf '0%.0s' {1..64})"
+```
+
+Once live, `az containerapp logs show -g <rg> -n <app>` surfaces the APNs
+response, so a token registered against the wrong environment shows up as
+`BadDeviceToken` rather than silence.
+
+## How deploys happen
+
+`.github/workflows/relay-deploy.yml` runs when a **GitHub Release is published**
+(or via manual `workflow_dispatch`): it builds the image, pushes it to ACR, runs
+`az containerapp update`, then verifies `/version` reports the new SHA. CI
+(fmt / clippy / test / docker build-check) is separate, in `relay.yml`, on every
+push/PR touching `remote/**`.
+
+Auth is **GitHub OIDC** — no Azure secret is stored in the repo. The deploy job
+binds to the `production` GitHub environment; the deploy identity's federated
+credential trusts exactly `repo:<owner>/<repo>:environment:production`, and
+`azure/login` exchanges the short-lived GitHub token for an Azure token.
+
+> `release` events run the workflow file from the repository's **default
+> branch**, so `relay-deploy.yml` must be on `main` for release publishes to
+> trigger it.
+
+### GitHub configuration
+
+Repo **variables**: `AZURE_RESOURCE_GROUP`, `AZURE_ACR_NAME`,
+`AZURE_CONTAINERAPP_NAME`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`
+(none of these three are secrets — the team id ships inside every signed binary
+and the topic is the bundle id).
+Repo **secrets**: `AZURE_CLIENT_ID` (the deploy identity's client id),
+`AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` — OIDC identifiers, not credentials —
+plus `FLIGHTDECK_RELAY_PASSWORD` and `APNS_AUTH_KEY` (the `.p8` contents).
+
+## Reproducing the setup
+
+Fill the variables in, then run top to bottom. Idempotent-ish (safe to re-run).
+
+```bash
+SUB=<SUBSCRIPTION_ID>
+RG=<RESOURCE_GROUP>
+ACR=<ACR_NAME>              # globally unique, alphanumeric
+ENVNAME=<ENV_NAME>
+APP=<APP_NAME>
+REPO=<owner>/<repo>
+REGION=northeurope         # see the capacity note above
+
+az account set --subscription "$SUB"
+az extension add --name containerapp --upgrade
+
+# 1. Resource group + registry.
+az group create -n "$RG" -l "$REGION"
+az acr create -g "$RG" -n "$ACR" --sku Basic -l "$REGION"
+
+# 2. Pull identity + AcrPull, then cloud-build the image (no local Docker).
+az identity create -g "$RG" -n "$APP-pull"
+PULL_PRINCIPAL=$(az identity show -g "$RG" -n "$APP-pull" --query principalId -o tsv)
+ACR_ID=$(az acr show -n "$ACR" --query id -o tsv)
+az role assignment create --assignee-object-id "$PULL_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID"
+( cd .. && az acr build --registry "$ACR" \
+    --image flightdeck-relay:latest --file relay/Dockerfile . )   # run from remote/
+
+# 3. Container Apps environment.
+az containerapp env create -g "$RG" -n "$ENVNAME" -l "$REGION" --logs-destination log-analytics
+
+# 4. The app — pull via the user-assigned identity, single small replica.
+PULL_ID_RID=$(az identity show -g "$RG" -n "$APP-pull" --query id -o tsv)
+az containerapp create -g "$RG" -n "$APP" --environment "$ENVNAME" \
+  --image "$ACR.azurecr.io/flightdeck-relay:latest" \
+  --user-assigned "$PULL_ID_RID" \
+  --registry-server "$ACR.azurecr.io" --registry-identity "$PULL_ID_RID" \
+  --target-port 8080 --ingress external --transport auto \
+  --min-replicas 1 --max-replicas 1 --cpu 0.25 --memory 0.5Gi \
+  --env-vars PORT=8080 LOG_FORMAT=json GIT_SHA=latest
+
+# 5. GitHub OIDC deploy identity: federated credential for the production
+#    environment, AcrPush + Container Registry Tasks Contributor on the
+#    registry, Contributor on the app only.
+az identity create -g "$RG" -n "$APP-gha"
+az identity federated-credential create --identity-name "$APP-gha" -g "$RG" \
+  --name gha-production \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject "repo:${REPO}:environment:production" \
+  --audiences api://AzureADTokenExchange
+GHA_PRINCIPAL=$(az identity show -g "$RG" -n "$APP-gha" --query principalId -o tsv)
+APP_ID=$(az containerapp show -g "$RG" -n "$APP" --query id -o tsv)
+az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role AcrPush --scope "$ACR_ID"
+# web-deploy's `az acr build` step needs this role too — AcrPush alone isn't
+# enough to run ACR Tasks builds.
+az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role "Container Registry Tasks Contributor" --scope "$ACR_ID"
+az role assignment create --assignee-object-id "$GHA_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role Contributor --scope "$APP_ID"
+
+# 6. Wire GitHub (gh CLI, repo admin).
+GHA_CLIENT_ID=$(az identity show -g "$RG" -n "$APP-gha" --query clientId -o tsv)
+gh api -X PUT "repos/${REPO}/environments/production" --silent
+gh variable set AZURE_RESOURCE_GROUP    --repo "$REPO" --body "$RG"
+gh variable set AZURE_ACR_NAME          --repo "$REPO" --body "$ACR"
+gh variable set AZURE_CONTAINERAPP_NAME --repo "$REPO" --body "$APP"
+gh secret   set AZURE_CLIENT_ID         --repo "$REPO" --body "$GHA_CLIENT_ID"
+gh secret   set AZURE_TENANT_ID         --repo "$REPO" --body "$(az account show --query tenantId -o tsv)"
+gh secret   set AZURE_SUBSCRIPTION_ID   --repo "$REPO" --body "$SUB"
+```
+
+## Cost (rough — verify on the Azure pricing calculator)
+
+- App, always-on 0.25 vCPU / 0.5 GiB, single replica: ~$12–15/mo. A held-open
+  WebSocket bills at the active rate, so scale-to-zero savings don't apply —
+  `minReplicas: 1` is intentional (avoids reconnect cold-starts).
+- ACR Basic: ~$5/mo. · Log Analytics: within the free grant at this volume.
+
+≈ **$17–20/month**. To drop the ACR cost, images could move to GitHub Container
+Registry (free) with an ACA registry credential — not done here, to keep the
+pull path on managed identity (no PAT to rotate).
+
+## Not addressed yet
+
+- **Horizontal scale (`maxReplicas > 1`)** — the persistent store (see above)
+  survives restarts/reschedules but is a single exclusive-locked SQLite file, so
+  it does not yet enable multiple replicas. That needs a networked `RelayStore`
+  (Redis / Azure Table) so both legs of a pairing can land on different replicas
+  (`../src/store.rs`).

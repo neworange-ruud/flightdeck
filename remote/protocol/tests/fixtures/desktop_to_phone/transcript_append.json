@@ -1,0 +1,14 @@
+{
+  "type": "transcript_append",
+  "session_id": "sess_fix_login",
+  "from_index": 5,
+  "replace": false,
+  "items": [
+    {
+      "type": "agent_message",
+      "item_id": "item_0006",
+      "text": "Denied. I'll leave dist/ in place and clean it another way.",
+      "at_ms": 1752412740000
+    }
+  ]
+}

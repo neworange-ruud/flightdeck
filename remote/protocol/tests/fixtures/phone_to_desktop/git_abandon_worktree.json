@@ -1,0 +1,7 @@
+{
+  "command_id": "cmd_0000000a",
+  "issued_at_ms": 1752412819000,
+  "type": "git_abandon_worktree",
+  "session_id": "sess_fix_login",
+  "confirm_name": "fix-login"
+}
