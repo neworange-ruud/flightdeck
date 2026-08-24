@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.16.0] - 2026-08-24
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - **Remote now works on Windows.** Enabling remote on a Windows build failed
   immediately with `wss is not supported on this build`, so the phone could
   never reach the hosted relay — the Windows binary was compiled without any TLS
