@@ -1623,3 +1623,37 @@ fn retiring_is_idempotent_and_keeps_the_claimed_pairing() {
     assert!(retired.is_empty());
     assert_eq!(state.pairing_ids(), vec!["pair_only".to_string()]);
 }
+
+// --- wss is compiled in on every platform (remote-control-2jy) --------------
+
+#[test]
+fn wss_reaches_the_tls_handshake_on_every_platform() {
+    // The windows-msvc build used to ship with no TLS backend at all, so
+    // `connect()` refused every `wss://` URL outright — which meant the default
+    // relay (`wss://relay.flightdeckai.app/ws`) could never be reached from
+    // Windows. Guard that: a `wss://` connect must now get past the scheme and
+    // fail in the *TLS handshake*, whichever backend this target was built with
+    // (rustls off Windows, SChannel on Windows).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Accept the TCP connection, then hang up without speaking TLS. The client's
+    // ClientHello read hits EOF immediately, so the handshake fails fast instead
+    // of parking on HANDSHAKE_TIMEOUT.
+    let mock = std::thread::spawn(move || {
+        drop(accept_within(&listener));
+    });
+
+    // `RelaySocket` is deliberately not `Debug` (it owns live sockets), so unwrap
+    // the error by hand rather than via `expect_err`.
+    let err = match connect(&format!("wss://{addr}/ws")) {
+        Err(e) => e,
+        Ok(_) => panic!("there is no TLS peer here to shake hands with"),
+    };
+    mock.join().unwrap();
+
+    assert!(
+        err.starts_with("tls upgrade:"),
+        "wss must reach the TLS handshake on this platform, got: {err}"
+    );
+}

@@ -16,7 +16,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Remote now works on Windows.** Enabling remote on a Windows build failed
+  immediately with `wss is not supported on this build`, so the phone could
+  never reach the hosted relay — the Windows binary was compiled without any TLS
+  backend, because the one used everywhere else needs a C toolchain that the
+  release build deliberately avoids. Windows now speaks `wss://` through
+  SChannel, the TLS stack built into the OS, and the binary stays free of that C
+  toolchain.
 
 ## [1.15.0] - 2026-08-21
 
