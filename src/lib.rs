@@ -1478,6 +1478,18 @@ fn event_loop(
                             }
                         }
                     }
+                    RemoteInbound::HandshakeFailed { reason, retrying } => {
+                        // The relay link never reached `auth_ok`, so no pairing
+                        // code can arrive. Tell the overlay why: a refusal (no
+                        // relay password configured, for instance) fails the
+                        // attempt, a transient failure just explains the wait.
+                        // Without this the overlay showed "Requesting a pairing
+                        // code from the relay…" forever while the client
+                        // backoff-looped in silence.
+                        if let Some(ps) = pairing_session.as_mut() {
+                            ps.on_handshake_failed(reason, *retrying);
+                        }
+                    }
                     RemoteInbound::PairingRejected { .. } => {
                         // The relay no longer recognizes our pairing; the client
                         // dropped the stale record and will re-offer. Give the
@@ -1845,7 +1857,12 @@ fn remote_pairing_view(session: &PairingSession, now_ms: u64) -> RemotePairing {
     use crate::remote::pairing::{qr_art, PairingPhase};
     match session.phase() {
         PairingPhase::Idle | PairingPhase::Offering => RemotePairing {
-            status_line: "Requesting a pairing code from the relay…".to_string(),
+            // A stalling relay handshake names itself here; only a genuinely
+            // quiet wait gets the bland line.
+            status_line: session
+                .stall_reason()
+                .map(str::to_string)
+                .unwrap_or_else(|| "Requesting a pairing code from the relay…".to_string()),
             ..RemotePairing::default()
         },
         PairingPhase::Displaying {

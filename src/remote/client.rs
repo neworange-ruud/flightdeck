@@ -577,6 +577,18 @@ fn ended_unauthed() -> SessionEnd {
     }
 }
 
+/// Tell the app *why* a handshake never reached `auth_ok`, so the pairing
+/// overlay can explain itself instead of spinning on "Requesting a pairing
+/// code…" while the supervisor backoff-loops invisibly (the Windows-pairing
+/// report: a relay that refuses the connection looked identical to a relay that
+/// was simply slow). Best-effort — a closed channel means the app is gone.
+fn report_handshake_failure(inbound_tx: &Sender<RemoteInbound>, reason: String, retrying: bool) {
+    crate::remote::debuglog::log(&format!(
+        "client HANDSHAKE failed retrying={retrying} reason={reason}"
+    ));
+    let _ = inbound_tx.send(RemoteInbound::HandshakeFailed { reason, retrying });
+}
+
 /// Whether a just-ended session justifies resetting the reconnect backoff to
 /// zero. Only a session that reached `auth_ok` **and** then stayed authenticated
 /// for at least `min_stable` counts as healthy; a post-auth flap does not, so a
@@ -783,7 +795,11 @@ fn run_session(
             // retries forever with the user seeing only "reconnecting" and zero
             // signal about why (remote-control-0ef.20).
             crate::remote::debuglog::log(&format!("client CONNECT failed url={url} err={e}"));
-            eprintln!("flightdeck-remote: connect to {url} failed: {e}");
+            // NOT `eprintln!`: this runs under a full-screen TUI on the alternate
+            // screen, where a stray stderr line lands on top of the rendered
+            // frame. The reason now reaches the UI over the inbound channel
+            // instead, which is where a user can actually act on it.
+            report_handshake_failure(inbound_tx, format!("cannot reach the relay: {e}"), true);
             return ended_unauthed();
         }
     };
@@ -797,6 +813,11 @@ fn run_session(
         relay_password: effective_relay_password(cfg),
     };
     if send_frame(&mut sock, &hello).is_err() {
+        report_handshake_failure(
+            inbound_tx,
+            "the connection dropped while greeting the relay".to_string(),
+            true,
+        );
         return ended_unauthed();
     }
 
@@ -851,6 +872,11 @@ fn run_session(
             return SessionEnd::Stopped;
         }
         if Instant::now() > deadline {
+            report_handshake_failure(
+                inbound_tx,
+                "the relay did not finish the handshake in time".to_string(),
+                true,
+            );
             return ended_unauthed();
         }
 
@@ -862,6 +888,12 @@ fn run_session(
                     Ok(RemoteOutbound::RequestPairing { claim_token_hint }) => {
                         let offer = build_pairing_offer(identity, claim_token_hint);
                         if send_frame(&mut sock, &offer).is_err() {
+                            report_handshake_failure(
+                                inbound_tx,
+                                "the connection dropped while requesting a pairing code"
+                                    .to_string(),
+                                true,
+                            );
                             return ended_unauthed();
                         }
                         offer_sent = true;
@@ -887,7 +919,14 @@ fn run_session(
 
         match read_frame(&mut sock) {
             Incoming::Idle => continue,
-            Incoming::Closed => return ended_unauthed(),
+            Incoming::Closed => {
+                report_handshake_failure(
+                    inbound_tx,
+                    "the relay closed the connection during the handshake".to_string(),
+                    true,
+                );
+                return ended_unauthed();
+            }
             Incoming::Frame(frame) => match *frame {
                 RelayFrame::HelloOk { .. } => saw_hello_ok = true,
                 RelayFrame::VersionIncompatible {
@@ -952,7 +991,23 @@ fn run_session(
                     on_authenticated(&mut sock, state, inbound_tx, pairing_ids);
                     break;
                 }
-                RelayFrame::Error { code, .. } => {
+                RelayFrame::Error { code, message, .. } => {
+                    // The relay told us why, so pass that on verbatim-ish: a
+                    // refusal here (a missing/wrong `relay_password`, an unknown
+                    // device) is a *configuration* fault that no amount of
+                    // reconnecting clears, and the pairing overlay used to sit on
+                    // "Requesting a pairing code…" through every silent retry.
+                    report_handshake_failure(
+                        inbound_tx,
+                        format!("the relay refused the connection: {message}"),
+                        // `rate_limited` and friends do clear on their own, so
+                        // only an outright rejection of this device counts as
+                        // terminal.
+                        !matches!(
+                            code,
+                            RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
+                        ),
+                    );
                     // A returning desktop that authed-first and got rejected: the
                     // relay does not recognize our device/pairing (its store was
                     // likely wiped). Surface it as a distinct end so the

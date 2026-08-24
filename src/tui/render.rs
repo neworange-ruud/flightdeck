@@ -1941,22 +1941,184 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
     frame.render_widget(para, overlay_area);
 }
 
-/// Draw the desktop pairing overlay (Settings → Remote, spec §5.2): the QR code
-/// (rendered as black-on-white half-block cells so a phone camera can scan it),
-/// the 4-digit code, an expiry countdown, and the pairing status. When the
-/// terminal is too small for the QR it honestly shows the code plus a note.
-pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rect) {
+/// The overlay's minimum content width, so a codes-only surface still reads as a
+/// dialog rather than a sliver.
+const PAIRING_MIN_CONTENT_W: u16 = 44;
+/// Left + right border plus one column of padding on each side.
+const PAIRING_BORDERED_CHROME_W: u16 = 4;
+/// Top + bottom border rows.
+const PAIRING_BORDER_H: u16 = 2;
+
+/// How the pairing overlay decided to lay itself out for a given terminal size:
+/// which frame it drew and which optional rows survived the height budget.
+///
+/// Split out from the drawing so the fit logic — the part that decides whether a
+/// phone can scan anything at all — is unit-testable at exact terminal sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingLayout {
+    /// Draw the titled border (false = borderless, which buys back two rows).
+    bordered: bool,
+    /// Render the QR art.
+    show_qr: bool,
+    /// Render the "terminal too small" note (only when a QR exists but no room).
+    note: Vec<String>,
+    /// Content width the text is wrapped to.
+    content_w: u16,
+    /// Wrapped status-line rows.
+    status: Vec<String>,
+    /// Whether a claim code row is rendered (never dropped when present).
+    has_code: bool,
+    /// Optional rows that fit, in drop order.
+    show_countdown: bool,
+    show_gap_after_art: bool,
+    show_esc: bool,
+    show_gap_before_status: bool,
+}
+
+impl PairingLayout {
+    /// Total content rows this layout renders (excluding the border).
+    fn content_h(&self, qr_h: u16) -> u16 {
+        (if self.show_qr { qr_h } else { 0 })
+            + self.note.len() as u16
+            + u16::from(self.show_gap_after_art)
+            + u16::from(self.has_code)
+            + u16::from(self.show_countdown)
+            + u16::from(self.show_gap_before_status)
+            + self.status.len() as u16
+            + u16::from(self.show_esc)
+    }
+}
+
+/// Decide the pairing overlay's layout for `area`.
+///
+/// The QR is what a phone actually scans, so it is fitted **first** and the
+/// chrome around it is what gives way: the countdown, the spacers and the "Esc
+/// to close" hint are dropped in that order, and if the box's own border is what
+/// tips the QR off screen the border goes too. The previous fixed 10-row chrome
+/// budget meant a real 57x29 `fdr1:` QR needed a 61x39 terminal — so a
+/// default-size Windows Terminal (~120x30) only ever showed the fallback note,
+/// never a scannable code.
+fn pairing_layout(pairing: &RemotePairing, area: Rect) -> PairingLayout {
     let qr_w = pairing.qr_width as u16;
     let qr_h = pairing.qr_rows.len() as u16;
-    // Non-QR chrome: title border + code + countdown + blank lines + status +
-    // footer. A generous fixed budget so the fit test is conservative.
-    const CHROME_H: u16 = 10;
-    let qr_fits =
-        !pairing.qr_rows.is_empty() && qr_w + 4 <= area.width && qr_h + CHROME_H <= area.height;
+    let has_qr = !pairing.qr_rows.is_empty();
+    let has_code = pairing.code.is_some();
 
-    let content_w = if qr_fits { qr_w.max(44) } else { 44 };
-    let box_w = (content_w + 4).min(area.width);
-    let box_h = if qr_fits { qr_h + CHROME_H } else { CHROME_H }.min(area.height);
+    // The only row that never gives way beside the art: the claim code, so the
+    // manual path always stays available. The status line *is* droppable while a
+    // QR is on screen — "Scan the QR or type the code" says nothing the visible
+    // QR and code do not, and giving it up is what lets a 29-row QR plus its
+    // code land in a 30-row terminal. With no QR the status is the only
+    // explanation there is, so it becomes required (see `budget` below).
+    let qr_content_w = qr_w.max(PAIRING_MIN_CONTENT_W);
+    let art_required_h = u16::from(has_code);
+    let qr_bordered = has_qr
+        && qr_content_w + PAIRING_BORDERED_CHROME_W <= area.width
+        && qr_h + PAIRING_BORDER_H + art_required_h <= area.height;
+    let qr_borderless = has_qr
+        && !qr_bordered
+        && qr_content_w <= area.width
+        && qr_h + art_required_h <= area.height;
+
+    let show_qr = qr_bordered || qr_borderless;
+    let bordered = !qr_borderless;
+    let content_w = if show_qr {
+        qr_content_w
+    } else {
+        PAIRING_MIN_CONTENT_W
+    }
+    .min(area.width.saturating_sub(if bordered {
+        PAIRING_BORDERED_CHROME_W
+    } else {
+        0
+    }))
+    .max(1);
+
+    let status_lines = wrap_message(&pairing.status_line, content_w as usize);
+    // Name the smallest terminal that would show the QR (the borderless fit) —
+    // a bare "too small" leaves the user guessing which dimension to grow.
+    let note_text = format!(
+        "Terminal too small for the QR (needs {}x{}, have {}x{}) — enter the code below.",
+        qr_content_w,
+        qr_h + art_required_h,
+        area.width,
+        area.height
+    );
+
+    let mut budget = area
+        .height
+        .saturating_sub(if bordered { PAIRING_BORDER_H } else { 0 })
+        .saturating_sub(if show_qr { qr_h } else { 0 })
+        .saturating_sub(u16::from(has_code))
+        // With no art, the status is required rather than budgeted.
+        .saturating_sub(if show_qr {
+            0
+        } else {
+            status_lines.len() as u16
+        });
+    let mut take = |n: u16| -> bool {
+        if n > 0 && budget >= n {
+            budget -= n;
+            true
+        } else {
+            false
+        }
+    };
+
+    let note = if has_qr && !show_qr {
+        let lines = wrap_message(&note_text, content_w as usize);
+        if take(lines.len() as u16) {
+            lines
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    // Highest-value optional row first: with the QR up, the status only makes it
+    // in when there is height to spare.
+    let status = if show_qr && !take(status_lines.len() as u16) {
+        Vec::new()
+    } else {
+        status_lines
+    };
+    let show_countdown = pairing.seconds_remaining.is_some() && take(1);
+    let show_gap_after_art = (show_qr || !note.is_empty()) && take(1);
+    let show_esc = take(1);
+    let show_gap_before_status = take(1);
+
+    PairingLayout {
+        bordered,
+        show_qr,
+        note,
+        content_w,
+        status,
+        has_code,
+        show_countdown,
+        show_gap_after_art,
+        show_esc,
+        show_gap_before_status,
+    }
+}
+
+/// Draw the desktop pairing overlay (Settings → Remote, spec §5.2): the QR code
+/// (rendered as black-on-white half-block cells so a phone camera can scan it),
+/// the 4-digit code, an expiry countdown, and the pairing status. The layout
+/// adapts to the terminal ([`pairing_layout`]); when even a borderless QR cannot
+/// fit it honestly shows the code plus the size the QR would need.
+pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rect) {
+    let qr_h = pairing.qr_rows.len() as u16;
+    let l = pairing_layout(pairing, area);
+
+    let box_w = (l.content_w
+        + if l.bordered {
+            PAIRING_BORDERED_CHROME_W
+        } else {
+            0
+        })
+    .min(area.width);
+    let box_h =
+        (l.content_h(qr_h) + if l.bordered { PAIRING_BORDER_H } else { 0 }).min(area.height);
     let overlay = layout::centered_overlay(area, box_w, box_h);
     frame.render_widget(Clear, overlay);
 
@@ -1967,26 +2129,33 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
     } else {
         Color::Cyan
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
-        .title(" Pair Phone ");
-    let inner = block.inner(overlay);
-    frame.render_widget(block, overlay);
+    let inner = if l.bordered {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .title(" Pair Phone ");
+        let inner = block.inner(overlay);
+        frame.render_widget(block, overlay);
+        inner
+    } else {
+        overlay
+    };
 
     let mut lines: Vec<Line> = Vec::new();
-    if qr_fits {
+    if l.show_qr {
         // Each row: black modules (foreground) on a white background.
         let style = Style::default().fg(Color::Black).bg(Color::White);
         for row in &pairing.qr_rows {
             lines.push(Line::from(Span::styled(row.clone(), style)));
         }
-        lines.push(Line::raw(""));
-    } else if !pairing.qr_rows.is_empty() {
+    }
+    for note in &l.note {
         lines.push(Line::from(Span::styled(
-            "Terminal too small for the QR — enter the code below.",
+            note.clone(),
             Style::default().fg(Color::Yellow),
         )));
+    }
+    if l.show_gap_after_art {
         lines.push(Line::raw(""));
     }
     if let Some(code) = &pairing.code {
@@ -1997,22 +2166,27 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    if let Some(secs) = pairing.seconds_remaining {
+    if let (true, Some(secs)) = (l.show_countdown, pairing.seconds_remaining) {
         lines.push(Line::from(Span::styled(
             format!("expires in {secs}s"),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        pairing.status_line.clone(),
-        Style::default().fg(accent),
-    )));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Esc to close",
-        Style::default().fg(Color::DarkGray),
-    )));
+    if l.show_gap_before_status {
+        lines.push(Line::raw(""));
+    }
+    for row in &l.status {
+        lines.push(Line::from(Span::styled(
+            row.clone(),
+            Style::default().fg(accent),
+        )));
+    }
+    if l.show_esc {
+        lines.push(Line::from(Span::styled(
+            "Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     let para = Paragraph::new(lines).alignment(Alignment::Center);
     frame.render_widget(para, inner);
@@ -3732,5 +3906,150 @@ mod tests {
         // App mode + setting off → no dim.
         ui.dim_terminal_in_app_mode = false;
         assert!(!super::dim_terminal(false, &ui));
+    }
+
+    // --- Pairing overlay layout (remote pairing on small terminals) --------
+
+    /// A `RemotePairing` carrying art the size a real `fdr1:` payload produces:
+    /// 57 cells wide, 29 half-block rows (measured through
+    /// `remote::pairing::qr_art`). The exact numbers are the point — they are
+    /// what the fixed chrome budget used to push off screen.
+    fn displaying_pairing() -> RemotePairing {
+        RemotePairing {
+            status_line: "Scan the QR or type the code on your phone — waiting…".to_string(),
+            code: Some("4729".to_string()),
+            qr_rows: vec!["#".repeat(57); 29],
+            qr_width: 57,
+            seconds_remaining: Some(120),
+            done: false,
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn pairing_layout_shows_qr_and_code_in_thirty_row_terminal() {
+        // A default-size Windows Terminal: 29 QR rows + the code line is exactly
+        // 30, so the QR gets in — borderless, with the droppable status gone.
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 120, 30));
+        assert!(l.show_qr, "the QR must fit a 120x30 terminal");
+        assert!(!l.bordered, "the border must give way before the QR does");
+        assert!(l.has_code, "the manual code is never dropped");
+        assert!(l.status.is_empty(), "the status yields at this height");
+        assert!(!l.show_countdown && !l.show_esc);
+        assert_eq!(
+            l.content_h(29),
+            30,
+            "must fill the height exactly, not exceed it"
+        );
+    }
+
+    #[test]
+    fn pairing_layout_keeps_border_and_chrome_when_tall_enough() {
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 120, 40));
+        assert!(l.show_qr && l.bordered);
+        assert_eq!(l.status.len(), 1);
+        assert!(l.show_countdown, "the countdown returns once there is room");
+        assert!(l.show_esc);
+        assert!(l.content_h(29) + PAIRING_BORDER_H <= 40);
+    }
+
+    #[test]
+    fn pairing_layout_restores_chrome_in_priority_order_as_height_grows() {
+        // Each extra row buys back the next-most-useful piece of chrome, and no
+        // layout ever claims more rows than the terminal has.
+        let p = displaying_pairing();
+        let mut seen_status = false;
+        let mut seen_countdown = false;
+        for h in 30..=40u16 {
+            let l = pairing_layout(&p, Rect::new(0, 0, 120, h));
+            let used = l.content_h(29) + if l.bordered { PAIRING_BORDER_H } else { 0 };
+            assert!(used <= h, "layout at height {h} used {used} rows");
+            assert!(l.show_qr, "the QR fits every height from 30 up");
+            if !l.status.is_empty() {
+                seen_status = true;
+            }
+            if l.show_countdown {
+                assert!(seen_status, "the status is restored before the countdown");
+                seen_countdown = true;
+            }
+            if l.show_esc {
+                assert!(seen_countdown, "the countdown is restored before the hint");
+            }
+        }
+        assert!(seen_countdown, "a 40-row terminal shows the countdown");
+    }
+
+    #[test]
+    fn pairing_layout_names_the_size_the_qr_needs_when_it_cannot_fit() {
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 80, 20));
+        assert!(!l.show_qr);
+        assert!(l.bordered, "the fallback keeps the dialog frame");
+        let note = l.note.join(" ");
+        assert!(
+            note.contains("57x30") && note.contains("80x20"),
+            "the note must name both the needed and the actual size: {note}"
+        );
+        assert!(l.has_code, "the code is what the user falls back to");
+        assert!(
+            !l.status.is_empty(),
+            "with no QR the status is required, wrapped to the 44-column box"
+        );
+    }
+
+    #[test]
+    fn pairing_layout_wraps_a_long_relay_failure_message() {
+        // The relay-refused message is far longer than the overlay is wide; it
+        // must wrap rather than be truncated to its first 44 columns.
+        let pairing = RemotePairing {
+            status_line: "the relay refused the connection: relay password required. \
+                          Check [remote] relay_url / relay_password in your configuration, \
+                          then try again."
+                .to_string(),
+            code: None,
+            qr_rows: Vec::new(),
+            qr_width: 0,
+            seconds_remaining: None,
+            done: false,
+            failed: true,
+        };
+        let l = pairing_layout(&pairing, Rect::new(0, 0, 120, 30));
+        assert!(
+            l.status.len() > 2,
+            "long failure text must wrap: {:?}",
+            l.status
+        );
+        for row in &l.status {
+            assert!(row.chars().count() <= l.content_w as usize);
+        }
+        assert!(l.note.is_empty(), "no QR was offered, so no size note");
+    }
+
+    #[test]
+    fn draw_remote_overlay_paints_qr_rows_in_a_thirty_row_terminal() {
+        let pairing = displaying_pairing();
+        let mut term = test_terminal(120, 30);
+        term.draw(|f| {
+            let area = f.area();
+            draw_remote_overlay(f, &pairing, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains(&"#".repeat(57)),
+            "a full QR row must reach the buffer at 120x30"
+        );
+        assert!(text.contains("Code  4729"));
+    }
+
+    #[test]
+    fn draw_remote_overlay_survives_a_tiny_terminal() {
+        let pairing = displaying_pairing();
+        let mut term = test_terminal(20, 4);
+        term.draw(|f| {
+            let area = f.area();
+            draw_remote_overlay(f, &pairing, area);
+        })
+        .unwrap();
     }
 }

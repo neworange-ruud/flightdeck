@@ -1657,3 +1657,109 @@ fn wss_reaches_the_tls_handshake_on_every_platform() {
         "wss must reach the TLS handshake on this platform, got: {err}"
     );
 }
+
+// --- Handshake failures are reported, not swallowed ------------------------
+
+/// The relay refusing the connection outright — what the hosted relay does to a
+/// desktop with no `relay_password` configured, verbatim: `error auth_failed
+/// "relay password required"` straight after `hello`. The client must tell the
+/// app *why*, with `retrying: false`, so the pairing overlay can stop waiting
+/// for a code that can never come instead of sitting on "Requesting a pairing
+/// code from the relay…" through every silent backoff retry.
+#[test]
+fn relay_refusing_the_password_reports_a_terminal_handshake_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+
+    let mock = std::thread::spawn(move || {
+        let stream = match accept_within(&listener) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut ws = tungstenite::accept(stream).unwrap();
+        if !matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })) {
+            return;
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::AuthFailed,
+                message: "relay password required".to_string(),
+                pairing_id: None,
+                expected_seq: None,
+            },
+        );
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    let mut report: Option<(String, bool)> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while report.is_none() && Instant::now() < deadline {
+        if let Ok(RemoteInbound::HandshakeFailed { reason, retrying }) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            report = Some((reason, retrying));
+        }
+    }
+    handle.stop();
+    let _ = mock.join();
+
+    let (reason, retrying) = report.expect("a refused handshake must be reported to the app");
+    assert!(
+        reason.contains("relay password required"),
+        "the relay's own words must reach the UI: {reason}"
+    );
+    assert!(
+        !retrying,
+        "a refusal is a configuration fault; retrying cannot clear it"
+    );
+}
+
+/// A relay that cannot be reached at all (nothing listening) must also report —
+/// but as retryable, so the overlay explains the wait rather than giving up.
+#[test]
+fn unreachable_relay_reports_a_retryable_handshake_failure() {
+    // Bind then drop, so the port is (almost certainly) closed but well-formed.
+    let addr = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle =
+        RemoteHandle::start_with_store(cfg, DeviceIdentity::generate(), store, in_tx, out_rx);
+
+    let mut report: Option<(String, bool)> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while report.is_none() && Instant::now() < deadline {
+        if let Ok(RemoteInbound::HandshakeFailed { reason, retrying }) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            report = Some((reason, retrying));
+        }
+    }
+    handle.stop();
+
+    let (reason, retrying) = report.expect("an unreachable relay must be reported to the app");
+    assert!(
+        reason.contains("cannot reach the relay"),
+        "unexpected reason: {reason}"
+    );
+    assert!(retrying, "a connect failure may clear on its own");
+}

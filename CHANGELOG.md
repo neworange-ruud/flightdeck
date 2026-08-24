@@ -12,11 +12,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **The pairing QR now fits an ordinary terminal window.** A real pairing QR is
+  57 columns by 29 rows, and the overlay reserved a fixed 10 rows around it — so
+  anything shorter than 39 rows (a default-size terminal window included) only
+  ever showed "Terminal too small for the QR" and a code to type by hand. The
+  overlay now fits the QR first and gives up its own chrome to do it: the
+  countdown, the spacers, the "Esc to close" hint and finally the border step
+  aside in that order, which lands a full QR in a 30-row window. When it truly
+  cannot fit, the note names the size the QR needs and the size you have.
 
 ### Bug fixes
 
-- None yet.
+- **Pairing a phone no longer waits silently on a relay that said no.** If the
+  relay refused the connection — most often no `relay_password` set for the
+  hosted relay — the pairing overlay sat on "Requesting a pairing code from the
+  relay…" forever while the client reconnected in the background, giving no hint
+  that a code was never coming. The overlay now says what the relay said and
+  points at the settings to fix, and a relay that is merely unreachable explains
+  the wait instead of looking identical to a refusal.
 
 ## [1.16.0] - 2026-08-24
 
