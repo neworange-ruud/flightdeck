@@ -370,14 +370,14 @@ fn client_info() -> ClientInfo {
     }
 }
 
-// --- Socket abstraction (plain ws + optional wss) --------------------------
+// --- Socket abstraction (plain ws + wss) -----------------------------------
 
-/// A connected relay socket. `wss` (rustls) is available on every platform
-/// except Windows, mirroring the self-update crypto gating that keeps the
-/// windows-msvc binary pure-Rust; Windows gets plain `ws://` only.
+/// A connected relay socket. `wss` works on every platform, but through a
+/// different TLS backend per target: rustls off Windows, SChannel (via
+/// `native-tls`) on Windows, where rustls' aws-lc dependency would cost the
+/// release runner a C toolchain. See the two tungstenite entries in Cargo.toml.
 enum RelaySocket {
     Plain(Box<WebSocket<TcpStream>>),
-    #[cfg(not(windows))]
     Tls(Box<WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>>),
 }
 
@@ -388,7 +388,6 @@ impl RelaySocket {
     fn read(&mut self) -> tungstenite::Result<Message> {
         match self {
             RelaySocket::Plain(ws) => ws.read(),
-            #[cfg(not(windows))]
             RelaySocket::Tls(ws) => ws.read(),
         }
     }
@@ -397,7 +396,6 @@ impl RelaySocket {
     fn send(&mut self, msg: Message) -> tungstenite::Result<()> {
         match self {
             RelaySocket::Plain(ws) => ws.send(msg),
-            #[cfg(not(windows))]
             RelaySocket::Tls(ws) => ws.send(msg),
         }
     }
@@ -407,7 +405,6 @@ impl RelaySocket {
             RelaySocket::Plain(ws) => {
                 let _ = ws.close(None);
             }
-            #[cfg(not(windows))]
             RelaySocket::Tls(ws) => {
                 let _ = ws.close(None);
             }
@@ -422,14 +419,21 @@ impl RelaySocket {
     /// the pump reading at the 10s handshake timeout on Windows — making dropped
     /// connections take ~10s to notice and reconnects miss their deadline.
     fn set_read_timeout(&self, dur: Duration) {
+        use tungstenite::stream::MaybeTlsStream;
         let _ = match self {
             RelaySocket::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
-            #[cfg(not(windows))]
+            // Every backend variant is spelled out on purpose. A catch-all arm
+            // here silently no-ops for whichever backend it swallows, leaving
+            // the pump reading at the handshake timeout — the exact bug the
+            // doc comment above describes, but invisible instead of loud.
             RelaySocket::Tls(ws) => match ws.get_ref() {
-                tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(dur)),
-                tungstenite::stream::MaybeTlsStream::Rustls(s) => {
-                    s.sock.set_read_timeout(Some(dur))
-                }
+                MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(dur)),
+                #[cfg(not(windows))]
+                MaybeTlsStream::Rustls(s) => s.sock.set_read_timeout(Some(dur)),
+                #[cfg(windows)]
+                MaybeTlsStream::NativeTls(s) => s.get_ref().set_read_timeout(Some(dur)),
+                // `MaybeTlsStream` is `#[non_exhaustive]`, so a wildcard is
+                // required even with both known variants covered.
                 _ => Ok(()),
             },
         };
@@ -510,16 +514,12 @@ fn connect(url: &str) -> Result<RelaySocket, String> {
     tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
 
     let sock = if secure {
-        #[cfg(not(windows))]
-        {
-            let (ws, _resp) =
-                tungstenite::client_tls(request, tcp).map_err(|e| format!("tls upgrade: {e}"))?;
-            RelaySocket::Tls(Box::new(ws))
-        }
-        #[cfg(windows)]
-        {
-            return Err("wss is not supported on this build (use ws:// for local dev)".to_string());
-        }
+        // Same call on every platform: with exactly one TLS backend enabled for
+        // this target, `client_tls`'s no-connector path picks it up and hands
+        // back the matching `MaybeTlsStream` variant.
+        let (ws, _resp) =
+            tungstenite::client_tls(request, tcp).map_err(|e| format!("tls upgrade: {e}"))?;
+        RelaySocket::Tls(Box::new(ws))
     } else {
         let (ws, _resp) =
             tungstenite::client(request, tcp).map_err(|e| format!("ws upgrade: {e}"))?;
