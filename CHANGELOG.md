@@ -8,54 +8,40 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **`flightdeck --isolated` / `-I`: a throwaway run.** Launches exactly one
+  fresh Agent Session Tab, running the default agent in the repository root on
+  the branch already checked out — no worktree, no git mutation, and nothing
+  continued from a previous run (`state.json` and the workspace file are never
+  read). FlightDeck writes nothing of its own for the whole run: no first-run
+  `config.toml`, no `.gitignore` entry, no global config base, and nothing on
+  exit either, though existing config on disk is still read and honoured.
+  `ui.auto_continue` is forced off (so even Restart Agent stays a fresh
+  session) and the update check is disabled (no network call, no cache
+  write). Agent status plumbing (the Claude/Codex/OpenCode lifecycle hooks)
+  is redirected to a per-process temp directory outside the project, removed
+  after every session is terminated; a containerized run is the one
+  exception and keeps writing into the bind-mounted worktree, since a temp
+  directory outside it would not be reachable from inside the container.
+  Open Project, Close Project, Next/Previous Project, and New Agent Session
+  Tab are refused with one consistent message (and hidden from the command
+  palette) since an isolated run is one session with nothing else to switch
+  to; Finish/Local Merge, Rebase, and Abandon Worktree are already refused
+  for free because the tab runs on the base branch. A permanent `ISOLATED`
+  badge in the status bar and a leading note in the help overlay (`?`) make
+  the mode unmistakable. Combining the flag with a subcommand
+  (`flightdeck -I doctor`) is a startup error rather than a silent ignore.
+  Normal runs are byte-identical to before. See SPECS §32.
 
 ### Improvements
 
-- Agent status plumbing (Claude/Codex/OpenCode lifecycle hooks) now takes an
-  explicit status root instead of always writing into the worktree, laying the
-  groundwork for `--isolated` runs to keep that plumbing out of the project.
-  Normal runs are unaffected — the status root is still the worktree.
-- `flightdeck --isolated` now launches its one throwaway session: a fresh
-  agent on the checked-out branch, in the repo root, with no worktree and no
-  git mutation. The previous-session workspace reopen (which used to run
-  `startup` against every remembered project, including the launch repo's own
-  root, before throwing the result away) is skipped entirely for an isolated
-  run, and the workspace file is never read or written. Normal runs are
-  byte-identical to before.
-- `flightdeck --isolated` teardown now writes nothing and leaves nothing
-  behind: `state.json` persistence is skipped explicitly (`persist_quietly`
-  calls `to_project_state` + `save_state` directly, bypassing the
-  `AppState::persist` no-op guard added earlier, so this guard is
-  load-bearing, not redundant), the workspace file was already unreachable
-  because `ws_path` is `None` for an isolated run, and the run's temp status
-  directory is removed (best effort) after every session has been
-  terminated, so a hook still running mid-teardown cannot race the cleanup.
-- `flightdeck --isolated` now refuses Open Project, Close Project, project
-  switching (keybinding, mouse, and command palette), and the New Agent
-  Session Tab flow, with one consistent message explaining why. The guard
-  lives inside each flow function (and in a new `switch_project` helper that
-  the keybinding, palette-next/prev, and project-tab-click paths all now go
-  through), so every entry point is covered at once. Normal runs are
-  byte-identical to before.
-- The command palette now hides Open Project, Close Project, Next Project,
-  Previous Project, and New Agent Session Tab during an isolated run, so it
-  stops offering what the flows already refuse. Presentation only — the
-  underlying guards are unchanged. Normal runs are byte-identical to before.
-- An isolated run now shows a permanent magenta `ISOLATED` badge in the
-  status bar (ordered before the update-available hint, so both can appear
-  together) and a three-line note at the top of the help overlay (`?`),
-  ahead of the keyboard shortcut list: the fixed-size overlay has no scroll,
-  so a note appended at the end would clip on an ordinary terminal, and even
-  leading it is kept short to limit how much of the existing shortcut list
-  it pushes into that overlay's pre-existing clipped tail. Nothing else
-  persists in an isolated run, so this is the cue that stops a forgotten
-  `-I` from looking like data loss. Normal runs are byte-identical to
-  before.
+- None yet.
 
 ### Bug fixes
 
-- None yet.
+- A base-branch Agent Session Tab now records the branch actually checked out
+  rather than the configured base, so Push Branch pushes the right ref. A
+  detached HEAD (which git reports as the literal string `"HEAD"`, not an
+  error) and a genuine git failure both fall back to the base branch instead.
 
 ## [1.16.0] - 2026-08-24
 

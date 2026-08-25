@@ -1318,3 +1318,58 @@ containers instead of directly on the host. Off by default; when enabled it is
   `containerfile`. A `flightdeck.build` label hash detects staleness. The fast
   launch path never builds — a missing image is refused with guidance;
   `flightdeck doctor` reports readiness.
+
+## 32. Isolated Mode
+
+`flightdeck --isolated` / `-I` launches a throwaway run: one fresh agent session
+in the current working directory, with nothing continued and nothing written.
+Combining the flag with a subcommand (`flightdeck -I doctor`) is a startup
+error, not a silent ignore.
+
+An isolated run:
+
+- reads the effective configuration (global + project) the same way a normal
+  run does — the on-disk global base layered under project overrides when a
+  global file exists, else an in-memory default global layered under project
+  overrides — and writes none of it: no first-run `config.toml`, no
+  `.gitignore` entry, no global base file. A partial project config is still
+  honoured even on a machine that has never run FlightDeck normally.
+- never reads `state.json` and never runs recovery, so no tab is reconstructed
+- creates exactly one Agent Session Tab, running the configured default agent in
+  the repository root, with no dedicated worktree and no git mutation of any
+  kind. The tab is labelled with the branch actually checked out, not the
+  configured base branch: `git rev-parse --abbrev-ref HEAD` reporting the
+  literal string `"HEAD"` (a detached checkout) or failing outright both fall
+  back to the base branch instead. This session failing to start is fatal —
+  the run exits with a message rather than showing an empty TUI.
+- forces `ui.auto_continue` off, so even Restart Agent starts a fresh session
+- disables the update check (it makes a network call and writes a cache file)
+- keeps its agent status plumbing in a per-process temp directory outside the
+  project, removed after every session has been terminated. Containerized runs
+  are the one documented exception and keep the in-worktree status root: the
+  agent inside the container only ever sees `/workspace/...`, and a temp
+  directory outside the worktree is not bind-mounted in, so the redirect
+  cannot work there regardless.
+- refuses Open Project, Close Project, Next Project, Previous Project, and New
+  Agent Session Tab with one shared message, and hides the same entries from
+  the command palette. The guard lives inside the flow functions
+  (`start_new_tab_flow`, `start_open_project_flow`, `start_close_project_flow`,
+  and a `switch_project` helper shared by the keybinding, mouse, and palette
+  paths), not in the command dispatcher — these are workspace-level actions
+  that never reach `AppState::dispatch` at all, so the dispatcher has no
+  occasion to refuse them. Finish / Local Merge, Rebase Worktree, and Abandon
+  Worktree are already refused for free because the tab is `runs_on_base`.
+- writes neither `state.json` nor the workspace file on exit
+- shows a permanent `ISOLATED` badge in the status bar, and leads the Help
+  overlay with a three-line note (the overlay is a fixed 40 rows with no
+  scroll, so a trailing note would clip)
+
+Push Branch, Pull Base, Open Configuration, phone pairing, child terminals and
+additional agents in the session remain available. The rule constrains what
+FlightDeck writes on its own; an explicit user action that exists to write still
+writes.
+
+Isolated mode is a per-run flag and never a configuration setting: a persisted
+setting that suppressed persistence would be a trap. See
+`specs/ISOLATED_MODE.md` for the design and `specs/ISOLATED_MODE_PLAN.md` for the
+implementation record.

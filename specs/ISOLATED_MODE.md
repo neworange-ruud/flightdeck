@@ -88,11 +88,19 @@ but it is not the goal.)
 
 ## 6. Blocked actions
 
-Blocked commands are refused in the dispatcher with
-`Effect::Refused("… is not available in isolated mode")` **and** hidden from the
-command palette. The dispatcher is the real gate — keybindings and the project
-tab bar's New button bypass the palette entirely; hiding the palette entries is
-presentation only.
+**As built, this is not a dispatcher-level refusal.** Open/Close/Switch Project
+and New Agent Session Tab are workspace-level actions — they never reach
+`AppState::dispatch` at all, so the dispatcher has no occasion to refuse them
+even in principle. The guard instead lives inside the flow functions
+themselves: `start_new_tab_flow`, `start_open_project_flow`,
+`start_close_project_flow`, and a `switch_project` helper (shared by the
+keybinding, mouse, and command-palette-next/prev paths). Each checks
+`state.isolated` first and, if set, calls `ui.message(ISOLATED_REFUSAL)` and
+returns — one shared constant, so the refusal reads identically wherever the
+user meets it, and one guard per flow covers every entry point (keybinding,
+mouse, palette) at once. The command palette additionally hides the blocked
+entries outright, which is presentation only; the flow-function guard is the
+real gate.
 
 Blocked:
 
@@ -151,7 +159,11 @@ JSON and TOML. Templating an absolute path into them means two layers of
 escaping, and a Windows path brings backslashes into both. This is the most
 likely thing in this design to break. It is squarely
 `flightdeck-cross-platform-parity` territory and must be tested on Windows, not
-reasoned about.
+reasoned about. **As of this writing it has not been** — the implementation
+work happened on Linux, and the escaping is argued correct by construction
+(the `serde_json`/`toml` serializers own the escaping, not hand-rolled string
+work) but has not been exercised on an actual Windows machine or CI runner.
+This stays open until someone does.
 
 ### 8.2 Exception: containerized runs
 
@@ -189,13 +201,26 @@ The strong tests are at `startup` level with `FakeFs`:
 
 Then:
 
-- dispatcher tests: each blocked command returns `Effect::Refused`
+- flow-function tests: `start_new_tab_flow`, `start_open_project_flow`,
+  `start_close_project_flow`, and `switch_project` each leave `ui.message` set
+  to `ISOLATED_REFUSAL` and take no other action when `state.isolated` is set
+  — this is the real gate (§6); there is no dispatcher-level refusal to test,
+  since these actions never reach `AppState::dispatch`
 - palette test: the blocked entries are absent from the palette in isolated mode
   and present in a normal one
 - `prepare_status_launch` with a root outside the worktree writes nothing under
   the worktree, and the absolute status path appears in the generated hooks
-- teardown test: no `state.json` and no workspace file are written
 - a normal-mode regression test that the status plumbing paths are unchanged
+
+**Open item: teardown is verified by reading, not by test.** The
+`persist_quietly` skip and the workspace-file skip are real (§7), but
+`workspace_state_path()` reads `HOME` directly and is not injected through
+`Env`/`Services`, so a test cannot swap in a fake home directory to assert the
+file was never written. Confirming this currently means reading the guard at
+the call site, not running a test that would fail if the guard were removed.
+Closing this gap needs `workspace_state_path()` (or its caller) to take an
+injectable home-directory seam; until then, treat teardown as covered by
+construction and manual verification, not by an automated test.
 
 ## 11. Non-goals
 
