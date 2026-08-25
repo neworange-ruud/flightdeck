@@ -254,6 +254,14 @@ pub fn run() -> Result<()> {
     {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            // A panic from inside the VT parser is caught and handled by
+            // `Terminal::process_output`, which rebuilds the parser and carries
+            // on. Tearing the terminal down and printing a backtrace over a live
+            // UI for a panic that never reaches the top of the stack would turn a
+            // recovered pane into a dead session.
+            if crate::terminal::session::parser_panic_expected() {
+                return;
+            }
             restore_terminal_modes(keyboard_enhanced);
             previous(info);
         }));

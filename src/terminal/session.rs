@@ -43,6 +43,36 @@ fn clamp_grid(size: PtySize) -> PtySize {
     }
 }
 
+thread_local! {
+    /// Set only while [`Terminal::process_output`] is inside `vt100`, so the
+    /// process-wide panic hook can tell a panic we handle from one we do not.
+    static PARSER_PANIC_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread is inside a guarded `vt100` parse whose panic is
+/// already handled. The panic hook installed in `run()` uses this to stay quiet
+/// and leave the terminal alone.
+pub fn parser_panic_expected() -> bool {
+    PARSER_PANIC_EXPECTED.with(std::cell::Cell::get)
+}
+
+/// Sets [`PARSER_PANIC_EXPECTED`] for its lifetime. Clearing happens in `Drop`,
+/// so it is correct on the unwinding path too.
+struct ExpectedParserPanic;
+
+impl ExpectedParserPanic {
+    fn new() -> Self {
+        PARSER_PANIC_EXPECTED.with(|f| f.set(true));
+        Self
+    }
+}
+
+impl Drop for ExpectedParserPanic {
+    fn drop(&mut self) {
+        PARSER_PANIC_EXPECTED.with(|f| f.set(false));
+    }
+}
+
 /// What a terminal hosts: the primary agent, an additional agent (a second
 /// agent process running in the same worktree), or a child shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +119,46 @@ impl Terminal {
     }
 
     /// Feed raw PTY output bytes into the VT parser (updates the screen grid).
+    ///
+    /// Guarded, because `vt100 0.16.2` can panic while printing and there is no
+    /// released version that does not. `Grid::set_size` truncates each row with a
+    /// plain `Vec::resize` (`grid.rs:78-80` -> `row.rs:73-76`), so shrinking the
+    /// column count through the middle of a wide (width-2) character drops the
+    /// continuation half and leaves the first half flagged `is_wide()` in the new
+    /// last column. The next print onto that cell reaches `screen.rs:870`, which
+    /// unwraps `drawing_cell_mut(col + 1)` on the library's own assumption that a
+    /// wide cell is always followed by its other half — and gets `None`.
+    ///
+    /// [`MIN_GRID_COLS`] does not help here: the stranded cell can sit at any
+    /// column, so the panic is reachable at any grid size. Rather than let a
+    /// resize take the whole app down, the panic is contained and the parser is
+    /// rebuilt. The rebuild is not optional: the panic unwinds out of
+    /// `Screen::text` mid-mutation and the stranded cell is still there, so
+    /// reusing the parser would just panic again on the next chunk.
+    ///
+    /// Cost when this fires: the pane's scrollback and screen contents are lost
+    /// and the agent repaints. That is a far better failure than losing every
+    /// pane and the user's session.
     pub fn process_output(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        if Self::feed(&mut self.parser, bytes).is_ok() {
+            return;
+        }
+        // Start from a clean grid at the same size, then let the chunk land on it.
+        let (rows, cols) = self.parser.screen().size();
+        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+        self.selection = None;
+        let _ = Self::feed(&mut self.parser, bytes);
+    }
+
+    /// Run one `vt100` parse, containing a panic from inside the library.
+    ///
+    /// The hook installed in `run()` checks [`parser_panic_expected`] so a panic
+    /// caught here does not tear down the user's terminal modes or print a
+    /// backtrace over a live UI.
+    fn feed(parser: &mut vt100::Parser, bytes: &[u8]) -> std::result::Result<(), ()> {
+        let _expected = ExpectedParserPanic::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)))
+            .map_err(|_| ())
     }
 
     /// Reply to a Device Status Report cursor-position query (`ESC[6n`) found in
@@ -650,6 +718,46 @@ mod tests {
         let term = session.active_mut().unwrap();
         assert_eq!(term.screen().size(), (MIN_GRID_ROWS, MIN_GRID_COLS));
         term.process_output("🎉 hello".as_bytes());
+    }
+
+    /// The continuous-drag gesture that killed the app before: shrink one column
+    /// at a time while an agent with wide characters on screen repaints.
+    #[test]
+    fn a_window_drag_while_the_agent_prints_wide_chars_survives() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &pty,
+                "claude",
+                &[],
+                Path::new(CWD),
+                PtySize {
+                    rows: 24,
+                    cols: 100,
+                },
+            )
+            .unwrap();
+        let term = session.active_mut().unwrap();
+
+        for cols in (20u16..=100).rev() {
+            for row in 1..=8u16 {
+                term.process_output(format!("\x1b[{row};1H").as_bytes());
+                term.process_output(
+                    "working \u{1f389} on \u{6f22}\u{5b57} files \u{2705} step \u{1f389} of \u{6f22}\u{5b57} many".as_bytes(),
+                );
+            }
+            term.resize(PtySize { rows: 24, cols }).unwrap();
+            for row in 1..=8u16 {
+                term.process_output(format!("\x1b[{row};1H").as_bytes());
+                term.process_output("z".repeat(cols as usize).as_bytes());
+            }
+        }
+
+        // The grid still tracks the requested size and the pane is still usable.
+        assert_eq!(term.screen().size(), (24, MIN_GRID_COLS));
+        term.process_output("still alive \u{1f389}".as_bytes());
     }
 
     // Windows/ConPTY: a Device Status Report cursor-position query (`ESC[6n`)
