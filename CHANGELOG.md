@@ -16,6 +16,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   explicit status root instead of always writing into the worktree, laying the
   groundwork for `--isolated` runs to keep that plumbing out of the project.
   Normal runs are unaffected — the status root is still the worktree.
+- `flightdeck --isolated` now launches its one throwaway session: a fresh
+  agent on the checked-out branch, in the repo root, with no worktree and no
+  git mutation. The previous-session workspace reopen (which used to run
+  `startup` against every remembered project, including the launch repo's own
+  root, before throwing the result away) is skipped entirely for an isolated
+  run, and the workspace file is never read or written. Normal runs are
+  byte-identical to before.
 
 ### Bug fixes
 

@@ -196,7 +196,21 @@ pub fn run() -> Result<()> {
     // effort): skip the launch project, folders that no longer exist, and any
     // that are no longer git repositories. Each project's own tabs are still
     // recovered from its `state.json` (agents are never auto-relaunched).
-    let ws_path = workspace_state_path();
+    // An isolated run is exactly one project by definition: skip the reopen
+    // loop entirely (SPECS §32). This must not merely pass `None` through to
+    // `open_project` for each remembered project and discard the result —
+    // `open_project` runs `startup` (init, config writes, `.gitignore`
+    // update, state load + recovery) against every one of them, including
+    // the launch repo's own root when it is already in the workspace file
+    // (the normal case for a repo the user has opened before), before the
+    // `contains_root` guard below throws the duplicate away. Binding
+    // `ws_path` to `None` also makes teardown skip writing the workspace
+    // file for free (Task 8).
+    let ws_path = if isolated {
+        None
+    } else {
+        workspace_state_path()
+    };
     if let Some(ref wp) = ws_path {
         if let Ok(saved) = load_workspace(&fs, wp) {
             for p in &saved.projects {
@@ -281,7 +295,17 @@ pub fn run() -> Result<()> {
         let active = workspace.active;
         let p = &mut workspace.projects[active];
         let services = env.services(&p.git);
-        let _ = p.state.resume_agents(&services);
+        if isolated {
+            // One fresh session; nothing to resume, because nothing was
+            // recovered (SPECS §32).
+            if let Err(e) = start_isolated_session(&mut p.state, &services) {
+                p.state
+                    .warnings
+                    .push(format!("Isolated session failed to start: {e}"));
+            }
+        } else {
+            let _ = p.state.resume_agents(&services);
+        }
     }
 
     let notifier = SystemNotifier;
@@ -619,6 +643,21 @@ fn run_doctor() -> Result<()> {
 /// (SPECS §32). Per-process so two concurrent isolated runs cannot collide.
 fn isolated_status_dir() -> PathBuf {
     std::env::temp_dir().join(format!("flightdeck-isolated-{}", std::process::id()))
+}
+
+/// Create the one session an isolated run consists of: the default agent, in
+/// the repository root, on the branch already checked out, with no worktree
+/// and no git mutation (SPECS §32). The base-tab path's [`WorktreeJob`] has
+/// `needs_create == false`, so [`materialize_worktree`] is deliberately not
+/// called here.
+fn start_isolated_session(state: &mut AppState, services: &Services) -> Result<()> {
+    let job = state.begin_new_agent_tab_ex("", None, true, services)?;
+    debug_assert!(
+        !job.needs_create,
+        "an isolated session never creates a worktree"
+    );
+    state.finalize_new_tab(&job.tab_id, services)?;
+    Ok(())
 }
 
 /// Compute the effective config the same way a normal run would — global base
@@ -6039,6 +6078,115 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("config.toml")),
             "a normal first run still writes the project config"
+        );
+    }
+
+    #[test]
+    fn isolated_run_creates_exactly_one_base_tab() {
+        let dir = TempDir::new().unwrap();
+        // Not one of the built-in agent keys: see the comment on
+        // `isolated_startup_ignores_a_corrupt_global_config_...` above for why
+        // a non-default key is the only fixture that can distinguish a real
+        // spawn from a silently-swallowed default.
+        let agent = make_real_agent(&dir, "myagent");
+        let config = config_with_agent(agent);
+        let toml = crate::config::load::serialize_config(&config).unwrap();
+
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", toml.as_str());
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let mut state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        start_isolated_session(&mut state, &services).unwrap();
+
+        assert_eq!(state.tabs.len(), 1, "exactly one session");
+        assert!(state.tabs[0].meta.runs_on_base, "it runs in the repo root");
+        assert_eq!(state.selected_tab, Some(0));
+        assert!(
+            state.tabs[0].meta.resume_args.is_empty(),
+            "a fresh session, never a continued one"
+        );
+        assert_eq!(state.tabs[0].meta.agent, "myagent");
+        assert_eq!(pty.spawns().len(), 1, "the agent is spawned");
+        assert!(
+            git.added_worktrees().is_empty() && git.created_branches().is_empty(),
+            "not one git mutation"
+        );
+        assert!(
+            fs.writes_under(Path::new("/repo")).is_empty(),
+            "and nothing written to the project: {:?}",
+            fs.writes_under(Path::new("/repo"))
+        );
+        assert!(
+            fs.writes().is_empty(),
+            "and nothing written anywhere else either: {:?}",
+            fs.writes()
+        );
+    }
+
+    #[test]
+    fn isolated_session_status_file_lives_outside_the_project() {
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "myagent");
+        let config = config_with_agent(agent);
+        let toml = crate::config::load::serialize_config(&config).unwrap();
+
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", toml.as_str());
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let mut state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        start_isolated_session(&mut state, &services).unwrap();
+
+        let status = state.tabs[0].status_file.clone().expect("a status file");
+        assert!(
+            status.starts_with("/tmp/fd-isolated-test"),
+            "status must be redirected out of the project: {}",
+            status.display()
         );
     }
 
