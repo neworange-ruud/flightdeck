@@ -600,9 +600,12 @@ pub fn draw(
         UiOverlay::None => {}
         UiOverlay::Dialog(dialog) => draw_dialog(frame, dialog, area),
         UiOverlay::Palette(palette) => draw_palette_overlay(frame, palette, area),
-        UiOverlay::Help => {
-            draw_help_overlay(frame, area, state.config.ui.use_f2_to_leave_terminal_focus)
-        }
+        UiOverlay::Help => draw_help_overlay(
+            frame,
+            area,
+            state.config.ui.use_f2_to_leave_terminal_focus,
+            state.isolated,
+        ),
         UiOverlay::About => draw_about_overlay(frame, area),
         UiOverlay::GitStatus { status, pr_url } => {
             draw_git_status_overlay(frame, status, pr_url.as_deref(), area);
@@ -1561,6 +1564,7 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         state.mode(),
         &state.config.ui,
         state.update_available.as_deref(),
+        state.isolated,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
@@ -1574,6 +1578,7 @@ pub fn status_bar_text(
     mode: InputMode,
     ui: &crate::contracts::UiConfig,
     update_available: Option<&str>,
+    isolated: bool,
 ) -> Line<'static> {
     let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
     let use_f2 = ui.use_f2_to_leave_terminal_focus;
@@ -1614,6 +1619,19 @@ pub fn status_bar_text(
             Span::raw(": help"),
         ],
     };
+
+    // Isolated run (SPECS §32): nothing persists and several actions are gone,
+    // so say so permanently rather than once at launch.
+    if isolated {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            "ISOLATED",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Update notice (SPECS §30): a non-intrusive hint, never a modal. It points
     // at `flightdeck update`, which itself routes Homebrew installs to
@@ -1853,10 +1871,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 // ---------------------------------------------------------------------------
 
 /// Draw the help / keybindings overlay (SPECS §23).
-pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
-    let overlay_area = layout::centered_overlay(area, 64, 40);
-    frame.render_widget(Clear, overlay_area);
-
+pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
     let leave_focus_key = if use_f2 {
         "  F2"
     } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
@@ -1865,7 +1880,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         "  Alt+Esc"
     };
 
-    let help_text = vec![
+    let mut help_text = vec![
         Line::from(Span::styled(
             "FlightDeck Keyboard Shortcuts",
             Style::default()
@@ -1931,6 +1946,33 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
+
+    // Isolated run (SPECS §32): nothing persists and several actions are
+    // gone, so say so here too, not only in the status bar.
+    if isolated {
+        help_text.push(Line::raw(""));
+        help_text.push(Line::from(Span::styled(
+            "Isolated run (--isolated)",
+            Style::default().fg(Color::Magenta),
+        )));
+        help_text.push(Line::raw("  Nothing is saved and nothing was continued."));
+        help_text.push(Line::raw(
+            "  One session, in this directory, on the current branch.",
+        ));
+        help_text.push(Line::raw("  No other projects and no new session tabs."));
+    }
+
+    // Base overlay is a fixed 64x40. The isolated note adds lines on top of
+    // the existing content, so grow the overlay to fit everything rather
+    // than let the note clip silently off the bottom; a normal run keeps
+    // the original 40 for byte-identical rendering.
+    let overlay_h: u16 = if isolated {
+        (help_text.len() as u16 + 2).max(40)
+    } else {
+        40
+    };
+    let overlay_area = layout::centered_overlay(area, 64, overlay_h);
+    frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
         .title(" Help / Keybindings ")
@@ -3125,7 +3167,7 @@ mod tests {
     #[test]
     fn status_bar_terminal_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::Terminal, &ui, None);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(
@@ -3143,7 +3185,7 @@ mod tests {
             use_f2_to_leave_terminal_focus: true,
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("F2"));
     }
@@ -3151,7 +3193,7 @@ mod tests {
     #[test]
     fn status_bar_app_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None);
+        let line = status_bar_text(InputMode::App, &ui, None, false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -3165,7 +3207,7 @@ mod tests {
     #[test]
     fn status_bar_shows_update_hint_when_available() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"));
+        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"), false);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -3176,9 +3218,40 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, &ui, None);
+        let none = status_bar_text(InputMode::App, &ui, None, false);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
+    }
+
+    #[test]
+    fn status_bar_shows_the_isolated_badge() {
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, None, true);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("ISOLATED"),
+            "an isolated run must be unmistakable: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_has_no_badge_in_a_normal_run() {
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, None, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("ISOLATED"), "no badge normally: {text}");
+    }
+
+    #[test]
+    fn status_bar_shows_both_the_badge_and_the_update_hint() {
+        // The two trailing spans must coexist, not overwrite each other.
+        let ui = crate::contracts::UiConfig::default();
+        let line = status_bar_text(InputMode::App, &ui, Some("9.9.9"), true);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("ISOLATED") && text.contains("9.9.9"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3187,7 +3260,7 @@ mod tests {
             terminal_mode_color: "magenta".to_string(),
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
         let chip = line
             .spans
             .iter()
@@ -3438,6 +3511,45 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::Help, 0);
         })
         .unwrap();
+    }
+
+    fn help_overlay_buffer_text(area_h: u16, isolated: bool) -> String {
+        // Tall enough that the (possibly grown) overlay is never clamped by
+        // the terminal itself, so a missing note means it wasn't drawn, not
+        // that it was clipped by a short buffer.
+        let mut term = test_terminal(80, area_h);
+        let area = Rect::new(0, 0, 80, area_h);
+        term.draw(|frame| {
+            draw_help_overlay(frame, area, false, isolated);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..area_h)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_overlay_shows_the_isolated_note_when_isolated() {
+        let text = help_overlay_buffer_text(60, true);
+        assert!(
+            text.contains("Isolated run"),
+            "isolated help note must be shown: {text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_has_no_isolated_note_normally() {
+        let text = help_overlay_buffer_text(60, false);
+        assert!(
+            !text.contains("Isolated run"),
+            "no isolated note in a normal run: {text}"
+        );
     }
 
     #[test]

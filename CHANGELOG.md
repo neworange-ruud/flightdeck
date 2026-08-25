@@ -42,6 +42,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   Previous Project, and New Agent Session Tab during an isolated run, so it
   stops offering what the flows already refuse. Presentation only — the
   underlying guards are unchanged. Normal runs are byte-identical to before.
+- An isolated run now shows a permanent magenta `ISOLATED` badge in the
+  status bar (ordered before the update-available hint, so both can appear
+  together) and a matching note in the help overlay (`?`), which grows to
+  fit the extra lines instead of clipping them. Nothing else persists in an
+  isolated run, so this is the cue that stops a forgotten `-I` from looking
+  like data loss. Normal runs are byte-identical to before.
 
 ### Bug fixes
 
