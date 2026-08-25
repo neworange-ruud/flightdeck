@@ -3196,6 +3196,68 @@ fn encode_mouse_button(
 /// Route a key press. Returns `Ok(true)` when the loop should quit. Workspace-
 /// level actions (switch project) act on `workspace`; everything else acts on
 /// the active project's [`AppState`].
+/// The FlightDeck repository, taken from `Cargo.toml` at compile time so the
+/// URL can never drift from the crate metadata.
+const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Whether a key press arriving while an overlay is open is the "open the
+/// FlightDeck repository" gesture — a second bare F1 on the help panel — rather
+/// than an ordinary dismissal.
+///
+/// The gesture keys off the help overlay *being open*, not off how it was
+/// opened, so `?` then F1 works exactly like F1 then F1.
+fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
+    matches!(overlay, UiOverlay::Help) && key.code == KeyCode::F(1) && key.modifiers.is_empty()
+}
+
+#[cfg(test)]
+mod help_repo_gesture_tests {
+    use super::*;
+
+    fn f1() -> KeyEvent {
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::empty())
+    }
+
+    #[test]
+    fn f1_on_the_help_overlay_is_the_gesture() {
+        assert!(is_help_repo_gesture(&UiOverlay::Help, f1()));
+    }
+
+    #[test]
+    fn f1_without_the_help_overlay_is_not_the_gesture() {
+        // With no overlay F1 must fall through to the key map and *open* help;
+        // on another overlay it must dismiss, as any key does.
+        assert!(!is_help_repo_gesture(&UiOverlay::None, f1()));
+        assert!(!is_help_repo_gesture(&UiOverlay::About, f1()));
+    }
+
+    #[test]
+    fn other_keys_on_the_help_overlay_are_not_the_gesture() {
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::F(2)] {
+            assert!(
+                !is_help_repo_gesture(&UiOverlay::Help, KeyEvent::new(code, KeyModifiers::empty())),
+                "{code:?} must still dismiss the help overlay",
+            );
+        }
+    }
+
+    #[test]
+    fn modified_f1_on_the_help_overlay_is_not_the_gesture() {
+        assert!(!is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn the_repository_url_is_a_github_https_url() {
+        assert!(
+            REPOSITORY_URL.starts_with("https://github.com/"),
+            "Cargo.toml `repository` must stay a GitHub https URL, got: {REPOSITORY_URL}",
+        );
+    }
+}
+
 fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<bool> {
     // 1. An active prompt captures all input first.
     if ui.prompt.is_some() {
@@ -3212,7 +3274,16 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return handle_palette_key(key, workspace, env, ui).map(|_| false);
     }
 
-    // 3. A non-interactive overlay (help, git status, message): any key dismisses.
+    // 3a. A second bare F1 while the help overlay is open opens the FlightDeck
+    //     repository in the browser. The panel deliberately stays up: pressing
+    //     F1 again is a shortcut out of help, not a way to leave it. Failures
+    //     are silent by design — see `is_help_repo_gesture`.
+    if is_help_repo_gesture(&ui.overlay, key) {
+        let _ = crate::tui::opener::open_url(REPOSITORY_URL);
+        return Ok(false);
+    }
+
+    // 3b. A non-interactive overlay (help, git status, message): any key dismisses.
     if !matches!(ui.overlay, UiOverlay::None) {
         ui.clear();
         return Ok(false);

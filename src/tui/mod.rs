@@ -10,6 +10,7 @@ pub mod file_manager;
 pub mod input;
 pub mod layout;
 pub mod mode_style;
+pub mod opener;
 pub mod palette;
 pub mod platform;
 pub mod render;

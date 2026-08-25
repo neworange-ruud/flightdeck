@@ -210,6 +210,13 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
         // Ctrl-q: Quit.
         KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
+        // F1: Help / keybindings (both modes). Global so help is reachable with
+        // a terminal focused, which is when a user actually reaches for it; the
+        // cost is that hosted agents never see bare F1. Modified F1 is left to
+        // the PTY. A second F1 while the overlay is open opens the FlightDeck
+        // repository in the browser — that lives in the overlay key handling
+        // (`handle_key`), not here, since this map has no view of the overlay.
+        KeyCode::F(1) if key.modifiers.is_empty() => Some(KeyAction::OpenHelp),
 
         // --- Project navigation (multi-project) --------------------------
         // Shift-Left / Shift-Right cycle the open projects. Global so they work
@@ -506,6 +513,41 @@ mod tests {
         assert_eq!(
             map_key(InputMode::App, key(KeyCode::Char('?'))),
             KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn f1_opens_help_in_app_mode() {
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::F(1))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn f1_opens_help_in_terminal_mode() {
+        // F1 is global: a focused terminal must not swallow it as passthrough,
+        // otherwise help is unreachable exactly when a user reaches for it.
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::F(1))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn modified_f1_still_passes_through() {
+        // Only bare F1 is claimed; Ctrl/Alt/Shift-F1 stay the PTY's.
+        assert_eq!(
+            map_key(InputMode::Terminal, ctrl(KeyCode::F(1))),
+            KeyAction::Passthrough(encode_key(ctrl(KeyCode::F(1))))
+        );
+    }
+
+    #[test]
+    fn f3_still_passes_through() {
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::F(3))),
+            KeyAction::Passthrough(encode_key(key(KeyCode::F(3))))
         );
     }
 

@@ -1925,15 +1925,17 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
         shortcut_line("  Ctrl-s", "Set manual status"),
         shortcut_line("  Ctrl-r", "Restart primary agent"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  Esc / q to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
 
+    // The hints live on the bottom border, not in the shortcut list: the list is
+    // taller than the overlay on any ordinary terminal, so a trailing content
+    // line is truncated away exactly when a user needs it.
     let block = Block::default()
         .title(" Help / Keybindings ")
+        .title_bottom(Span::styled(
+            " F1 again: open on GitHub · Esc / q: close ",
+            Style::default().fg(Color::DarkGray),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
@@ -3438,6 +3440,43 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::Help, 0);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn help_overlay_advertises_the_f1_repository_gesture() {
+        // The gesture is invisible unless the panel says so — nobody presses a
+        // key twice on a hunch. The hints live on the block's bottom border, so
+        // they survive even when the shortcut list is taller than the overlay.
+        let mut term = test_terminal(120, 50);
+        term.draw(|frame| {
+            draw_help_overlay(frame, frame.area(), false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("F1"), "must name the key, got: {text}");
+        assert!(
+            text.contains("GitHub"),
+            "must say where F1 leads, got: {text}"
+        );
+        assert!(
+            text.contains("Esc"),
+            "must keep the close hint, got: {text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_hints_stay_visible_on_a_short_terminal() {
+        // The shortcut list overflows a small overlay; border titles must not.
+        let mut term = test_terminal(80, 24);
+        term.draw(|frame| {
+            draw_help_overlay(frame, frame.area(), false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("F1"), "hint must survive truncation");
+        assert!(text.contains("GitHub"), "hint must survive truncation");
     }
 
     #[test]

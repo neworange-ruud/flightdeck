@@ -8,11 +8,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **F1 opens help, anywhere.** F1 now opens the help / keybindings panel in both App and Terminal focus, so help is reachable without leaving the terminal first. Pressing F1 again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 is claimed — Ctrl/Alt/Shift-F1 still reach the agent.
 
 ### Improvements
 
-- None yet.
+- The help panel's hints ("F1 again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
 
 ### Bug fixes
 
