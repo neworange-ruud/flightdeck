@@ -3201,13 +3201,19 @@ fn encode_mouse_button(
 const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Whether a key press arriving while an overlay is open is the "open the
-/// FlightDeck repository" gesture — a second bare F1 on the help panel — rather
-/// than an ordinary dismissal.
+/// FlightDeck repository" gesture — a second press of a help key on the help
+/// panel — rather than an ordinary dismissal.
 ///
-/// The gesture keys off the help overlay *being open*, not off how it was
-/// opened, so `?` then F1 works exactly like F1 then F1.
+/// Either global help key counts, so the gesture is "press it again" whichever
+/// key you reached for. It keys off the help overlay *being open*, not off how
+/// it was opened, so `?` then F1 works exactly like F1 then F1.
 fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
-    matches!(overlay, UiOverlay::Help) && key.code == KeyCode::F(1) && key.modifiers.is_empty()
+    if !matches!(overlay, UiOverlay::Help) {
+        return false;
+    }
+    let bare_f1 = key.code == KeyCode::F(1) && key.modifiers.is_empty();
+    let alt_h = key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::ALT;
+    bare_f1 || alt_h
 }
 
 #[cfg(test)]
@@ -3229,6 +3235,23 @@ mod help_repo_gesture_tests {
         // on another overlay it must dismiss, as any key does.
         assert!(!is_help_repo_gesture(&UiOverlay::None, f1()));
         assert!(!is_help_repo_gesture(&UiOverlay::About, f1()));
+    }
+
+    #[test]
+    fn alt_h_on_the_help_overlay_is_also_the_gesture() {
+        // "Press the help key again" must hold for whichever help key was used.
+        assert!(is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)
+        ));
+    }
+
+    #[test]
+    fn bare_h_on_the_help_overlay_still_dismisses() {
+        assert!(!is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty())
+        ));
     }
 
     #[test]

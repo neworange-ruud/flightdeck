@@ -8,7 +8,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- **F1 opens help, anywhere.** F1 now opens the help / keybindings panel in both App and Terminal focus, so help is reachable without leaving the terminal first. Pressing F1 again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 is claimed — Ctrl/Alt/Shift-F1 still reach the agent.
+- **F1 (or Alt-h) opens help, anywhere.** Both now open the help / keybindings panel in App and Terminal focus, so help is reachable without leaving the terminal first. Pressing the same key again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 and Alt-h are claimed — modified F1 and a bare `h` still reach the agent. Alt-h exists because Apple keyboards reserve F1 as a brightness key unless standard function keys are enabled; on macOS it needs "Use Option as Meta key", the same requirement `Alt-o` already carries.
 
 ### Improvements
 

@@ -210,13 +210,23 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
         // Ctrl-q: Quit.
         KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
-        // F1: Help / keybindings (both modes). Global so help is reachable with
-        // a terminal focused, which is when a user actually reaches for it; the
-        // cost is that hosted agents never see bare F1. Modified F1 is left to
-        // the PTY. A second F1 while the overlay is open opens the FlightDeck
-        // repository in the browser — that lives in the overlay key handling
+        // F1 / Alt-h: Help / keybindings (both modes). Global so help is
+        // reachable with a terminal focused, which is when a user actually
+        // reaches for it; the cost is that hosted agents never see bare F1 or
+        // Alt-h. Modified F1 and bare 'h' are left to the PTY.
+        //
+        // Alt-h exists because Apple keyboards reserve F1 as a media key
+        // (brightness) unless the user enables standard function keys, so on a
+        // Mac laptop F1 never reaches the terminal. Alt-h carries its own macOS
+        // caveat — Option+letter composes a special character unless "Use
+        // Option as Meta key" is on — but that is the same requirement Alt-o
+        // and Alt-1..9 already impose, so it adds no new configuration burden.
+        //
+        // Pressing the same key again while the overlay is open opens the
+        // FlightDeck repository; that lives in the overlay key handling
         // (`handle_key`), not here, since this map has no view of the overlay.
         KeyCode::F(1) if key.modifiers.is_empty() => Some(KeyAction::OpenHelp),
+        KeyCode::Char('h') if alt && !ctrl && !shift => Some(KeyAction::OpenHelp),
 
         // --- Project navigation (multi-project) --------------------------
         // Shift-Left / Shift-Right cycle the open projects. Global so they work
@@ -548,6 +558,37 @@ mod tests {
         assert_eq!(
             map_key(InputMode::Terminal, key(KeyCode::F(3))),
             KeyAction::Passthrough(encode_key(key(KeyCode::F(3))))
+        );
+    }
+
+    #[test]
+    fn alt_h_opens_help_in_both_modes() {
+        // The reachable-everywhere companion to F1: macOS reserves F1 as a
+        // media key on Apple keyboards, so a non-function-key route matters.
+        assert_eq!(
+            map_key(InputMode::App, alt(KeyCode::Char('h'))),
+            KeyAction::OpenHelp
+        );
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Char('h'))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn bare_h_still_passes_through_to_the_pty() {
+        // Only the Alt-modified 'h' is claimed; typing 'h' must reach the agent.
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::Char('h'))),
+            KeyAction::Passthrough(encode_key(key(KeyCode::Char('h'))))
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_h_is_not_the_help_key() {
+        assert_ne!(
+            map_key(InputMode::Terminal, ctrl(KeyCode::Char('h'))),
+            KeyAction::OpenHelp
         );
     }
 

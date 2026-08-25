@@ -1882,7 +1882,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
         shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
         shortcut_line("  Alt-o", "Open worktree in file manager"),
-        shortcut_line("  ?", "Help / keybindings"),
+        shortcut_line("  ? / F1 / Alt-h", "Help / keybindings"),
         Line::raw(""),
         Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
         shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
@@ -1933,7 +1933,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
     let block = Block::default()
         .title(" Help / Keybindings ")
         .title_bottom(Span::styled(
-            " F1 again: open on GitHub · Esc / q: close ",
+            " Press the help key again: open on GitHub · Esc / q: close ",
             Style::default().fg(Color::DarkGray),
         ))
         .borders(Borders::ALL)
@@ -3454,10 +3454,17 @@ mod tests {
         .unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("F1"), "must name the key, got: {text}");
+        assert!(
+            text.contains("? / F1 / Alt-h"),
+            "the shortcut list must name every help key, got: {text}"
+        );
+        assert!(
+            text.contains("Press the help key again"),
+            "must advertise the second-press gesture, got: {text}"
+        );
         assert!(
             text.contains("GitHub"),
-            "must say where F1 leads, got: {text}"
+            "must say where the second press leads, got: {text}"
         );
         assert!(
             text.contains("Esc"),
@@ -3475,8 +3482,21 @@ mod tests {
         .unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("F1"), "hint must survive truncation");
-        assert!(text.contains("GitHub"), "hint must survive truncation");
+        // Assert on the border hint's own wording, not on "F1" — that also
+        // appears in the shortcut list, which would let this pass even if the
+        // hint were truncated away.
+        assert!(
+            text.contains("Press the help key again"),
+            "border hint must survive truncation, got: {text}"
+        );
+        assert!(
+            text.contains("GitHub"),
+            "border hint must survive truncation, got: {text}"
+        );
+        assert!(
+            text.contains("Esc / q: close"),
+            "border hint must survive truncation, got: {text}"
+        );
     }
 
     #[test]
