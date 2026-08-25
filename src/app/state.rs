@@ -538,6 +538,15 @@ pub struct AppState {
     /// check completes (or when up to date / the check is disabled). Drives the
     /// status-bar update hint. Runtime-only.
     pub update_available: Option<String>,
+    /// Isolated run (SPECS §32): a throwaway session that continues nothing and
+    /// writes nothing of its own. Runtime-only — never serialized, never a
+    /// configuration setting, because a persisted file that suppressed
+    /// persistence would be a trap.
+    pub isolated: bool,
+    /// Where the agent status plumbing lives when it must stay out of the
+    /// project directory (SPECS §32). `None` means the tab's own worktree,
+    /// which is the normal behavior.
+    pub isolated_status_root: Option<PathBuf>,
 }
 
 impl AppState {
@@ -567,6 +576,8 @@ impl AppState {
             notify_grace_until_ms: 0,
             split_view: false,
             update_available: None,
+            isolated: false,
+            isolated_status_root: None,
         }
     }
 
@@ -577,6 +588,14 @@ impl AppState {
     pub fn reload_config(&mut self, config: Config) {
         self.registry = AgentRegistry::from_config(&config);
         self.config = config;
+    }
+
+    /// Mark this run isolated (SPECS §32), optionally redirecting the agent
+    /// status plumbing to `status_root` so it stays out of the project
+    /// directory. Call once, during startup, before the event loop.
+    pub fn set_isolated(&mut self, status_root: Option<PathBuf>) {
+        self.isolated = true;
+        self.isolated_status_root = status_root;
     }
 
     // -----------------------------------------------------------------------
@@ -794,6 +813,11 @@ impl AppState {
     /// Persist `state.json` via the filesystem service (SPECS §9). Called after
     /// mutations that change tab metadata.
     fn persist(&self, services: &Services) -> Result<()> {
+        // An isolated run continues nothing, so it records nothing: this is the
+        // single funnel every `state.json` write passes through (SPECS §32).
+        if self.isolated {
+            return Ok(());
+        }
         let state = self.to_project_state(services.clock.now_millis());
         save_state(services.fs, &self.state_path, &state)
     }
@@ -3413,6 +3437,55 @@ mod tests {
         .unwrap();
         let id = app.tabs[0].id();
         (app, git, fs, pty, clock, id)
+    }
+
+    #[test]
+    fn isolated_state_never_writes_state_json() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        app.set_isolated(None);
+        assert!(app.isolated);
+
+        // Renaming persists in a normal run; in an isolated one it must not.
+        let before = fs.writes().len();
+        app.dispatch(
+            Command::RenameAgentTab {
+                new_name: "renamed".to_string(),
+            },
+            &services(&git, &fs, &pty, &clock),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.tabs[0].meta.name, "renamed",
+            "the rename still applies in memory"
+        );
+        assert_eq!(
+            fs.writes().len(),
+            before,
+            "an isolated run must not write state.json: {:?}",
+            fs.writes()
+        );
+    }
+
+    #[test]
+    fn non_isolated_state_still_writes_state_json() {
+        // Regression guard: the guard must not disable persistence generally.
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        assert!(!app.isolated, "isolated is off by default");
+        app.dispatch(
+            Command::RenameAgentTab {
+                new_name: "renamed".to_string(),
+            },
+            &services(&git, &fs, &pty, &clock),
+        )
+        .unwrap();
+        assert!(
+            fs.writes().iter().any(|p| p.ends_with("state.json")),
+            "a normal run still persists: {:?}",
+            fs.writes()
+        );
     }
 
     /// A config with one real agent and OS notifications enabled (on by default,
