@@ -5966,7 +5966,14 @@ mod tests {
         // swallowed into built-in defaults — the user's own agents and
         // settings would vanish with no message.
         let dir = TempDir::new().unwrap();
-        let agent = make_real_agent(&dir, "opencode");
+        // Deliberately not one of the built-in agent keys ("opencode",
+        // "claude", "codex"): default_config()'s own default_agent is
+        // "opencode", so asserting a project-supplied "opencode" survives
+        // would pass identically whether the project layer was honoured or
+        // silently discarded in favour of built-in defaults (both produce
+        // "opencode") — a non-default key is the only way this assertion can
+        // actually distinguish the two.
+        let agent = make_real_agent(&dir, "myagent");
         let config = config_with_agent(agent);
         let toml = crate::config::load::serialize_config(&config).unwrap();
 
@@ -5999,7 +6006,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            state.config.ui.default_agent, "opencode",
+            state.config.ui.default_agent, "myagent",
             "the project's own config must survive a corrupt global base"
         );
         assert!(fs.writes_under(Path::new("/repo")).is_empty());
