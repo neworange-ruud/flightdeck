@@ -3256,6 +3256,18 @@ mod help_repo_gesture_tests {
             "Cargo.toml `repository` must stay a GitHub https URL, got: {REPOSITORY_URL}",
         );
     }
+
+    #[test]
+    fn the_repository_url_survives_the_windows_cmd_launcher() {
+        // Windows opens URLs via `cmd /c start`, which re-parses the argument.
+        // A `repository` value carrying a cmd metacharacter would be mangled on
+        // Windows only — a platform-specific break CI cannot catch, since no
+        // test spawns a real browser. Assert the requirement at the call site.
+        assert!(
+            crate::tui::opener::url_is_cmd_safe(REPOSITORY_URL),
+            "Cargo.toml `repository` must be free of cmd metacharacters, got: {REPOSITORY_URL}",
+        );
+    }
 }
 
 fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<bool> {

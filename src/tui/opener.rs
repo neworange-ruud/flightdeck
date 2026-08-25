@@ -62,13 +62,48 @@ pub fn spawn_detached(
     Ok(())
 }
 
+/// Resolve the launcher for a URL: program plus its fixed arguments.
+///
+/// Windows does not reuse [`default_program`] here. `explorer.exe` happens to
+/// forward an http(s) URL, but the documented way to hand one to the default
+/// browser is the `start` shell verb — and `start` is a **cmd.exe builtin**,
+/// not an executable, so it has to be invoked as `cmd /c start`. The empty
+/// `""` argument is load-bearing: `start` reads a first quoted argument as the
+/// window title, so without it a quoted URL would be swallowed as a title and
+/// nothing would open.
+fn url_launcher() -> (&'static str, Vec<String>) {
+    if platform::IS_MACOS {
+        ("open", Vec::new())
+    } else if platform::IS_WINDOWS {
+        (
+            "cmd",
+            vec!["/c".to_string(), "start".to_string(), String::new()],
+        )
+    } else {
+        ("xdg-open", Vec::new())
+    }
+}
+
 /// Open `url` in the user's browser via the platform default handler.
 ///
 /// Unlike the file manager there is no config escape hatch: a URL belongs to
 /// whatever the desktop has registered for `http(s)`, not to a configured file
 /// manager.
+///
+/// **Windows caveat:** the `cmd /c` launcher means cmd.exe re-parses the
+/// argument, so a URL containing `&`, `^`, `|` or `%` would be mangled or
+/// worse. Callers must pass a trusted, metacharacter-free URL — today the only
+/// caller passes a compile-time constant, and [`url_is_cmd_safe`] states the
+/// requirement so it can be asserted at the call site.
 pub fn open_url(url: &str) -> Result<(), String> {
-    spawn_detached(default_program(), &[], std::ffi::OsStr::new(url), "browser")
+    let (program, args) = url_launcher();
+    spawn_detached(program, &args, std::ffi::OsStr::new(url), "browser")
+}
+
+/// Whether `url` is free of characters cmd.exe would re-interpret, and so safe
+/// to pass through the Windows `cmd /c start` launcher.
+pub fn url_is_cmd_safe(url: &str) -> bool {
+    !url.contains(['&', '^', '|', '%', '<', '>', '"'])
 }
 
 #[cfg(test)]
@@ -83,6 +118,38 @@ mod tests {
             assert_eq!(default_program(), "explorer.exe");
         } else {
             assert_eq!(default_program(), "xdg-open");
+        }
+    }
+
+    #[test]
+    fn url_launcher_matches_the_platform() {
+        let (program, args) = url_launcher();
+        if platform::IS_MACOS {
+            assert_eq!(program, "open");
+            assert!(args.is_empty());
+        } else if platform::IS_WINDOWS {
+            // `start` is a cmd builtin, and the empty title argument must be
+            // present or the URL is consumed as the window title.
+            assert_eq!(program, "cmd");
+            assert_eq!(args, vec!["/c", "start", ""]);
+        } else {
+            assert_eq!(program, "xdg-open");
+            assert!(args.is_empty());
+        }
+    }
+
+    #[test]
+    fn cmd_metacharacters_are_rejected_as_url_safe() {
+        assert!(url_is_cmd_safe(
+            "https://github.com/neworange-ruud/flightdeck"
+        ));
+        for bad in [
+            "https://x.test/?a=1&b=2",
+            "https://x.test/^",
+            "https://x.test/|",
+            "https://x.test/%PATH%",
+        ] {
+            assert!(!url_is_cmd_safe(bad), "{bad} must be rejected");
         }
     }
 
