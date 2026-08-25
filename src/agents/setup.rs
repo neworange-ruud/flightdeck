@@ -81,10 +81,24 @@ pub fn status_backend(agent: &AgentDef) -> Option<StatusBackend> {
 ///
 /// `containerized` changes only paths passed to the agent: the generated files
 /// live in the bind-mounted worktree in both modes.
+///
+/// `status_root` is where the plugin dir, the seeded status file, and
+/// `agent-question.json` live. Passing `worktree` for it reproduces today's
+/// behavior exactly. When it differs from `worktree` (an isolated run), the
+/// hook bodies carry `status_root`'s *absolute* path instead of a path
+/// relative to the agent's working directory, so lifecycle events still land
+/// somewhere FlightDeck polls even though the agent's cwd is the project.
+///
+/// A `status_root` that differs from `worktree` is treated as exclusively
+/// FlightDeck-owned scratch space: any pre-existing contents are wiped before
+/// writing, so a stale directory left behind by a crashed earlier run (its
+/// pid-based name can be recycled — see [`crate::isolated_status_dir`]) never
+/// bleeds into a fresh run. `status_root == worktree` is never wiped.
 pub fn prepare_status_launch(
     fs: &dyn FileSystem,
     agent: &AgentDef,
     worktree: &Path,
+    status_root: &Path,
     containerized: bool,
 ) -> Result<StatusLaunch> {
     let Some(backend) = status_backend(agent) else {
@@ -95,12 +109,18 @@ pub fn prepare_status_launch(
         });
     };
 
-    let runtime = worktree.join(STATUS_RUNTIME_DIR);
+    if status_root != worktree && fs.exists(status_root) {
+        fs.remove_dir_all(status_root)?;
+    }
+
+    let runtime = status_root.join(STATUS_RUNTIME_DIR);
     fs.create_dir_all(&runtime)?;
+    let status_file = status_root.join(".flightdeck").join("agent-status");
     // A freshly launched interactive agent starts at its prompt. Writing this
     // before spawn gives the UI a deterministic initial state even if a backend
     // does not emit a session-start event.
-    fs.write(&worktree.join(".flightdeck/agent-status"), "idle\n")?;
+    fs.write(&status_file, "idle\n")?;
+    let question_file = status_root.join(".flightdeck").join("agent-question.json");
 
     let agent_runtime = if containerized {
         format!("/workspace/{STATUS_RUNTIME_DIR}")
@@ -119,7 +139,10 @@ pub fn prepare_status_launch(
                 &root.join(".claude-plugin/plugin.json"),
                 CLAUDE_PLUGIN_MANIFEST,
             )?;
-            fs.write(&root.join("hooks/hooks.json"), CLAUDE_PLUGIN_HOOKS)?;
+            fs.write(
+                &root.join("hooks/hooks.json"),
+                &claude_plugin_hooks(&status_file, &question_file),
+            )?;
             args.push("--plugin-dir".to_string());
             args.push(format!("{agent_runtime}/claude"));
         }
@@ -135,13 +158,16 @@ pub fn prepare_status_launch(
                 ("PostToolUse", "working"),
             ] {
                 args.push("--config".to_string());
-                args.push(codex_hook_override(event, state));
+                args.push(codex_hook_override(event, state, &status_file));
             }
         }
         StatusBackend::OpenCode => {
             let root = runtime.join("opencode");
             fs.create_dir_all(&root.join("plugins"))?;
-            fs.write(&root.join("plugins/flightdeck.js"), OPENCODE_RUNTIME_PLUGIN)?;
+            fs.write(
+                &root.join("plugins/flightdeck.js"),
+                &opencode_runtime_plugin(&status_file),
+            )?;
             env.push((
                 "OPENCODE_CONFIG_DIR".to_string(),
                 format!("{agent_runtime}/opencode"),
@@ -156,9 +182,25 @@ pub fn prepare_status_launch(
     })
 }
 
-fn codex_hook_override(event: &str, state: &str) -> String {
-    let command =
-        format!("[ -d .flightdeck ] && printf '{state}\\n' >> .flightdeck/agent-status; exit 0");
+/// Single-quote a path for a POSIX shell, escaping embedded single quotes by
+/// closing the quoted string, emitting an escaped literal quote, and
+/// reopening it (the standard `'\''` trick). Safe for any byte sequence,
+/// including a Windows path's backslashes (backslash has no special meaning
+/// inside single quotes).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Build one Codex hook override CLI arg (`--config hooks.<event>=...`) that
+/// appends `state` to the absolute `status_file`. The command string is a
+/// POSIX-shell one-liner, single-quoted via [`shell_quote`]; the whole TOML
+/// value is then serialized through `toml::Value::String`, never hand-quoted,
+/// so embedded quotes/backslashes from either layer are escaped correctly.
+fn codex_hook_override(event: &str, state: &str, status_file: &Path) -> String {
+    let command = format!(
+        "printf '{state}\\n' >> {}; exit 0",
+        shell_quote(&status_file.to_string_lossy())
+    );
     format!(
         "hooks.{event}=[{{hooks=[{{type=\"command\",command={}}}]}}]",
         toml::Value::String(command)
@@ -172,34 +214,90 @@ const CLAUDE_PLUGIN_MANIFEST: &str = r#"{
 }
 "#;
 
-const CLAUDE_PLUGIN_HOOKS: &str = r#"{
-  "description": "FlightDeck agent lifecycle status",
-  "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'working\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "StopFailure": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "PermissionRequest": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && { cat > .flightdeck/agent-question.json; printf 'waiting\\n' >> .flightdeck/agent-status; }; exit 0"}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'working\\n' >> .flightdeck/agent-status; exit 0"}]}],
-    "Notification": [
-      {"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'waiting\\n' >> .flightdeck/agent-status; exit 0"}]},
-      {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "[ -d .flightdeck ] && printf 'idle\\n' >> .flightdeck/agent-status; exit 0"}]}
-    ]
-  }
+/// The Claude plugin's hook bodies, targeting the absolute `status_file` (and,
+/// for the `AskUserQuestion` matcher, the absolute `question_file`).
+///
+/// Each body is a POSIX-shell one-liner embedded in JSON, so the whole
+/// document is built with `serde_json::json!` and rendered with
+/// `to_string()` — every string (including the shell-quoted path) is escaped
+/// by the serializer, never by hand-writing `format!("\"{path}\"")`. That
+/// also makes a Windows path's backslashes safe: `serde_json` escapes them as
+/// `\\` in the JSON string, and the JSON parser on the Claude side hands the
+/// shell the literal single backslash back, which POSIX single-quoting (see
+/// [`shell_quote`]) then passes through unchanged.
+///
+/// The original bodies guarded on `[ -d .flightdeck ]` because the path was
+/// relative to the agent's (arbitrary) working directory, and the hook could
+/// otherwise fire in an unrelated project. With an absolute `status_file` that
+/// FlightDeck itself creates via `create_dir_all` plus the seeded status file,
+/// the directory exists by construction, so the guard is dropped; `>>` failing
+/// on a since-vanished directory is already harmless because every body ends
+/// `exit 0`.
+///
+/// Every event transcribed here matches the original `CLAUDE_PLUGIN_HOOKS`
+/// constant exactly (SessionStart, UserPromptSubmit, Stop, StopFailure,
+/// PermissionRequest, PreToolUse/AskUserQuestion, PostToolUse, and both
+/// Notification matchers) — dropping one would silently lose a status
+/// transition.
+fn claude_plugin_hooks(status_file: &Path, question_file: &Path) -> String {
+    let sf = shell_quote(&status_file.to_string_lossy());
+    let qf = shell_quote(&question_file.to_string_lossy());
+    let write = |state: &str| -> String { format!("printf '{state}\\n' >> {sf}; exit 0") };
+    let hook = |command: String| -> serde_json::Value {
+        serde_json::json!([{"hooks": [{"type": "command", "command": command}]}])
+    };
+    let matched_hook = |matcher: &str, command: String| -> serde_json::Value {
+        serde_json::json!([{"matcher": matcher, "hooks": [{"type": "command", "command": command}]}])
+    };
+    serde_json::json!({
+        "description": "FlightDeck agent lifecycle status",
+        "hooks": {
+            "SessionStart": hook(write("idle")),
+            "UserPromptSubmit": hook(write("working")),
+            "Stop": hook(write("idle")),
+            "StopFailure": hook(write("idle")),
+            "PermissionRequest": hook(write("waiting")),
+            "PreToolUse": matched_hook(
+                "AskUserQuestion",
+                format!("cat > {qf}; printf 'waiting\\n' >> {sf}; exit 0"),
+            ),
+            "PostToolUse": hook(write("working")),
+            "Notification": [
+                serde_json::json!({"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": write("waiting")}]}),
+                serde_json::json!({"matcher": "idle_prompt", "hooks": [{"type": "command", "command": write("idle")}]}),
+            ],
+        }
+    })
+    .to_string()
 }
-"#;
 
-const OPENCODE_RUNTIME_PLUGIN: &str = r#"// Generated by FlightDeck. Explicit lifecycle state only; no terminal heuristics.
+/// The OpenCode runtime plugin, targeting the absolute `status_file`.
+///
+/// The path is serialized once through `serde_json::to_string` (never
+/// hand-quoted) and substituted for the `__FLIGHTDECK_STATUS_FILE_JSON__`
+/// placeholder in [`OPENCODE_RUNTIME_PLUGIN_TEMPLATE`] with a plain string
+/// replace — so the rest of the generated source is untouched, and only the
+/// one substitution point needs to be reasoned about for escaping. A JSON
+/// string is also valid JS string-literal syntax (both use `\"`/`\\`
+/// escaping and Unicode `\uXXXX`), so the same serialization is safe to embed
+/// directly as a JS literal, including a Windows path's backslashes.
+fn opencode_runtime_plugin(status_file: &Path) -> String {
+    let status_file_js =
+        serde_json::to_string(&status_file.to_string_lossy()).expect("string always serializes");
+    OPENCODE_RUNTIME_PLUGIN_TEMPLATE.replace("__FLIGHTDECK_STATUS_FILE_JSON__", &status_file_js)
+}
+
+const OPENCODE_RUNTIME_PLUGIN_TEMPLATE: &str = r#"// Generated by FlightDeck. Explicit lifecycle state only; no terminal heuristics.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-export const FlightDeckStatus = async ({ directory, worktree }) => {
-  const root = worktree || directory;
-  const fdDir = join(root, ".flightdeck");
+const FLIGHTDECK_STATUS_FILE = __FLIGHTDECK_STATUS_FILE_JSON__;
+
+export const FlightDeckStatus = async () => {
+  const fdDir = dirname(FLIGHTDECK_STATUS_FILE);
   const write = (state) => {
     try {
-      if (existsSync(fdDir)) appendFileSync(join(fdDir, "agent-status"), state + "\n");
+      if (existsSync(fdDir)) appendFileSync(FLIGHTDECK_STATUS_FILE, state + "\n");
     } catch (_) {}
   };
   // Serialize the structured prompt so FlightDeck can offer real options on the
@@ -619,10 +717,158 @@ mod tests {
     }
 
     #[test]
+    fn status_launch_writes_only_under_the_status_root() {
+        let fs = FakeFs::new();
+        let agent = agent("claude", "claude");
+
+        let launch = prepare_status_launch(
+            &fs,
+            &agent,
+            Path::new("/repo"),
+            Path::new("/tmp/fd-isolated-1"),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            fs.writes_under(Path::new("/repo")).is_empty(),
+            "nothing may land in the project: {:?}",
+            fs.writes_under(Path::new("/repo"))
+        );
+        assert!(
+            !fs.writes_under(Path::new("/tmp/fd-isolated-1")).is_empty(),
+            "the plumbing goes to the status root instead"
+        );
+        assert!(
+            launch.explicit,
+            "a known backend still reports explicit status"
+        );
+        assert!(
+            launch.args.iter().any(|a| a.contains("/tmp/fd-isolated-1")),
+            "the plugin dir handed to the agent points at the status root: {:?}",
+            launch.args
+        );
+    }
+
+    #[test]
+    fn claude_hooks_target_the_absolute_status_file() {
+        let fs = FakeFs::new();
+        let agent = agent("claude", "claude");
+        prepare_status_launch(
+            &fs,
+            &agent,
+            Path::new("/repo"),
+            Path::new("/tmp/root"),
+            false,
+        )
+        .unwrap();
+
+        let hooks = fs
+            .file_contents(Path::new(
+                "/tmp/root/.flightdeck/runtime/status/claude/hooks/hooks.json",
+            ))
+            .expect("hooks.json written under the status root");
+        assert!(
+            hooks.contains("/tmp/root/.flightdeck/agent-status"),
+            "hook bodies must carry the absolute status path, not a cwd-relative one: {hooks}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&hooks).is_ok(),
+            "the templated hooks must still be valid JSON: {hooks}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_override_quotes_the_absolute_path_as_toml() {
+        let ov = codex_hook_override(
+            "Stop",
+            "idle",
+            Path::new("/tmp/root/.flightdeck/agent-status"),
+        );
+        assert!(ov.contains("/tmp/root/.flightdeck/agent-status"));
+        assert!(
+            toml::from_str::<toml::Value>(&ov.replace("hooks.Stop=", "x=")).is_ok(),
+            "the override must be parseable TOML: {ov}"
+        );
+    }
+
+    #[test]
+    fn status_root_equal_to_the_worktree_is_todays_behavior() {
+        // Regression guard for the normal path.
+        let fs = FakeFs::new();
+        let agent = agent("claude", "claude");
+        prepare_status_launch(&fs, &agent, Path::new("/repo"), Path::new("/repo"), false).unwrap();
+
+        assert!(
+            fs.exists(Path::new("/repo/.flightdeck/agent-status")),
+            "the seeded status file still lands in the worktree"
+        );
+        assert!(
+            fs.exists(Path::new(
+                "/repo/.flightdeck/runtime/status/claude/hooks/hooks.json"
+            )),
+            "so does the plugin"
+        );
+    }
+
+    #[test]
+    fn stale_status_root_contents_are_cleaned_before_a_fresh_run() {
+        // A pid-based isolated temp dir can be recycled from a crashed earlier
+        // run. Leftover files this run does not itself rewrite (e.g. a
+        // different backend's plugin dir) must not survive into the fresh run.
+        let fs = FakeFs::new().with_file(
+            "/tmp/root/.flightdeck/runtime/status/opencode/plugins/flightdeck.js",
+            "stale leftover from a crashed earlier run",
+        );
+        let agent = agent("codex", "codex");
+        prepare_status_launch(
+            &fs,
+            &agent,
+            Path::new("/repo"),
+            Path::new("/tmp/root"),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            fs.file_contents(Path::new(
+                "/tmp/root/.flightdeck/runtime/status/opencode/plugins/flightdeck.js"
+            ))
+            .is_none(),
+            "a stale directory left by a crashed earlier run must be cleaned, not merged into"
+        );
+    }
+
+    #[test]
+    fn status_root_equal_to_the_worktree_is_never_wiped() {
+        // Guard against the cleanup step ever touching the worktree: a normal
+        // (non-isolated) run must never have its status_root nuked just because
+        // it happens to already contain a stale status file from a prior spawn.
+        let fs = FakeFs::new().with_file(
+            "/repo/some-unrelated-project-file.txt",
+            "must survive prepare_status_launch",
+        );
+        let agent = agent("claude", "claude");
+        prepare_status_launch(&fs, &agent, Path::new("/repo"), Path::new("/repo"), false).unwrap();
+
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/some-unrelated-project-file.txt")),
+            Some("must survive prepare_status_launch".to_string()),
+            "status_root == worktree must never be wiped"
+        );
+    }
+
+    #[test]
     fn prepares_claude_plugin_without_replacing_existing_args() {
         let fs = FakeFs::new();
-        let launch =
-            prepare_status_launch(&fs, &agent("claude", "claude"), Path::new(REPO), false).unwrap();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("claude", "claude"),
+            Path::new(REPO),
+            Path::new(REPO),
+            false,
+        )
+        .unwrap();
         assert!(launch.explicit);
         assert_eq!(launch.args[0], "--existing");
         assert!(launch.args.contains(&"--plugin-dir".to_string()));
@@ -663,8 +909,14 @@ mod tests {
     #[test]
     fn prepares_codex_inline_hooks_as_valid_toml_overrides() {
         let fs = FakeFs::new();
-        let launch =
-            prepare_status_launch(&fs, &agent("codex", "codex"), Path::new(REPO), false).unwrap();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("codex", "codex"),
+            Path::new(REPO),
+            Path::new(REPO),
+            false,
+        )
+        .unwrap();
         assert!(launch.explicit);
         assert!(launch.args.windows(2).any(|w| w == ["--enable", "hooks"]));
         for pair in launch.args.windows(2).filter(|w| w[0] == "--config") {
@@ -690,9 +942,14 @@ mod tests {
     #[test]
     fn prepares_opencode_runtime_plugin_and_config_environment() {
         let fs = FakeFs::new();
-        let launch =
-            prepare_status_launch(&fs, &agent("opencode", "opencode"), Path::new(REPO), true)
-                .unwrap();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("opencode", "opencode"),
+            Path::new(REPO),
+            Path::new(REPO),
+            true,
+        )
+        .unwrap();
         assert_eq!(
             launch.env,
             vec![(
@@ -733,8 +990,14 @@ mod tests {
     #[test]
     fn unknown_agent_fails_closed_without_generating_runtime_files() {
         let fs = FakeFs::new();
-        let launch =
-            prepare_status_launch(&fs, &agent("custom", "other"), Path::new(REPO), false).unwrap();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("custom", "other"),
+            Path::new(REPO),
+            Path::new(REPO),
+            false,
+        )
+        .unwrap();
         assert!(!launch.explicit);
         assert!(launch.env.is_empty());
         assert_eq!(launch.args, vec!["--existing"]);
@@ -782,7 +1045,7 @@ mod tests {
         assert!(OPENCODE_PLUGIN.contains(".flightdeck/agent-status"));
         for event in ["question.asked", "question.replied", "question.rejected"] {
             assert!(
-                OPENCODE_RUNTIME_PLUGIN.contains(event) && OPENCODE_PLUGIN.contains(event),
+                OPENCODE_RUNTIME_PLUGIN_TEMPLATE.contains(event) && OPENCODE_PLUGIN.contains(event),
                 "all OpenCode bridges must handle {event}"
             );
         }
@@ -790,7 +1053,7 @@ mod tests {
         // text + options) to the sidecar the desktop reads, overwriting it each
         // time (writeFileSync, not appendFileSync) so a stale prompt never
         // lingers, and must invoke that capture on the asked events.
-        for plugin in [OPENCODE_RUNTIME_PLUGIN, OPENCODE_PLUGIN] {
+        for plugin in [OPENCODE_RUNTIME_PLUGIN_TEMPLATE, OPENCODE_PLUGIN] {
             assert!(
                 plugin.contains("agent-prompt.json"),
                 "OpenCode plugin must write the prompt sidecar"

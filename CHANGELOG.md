@@ -12,7 +12,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Agent status plumbing (Claude/Codex/OpenCode lifecycle hooks) now takes an
+  explicit status root instead of always writing into the worktree, laying the
+  groundwork for `--isolated` runs to keep that plumbing out of the project.
+  Normal runs are unaffected — the status root is still the worktree.
 
 ### Bug fixes
 

@@ -379,15 +379,19 @@ impl RuntimeTab {
     }
 }
 
-/// Path to a tab's agent status event file inside its worktree (SPECS §24).
+/// Path to a tab's agent status event file under `status_root` (SPECS §24, §32).
 ///
 /// The agent's status hook/plugin writes one of the keywords understood by
-/// [`status_keyword_to_interpreted`] here; FlightDeck polls it. The path is
-/// derived purely from the worktree so the hook can compute the same path from
-/// its own working directory without any injected configuration. It is covered
-/// by the `.flightdeck/agent-status` `.gitignore` entry added at init.
-pub fn agent_status_file(worktree_abs: &Path) -> PathBuf {
-    worktree_abs.join(".flightdeck").join("agent-status")
+/// [`status_keyword_to_interpreted`] here; FlightDeck polls it. `status_root`
+/// is the tab's worktree in a normal run (in which case this reproduces the
+/// pre-isolated-mode path exactly), and a redirect target — normally a temp
+/// directory — in an isolated one; the hook body carries the same absolute
+/// path so it writes to this exact file regardless of the agent's own working
+/// directory. Covered by the `.flightdeck/agent-status` `.gitignore` entry
+/// added at init (for a normal run; an isolated run's root is outside the
+/// project and is not tracked at all).
+pub fn agent_status_file(status_root: &Path) -> PathBuf {
+    status_root.join(".flightdeck").join("agent-status")
 }
 
 /// Map a status-file keyword (written by an agent hook/plugin) to an
@@ -1232,7 +1236,7 @@ impl AppState {
             return Err(e);
         }
 
-        let status_file = agent_status_file(&worktree_abs);
+        let status_file = agent_status_file(&self.status_root(&worktree_abs));
         let (initial_status, status_file_seen) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         let tab = &mut self.tabs[idx];
@@ -1882,6 +1886,20 @@ impl AppState {
         }
     }
 
+    /// Where this run keeps the agent status plumbing for a tab whose working
+    /// directory is `worktree` (SPECS §32). Normally the worktree itself; an
+    /// isolated run redirects it out of the project. Containerized runs always
+    /// use the worktree, because a temp directory outside it is not
+    /// bind-mounted into the container (specs/ISOLATED_MODE.md §8.2).
+    fn status_root(&self, worktree: &Path) -> PathBuf {
+        if self.config.containers.enabled {
+            return worktree.to_path_buf();
+        }
+        self.isolated_status_root
+            .clone()
+            .unwrap_or_else(|| worktree.to_path_buf())
+    }
+
     /// Resolve how to launch (or reattach) a primary terminal (SPECS §31).
     ///
     /// - Local mode (`containers.enabled == false`): the agent command directly.
@@ -1898,7 +1916,13 @@ impl AppState {
         allow_attach: bool,
     ) -> Result<PrimarySpawn> {
         if !self.config.containers.enabled {
-            let status = prepare_status_launch(services.fs, agent, worktree_abs, false)?;
+            let status = prepare_status_launch(
+                services.fs,
+                agent,
+                worktree_abs,
+                &self.status_root(worktree_abs),
+                false,
+            )?;
             let mut launch_agent = agent.clone();
             launch_agent.args = status.args;
             let launch = build_launch(&launch_agent, worktree_abs);
@@ -1944,7 +1968,16 @@ impl AppState {
         // Clear any stale exited container so `--name` does not clash.
         let _ = services.container.remove_container(&name, true);
 
-        let status = prepare_status_launch(services.fs, agent, worktree_abs, true)?;
+        // Containerized: always the worktree (§8.2), so `self.status_root`
+        // would be redundant here — but calling it keeps this call site honest
+        // about the same rule the helper enforces.
+        let status = prepare_status_launch(
+            services.fs,
+            agent,
+            worktree_abs,
+            &self.status_root(worktree_abs),
+            true,
+        )?;
         let mut launch_agent = agent.clone();
         launch_agent.args = status.args;
         let mut spec = self.container_spec(
@@ -2148,7 +2181,7 @@ impl AppState {
             }
         }
 
-        let status_file = agent_status_file(&cwd);
+        let status_file = agent_status_file(&self.status_root(&cwd));
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
         // Fresh container: start it detached before attaching its PTY.
@@ -5415,6 +5448,48 @@ mod tests {
         // The tab records that it is containerized + the image used.
         assert!(app.tabs[0].meta.containerized);
         assert_eq!(app.tabs[0].meta.container_image, Some(image));
+    }
+
+    #[test]
+    fn containerized_status_plumbing_stays_in_the_worktree_even_when_isolated() {
+        // SPECS §8.2 ruling: a temp status root outside the worktree is never
+        // bind-mounted into the container, so a containerized run must keep the
+        // in-worktree status root regardless of the isolated flag.
+        let image = project_image();
+        let mut app = fresh_state(exec_config());
+        app.set_isolated(Some(PathBuf::from("/tmp/fd-isolated-container-guard")));
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(image);
+        let command = FakeCommandRunner::new();
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        app.dispatch(new_tab_cmd(), &svc).unwrap();
+
+        assert!(
+            fs.writes_under(Path::new("/tmp/fd-isolated-container-guard"))
+                .is_empty(),
+            "a containerized run must never write status plumbing to the isolated temp root: {:?}",
+            fs.writes_under(Path::new("/tmp/fd-isolated-container-guard"))
+        );
+        let worktree = to_absolute(
+            Path::new(REPO),
+            Path::new(&app.tabs[0].meta.worktree_path_relative),
+        );
+        assert!(
+            fs.exists(&worktree.join(".flightdeck/runtime/status/opencode/plugins/flightdeck.js")),
+            "the plugin must still land in the bind-mounted worktree: {:?}",
+            fs.writes()
+        );
     }
 
     #[test]

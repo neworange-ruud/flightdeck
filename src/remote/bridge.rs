@@ -552,6 +552,20 @@ impl RemoteBridge {
                     self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_i64);
                 }
 
+                // Where the agent's status hook/plugin actually writes its
+                // sidecars: the tab's worktree in a normal run, a redirect
+                // target (outside the project) in an isolated one. Derived from
+                // `status_file` (`<status_root>/.flightdeck/agent-status`)
+                // rather than recomputed, so this can never drift from the root
+                // `prepare_status_launch` was actually given. Falls back to the
+                // worktree before the tab's first spawn sets `status_file`.
+                let status_root = tab
+                    .status_file
+                    .as_deref()
+                    .and_then(|f| f.parent()?.parent())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| worktree.clone());
+
                 let ds = tab.display_status(now_ms);
                 let interpreted = ds.interpreted;
                 let status = feed::agent_status(ds);
@@ -574,9 +588,9 @@ impl RemoteBridge {
                     // real question shows immediately — never the binary card whose
                     // keystroke would answer it (remote-control-qa1).
                     let sidecar = if is_opencode {
-                        read_prompt_sidecar(&worktree)
+                        read_prompt_sidecar(&status_root)
                     } else if is_claude {
-                        read_claude_question_sidecar(&worktree)
+                        read_claude_question_sidecar(&status_root)
                     } else {
                         None
                     };
@@ -608,12 +622,12 @@ impl RemoteBridge {
                         self.previews.insert(sid.clone(), preview);
                     }
                     if is_opencode {
-                        let _ = std::fs::remove_file(prompt_sidecar_path(&worktree));
+                        let _ = std::fs::remove_file(prompt_sidecar_path(&status_root));
                     }
                     if is_claude {
                         // Consume the sidecar so a later, unrelated wait never
                         // reuses this question.
-                        let _ = std::fs::remove_file(claude_question_sidecar_path(&worktree));
+                        let _ = std::fs::remove_file(claude_question_sidecar_path(&status_root));
                     }
                 } else if now_needs && was_needs {
                     // Still waiting with a deferred Claude binary fallback: resolve
@@ -900,30 +914,34 @@ struct PromptSidecarOption {
     description: Option<String>,
 }
 
-/// Path of the OpenCode prompt sidecar within a worktree (sibling of the
-/// `agent-status` file the poller reads).
-fn prompt_sidecar_path(worktree: &Path) -> PathBuf {
-    worktree.join(".flightdeck").join("agent-prompt.json")
+/// Path of the OpenCode prompt sidecar under `status_root` (sibling of the
+/// `agent-status` file the poller reads — the same root [`prepare_status_launch`]
+/// was given, normally the worktree but redirected for an isolated run).
+///
+/// [`prepare_status_launch`]: crate::agents::setup::prepare_status_launch
+fn prompt_sidecar_path(status_root: &Path) -> PathBuf {
+    status_root.join(".flightdeck").join("agent-prompt.json")
 }
 
-/// Path of the Claude AskUserQuestion sidecar within a worktree. Written by the
-/// Claude `PreToolUse`/`AskUserQuestion` hook (which pipes the hook's stdin —
-/// the `{tool_name, tool_input, …}` payload — to this file) at the instant the
-/// question is asked, BEFORE it flips the status to `waiting`. This gives the
-/// desktop the question deterministically on the needs-input edge, rather than
-/// waiting for Claude to write the tool_use to its JSONL — which it does only
-/// AFTER the user answers, so the binary fallback would otherwise win the race
-/// and its "Allow" keystroke would answer the live question (remote-control-qa1).
-fn claude_question_sidecar_path(worktree: &Path) -> PathBuf {
-    worktree.join(".flightdeck").join("agent-question.json")
+/// Path of the Claude AskUserQuestion sidecar under `status_root` (see
+/// [`prompt_sidecar_path`]). Written by the Claude `PreToolUse`/`AskUserQuestion`
+/// hook (which pipes the hook's stdin — the `{tool_name, tool_input, …}`
+/// payload — to this file) at the instant the question is asked, BEFORE it
+/// flips the status to `waiting`. This gives the desktop the question
+/// deterministically on the needs-input edge, rather than waiting for Claude to
+/// write the tool_use to its JSONL — which it does only AFTER the user answers,
+/// so the binary fallback would otherwise win the race and its "Allow"
+/// keystroke would answer the live question (remote-control-qa1).
+fn claude_question_sidecar_path(status_root: &Path) -> PathBuf {
+    status_root.join(".flightdeck").join("agent-question.json")
 }
 
 /// Read and parse the Claude AskUserQuestion sidecar into a [`StructuredPrompt`],
 /// or `None` when it is absent/malformed. The file holds the raw PreToolUse hook
 /// payload, so the `tool_input` field is the AskUserQuestion input the transcript
 /// parser already understands.
-fn read_claude_question_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
-    let raw = std::fs::read_to_string(claude_question_sidecar_path(worktree)).ok()?;
+fn read_claude_question_sidecar(status_root: &Path) -> Option<StructuredPrompt> {
+    let raw = std::fs::read_to_string(claude_question_sidecar_path(status_root)).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let input = parsed.get("tool_input")?;
     crate::remote::transcript::parse_ask_user_question(input)
@@ -958,8 +976,8 @@ fn classify_permission_choice(label: &str) -> Option<PermissionChoice> {
 /// - `kind == "permission"` → [`PromptKind::Permission`], `allow_free_text =
 ///   false`; each option must classify to allow/deny — if any label is unclear
 ///   the whole structured prompt is abandoned in favour of the binary fallback.
-fn read_prompt_sidecar(worktree: &Path) -> Option<StructuredPrompt> {
-    let raw = std::fs::read_to_string(prompt_sidecar_path(worktree)).ok()?;
+fn read_prompt_sidecar(status_root: &Path) -> Option<StructuredPrompt> {
+    let raw = std::fs::read_to_string(prompt_sidecar_path(status_root)).ok()?;
     let parsed: PromptSidecar = serde_json::from_str(&raw).ok()?;
     if parsed.options.is_empty() {
         return None;
