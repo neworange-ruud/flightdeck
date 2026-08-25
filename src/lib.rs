@@ -3472,6 +3472,10 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             // Phone" when already paired and "Unpair Phone" when there is no
             // pairing to forget.
             palette.set_paired(ui.remote_paired);
+            // Hide the project/new-tab entries in an isolated run: one session,
+            // one project (SPECS §32). The flows refuse independently; this is
+            // presentation only.
+            palette.set_isolated(workspace.active_project().state.isolated);
             ui.palette = Some(palette);
             Ok(false)
         }

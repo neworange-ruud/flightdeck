@@ -237,6 +237,10 @@ pub struct CommandPalette {
     /// is hidden while unpaired (there is nothing to forget). Defaults to
     /// `false` (unpaired) so an un-configured palette offers pairing.
     is_paired: bool,
+    /// Whether this is an isolated run (SPECS §32), which hides the project
+    /// entries and "New Agent Session Tab". Presentation only — the flows
+    /// themselves refuse independently, because keybindings bypass the palette.
+    isolated: bool,
 }
 
 impl CommandPalette {
@@ -253,14 +257,29 @@ impl CommandPalette {
         self.selected = 0;
     }
 
-    /// Whether an entry is visible given the current pairing state. Only the
-    /// two Remote entries are state-dependent; everything else is always shown.
+    /// Set whether this is an isolated run, which decides the visibility of the
+    /// project and new-session entries. Resets the selection so it can never
+    /// point past the shorter filtered list.
+    pub fn set_isolated(&mut self, isolated: bool) {
+        self.isolated = isolated;
+        self.selected = 0;
+    }
+
+    /// Whether an entry is visible given the current pairing and isolation
+    /// state. Only the two Remote entries and the project/new-tab entries are
+    /// state-dependent; everything else is always shown.
     fn entry_visible(&self, entry: &PaletteEntry) -> bool {
         match entry.action {
             // Cannot pair a phone that is already paired.
             PaletteAction::PairPhone => !self.is_paired,
             // Nothing to unpair unless a pairing exists.
             PaletteAction::UnpairPhone => self.is_paired,
+            // An isolated run has one session in one project (SPECS §32).
+            PaletteAction::OpenProject
+            | PaletteAction::CloseProject
+            | PaletteAction::SwitchProjectNext
+            | PaletteAction::SwitchProjectPrev
+            | PaletteAction::NewAgentTab => !self.isolated,
             _ => true,
         }
     }
@@ -652,6 +671,60 @@ mod tests {
         palette.select_next();
         assert_eq!(palette.selected_index(), 2);
         palette.set_filter("quit");
+        assert_eq!(palette.selected_index(), 0);
+    }
+
+    #[test]
+    fn isolated_palette_hides_project_and_new_tab_entries() {
+        let mut p = CommandPalette::new();
+        p.set_isolated(true);
+        let labels: Vec<&str> = p.filtered().iter().map(|e| e.label).collect();
+
+        for hidden in [
+            "Open Project",
+            "Close Project",
+            "Next Project",
+            "Previous Project",
+            "New Agent Session Tab",
+        ] {
+            assert!(
+                !labels.contains(&hidden),
+                "'{hidden}' must be hidden in an isolated run"
+            );
+        }
+        for shown in [
+            "Push Branch",
+            "Pull Base",
+            "Open Configuration",
+            "Pair Phone",
+            "Open Shell",
+            "Show Git Status",
+            "Toggle Split View",
+            "Quit",
+        ] {
+            assert!(labels.contains(&shown), "'{shown}' stays available");
+        }
+    }
+
+    #[test]
+    fn a_normal_palette_shows_everything() {
+        // Regression guard: REQUIRED_ACTION_COUNT is the unfiltered normal count.
+        let p = CommandPalette::new();
+        let labels: Vec<&str> = p.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Open Project"));
+        assert!(labels.contains(&"Close Project"));
+        assert!(labels.contains(&"Next Project"));
+        assert!(labels.contains(&"Previous Project"));
+        assert!(labels.contains(&"New Agent Session Tab"));
+    }
+
+    #[test]
+    fn set_isolated_resets_selection() {
+        let mut palette = CommandPalette::new();
+        palette.select_next();
+        palette.select_next();
+        assert_eq!(palette.selected_index(), 2);
+        palette.set_isolated(true);
         assert_eq!(palette.selected_index(), 0);
     }
 }

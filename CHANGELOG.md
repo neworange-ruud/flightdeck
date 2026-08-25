@@ -38,6 +38,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   the keybinding, palette-next/prev, and project-tab-click paths all now go
   through), so every entry point is covered at once. Normal runs are
   byte-identical to before.
+- The command palette now hides Open Project, Close Project, Next Project,
+  Previous Project, and New Agent Session Tab during an isolated run, so it
+  stops offering what the flows already refuse. Presentation only — the
+  underlying guards are unchanged. Normal runs are byte-identical to before.
 
 ### Bug fixes
 
