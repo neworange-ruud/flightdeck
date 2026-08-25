@@ -82,11 +82,13 @@ Created through the existing `begin_base_agent_tab`:
   no-op and **not one git mutation occurs**
 - `resume_args` empty: a fresh session
 
-**Branch label fix.** A base tab currently labels itself with the *base* branch,
-which is wrong whenever HEAD is on something else. In isolated mode the tab is
-labelled with the actual current branch. (The same wart exists for a
-user-created base tab; fixing it there too is in scope if it falls out cleanly,
-but it is not the goal.)
+**Branch label fix.** A base tab used to label itself with the *base* branch,
+which was wrong whenever HEAD was on something else. The fix landed in the
+shared `begin_base_agent_tab` (`src/app/state.rs:1111-1115`), so it is not
+isolated-mode-specific: every base tab, in every run, is now labelled with
+the branch actually checked out (falling back to the base branch on a
+detached HEAD or a git failure — see SPECS §32). This is the same fix the
+CHANGELOG's `Bug fixes` entry announces.
 
 ## 6. Blocked actions
 
@@ -193,13 +195,27 @@ Without this, a forgotten `-I` looks exactly like data loss.
 
 ## 10. Verification
 
-The strong tests are at `startup` level with `FakeFs`:
+The strong tests are at `startup` level with `FakeFs`
+(`isolated_startup_writes_nothing_under_the_repo`,
+`isolated_startup_ignores_state_json_on_disk`,
+`isolated_startup_still_reads_project_config`):
 
 - the fake filesystem receives **zero writes** during an isolated startup
-- exactly one tab exists, and it is `runs_on_base`
 - the effective `auto_continue` is `false`
-- the workspace file is never read
-- `state.json` is never read
+- `state.json` on disk is present but ignored — nothing is recovered from it
+
+`startup` itself creates no tab (the single tab is created afterwards, by
+`start_isolated_session`), so "exactly one tab exists, and it is
+`runs_on_base`" is asserted one level up, in
+`isolated_run_creates_exactly_one_base_tab` (`src/lib.rs`), not in a
+`startup`-level test.
+
+The workspace file is not read by `startup` at all — normal mode reads it in
+`run()`, and an isolated run skips that read by passing `ws_path = None`
+before `startup` is ever called (`src/lib.rs:207-215`). No test exercises
+this the way the `startup`-level tests exercise `state.json`, because `run()`
+has no test seam (the same limitation noted for teardown below); it is
+covered by construction, not by an automated assertion.
 
 Then:
 

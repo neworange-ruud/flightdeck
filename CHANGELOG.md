@@ -30,7 +30,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   badge in the status bar and a leading note in the help overlay (`?`) make
   the mode unmistakable. Combining the flag with a subcommand
   (`flightdeck -I doctor`) is a startup error rather than a silent ignore.
-  Normal runs are byte-identical to before. See SPECS §32.
+  A normal run's status *root* is unchanged (still the worktree), but its
+  generated hook bodies now carry an absolute status-file path instead of
+  the old cwd-relative one, so a normal run's hooks are not byte-identical
+  to before this series. See SPECS §32.
 
 ### Improvements
 
