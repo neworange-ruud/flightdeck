@@ -634,18 +634,34 @@ fn effective_config_without_writing(
     global_path: Option<&Path>,
     config_path: &Path,
 ) -> Result<Config> {
-    let read_table = |path: &Path| -> Result<toml::Table> {
-        if fs.exists(path) {
-            crate::config::load::parse_table(&fs.read_to_string(path)?)
-        } else {
-            Ok(toml::Table::new())
+    // Mirrors `crate::config::load::read_table` (private to that module):
+    // a missing file layers as an empty table; when `lenient`, an unparsable
+    // file is also treated as empty (with a notice) rather than failing the
+    // whole load — used for the global base so a corrupt user-level file
+    // never blocks a project's own config, exactly as `load_layered_config`
+    // behaves for a normal run.
+    let read_table = |path: &Path, lenient: bool| -> Result<toml::Table> {
+        if !fs.exists(path) {
+            return Ok(toml::Table::new());
+        }
+        let contents = fs.read_to_string(path)?;
+        match crate::config::load::parse_table(&contents) {
+            Ok(t) => Ok(t),
+            Err(e) if lenient => {
+                eprintln!(
+                    "FlightDeck: ignoring unparsable global config {}: {e}",
+                    path.display()
+                );
+                Ok(toml::Table::new())
+            }
+            Err(e) => Err(e),
         }
     };
     let global = match global_path {
-        Some(gp) if fs.exists(gp) => read_table(gp)?,
+        Some(gp) if fs.exists(gp) => read_table(gp, true)?,
         _ => crate::config::load::parse_table(&serialize_global_config(&default_global_config())?)?,
     };
-    let project = read_table(config_path)?;
+    let project = read_table(config_path, false)?;
     crate::config::load::effective_config(global, project)
 }
 
@@ -5848,6 +5864,12 @@ mod tests {
             !state.config.ui.auto_continue,
             "auto_continue is forced off so even Restart Agent starts fresh"
         );
+        assert!(state.isolated, "the run must be marked isolated");
+        assert_eq!(
+            state.isolated_status_root.as_deref(),
+            Some(Path::new("/tmp/fd-isolated-test")),
+            "the status root must reach AppState, or the redirect silently falls back to the worktree"
+        );
     }
 
     #[test]
@@ -5928,6 +5950,57 @@ mod tests {
         assert_eq!(
             state.config.ui.default_agent, "claude",
             "isolated mode reads existing config; it only refuses to write"
+        );
+        assert!(fs.writes_under(Path::new("/repo")).is_empty());
+        assert!(fs.writes().is_empty());
+    }
+
+    #[test]
+    fn isolated_startup_ignores_a_corrupt_global_config_like_a_normal_run_would() {
+        // Mirrors load_layered_config's lenient handling of a broken global
+        // base (src/config/load.rs): a hand-edited, syntactically invalid
+        // ~/.flightdeck/config.toml must not blot out a perfectly valid
+        // project config.toml, in an isolated run any more than in a normal
+        // one. Before this test, effective_config_without_writing propagated
+        // the parse error, which the outer `unwrap_or_else` silently
+        // swallowed into built-in defaults — the user's own agents and
+        // settings would vanish with no message.
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let toml = crate::config::load::serialize_config(&config).unwrap();
+
+        let repo = Path::new("/repo");
+        let global_path = global_config_path().expect("HOME must be set for this test to run");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", toml.as_str())
+            .with_file(global_path.to_str().unwrap(), "this is not [valid toml");
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.config.ui.default_agent, "opencode",
+            "the project's own config must survive a corrupt global base"
         );
         assert!(fs.writes_under(Path::new("/repo")).is_empty());
         assert!(fs.writes().is_empty());
