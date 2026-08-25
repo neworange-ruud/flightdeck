@@ -74,26 +74,46 @@ pub fn status_backend(agent: &AgentDef) -> Option<StatusBackend> {
     classify(&agent.command)
 }
 
+/// The agent-visible (container-internal) path to the status file, when
+/// `containerized`. The worktree is bind-mounted at
+/// [`crate::runtime::container::WORKSPACE`] with that as `WORKDIR`, so this is
+/// a fixed Linux path regardless of the host OS — built as a string constant,
+/// never via `Path::join`, which would emit backslashes on a Windows host.
+const CONTAINER_STATUS_FILE: &str = "/workspace/.flightdeck/agent-status";
+
+/// The agent-visible (container-internal) path to the question sidecar. See
+/// [`CONTAINER_STATUS_FILE`].
+const CONTAINER_QUESTION_FILE: &str = "/workspace/.flightdeck/agent-question.json";
+
 /// Materialize and attach a launch-scoped lifecycle integration for a built-in
 /// backend. Hooks/plugins write `working`, `idle`, or `waiting` to the status
 /// file that [`crate::app::state::AppState`] polls. OpenCode questions and
 /// permission prompts both mean the agent is waiting for user input.
 ///
-/// `containerized` changes only paths passed to the agent: the generated files
-/// live in the bind-mounted worktree in both modes.
+/// `containerized` changes the paths passed to the agent (both the plugin-dir
+/// flag and the path templated into the hook bodies): the generated files
+/// still live on the host, under `status_root`, but the agent inside the
+/// container sees them at their bind-mounted `/workspace/...` location, since
+/// a host path (or, in isolated mode, a host temp directory entirely outside
+/// the bind mount) does not exist inside the container.
 ///
 /// `status_root` is where the plugin dir, the seeded status file, and
-/// `agent-question.json` live. Passing `worktree` for it reproduces today's
-/// behavior exactly. When it differs from `worktree` (an isolated run), the
-/// hook bodies carry `status_root`'s *absolute* path instead of a path
-/// relative to the agent's working directory, so lifecycle events still land
-/// somewhere FlightDeck polls even though the agent's cwd is the project.
+/// `agent-question.json` live **on the host** — this is also what
+/// [`crate::app::state::agent_status_file`] and the desktop bridge poll, so it
+/// must always be the host truth even when the hook body itself has to carry
+/// a different, container-internal path. Passing `worktree` for it reproduces
+/// today's behavior exactly. When it differs from `worktree` (an isolated,
+/// non-containerized run), the hook bodies carry `status_root`'s *absolute*
+/// host path instead of a path relative to the agent's working directory, so
+/// lifecycle events still land somewhere FlightDeck polls even though the
+/// agent's cwd is the project.
 ///
 /// A `status_root` that differs from `worktree` is treated as exclusively
-/// FlightDeck-owned scratch space: any pre-existing contents are wiped before
-/// writing, so a stale directory left behind by a crashed earlier run (its
-/// pid-based name can be recycled — see [`crate::isolated_status_dir`]) never
-/// bleeds into a fresh run. `status_root == worktree` is never wiped.
+/// FlightDeck-owned scratch space: any pre-existing `.flightdeck` contents
+/// under it are wiped before writing, so a stale directory left behind by a
+/// crashed earlier run (its pid-based name can be recycled — see
+/// [`crate::isolated_status_dir`]) never bleeds into a fresh run.
+/// `status_root == worktree` is never wiped.
 pub fn prepare_status_launch(
     fs: &dyn FileSystem,
     agent: &AgentDef,
@@ -109,12 +129,20 @@ pub fn prepare_status_launch(
         });
     };
 
-    if status_root != worktree && fs.exists(status_root) {
-        fs.remove_dir_all(status_root)?;
+    // `status_root` is FlightDeck-owned scratch only when it differs from the
+    // worktree (an isolated run's redirect target, never a user's project).
+    // Narrowed to `.flightdeck` (not the whole root) so this can never nuke
+    // something outside what this function itself owns, if a future caller
+    // ever passes a status_root that isn't purely scratch.
+    let flightdeck_dir = status_root.join(".flightdeck");
+    if status_root != worktree && fs.exists(&flightdeck_dir) {
+        fs.remove_dir_all(&flightdeck_dir)?;
     }
 
     let runtime = status_root.join(STATUS_RUNTIME_DIR);
     fs.create_dir_all(&runtime)?;
+    // Host truth: what FlightDeck itself writes to and polls (via
+    // `agent_status_file`) regardless of containerization.
     let status_file = status_root.join(".flightdeck").join("agent-status");
     // A freshly launched interactive agent starts at its prompt. Writing this
     // before spawn gives the UI a deterministic initial state even if a backend
@@ -126,6 +154,22 @@ pub fn prepare_status_launch(
         format!("/workspace/{STATUS_RUNTIME_DIR}")
     } else {
         runtime.to_string_lossy().to_string()
+    };
+    // Agent-visible: what gets templated into the hook bodies. Containerized
+    // agents only ever see `/workspace/...`; a host path (or an isolated run's
+    // host temp directory, which is never bind-mounted) would resolve to
+    // nothing inside the container, silently swallowed by each body's
+    // trailing `exit 0`.
+    let (agent_status_file, agent_question_file) = if containerized {
+        (
+            CONTAINER_STATUS_FILE.to_string(),
+            CONTAINER_QUESTION_FILE.to_string(),
+        )
+    } else {
+        (
+            status_file.to_string_lossy().to_string(),
+            question_file.to_string_lossy().to_string(),
+        )
     };
     let mut args = agent.args.clone();
     let mut env = Vec::new();
@@ -141,7 +185,7 @@ pub fn prepare_status_launch(
             )?;
             fs.write(
                 &root.join("hooks/hooks.json"),
-                &claude_plugin_hooks(&status_file, &question_file),
+                &claude_plugin_hooks(&agent_status_file, &agent_question_file),
             )?;
             args.push("--plugin-dir".to_string());
             args.push(format!("{agent_runtime}/claude"));
@@ -158,7 +202,7 @@ pub fn prepare_status_launch(
                 ("PostToolUse", "working"),
             ] {
                 args.push("--config".to_string());
-                args.push(codex_hook_override(event, state, &status_file));
+                args.push(codex_hook_override(event, state, &agent_status_file));
             }
         }
         StatusBackend::OpenCode => {
@@ -166,7 +210,7 @@ pub fn prepare_status_launch(
             fs.create_dir_all(&root.join("plugins"))?;
             fs.write(
                 &root.join("plugins/flightdeck.js"),
-                &opencode_runtime_plugin(&status_file),
+                &opencode_runtime_plugin(&agent_status_file),
             )?;
             env.push((
                 "OPENCODE_CONFIG_DIR".to_string(),
@@ -196,10 +240,10 @@ fn shell_quote(s: &str) -> String {
 /// POSIX-shell one-liner, single-quoted via [`shell_quote`]; the whole TOML
 /// value is then serialized through `toml::Value::String`, never hand-quoted,
 /// so embedded quotes/backslashes from either layer are escaped correctly.
-fn codex_hook_override(event: &str, state: &str, status_file: &Path) -> String {
+fn codex_hook_override(event: &str, state: &str, status_file: &str) -> String {
     let command = format!(
         "printf '{state}\\n' >> {}; exit 0",
-        shell_quote(&status_file.to_string_lossy())
+        shell_quote(status_file)
     );
     format!(
         "hooks.{event}=[{{hooks=[{{type=\"command\",command={}}}]}}]",
@@ -239,9 +283,9 @@ const CLAUDE_PLUGIN_MANIFEST: &str = r#"{
 /// PermissionRequest, PreToolUse/AskUserQuestion, PostToolUse, and both
 /// Notification matchers) — dropping one would silently lose a status
 /// transition.
-fn claude_plugin_hooks(status_file: &Path, question_file: &Path) -> String {
-    let sf = shell_quote(&status_file.to_string_lossy());
-    let qf = shell_quote(&question_file.to_string_lossy());
+fn claude_plugin_hooks(status_file: &str, question_file: &str) -> String {
+    let sf = shell_quote(status_file);
+    let qf = shell_quote(question_file);
     let write = |state: &str| -> String { format!("printf '{state}\\n' >> {sf}; exit 0") };
     let hook = |command: String| -> serde_json::Value {
         serde_json::json!([{"hooks": [{"type": "command", "command": command}]}])
@@ -281,9 +325,8 @@ fn claude_plugin_hooks(status_file: &Path, question_file: &Path) -> String {
 /// string is also valid JS string-literal syntax (both use `\"`/`\\`
 /// escaping and Unicode `\uXXXX`), so the same serialization is safe to embed
 /// directly as a JS literal, including a Windows path's backslashes.
-fn opencode_runtime_plugin(status_file: &Path) -> String {
-    let status_file_js =
-        serde_json::to_string(&status_file.to_string_lossy()).expect("string always serializes");
+fn opencode_runtime_plugin(status_file: &str) -> String {
+    let status_file_js = serde_json::to_string(status_file).expect("string always serializes");
     OPENCODE_RUNTIME_PLUGIN_TEMPLATE.replace("__FLIGHTDECK_STATUS_FILE_JSON__", &status_file_js)
 }
 
@@ -780,11 +823,7 @@ mod tests {
 
     #[test]
     fn codex_hook_override_quotes_the_absolute_path_as_toml() {
-        let ov = codex_hook_override(
-            "Stop",
-            "idle",
-            Path::new("/tmp/root/.flightdeck/agent-status"),
-        );
+        let ov = codex_hook_override("Stop", "idle", "/tmp/root/.flightdeck/agent-status");
         assert!(ov.contains("/tmp/root/.flightdeck/agent-status"));
         assert!(
             toml::from_str::<toml::Value>(&ov.replace("hooks.Stop=", "x=")).is_ok(),
@@ -984,6 +1023,76 @@ mod tests {
         assert!(
             plugin.contains("writePrompt(event)"),
             "runtime plugin must capture the prompt on question/permission asked"
+        );
+        // Regression guard: the hook body must carry the *container-internal*
+        // path, not a host path the agent cannot see once inside the
+        // bind-mounted container (`/workspace` is `WORKDIR`).
+        assert!(
+            plugin.contains("/workspace/.flightdeck/agent-status"),
+            "containerized OpenCode plugin must target the bind-mounted path: {plugin}"
+        );
+        assert!(
+            !plugin.contains(REPO),
+            "containerized OpenCode plugin must never carry the host status root: {plugin}"
+        );
+    }
+
+    #[test]
+    fn claude_hooks_use_the_container_path_when_containerized() {
+        let fs = FakeFs::new();
+        prepare_status_launch(
+            &fs,
+            &agent("claude", "claude"),
+            Path::new(REPO),
+            Path::new(REPO),
+            true,
+        )
+        .unwrap();
+        let hooks = fs
+            .file_contents(Path::new(
+                "/repo/.flightdeck/runtime/status/claude/hooks/hooks.json",
+            ))
+            .unwrap();
+        assert!(
+            hooks.contains("/workspace/.flightdeck/agent-status"),
+            "containerized Claude hooks must target the bind-mounted path: {hooks}"
+        );
+        assert!(
+            hooks.contains("/workspace/.flightdeck/agent-question.json"),
+            "the AskUserQuestion sidecar path must also be the bind-mounted one: {hooks}"
+        );
+        assert!(
+            !hooks.contains(REPO),
+            "containerized Claude hooks must never carry the host status root: {hooks}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_override_uses_the_container_path_when_containerized() {
+        let fs = FakeFs::new();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("codex", "codex"),
+            Path::new(REPO),
+            Path::new(REPO),
+            true,
+        )
+        .unwrap();
+        let overrides: Vec<&String> = launch
+            .args
+            .iter()
+            .filter(|a| a.starts_with("hooks.Stop="))
+            .collect();
+        assert_eq!(overrides.len(), 1);
+        assert!(
+            overrides[0].contains("/workspace/.flightdeck/agent-status"),
+            "containerized Codex override must target the bind-mounted path: {:?}",
+            overrides[0]
+        );
+        assert!(
+            !overrides[0].contains(REPO),
+            "containerized Codex override must never carry the host status root: {:?}",
+            overrides[0]
         );
     }
 

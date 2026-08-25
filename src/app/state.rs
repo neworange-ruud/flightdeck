@@ -1891,6 +1891,15 @@ impl AppState {
     /// isolated run redirects it out of the project. Containerized runs always
     /// use the worktree, because a temp directory outside it is not
     /// bind-mounted into the container (specs/ISOLATED_MODE.md §8.2).
+    ///
+    /// `isolated_status_root`, when set, is returned as-is regardless of
+    /// `worktree` — it is a single, process-wide redirect target
+    /// (`isolated_status_dir()`), not computed per tab. This is only correct
+    /// because isolated mode allows exactly one tab (a second base-branch or
+    /// worktree tab is refused, SPECS §32) and secondary in-tab agents never
+    /// reach `prepare_status_launch`. If that constraint is ever relaxed,
+    /// this must derive a per-tab subdirectory instead of every tab
+    /// colliding on one status file and one plugin dir.
     fn status_root(&self, worktree: &Path) -> PathBuf {
         if self.config.containers.enabled {
             return worktree.to_path_buf();
