@@ -1,0 +1,207 @@
+# Isolated Mode — Design
+
+Status: approved design, not yet implemented.
+Date: 2026-08-25
+Reserves SPECS §32.
+
+## 1. Purpose
+
+`flightdeck --isolated` (`-I`) launches a throwaway FlightDeck: one fresh agent
+session in the current working directory, nothing continued from a previous run,
+nothing left behind on disk. It exists for testing FlightDeck itself and for
+poking at a repository without accreting state.
+
+A normal startup is unchanged in every respect. Isolated mode adds a run-time
+switch; it never alters default behavior.
+
+## 2. Definition
+
+An isolated run is defined by four properties:
+
+1. **No continuation.** Nothing is read from a previous run and nothing is
+   replayed — not `state.json`, not the workspace file, not a captured resume
+   command.
+2. **No FlightDeck-initiated writes.** FlightDeck writes nothing on its own.
+   Explicit user actions that exist to write (saving in the configuration
+   manager, pairing a phone) still write; the rule constrains FlightDeck, not
+   the process. One documented exception applies to containerized runs (§8.2).
+3. **No worktrees.** No branch is created, no `git worktree add` is run — no git
+   mutation of any kind happens at startup.
+4. **One session, in the cwd.** Exactly one tab, running the default agent with
+   the repository root as its working directory.
+
+## 3. The flag
+
+`--isolated` and `-I` are recognized in `run()` alongside the existing
+`--version`/`--help` scans, before the subcommand match.
+
+Combining the flag with a subcommand (`flightdeck -I doctor`) is an error with a
+clear message, not a silent ignore.
+
+It is represented as a runtime-only `pub isolated: bool` on `AppState`, next to
+`split_view`. The command dispatcher, the renderer and the palette all already
+reach `AppState`, so no new plumbing is needed.
+
+**It is deliberately not a configuration setting.** It is a per-run decision, and
+a persisted file that silently suppressed persistence would be a trap. This is
+the one intended exception to `flightdeck-config-conventions`.
+
+## 4. Startup
+
+Reads the effective configuration (global + project) if it exists. Writes
+nothing.
+
+| Step | Normal | Isolated |
+|---|---|---|
+| `initialize()` first-run config write | on demand | **never** — runs on defaults + whatever config exists |
+| `state.json` read + `recover()` | yes | **skipped** |
+| `resume_agents()` | yes | **skipped** |
+| workspace file read | yes | **skipped** — only the cwd project is open |
+| `update::start_check` | per config | **`enabled = false`** — no network call, no cache write |
+| `ui.auto_continue` | per config | **forced `false`** for the run |
+| initial tabs | recovered | **exactly one**, created fresh |
+
+A git repository is still required, and base-branch detection is unchanged.
+
+`auto_continue` is forced off so that even an in-session **Restart Agent** starts
+a fresh session instead of replaying a captured resume command. Without this,
+"no continuation" would hold only until the first restart.
+
+The update check is disabled because it writes a cache file and makes a network
+call, both of which an isolated run should not do.
+
+## 5. The single tab
+
+Created through the existing `begin_base_agent_tab`:
+
+- agent: `ui.default_agent`
+- working directory: the repository root
+- `runs_on_base = true`, `needs_create = false` — so `materialize_worktree` is a
+  no-op and **not one git mutation occurs**
+- `resume_args` empty: a fresh session
+
+**Branch label fix.** A base tab currently labels itself with the *base* branch,
+which is wrong whenever HEAD is on something else. In isolated mode the tab is
+labelled with the actual current branch. (The same wart exists for a
+user-created base tab; fixing it there too is in scope if it falls out cleanly,
+but it is not the goal.)
+
+## 6. Blocked actions
+
+Blocked commands are refused in the dispatcher with
+`Effect::Refused("… is not available in isolated mode")` **and** hidden from the
+command palette. The dispatcher is the real gate — keybindings and the project
+tab bar's New button bypass the palette entirely; hiding the palette entries is
+presentation only.
+
+Blocked:
+
+- Open Project, Close Project, Next Project, Previous Project
+- the project tab bar's New button
+- New Agent Session Tab
+
+Already refused for free, because the tab is `runs_on_base`:
+
+- Finish / Local Merge, Rebase Worktree, Abandon Worktree
+
+Explicitly still available: Push Branch, Pull Base, Open Configuration, Pair
+Phone, child terminals, additional agents in the same tab, Open Shell, Show Git
+Status, split view, rename, restart, close tab.
+
+## 7. Teardown
+
+- `persist_quietly` is skipped for every project
+- `save_workspace` is skipped
+- all sessions are terminated, exactly as in a normal run
+- the temporary status directory (§8) is removed
+
+## 8. Status plumbing redirect
+
+Spawning an agent normally writes its status plumbing into the working tree:
+`.flightdeck/runtime/status/…` (a Claude plugin directory, an OpenCode plugin)
+plus a seeded `.flightdeck/agent-status`, and the generated hooks append to
+`.flightdeck/agent-status` **relative to the agent's working directory**.
+
+Isolated mode redirects all of it to a temporary directory outside the
+repository, so the status chips and OS notifications keep working while the
+project directory stays untouched.
+
+`prepare_status_launch` gains a status-root parameter. Normal mode passes the
+worktree, which is byte-identical to today's behavior. Isolated mode passes a
+temp directory (`flightdeck-isolated-<pid>/`), removed on teardown.
+
+What becomes path-aware:
+
+- `agent_status_file(root)` — derived from the status root, not the worktree
+- `CLAUDE_PLUGIN_HOOKS` — currently a `const` whose one-liners write to a
+  cwd-relative path; becomes templated with the absolute status-file path
+- `codex_hook_override` — the same, in its `--config hooks.…` overrides
+- the OpenCode runtime plugin JS — the same
+- `remote::bridge::agent_question_path` — so remote question-answering keeps
+  working
+
+`RuntimeTab::status_file` is already an absolute `PathBuf`, so polling itself
+needs no change; only the two sites that construct it do.
+
+### 8.1 Risk: shell and JSON escaping across platforms
+
+The generated hooks are POSIX-shell one-liners
+(`[ -d .flightdeck ] && printf 'idle\n' >> .flightdeck/agent-status`) embedded in
+JSON and TOML. Templating an absolute path into them means two layers of
+escaping, and a Windows path brings backslashes into both. This is the most
+likely thing in this design to break. It is squarely
+`flightdeck-cross-platform-parity` territory and must be tested on Windows, not
+reasoned about.
+
+### 8.2 Exception: containerized runs
+
+`prepare_status_launch`'s `containerized` mode maps the status runtime to
+`/workspace/…` precisely because it lives inside the bind-mounted worktree. A
+temp directory outside the worktree is not mounted, so the redirect cannot work
+there.
+
+**Resolution:** when containers are enabled, an isolated run keeps the
+in-worktree status path, and this exception is documented in the help text. A
+containerized run already writes into the mounted worktree by its nature, so
+this concedes little. Adding a second bind mount for the temp directory is the
+alternative if the exception proves annoying in practice.
+
+## 9. Visibility
+
+Nothing persists and several actions are absent, so the mode must be
+unmistakable:
+
+- an `ISOLATED` badge in the status bar
+- a line in the Help overlay stating what is off (no persistence, no
+  continuation, no other projects, no new session tabs)
+
+Without this, a forgotten `-I` looks exactly like data loss.
+
+## 10. Verification
+
+The strong tests are at `startup` level with `FakeFs`:
+
+- the fake filesystem receives **zero writes** during an isolated startup
+- exactly one tab exists, and it is `runs_on_base`
+- the effective `auto_continue` is `false`
+- the workspace file is never read
+- `state.json` is never read
+
+Then:
+
+- dispatcher tests: each blocked command returns `Effect::Refused`
+- palette test: the blocked entries are absent from the palette in isolated mode
+  and present in a normal one
+- `prepare_status_launch` with a root outside the worktree writes nothing under
+  the worktree, and the absolute status path appears in the generated hooks
+- teardown test: no `state.json` and no workspace file are written
+- a normal-mode regression test that the status plumbing paths are unchanged
+
+## 11. Non-goals
+
+- Isolated mode is not a sandbox. The agent can still read and write the
+  repository and reach the network; only FlightDeck's own bookkeeping is
+  suppressed.
+- Not a config setting, and not persisted anywhere (§3).
+- No new isolated-only UI beyond the badge and the help line.
+- Running outside a git repository stays unsupported.
