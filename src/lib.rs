@@ -291,25 +291,33 @@ pub fn run() -> Result<()> {
     // agents are not auto-resumed; switching/opening one resumes it on demand
     // (see the open-project flow). Done here, after the viewport size is known,
     // rather than in `recover`/`AppState::new` which never spawn.
-    {
+    // An isolated run's single session failing to start is fatal (not a
+    // `warnings.push`): `AppState::warnings` has no renderer anywhere in
+    // `src/tui/`, so surfacing it that way would launch a blank TUI with no
+    // session and no visible message. There is nothing useful to show, so
+    // the error is threaded past `event_loop` instead, to reach `main` as
+    // `flightdeck error: <msg>` — while still running the full teardown below
+    // (terminal restore, session termination) exactly like any other
+    // `loop_result` error.
+    let isolated_session_result = {
         let active = workspace.active;
         let p = &mut workspace.projects[active];
         let services = env.services(&p.git);
         if isolated {
             // One fresh session; nothing to resume, because nothing was
             // recovered (SPECS §32).
-            if let Err(e) = start_isolated_session(&mut p.state, &services) {
-                p.state
-                    .warnings
-                    .push(format!("Isolated session failed to start: {e}"));
-            }
+            start_isolated_session(&mut p.state, &services)
         } else {
             let _ = p.state.resume_agents(&services);
+            Ok(())
         }
-    }
+    };
 
     let notifier = SystemNotifier;
-    let loop_result = event_loop(&mut terminal, &mut workspace, &env, &notifier);
+    let loop_result = match isolated_session_result {
+        Err(e) => Err(e),
+        Ok(()) => event_loop(&mut terminal, &mut workspace, &env, &notifier),
+    };
 
     // CLEAN TEARDOWN (SPECS §25). Persist FIRST, before touching the terminal:
     // on a severed terminal (Konsole/window close closes stdin+stdout+stderr) the
@@ -650,13 +658,22 @@ fn isolated_status_dir() -> PathBuf {
 /// and no git mutation (SPECS §32). The base-tab path's [`WorktreeJob`] has
 /// `needs_create == false`, so [`materialize_worktree`] is deliberately not
 /// called here.
+///
+/// A `finalize_new_tab` failure (missing container image, PTY spawn error,
+/// ...) must not leave the placeholder behind in `TabPhase::Creating` — the
+/// same contract `cmd_new_agent_tab` and `drain_create_outcomes` already
+/// honour (`src/app/state.rs:906-908`) applies here too, so the placeholder
+/// is removed via `fail_new_tab` before the error is propagated.
 fn start_isolated_session(state: &mut AppState, services: &Services) -> Result<()> {
     let job = state.begin_new_agent_tab_ex("", None, true, services)?;
     debug_assert!(
         !job.needs_create,
         "an isolated session never creates a worktree"
     );
-    state.finalize_new_tab(&job.tab_id, services)?;
+    if let Err(e) = state.finalize_new_tab(&job.tab_id, services) {
+        state.fail_new_tab(&job.tab_id);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -6187,6 +6204,60 @@ mod tests {
             status.starts_with("/tmp/fd-isolated-test"),
             "status must be redirected out of the project: {}",
             status.display()
+        );
+    }
+
+    #[test]
+    fn start_isolated_session_removes_the_dead_placeholder_on_spawn_failure() {
+        // A `finalize_new_tab` failure (missing container image, PTY spawn
+        // error, ...) must not leave the placeholder behind in
+        // `TabPhase::Creating` (SPECS: the TabPhase contract at
+        // `src/app/state.rs:906-908` — creation failures remove the tab
+        // entirely, and a finalize-time spawn failure is no exception).
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "myagent");
+        let config = config_with_agent(agent);
+        let toml = crate::config::load::serialize_config(&config).unwrap();
+
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", toml.as_str());
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        pty.fail_next_spawn();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let mut state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        let err = start_isolated_session(&mut state, &services)
+            .expect_err("a spawn failure must propagate, not be swallowed");
+        assert!(
+            state.tabs.is_empty(),
+            "the failed placeholder must not be left behind: {} tab(s) remain",
+            state.tabs.len()
+        );
+        // Sanity: the error is the spawn failure, not something unrelated.
+        let msg = err.to_string();
+        assert!(
+            !msg.is_empty(),
+            "the propagated error should carry a message"
         );
     }
 
