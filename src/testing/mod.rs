@@ -33,6 +33,11 @@ struct FakeFsState {
     dirs: HashSet<PathBuf>,
     /// Symlinks as `link -> target`.
     symlinks: BTreeMap<PathBuf, PathBuf>,
+    /// Every path handed to a mutating `FileSystem` method, in call order.
+    /// Seeding helpers (`with_file`/`with_dir`) deliberately do not record, so
+    /// a test can assert "this code path wrote nothing" against a pre-seeded
+    /// filesystem.
+    writes: Vec<PathBuf>,
 }
 
 impl FakeFs {
@@ -77,6 +82,20 @@ impl FakeFs {
     pub fn symlink_target(&self, link: &Path) -> Option<PathBuf> {
         self.inner.lock().unwrap().symlinks.get(link).cloned()
     }
+
+    /// Every path passed to a mutating `FileSystem` method, in call order,
+    /// duplicates included. Seeding via `with_file`/`with_dir` is not recorded.
+    pub fn writes(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().writes.clone()
+    }
+
+    /// The journalled writes whose path lies under `root`.
+    pub fn writes_under(&self, root: &Path) -> Vec<PathBuf> {
+        self.writes()
+            .into_iter()
+            .filter(|p| p.starts_with(root))
+            .collect()
+    }
 }
 
 fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
@@ -105,6 +124,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.dirs.insert(p.to_path_buf());
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -122,6 +142,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.files.insert(p.to_path_buf(), contents.to_string());
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -135,6 +156,7 @@ impl FileSystem for FakeFs {
         }
         mark_parents(&mut st.dirs, link);
         st.symlinks.insert(link.to_path_buf(), target.to_path_buf());
+        st.writes.push(link.to_path_buf());
         Ok(())
     }
 
@@ -149,6 +171,7 @@ impl FileSystem for FakeFs {
         }
         entry.push_str(line);
         entry.push('\n');
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -182,6 +205,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         st.files.retain(|path, _| !path.starts_with(p));
         st.dirs.retain(|dir| dir != p && !dir.starts_with(p));
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 }
@@ -1204,5 +1228,59 @@ mod tests {
         assert!(pty
             .spawn("ok", &[], &[], Path::new("/wt"), PtySize::default())
             .is_ok());
+    }
+
+    #[test]
+    fn fake_fs_records_every_mutating_call() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new();
+        fs.write(Path::new("/repo/a.txt"), "x").unwrap();
+        fs.create_dir_all(Path::new("/repo/sub")).unwrap();
+        fs.append_line(Path::new("/repo/.gitignore"), "ignored")
+            .unwrap();
+        fs.symlink(Path::new("/repo/a.txt"), Path::new("/repo/link"))
+            .unwrap();
+
+        let writes = fs.writes();
+        assert_eq!(
+            writes,
+            vec![
+                PathBuf::from("/repo/a.txt"),
+                PathBuf::from("/repo/sub"),
+                PathBuf::from("/repo/.gitignore"),
+                PathBuf::from("/repo/link"),
+            ],
+            "every mutating call must be journalled in order"
+        );
+    }
+
+    #[test]
+    fn fake_fs_writes_under_filters_by_root() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new();
+        fs.write(Path::new("/repo/inside.txt"), "x").unwrap();
+        fs.write(Path::new("/tmp/outside.txt"), "x").unwrap();
+
+        assert_eq!(
+            fs.writes_under(Path::new("/repo")),
+            vec![PathBuf::from("/repo/inside.txt")]
+        );
+        assert!(
+            fs.writes_under(Path::new("/nowhere")).is_empty(),
+            "a root with no writes under it yields nothing"
+        );
+    }
+
+    #[test]
+    fn fake_fs_reads_are_not_journalled() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new().with_file("/repo/a.txt", "x");
+        let _ = fs.read_to_string(Path::new("/repo/a.txt"));
+        let _ = fs.exists(Path::new("/repo/a.txt"));
+        let _ = fs.is_dir(Path::new("/repo"));
+        assert!(
+            fs.writes().is_empty(),
+            "seeding and reading must not count as writes"
+        );
     }
 }
