@@ -23,6 +23,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   root, before throwing the result away) is skipped entirely for an isolated
   run, and the workspace file is never read or written. Normal runs are
   byte-identical to before.
+- `flightdeck --isolated` teardown now writes nothing and leaves nothing
+  behind: `state.json` persistence is skipped explicitly (`persist_quietly`
+  calls `to_project_state` + `save_state` directly, bypassing the
+  `AppState::persist` no-op guard added earlier, so this guard is
+  load-bearing, not redundant), the workspace file was already unreachable
+  because `ws_path` is `None` for an isolated run, and the run's temp status
+  directory is removed (best effort) after every session has been
+  terminated, so a hook still running mid-teardown cannot race the cleanup.
 
 ### Bug fixes
 

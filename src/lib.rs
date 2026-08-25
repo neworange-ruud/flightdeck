@@ -325,10 +325,12 @@ pub fn run() -> Result<()> {
     // the save — otherwise a failed restore that writes to the dead stderr can
     // take the process down before the state is written.
     let mut persist_result = Ok(());
-    for p in workspace.projects.iter() {
-        let services = env.services(&p.git);
-        if let Err(e) = persist_quietly(&p.state, &services) {
-            persist_result = Err(e);
+    if !isolated {
+        for p in workspace.projects.iter() {
+            let services = env.services(&p.git);
+            if let Err(e) = persist_quietly(&p.state, &services) {
+                persist_result = Err(e);
+            }
         }
     }
     if let Some(wp) = &ws_path {
@@ -367,6 +369,13 @@ pub fn run() -> Result<()> {
     // Terminate every session so no orphaned child processes remain.
     for p in workspace.projects.iter_mut() {
         terminate_all_sessions(&mut p.state);
+    }
+
+    // Remove the temp status directory only after every agent is dead —
+    // otherwise a hook still running mid-teardown could recreate files under
+    // a directory just deleted, or write into a partially-removed tree.
+    if isolated {
+        cleanup_isolated_run(&fs, &isolated_status_dir());
     }
 
     loop_result.and(persist_result)
@@ -5259,6 +5268,13 @@ fn persist_quietly(state: &AppState, services: &Services) -> Result<()> {
     save_state(services.fs, &state.state_path, &project_state)
 }
 
+/// Remove an isolated run's temp status directory (SPECS §32). Best effort: a
+/// leftover directory under the OS temp dir is harmless, and teardown must never
+/// fail on it.
+fn cleanup_isolated_run(fs: &dyn FileSystem, status_dir: &Path) {
+    let _ = fs.remove_dir_all(status_dir);
+}
+
 /// Force-terminate every session in every tab so no orphaned child processes
 /// remain after FlightDeck exits (SPECS §25).
 fn terminate_all_sessions(state: &mut AppState) {
@@ -6259,6 +6275,29 @@ mod tests {
             !msg.is_empty(),
             "the propagated error should carry a message"
         );
+    }
+
+    #[test]
+    fn cleanup_isolated_run_removes_the_temp_status_dir() {
+        let fs = FakeFs::new()
+            .with_dir("/tmp/fd-isolated-9")
+            .with_file("/tmp/fd-isolated-9/.flightdeck/agent-status", "idle\n");
+
+        cleanup_isolated_run(&fs, Path::new("/tmp/fd-isolated-9"));
+
+        assert!(
+            fs.writes()
+                .iter()
+                .any(|p| p == Path::new("/tmp/fd-isolated-9")),
+            "the temp dir must be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_isolated_run_tolerates_a_missing_dir() {
+        let fs = FakeFs::new();
+        // Must not panic: the agent may never have started.
+        cleanup_isolated_run(&fs, Path::new("/tmp/fd-isolated-absent"));
     }
 
     #[test]
