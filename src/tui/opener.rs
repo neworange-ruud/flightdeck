@@ -11,11 +11,18 @@
 
 use std::process::{Command, Stdio};
 
+use crate::tui::platform;
+
 /// The platform's default opener for both files and URLs.
+///
+/// Branches on the symmetric per-OS constants rather than raw `cfg!`, so a
+/// fourth OS means adding a constant, not inverting a condition.
 pub fn default_program() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if platform::IS_MACOS {
         "open"
-    } else if cfg!(target_os = "windows") {
+    } else if platform::IS_WINDOWS {
+        // `explorer.exe <url>` hands an http(s) URL to the default browser, the
+        // same way it hands a path to Explorer.
         "explorer.exe"
     } else {
         "xdg-open"
@@ -70,9 +77,9 @@ mod tests {
 
     #[test]
     fn default_program_matches_the_platform() {
-        if cfg!(target_os = "macos") {
+        if platform::IS_MACOS {
             assert_eq!(default_program(), "open");
-        } else if cfg!(target_os = "windows") {
+        } else if platform::IS_WINDOWS {
             assert_eq!(default_program(), "explorer.exe");
         } else {
             assert_eq!(default_program(), "xdg-open");
