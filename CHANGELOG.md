@@ -12,7 +12,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- The help panel's hints ("F1 again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
+- The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
+- The status bar now advertises the help keys in **both** modes, not just App mode — help is global, so terminal focus should say so. To pay for the extra text, `Ctrl-g: command palette` is shortened to `Ctrl-g: palette` and `app commands` to `app mode`, keeping the bar within roughly the width it already required.
 
 ### Bug fixes
 
