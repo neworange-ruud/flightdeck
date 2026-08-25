@@ -1095,17 +1095,27 @@ impl AppState {
             )));
         }
 
-        // The tab name falls back to the base branch when the field was left
-        // blank (the branch textbox is disabled in base mode).
+        // The branch a base tab is *actually* on. `base` is the configured base
+        // branch, which is not necessarily what HEAD points at in the project
+        // root — and `meta.branch` is what Push Branch pushes, so recording the
+        // base here would push the wrong ref. A detached HEAD has no branch
+        // name; fall back to the base.
+        let head = services
+            .git
+            .current_branch(&self.repo_root)
+            .unwrap_or_else(|_| base.clone());
+
+        // The tab name falls back to the checked-out branch when the field was
+        // left blank (the branch textbox is disabled in base mode).
         let display_name = if name.trim().is_empty() {
-            base.clone()
+            head.clone()
         } else {
             name.trim().to_string()
         };
         let slug = {
             let s = slugify(&display_name);
             if s.is_empty() {
-                slugify(&base)
+                slugify(&head)
             } else {
                 s
             }
@@ -1119,7 +1129,7 @@ impl AppState {
             name: display_name,
             slug,
             agent: key,
-            branch: base.clone(),
+            branch: head.clone(),
             // The project root, relative to itself.
             worktree_path_relative: ".".to_string(),
             base_branch: base.clone(),
@@ -1149,7 +1159,7 @@ impl AppState {
 
         Ok(WorktreeJob {
             tab_id: id,
-            branch: base.clone(),
+            branch: head,
             base_branch: base,
             worktree_abs: self.repo_root.clone(),
             // Nothing to materialize — the root worktree already exists.
@@ -2862,6 +2872,71 @@ mod tests {
             "primary agent runs in the project root, got {:?}",
             spawns[0].2
         );
+    }
+
+    #[test]
+    fn base_tab_records_the_checked_out_branch_not_the_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // Base is "main", but the repo root currently has "spike" checked out.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert!(app.tabs[0].meta.runs_on_base);
+        assert_eq!(
+            app.tabs[0].meta.branch, "spike",
+            "the tab must name the branch it is actually on — push uses this field"
+        );
+        assert_eq!(
+            app.tabs[0].meta.base_branch, "main",
+            "the configured base is unchanged"
+        );
+        assert_eq!(
+            app.tabs[0].meta.name, "spike",
+            "the blank name falls back to the branch"
+        );
+        assert!(
+            !job.needs_create,
+            "a base tab still materializes no worktree"
+        );
+        assert!(git.added_worktrees().is_empty(), "and runs no git mutation");
+    }
+
+    #[test]
+    fn base_tab_falls_back_to_base_when_head_is_detached() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // A detached HEAD makes current_branch fail; the base name is the
+        // fallback.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch_error("HEAD is detached");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs[0].meta.branch, "main");
     }
 
     #[test]

@@ -224,6 +224,9 @@ pub struct FakeGit {
 struct FakeGitState {
     root: PathBuf,
     current_branch: String,
+    /// When set, [`GitExecutor::current_branch`] fails with this `Git` message
+    /// (e.g. to simulate a detached HEAD, which has no branch name).
+    current_branch_error: Option<String>,
     branches: HashSet<String>,
     /// Per-cwd dirty flag; `None` key holds the default.
     dirty: HashMap<PathBuf, bool>,
@@ -269,6 +272,7 @@ impl Default for FakeGit {
             inner: Mutex::new(FakeGitState {
                 root: PathBuf::from("/repo"),
                 current_branch: "main".to_string(),
+                current_branch_error: None,
                 branches: ["main".to_string()].into_iter().collect(),
                 dirty: HashMap::new(),
                 default_dirty: false,
@@ -334,6 +338,13 @@ impl FakeGit {
     /// branch has been created and its name is known.
     pub fn set_current_branch(&self, branch: impl Into<String>) {
         self.inner.lock().unwrap().current_branch = branch.into();
+    }
+
+    /// Make [`GitExecutor::current_branch`] fail, as it would on a detached
+    /// HEAD, which has no branch name to report.
+    pub fn with_current_branch_error(self, message: impl Into<String>) -> Self {
+        self.inner.lock().unwrap().current_branch_error = Some(message.into());
+        self
     }
 
     /// Set the default dirty state used when a `cwd` has no specific override.
@@ -504,7 +515,11 @@ impl GitExecutor for FakeGit {
     }
 
     fn current_branch(&self, _cwd: &Path) -> Result<String> {
-        Ok(self.inner.lock().unwrap().current_branch.clone())
+        let st = self.inner.lock().unwrap();
+        if let Some(msg) = st.current_branch_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
+        Ok(st.current_branch.clone())
     }
 
     fn is_dirty(&self, cwd: &Path) -> Result<bool> {
