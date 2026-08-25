@@ -760,6 +760,71 @@ mod tests {
         term.process_output("still alive \u{1f389}".as_bytes());
     }
 
+    /// The panic hook must stand aside for a parser panic we contain, and still
+    /// fire for anything else. A hook runs on *every* panic, caught or not, so if
+    /// this regressed the first recovered pane would tear down the user's
+    /// terminal modes and print a backtrace over a live UI.
+    ///
+    /// Counts only panics raised on this thread: the hook is process-wide, and
+    /// tests run in parallel.
+    #[test]
+    fn panic_hook_stands_aside_only_for_contained_parser_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let here = std::thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let previous = std::panic::take_hook();
+        // Mirrors the hook installed in `run()`.
+        std::panic::set_hook(Box::new(move |_| {
+            if parser_panic_expected() {
+                return;
+            }
+            if std::thread::current().id() == here {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // Strand a wide character by shrinking through it, then print onto it.
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &pty,
+                "claude",
+                &[],
+                Path::new(CWD),
+                PtySize { rows: 10, cols: 40 },
+            )
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output("\x1b[1;23H\u{6f22}".as_bytes());
+        term.resize(PtySize { rows: 10, cols: 23 }).unwrap();
+        term.process_output("\x1b[1;23Ha".as_bytes());
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "hook ran for a parser panic that process_output already handled"
+        );
+        assert!(!parser_panic_expected(), "guard leaked past the parse");
+        // The pane is still usable, on a fresh grid at the same size.
+        assert_eq!(term.screen().size(), (10, 23));
+        term.process_output("still alive \u{1f389}".as_bytes());
+
+        // A panic we do not handle must still reach the hook.
+        let _ = std::panic::catch_unwind(|| panic!("unrelated"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hook must still run for panics we do not handle"
+        );
+
+        std::panic::set_hook(previous);
+    }
+
     // Windows/ConPTY: a Device Status Report cursor-position query (`ESC[6n`)
     // must be answered with a CPR on the PTY input, or the child stalls before
     // rendering. A fresh screen has the cursor at home → 1;1 (1-based).
