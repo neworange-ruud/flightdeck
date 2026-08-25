@@ -1872,6 +1872,9 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 
 /// Draw the help / keybindings overlay (SPECS §23).
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
+    let overlay_area = layout::centered_overlay(area, 64, 40);
+    frame.render_widget(Clear, overlay_area);
+
     let leave_focus_key = if use_f2 {
         "  F2"
     } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
@@ -1948,31 +1951,27 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: 
     ];
 
     // Isolated run (SPECS §32): nothing persists and several actions are
-    // gone, so say so here too, not only in the status bar.
+    // gone, so say so here first, not buried after the shortcut list. The
+    // overlay is a fixed 64x40 box with no scroll, so anything appended at
+    // the end clips silently on realistic terminal heights (verified: the
+    // base 44-line shortcut list already clips its own tail there). Leading
+    // with the note trades away the "Keyboard Shortcuts" title line in an
+    // isolated run, but guarantees the note itself is always visible — it is
+    // the reason the user opened this overlay in the first place.
     if isolated {
-        help_text.push(Line::raw(""));
-        help_text.push(Line::from(Span::styled(
-            "Isolated run (--isolated)",
-            Style::default().fg(Color::Magenta),
-        )));
-        help_text.push(Line::raw("  Nothing is saved and nothing was continued."));
-        help_text.push(Line::raw(
-            "  One session, in this directory, on the current branch.",
-        ));
-        help_text.push(Line::raw("  No other projects and no new session tabs."));
+        let mut isolated_first = vec![
+            Line::from(Span::styled(
+                "Isolated run (--isolated)",
+                Style::default().fg(Color::Magenta),
+            )),
+            Line::raw("  Nothing is saved and nothing was continued."),
+            Line::raw("  One session, in this directory, on the current branch."),
+            Line::raw("  No other projects and no new session tabs."),
+            Line::raw(""),
+        ];
+        isolated_first.append(&mut help_text);
+        help_text = isolated_first;
     }
-
-    // Base overlay is a fixed 64x40. The isolated note adds lines on top of
-    // the existing content, so grow the overlay to fit everything rather
-    // than let the note clip silently off the bottom; a normal run keeps
-    // the original 40 for byte-identical rendering.
-    let overlay_h: u16 = if isolated {
-        (help_text.len() as u16 + 2).max(40)
-    } else {
-        40
-    };
-    let overlay_area = layout::centered_overlay(area, 64, overlay_h);
-    frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
         .title(" Help / Keybindings ")
@@ -3514,9 +3513,11 @@ mod tests {
     }
 
     fn help_overlay_buffer_text(area_h: u16, isolated: bool) -> String {
-        // Tall enough that the (possibly grown) overlay is never clamped by
-        // the terminal itself, so a missing note means it wasn't drawn, not
-        // that it was clipped by a short buffer.
+        // Realistic terminal heights: the 64x40 overlay box is clamped to
+        // the terminal by `centered_overlay`, and the Paragraph has no
+        // scroll, so a note near the bottom of a long list can be present in
+        // the data yet invisible on an ordinary terminal. Testing at heights
+        // nobody actually runs (e.g. 60 rows) would hide that.
         let mut term = test_terminal(80, area_h);
         let area = Rect::new(0, 0, 80, area_h);
         term.draw(|frame| {
@@ -3536,20 +3537,26 @@ mod tests {
 
     #[test]
     fn help_overlay_shows_the_isolated_note_when_isolated() {
-        let text = help_overlay_buffer_text(60, true);
-        assert!(
-            text.contains("Isolated run"),
-            "isolated help note must be shown: {text}"
-        );
+        // The note leads the overlay in an isolated run (SPECS §32), so it
+        // must be visible even on a short, ordinary terminal.
+        for area_h in [24, 40] {
+            let text = help_overlay_buffer_text(area_h, true);
+            assert!(
+                text.contains("Isolated run"),
+                "isolated help note must be shown at height {area_h}: {text}"
+            );
+        }
     }
 
     #[test]
     fn help_overlay_has_no_isolated_note_normally() {
-        let text = help_overlay_buffer_text(60, false);
-        assert!(
-            !text.contains("Isolated run"),
-            "no isolated note in a normal run: {text}"
-        );
+        for area_h in [24, 40] {
+            let text = help_overlay_buffer_text(area_h, false);
+            assert!(
+                !text.contains("Isolated run"),
+                "no isolated note in a normal run at height {area_h}: {text}"
+            );
+        }
     }
 
     #[test]
