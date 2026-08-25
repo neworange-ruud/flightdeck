@@ -151,8 +151,6 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('u') if ctrl => KeyAction::Dispatch(Command::PullBase),
         // Ctrl-k: Close Agent Tab.
         KeyCode::Char('k') if ctrl => KeyAction::Dispatch(Command::CloseAgentTab { action: None }),
-        // ?: Help / keybindings.
-        KeyCode::Char('?') if no_mod => KeyAction::OpenHelp,
 
         // --- Agent Tab Navigation (SPECS §23) ----------------------------
         // Bare Up/Down: previous / next Agent Tab. The Alt-modified variants are
@@ -519,10 +517,12 @@ mod tests {
     }
 
     #[test]
-    fn app_mode_question_mark_help() {
+    fn app_mode_question_mark_is_no_longer_help() {
+        // Help used to be App-mode-only on '?'. It is now F1 / Alt-h, global in
+        // both modes, so '?' is an ordinary unbound key in App mode.
         assert_eq!(
             map_key(InputMode::App, key(KeyCode::Char('?'))),
-            KeyAction::OpenHelp
+            KeyAction::None
         );
     }
 

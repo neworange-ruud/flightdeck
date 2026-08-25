@@ -1555,7 +1555,7 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 /// Draw the mode status bar (SPECS §23).
 ///
 /// Terminal mode includes the configured leave-focus key and command palette.
-/// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
+/// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | F1: help`
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(
         state.mode(),
@@ -1610,7 +1610,7 @@ pub fn status_bar_text(
             Span::raw(": focus terminal | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
             Span::raw(": command palette | "),
-            Span::styled("?", Style::default().fg(Color::Yellow)),
+            Span::styled("F1", Style::default().fg(Color::Yellow)),
             Span::raw(": help"),
         ],
     };
@@ -1882,7 +1882,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
         shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
         shortcut_line("  Alt-o", "Open worktree in file manager"),
-        shortcut_line("  ? / F1 / Alt-h", "Help / keybindings"),
+        shortcut_line("  F1 / Alt-h", "Help / keybindings"),
         Line::raw(""),
         Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
         shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
@@ -3160,8 +3160,12 @@ mod tests {
         assert!(flat.contains("focus terminal"), "must say focus terminal");
         assert!(flat.contains("Ctrl-g"), "must mention Ctrl-g");
         assert!(flat.contains("command palette"), "must mention palette");
-        assert!(flat.contains('?'), "must mention '?'");
+        assert!(flat.contains("F1"), "must mention the help key");
         assert!(flat.contains("help"), "must mention help");
+        assert!(
+            !flat.contains('?'),
+            "'?' is no longer a help key and must not be advertised as one"
+        );
     }
 
     #[test]
@@ -3455,7 +3459,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(
-            text.contains("? / F1 / Alt-h"),
+            text.contains("F1 / Alt-h"),
             "the shortcut list must name every help key, got: {text}"
         );
         assert!(

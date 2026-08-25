@@ -3206,7 +3206,8 @@ const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 ///
 /// Either global help key counts, so the gesture is "press it again" whichever
 /// key you reached for. It keys off the help overlay *being open*, not off how
-/// it was opened, so `?` then F1 works exactly like F1 then F1.
+/// it was opened, so opening help from the command palette and then pressing F1
+/// works exactly like F1 then F1.
 fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
     if !matches!(overlay, UiOverlay::Help) {
         return false;
