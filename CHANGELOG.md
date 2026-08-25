@@ -44,12 +44,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   underlying guards are unchanged. Normal runs are byte-identical to before.
 - An isolated run now shows a permanent magenta `ISOLATED` badge in the
   status bar (ordered before the update-available hint, so both can appear
-  together) and a matching note at the top of the help overlay (`?`),
-  ahead of the keyboard shortcut list, since the fixed-size overlay has no
-  scroll and a note appended at the end would clip on an ordinary terminal.
-  Nothing else persists in an isolated run, so this is the cue that stops a
-  forgotten `-I` from looking like data loss. Normal runs are byte-identical
-  to before.
+  together) and a three-line note at the top of the help overlay (`?`),
+  ahead of the keyboard shortcut list: the fixed-size overlay has no scroll,
+  so a note appended at the end would clip on an ordinary terminal, and even
+  leading it is kept short to limit how much of the existing shortcut list
+  it pushes into that overlay's pre-existing clipped tail. Nothing else
+  persists in an isolated run, so this is the cue that stops a forgotten
+  `-I` from looking like data loss. Normal runs are byte-identical to
+  before.
 
 ### Bug fixes
 

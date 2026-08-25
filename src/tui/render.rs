@@ -1952,12 +1952,13 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: 
 
     // Isolated run (SPECS §32): nothing persists and several actions are
     // gone, so say so here first, not buried after the shortcut list. The
-    // overlay is a fixed 64x40 box with no scroll, so anything appended at
-    // the end clips silently on realistic terminal heights (verified: the
-    // base 44-line shortcut list already clips its own tail there). Leading
-    // with the note trades away the "Keyboard Shortcuts" title line in an
-    // isolated run, but guarantees the note itself is always visible — it is
-    // the reason the user opened this overlay in the first place.
+    // overlay is a fixed 64x40 box with no scroll or pagination (a known,
+    // separate defect: the base 44-line shortcut list alone already clips
+    // its own tail there). Leading with the note guarantees it survives
+    // that clip regardless of terminal height, but every line it costs is a
+    // line of the existing shortcut list pushed further into the clipped
+    // tail — so it is kept to a header plus two lines, not the four the
+    // first attempt used.
     if isolated {
         let mut isolated_first = vec![
             Line::from(Span::styled(
@@ -1965,9 +1966,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: 
                 Style::default().fg(Color::Magenta),
             )),
             Line::raw("  Nothing is saved and nothing was continued."),
-            Line::raw("  One session, in this directory, on the current branch."),
-            Line::raw("  No other projects and no new session tabs."),
-            Line::raw(""),
+            Line::raw("  One session here; no other projects, no new session tabs."),
         ];
         isolated_first.append(&mut help_text);
         help_text = isolated_first;
