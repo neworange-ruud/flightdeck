@@ -1098,12 +1098,17 @@ impl AppState {
         // The branch a base tab is *actually* on. `base` is the configured base
         // branch, which is not necessarily what HEAD points at in the project
         // root — and `meta.branch` is what Push Branch pushes, so recording the
-        // base here would push the wrong ref. A detached HEAD has no branch
-        // name; fall back to the base.
-        let head = services
-            .git
-            .current_branch(&self.repo_root)
-            .unwrap_or_else(|_| base.clone());
+        // base here would push the wrong ref. Two cases fall back to the base:
+        // a genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
+        // unavailable), and a detached HEAD, which `git rev-parse --abbrev-ref
+        // HEAD` reports not as an error but as the literal string "HEAD" —
+        // recording that verbatim would name the tab "HEAD" and hand Push a
+        // refname git rejects.
+        let head = match services.git.current_branch(&self.repo_root) {
+            Ok(b) if b == "HEAD" => base.clone(),
+            Ok(b) => b,
+            Err(_) => base.clone(),
+        };
 
         // The tab name falls back to the checked-out branch when the field was
         // left blank (the branch textbox is disabled in base mode).
@@ -2921,12 +2926,37 @@ mod tests {
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
 
-        // A detached HEAD makes current_branch fail; the base name is the
-        // fallback.
+        // A detached HEAD is not an error from `current_branch` — real git's
+        // `rev-parse --abbrev-ref HEAD` reports it as the literal string
+        // "HEAD" and exits 0. That is the path production actually takes.
         let git = FakeGit::new()
             .with_root(REPO)
             .with_branches(["main"])
-            .with_current_branch_error("HEAD is detached");
+            .with_current_branch("HEAD");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs[0].meta.branch, "main");
+    }
+
+    #[test]
+    fn base_tab_falls_back_to_base_when_current_branch_errors() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // A genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
+        // being unavailable) also falls back to the base.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch_error("fatal: not a git repository");
         let fs = FakeFs::new();
         let pty = FakePty::new();
         pty.queue_session();
@@ -4488,6 +4518,47 @@ mod tests {
             other => panic!("expected PrUrl, got {other:?}"),
         }
         assert_eq!(git.pushes().len(), 1);
+    }
+
+    #[test]
+    fn base_tab_push_pushes_the_checked_out_branch_not_the_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // Base is "main", but the repo root has "spike" checked out. This is
+        // the whole point of the fix: Push must push "spike", not "main".
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let job = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
+        assert_eq!(app.tabs[0].meta.branch, "spike");
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
+        app.finalize_new_tab(&job.tab_id, &svc).unwrap();
+
+        // Clean worktree (default_dirty is false), so push needs no confirm.
+        let effect = app
+            .dispatch(Command::PushBranch { confirm: None }, &svc)
+            .unwrap();
+        assert!(
+            matches!(effect, Effect::Message(_)),
+            "expected a plain success message, got {effect:?}"
+        );
+
+        let pushes = git.pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(
+            pushes[0].1, "spike",
+            "Push must push the branch actually checked out, not the configured base"
+        );
     }
 
     // --- §21: git status overlay surfaces the PR compare URL after push ---
