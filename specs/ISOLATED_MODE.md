@@ -13,8 +13,12 @@ session in the current working directory, nothing continued from a previous run,
 nothing left behind on disk. It exists for testing FlightDeck itself and for
 poking at a repository without accreting state.
 
-A normal startup is unchanged in every respect. Isolated mode adds a run-time
-switch; it never alters default behavior.
+A normal startup keeps its behavior: no worktree changes, no new refusals, and
+no new UI. One thing is not preserved: the agent status hooks a normal run
+generates changed shape as part of this series (§8) — every non-containerized
+run's hooks now carry an absolute, single-quoted status-file path instead of
+the old cwd-relative one. Isolated mode itself still adds only a run-time
+switch; it introduces no new configuration and no new persisted state.
 
 ## 2. Definition
 
@@ -129,24 +133,32 @@ Status, split view, rename, restart, close tab.
 
 ## 8. Status plumbing redirect
 
-Spawning an agent normally writes its status plumbing into the working tree:
-`.flightdeck/runtime/status/…` (a Claude plugin directory, an OpenCode plugin)
-plus a seeded `.flightdeck/agent-status`, and the generated hooks append to
-`.flightdeck/agent-status` **relative to the agent's working directory**.
+Before this series, spawning an agent always wrote its status plumbing into
+the working tree: `.flightdeck/runtime/status/…` (a Claude plugin directory,
+an OpenCode plugin) plus a seeded `.flightdeck/agent-status`, and the
+generated hooks appended to `.flightdeck/agent-status` **relative to the
+agent's working directory**, guarded with `[ -d .flightdeck ]` in case the
+hook fired somewhere unrelated.
 
-Isolated mode redirects all of it to a temporary directory outside the
-repository, so the status chips and OS notifications keep working while the
-project directory stays untouched.
+As built, every non-containerized run — isolated or not — now builds its
+status file path from an explicit status root and templates that **absolute**
+path directly into the hook body; the relative-path form and the
+`[ -d .flightdeck ]` guard are both gone (the guard is unnecessary once the
+directory is FlightDeck-created and absolute — see §8.1 for the exact
+emitted form). Isolated mode redirects that status root to a temporary
+directory outside the repository, so the status chips and OS notifications
+keep working while the project directory stays untouched; normal mode's
+status root is still the worktree, unchanged.
 
-`prepare_status_launch` gains a status-root parameter. Normal mode passes the
-worktree, which is byte-identical to today's behavior. Isolated mode passes a
-temp directory (`flightdeck-isolated-<pid>/`), removed on teardown.
+`prepare_status_launch` takes a status-root parameter. Normal mode passes the
+worktree — the *root* is byte-identical to before — and isolated mode passes
+a temp directory (`flightdeck-isolated-<pid>/`), removed on teardown.
 
-What becomes path-aware:
+What became path-aware:
 
 - `agent_status_file(root)` — derived from the status root, not the worktree
-- `CLAUDE_PLUGIN_HOOKS` — currently a `const` whose one-liners write to a
-  cwd-relative path; becomes templated with the absolute status-file path
+- the Claude plugin hooks (`claude_plugin_hooks`) — templated with the
+  absolute status-file path, guard dropped
 - `codex_hook_override` — the same, in its `--config hooks.…` overrides
 - the OpenCode runtime plugin JS — the same
 - `remote::bridge::agent_question_path` — so remote question-answering keeps
@@ -157,17 +169,25 @@ needs no change; only the two sites that construct it do.
 
 ### 8.1 Risk: shell and JSON escaping across platforms
 
-The generated hooks are POSIX-shell one-liners
-(`[ -d .flightdeck ] && printf 'idle\n' >> .flightdeck/agent-status`) embedded in
-JSON and TOML. Templating an absolute path into them means two layers of
-escaping, and a Windows path brings backslashes into both. This is the most
-likely thing in this design to break. It is squarely
-`flightdeck-cross-platform-parity` territory and must be tested on Windows, not
-reasoned about. **As of this writing it has not been** — the implementation
-work happened on Linux, and the escaping is argued correct by construction
-(the `serde_json`/`toml` serializers own the escaping, not hand-rolled string
-work) but has not been exercised on an actual Windows machine or CI runner.
-This stays open until someone does.
+The generated hooks are POSIX-shell one-liners with no guard and a
+single-quoted absolute path, e.g. the "idle" hook body
+(`src/agents/setup.rs`, `claude_plugin_hooks`/`codex_hook_override`, via
+`shell_quote`):
+
+```
+printf 'idle\n' >> '/abs/status/root/.flightdeck/agent-status'; exit 0
+```
+
+embedded in JSON (Claude) or a TOML `--config hooks.…` override (Codex).
+Templating an absolute path into them means two layers of escaping, and a
+Windows path brings backslashes into both. This is the most likely thing in
+this design to break. It is squarely `flightdeck-cross-platform-parity`
+territory and must be tested on Windows, not reasoned about. **As of this
+writing it has not been** — the implementation work happened on Linux, and
+the escaping is argued correct by construction (the `serde_json`/`toml`
+serializers own the escaping, not hand-rolled string work) but has not been
+exercised on an actual Windows machine or CI runner. This stays open until
+someone does.
 
 ### 8.2 Exception: containerized runs
 
