@@ -7755,5 +7755,96 @@ mod tests {
 
             assert_ne!(ws.active, before, "the normal flow is untouched");
         }
+
+        /// Behavioural pin for the `ProjectHit::Tab` mouse path (#26 regression
+        /// class): a click on the project tab row must be refused the same way
+        /// as the keybinding and palette switch paths in an isolated run, not
+        /// silently bypass `switch_project` via a direct `set_active`.
+        #[test]
+        fn isolated_refuses_switching_project_via_a_tab_click() {
+            let mut ws = one_project_workspace(true);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let before = ws.active;
+
+            // Column/row land inside the single project's tab segment: the
+            // project tab row starts at (area.x, HEADER_HEIGHT).
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            };
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: crate::tui::layout::HEADER_HEIGHT,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            handle_mouse(click, area, &mut ws, &e, &mut ui);
+
+            assert_eq!(
+                ws.active, before,
+                "a tab click must not switch the active project"
+            );
+            assert!(
+                overlay_message(&ui)
+                    .expect("a refusal is surfaced")
+                    .contains(ISOLATED_MSG_FRAGMENT),
+                "the click must be refused like every other switch path"
+            );
+        }
+
+        #[test]
+        fn a_normal_run_still_switches_project_via_a_tab_click() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let before = ws.active;
+
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            };
+            let ml = crate::tui::layout::compute(area, false);
+            let names: Vec<String> = ws.projects.iter().map(|p| p.name.clone()).collect();
+            let row = crate::tui::layout::HEADER_HEIGHT;
+            // Find a column that hits the second project's tab, wherever the
+            // first project's label happens to place it.
+            let column = (0..area.width)
+                .find(|&col| {
+                    matches!(
+                        crate::tui::render::project_tab_hit_test(ml.project_tabs, &names, col, row),
+                        Some(ProjectHit::Tab(1))
+                    )
+                })
+                .expect("the second project's tab must be hit-testable");
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            handle_mouse(click, area, &mut ws, &e, &mut ui);
+
+            assert_ne!(
+                ws.active, before,
+                "the normal flow is untouched: a tab click still switches"
+            );
+        }
     }
 }
