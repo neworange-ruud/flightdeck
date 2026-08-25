@@ -1,6 +1,8 @@
 # Isolated Mode — Design
 
-Status: approved design, not yet implemented.
+Status: implemented. This design shipped across the ISOLATED_MODE_PLAN task
+series (Tasks 1-12); see specs/ISOLATED_MODE_PLAN.md for the implementation
+record and SPECS §32 for the canonical, as-built description.
 Date: 2026-08-25
 Reserves SPECS §32.
 
