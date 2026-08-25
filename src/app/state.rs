@@ -589,7 +589,15 @@ impl AppState {
     /// (SPECS §8). Called after the configuration manager (or an `$EDITOR` edit)
     /// changes the global/project config; running tabs are untouched — only
     /// newly-spawned agents and config-derived UI reflect the change.
-    pub fn reload_config(&mut self, config: Config) {
+    pub fn reload_config(&mut self, mut config: Config) {
+        // An isolated run forces `auto_continue` off for the whole run (SPECS
+        // §32), so even Restart Agent starts fresh. The config manager can
+        // reload a config loaded fresh from disk (where the field defaults to
+        // `true`) via Open Configuration -> save; re-apply the force here so
+        // that flow cannot silently undo the startup invariant.
+        if self.isolated {
+            config.ui.auto_continue = false;
+        }
         self.registry = AgentRegistry::from_config(&config);
         self.config = config;
     }
@@ -2519,6 +2527,50 @@ mod tests {
         assert_eq!(app.registry.all().len(), 1);
         assert!(app.registry.get("codex").is_none());
         assert!(app.registry.get("opencode").is_some());
+    }
+
+    #[test]
+    fn reload_config_on_an_isolated_state_keeps_auto_continue_forced_off() {
+        // Startup forces auto_continue off for the whole isolated run (SPECS
+        // §32) so even Restart Agent starts fresh. The config manager's save
+        // flow replaces the whole Config via reload_config with one loaded
+        // fresh from disk, where auto_continue defaults to true — that must
+        // not silently undo the invariant.
+        let mut app = fresh_state(crate::config::schema::default_config("p", "main"));
+        app.set_isolated(None);
+        assert!(app.isolated);
+
+        let mut next = crate::config::schema::default_config("p", "main");
+        next.ui.auto_continue = true;
+        app.reload_config(next);
+
+        assert!(
+            !app.config.ui.auto_continue,
+            "an isolated run must keep auto_continue forced off across a config reload"
+        );
+    }
+
+    #[test]
+    fn reload_config_on_a_non_isolated_state_takes_the_new_auto_continue_value() {
+        // The isolated guard must be a no-op for a normal run, or every
+        // normal save that flips this setting would silently be ignored. Start
+        // from `false` and reload to `true`: a fix that always forces the
+        // field off (rather than only when isolated) would leave this at
+        // `false` and fail here.
+        let mut starting = crate::config::schema::default_config("p", "main");
+        starting.ui.auto_continue = false;
+        let mut app = fresh_state(starting);
+        assert!(!app.isolated, "isolated is off by default");
+        assert!(!app.config.ui.auto_continue);
+
+        let mut next = crate::config::schema::default_config("p", "main");
+        next.ui.auto_continue = true;
+        app.reload_config(next);
+
+        assert!(
+            app.config.ui.auto_continue,
+            "a non-isolated run must honour the new value from a config reload"
+        );
     }
 
     // --- Switching with no selected tab is a graceful no-op ---------------

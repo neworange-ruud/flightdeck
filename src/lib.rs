@@ -4834,11 +4834,20 @@ fn run_palette_action(
 
 /// Build and open the configuration manager for the active project, reading the
 /// global base and this project's override files into an editable model. Ensures
-/// the global base exists first so it is always editable.
+/// the global base exists first so it is always editable — except in an
+/// isolated run, which must not create `~/.flightdeck/config.toml` merely by
+/// being opened (SPECS §32); the manager still opens and shows the effective
+/// settings without it.
 fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
     let global_path = global_config_path();
-    if let Some(gp) = &global_path {
-        let _ = ensure_global_config(env.fs, gp);
+    // An isolated run writes nothing to the user's config on its own (SPECS
+    // §32): merely opening the manager to look must not create
+    // `~/.flightdeck/config.toml`. `read_table` below tolerates a missing
+    // file, so the manager still opens and shows the effective settings.
+    if !workspace.active_project().state.isolated {
+        if let Some(gp) = &global_path {
+            let _ = ensure_global_config(env.fs, gp);
+        }
     }
 
     let read_table = |path: &Path| -> toml::Table {
@@ -7848,6 +7857,57 @@ mod tests {
             assert_ne!(
                 ws.active, before,
                 "the normal flow is untouched: a tab click still switches"
+            );
+        }
+
+        #[test]
+        fn isolated_open_config_manager_writes_nothing() {
+            // Merely opening "Open Configuration" — a viewer, not a write
+            // action — must not create ~/.flightdeck/config.toml (SPECS §32,
+            // ISOLATED_MODE.md §2 property 2 / §4).
+            let ws = one_project_workspace(true);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let mut ui = Ui::default();
+
+            open_config_manager(&ws, &e, &mut ui);
+
+            assert!(
+                ui.config.is_some(),
+                "Open Configuration must stay available in an isolated run"
+            );
+            assert!(
+                fs.writes().is_empty(),
+                "opening the config manager in an isolated run must write nothing: {:?}",
+                fs.writes()
+            );
+        }
+
+        #[test]
+        fn a_normal_run_still_creates_the_global_config_base_on_open() {
+            // Guards against the isolated guard above being inverted (which
+            // would make the isolated test pass for the wrong reason).
+            let ws = one_project_workspace(false);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let mut ui = Ui::default();
+
+            open_config_manager(&ws, &e, &mut ui);
+
+            assert!(ui.config.is_some());
+            let global_path = global_config_path().expect("HOME must be set for this test to run");
+            assert!(
+                fs.writes().contains(&global_path),
+                "a normal run still creates the global base on open: {:?}",
+                fs.writes()
             );
         }
     }

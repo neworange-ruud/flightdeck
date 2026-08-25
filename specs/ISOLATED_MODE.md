@@ -197,10 +197,15 @@ temp directory outside the worktree is not mounted, so the redirect cannot work
 there.
 
 **Resolution:** when containers are enabled, an isolated run keeps the
-in-worktree status path, and this exception is documented in the help text. A
-containerized run already writes into the mounted worktree by its nature, so
-this concedes little. Adding a second bind mount for the temp directory is the
-alternative if the exception proves annoying in practice.
+in-worktree status path; this exception is documented here (§8.2), not in the
+help text or `--help` output — the help overlay is already clipping content on
+a 40-row terminal, so a container caveat is not worth the line. Concretely,
+this means a containerized isolated run writes `.flightdeck/agent-status` and
+`runtime/status/...` into the project, same as a normal run, and nothing
+removes those files at teardown. A containerized run already writes into the
+mounted worktree by its nature, so this concedes little. Adding a second bind
+mount for the temp directory is the alternative if the exception proves
+annoying in practice.
 
 ## 9. Visibility
 

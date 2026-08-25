@@ -33,7 +33,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   A normal run's status *root* is unchanged (still the worktree), but its
   generated hook bodies now carry an absolute status-file path instead of
   the old cwd-relative one, so a normal run's hooks are not byte-identical
-  to before this series. See SPECS §32.
+  to before this series. "Open Configuration" stays available in an
+  isolated run (it is a viewer, not a write action) but no longer creates
+  `~/.flightdeck/config.toml` merely by being opened, and saving from it can
+  no longer undo the forced `ui.auto_continue = false` for the run — both
+  guards live where the config is replaced (`AppState::reload_config`), so
+  they hold regardless of call site. See SPECS §32.
 
 ### Improvements
 
