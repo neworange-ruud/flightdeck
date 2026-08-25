@@ -59,8 +59,10 @@ use crate::app::commands::{CloseAction, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::app::state::{materialize_worktree, AppState, Services, TabPhase, WorktreeJob};
 use crate::config::init::{ensure_global_config, initialize};
-use crate::config::load::{global_config_path, load_config, load_layered_config};
-use crate::config::schema::default_config;
+use crate::config::load::{
+    global_config_path, load_config, load_layered_config, serialize_global_config,
+};
+use crate::config::schema::{default_config, default_global_config};
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
@@ -73,7 +75,7 @@ use crate::git::repo::{detect_base_branch, GitCli};
 use crate::git::status::{collect_status, WorktreeStatus};
 use crate::notify::SystemNotifier;
 use crate::persistence::project_state::{default_state, load_state, save_state};
-use crate::persistence::recovery::recover;
+use crate::persistence::recovery::{recover, RecoveryReport};
 use crate::persistence::workspace::{
     load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
 };
@@ -134,7 +136,12 @@ pub fn run() -> Result<()> {
     }
 
     let argv: Vec<String> = std::env::args().collect();
-    let _isolated = parse_isolated(&argv)?;
+    let isolated = parse_isolated(&argv)?;
+    let isolated_root: Option<PathBuf> = if isolated {
+        Some(isolated_status_dir())
+    } else {
+        None
+    };
 
     // Subcommand dispatch. These configure status/notification
     // features and exit without launching the TUI (SPECS §24).
@@ -173,7 +180,7 @@ pub fn run() -> Result<()> {
 
     // The launch project (the cwd's repository) must be a git repo — fail fast
     // with the friendly message if not. It is always opened and made active.
-    let launch = open_project(&env, &cwd).map_err(|e| {
+    let launch = open_project(&env, &cwd, isolated_root.as_deref()).map_err(|e| {
         FlightDeckError::Git(format!(
             "not inside a Git repository (run FlightDeck from a git project): {e}"
         ))
@@ -197,7 +204,7 @@ pub fn run() -> Result<()> {
                 if !fs.is_dir(pr) {
                     continue;
                 }
-                match open_project(&env, pr) {
+                match open_project(&env, pr, None) {
                     Ok(proj) if !workspace.contains_root(proj.git.root()) => {
                         workspace.projects.push(proj)
                     }
@@ -608,13 +615,58 @@ fn run_doctor() -> Result<()> {
 // Startup (SPECS §4, §7, §10, §13) — terminal-free, returns the built AppState.
 // ---------------------------------------------------------------------------
 
+/// The temp directory an isolated run keeps its agent status plumbing in
+/// (SPECS §32). Per-process so two concurrent isolated runs cannot collide.
+fn isolated_status_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("flightdeck-isolated-{}", std::process::id()))
+}
+
+/// Compute the effective config the same way a normal run would — global base
+/// layered under project overrides (SPECS §8) — without writing anything to
+/// disk. Used by an isolated run, which reads existing config but never
+/// creates a global base file. When no global file exists on disk, the
+/// in-memory default global is serialized and re-parsed into a table; this
+/// reuses the exact code path a normal run's on-disk global base goes
+/// through (so the two cannot drift), and runs at most once per process, so
+/// the round-trip cost is immaterial.
+fn effective_config_without_writing(
+    fs: &dyn FileSystem,
+    global_path: Option<&Path>,
+    config_path: &Path,
+) -> Result<Config> {
+    let read_table = |path: &Path| -> Result<toml::Table> {
+        if fs.exists(path) {
+            crate::config::load::parse_table(&fs.read_to_string(path)?)
+        } else {
+            Ok(toml::Table::new())
+        }
+    };
+    let global = match global_path {
+        Some(gp) if fs.exists(gp) => read_table(gp)?,
+        _ => crate::config::load::parse_table(&serialize_global_config(&default_global_config())?)?,
+    };
+    let project = read_table(config_path)?;
+    crate::config::load::effective_config(global, project)
+}
+
 /// Run the SPECS §7 startup sequence and build the [`AppState`]. Pure of any
 /// terminal I/O so it can be exercised with the fakes in [`crate::testing`].
 ///
 /// Steps: detect base branch, first-run init, load config (default fallback),
 /// `.gitignore` update + §6 notice, load + recover state, build [`AppState`],
 /// and record the §13 dirty-base warning if the base repo is dirty at startup.
-fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState> {
+///
+/// `isolated`: `None` for a normal run. `Some(status_root)` for an isolated
+/// run (SPECS §32) — nothing is written under the project (no first-run init,
+/// no global config base, no `.gitignore` update, no state load/recovery),
+/// though existing config on disk is still read; the agent status plumbing
+/// lives at `status_root` instead.
+fn startup(
+    services: &Services,
+    repo_root: &Path,
+    cwd: &Path,
+    isolated: Option<&Path>,
+) -> Result<AppState> {
     // Capture dirtiness before any of FlightDeck's own first-run writes below
     // (config.toml, .gitignore) touch the working tree — otherwise those
     // bootstrap writes would themselves make an actually-clean repo look dirty
@@ -632,50 +684,79 @@ fn startup(services: &Services, repo_root: &Path, cwd: &Path) -> Result<AppState
     let base_branch = detect_base_branch(services.git, cwd, pre_configured_base.as_deref())?;
 
     // First-run init: create .flightdeck/, config.toml, state.json, worktrees/.
+    // Skipped entirely for an isolated run (SPECS §32): nothing is written.
     let project_name = derive_project_name(repo_root);
-    initialize(services.fs, repo_root, &project_name, &base_branch)?;
+    if isolated.is_none() {
+        initialize(services.fs, repo_root, &project_name, &base_branch)?;
+    }
 
     // Ensure the per-user global base exists (documents every overridable
     // setting), then load the effective config by layering it under this
     // project's overrides (SPECS §8). Fall back to a freshly-built default if
     // loading fails, or when there is no home dir to host a global config.
+    //
+    // An isolated run never creates the global base file, but still computes
+    // the same effective config a normal run would (global base — on disk if
+    // present, else the in-memory default — layered under the project's
+    // overrides), so a partial project config.toml is honoured even on a
+    // machine that has never run FlightDeck normally (SPECS §4).
     let global_path = global_config_path();
-    if let Some(gp) = &global_path {
-        let _ = ensure_global_config(services.fs, gp);
-    }
-    let config = match &global_path {
-        Some(gp) => load_layered_config(services.fs, gp, &config_path),
-        None => load_config(services.fs, &config_path),
+    let config = if isolated.is_none() {
+        if let Some(gp) = &global_path {
+            let _ = ensure_global_config(services.fs, gp);
+        }
+        match &global_path {
+            Some(gp) => load_layered_config(services.fs, gp, &config_path),
+            None => load_config(services.fs, &config_path),
+        }
+    } else {
+        effective_config_without_writing(services.fs, global_path.as_deref(), &config_path)
     }
     .unwrap_or_else(|_| default_config(&project_name, &base_branch));
 
     // Append .gitignore entries and surface the §6 notice if it changed.
-    let update = ensure_flightdeck_gitignore(services.fs, repo_root)?;
-    if update.changed {
-        eprintln!(
-            "FlightDeck: added {} to .gitignore: {}",
-            if update.added.len() == 1 {
-                "entry"
-            } else {
-                "entries"
-            },
-            update.added.join(", ")
-        );
+    // Skipped for an isolated run: nothing under the project is touched.
+    if isolated.is_none() {
+        let update = ensure_flightdeck_gitignore(services.fs, repo_root)?;
+        if update.changed {
+            eprintln!(
+                "FlightDeck: added {} to .gitignore: {}",
+                if update.added.len() == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                update.added.join(", ")
+            );
+        }
     }
 
     // Load state (default if missing), then recover tabs WITHOUT relaunching
-    // agents (SPECS §10).
-    let mut project_state =
-        load_state(services.fs, &state_path).unwrap_or_else(|_| default_state(&base_branch));
-    let report = recover(
-        services.fs,
-        services.git,
-        repo_root,
-        &worktrees_root,
-        &mut project_state,
-    )?;
+    // agents (SPECS §10). An isolated run reads nothing and recovers nothing:
+    // no continuation (SPECS §32).
+    let (project_state, report) = if isolated.is_some() {
+        (default_state(&base_branch), RecoveryReport::default())
+    } else {
+        let mut ps =
+            load_state(services.fs, &state_path).unwrap_or_else(|_| default_state(&base_branch));
+        let report = recover(
+            services.fs,
+            services.git,
+            repo_root,
+            &worktrees_root,
+            &mut ps,
+        )?;
+        (ps, report)
+    };
 
     let mut state = AppState::new(config, project_state, repo_root, &state_path);
+    if let Some(status_root) = isolated {
+        state.set_isolated(Some(status_root.to_path_buf()));
+        // Forced off, not merely defaulted: without this, "no continuation"
+        // would hold only until the first Restart Agent replayed a captured
+        // resume command (SPECS §32 §4).
+        state.config.ui.auto_continue = false;
+    }
 
     // Surface stale entries (worktree missing on disk / unregistered in git)
     // so the user knows to remove them, instead of silently discarding them.
@@ -1111,13 +1192,17 @@ struct Project {
 /// root, run the SPECS §7 startup (init, recover — never relaunch agents), and
 /// build a [`Project`] with fresh per-project worker channels. Fails if `path`
 /// is not inside a git repository.
-fn open_project(env: &Env, path: &Path) -> Result<Project> {
+///
+/// `isolated`: `None` for a normal project. `Some(status_root)` for an
+/// isolated run (SPECS §32) whose status plumbing lives at that root —
+/// forwarded straight through to [`startup`].
+fn open_project(env: &Env, path: &Path, isolated: Option<&Path>) -> Result<Project> {
     let git = GitCli::discover(path)?;
     let root = git.root().to_path_buf();
     let name = derive_project_name(&root);
     let state = {
         let services = env.services(&git);
-        startup(&services, &root, &root)?
+        startup(&services, &root, &root, isolated)?
     };
     let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
     let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
@@ -1306,7 +1391,9 @@ fn event_loop(
     // finding immediately and, when due, kick off a background check. Applied to
     // every project so whichever is active shows the hint.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    let check_enabled = workspace.active_project().state.config.update.check;
+    // An isolated run makes no network call and writes no cache (SPECS §32).
+    let check_enabled = !workspace.active_project().state.isolated
+        && workspace.active_project().state.config.update.check;
     if let Some(latest) =
         crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
     {
@@ -3686,7 +3773,7 @@ fn handle_open_project_key(
                 return Ok(());
             }
         };
-        match open_project(env, &target) {
+        match open_project(env, &target, None) {
             Ok(mut proj) => {
                 if workspace.contains_root(proj.git.root()) {
                     let root = proj.git.root().to_path_buf();
@@ -5676,7 +5763,7 @@ mod tests {
             command: &command,
         };
 
-        let state = startup(&services, repo, repo).expect("startup should succeed");
+        let state = startup(&services, repo, repo, None).expect("startup should succeed");
         assert_eq!(state.base_branch, "main");
         assert!(state
             .warnings
@@ -5709,12 +5796,170 @@ mod tests {
             command: &command,
         };
 
-        let state = startup(&services, repo, repo).expect("startup should succeed");
+        let state = startup(&services, repo, repo, None).expect("startup should succeed");
         assert!(state.tabs.is_empty());
         assert!(!state
             .warnings
             .iter()
             .any(|w| w.contains("local merge disabled")));
+    }
+
+    #[test]
+    fn isolated_startup_writes_nothing_under_the_repo() {
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new();
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        assert!(
+            fs.writes_under(Path::new("/repo")).is_empty(),
+            "isolated startup must not touch the project: {:?}",
+            fs.writes_under(Path::new("/repo"))
+        );
+        assert!(
+            fs.writes().is_empty(),
+            "isolated startup must not write anything at all: {:?}",
+            fs.writes()
+        );
+        assert!(
+            state.tabs.is_empty(),
+            "startup itself creates no tab (Task 7 does)"
+        );
+        assert!(
+            !state.config.ui.auto_continue,
+            "auto_continue is forced off so even Restart Agent starts fresh"
+        );
+    }
+
+    #[test]
+    fn isolated_startup_ignores_state_json_on_disk() {
+        let repo = Path::new("/repo");
+        // A previous run's state that a normal startup would recover.
+        let fs = FakeFs::new().with_file(
+            "/repo/.flightdeck/state.json",
+            r#"{"version":1,"base_branch":"main","tabs":[]}"#,
+        );
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        assert!(
+            state.tabs.is_empty(),
+            "nothing is recovered in an isolated run"
+        );
+        assert!(fs.writes_under(Path::new("/repo")).is_empty());
+        assert!(fs.writes().is_empty());
+    }
+
+    #[test]
+    fn isolated_startup_still_reads_project_config() {
+        let repo = Path::new("/repo");
+        // Deliberately partial (no [agents] section): a real user's trimmed
+        // project override, with no global config.toml on disk anywhere in
+        // this fixture (an isolated run never writes one). Do not "simplify"
+        // this into a self-sufficient config — it exercises isolated mode
+        // computing the same effective config a normal run would (default
+        // global base + project overrides) purely in memory, so a partial
+        // override on a machine that has never run FlightDeck is honoured
+        // rather than silently discarded (SPECS §4).
+        let fs = FakeFs::new().with_file(
+            "/repo/.flightdeck/config.toml",
+            "[ui]\ndefault_agent = \"claude\"\n",
+        );
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(
+            &services,
+            repo,
+            repo,
+            Some(Path::new("/tmp/fd-isolated-test")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.config.ui.default_agent, "claude",
+            "isolated mode reads existing config; it only refuses to write"
+        );
+        assert!(fs.writes_under(Path::new("/repo")).is_empty());
+        assert!(fs.writes().is_empty());
+    }
+
+    #[test]
+    fn normal_startup_still_initializes_the_project() {
+        // Regression guard for the untouched default path.
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new();
+        let git = FakeGit::new().with_root("/repo").with_branches(["main"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let _ = startup(&services, repo, repo, None).unwrap();
+
+        assert!(
+            fs.writes_under(Path::new("/repo"))
+                .iter()
+                .any(|p| p.ends_with("config.toml")),
+            "a normal first run still writes the project config"
+        );
     }
 
     #[test]
