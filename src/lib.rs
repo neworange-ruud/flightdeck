@@ -133,6 +133,9 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    let argv: Vec<String> = std::env::args().collect();
+    let _isolated = parse_isolated(&argv)?;
+
     // Subcommand dispatch. These configure status/notification
     // features and exit without launching the TUI (SPECS §24).
     match std::env::args().nth(1).as_deref() {
@@ -755,6 +758,37 @@ fn derive_project_name(repo_root: &Path) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
+/// Subcommands that configure or inspect FlightDeck and exit without the TUI.
+/// Kept next to [`parse_isolated`] so a new subcommand cannot silently become
+/// combinable with `--isolated`.
+const SUBCOMMANDS: &[&str] = &[
+    "setup-status",
+    "setup-notifications",
+    "setup-update",
+    "update",
+    "image",
+    "doctor",
+];
+
+/// Whether this invocation asked for an isolated run (SPECS §32).
+///
+/// `args` is the full argv, argv[0] included. Isolated mode launches the TUI, so
+/// it cannot be combined with a subcommand — that combination is a hard error
+/// rather than a silent ignore, because silently dropping the flag would let a
+/// user believe a run was isolated when it was not.
+fn parse_isolated(args: &[String]) -> Result<bool> {
+    let isolated = args.iter().any(|a| a == "--isolated" || a == "-I");
+    if !isolated {
+        return Ok(false);
+    }
+    if let Some(sub) = args.iter().find(|a| SUBCOMMANDS.contains(&a.as_str())) {
+        return Err(FlightDeckError::Config(format!(
+            "--isolated launches the TUI and cannot be combined with the '{sub}' subcommand"
+        )));
+    }
+    Ok(true)
+}
+
 /// Print usage for `flightdeck --help`/`-h`.
 fn print_help() {
     println!("flightdeck {}", env!("CARGO_PKG_VERSION"));
@@ -784,6 +818,9 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");
     println!("    -V, --version    Print version");
+    println!("    -I, --isolated   Throwaway run: one fresh session in the current");
+    println!("                     directory. No continuation, no worktrees, no");
+    println!("                     other projects, and nothing written to the project.");
 }
 
 /// Push the current window/icon title onto the terminal's title stack
@@ -5079,6 +5116,42 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_isolated_accepts_both_spellings() {
+        assert!(parse_isolated(&argv(&["flightdeck", "--isolated"])).unwrap());
+        assert!(parse_isolated(&argv(&["flightdeck", "-I"])).unwrap());
+    }
+
+    #[test]
+    fn parse_isolated_defaults_to_off() {
+        assert!(!parse_isolated(&argv(&["flightdeck"])).unwrap());
+    }
+
+    #[test]
+    fn parse_isolated_is_not_confused_by_lowercase_i() {
+        // `-i` is not the flag; only the documented `-I` is.
+        assert!(!parse_isolated(&argv(&["flightdeck", "-i"])).unwrap());
+    }
+
+    #[test]
+    fn parse_isolated_refuses_a_subcommand() {
+        let err = parse_isolated(&argv(&["flightdeck", "-I", "doctor"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--isolated") && msg.contains("doctor"),
+            "the error must name the flag and the offending subcommand: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_isolated_refuses_a_subcommand_given_first() {
+        assert!(parse_isolated(&argv(&["flightdeck", "image", "--isolated"])).is_err());
+    }
 
     // --- next_loop_step: the shutdown-flag / input decision --------------
 
