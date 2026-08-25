@@ -1240,6 +1240,7 @@ mod tests {
             .unwrap();
         fs.symlink(Path::new("/repo/a.txt"), Path::new("/repo/link"))
             .unwrap();
+        fs.remove_dir_all(Path::new("/repo/sub")).unwrap();
 
         let writes = fs.writes();
         assert_eq!(
@@ -1249,8 +1250,21 @@ mod tests {
                 PathBuf::from("/repo/sub"),
                 PathBuf::from("/repo/.gitignore"),
                 PathBuf::from("/repo/link"),
+                PathBuf::from("/repo/sub"),
             ],
-            "every mutating call must be journalled in order"
+            "every mutating call must be journalled in order, including remove_dir_all"
+        );
+    }
+
+    #[test]
+    fn fake_fs_symlink_refusal_is_not_journalled() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new().with_file("/repo/link", "already here");
+        let err = fs.symlink(Path::new("/repo/a.txt"), Path::new("/repo/link"));
+        assert!(err.is_err(), "symlinking over an existing path must fail");
+        assert!(
+            fs.writes().is_empty(),
+            "a rejected symlink must leave no journal entry"
         );
     }
 
