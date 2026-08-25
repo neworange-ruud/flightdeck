@@ -23,6 +23,15 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **The phone now shows the agent's replies on Windows.** FlightDeck rebuilds the
+  mobile chat from the agent's own session file, and it derived Claude Code's
+  store directory by folding path separators and `.` to `-` — but not the Windows
+  drive colon. So a `C:\repo` worktree was looked up under `C:-repo`, a name
+  Windows cannot even represent: the directory read failed, no session file was
+  ever found, and every Windows agent's transcript stayed permanently empty on
+  the remote app. The colon now folds like every other separator, matching what
+  Claude Code actually writes (`C--repo`).
+
 - **Pairing a phone no longer waits silently on a relay that said no.** If the
   relay refused the connection — most often no `relay_password` set for the
   hosted relay — the pairing overlay sat on "Requesting a pairing code from the
