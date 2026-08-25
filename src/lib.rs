@@ -1379,6 +1379,17 @@ fn resume_active_project_agents(workspace: &mut Workspace, env: &Env) {
     let _ = p.state.resume_agents(&services);
 }
 
+/// Switch the active project, resuming its agents (SPECS §22). Refused in an
+/// isolated run, which has exactly one project by construction (SPECS §32).
+fn switch_project(workspace: &mut Workspace, env: &Env, sel: Selector, ui: &mut Ui) {
+    if workspace.active_project().state.isolated {
+        ui.message(ISOLATED_REFUSAL);
+        return;
+    }
+    workspace.switch(sel);
+    resume_active_project_agents(workspace, env);
+}
+
 /// Collapse agent lifecycle states into the two indicators shown on a project
 /// tab. Because callers pass display-ready states, project progress follows the
 /// same explicit backend events as each agent tab.
@@ -2936,8 +2947,7 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
             ui.drag = None;
             match hit {
                 ProjectHit::Tab(i) => {
-                    workspace.set_active(i);
-                    resume_active_project_agents(workspace, env);
+                    switch_project(workspace, env, Selector::Index(i), ui);
                 }
                 ProjectHit::Close(i) => {
                     workspace.set_active(i);
@@ -3445,8 +3455,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         }
         // Project switching is workspace-level, not an AppState command.
         KeyAction::SwitchProject(sel) => {
-            workspace.switch(sel);
-            resume_active_project_agents(workspace, env);
+            switch_project(workspace, env, sel, ui);
             Ok(false)
         }
         KeyAction::Passthrough(bytes) => {
@@ -3697,10 +3706,20 @@ fn start_prompt(ui: &mut Ui, prompt: Prompt) {
     ui.prompt = Some(PromptState { prompt, dialog });
 }
 
+/// Why an action is unavailable in an isolated run (SPECS §32). One string, so
+/// every refusal reads identically wherever the user meets it.
+const ISOLATED_REFUSAL: &str =
+    "Not available in an isolated run (--isolated): it has one session in this \
+     directory and opens nothing else.";
+
 /// Begin the New Agent Tab flow (SPECS §4, §22): open the combined form —
 /// agent radio, branch name, and the "run from base branch" toggle — with the
 /// configured default agent preselected.
 fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
+    if state.isolated {
+        ui.message(ISOLATED_REFUSAL);
+        return;
+    }
     let agents: Vec<(String, String)> = state
         .registry
         .all()
@@ -3783,6 +3802,10 @@ fn list_subdirs(fs: &dyn FileSystem, dir: &Path) -> Vec<PathBuf> {
 /// directory of the active project (its neighbours are the likely next
 /// projects), falling back to `$HOME` then the filesystem root.
 fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    if workspace.active_project().state.isolated {
+        ui.message(ISOLATED_REFUSAL);
+        return;
+    }
     let start_dir = workspace
         .active_project()
         .git
@@ -3808,6 +3831,10 @@ fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
 /// Begin the Close Project flow: confirm first (SPECS §25 no-surprise rule).
 /// Refuses to close the only remaining project — that is what Ctrl-q is for.
 fn start_close_project_flow(workspace: &Workspace, ui: &mut Ui, index: usize) {
+    if workspace.active_project().state.isolated {
+        ui.message(ISOLATED_REFUSAL);
+        return;
+    }
     if workspace.projects.len() <= 1 {
         ui.message("Can't close the only project. Use Ctrl-q to quit FlightDeck.");
         return;
@@ -4717,13 +4744,11 @@ fn run_palette_action(
             return Ok(());
         }
         PaletteAction::SwitchProjectNext => {
-            workspace.switch(Selector::Next);
-            resume_active_project_agents(workspace, env);
+            switch_project(workspace, env, Selector::Next, ui);
             return Ok(());
         }
         PaletteAction::SwitchProjectPrev => {
-            workspace.switch(Selector::Prev);
-            resume_active_project_agents(workspace, env);
+            switch_project(workspace, env, Selector::Prev, ui);
             return Ok(());
         }
         PaletteAction::OpenConfig => {
@@ -7502,6 +7527,233 @@ mod tests {
                 workspace.projects[1].state.tabs[0].session.active().is_some(),
                 "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
             );
+        }
+    }
+
+    /// Refuse Open/Close/New-Tab/New-Button and project switching in an
+    /// isolated run (specs/ISOLATED_MODE.md §6), while leaving every other
+    /// mode's behaviour byte-identical.
+    mod isolated_refusals {
+        use super::*;
+
+        const ISOLATED_MSG_FRAGMENT: &str = "isolated";
+
+        /// Extract the message text from whatever a refusal set — a
+        /// notification dialog, matching how `Ui::message` renders it.
+        fn overlay_message(ui: &Ui) -> Option<String> {
+            match &ui.overlay {
+                UiOverlay::Dialog(d) => Some(d.title.clone()),
+                _ => None,
+            }
+        }
+
+        fn one_project_workspace(isolated: bool) -> Workspace {
+            let mut config = config_with_agent(AgentDef {
+                key: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                command: "codex".to_string(),
+                ..AgentDef::default()
+            });
+            config.ui.default_agent = "codex".to_string();
+            let mut app = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
+            if isolated {
+                app.set_isolated(None);
+            }
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            Workspace {
+                projects: vec![Project {
+                    name: "proj".to_string(),
+                    git: GitCli::new(PathBuf::from("/repo")),
+                    state: app,
+                    cache: GitStatusCache::new(),
+                    create_tx,
+                    create_rx,
+                    status_tx,
+                    status_rx,
+                    status_in_flight: false,
+                    git_lock: Arc::new(Mutex::new(())),
+                }],
+                active: 0,
+            }
+        }
+
+        fn two_project_workspace(active_isolated: bool) -> Workspace {
+            let mut ws = one_project_workspace(active_isolated);
+            let mut other_config = config_with_agent(AgentDef {
+                key: "claude".to_string(),
+                display_name: "Claude".to_string(),
+                command: "claude".to_string(),
+                ..AgentDef::default()
+            });
+            other_config.ui.default_agent = "claude".to_string();
+            let other_app = AppState::new(
+                other_config,
+                default_state("main"),
+                "/repo2",
+                "/repo2/state.json",
+            );
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            ws.projects.push(Project {
+                name: "other".to_string(),
+                git: GitCli::new(PathBuf::from("/repo2")),
+                state: other_app,
+                cache: GitStatusCache::new(),
+                create_tx,
+                create_rx,
+                status_tx,
+                status_rx,
+                status_in_flight: false,
+                git_lock: Arc::new(Mutex::new(())),
+            });
+            ws
+        }
+
+        fn env<'a>(
+            fs: &'a FakeFs,
+            pty: &'a FakePty,
+            clock: &'a FakeClock,
+            container: &'a crate::testing::FakeContainerRuntime,
+            command: &'a crate::testing::FakeCommandRunner,
+        ) -> Env<'a> {
+            Env {
+                fs,
+                pty,
+                clock,
+                container,
+                command,
+            }
+        }
+
+        #[test]
+        fn isolated_refuses_the_new_tab_flow() {
+            let ws = one_project_workspace(true);
+            let mut ui = Ui::default();
+
+            start_new_tab_flow(&ws.active_project().state, &mut ui);
+
+            let msg = overlay_message(&ui).expect("a refusal is surfaced");
+            assert!(
+                msg.contains(ISOLATED_MSG_FRAGMENT),
+                "the refusal must say why: {msg}"
+            );
+            assert!(ui.prompt.is_none(), "and no new-tab prompt may open");
+        }
+
+        #[test]
+        fn a_normal_run_still_opens_the_new_tab_prompt() {
+            let ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            start_new_tab_flow(&ws.active_project().state, &mut ui);
+
+            assert!(ui.prompt.is_some(), "the normal flow is untouched");
+        }
+
+        #[test]
+        fn isolated_refuses_opening_another_project() {
+            let ws = one_project_workspace(true);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+
+            start_open_project_flow(&ws, &e, &mut ui);
+
+            let msg = overlay_message(&ui).expect("a refusal is surfaced");
+            assert!(msg.contains(ISOLATED_MSG_FRAGMENT));
+            assert!(ui.prompt.is_none(), "the folder browser must not open");
+        }
+
+        #[test]
+        fn a_normal_run_still_opens_the_open_project_browser() {
+            let ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+
+            start_open_project_flow(&ws, &e, &mut ui);
+
+            assert!(
+                matches!(
+                    ui.prompt.as_ref().map(|p| &p.prompt),
+                    Some(Prompt::OpenProject { .. })
+                ),
+                "the normal flow is untouched"
+            );
+        }
+
+        #[test]
+        fn isolated_refuses_closing_project() {
+            let ws = two_project_workspace(true);
+            let mut ui = Ui::default();
+
+            start_close_project_flow(&ws, &mut ui, 0);
+
+            let msg = overlay_message(&ui).expect("a refusal is surfaced");
+            assert!(msg.contains(ISOLATED_MSG_FRAGMENT));
+            assert!(ui.prompt.is_none(), "the close confirmation must not open");
+        }
+
+        #[test]
+        fn a_normal_run_still_opens_the_close_project_confirmation() {
+            let ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+
+            start_close_project_flow(&ws, &mut ui, 0);
+
+            assert!(
+                matches!(
+                    ui.prompt.as_ref().map(|p| &p.prompt),
+                    Some(Prompt::CloseProjectConfirm { .. })
+                ),
+                "the normal flow is untouched"
+            );
+        }
+
+        #[test]
+        fn isolated_refuses_switching_project() {
+            let mut ws = two_project_workspace(true);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let before = ws.active;
+
+            switch_project(&mut ws, &e, Selector::Next, &mut ui);
+
+            assert_eq!(ws.active, before, "the active project must not change");
+            assert!(overlay_message(&ui)
+                .expect("a refusal is surfaced")
+                .contains(ISOLATED_MSG_FRAGMENT));
+        }
+
+        #[test]
+        fn a_normal_run_still_switches_project() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let before = ws.active;
+
+            switch_project(&mut ws, &e, Selector::Next, &mut ui);
+
+            assert_ne!(ws.active, before, "the normal flow is untouched");
         }
     }
 }

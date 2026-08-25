@@ -31,6 +31,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   because `ws_path` is `None` for an isolated run, and the run's temp status
   directory is removed (best effort) after every session has been
   terminated, so a hook still running mid-teardown cannot race the cleanup.
+- `flightdeck --isolated` now refuses Open Project, Close Project, project
+  switching (keybinding, mouse, and command palette), and the New Agent
+  Session Tab flow, with one consistent message explaining why. The guard
+  lives inside each flow function (and in a new `switch_project` helper that
+  the keybinding, palette-next/prev, and project-tab-click paths all now go
+  through), so every entry point is covered at once. Normal runs are
+  byte-identical to before.
 
 ### Bug fixes
 
