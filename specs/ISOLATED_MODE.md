@@ -274,6 +274,14 @@ Closing this gap needs `workspace_state_path()` (or its caller) to take an
 injectable home-directory seam; until then, treat teardown as covered by
 construction and manual verification, not by an automated test.
 
+That manual verification has been done, on 2026-08-26, against a release build:
+`~/.flightdeck/workspace.json` and the `state.json` of both the main checkout
+and the worktree kept their prior mtimes across several isolated runs — quitting
+by `Ctrl-q` and by closing the only session tab, which reaches the same teardown
+— and no `flightdeck-isolated-*` directory was left under the OS temp dir. The
+guards hold in practice; what is missing is a test that would catch it if
+someone removed them.
+
 ## 11. Non-goals
 
 - Isolated mode is not a sandbox. The agent can still read and write the
