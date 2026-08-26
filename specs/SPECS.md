@@ -1369,6 +1369,11 @@ additional agents in the session remain available. The rule constrains what
 FlightDeck writes on its own; an explicit user action that exists to write still
 writes.
 
+Closing the only session tab quits the run: an isolated run is that one session,
+and every route back to an agent is refused, so remaining open would leave an
+empty shell whose only exit is Ctrl-q. A close whose container removal failed is
+the exception — the run stays up so the warning can be read.
+
 Isolated mode is a per-run flag and never a configuration setting: a persisted
 setting that suppressed persistence would be a trap. See
 `specs/ISOLATED_MODE.md` for the design and `specs/ISOLATED_MODE_PLAN.md` for the

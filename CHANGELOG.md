@@ -38,7 +38,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   `~/.flightdeck/config.toml` merely by being opened, and saving from it can
   no longer undo the forced `ui.auto_continue = false` for the run — both
   guards live where the config is replaced (`AppState::reload_config`), so
-  they hold regardless of call site. See SPECS §32.
+  they hold regardless of call site. Closing the only session tab quits the
+  run — an isolated run is that one session, and every route back to an agent
+  is refused, so staying open would leave an empty shell whose only exit is
+  Ctrl-q. See SPECS §32.
 
 ### Improvements
 

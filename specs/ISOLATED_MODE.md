@@ -124,6 +124,15 @@ Explicitly still available: Push Branch, Pull Base, Open Configuration, Pair
 Phone, child terminals, additional agents in the same tab, Open Shell, Show Git
 Status, split view, rename, restart, close tab.
 
+**Closing the last session ends the run.** An isolated run *is* its one
+session. New Agent Session Tab is refused, and the "+ agent" flow falls back to
+that same refusal when no tab is selected, so a tabless isolated run has no
+route back to an agent — staying open would strand the user in an empty shell
+whose only exit is Ctrl-q. Closing the only session tab therefore quits, as if
+they had. The one exception is a close whose container removal failed: that
+warning is worth reading, and quitting would flash it past, so the run stays up
+and Ctrl-q remains available.
+
 ## 7. Teardown
 
 - `persist_quietly` is skipped for every project

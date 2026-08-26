@@ -1353,6 +1353,14 @@ impl AppState {
         self.fix_selection_after_removal(idx);
         self.persist(services)?;
         match container_result {
+            // An isolated run IS its one session (SPECS §32): New Agent Session
+            // Tab is refused and the "+ agent" fallback lands on that same
+            // refusal, so a tabless isolated run has no route back to an agent.
+            // Closing the last session therefore ends the run rather than
+            // stranding the user in an empty shell whose only exit is Ctrl-q.
+            // Only on a clean close: if the container could not be removed the
+            // warning is worth reading, and quitting would flash it past.
+            Ok(()) if self.isolated && self.tabs.is_empty() => Ok(Effect::Quit),
             Ok(()) => Ok(Effect::Message("Closed Agent Tab.".to_string())),
             Err(e) => Ok(Effect::Warning(format!(
                 "Closed Agent Tab, but removing its container failed: {e}. It may still be running."
@@ -3572,6 +3580,86 @@ mod tests {
         assert!(handle.terminated());
         assert!(app.tabs.is_empty());
         assert_eq!(app.selected_tab, None);
+    }
+
+    #[test]
+    fn closing_the_last_tab_in_an_isolated_run_quits() {
+        // SPECS §32: an isolated run IS its one session. Once that session is
+        // closed there is nothing left to do, and every route back to a session
+        // is refused, so staying open would strand the user in an empty shell
+        // whose only exit is Ctrl-q.
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "myagent");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.set_isolated(Some(PathBuf::from("/tmp/fd-isolated-test")));
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &svc)
+            .expect("the isolated base tab is created");
+        app.finalize_new_tab(&job.tab_id, &svc).unwrap();
+
+        let effect = app
+            .dispatch(
+                Command::CloseAgentTab {
+                    action: Some(CloseAction::ForceTerminate),
+                },
+                &svc,
+            )
+            .unwrap();
+
+        assert!(handle.terminated(), "the session is still torn down");
+        assert!(app.tabs.is_empty());
+        assert!(
+            matches!(effect, Effect::Quit),
+            "closing the only session of an isolated run must quit, got {effect:?}"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_in_a_normal_run_does_not_quit() {
+        // The control half: without this, a fix that always quit on the last
+        // tab would pass the test above while breaking every normal run.
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let _handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        let effect = app
+            .dispatch(
+                Command::CloseAgentTab {
+                    action: Some(CloseAction::ForceTerminate),
+                },
+                &svc,
+            )
+            .unwrap();
+
+        assert!(app.tabs.is_empty());
+        assert!(
+            matches!(effect, Effect::Message(_)),
+            "a normal run stays open with no tabs, got {effect:?}"
+        );
     }
 
     // --- §26 / §24: manual status applied AND process state represented --
