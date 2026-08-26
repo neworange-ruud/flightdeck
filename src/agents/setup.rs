@@ -811,13 +811,27 @@ mod tests {
                 "/tmp/root/.flightdeck/runtime/status/claude/hooks/hooks.json",
             ))
             .expect("hooks.json written under the status root");
+        // Compare against the DECODED command, not the raw file text, and
+        // derive the expected path with the same `Path::join` the code uses.
+        // Both matter for cross-platform parity: on Windows `join` yields
+        // backslashes, and JSON escapes each one as `\\`, so a raw
+        // `contains` of either a forward-slash literal or a native path string
+        // fails there while the hook is perfectly correct.
+        let doc: serde_json::Value = serde_json::from_str(&hooks)
+            .unwrap_or_else(|e| panic!("the templated hooks must be valid JSON: {e}: {hooks}"));
+        let expected = Path::new("/tmp/root")
+            .join(".flightdeck")
+            .join("agent-status")
+            .to_string_lossy()
+            .to_string();
+        let stop = doc["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Stop hook command missing: {hooks}"));
         assert!(
-            hooks.contains("/tmp/root/.flightdeck/agent-status"),
-            "hook bodies must carry the absolute status path, not a cwd-relative one: {hooks}"
-        );
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&hooks).is_ok(),
-            "the templated hooks must still be valid JSON: {hooks}"
+            stop.contains(&expected),
+            "hook bodies must carry the absolute status path, not a cwd-relative one.\n\
+             expected to find: {expected}\n\
+             in command: {stop}"
         );
     }
 
