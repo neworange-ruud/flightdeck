@@ -191,12 +191,37 @@ embedded in JSON (Claude) or a TOML `--config hooks.…` override (Codex).
 Templating an absolute path into them means two layers of escaping, and a
 Windows path brings backslashes into both. This is the most likely thing in
 this design to break. It is squarely `flightdeck-cross-platform-parity`
-territory and must be tested on Windows, not reasoned about. **As of this
-writing it has not been** — the implementation work happened on Linux, and
-the escaping is argued correct by construction (the `serde_json`/`toml`
-serializers own the escaping, not hand-rolled string work) but has not been
-exercised on an actual Windows machine or CI runner. This stays open until
-someone does.
+territory and had to be tested on Windows rather than reasoned about.
+
+**It has been, on 2026-08-26**, on a Windows VM, and the outcome is that the
+single-quoting is not merely safe there — it is *required*:
+
+- Claude Code on Windows executes `hooks.json` commands through **Git Bash**
+  (MSYS `bash`). Established empirically by firing a real `SessionStart` hook
+  whose body reported its own interpreter: `$0` = `/usr/bin/bash`, `uname` =
+  `MINGW64_NT-… Msys`, and `%COMSPEC%` came back *unexpanded*, which rules out
+  `cmd.exe`. So `printf` exists and the mechanism works.
+- A single-quoted absolute Windows path appends correctly — with backslashes or
+  forward slashes, and with a space in the path, which is where quoting usually
+  fails. Verified standalone in `sh` and end-to-end through the live hook.
+- An **unquoted** backslash path is destroyed: Git Bash consumes the
+  backslashes as escapes and writes a file literally named
+  `CUsersSanderLanghorst…diag.log` in the cwd. `shell_quote`'s single-quoting
+  is therefore load-bearing on Windows, not defensive.
+
+One Windows limitation remains, and it is **pre-existing and orthogonal to
+this design**: with no Git for Windows installed, Claude Code falls back to
+PowerShell, where `printf` does not exist. Both the current body and the
+cwd-relative `[ -d .flightdeck ] && printf …` form that preceded isolated mode
+fail there identically, and both exit 0, so the failure is silent either way.
+Closing that gap means not using a shell string at all — an exec-form argument
+array, or a small cross-platform writer — which is separate work from anything
+isolated mode does.
+
+Codex is unverified: it was not installed on the VM. It shares the same
+`shell_quote`/`codex_hook_override` one-liner, so the path-form result should
+carry over if Codex also shells out through Git Bash, but which shell it uses
+on Windows has not been established.
 
 ### 8.2 Exception: containerized runs
 
