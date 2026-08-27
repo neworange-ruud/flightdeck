@@ -1,59 +1,56 @@
-import { reduce } from "./state/reducer";
-import { createInitialState } from "./state/types";
+import { fixtureSnapshot } from "./state/fixture";
+import { fixtureTerminalBytes } from "./state/fixtureBytes";
+import { createApp } from "./ui/app";
 import { mountTerminal } from "./term/terminal";
+import type { TerminalMount } from "./ui/terminalStage";
 
 /**
- * Scaffold entry point. There is no server connection here yet — that is
- * `src/web/server.rs` (a separate task) plus this app's own websocket client
- * (also not yet written). This file exists to prove three things wire
- * together: the reducer, the palette/font stylesheets, and an xterm.js
- * instance that respects D4 (host-owned, letterboxed, no `FitAddon`).
+ * Entry point for the main screen (artboards 1a/1b/1c).
  *
- * remote-control-sk4u replaces this with the real main screen against
- * artboards 1a/1b/1c.
+ * Everything below the fold is fixture-driven: there is no websocket in this
+ * task. `remote-control-hgqy` replaces the three fixture lines at the bottom
+ * with a socket that dispatches the same actions — `snapshot/received` from
+ * `ServerMsg::Snapshot`, `connection/changed` from the transport — and swaps
+ * the `mount` below for one that pipes `ServerMsg::Delta` into `term.write`.
+ * The components never learn the difference.
  */
 
-let state = createInitialState();
-
-const app = document.querySelector<HTMLDivElement>("#app");
-if (!app) {
+const root = document.querySelector<HTMLDivElement>("#app");
+if (root === null) {
   throw new Error("#app mount point missing from index.html");
 }
 
-const status = document.createElement("div");
-status.className = "fd-status-line";
-status.style.padding = "8px 12px";
-status.style.fontSize = "var(--fd-t-meta)";
-status.style.color = "var(--fd-text-quiet)";
-status.style.letterSpacing = ".08em";
-status.style.textTransform = "uppercase";
+/**
+ * D4: construct xterm with the host's grid and letterbox it. `FitAddon` is
+ * absent by design — see `src/term/terminal.ts`.
+ */
+const mount: TerminalMount = (container, geometry, terminalId) => {
+  const term = mountTerminal(container, geometry);
+  term.write(fixtureTerminalBytes(terminalId));
+  return () => term.dispose();
+};
 
-const stage = document.createElement("div");
-stage.className = "fd-term-stage";
-
-const mount = document.createElement("div");
-mount.className = "fd-term-mount";
-stage.append(mount);
-
-app.append(status, stage);
-
-// D4: this 120x34 stands in for the host's real geometry until
-// ServerMsg::Snapshot exists (D12). It is never fitted to the container.
-state = reduce(state, {
-  type: "geometry/set",
-  geometry: { cols: 120, rows: 34 },
+const app = createApp({
+  mount,
+  /**
+   * D3: a selection made here is the whole instance's selection, the desktop
+   * included. There is no socket yet, so this is where the `ClientMsg::Command`
+   * frame goes — announced rather than silently dropped, so nobody mistakes the
+   * fixture for a working remote control.
+   */
+  onDispatch: (action) => {
+    if (action.type.startsWith("selection/")) {
+      console.info(
+        "[fixture] selection changed locally; ClientMsg::Command { select } goes here (D3)",
+        action,
+      );
+    }
+  },
 });
 
-if (state.geometry) {
-  mountTerminal(mount, state.geometry);
-}
+root.append(app.el);
 
-state = reduce(state, { type: "connection/changed", status: "connected" });
-
-function renderStatus(): void {
-  const geometry = state.geometry;
-  const grid = geometry ? `${geometry.cols}×${geometry.rows}` : "—";
-  status.textContent = `${state.connection} · ${grid} · host owns geometry`;
-}
-
-renderStatus();
+app.store.dispatch({ type: "snapshot/received", snapshot: fixtureSnapshot() });
+app.store.dispatch({ type: "connection/changed", status: "connected" });
+/** 1a is drawn in Terminal mode, so that is the state the fixture shows. */
+app.store.dispatch({ type: "mode/set", mode: "terminal" });

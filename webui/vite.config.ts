@@ -16,9 +16,14 @@ const keepDistTracked = {
 } as const;
 
 // Single Vite config doubling as the vitest config (the `vitest/config` triple-
-// slash reference above augments `UserConfig` with the `test` key). D15 only
-// asks for `vitest` on the reducer, so the test environment stays plain
-// `node` — no jsdom, because the reducer and its tests never touch the DOM.
+// slash reference above augments `UserConfig` with the `test` key).
+//
+// The default environment stays plain `node`: the reducer, the status
+// vocabulary, the `Esc Esc` timing and the palette guard are all pure and gain
+// nothing from a DOM. The component tests, which render the seven regions of
+// artboard 1a and assert on real elements, opt into `jsdom` per file with a
+// `@vitest-environment jsdom` docblock — so a DOM is available where the design
+// has to be checked, and absent everywhere it would only slow the suite down.
 export default defineConfig({
   plugins: [keepDistTracked],
   // `rust-embed` walks this directory at Rust compile time (src/web/assets.rs)

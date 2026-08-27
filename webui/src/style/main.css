@@ -1,0 +1,649 @@
+/*
+ * FlightDeck Web — the main screen (artboards 1a Terminal mode, 1b App mode,
+ * 1c split view).
+ *
+ * THE TWO RULES THIS FILE IS UNDER, both enforced by
+ * src/ui/tokens.guard.test.ts:
+ *
+ *   1. No colour literal. Every colour is `var(--fd-*)` from tokens.css, or a
+ *      `color-mix()` OF those tokens where the artboard used a wash or an
+ *      overlay. A mix of named tokens still says which token it means; a hex
+ *      value says nothing and drifts silently when the palette moves.
+ *   2. Four type sizes, from `--fd-t-meta | -body | -title | -code`. Turn 2
+ *      collapsed turn 1's seven; a raw `px` font-size here is a fifth size and
+ *      a bug (2g).
+ *
+ * Where the artboards used a value the palette does not name — the logo band's
+ * gradient, the selected-row wash, the App-mode dimmed tab fills, the split
+ * view's inactive column header — the mix percentage is chosen to land on the
+ * artboard's pixel value while keeping the *token* as the subject. Those are
+ * listed as findings in the task report; they are not new literals.
+ */
+
+/* ── The frame ─────────────────────────────────────────────────────────────
+ * `data-mode` (terminal | app) and `data-layout` (single | split) on this one
+ * element drive every mode-dependent rule below, so 1a→1b is a state change,
+ * not a second stylesheet. */
+.fd-frame {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--fd-ground);
+  color: var(--fd-text);
+  font-size: var(--fd-t-body);
+  line-height: 1.5;
+}
+
+/* ── Tones: a status's meaning, not its colour ───────────────────────────── */
+.fd-tone-accent {
+  color: var(--fd-accent);
+}
+.fd-tone-ok {
+  color: var(--fd-ok);
+}
+.fd-tone-alert {
+  color: var(--fd-alert);
+}
+.fd-tone-quiet {
+  color: var(--fd-text-quiet);
+}
+.fd-tone-focus {
+  color: var(--fd-focus);
+}
+.fd-tone-elsewhere {
+  color: var(--fd-elsewhere);
+}
+.fd-tone-info {
+  color: var(--fd-info);
+}
+/* "still true a moment ago" — reconnecting, revoked, a stale terminal. */
+.fd-tone-stale {
+  color: var(--fd-stale);
+}
+
+/* Decoration only. If deleting it would lose a fact, it must not use this. */
+.fd-decor {
+  color: var(--fd-text-decor);
+}
+.fd-sep {
+  color: var(--fd-sep);
+  padding: 0 0.3em;
+}
+
+.fd-glyph {
+  flex: none;
+}
+/* 1a draws the working glyph as `{{ spinner }}` with `animation: fdPulse`. */
+.fd-glyph--spinner {
+  animation: fd-pulse 1s ease-in-out infinite;
+}
+@keyframes fd-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-glyph--spinner {
+    animation: none;
+  }
+}
+
+/* D16: a desktop-only action stays visible and says so. */
+.fd-badge-host {
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fd-text-quiet);
+  border: 1px solid var(--fd-rule);
+  padding: 0 0.4em;
+  margin-left: 0.6em;
+}
+
+/* ── Region 1: logo band ─────────────────────────────────────────────────── */
+.fd-logo {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--fd-rule);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--fd-accent) 18%, transparent),
+    color-mix(in srgb, var(--fd-accent) 2%, transparent) 26%,
+    color-mix(in srgb, var(--fd-accent) 2%, transparent) 74%,
+    color-mix(in srgb, var(--fd-accent) 18%, transparent)
+  );
+}
+/* 1b: the band's edges take the "another actor" hue while FlightDeck, not the
+ * agent, is holding the keyboard. */
+.fd-frame[data-mode="app"] .fd-logo {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--fd-elsewhere) 16%, transparent),
+    color-mix(in srgb, var(--fd-accent) 2%, transparent) 26%,
+    color-mix(in srgb, var(--fd-accent) 2%, transparent) 74%,
+    color-mix(in srgb, var(--fd-elsewhere) 16%, transparent)
+  );
+}
+.fd-logo__ramp {
+  color: var(--fd-accent);
+  opacity: 0.55;
+  letter-spacing: -0.5px;
+}
+.fd-logo__word {
+  color: var(--fd-accent);
+  font-weight: 700;
+  letter-spacing: 0.42em;
+}
+
+/* ── Region 2: project tab row ───────────────────────────────────────────── */
+.fd-projects {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+}
+.fd-project {
+  display: flex;
+  align-items: center;
+}
+.fd-project__select,
+.fd-project__close,
+.fd-tab__label,
+.fd-tab__close,
+.fd-session__select,
+.fd-session__close,
+.fd-action {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+}
+.fd-project__select {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  height: 100%;
+  color: var(--fd-text-muted);
+}
+.fd-project[data-selected="true"] {
+  background: var(--fd-tui-tab);
+  box-shadow: inset 0 -2px 0 var(--fd-accent);
+}
+.fd-frame[data-mode="app"] .fd-project[data-selected="true"] {
+  box-shadow: inset 0 -2px 0 var(--fd-elsewhere);
+}
+.fd-project[data-selected="true"] .fd-project__select {
+  color: var(--fd-text);
+  font-weight: 500;
+}
+.fd-project__close {
+  color: var(--fd-alert);
+  opacity: 0.5;
+  padding-right: 10px;
+}
+.fd-project[data-selected="true"] .fd-project__close {
+  opacity: 0.8;
+}
+.fd-spacer {
+  flex: 1;
+}
+.fd-action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--fd-accent);
+}
+.fd-action[disabled] {
+  cursor: not-allowed;
+}
+.fd-action--new-agent {
+  margin: 4px 0;
+  background: var(--fd-ok);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-action--new-shell {
+  margin: 4px 0;
+  /* 1a's `+ shell` fill: a mid blue the palette does not name, expressed as
+   * the branch/`(global)` blue sunk into the canvas. */
+  background: color-mix(in srgb, var(--fd-info) 55%, var(--fd-canvas));
+  color: var(--fd-text);
+  font-weight: 500;
+}
+/* 1b dims the whole tab strip, including its two buttons, because none of them
+ * are what the keyboard is pointed at. */
+.fd-frame[data-mode="app"] .fd-tabs {
+  opacity: 0.5;
+}
+
+/* ── Region 3: agents sidebar ────────────────────────────────────────────── */
+.fd-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.fd-sidebar {
+  width: 300px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  /* 1a's sidebar sits between the frame ground and the recessed chrome. */
+  background: color-mix(in srgb, var(--fd-ground) 50%, var(--fd-chrome));
+  border-right: 1px solid var(--fd-rule);
+  /* 1a: the sidebar recedes while the terminal has the keyboard. */
+  opacity: 0.72;
+}
+.fd-frame[data-layout="split"] .fd-sidebar {
+  width: 220px;
+}
+/* 1b: the glow moves here, the receding stops, and the frame border is
+ * replaced by the same inset glow the viewport had. */
+.fd-frame[data-mode="app"] .fd-sidebar {
+  opacity: 1;
+  margin: 4px;
+  border-right: 0;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--fd-elsewhere) 90%, transparent),
+    0 0 26px -4px color-mix(in srgb, var(--fd-elsewhere) 40%, transparent);
+}
+.fd-sidebar__title {
+  height: 28px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fd-text-muted);
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  font-size: var(--fd-t-meta);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--fd-rule);
+}
+.fd-frame[data-mode="app"] .fd-sidebar__title {
+  color: var(--fd-text);
+}
+.fd-sessions {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.fd-session {
+  position: relative;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-session__select {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px 10px;
+}
+.fd-session[data-selected="true"] {
+  /* 1a's selected wash + the 2px inset bar, both in the selection hue. */
+  background: color-mix(in srgb, var(--fd-focus) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-focus);
+}
+.fd-frame[data-mode="app"] .fd-session[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-focus) 9%, transparent);
+}
+.fd-session__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.fd-session__caret {
+  color: var(--fd-focus);
+}
+/* Unselected rows keep the caret's *space* so six names stay on one x-axis. */
+.fd-session[data-selected="false"] .fd-session__caret {
+  visibility: hidden;
+}
+.fd-session__name {
+  flex: 1;
+  color: var(--fd-text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-session[data-selected="true"] .fd-session__name {
+  color: var(--fd-focus);
+  font-weight: 700;
+}
+.fd-session__agent,
+.fd-session__facts {
+  display: flex;
+  gap: 8px;
+  padding-left: 20px;
+  /* The agent's product name is a fact a user could act on wrongly (2g), so it
+   * sits on the lifted floor, never on --fd-text-decor. */
+  color: var(--fd-text-quiet);
+}
+.fd-frame[data-mode="app"] .fd-session__agent {
+  color: var(--fd-text-second);
+}
+.fd-session__starting {
+  padding-left: 20px;
+  color: var(--fd-text-quiet);
+  font-style: italic;
+}
+.fd-session__close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  color: var(--fd-alert);
+  opacity: 0.5;
+}
+.fd-session[data-selected="true"] .fd-session__close {
+  opacity: 0.8;
+}
+.fd-session__select:focus-visible,
+.fd-project__select:focus-visible,
+.fd-tab__label:focus-visible,
+.fd-action:focus-visible,
+.fd-session__close:focus-visible,
+.fd-tab__close:focus-visible,
+.fd-project__close:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+.fd-sidebar__foot {
+  flex: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--fd-rule-inner);
+  font-size: var(--fd-t-meta);
+  /* A session count is a count: 2g lists counts as decoration. */
+  color: var(--fd-text-decor);
+}
+.fd-frame[data-mode="app"] .fd-sidebar__foot {
+  color: var(--fd-text-second);
+}
+.fd-key {
+  /* Key names, per 2g. Not --fd-text-decor: the letters are the instruction. */
+  color: var(--fd-focus);
+}
+.fd-frame[data-mode="app"] .fd-sidebar__foot .fd-key {
+  color: var(--fd-elsewhere);
+}
+
+/* ── Region 4 + 5: the main pane ─────────────────────────────────────────── */
+.fd-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--fd-ground);
+  /* 1a: the focus glow, drawn as a real inset ring + bloom rather than the
+   * TUI's one-cell border. */
+  margin: 4px;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--fd-accent) 85%, transparent),
+    0 0 26px -4px color-mix(in srgb, var(--fd-accent) 40%, transparent);
+}
+/* 1b: the glow left; the pane goes back to being framed by a plain rule. */
+.fd-frame[data-mode="app"] .fd-main {
+  margin: 0;
+  border-left: 1px solid var(--fd-rule);
+  box-shadow: none;
+}
+.fd-tabs {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+}
+.fd-tab {
+  display: flex;
+  align-items: center;
+}
+.fd-tab__label {
+  padding: 0 12px;
+  height: 100%;
+  /* Inactive tab labels use the asleep tone: this text belongs to a terminal
+   * that is not the one you are looking at. */
+  color: var(--fd-term-asleep);
+}
+.fd-tab[data-selected="true"][data-kind="agent"] {
+  background: var(--fd-focus);
+}
+.fd-tab[data-selected="true"][data-kind="shell"] {
+  background: var(--fd-accent);
+}
+.fd-tab[data-selected="true"] .fd-tab__label {
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-tab[data-selected="true"] .fd-tab__close {
+  /* The ✕ on a bright tab: the alert hue sunk into the canvas so it stays
+   * legible against yellow instead of vibrating on it. */
+  color: color-mix(in srgb, var(--fd-alert) 50%, var(--fd-canvas));
+}
+.fd-tab__close {
+  color: var(--fd-alert);
+  opacity: 0.5;
+  padding-right: 8px;
+}
+/* 1b: an inactive-looking, drained version of the selected tab. */
+.fd-frame[data-mode="app"] .fd-tab[data-selected="true"][data-kind="agent"] {
+  background: color-mix(in srgb, var(--fd-focus) 22%, var(--fd-ground));
+}
+.fd-frame[data-mode="app"] .fd-tab[data-selected="true"] .fd-tab__label {
+  color: var(--fd-text-muted);
+  font-weight: 400;
+}
+
+/*
+ * D4, turn 2 — LETTERBOX, NEVER SCALE.
+ *
+ * The host owns cols/rows. The grid renders at its natural pixel size, centred
+ * on the terminal ground, and whatever is left over stays dark. That dark
+ * margin is the design; the `120×34 · host owns geometry` chip in the git bar
+ * is its explanation.
+ *
+ * Therefore, and this is the rule a future "make it fill the window" commit
+ * will try to break:
+ *   - no `transform: scale()` on the stage, the letterbox or the mount;
+ *   - no `width/height: 100%` on `.fd-mount`;
+ *   - no `FitAddon` anywhere in the app (see src/term/terminal.ts).
+ */
+.fd-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.fd-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: var(--fd-ground);
+}
+.fd-letterbox {
+  /* Natural size only — the host's grid decides how big this is. */
+  flex: none;
+  padding: 10px 14px;
+  color: var(--fd-text-soft);
+}
+/*
+ * 2d, asleep: an entire terminal renders in `--fd-term-asleep` (lifted to
+ * 5.6:1 precisely because a whole screen of text was the palette's least
+ * defensible dim value), with bold removed. xterm.js writes per-cell colours
+ * inline, so the two things that reach *inside* it are a saturation filter —
+ * "asleep desaturates cool" — and dropping the weight off its bold cells.
+ * Neither is a colour value; both are token-safe.
+ */
+.fd-pane[data-tone="asleep"] .fd-letterbox {
+  color: var(--fd-term-asleep);
+  filter: saturate(0.16);
+}
+.fd-pane[data-tone="asleep"] .xterm-bold {
+  font-weight: 400;
+}
+.fd-pane__foot {
+  flex: none;
+  padding: 6px 14px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-second);
+}
+.fd-pane__foot .fd-key {
+  color: var(--fd-elsewhere);
+}
+.fd-pane[data-tone="live"] .fd-pane__foot {
+  display: none;
+}
+
+/* ── 1c: split view ──────────────────────────────────────────────────────── */
+.fd-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 1px;
+  padding: 4px;
+  background: var(--fd-rule);
+}
+.fd-column {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--fd-ground);
+}
+.fd-column[data-focused="true"] {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--fd-accent) 85%, transparent),
+    0 0 22px -6px color-mix(in srgb, var(--fd-accent) 40%, transparent);
+}
+.fd-column__label {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  /* Inactive column header: the shell-tab blue sunk into the ground. */
+  background: color-mix(in srgb, var(--fd-accent) 22%, var(--fd-ground));
+  color: var(--fd-text-muted);
+}
+.fd-column[data-focused="true"] .fd-column__label {
+  background: var(--fd-focus);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-column__index {
+  /* "2/3" — a count, so decoration by 2g's own list. */
+  color: var(--fd-text-decor);
+}
+.fd-column[data-focused="true"] .fd-column__index {
+  color: var(--fd-ground);
+  opacity: 0.7;
+}
+
+/* ── Region 6: git info bar ──────────────────────────────────────────────── */
+.fd-gitbar {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+}
+.fd-gitbar__branch {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+/*
+ * D4: not decoration. This chip is the honest answer to "why does my 4K window
+ * have dark margins?", so it is a fact and sits on the lifted floor.
+ */
+.fd-geometry {
+  margin-left: auto;
+  color: var(--fd-text-quiet);
+}
+
+/* ── Region 7: status bar ────────────────────────────────────────────────── */
+.fd-statusbar {
+  height: 32px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-canvas);
+}
+.fd-mode {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--fd-ground);
+  background: var(--fd-focus);
+}
+.fd-mode[data-tone="app"] {
+  background: var(--fd-elsewhere);
+}
+/* §5.1: any state that costs the user control drains the chip, because the
+ * mode is a lie while input is not arriving. Amber: "still true a moment ago". */
+.fd-mode[data-tone="drained"] {
+  background: var(--fd-stale);
+}
+.fd-hint {
+  color: var(--fd-text-muted);
+}
+.fd-conn,
+.fd-viewers {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fd-text-second);
+}
+/* The round-trip time and the viewer breakdown are both facts about whether
+ * you can trust what you are looking at, so neither is --fd-text-decor. */
+.fd-conn__latency,
+.fd-viewers__detail {
+  color: var(--fd-text-quiet);
+}
+/* 1a butts this chip against the viewer count at the frame's right edge — the
+ * flexible spacer earlier in the bar is what pushes the whole group over, so
+ * this must NOT add a second `margin-left: auto` or the group splits apart. */
+.fd-update {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  background: var(--fd-focus);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-statusbar__pad {
+  padding-right: 14px;
+}
