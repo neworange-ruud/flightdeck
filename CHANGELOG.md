@@ -50,6 +50,31 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   Ctrl-q. See SPECS §32.
 - **F1 (or Alt-h) opens help, anywhere.** Both open the help / keybindings panel in App and Terminal focus, so help is reachable without leaving the terminal first. Pressing the same key again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 and Alt-h are claimed — modified F1 and a bare `h` still reach the agent. Two keys because Apple keyboards reserve F1 as a brightness key unless standard function keys are enabled, while `Alt-h` needs "Use Option as Meta key" on macOS — the same requirement `Alt-o` already carries. `Ctrl-g` → *Show Help* works unconditionally on every platform.
 
+- **FlightDeck Web: a browser control surface for the running instance.** A web
+  server embedded in the desktop binary serves a full-fidelity browser remote
+  control — every project, session, status and git bar the TUI sees, real
+  terminals rendered by xterm.js from the actual PTY byte stream, and keystrokes
+  back into the focused terminal, so a waiting agent can be unblocked from a
+  phone or a second laptop. Start it from the palette (`Start Web Interface` /
+  `Stop Web Interface`) or set `[web] enabled = true` to have it on every launch.
+  It binds `127.0.0.1` by default; a routable bind is an explicit opt-in that
+  says so when the server starts. Access is a short code shown on the desktop,
+  exchanged once for a per-browser cookie that survives restarts and can be
+  revoked or rotated — the code arrives in the URL fragment, so it never reaches
+  a request line or a log, and only a hash of the token is ever written to disk.
+  One browser drives at a time; a second is offered a takeover or can watch
+  read-only, and both surfaces show which seats are taken. The browser
+  letterboxes the host's terminal grid rather than scaling it, with a chip in the
+  git bar naming the geometry, because crisp type is the one thing a browser does
+  better than a terminal and upscaling a bitmap grid would throw it away. A
+  reconnecting tab resumes from a byte cursor and says plainly when it missed
+  output rather than pretending continuity, keystrokes typed while reconnecting
+  are held and delivered in order instead of being dropped, and an activity feed
+  keeps the last 200 status transitions (or 24 hours) so a freshly opened tab
+  lands on history rather than silence. Dark-only, keyboard-first, and no relay
+  involved: reaching it from outside your network is deliberately your own choice
+  of Tailscale, `ssh -L` or a tunnel.
+
 ### Improvements
 
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
@@ -67,6 +92,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   countdown, the spacers, the "Esc to close" hint and finally the border step
   aside in that order, which lands a full QR in a 30-row window. When it truly
   cannot fit, the note names the size the QR needs and the size you have.
+
+- **Both remote transports now share one async runtime.** The relay client that
+  drives the iOS companion moved from a blocking socket to `tokio-tungstenite` on
+  the same runtime the web server uses, so the desktop has one async world
+  instead of two. Its public behaviour is unchanged — the same backoff, pings,
+  liveness deadline and resume-from-cursor — but it stops waking roughly ten
+  times a second on an idle link. Windows keeps its own TLS path, and the
+  released Windows binary stays free of a C toolchain.
 
 ### Bug fixes
 
@@ -104,6 +137,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - A crash no longer leaves your shell printing mouse movement as escape
   sequences: mouse capture, bracketed paste, and keyboard flags are restored on
   the panic path as well as on a clean exit.
+
+- **The desktop no longer feeds a phone that is not listening.** "Phone
+  connected" was asserted once by the relay and never re-checked, so a link that
+  died half-open — the normal case when iOS suspends the app — left the desktop
+  shipping updates into the void indefinitely while showing no problem at all. In
+  one observed case that ran for 17 days and 33,000 messages. Presence is now
+  earned from the phone's own acknowledgements: silence counts only while
+  something is actually owed, so a connected phone with nothing to acknowledge is
+  never wrongly written off, and a phone whose messages the relay is rejecting is
+  told apart from one that is gone. Fixing it required the relay to start
+  forwarding those acknowledgements at all, which it never had — so the relay
+  must be updated alongside this release for the check to arm. Against an older
+  relay the desktop behaves exactly as before rather than declaring every phone
+  dark.
+- **A first `wss://` connection could crash the desktop.** A dependency change
+  left the TLS stack with no crypto provider selected, which would have panicked
+  on the first secure relay connection on macOS and Linux. Found while porting
+  the transport; fixed before it shipped.
 
 ### Breaking changes
 
