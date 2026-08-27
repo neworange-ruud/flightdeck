@@ -8,7 +8,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- Collapse FlightDeck's chrome in small windows while in terminal focus: the
+  project tab row and git info bar hide and the agents sidebar shrinks to a
+  one-glyph strip, giving the agent three more rows and 25 more columns.
+  Switching to app mode restores everything.
 
 ### Improvements
 
@@ -16,7 +19,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- Stop FlightDeck dying when the window is resized while an agent is printing
+  emoji or CJK text. Narrowing the window can cut a double-width character in
+  half, which the terminal parser cannot survive — and the crash took the whole
+  app down, every project and every pane with it. The parser is now contained per
+  pane: the affected pane clears, the agent repaints it, and everything else
+  keeps running. That one pane loses its scrollback, which is the price of not
+  losing the session.
+- Hold each terminal's grid at a floor of 4 rows by 20 columns. The same parser
+  panics outright on a grid a single column wide or a single row tall, so in a
+  very small window the agent's view is now clipped rather than shrunk past that
+  point.
+- A crash no longer leaves your shell printing mouse movement as escape
+  sequences: mouse capture, bracketed paste, and keyboard flags are restored on
+  the panic path as well as on a clean exit.
 
 ## [1.16.0] - 2026-08-24
 

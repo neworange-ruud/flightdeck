@@ -276,6 +276,11 @@ terminals.
   drift, and the base branch. It reflects the tab's worktree regardless of
   whether the agent or a shell is focused.
 
+Below roughly 108 columns or 32 rows, terminal focus hides the project tab
+row and git info bar and shrinks the sidebar to a one-glyph strip per agent,
+handing those rows and columns to the terminal. App focus always shows the
+full chrome — that is how you get the hidden bars back.
+
 ## Multiple projects
 
 FlightDeck can run several project folders at once. The folder you launch from
