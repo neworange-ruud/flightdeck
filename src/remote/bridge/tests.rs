@@ -1231,3 +1231,546 @@ fn deferred_pty_writes_fire_only_once_due() {
     // Already drained — a later poll yields nothing.
     assert!(b.take_due_deferred_pty(2_000).is_empty());
 }
+
+// --- ack-based peer liveness (remote-control-5qu) --------------------------
+//
+// GROUND TRUTH these tests encode, from the user's own `~/.flightdeck/remote.json`
+// (2026-08-05, confirmed still degrading 2026-08-21):
+//
+//     pair_0009_73faf508bbca
+//       last_sent_seq        23943 -> 32985     (+9042 in 17 days)
+//       last_acked_by_peer       0 ->     0     <-- never advanced
+//       last_received_seq        0 ->     0     <-- never advanced
+//
+// The desktop→relay socket was ESTABLISHED the whole time and the link indicator
+// (driven by the relay `pong`) showed healthy, because liveness was measured on
+// the desktop↔RELAY hop while the failure was on the relay↔PHONE hop. `peer_present`
+// latched `true` from a single presence frame and nothing could clear it — the
+// relay deliberately sends no `Disconnected` for a superseded leg — so the
+// per-tick feed sealed and shipped ~33,000 envelopes into the void.
+
+/// A [`RemoteState`] carrying one pairing, so a test can assert in the same
+/// counters the bug report used.
+fn recording_state(pairing_id: &str) -> crate::remote::RemoteState {
+    let mut st = crate::remote::RemoteState::default();
+    st.pairings
+        .push(crate::remote::Pairing::new(pairing_id.to_string()));
+    st
+}
+
+/// Tick the bridge and mirror every sealed envelope into `st` exactly as
+/// `client::handle_outbound` does (monotonic `last_sent_seq` bump on a successful
+/// send, nothing else). Returns how many envelopes this tick put on the wire.
+///
+/// This is what lets the assertions read `last_sent_seq` / `last_acked_by_peer`:
+/// those cursors live in the relay client's persisted state, and the desktop's
+/// side of the reported failure is exactly "one climbing while the other never
+/// moves".
+fn tick_recording(
+    b: &mut RemoteBridge,
+    views: &[ProjectView<'_>],
+    now_ms: u64,
+    st: &mut crate::remote::RemoteState,
+) -> usize {
+    let mut sent = 0usize;
+    b.tick(views, now_ms, &mut |o| {
+        if let RemoteOutbound::SendEnvelope {
+            pairing_id, seq, ..
+        } = &o
+        {
+            sent += 1;
+            if let Some(p) = st.pairing_mut(pairing_id.as_str()) {
+                if *seq > p.last_sent_seq {
+                    p.last_sent_seq = *seq;
+                }
+            }
+        }
+    });
+    sent
+}
+
+/// A paired bridge whose phone is attached AND whose relay has proved it forwards
+/// peer acks — the relay echoes each activated pairing's stored ack cursor right
+/// after `auth_ok`, which for a phone that has confirmed nothing is `cursor: 0`.
+/// That echo arms the ack deadline without crediting the phone with anything.
+fn paired_bridge_with_ack_capable_relay() -> RemoteBridge {
+    let mut b = paired_bridge();
+    b.handle_inbound(RemoteInbound::PeerAck {
+        pairing_id: PairingId::new("pair-1"),
+        cursor: 0,
+    });
+    b
+}
+
+/// Deliver the phone's cumulative ack for everything sealed so far, as the relay
+/// now forwards it.
+fn ack_through(b: &mut RemoteBridge, cursor: u64) {
+    b.handle_inbound(RemoteInbound::PeerAck {
+        pairing_id: PairingId::new("pair-1"),
+        cursor,
+    });
+}
+
+#[test]
+fn a_phone_that_never_acks_stops_being_fed_and_reports_a_dark_peer() {
+    // THE REPORTED FAILURE. Presence says `Connected`, the desktop seals a
+    // status_update every tick (a Working session's running-time changes every
+    // second — the real 1/second spam), and no ack ever comes back. The desktop
+    // must stop feeding within a bounded time and must report the peer as not
+    // live, WITHOUT needing a presence frame from the relay.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    // While the peer is presumed live the feed runs and `last_sent_seq` climbs,
+    // exactly as it did on the user's machine.
+    let mut now = 1_000u64;
+    for _ in 0..10 {
+        let views = vec![view("proj", &app, &cache)];
+        assert!(
+            tick_recording(&mut b, &views, now, &mut st) > 0,
+            "the per-tick feed should still be running at {now}ms"
+        );
+        now += 1_000;
+    }
+    let climbed_to = st.pairing("pair-1").unwrap().last_sent_seq;
+    assert!(
+        climbed_to >= 10,
+        "last_sent_seq should have climbed, got {climbed_to}"
+    );
+    assert_eq!(
+        st.pairing("pair-1").unwrap().last_acked_by_peer,
+        0,
+        "no ack ever arrives in this scenario — that is the whole point"
+    );
+    assert_eq!(
+        b.peer_liveness(),
+        PeerLiveness::Live,
+        "inside the ack window the phone is still given the benefit of the doubt"
+    );
+
+    // Run past the ack deadline. No presence frame, no Disconnected, nothing from
+    // the relay — just silence from the phone.
+    now = 1_000 + PEER_ACK_TIMEOUT_MS + 1_000;
+    let views = vec![view("proj", &app, &cache)];
+    tick_recording(&mut b, &views, now, &mut st);
+    assert_eq!(
+        b.peer_liveness(),
+        PeerLiveness::Dark,
+        "a phone that never acks must stop counting as present"
+    );
+
+    // And the feed is off: the cursor stops climbing no matter how long this runs.
+    let frozen = st.pairing("pair-1").unwrap().last_sent_seq;
+    for _ in 0..30 {
+        now += 1_000;
+        set_status(&mut app, 0, InterpretedStatus::Working);
+        let views = vec![view("proj", &app, &cache)];
+        assert_eq!(
+            tick_recording(&mut b, &views, now, &mut st),
+            0,
+            "nothing may be sealed into the void once the peer is dark"
+        );
+    }
+    assert_eq!(
+        st.pairing("pair-1").unwrap().last_sent_seq,
+        frozen,
+        "last_sent_seq must stop climbing — it reached 33,000 in the report"
+    );
+    assert_eq!(st.pairing("pair-1").unwrap().last_acked_by_peer, 0);
+}
+
+#[test]
+fn a_quiet_phone_with_nothing_to_ack_is_never_declared_dark() {
+    // The other half of the contract: "no news" is only evidence when something
+    // is owed. A connected phone that has acked everything (or has been sent
+    // nothing at all) must stay present for as long as the desktop is idle —
+    // hours of it — or this guard would be worse than the bug.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    // An Idle session: the first tick sends a snapshot, then there is no delta.
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+
+    let views = vec![view("proj", &app, &cache)];
+    let n = tick_recording(&mut b, &views, 1_000, &mut st);
+    assert!(n > 0, "the first tick sends the snapshot");
+    // The phone acks that snapshot and then everything goes quiet.
+    ack_through(&mut b, st.pairing("pair-1").unwrap().last_sent_seq);
+
+    let mut now = 2_000u64;
+    for _ in 0..12 {
+        // Twelve minutes of an idle desktop — twelve times the ack window.
+        now += PEER_ACK_TIMEOUT_MS;
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+        assert_eq!(
+            b.peer_liveness(),
+            PeerLiveness::Live,
+            "a phone with nothing outstanding must never be declared dark (at {now}ms)"
+        );
+    }
+}
+
+#[test]
+fn a_phone_that_acks_then_stops_goes_dark_after_the_window() {
+    // The degradation the user actually described: it works for a while, then
+    // stops. Acks flow, then dry up while the feed keeps producing.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    // A healthy phone: every tick is acked. It never goes dark, however long.
+    let mut now = 1_000u64;
+    for _ in 0..90 {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+        ack_through(&mut b, st.pairing("pair-1").unwrap().last_sent_seq);
+        assert_eq!(b.peer_liveness(), PeerLiveness::Live);
+        now += 1_000;
+    }
+    let healthy_sent = st.pairing("pair-1").unwrap().last_sent_seq;
+    assert!(healthy_sent >= 90, "a healthy phone keeps being fed");
+
+    // The acks stop (the phone suspends / its socket goes half-open). One ack
+    // window later the desktop must notice on its own.
+    let stopped_at = now;
+    while now < stopped_at + PEER_ACK_TIMEOUT_MS {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+        assert_eq!(
+            b.peer_liveness(),
+            PeerLiveness::Live,
+            "inside the window the phone is not condemned yet"
+        );
+        now += 5_000;
+    }
+    let views = vec![view("proj", &app, &cache)];
+    tick_recording(&mut b, &views, now + 1_000, &mut st);
+    assert_eq!(b.peer_liveness(), PeerLiveness::Dark);
+}
+
+#[test]
+fn a_phone_declared_dark_recovers_and_gets_a_fresh_snapshot_on_reattach() {
+    // Recovery must not need a re-pair. When the phone comes back the relay
+    // announces its presence on attach; that both revives the feed and re-arms a
+    // full snapshot, because `status_update` deltas can only mutate sessions the
+    // phone already knows (remote-control-e9l).
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, 1_000, &mut st);
+    }
+    let mut now = 1_000 + PEER_ACK_TIMEOUT_MS + 1_000;
+    {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+    }
+    assert_eq!(b.peer_liveness(), PeerLiveness::Dark);
+
+    // The session set changes while the phone is dark, so a delta could never
+    // repair its view.
+    app = app_with_tabs(vec![tab_state("t2", "fix-login-v2", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+
+    // The phone reattaches (superseding leg → `Connected`, no `Disconnected`).
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new("pair-1"),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
+    assert_eq!(
+        b.peer_liveness(),
+        PeerLiveness::Live,
+        "a reattaching phone gets a fresh chance"
+    );
+    now += 1_000;
+    let views = vec![view("proj", &app, &cache)];
+    let mut sent = Vec::new();
+    b.tick(&views, now, &mut |o| sent.push(o));
+    let msgs: Vec<DesktopToPhone> = sent.iter().map(decode).collect();
+    let snap = msgs
+        .iter()
+        .find_map(|m| match m {
+            DesktopToPhone::Snapshot(s) => Some(s),
+            _ => None,
+        })
+        .expect("a recovered phone must be resynchronised with a full snapshot");
+    assert_eq!(snap.projects[0].sessions[0].name, "fix-login-v2");
+}
+
+#[test]
+fn a_relay_that_never_forwards_peer_acks_leaves_the_guard_disarmed() {
+    // COMPATIBILITY, and the reason the guard is armed by evidence rather than by
+    // a build flag: the relay used to consume the phone's `ack` purely to trim its
+    // own queue and never forwarded it, so `last_acked_by_peer` was structurally
+    // pinned at 0 for every desktop in the field. Enforcing an ack deadline
+    // against such a relay would darken EVERY phone within a minute. Until the
+    // relay proves it forwards acks (by sending one — the post-`auth_ok` cursor
+    // echo does it even when the cursor is 0), the bridge must behave exactly as
+    // it did before.
+    let mut b = paired_bridge(); // no PeerAck ever
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    let mut now = 1_000u64;
+    for _ in 0..20 {
+        now += PEER_ACK_TIMEOUT_MS;
+        let views = vec![view("proj", &app, &cache)];
+        assert!(
+            tick_recording(&mut b, &views, now, &mut st) > 0,
+            "an un-upgraded relay must not change desktop behaviour"
+        );
+        assert_eq!(b.peer_liveness(), PeerLiveness::Live);
+    }
+}
+
+#[test]
+fn an_unacked_backlog_past_the_bound_darkens_the_peer_before_the_timeout() {
+    // The cheap guard the issue asks for regardless: never let the outbound
+    // stream run thousands of envelopes ahead of the peer's ack cursor. This
+    // catches a phone that reattaches often enough to keep resetting the ack
+    // window but never actually receives anything — the flapping-iOS shape.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    let mut now = 1_000u64;
+    let mut dark_at = None;
+    for _ in 0..(MAX_UNACKED_ENVELOPES + 50) {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+        if b.peer_liveness() == PeerLiveness::Dark {
+            dark_at = Some(now);
+            break;
+        }
+        // The phone keeps reattaching, so the CLOCK never condemns it: every
+        // `Connected` restarts the ack window (and re-arms the snapshot, which is
+        // remote-control-e9l's fix and must survive).
+        b.handle_inbound(RemoteInbound::Presence {
+            pairing_id: PairingId::new("pair-1"),
+            peer: Role::Phone,
+            state: flightdeck_remote_protocol::PresenceState::Connected,
+        });
+        now += 10; // far inside the ack window
+    }
+    let dark_at = dark_at.expect("the backlog bound must condemn a phone that never receives");
+    assert!(
+        dark_at - 1_000 < PEER_ACK_TIMEOUT_MS,
+        "this must trip on the backlog bound, not on the clock (at {dark_at}ms)"
+    );
+    let sent = st.pairing("pair-1").unwrap().last_sent_seq;
+    assert!(
+        sent <= MAX_UNACKED_ENVELOPES + 10,
+        "the stream must be stopped near the bound, not thousands past it (got {sent})"
+    );
+}
+
+#[test]
+fn a_relay_queue_overflow_advisory_darkens_the_peer_with_no_acks_at_all() {
+    // `rate_limited`/queue-overflow is the relay saying it is SHEDDING our
+    // un-acked envelopes because the peer has not drained ~1000 of them. Every
+    // already-deployed relay sends it, and the desktop used to swallow it as a
+    // non-fatal advisory and keep sealing. It is proof of a peer that is not
+    // consuming, so it applies even with the ack guard disarmed.
+    let mut b = paired_bridge(); // deliberately NOT ack-armed
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+    {
+        let views = vec![view("proj", &app, &cache)];
+        assert!(tick_recording(&mut b, &views, 1_000, &mut st) > 0);
+    }
+
+    b.handle_inbound(RemoteInbound::PeerBacklog {
+        pairing_id: PairingId::new("pair-1"),
+    });
+    assert_eq!(b.peer_liveness(), PeerLiveness::Dark);
+    let views = vec![view("proj", &app, &cache)];
+    assert_eq!(
+        tick_recording(&mut b, &views, 2_000, &mut st),
+        0,
+        "stop feeding a queue the relay is already shedding"
+    );
+
+    // An advisory for a pairing we are not feeding must not touch the live one.
+    let mut b2 = paired_bridge();
+    b2.handle_inbound(RemoteInbound::PeerBacklog {
+        pairing_id: PairingId::new("pair-other"),
+    });
+    assert_eq!(b2.peer_liveness(), PeerLiveness::Live);
+}
+
+#[test]
+fn the_relays_own_rejections_are_not_blamed_on_the_phone_but_only_so_often() {
+    // "No acks" has two causes and they are NOT the same failure: the phone is
+    // gone (remote-control-5qu), or the relay is rejecting our envelopes so the
+    // phone never sees them (remote-control-zv3, whose realign path is live in
+    // this same code). A realign is proof of the second, so it rebases the ack
+    // tracking onto the renumbered stream and grants a fresh window — otherwise
+    // the recovery snapshot zv3 arms would be blocked by this very guard and a
+    // recoverable stream would wedge again.
+    //
+    // Bounded, though: a stream that only ever realigns and never collects an ack
+    // is indistinguishable from a dead peer, so after MAX_REALIGN_CREDITS the
+    // deadline is allowed to stand.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+
+    let mut now = 1_000u64;
+    for credit in 0..MAX_REALIGN_CREDITS {
+        // Run out the ack window with the relay eating everything.
+        for _ in 0..3 {
+            let views = vec![view("proj", &app, &cache)];
+            tick_recording(&mut b, &views, now, &mut st);
+            now += PEER_ACK_TIMEOUT_MS / 2;
+        }
+        b.handle_inbound(RemoteInbound::SeqRealign {
+            pairing_id: PairingId::new("pair-1"),
+            next_seq: 98 + credit as u64,
+        });
+        assert_eq!(
+            b.peer_liveness(),
+            PeerLiveness::Live,
+            "a relay-side rejection is not the phone's fault (credit {credit})"
+        );
+        // The realigned stream is fed again, which is what lets zv3 recover.
+        let views = vec![view("proj", &app, &cache)];
+        assert!(
+            tick_recording(&mut b, &views, now, &mut st) > 0,
+            "a realigned stream must be allowed to send its recovery snapshot"
+        );
+    }
+
+    // Credits exhausted: the same silence now condemns the peer.
+    for _ in 0..3 {
+        now += PEER_ACK_TIMEOUT_MS;
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, now, &mut st);
+    }
+    b.handle_inbound(RemoteInbound::SeqRealign {
+        pairing_id: PairingId::new("pair-1"),
+        next_seq: 500,
+    });
+    let views = vec![view("proj", &app, &cache)];
+    tick_recording(&mut b, &views, now + PEER_ACK_TIMEOUT_MS, &mut st);
+    assert_eq!(
+        b.peer_liveness(),
+        PeerLiveness::Dark,
+        "an endlessly-realigning stream with no acks must still end up dark"
+    );
+
+    // A genuine ack restores the credits (a healthy stream realigns at most once).
+    ack_through(&mut b, st.pairing("pair-1").unwrap().last_sent_seq);
+    assert_eq!(b.peer_liveness(), PeerLiveness::Live);
+}
+
+#[test]
+fn an_inbound_envelope_is_evidence_the_phone_is_there() {
+    // A phone that is receiving but whose acks are lost (or whose relay does not
+    // forward them promptly) still talks to us: any inbound envelope revives the
+    // feed, without a presence frame. This is also what keeps the ungated
+    // event/transcript traffic working as a free liveness probe.
+    let mut b = paired_bridge_with_ack_capable_relay();
+    let mut st = recording_state("pair-1");
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+    {
+        let views = vec![view("proj", &app, &cache)];
+        tick_recording(&mut b, &views, 1_000, &mut st);
+        tick_recording(&mut b, &views, 1_000 + PEER_ACK_TIMEOUT_MS + 1, &mut st);
+    }
+    assert_eq!(b.peer_liveness(), PeerLiveness::Dark);
+
+    let cmd = PhoneCommand {
+        command_id: CommandId::new("c1"),
+        issued_at_ms: 1,
+        body: CommandBody::RequestSnapshot { project_id: None },
+    };
+    b.handle_inbound(RemoteInbound::Envelope(EncryptedEnvelope {
+        pairing_id: PairingId::new("pair-1"),
+        seq: 1,
+        sender: Role::Phone,
+        sent_at_ms: 1,
+        nonce: String::new(),
+        ciphertext: STANDARD.encode(serde_json::to_vec(&cmd).unwrap()),
+    }));
+    assert_eq!(
+        b.peer_liveness(),
+        PeerLiveness::Live,
+        "the phone just spoke to us; it is plainly there"
+    );
+}
+
+#[test]
+fn a_restart_does_not_blame_the_phone_for_the_previous_sessions_backlog() {
+    // At startup `install_channel` floors `out_seq` to the persisted
+    // `last_sent_seq` (remote-control-bbf). Those envelopes were sent by a
+    // previous process and may well have been acked before the restart, so they
+    // must not be counted as outstanding — otherwise a healthy phone is declared
+    // dark one ack-window after every launch, with nothing sent in between.
+    let mut b = RemoteBridge::passthrough(0);
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    b.install_channel(passthrough_seal(), passthrough_open(), 23_943);
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new("pair-1"),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
+    // The relay's post-auth echo: the phone has confirmed nothing it can prove.
+    b.handle_inbound(RemoteInbound::PeerAck {
+        pairing_id: PairingId::new("pair-1"),
+        cursor: 0,
+    });
+
+    let mut st = recording_state("pair-1");
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+    // The phone receives and acks the reconnect snapshot, then the desktop goes
+    // idle: nothing more is sent, so nothing is owed. The inherited 23,943 must
+    // not condemn the phone.
+    let mut top = 0;
+    for now in [1_000u64, 2_000] {
+        b.tick(&views, now, &mut |o| {
+            if let RemoteOutbound::SendEnvelope { seq, .. } = &o {
+                top = top.max(*seq);
+            }
+        });
+    }
+    assert!(
+        top > 23_943,
+        "the outbound stream continues above the resumed mark"
+    );
+    ack_through(&mut b, top);
+    for i in 1..6 {
+        let now = 2_000 + i * PEER_ACK_TIMEOUT_MS;
+        tick_recording(&mut b, &views, now, &mut st);
+        assert_eq!(
+            b.peer_liveness(),
+            PeerLiveness::Live,
+            "a resumed high-water mark is not an un-acked backlog (at {now}ms)"
+        );
+    }
+}

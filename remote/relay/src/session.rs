@@ -745,6 +745,22 @@ impl Connection {
         let role = self.role.expect("role set at hello");
         let handle = self.handle();
         for pairing in &activated {
+            // Hand this leg its OWN stream's ack position before anything else.
+            // Sent unconditionally, including the very common `cursor: 0`, for two
+            // reasons (remote-control-5qu): it is reconnect catch-up for a cursor
+            // the endpoint does not persist reliably, and — because a relay built
+            // before this change never sends an unsolicited ack — receiving one at
+            // all is how an endpoint learns that THIS relay forwards peer acks and
+            // that an ack-based liveness deadline is therefore safe to enforce.
+            // Without that signal a desktop could not distinguish "my phone has
+            // acked nothing" from "this relay never relays acks", and enforcing a
+            // deadline against an older relay would declare every phone dark.
+            let ack_cursor = self.state.store.ack_cursor(pairing, role).await;
+            self.send(RelayFrame::Ack {
+                pairing_id: pairing.clone(),
+                cursor: ack_cursor,
+            })
+            .await;
             let peer = self.state.registry.attach(pairing, role, handle.clone());
             tracing::info!(
                 conn = %self.connection_id, pairing = ?pairing, role = ?role,
@@ -1095,6 +1111,29 @@ impl Connection {
             .store
             .ack(&pairing_id, peer_role(role), cursor)
             .await;
+        // FORWARD it to that peer. The frame is documented as travelling in both
+        // directions and the sender needs it — it is the only end-to-end evidence
+        // that its envelopes are actually being received — but the relay used to
+        // consume it purely to trim its own queue. With nothing coming back, the
+        // desktop's `last_acked_by_peer` was structurally pinned at 0 no matter
+        // what the phone did, so it could not tell a receiving phone from a dark
+        // one and fed a dead pairing 33,000 envelopes over 17 days
+        // (remote-control-5qu). Non-blocking, exactly like the envelope forward
+        // in `deliver_or_push`: a stuck peer must never back-pressure this leg,
+        // and a dropped ack costs nothing (the next one is cumulative, and the
+        // cursor is re-sent on the peer's next auth).
+        if let Some(peer) = self.state.registry.peer(&pairing_id, role) {
+            let outcome = peer.try_send(RelayFrame::Ack {
+                pairing_id: pairing_id.clone(),
+                cursor,
+            });
+            if outcome != TrySendOutcome::Sent {
+                tracing::info!(
+                    conn = %self.connection_id, pairing = ?pairing_id, role = ?role,
+                    ?outcome, cursor, "DIAG peer ack not forwarded; next ack or auth will carry it"
+                );
+            }
+        }
         Flow::Continue
     }
 

@@ -183,6 +183,16 @@ pub trait RelayStore: Send + Sync {
     /// Prune the `sender` stream of `pairing` up to and including `cursor`.
     async fn ack(&self, pairing: &PairingId, sender: Role, cursor: u64);
 
+    /// The `sender` stream's current cumulative ack cursor — how much of what
+    /// `sender` sent its peer has confirmed. 0 for an unknown stream, and 0 is a
+    /// meaningful answer ("nothing acked yet"), not an error.
+    ///
+    /// Read when a leg authenticates, so the relay can hand the endpoint its own
+    /// stream's ack position (remote-control-5qu): a desktop otherwise has no way
+    /// to learn that the phone has confirmed nothing, and fed a dark phone for 17
+    /// days behind a healthy-looking relay link.
+    async fn ack_cursor(&self, pairing: &PairingId, sender: Role) -> u64;
+
     /// Store/refresh a pairing's APNs push token (opaque; never encrypted).
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment);
 
@@ -438,6 +448,14 @@ impl RelayStore for InMemoryStore {
         {
             q.ack(cursor);
         }
+    }
+
+    async fn ack_cursor(&self, pairing: &PairingId, sender: Role) -> u64 {
+        self.lock()
+            .queues
+            .get(&QueueKey::new(pairing.clone(), sender))
+            .map(|q| q.ack_cursor())
+            .unwrap_or(0)
     }
 
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment) {

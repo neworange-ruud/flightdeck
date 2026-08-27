@@ -159,8 +159,15 @@ impl Conn {
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<RelayFrame>(text.as_str()) {
                         // Relay-plane background chatter that is never an answer
-                        // to a handshake step or an application message.
-                        Ok(RelayFrame::PeerPresence { .. }) | Ok(RelayFrame::Pong { .. }) => {}
+                        // to a handshake step or an application message. `ack` is
+                        // in here because the relay now forwards a peer's
+                        // cumulative ack to the sender, and echoes each activated
+                        // pairing's cursor right after `auth_ok`
+                        // (remote-control-5qu) — neither is an answer to anything
+                        // a driver asked for.
+                        Ok(RelayFrame::PeerPresence { .. })
+                        | Ok(RelayFrame::Pong { .. })
+                        | Ok(RelayFrame::Ack { .. }) => {}
                         Ok(frame) => return Some(frame),
                         Err(e) => panic!("unparseable relay frame {text:?}: {e}"),
                     }
@@ -491,15 +498,29 @@ impl PhoneDriver {
                         continue;
                     }
                     let seq = env.seq;
+                    let pairing_id = env.pairing_id.clone();
                     let msg = self.open(env);
                     self.last_received_seq = seq;
                     if is_reset {
                         self.stream_resets += 1;
                     }
+                    // ACK it, exactly as the real app does the moment an envelope
+                    // opens and decodes (`TransportClient.swift`, after the
+                    // open/decode guards). Without this the driver was stricter
+                    // than the phone in the one way that matters for
+                    // remote-control-5qu: a desktop that measures peer liveness by
+                    // acks would see this driver as a dark phone and correctly stop
+                    // feeding it. A driver that never acks cannot exercise the
+                    // healthy path at all.
+                    self.conn.send(&RelayFrame::Ack {
+                        pairing_id,
+                        cursor: seq,
+                    });
                     return msg;
                 }
-                // Relay-plane acks/errors are not application messages; an
-                // error frame is worth surfacing loudly.
+                // Relay-plane acks are already skipped by `Conn::recv`; kept as an
+                // explicit arm so this match stays exhaustive over what can
+                // plausibly arrive. An error frame is worth surfacing loudly.
                 RelayFrame::Ack { .. } => {}
                 // The desktop announces its machine name on connect (spec §5.7);
                 // it is relay-plane metadata, not an application message — skip it.

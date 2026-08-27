@@ -2250,3 +2250,203 @@ fn a_fresh_desktop_offers_a_pairing_before_it_authenticates() {
 
     handle.stop();
 }
+
+// --- Peer-ack liveness plumbing (remote-control-5qu) -----------------------
+
+/// The relay forwards the phone's cumulative `ack` for OUR stream. The client
+/// must persist it as `last_acked_by_peer` **and** surface it as
+/// [`RemoteInbound::PeerAck`], because that cursor is the desktop's only
+/// end-to-end evidence that the phone is receiving anything. It used to be
+/// written and read nowhere, so a dark phone was indistinguishable from a healthy
+/// one behind a relay-`pong`-driven link indicator.
+///
+/// A `cursor: 0` ack must be surfaced too: the relay echoes each activated
+/// pairing's stored cursor right after `auth_ok`, and receiving one at all is how
+/// the bridge learns this relay forwards peer acks (and may therefore enforce an
+/// ack deadline).
+#[test]
+fn a_forwarded_peer_ack_is_persisted_and_surfaced_to_the_app() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume, got {other:?}"),
+        }
+        // The post-`auth_ok` cursor echo: nothing acked yet.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 0,
+            },
+        );
+        // Later, the phone confirms up to seq 7.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 7,
+            },
+        );
+        // Keep the socket open so the client is not reconnecting mid-assert.
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut pairing = Pairing::new("pair_test");
+    pairing.last_sent_seq = 9;
+    seed.pairings.push(pairing);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    // Held (not dropped) so the client's app→relay channel stays open.
+    let (_out_tx, out_rx) = channel();
+    let tuning = ClientTuning {
+        cursor_flush_interval: Duration::ZERO,
+        ..ClientTuning::default()
+    };
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
+
+    wait_for_connected(&in_rx);
+
+    let mut cursors = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !cursors.contains(&7) {
+        if let Ok(RemoteInbound::PeerAck { pairing_id, cursor }) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            assert_eq!(pairing_id.as_str(), "pair_test");
+            cursors.push(cursor);
+        }
+    }
+    assert!(
+        cursors.contains(&0),
+        "the relay's post-auth cursor echo must reach the app — it is what arms \
+         the ack-liveness guard; got {cursors:?}"
+    );
+    assert!(
+        cursors.contains(&7),
+        "a real peer ack must reach the app; got {cursors:?}"
+    );
+
+    let mut acked = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        acked = shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_acked_by_peer)
+            .unwrap_or(0);
+        if acked == 7 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(acked, 7, "the peer-ack high-water must be persisted");
+
+    handle.stop();
+    let _ = mock.join();
+}
+
+/// `rate_limited` for a pairing is the relay saying it is SHEDDING our un-acked
+/// envelopes (its queue holds ~1000), i.e. the peer has stopped draining. The
+/// client must keep the connection (nothing is wrong with the *link*) but surface
+/// it as [`RemoteInbound::PeerBacklog`] instead of swallowing it as a non-fatal
+/// advisory, which is what let the desktop shovel 33,000 envelopes into the void.
+#[test]
+fn a_queue_overflow_advisory_is_surfaced_as_a_peer_backlog() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::RateLimited,
+                message: "pairing queue overflow: oldest envelope dropped".to_string(),
+                pairing_id: Some(PairingId::new("pair_test")),
+                expected_seq: None,
+            },
+        );
+        // The connection must survive: a live envelope still gets through.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_test"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 1,
+                nonce: "bg==".to_string(),
+                ciphertext: "Y2lwaGVy".to_string(),
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(SharedStore(std::sync::Arc::new(Mutex::new(seed))));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle =
+        RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, ClientTuning::default());
+
+    wait_for_connected(&in_rx);
+
+    let mut backlog = false;
+    let mut envelope_after = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !envelope_after {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::PeerBacklog { pairing_id }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+                backlog = true;
+            }
+            Ok(RemoteInbound::Envelope(_)) => envelope_after = true,
+            _ => {}
+        }
+    }
+    assert!(
+        backlog,
+        "a queue-overflow advisory must be surfaced as loss of peer liveness"
+    );
+    assert!(
+        envelope_after,
+        "the advisory must not tear the connection down — the link is fine"
+    );
+
+    drop(out_tx);
+    handle.stop();
+    let _ = mock.join();
+}

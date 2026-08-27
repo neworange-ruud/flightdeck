@@ -69,6 +69,63 @@ const PROMPT_SETTLE_MS: u64 = 750;
 /// window.
 const UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS: i64 = 3_000;
 
+/// How long an outbound envelope may sit un-acknowledged by the phone before the
+/// peer stops counting as *live* (remote-control-5qu).
+///
+/// The phone acks every envelope it opens and decodes, immediately, so a healthy
+/// round trip is well under a second; a whole minute of total silence with
+/// envelopes outstanding means the phone is not receiving them. It is measured on
+/// the injected clock (`now_ms` from [`RemoteBridge::tick`]), never on wall time,
+/// so it is testable without sleeping.
+const PEER_ACK_TIMEOUT_MS: u64 = 60_000;
+
+/// Hard bound on how far the outbound stream may run ahead of the peer's ack
+/// cursor before the peer stops counting as live, regardless of the clock. The
+/// relay holds ~1000 un-acked envelopes per pairing before it starts shedding
+/// them, so tripping at half of that stops the desktop well before the relay has
+/// to drop anything. This is the "never let `out_seq` run thousands of envelopes
+/// ahead of `last_acked_by_peer`" guard from remote-control-5qu; the reported
+/// case reached 33,000.
+const MAX_UNACKED_ENVELOPES: u64 = 500;
+
+/// How many consecutive [`RemoteInbound::SeqRealign`]s may excuse an un-acked
+/// backlog before the ack deadline is allowed to stand anyway.
+///
+/// A realign proves the *relay* rejected our envelopes, so their silence is not
+/// the phone's fault (remote-control-zv3) — but it must not become an unbounded
+/// loophole: a stream that realigns forever without ever collecting an ack is
+/// indistinguishable from a dead peer, and after this many attempts the safer
+/// reading is "dark". Any genuine ack resets the count, and zv3's realign
+/// converges on the very next envelope, so a healthy stream never spends more
+/// than one.
+const MAX_REALIGN_CREDITS: u32 = 3;
+
+/// Whether a phone peer is attached to the active pairing **and** still proving
+/// it by acknowledging what we send (remote-control-5qu).
+///
+/// The relay `pong`-driven link indicator measures the desktop↔relay hop only, so
+/// it reads healthy while the phone is dark — which is exactly why the reported
+/// failure ran for 17 days unnoticed. This is the peer-side half of the story,
+/// derived from end-to-end ack evidence, and is what the UI must show alongside
+/// (not instead of) the relay link state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerLiveness {
+    /// No phone is attached to the pairing (or there is no pairing at all): the
+    /// relay has told us the peer is absent, or has never said it is present.
+    NoPeer,
+    /// A phone is attached and nothing contradicts it: either it has acked
+    /// everything we sent, or the outstanding envelopes are still inside the ack
+    /// window. Also the state when this relay does not forward peer acks at all
+    /// (an older relay), where the desktop deliberately makes no claim.
+    Live,
+    /// The relay says a phone is attached, but it has not acknowledged our
+    /// envelopes for [`PEER_ACK_TIMEOUT_MS`] (or is [`MAX_UNACKED_ENVELOPES`]
+    /// behind, or the relay is shedding our queue). The link to the relay is up;
+    /// the *peer* is dark. The per-tick feed is suspended until it proves
+    /// otherwise.
+    Dark,
+}
+
 /// Seals E2E plaintext for the wire. Given the JSON plaintext plus the envelope
 /// header the payload will travel under (`seq`, `sent_at_ms`), returns
 /// `(nonce_b64, ciphertext_b64)` for a [`RemoteOutbound::SendEnvelope`], or
@@ -153,6 +210,44 @@ pub struct RemoteBridge {
     /// current snapshot the moment it connects. Defaults to `false` (no phone
     /// until one attaches); unit tests that drive presence set it explicitly.
     peer_present: bool,
+    /// Whether this relay forwards peer acks at all — set by the FIRST
+    /// [`RemoteInbound::PeerAck`] seen on this connection, for any pairing, and
+    /// never cleared. Until then the ack deadline below stays DISARMED and the
+    /// bridge behaves exactly as it did before remote-control-5qu.
+    ///
+    /// This is the compatibility seam, and it is load-bearing. The relay never
+    /// used to forward the phone's `ack` to the desktop at all, which is why
+    /// `last_acked_by_peer` sat at 0 for 33,000 envelopes. A desktop that
+    /// enforced an ack deadline against such a relay would declare EVERY phone
+    /// dark within a minute, so the guard only arms once the relay has
+    /// demonstrated it relays acks. The relay echoes the stored cursor for each
+    /// activated pairing right after `auth_ok` — even when it is 0 — so against
+    /// an upgraded relay this arms within a second of connecting, before any
+    /// envelope is sent, and the "never acked even once" case is caught too.
+    peer_acks_observed: bool,
+    /// Highest outbound `seq` the peer has acknowledged (the app-side mirror of
+    /// `Pairing::last_acked_by_peer`), for the ACTIVE pairing only.
+    peer_acked_seq: u64,
+    /// Outbound `seq` at or below which un-acked envelopes are not held against
+    /// the peer, because we have no evidence either way and their silence is not
+    /// attributable to this phone: envelopes a previous process sent (seeded from
+    /// the resumed high-water mark in [`Self::install_channel`]) and envelopes the
+    /// relay itself rejected (rebased in the `SeqRealign` arm). Liveness is only
+    /// ever judged on envelopes this session actually put on the wire.
+    ack_baseline_seq: u64,
+    /// Clock-ms (injected clock) from which the current ack window is measured —
+    /// armed on the first tick at which an envelope is outstanding, cleared the
+    /// moment the peer catches up or produces any other evidence of life. `None`
+    /// means "nothing is owed", which is the state a legitimately quiet phone
+    /// with nothing to ack sits in forever.
+    ack_wait_since_ms: Option<u64>,
+    /// Whether the peer has stopped proving it is there (see [`PeerLiveness`]).
+    /// ANDed with `peer_present` to gate the per-tick feed, so it can only ever
+    /// make that gate stricter — never looser (remote-control-uqa).
+    peer_dark: bool,
+    /// Consecutive `SeqRealign`s that have excused the un-acked backlog without
+    /// an intervening ack; bounded by [`MAX_REALIGN_CREDITS`].
+    realign_credits: u32,
     snapshot_needed: bool,
     grace_until_ms: u64,
     pending_transcript_requests: Vec<(SessionId, Option<u64>)>,
@@ -207,6 +302,12 @@ impl RemoteBridge {
             pairing: None,
             link_up: true,
             peer_present: false,
+            peer_acks_observed: false,
+            peer_acked_seq: 0,
+            ack_baseline_seq: 0,
+            ack_wait_since_ms: None,
+            peer_dark: false,
+            realign_credits: 0,
             snapshot_needed: true,
             grace_until_ms,
             pending_transcript_requests: Vec::new(),
@@ -252,6 +353,15 @@ impl RemoteBridge {
         // resets `out_seq` to 0 in `handle_inbound` (on the pairing-id change) or
         // via `reset_to_passthrough` (on unpair), so the max here is 0-vs-0 there.
         self.out_seq = self.out_seq.max(resume_from_seq);
+        // Whatever is already outstanding at a session boundary is not this
+        // phone's fault to answer for. At startup `resume_from_seq` is the
+        // persisted `last_sent_seq` — envelopes a PREVIOUS process sent, which the
+        // phone may well have acked before the restart — and a mid-session repeat
+        // claim means the phone just authenticated at the relay and redeemed a
+        // token, which is direct proof of life. Judging liveness only on
+        // envelopes we send from here on is what keeps a restarted desktop from
+        // declaring a perfectly healthy phone dark on its first tick.
+        self.forgive_unacked();
     }
 
     /// Revert to the no-crypto passthrough and forget the active pairing — used
@@ -261,6 +371,7 @@ impl RemoteBridge {
         self.seal = passthrough_seal();
         self.open = passthrough_open();
         self.out_seq = 0;
+        self.reset_ack_tracking();
         self.pairing = None;
         // Forget remote shells; their backing child terminals stay as ordinary
         // desktop shells (the phone is no longer trusted to drive them).
@@ -347,6 +458,9 @@ impl RemoteBridge {
                 // phone's resumed cursor keeps matching (remote-control-bbf).
                 if self.pairing.is_some() && self.pairing.as_ref() != Some(&pairing_id) {
                     self.out_seq = 0;
+                    // A different peer with its own ack cursor: everything the
+                    // old one owed us is meaningless now.
+                    self.reset_ack_tracking();
                 }
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
@@ -388,6 +502,19 @@ impl RemoteBridge {
                 if self.pairing.as_ref() == Some(&pairing_id) {
                     self.out_seq = next_seq.saturating_sub(1);
                     self.snapshot_needed = true;
+                    // The relay REJECTED those envelopes, so they never reached
+                    // the phone and their silence says nothing about it: a
+                    // rejected stream is a different fault from a dead peer even
+                    // though both produce "no acks" (remote-control-5qu vs zv3).
+                    // Rebase the ack tracking onto the renumbered stream and give
+                    // the realigned stream a fresh window — bounded, so a
+                    // stream that only ever realigns still ends up dark.
+                    if self.realign_credits < MAX_REALIGN_CREDITS {
+                        self.realign_credits += 1;
+                        self.ack_baseline_seq = self.out_seq;
+                        self.peer_acked_seq = self.peer_acked_seq.min(self.out_seq);
+                        self.credit_peer_liveness();
+                    }
                 }
             }
             // The offer (code shown) does not itself activate a pairing for the
@@ -402,6 +529,12 @@ impl RemoteBridge {
             RemoteInbound::Envelope(env) => {
                 if self.pairing.is_none() {
                     self.pairing = Some(env.pairing_id.clone());
+                }
+                // The phone sent us something: it is unambiguously there, even if
+                // this particular envelope fails to open. Credit it before the
+                // open attempt so a crypto fault cannot be mistaken for absence.
+                if self.pairing.as_ref() == Some(&env.pairing_id) {
+                    self.credit_peer_liveness();
                 }
                 if let Some(plain) = (self.open)(
                     env.seq,
@@ -440,6 +573,43 @@ impl RemoteBridge {
                         self.snapshot_needed = true;
                     }
                     self.peer_present = now_present;
+                    // A presence frame is fresh word from the relay about the
+                    // peer's leg, so the peer gets a clean ack window either way:
+                    // an attach (or re-attach) deserves a chance to prove itself,
+                    // and a detach/re-attach cycle must not inherit the previous
+                    // leg's stall. The BACKLOG bound is deliberately NOT reset
+                    // here, so a phone that reattaches over and over without ever
+                    // receiving anything is still caught.
+                    self.credit_peer_liveness();
+                }
+            }
+            // The relay forwarded the phone's cumulative ack for OUR stream: the
+            // one piece of end-to-end evidence that the phone is really
+            // receiving. Arms the guard (see `peer_acks_observed`) and, when the
+            // cursor actually advances, credits the peer with being alive.
+            RemoteInbound::PeerAck { pairing_id, cursor } => {
+                // Arming is a property of the RELAY, not of one pairing, so it is
+                // set for any pairing and never cleared.
+                self.peer_acks_observed = true;
+                if self.pairing.as_ref() == Some(&pairing_id) && cursor > self.peer_acked_seq {
+                    self.peer_acked_seq = cursor;
+                    self.realign_credits = 0;
+                    self.credit_peer_liveness();
+                }
+            }
+            // The relay is shedding our un-acked envelopes: the peer has stopped
+            // draining ~1000 of them, which is proof enough on its own. Applies
+            // whether or not the ack guard is armed — every deployed relay
+            // already sends this advisory, and the desktop used to ignore it.
+            RemoteInbound::PeerBacklog { pairing_id } => {
+                if self.pairing.as_ref() == Some(&pairing_id) && !self.peer_dark {
+                    self.peer_dark = true;
+                    crate::remote::debuglog::log(&format!(
+                        "bridge PEER DARK (relay queue overflow) pairing={} out_seq={} acked={}",
+                        pairing_id.as_str(),
+                        self.out_seq,
+                        self.peer_acked_seq
+                    ));
                 }
             }
             // Track link state so `tick` can pause seal/queue while the relay is
@@ -495,6 +665,93 @@ impl RemoteBridge {
     /// Whether a phone pairing is currently active.
     pub fn is_paired(&self) -> bool {
         self.pairing.is_some()
+    }
+
+    /// Whether the attached phone is still earning its presence — see
+    /// [`PeerLiveness`]. This is the peer-side half of the link status the UI
+    /// must show: `Dark` means the relay link is up but the phone is not
+    /// receiving, which used to be indistinguishable from a healthy link
+    /// (remote-control-5qu).
+    pub fn peer_liveness(&self) -> PeerLiveness {
+        if !self.peer_present || self.pairing.is_none() {
+            PeerLiveness::NoPeer
+        } else if self.peer_dark {
+            PeerLiveness::Dark
+        } else {
+            PeerLiveness::Live
+        }
+    }
+
+    /// The highest outbound `seq` we have no reason to think the phone is
+    /// missing: what it has acked, or what predates this session's judgement.
+    fn ack_floor(&self) -> u64 {
+        self.peer_acked_seq.max(self.ack_baseline_seq)
+    }
+
+    /// Record fresh evidence that the peer is alive: it stops being dark, and the
+    /// ack window restarts from the next tick that still has something
+    /// outstanding. Does NOT forgive the backlog itself, so the
+    /// [`MAX_UNACKED_ENVELOPES`] bound survives a flapping peer.
+    fn credit_peer_liveness(&mut self) {
+        self.peer_dark = false;
+        self.ack_wait_since_ms = None;
+    }
+
+    /// Stop holding the currently-outstanding envelopes against the peer (a
+    /// session boundary, not evidence about any single envelope).
+    fn forgive_unacked(&mut self) {
+        self.ack_baseline_seq = self.ack_baseline_seq.max(self.out_seq);
+        self.credit_peer_liveness();
+    }
+
+    /// Forget everything we knew about the peer's ack position — used when the
+    /// pairing itself changes, so a new phone's cursor never inherits the old
+    /// one's. `peer_acks_observed` deliberately survives: it describes the relay.
+    fn reset_ack_tracking(&mut self) {
+        self.peer_acked_seq = 0;
+        self.ack_baseline_seq = 0;
+        self.realign_credits = 0;
+        self.credit_peer_liveness();
+    }
+
+    /// Re-evaluate ack-based peer liveness for this tick (remote-control-5qu).
+    ///
+    /// "No news" is read direction-sensitively, which is the whole design:
+    /// * nothing outstanding (`out_seq <= ack_floor`) ⇒ the peer owes us nothing,
+    ///   so silence proves nothing and the window is disarmed. A connected phone
+    ///   with nothing to ack is therefore NEVER declared absent.
+    /// * something outstanding ⇒ silence is measured. Past
+    ///   [`PEER_ACK_TIMEOUT_MS`], or [`MAX_UNACKED_ENVELOPES`] behind, the peer
+    ///   is dark.
+    ///
+    /// Disarmed entirely until the relay has proved it forwards peer acks
+    /// (`peer_acks_observed`), so an older relay behaves exactly as before.
+    fn update_peer_liveness(&mut self, now_ms: u64) {
+        if !self.peer_acks_observed {
+            return;
+        }
+        let floor = self.ack_floor();
+        if self.out_seq <= floor {
+            self.ack_wait_since_ms = None;
+            return;
+        }
+        // Normally already armed by `send_msg` at the instant the envelope was
+        // sealed; this covers a cursor that went outstanding any other way.
+        let since = *self.ack_wait_since_ms.get_or_insert(now_ms);
+        let waited_ms = now_ms.saturating_sub(since);
+        let backlog = self.out_seq - floor;
+        if !self.peer_dark && (waited_ms >= PEER_ACK_TIMEOUT_MS || backlog >= MAX_UNACKED_ENVELOPES)
+        {
+            self.peer_dark = true;
+            crate::remote::debuglog::log(&format!(
+                "bridge PEER DARK (no ack) pairing={:?} out_seq={} acked={} unacked={} waited_ms={}",
+                self.pairing.as_ref().map(|p| p.as_str()),
+                self.out_seq,
+                self.peer_acked_seq,
+                backlog,
+                waited_ms
+            ));
+        }
     }
 
     /// The currently pending permission-prompt id for a session, if any (the
@@ -690,6 +947,10 @@ impl RemoteBridge {
 
         let sent_at = now_ms as i64;
 
+        // Re-evaluate whether the phone is still earning its presence, BEFORE
+        // anything is sealed this tick (remote-control-5qu).
+        self.update_peer_liveness(now_ms);
+
         // Send typed events first (most urgent).
         for ev in events {
             self.send_msg(DesktopToPhone::Event(ev), sent_at, send);
@@ -704,7 +965,19 @@ impl RemoteBridge {
         // current snapshot the instant it connects. Events, transcript flushes and
         // shell output below are edge/request-driven, not per-tick, so they are
         // unaffected.
-        if self.peer_present {
+        // `!peer_dark` makes this gate STRICTLY narrower than the presence check
+        // remote-control-uqa introduced: presence is what the relay asserts, dark
+        // is what the phone has failed to earn by acking. The reported failure had
+        // presence latched `true` with no way to clear it — the relay deliberately
+        // sends no `Disconnected` for a superseded leg — so this per-tick feed
+        // shipped 33,000 envelopes to a phone that never received one.
+        //
+        // Events, transcript flushes, transcript replies, shell output and command
+        // acks below stay ungated: they are edge/request-driven rather than
+        // per-tick (so they cannot spam), and they double as free liveness probes
+        // — an ack for any one of them revives the feed without needing a presence
+        // frame from the relay.
+        if self.peer_present && !self.peer_dark {
             // Build the current world and reconcile against what the phone saw.
             let snap = self.build_snapshot(projects, now_ms);
             let delta = self.feed.diff(&snap);
@@ -872,6 +1145,15 @@ impl RemoteBridge {
         let seq = self.out_seq + 1;
         if let Some((nonce, ciphertext)) = (self.seal)(&bytes, seq, now_ms) {
             self.out_seq = seq;
+            // Start the ack clock on the FIRST envelope the peer owes us an
+            // answer for (remote-control-5qu). Arming here rather than on the
+            // next tick means the deadline measures the envelope's real age, and
+            // a burst that all goes out on one tick shares one deadline. Cleared
+            // by `credit_peer_liveness` / catch-up, so a quiet phone never has a
+            // clock running against it.
+            if self.ack_wait_since_ms.is_none() && seq > self.ack_floor() {
+                self.ack_wait_since_ms = Some(now_ms.max(0) as u64);
+            }
             crate::remote::debuglog::log(&format!(
                 "bridge SEAL {} pairing={} seq={}",
                 msg_kind(&msg),

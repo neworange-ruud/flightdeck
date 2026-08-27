@@ -1355,3 +1355,145 @@ async fn idle_timeout_notifies_the_peer_of_disconnect() {
         }
     ));
 }
+
+// ── peer acks are relayed end to end (remote-control-5qu) ──────────────────
+
+fn is_ack(frame: &RelayFrame) -> bool {
+    matches!(frame, RelayFrame::Ack { .. })
+}
+
+fn ack_cursor(frame: &RelayFrame) -> u64 {
+    match frame {
+        RelayFrame::Ack { cursor, .. } => *cursor,
+        other => panic!("not an ack: {other:?}"),
+    }
+}
+
+/// The phone's `ack` must be FORWARDED to the desktop, not just used to trim the
+/// relay's own queue.
+///
+/// The frame is documented as travelling in both directions and the sender needs
+/// it — a cumulative peer ack is the sender's only end-to-end evidence that its
+/// envelopes are actually being received — but the relay used to consume it
+/// silently. With nothing coming back, a desktop's `last_acked_by_peer` was
+/// structurally pinned at 0 no matter what the phone did, so it could not tell a
+/// receiving phone from a dark one and fed a dead pairing ~33,000 envelopes over
+/// 17 days behind a healthy-looking link (remote-control-5qu).
+#[tokio::test]
+async fn a_peer_ack_is_forwarded_to_the_sender() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+
+    // Three desktop→phone envelopes, which the phone receives and acks.
+    for seq in 1..=3 {
+        desktop
+            .send(envelope(
+                &pairing,
+                Role::Desktop,
+                seq,
+                &format!("d->p#{seq}"),
+            ))
+            .await;
+        assert_eq!(env_seq(&phone.recv_until(is_envelope).await), seq);
+    }
+    phone
+        .send(RelayFrame::Ack {
+            pairing_id: pairing.clone(),
+            cursor: 3,
+        })
+        .await;
+
+    // The DESKTOP must learn about it.
+    let ack = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Ack { cursor, .. } if *cursor == 3))
+        .await;
+    assert_eq!(ack_cursor(&ack), 3);
+
+    // Cumulative: a later ack supersedes, and is forwarded too.
+    desktop
+        .send(envelope(&pairing, Role::Desktop, 4, "d->p#4"))
+        .await;
+    assert_eq!(env_seq(&phone.recv_until(is_envelope).await), 4);
+    phone
+        .send(RelayFrame::Ack {
+            pairing_id: pairing.clone(),
+            cursor: 4,
+        })
+        .await;
+    let ack = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Ack { cursor, .. } if *cursor == 4))
+        .await;
+    assert_eq!(ack_cursor(&ack), 4);
+}
+
+/// An authenticating leg is told its OWN stream's ack cursor for every activated
+/// pairing, including the very common `cursor: 0`.
+///
+/// Two jobs (remote-control-5qu): it is reconnect catch-up, and — because a relay
+/// built before this change never sends an unsolicited ack — receiving one at all
+/// is how an endpoint learns that THIS relay forwards peer acks and that an
+/// ack-based liveness deadline is therefore safe to enforce. Without it a desktop
+/// cannot distinguish "my phone has acked nothing" from "this relay never relays
+/// acks", and a desktop that guessed wrong would declare every phone dark.
+#[tokio::test]
+async fn an_authenticating_leg_is_told_its_own_streams_ack_cursor() {
+    let base = spawn_app().await;
+
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    // Nothing sent yet: the echo is 0, and it is still sent.
+    let ack = desktop.recv_until(is_ack).await;
+    assert_eq!(
+        ack_cursor(&ack),
+        0,
+        "a leg with nothing acked must still be told so — that is the capability signal"
+    );
+
+    let mut phone = TestClient::connect(&base, Role::Phone, "dev_phone").await;
+    phone.claim_pairing(&token).await;
+    phone.authenticate(vec![pairing.clone()]).await;
+    // The phone's own echo is for the PHONE's stream, which is untouched.
+    assert_eq!(ack_cursor(&phone.recv_until(is_ack).await), 0);
+
+    for seq in 1..=5 {
+        desktop
+            .send(envelope(
+                &pairing,
+                Role::Desktop,
+                seq,
+                &format!("d->p#{seq}"),
+            ))
+            .await;
+        assert_eq!(env_seq(&phone.recv_until(is_envelope).await), seq);
+    }
+    phone
+        .send(RelayFrame::Ack {
+            pairing_id: pairing.clone(),
+            cursor: 5,
+        })
+        .await;
+    let _ = desktop
+        .recv_until(|f| matches!(f, RelayFrame::Ack { cursor, .. } if *cursor == 5))
+        .await;
+
+    // A desktop that reconnects is told where the phone actually stands, so a
+    // restarted process does not have to assume.
+    let mut desktop2 =
+        TestClient::connect_with_key(&base, Role::Desktop, "dev_mac", desktop.key()).await;
+    desktop2.authenticate(vec![pairing.clone()]).await;
+    let ack = desktop2.recv_until(is_ack).await;
+    assert_eq!(
+        ack_cursor(&ack),
+        5,
+        "the reconnecting desktop must be handed its stream's real ack cursor"
+    );
+}

@@ -1885,6 +1885,14 @@ async fn handle_frame(
                     gate.mark_dirty();
                 }
             }
+            // Surface it to the app. `last_acked_by_peer` used to be written here
+            // and read NOWHERE — the desktop had no end-to-end evidence that the
+            // phone was receiving anything, so it fed a dark phone for 17 days
+            // behind a green (relay-`pong`-driven) link indicator
+            // (remote-control-5qu). The bridge turns these into an ack deadline.
+            // Sent even when the cursor did not advance: an un-advanced ack still
+            // proves this relay forwards peer acks, which is what arms the guard.
+            inbound_tx.send(RemoteInbound::PeerAck { pairing_id, cursor });
             true
         }
         RelayFrame::Pong { client_time_ms, .. } => {
@@ -2097,6 +2105,28 @@ async fn handle_frame(
                 .await;
                 inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
             }
+            true
+        }
+        // The relay's per-pairing queue overflowed and it shed the oldest
+        // un-acked envelope (spec §6 amendment). The queue holds ~1000 un-acked
+        // envelopes, so this only happens when the peer has stopped draining
+        // ours: it is direct, deployed-today evidence that the phone is not
+        // receiving, and it was previously swallowed as a non-fatal advisory
+        // while the desktop kept sealing (remote-control-5qu). Not fatal — the
+        // connection is fine, the *peer* is not — so the session continues and
+        // the bridge closes its per-tick feed instead.
+        RelayFrame::Error {
+            code: RelayErrorCode::RateLimited,
+            pairing_id: Some(pairing_id),
+            ref message,
+            ..
+        } => {
+            crate::remote::debuglog::log(&format!(
+                "client RECV error rate_limited (peer backlog) pairing={} msg={}",
+                pairing_id.as_str(),
+                message
+            ));
+            inbound_tx.send(RemoteInbound::PeerBacklog { pairing_id });
             true
         }
         RelayFrame::Error {

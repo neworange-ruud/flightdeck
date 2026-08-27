@@ -48,7 +48,7 @@ pub mod shell;
 pub mod state;
 pub mod transcript;
 
-pub use bridge::{ProjectView, RemoteBridge};
+pub use bridge::{PeerLiveness, ProjectView, RemoteBridge};
 pub use client::{RemoteHandle, RemoteLinkState};
 pub use identity::DeviceIdentity;
 pub use state::{Pairing, RemoteState};
@@ -161,6 +161,38 @@ pub enum RemoteInbound {
         pairing_id: PairingId,
         /// The `seq` the relay will accept next; the next envelope must use it.
         next_seq: u64,
+    },
+    /// The peer acknowledged our outbound envelopes up to `cursor` (cumulative,
+    /// spec §6.2) — the relay forwarded the phone's `ack` for **our** stream.
+    ///
+    /// This is the desktop's only *end-to-end* evidence that the phone is
+    /// actually receiving: the link indicator is driven by the relay `pong`,
+    /// which measures the desktop↔relay hop and stays healthy while the phone is
+    /// dark. The bridge feeds it into an ack-based peer-liveness deadline so a
+    /// phone that never acks stops being treated as present (remote-control-5qu).
+    ///
+    /// A `cursor` of 0 is meaningful and expected: the relay echoes the stored
+    /// ack cursor for each activated pairing right after `auth_ok`, so the very
+    /// first one may say "your peer has acked nothing". Receiving *any* of these
+    /// is what tells the desktop this relay forwards peer acks at all — a relay
+    /// built before that change never sends one, and the bridge then leaves the
+    /// guard disarmed rather than declaring every phone dark.
+    PeerAck {
+        /// Pairing whose outbound stream was acknowledged.
+        pairing_id: PairingId,
+        /// Highest contiguous outbound `seq` the peer has durably handled.
+        cursor: u64,
+    },
+    /// The relay's queue for this pairing overflowed: it shed the oldest
+    /// un-acked envelope because the peer has not drained ~1000 of them
+    /// (`rate_limited`, spec §6 amendment). Independent of [`Self::PeerAck`] —
+    /// and available from every already-deployed relay — this is proof that the
+    /// peer is not consuming what we send, so the bridge treats it as immediate
+    /// loss of peer liveness instead of ignoring the advisory and shovelling on
+    /// (remote-control-5qu).
+    PeerBacklog {
+        /// The pairing whose queue is overflowing.
+        pairing_id: PairingId,
     },
     /// The relay handshake ended before `auth_ok`, so the connection never went
     /// live: no pairing code can be minted and no envelope can flow. Carries a

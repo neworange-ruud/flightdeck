@@ -624,6 +624,13 @@ impl RelayStore for SqliteStore {
         }
     }
 
+    async fn ack_cursor(&self, pairing: &PairingId, sender: Role) -> u64 {
+        // An absent stream rehydrates as an empty queue whose cursor is 0, which
+        // is exactly the right answer, so no special-casing is needed.
+        let conn = self.lock();
+        load_queue(&conn, pairing, sender, self.queue_max_per_pairing).ack_cursor()
+    }
+
     async fn register_push_token(&self, pairing: PairingId, token: String, env: ApnsEnvironment) {
         self.lock()
             .execute(
