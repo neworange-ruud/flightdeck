@@ -34,3 +34,11 @@
 /webui/node_modules/
 /webui/dist/*
 !/webui/dist/.gitkeep
+
+# Playwright end-to-end job (specs/WEB_INTERFACE.md D15, Q6). `.host.json`
+# records the FlightDeck instance the global setup launched, so the spec files
+# can find its port; the rest is report/trace output. All per-run scratch.
+/webui/e2e/.host.json
+/webui/test-results/
+/webui/playwright-report/
+/webui/blob-report/

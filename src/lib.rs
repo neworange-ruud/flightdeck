@@ -1444,6 +1444,28 @@ impl WebSurface {
         self.published = crate::web::server::HostState::default();
     }
 
+    /// **Test-only seam (debug builds only).** Keep a *known* bootstrap code
+    /// live while the server runs, so the Playwright suite can authenticate a
+    /// real browser through the real `POST /auth/exchange` (D15).
+    ///
+    /// Called every tick and idempotent: it mints only when no code is live, so
+    /// a code that has just been spent (they are single use) or expired is
+    /// replaced and the next test in the run can authenticate too. Nothing else
+    /// changes — the exchange, the TTL and both rate limiters are the shipped
+    /// ones. See `CredentialStore::mint_fixed_bootstrap_code` for why this
+    /// cannot exist in a release binary.
+    #[cfg(debug_assertions)]
+    fn ensure_test_bootstrap_code(&self, digits: &str) {
+        if self.handle.is_none() {
+            return;
+        }
+        if let Ok(mut store) = self.credentials.lock() {
+            if store.bootstrap_code().is_none() {
+                store.mint_fixed_bootstrap_code(digits);
+            }
+        }
+    }
+
     /// One chunk of raw PTY output, from `drain_pty_output`'s tee.
     fn tee(&mut self, tab_id: &str, child: Option<usize>, mint: u64, bytes: &[u8]) {
         let Some(handle) = self.handle.as_ref() else {
@@ -1843,6 +1865,16 @@ fn event_loop(
     // started here only when `[web] enabled` opted in — D10 makes auto-start the
     // TUI's decision, which is why `server::start` deliberately ignores the flag.
     let mut web_surface = WebSurface::new(&workspace.active_project().state.config.web);
+    // Test / E2E seam, debug builds only (read once at startup): when
+    // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
+    // always has *that* bootstrap code live, so the Playwright suite (D15) can
+    // exchange it in a real browser instead of screen-scraping a TUI overlay for
+    // a random one. `None` in every normal run, and absent entirely from a
+    // release build — see `WebSurface::ensure_test_bootstrap_code`.
+    #[cfg(debug_assertions)]
+    let web_test_code: Option<String> = std::env::var("FLIGHTDECK_WEB_TEST_CODE")
+        .ok()
+        .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
     if workspace.active_project().state.config.web.enabled {
         let config = workspace.active_project().state.config.web.clone();
         let initial = build_web_host_state(workspace, &web_surface.streams, now0);
@@ -2170,6 +2202,10 @@ fn event_loop(
                 web_surface.stop(crate::web::server::ShutdownNotice::server_stopped());
                 ui.message("Web interface stopped.".to_string());
             }
+        }
+        #[cfg(debug_assertions)]
+        if let Some(digits) = web_test_code.as_deref() {
+            web_surface.ensure_test_bootstrap_code(digits);
         }
         ui.web_running = web_surface.running();
 

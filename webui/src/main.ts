@@ -1,28 +1,25 @@
 import { consumeBootstrapCode, windowUrlBar } from "./access/bootstrap";
 import { checkSession, exchangeCode } from "./access/client";
 import type { AccessResult } from "./access/client";
-import { fixtureSnapshot } from "./state/fixture";
-import { fixtureTerminalBytes } from "./state/fixtureBytes";
 import { createApp } from "./ui/app";
 import { mountTerminal } from "./term/terminal";
 import type { Store } from "./ui/store";
 import type { TerminalMount } from "./ui/terminalStage";
+import { openSession, type SessionSocket } from "./wire/socket";
 
 /**
  * Entry point.
  *
- * Two halves, and only one of them is real yet:
+ * Both halves are real:
  *
- *   - **Access is real.** The bootstrap code is consumed from the URL fragment
- *     and stripped from history, exchanged at `POST /auth/exchange`, and
+ *   - **Access.** The bootstrap code is consumed from the URL fragment and
+ *     stripped from history, exchanged at `POST /auth/exchange`, and
  *     `GET /auth/session` decides between the app and one of artboard 2b's
- *     screens. That whole path talks to the server that exists.
- *   - **The session is still fixture-driven.** `remote-control-hgqy` replaces
- *     the three fixture lines at the bottom with a websocket that dispatches
- *     the same actions — `snapshot/received` from `ServerMsg::Snapshot`,
- *     `connection/changed` from the transport — and swaps `mount` for one that
- *     pipes `ServerMsg::Delta` into `term.write`. The components never learn
- *     the difference.
+ *     screens.
+ *   - **The session.** Once access is granted, `./wire/socket` opens `GET /ws`
+ *     and the host drives everything: the snapshot paints the tree, `term_bytes`
+ *     goes straight into xterm.js, and a keystroke goes back as an `input`
+ *     frame. Nothing on screen is a fixture.
  */
 
 const root = document.querySelector<HTMLDivElement>("#app");
@@ -30,37 +27,79 @@ if (root === null) {
   throw new Error("#app mount point missing from index.html");
 }
 
+/** `Some` from the moment access is granted; one socket per tab. */
+let session: SessionSocket | null = null;
+
 /**
  * D4: construct xterm with the host's grid and letterbox it. `FitAddon` is
  * absent by design — see `src/term/terminal.ts`.
+ *
+ * The mount is also where the two directions of the terminal meet: the socket's
+ * sink writes host bytes in, and xterm's `onData` — which owns the whole
+ * keyboard-to-bytes translation, including the escape sequences a hand-written
+ * key handler always gets wrong — sends them back out.
  */
 const mount: TerminalMount = (container, geometry, terminalId) => {
   const term = mountTerminal(container, geometry);
-  term.write(fixtureTerminalBytes(terminalId));
-  return () => term.dispose();
+  /**
+   * `Esc` is the one key xterm must **not** claim.
+   *
+   * `Esc Esc` within 400 ms leaves terminal focus and a single `Esc` passes
+   * through to the agent (§5, `decideEscape`), and only the app knows which of
+   * the two a given press is. If xterm handled `Escape` itself it would send
+   * `\x1b` immediately — before the app could decide — and the second press of
+   * an `Esc Esc` would have already gone to the agent. So the app's frame-level
+   * handler owns `Escape`, queues it through the store when it is a
+   * pass-through, and `flushQueuedInput` below puts it on the wire. Every other
+   * key stays xterm's, because xterm owns the keyboard-to-bytes translation.
+   */
+  term.attachCustomKeyEventHandler(
+    (event) => !(event.type === "keydown" && event.key === "Escape"),
+  );
+  const socket = session;
+  if (socket !== null) {
+    socket.attachTerminal(terminalId, (bytes) => term.write(bytes));
+    term.onData((data) => socket.sendInput(terminalId, data));
+  }
+  return () => {
+    socket?.detachTerminal(terminalId);
+    term.dispose();
+  };
 };
 
 const app = createApp({
   mount,
   /**
    * D3: a selection made here is the whole instance's selection, the desktop
-   * included. There is no socket yet, so this is where the `ClientMsg::Command`
-   * frame goes — announced rather than silently dropped, so nobody mistakes the
-   * fixture for a working remote control.
+   * included — so it goes out as a `Command` and comes back as the host's own
+   * selection, rather than being applied locally and hoping the host agrees.
    */
   onDispatch: (action) => {
-    if (action.type.startsWith("selection/")) {
-      console.info(
-        "[fixture] selection changed locally; ClientMsg::Command { select } goes here (D3)",
-        action,
-      );
+    if (session === null) {
+      return;
     }
-    /** Takeover has no frame of its own: the browser re-sends `Attach`. */
-    if (action.type === "takeover/claim" || action.type === "takeover/observe") {
-      console.info(
-        "[fixture] re-Attach { seat } goes here (D14) — takeover has no dedicated frame",
-        action,
-      );
+    switch (action.type) {
+      case "selection/project":
+        session.sendCommand("select_project", { project_id: action.projectId });
+        return;
+      case "selection/session":
+        session.sendCommand("select_session", { session_id: action.sessionId });
+        return;
+      case "selection/terminal":
+        session.sendCommand("select_terminal", {
+          terminal_id: action.terminalId,
+        });
+        return;
+      case "selection/jump":
+        session.sendCommand("select_session", { session_id: action.sessionId });
+        return;
+      case "activity/read":
+        session.sendCommand("mark_activity_read", { event_ids: action.ids });
+        return;
+      /** Takeover has no frame of its own: the browser re-sends `Attach`. The
+       * socket does that itself when the host refuses the seat. */
+      default:
+        return;
     }
   },
   onSubmitCode: (code) => {
@@ -82,8 +121,11 @@ const app = createApp({
       });
       return;
     }
-    /** `retry` belongs to the transport, which `remote-control-hgqy` owns. */
-    console.info("[fixture] reconnect now goes here (2c: r Retry now)");
+    /** `retry` — drop the socket and let the session open a fresh one now
+     * instead of waiting out the backoff. */
+    session?.close();
+    session = null;
+    startSession();
   },
 });
 
@@ -91,6 +133,9 @@ root.append(app.el);
 
 /** 2b's footer prints the address the user actually reached, never a guess. */
 app.store.dispatch({ type: "host/set", host: window.location.host });
+
+/** Installed once, not per session: a reconnect must not double the flush. */
+app.store.subscribe(flushQueuedInput);
 
 /**
  * Q4, in the order that matters.
@@ -141,7 +186,7 @@ function applyResult(
 ): void {
   if (result.ok) {
     store.dispatch({ type: "access/granted" });
-    showFixtureSession();
+    startSession();
     return;
   }
   if ("unreachable" in result) {
@@ -176,16 +221,65 @@ function applyResult(
 }
 
 /**
- * Everything below here is the fixture, and goes away with
- * `remote-control-hgqy`. It runs only once access is granted, which is also the
- * real sequence: no snapshot exists before a socket is allowed to open.
+ * Open the live session. Idempotent: a second call while a socket is already
+ * open is a no-op, so `access/granted` arriving twice cannot produce two
+ * sockets competing for the controlling seat.
  */
-function showFixtureSession(): void {
-  app.store.dispatch({
-    type: "snapshot/received",
-    snapshot: fixtureSnapshot(),
+/**
+ * Put anything the app queued in the store on the wire, and clear the queue.
+ *
+ * Only the `Esc` path puts bytes here (the reducer's `input/esc` pass-through);
+ * everything else goes straight from xterm's `onData` to the socket. It still
+ * has to be drained, and drained *by the transport*, because
+ * `state.pendingInput` is what artboard 2d's `N keystrokes held` counts — a
+ * queue nobody empties would leave the pane reporting held keystrokes that were
+ * in fact delivered, which is exactly the kind of claim §5.1 rules out.
+ *
+ * Deferred to a microtask so it never dispatches from inside the store's own
+ * notification pass.
+ */
+let flushScheduled = false;
+function flushQueuedInput(): void {
+  if (flushScheduled || session === null) {
+    return;
+  }
+  const state = app.store.getState();
+  if (state.pendingInput.length === 0) {
+    return;
+  }
+  const terminalId = state.selection?.terminalId ?? null;
+  if (terminalId === null) {
+    return; /** Nothing selected: keep it queued rather than guess a terminal. */
+  }
+  flushScheduled = true;
+  queueMicrotask(() => {
+    flushScheduled = false;
+    const pending = app.store.getState().pendingInput;
+    if (pending.length === 0 || session === null) {
+      return;
+    }
+    session.sendInput(terminalId, pending.join(""));
+    app.store.dispatch({ type: "input/flush" });
   });
-  app.store.dispatch({ type: "connection/changed", status: "connected" });
-  /** 1a is drawn in Terminal mode, so that is the state the fixture shows. */
-  app.store.dispatch({ type: "mode/set", mode: "terminal" });
+}
+
+function startSession(): void {
+  if (session !== null) {
+    return;
+  }
+  session = openSession({
+    store: app.store,
+    /**
+     * The viewport the browser can currently show, in cells. Reported so the
+     * host knows whether this tab is clipping the grid; it is structurally
+     * incapable of resizing a PTY (D4).
+     */
+    viewport: () => {
+      const geometry = app.store.getState().geometry;
+      if (geometry === null) {
+        return null;
+      }
+      return { cols: geometry.cols, rows: geometry.rows };
+    },
+  });
 }

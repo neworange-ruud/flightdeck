@@ -51,9 +51,29 @@ npx tsc --noEmit
 npm run test         # vitest
 ```
 
-The Playwright end-to-end job is separate and governed by the flake policy in
-`specs/WEB_INTERFACE.md` Q6 — retries 2 in CI, 0 locally, quarantine within a
-working day. Do not silence it by raising retries.
+**The Playwright end-to-end suite** (`webui/e2e`) is the fourth command, and it
+is the only test that proves the whole chain — a real FlightDeck on a real PTY, a
+real browser, real bytes rendered by xterm.js. Run it when you touch `webui/`,
+`src/web/`, or anything the browser reads:
+
+```bash
+cd webui
+npm run build                   # the suite asserts the page came from the embed
+npx playwright test             # locally: retries 0, so flake is visible
+# first time only:
+npx playwright install chromium
+```
+
+It launches the host itself (`cargo build`, a throwaway `$HOME`, a temp fixture
+repo, `--isolated`). `FD_E2E_SKIP_BUILD=1` reuses an existing
+`target/debug/flightdeck`; `FD_E2E_KEEP_TMP=1` keeps the fixture and the PTY
+transcript for a post-mortem. Unix only — it needs a PTY, like
+`tests/remote_e2e.rs`.
+
+Governed by the flake policy in `specs/WEB_INTERFACE.md` Q6 — retries 2 in CI, 0
+locally, quarantine (`test.fixme` + a filed `bd` issue) within a working day. **Do
+not silence it by raising retries.** The CI job is non-blocking until 2026-09-10
+and required after; see `.github/workflows/webui.yml`.
 - Dangerous / refusal paths need tests, not only success paths (SPECS §26).
 - A Stop hook runs the fast subset (`fmt --check` + `clippy`) automatically; the
   full `cargo test` run is still your responsibility.

@@ -1068,6 +1068,53 @@ impl CredentialStore {
         (self.mint_bootstrap_code(), error)
     }
 
+    /// **Test-only seam (debug builds only).** Mint a bootstrap code with
+    /// *known* digits instead of random ones, so an automated harness can
+    /// exchange it without reading the desktop's screen.
+    ///
+    /// The Playwright end-to-end suite (`webui/e2e`, D15) has to drive the real
+    /// `POST /auth/exchange` in a real browser, and it cannot: the persistent
+    /// token is stored as a SHA-256 hash so no usable credential can be read off
+    /// disk, and a random 4-digit code is only ever rendered into a TUI overlay
+    /// on a PTY. This is the same shape of seam as `PairingSession::begin_with_hint`
+    /// (the `FLIGHTDECK_REMOTE_AUTOPAIR` startup hook), for the same reason.
+    ///
+    /// What it deliberately is **not**:
+    ///
+    /// * Not a bypass. The returned code still has to be exchanged over the real
+    ///   endpoint, still expires after [`BOOTSTRAP_CODE_TTL_MS`], is still single
+    ///   use, and is still subject to both rate limiters. Nothing here mints a
+    ///   token or accepts one.
+    /// * Not present in a release build. The whole method is
+    ///   `#[cfg(debug_assertions)]`, so `cargo build --release` — which is how
+    ///   every shipped binary is produced (`dist-workspace.toml`,
+    ///   `.github/workflows/release.yml`) — does not compile it at all. There is
+    ///   no runtime flag, no config key and no feature to accidentally leave on.
+    ///
+    /// Returns `None` (minting nothing) unless `digits` is exactly
+    /// [`BOOTSTRAP_CODE_DIGITS`] ASCII digits, so a typo cannot install a code
+    /// the exchange endpoint would never match.
+    #[cfg(debug_assertions)]
+    pub fn mint_fixed_bootstrap_code(&mut self, digits: &str) -> Option<BootstrapCode> {
+        if digits.len() != BOOTSTRAP_CODE_DIGITS || !digits.bytes().all(|b: u8| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let code = BootstrapCode {
+            digits: digits.to_string(),
+            expires_at_ms: self
+                .clock
+                .now_millis()
+                .saturating_add(BOOTSTRAP_CODE_TTL_MS),
+        };
+        self.pending = Some(PendingCode {
+            code: code.clone(),
+            consumed: false,
+            failures: 0,
+        });
+        Some(code)
+    }
+
     /// Keep the tombstone list bounded, dropping the oldest revocations first.
     fn prune_tombstones(&mut self) {
         let mut revoked: Vec<(u64, TokenId)> = self

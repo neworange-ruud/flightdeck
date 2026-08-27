@@ -310,6 +310,14 @@
    * photograph" is a statement the user can verify by looking. */
   background: color-mix(in srgb, var(--fd-canvas) 74%, transparent);
 }
+/* The layer is toggled with the `hidden` property (`accessScreen.ts`), and
+ * `display: flex` above beats the UA stylesheet's `[hidden] { display: none }`
+ * — so without this rule a granted tab keeps a full-frame scrim over the app
+ * that dims everything and swallows every click, the terminal included. Caught
+ * by the Playwright suite (D15) trying to click into the terminal. */
+.fd-access[hidden] {
+  display: none;
+}
 .fd-frame {
   position: relative;
 }
@@ -528,6 +536,11 @@
   z-index: 2;
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 76%, transparent);
+}
+/* Same trap as `.fd-access[hidden]` above: `takeover.ts` toggles `hidden`, and
+ * `display: flex` would otherwise leave this scrim over the app for ever. */
+.fd-takeover[hidden] {
+  display: none;
 }
 .fd-takeover__panel {
   width: min(600px, calc(100% - 36px));

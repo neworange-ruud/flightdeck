@@ -27,5 +27,10 @@
        palette guard test, which reads the source tree off disk. */
     "types": ["vite/client", "node"]
   },
-  "include": ["src", "vite.config.ts"]
+  "include": [
+    "src",
+    "vite.config.ts",
+    "playwright.config.ts",
+    "e2e"
+  ]
 }

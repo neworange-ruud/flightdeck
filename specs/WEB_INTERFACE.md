@@ -459,7 +459,7 @@ On receiving it the browser enters a **terminal state and stops retrying**,
 naming the reason. If the quit was initiated from *this* browser, it shows an
 acknowledgement of its own action instead of a failure.
 
-### Q6 — Playwright flake policy · **provisional**
+### Q6 — Playwright flake policy · **implemented, see R5/R6**
 
 Agreed before the job lands, per D15's accepted cost:
 
@@ -470,6 +470,9 @@ Agreed before the job lands, per D15's accepted cost:
 - The job is **non-blocking for its first two weeks**, then becomes required.
   This repo has three open iOS flake issues (`remote-control-7lo`, `ba5`, `7lr`);
   the policy exists so the browser suite does not become a fourth.
+
+Landed as written on 2026-08-27: non-blocking from that date, **required from
+2026-09-10**. §6.5 R6 records where each half lives.
 
 ### Q7 — Is "hide the code while screen recording" implementable? · **provisional**
 
@@ -579,6 +582,85 @@ D4 and §7 previously cited `sync_selected_tab_sizes` and `resize_sessions`.
 Neither exists. The function is `sync_terminal_sizes` (`src/lib.rs:5405`),
 calling `resize_if_changed` (`src/lib.rs:5387`). Corrected in both places; the
 invariant is unchanged and still load-bearing.
+
+### R5 — the browser's live socket, and the one test-only seam it needed
+
+The Playwright job (D15) is the last M1 task, and writing it surfaced two gaps
+that had to be closed before it could assert anything true.
+
+**1. The SPA had no transport.** `remote-control-hgqy` landed the host half —
+the tee, the ring, the fan-out, the input path — and `webui/src/main.ts` was
+still painting `state/fixture.ts`. A browser-in-CI test against a fixture proves
+nothing, so the socket landed here: `webui/src/wire/frames.ts` (protocol v1 as
+TypeScript), `wire/adapt.ts` (wire → `state/model.ts`, per R2's decision, on the
+browser side of the pair), `wire/socket.ts` (attach, snapshot, `term_bytes`,
+`input`, acks, seats, shutdown, reconnect with backoff). Three properties are
+load-bearing and stated where they live: **bytes never enter the store** (they go
+from the frame to xterm.js, so a re-render cannot repaint or lose terminal
+output); **bytes stay bytes** (base64 → `Uint8Array` → `term.write`, so a UTF-8
+sequence split across two frames is xterm's decoder's problem, not a corrupted
+string); and **keystrokes come from xterm's own `onData`** rather than a
+hand-written key→bytes encoder, which is the part that always gets Home, Alt and
+the arrow keys wrong.
+
+Deltas that change facts the store only accepts wholesale (status, git, a new
+session) are answered with the host's own `request_snapshot` command, coalesced.
+That is a deliberate simplification of M1, not a permanent shape: it is honest
+(the browser never invents the new state) and it is one command away from being
+replaced by per-delta reducer actions when M2 needs them.
+
+**2. Authentication had no way in for a machine.** The persistent token is
+stored as a SHA-256 hash, so no usable credential can be read off disk, and the
+bootstrap code is random and rendered only into a TUI overlay on a PTY. The seam
+is `CredentialStore::mint_fixed_bootstrap_code`, driven by
+`FLIGHTDECK_WEB_TEST_CODE` — the same shape as the `FLIGHTDECK_REMOTE_AUTOPAIR`
+hook the phone harness uses, and bounded the same way:
+
+- It mints a code with **known digits**. It does not mint a token, accept one,
+  or skip a check. The browser still exchanges it at the real
+  `POST /auth/exchange`, and the code still expires after 120s, is still single
+  use, and is still subject to both rate limiters (asserted by three tests in
+  `src/web/credentials/tests.rs`).
+- The method and its caller are **`#[cfg(debug_assertions)]`**, so
+  `cargo build --release` — how every shipped binary is produced — does not
+  compile them at all. There is no runtime flag, no config key and no cargo
+  feature that could turn it on in a release build.
+
+**What the job found on its first run**, which is the argument for its
+existence: `.fd-access` and `.fd-takeover` are toggled with the `hidden`
+property, and their `display: flex` beat the UA stylesheet's
+`[hidden] { display: none }`. Every authenticated tab therefore kept a
+full-frame scrim over the app that dimmed it and swallowed every click,
+including into the terminal. No unit test in either language could have seen it;
+the browser found it in one click.
+
+### R6 — Q6's flake policy, as registered
+
+Implemented exactly as Q6 fixed it, and recorded here because the dates matter:
+
+- `retries: 2` in CI, `retries: 0` locally (`webui/playwright.config.ts`, from
+  `$CI`). `workers: 1` and `fullyParallel: false` are a *correctness*
+  requirement, not tuning: D14 gives out one controlling seat, and two workers
+  would fight over it.
+- Quarantine is `test.fixme` naming a filed `bd` issue and an owner, within the
+  same working day as the second consecutive failure on `main`. The exact form
+  is at the bottom of `webui/e2e/chain.spec.ts`. There are no quarantined tests
+  today.
+- **The job is registered non-blocking on 2026-08-27 and becomes required on
+  2026-09-10** — `continue-on-error: true` on the `e2e` job in
+  `.github/workflows/webui.yml`, with that date in the job's own comment and the
+  removal step spelled out. Raising `retries` to quiet the job is ruled out by
+  Q6; the repository's three open iOS flake issues are why.
+
+The suite is deliberately three tests, not ten. `tests/web_server.rs` already
+drives 35 tests over real sockets, so the browser suite asserts only what
+nothing else can reach: that the page came from the embedded assets, that
+authentication went through the real exchange endpoint, that **text the PTY
+really emitted is in the DOM xterm.js rendered**, that a keystroke typed in the
+browser reached the PTY (proved twice — the agent's echo renders, and the agent's
+own on-disk reply log records the line), and that the rendered grid is the host's
+`cols`×`rows` with the geometry chip saying so. The keystroke test was checked
+for vacuity by disabling the input path and watching it fail.
 
 ---
 

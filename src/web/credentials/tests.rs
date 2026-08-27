@@ -759,3 +759,70 @@ fn the_default_path_sits_beside_remote_json() {
         assert!(path.ends_with(".flightdeck/web.json"));
     }
 }
+
+// -- the debug-only test seam ----------------------------------------------
+//
+// `mint_fixed_bootstrap_code` exists so the Playwright suite (D15) can drive the
+// real exchange endpoint in a real browser; the tests below pin the two
+// properties that keep it from being a credential bypass. It is
+// `#[cfg(debug_assertions)]`, so a release build has no such method — and these
+// tests, which are also debug-only, are how we know the shape it does have.
+
+#[test]
+fn a_fixed_test_code_is_exchanged_by_the_ordinary_path() {
+    let (mut s, _fs, _clock) = store();
+
+    let code = s
+        .mint_fixed_bootstrap_code("8419")
+        .expect("four digits mint a code");
+    assert_eq!(code.reveal(), "8419");
+    // It is the live code, and it behaves like any other: same TTL, and the
+    // exchange is the shipped one.
+    assert_eq!(s.bootstrap_code().map(|c| c.reveal()), Some("8419"));
+    assert_eq!(s.bootstrap_seconds_remaining(), Some(120));
+    let token = s
+        .exchange_code(ADDR_A, "8419", Some("Chromium"))
+        .expect("exchange succeeds");
+    assert!(!token.reveal().is_empty());
+    // Single use, exactly as a random code is: the second attempt is refused
+    // and there is no live code left to try again with.
+    assert!(s.bootstrap_code().is_none());
+    assert!(s.exchange_code(ADDR_B, "8419", None).is_err());
+}
+
+#[test]
+fn a_fixed_test_code_still_expires_and_is_still_rate_limited() {
+    let (mut s, _fs, clock) = store();
+
+    s.mint_fixed_bootstrap_code("8419").expect("mint");
+    clock.set_millis(1_000_000 + BOOTSTRAP_CODE_TTL_MS + 1);
+    assert!(
+        s.bootstrap_code().is_none(),
+        "the seam must not hand out a code that outlives the TTL"
+    );
+    assert!(s.exchange_code(ADDR_A, "8419", None).is_err());
+
+    // And a wrong guess against a fixed code spends the address's budget the
+    // same way, so the seam cannot be used to sidestep the limiter either.
+    s.mint_fixed_bootstrap_code("8419").expect("mint");
+    let before = s.attempts_remaining(ADDR_A);
+    let _ = s.exchange_code(ADDR_A, "0000", None);
+    assert!(s.attempts_remaining(ADDR_A) < before);
+}
+
+#[test]
+fn a_fixed_test_code_that_is_not_four_digits_mints_nothing() {
+    let (mut s, _fs, _clock) = store();
+
+    for bad in ["", "84", "84190", "84a9", "８４１９"] {
+        assert!(
+            s.mint_fixed_bootstrap_code(bad).is_none(),
+            "{bad:?} must not mint a code"
+        );
+        assert!(
+            s.bootstrap_code().is_none(),
+            "{bad:?} left a code behind — a typo must not install one the \
+             exchange endpoint can never match"
+        );
+    }
+}
