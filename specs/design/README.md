@@ -16,7 +16,11 @@ network access or a live MCP login.
 
 | File | Contents |
 | --- | --- |
-| `flightdeck-web-turn1.dc.html` | Turn 1, artboards 1a–1h: main screen in Terminal and App mode, split view ×3, filtered command palette, new-agent dialog (both states), configuration manager, destructive confirmation, and the stated positions. |
+| `flightdeck-web-turn2.dc.html` | **Current.** Turn 2 (2a–2g) followed by turn 1 (1a–1h) in one document. Turn 2: access overlay in both states, the three browser-side access screens, every connection state, live/asleep/stale/asleep-and-stale/catching-up, the activity feed, the takeover trio, and the semantic reference sheet. |
+| `flightdeck-web-turn1.dc.html` | Turn 1 as originally delivered, artboards 1a–1h: main screen in Terminal and App mode, split view ×3, filtered command palette, new-agent dialog (both states), configuration manager, destructive confirmation, and the stated positions. Kept as the record of that turn; the turn-2 file carries the same artboards unchanged. |
+
+**Read `flightdeck-web-turn2.dc.html`** unless you specifically need the turn-1
+record — it is a superset.
 
 ## How to read them
 
@@ -30,9 +34,11 @@ size, border and string is an inline literal. To find a region, search for its
 banner comment — `1a — MAIN, TERMINAL MODE`, `1c — SPLIT VIEW`,
 `1f — CONFIGURATION MANAGER`, and so on.
 
-The palette is already extracted and named, with WCAG contrast measured, in
-`specs/WEBAPP_DESIGN_BRIEFING_T2.md` §7. Prefer that table over re-deriving
-values by hand; use these files for layout, structure and copy.
+**The palette is now named by the designer**, in artboard `2g — REFERENCE SHEET`:
+semantic custom properties (`--fd-text`, `--fd-stale`, `--fd-term-asleep`, …) with
+their meanings and contrast. Ship those names, not literals. `2g` supersedes the
+extracted table in `specs/WEBAPP_DESIGN_BRIEFING_T2.md` §7, which was the input
+that produced it. Use these files for layout, structure and copy.
 
 ## Keeping them current
 

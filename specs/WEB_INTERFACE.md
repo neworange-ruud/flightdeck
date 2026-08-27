@@ -80,11 +80,18 @@ any viewer-set geometry would be reverted within one frame unless the render pat
 learned to draw a PTY grid that is not its own pane size. Desktop-owns keeps that
 invariant exactly as it is, adds no state, and eliminates SIGWINCH churn.
 
+**Turn 2 refines how the browser presents that fixed grid: it letterboxes, it
+does not scale.** The host's grid renders at its natural size, centred on the
+terminal ground, leftover margin left dark, with a `120×34 · host owns geometry`
+chip in the git bar. The designer's argument is accepted: upscaling a bitmap grid
+would turn crisp type — the one thing a browser is genuinely better at than a
+terminal — into the one thing it does worst.
+
 Implementation notes:
 - xterm.js must be constructed with the host's `cols`/`rows` and **must not** use
-  `FitAddon` — it is a scaled viewport, not a fitted one.
-- Scaling is crisp at integer-ish ratios and soft off them; the browser should
-  prefer the nearest clean ratio over filling every pixel.
+  `FitAddon` — the viewport is letterboxed, not fitted, and never scaled.
+- The geometry chip is not decoration. It is the honest explanation for why a
+  large browser window has dark margins.
 
 > **Cost accepted:** a large browser window under-uses its space.
 > **Precedent that does not apply:** `src/lib.rs:2637` sizes a shell the *phone*
@@ -211,15 +218,26 @@ or cancel. No new state.
 
 M2 concern, but recorded now because D12's protocol must accommodate it.
 
-### D14 — Concurrent input: a single browser viewer in M1
+### D14 — One *controlling* browser, plus read-only observers
 
-The server accepts one browser at a time. A second attach is refused with an
-`already in use — take over?` prompt. The design's viewer count stays honest at
-2 (the desktop plus at most one browser), and the whole class of interleaved-input
-questions is deferred cheaply.
+The server accepts **one controlling browser at a time**. A second attach is
+offered a takeover, and — per turn 2 — **may instead watch read-only**.
 
-> **Cost accepted:** the design presents viewers as first-class; M1 under-delivers
-> on that until multi-viewer arrives.
+This is a revision. D14 originally said "one viewer, full stop"; turn 2's
+takeover artboard (2f) makes read-only observation a first-class affordance in
+two places: cancelling a takeover leaves a live read-only view, and an evicted
+browser can watch rather than fight. Adopted, because **it preserves D14's actual
+rationale exactly**. The reason for the restriction was to defer the
+interleaved-input problem — and read-only viewers have no input, so they do not
+reintroduce it. What it adds is read-only fan-out, which is strictly simpler than
+multi-writer arbitration.
+
+So M1 supports: the desktop, one controlling browser, and N observers. The
+viewer chip reads `desktop + this tab` — two named seats rather than a counter
+implying a crowd (2f). M3's multi-viewer list is the same panel with rows.
+
+> **Cost accepted:** fan-out to N sockets lands in M1 rather than M3. Modest, and
+> the alternative was shipping an approved design minus a feature.
 
 ### D15 — Testing: Rust integration + SPA unit + Playwright E2E
 
@@ -267,7 +285,7 @@ treatment from artboard 1g.
 └───────────────────────────────────────────────────────────────────┘
         │ 127.0.0.1 by default, 0.0.0.0 opt-in (D5)
         ▼
-   browser: Vite/TS SPA + xterm.js  (scales the fixed grid, D4)
+   browser: Vite/TS SPA + xterm.js  (letterboxes the fixed grid, D4)
 ```
 
 ---
@@ -277,7 +295,7 @@ treatment from artboard 1g.
 | Milestone | Contents |
 | --- | --- |
 | **M0** | Port the relay client to tokio (D6/D7 step 1); fix `5qu`, `zv3`, `aew` in async code; reconcile with `2jy`. **Prerequisite for M1.** |
-| **M1** | Embedded axum server, token auth + QR overlay, palette start/stop + config opt-in, web protocol v1, `webui/` SPA against artboards 1a/1b, live state, raw terminal streaming, terminal input, single-viewer takeover, activity feed, Rust integration tests + Playwright job. |
+| **M1** | Embedded axum server, token auth + access overlay, palette start/stop + config opt-in, web protocol v1, `webui/` SPA against artboards 1a–1c and 2a–2g, live state, raw terminal streaming, terminal input, takeover **plus read-only observers** (D14), activity feed, Rust integration tests + Playwright job. |
 | **M2** | Command palette, the dialog family with origin labels, git commands, destructive operations with two-step confirmation, configuration manager, split view (1c–1g). |
 | **M3** | Multi-viewer, narrow-viewport/slide-over layout, and — if pursued — a relay-tunnelled transport (which is what unblocks Web Push). |
 
@@ -296,19 +314,63 @@ leave terminal focus, with a single `Esc` still passing through to the agent;
 dark-only; `● connected 18ms` and a viewer count in the status bar; slide-over
 sidebar below 900px.
 
-**Not yet designed — needed before the milestone that uses them.** The turn-2
-brief covering the M1 gaps is `specs/WEBAPP_DESIGN_BRIEFING_T2.md`
-(`remote-control-l83`); turn 3 covers the rest (`remote-control-v4s`):
+Delivered in turn 2 (brief: `specs/WEBAPP_DESIGN_BRIEFING_T2.md`, artboards
+vendored at `specs/design/flightdeck-web-turn2.dc.html`): 2a access overlay in
+both states · 2b the three browser-side access screens · 2c every connection
+state · 2d live/asleep/stale/asleep-and-stale/catching-up · 2e activity feed ·
+2f takeover trio · 2g the semantic reference sheet.
+
+### 5.1 Requirements turn 2 introduced
+
+Behaviour the artboards specify that no decision above covered. All of it is
+required for M1.
+
+- **Input is queued, never dropped.** While reconnecting, the status bar says
+  `keystrokes are being held`; while catching up it says input queues until the
+  replay lands. Keystrokes typed against a stale terminal must not be silently
+  discarded, and must not be delivered out of order once the link returns.
+- **Losing control drains the mode chip.** Any state that costs the user control
+  renders `MODE: —`, because the mode is a lie while input is not arriving. The
+  connection strip never moves position, and the bar takes the state's frame
+  colour — the only chrome in the app that changes hue.
+- **The stale terminal is amber, cast plus scanlines plus a frozen clock, with
+  the caret removed.** Asleep desaturates cool (`--fd-term-asleep`, lifted to
+  5.8:1). The scanlines are what survive both, so asleep-and-stale is legible as
+  a third state. `--fd-stale #e0a34a` is a new token.
+- **The activity feed is a right-edge slide-over**, opened with `a` in App mode
+  or from the unread chip, never a modal. **The host retains the last 200 events
+  or 24 hours**, whichever is smaller, so a fresh tab opens on history rather
+  than silence. The unread chip has three tiers following the existing project-dot
+  precedence — attention beats finished beats quiet — and takes the colour of the
+  most urgent unread event.
+- **Feed rows are honest about shared selection.** Clicking an entry selects that
+  session on the desktop too (D3); the row says so on hover
+  (`jump · also moves the desktop`).
+- **Unknown stays unknown.** An agent with no lifecycle hooks renders `○` and
+  `unknown → unknown · Codex CLI reports no lifecycle` rather than a guess,
+  honouring the original brief's requirement for a credible "we don't know".
+- **Read-only observation is a real mode** (D14), reachable from both the
+  arriving and the evicted browser.
+- **The type scale is four sizes**, not turn 1's seven: 11 meta / 12.5 body / 14
+  title / 30 for the pairing code, which is the only place the app shouts.
+- **The dim tier is lifted.** `--fd-text-quiet` (4.8:1) carries anything a user
+  could act on wrongly, including `no-upstream` and `git: ?`.
+  `--fd-text-decor` (2.9:1) is decoration only, under a rule worth quoting into
+  code review: *if deleting it would lose a fact, it cannot be this colour.*
+
+**Not yet designed — needed before the milestone that uses them.** Turn 3 covers
+these (`remote-control-v4s`):
 
 | Gap | Needed by | Brief item |
 | --- | --- | --- |
-| Pairing / token-entry screen | M1 | §11.8 |
-| Disconnected / reconnecting / stale-terminal states | M1 | §8, §11.8 |
-| Single-viewer takeover prompt | M1 | new (D14) |
-| Activity feed | M1 | new (D11) |
-| Narrow viewport main screen | M3 | §11.9 |
+| Narrow viewport main screen — the below-900px slide-over 1h asserts but does not draw | M3 | §11.9 |
 | Help overlay, git-status overlay | M2 | §6.1 |
-| Colour/type reference sheet | M1 | §11.10 |
+
+**Nothing M1 needs is undesigned.** Every gap the turn-2 brief raised was
+delivered: the access screens, the connection states, the stale treatment, the
+takeover trio, the activity feed and the reference sheet. M1 can be built
+end-to-end against `specs/design/flightdeck-web-turn2.dc.html` without further
+design input.
 
 ---
 
@@ -336,6 +398,22 @@ states and the transition between them is part of the flow:
 - **Network enabled.** The QR now earns its place, encoding
   `http://<lan-ip>:<port>/#<code>`, alongside the code in large type, an explicit
   address choice, and the warning.
+
+**Delivered in turn 2, artboard 2a**, with three additions beyond the proposal:
+
+1. **The QR encodes the code**, deliberately. The designer's reasoning: a
+   URL-only QR trades a real and frequent cost — typing four digits on a phone
+   at the moment the user is trying to walk away from their desk — against a
+   hazard we cannot detect and the user can. Mitigated by `r` to hide the code
+   and QR at any time, and by hiding them by default while a screen-recording
+   API reports active capture (see **Q7** — that second mitigation may not be
+   portable).
+2. **The address is chosen, not guessed.** The overlay enumerates interfaces
+   (`en0` wifi, `bridge100` vm bridge, `tailscale0` your own tunnel) with a
+   one-line description each, and publishes the selected one. This is new work:
+   interface enumeration must behave identically on macOS, Linux and Windows.
+3. **Code entry is rate-limited** — "3 attempts left before this address is
+   rate-limited for 60s" (2b). Per-address, not global.
 
 ### Q2 — Replay ring buffer size · **provisional**
 
@@ -392,6 +470,26 @@ Agreed before the job lands, per D15's accepted cost:
 - The job is **non-blocking for its first two weeks**, then becomes required.
   This repo has three open iOS flake issues (`remote-control-7lo`, `ba5`, `7lr`);
   the policy exists so the browser suite does not become a fourth.
+
+### Q7 — Is "hide the code while screen recording" implementable? · **provisional**
+
+Turn 2 specifies that the code and QR render hidden by default "when a
+screen-recording API is active". This is on the **desktop overlay**, so detection
+would be a host-side OS query, not a browser one — and there is no portable way
+to ask it. macOS exposes partial signals, Linux has no common answer across
+compositors, and Windows differs again. FlightDeck holds a hard cross-platform
+parity requirement (`.agents/skills/flightdeck-cross-platform-parity`).
+
+**Provisional answer: do not gate the design on detection.** Ship the manual
+control, which works everywhere and is what the user actually controls:
+
+- The code and QR are **hidden behind a reveal** by default on every platform.
+- `r` toggles them, as the artboard specifies.
+- Where a platform *does* offer a trustworthy capture signal, use it to keep them
+  hidden and say why. Never use its *absence* to imply the screen is private.
+
+This keeps the security posture honest — never claiming a protection we cannot
+deliver — and keeps behaviour identical across platforms, which parity requires.
 
 ## 7. Reference
 

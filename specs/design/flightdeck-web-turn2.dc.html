@@ -1,0 +1,1479 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: #04090f; }
+  a { color: #61dafb; text-decoration: none; }
+  a:hover { color: #9be9ff; }
+  @keyframes fdPulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+  @keyframes fdGlow { 0%,100% { box-shadow: inset 0 0 0 1px rgba(97,218,251,.85), 0 0 22px -4px rgba(97,218,251,.45) } 50% { box-shadow: inset 0 0 0 1px rgba(97,218,251,.6), 0 0 30px -4px rgba(97,218,251,.28) } }
+  @keyframes fdCaret { 0%,49% { opacity: 1 } 50%,100% { opacity: 0 } }
+</style>
+</helmet>
+
+<section style="display: flex; flex-direction: column; gap: 64px; padding: 56px; font-family: 'JetBrains Mono', ui-monospace, monospace; background: #04090f; color: #edf4ff;">
+
+  <header style="display: flex; flex-direction: column; gap: 10px; max-width: 900px;">
+    <div style="display: flex; align-items: center; gap: 12px; font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: #5f7391;">
+      <span style="padding: 2px 7px; border: 1px solid #1b2c45; color: #61dafb;">turn 2</span>
+      <span>access · connection · takeover · activity · tokens</span>
+    </div>
+    <h1 style="margin: 0; font-size: 26px; font-weight: 500; letter-spacing: -.01em;">Everything that can go wrong, drawn honestly</h1>
+    <p style="margin: 0; font-size: 13px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty; max-width: 78ch;">Turn 1's language carried forward unchanged: 1px accent frame, titled header, every button shows its key, <span style="color: #4d5f79;">host only</span> badges stay visible. New this turn: one <span style="color: #e0a34a;">amber</span> token for staleness — the one state that must never be confused with App-mode sleep — and a lifted dim tier. Artboards <a href="#2a">2a</a>–<a href="#2g">2g</a>.</p>
+  </header>
+
+  <!-- ══ 2a — ACCESS OVERLAY, BOTH STATES ══ -->
+  <div id="2a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2a</span>
+      <span style="font-size: 14px;">Access overlay — State A local-only, State B network-enabled</span>
+      <span style="font-size: 12px; color: #5f7391;">desktop overlay · palette → Start Web Interface · the QR only appears once it can reach something</span>
+    </div>
+    <div style="display: flex; gap: 40px; flex-wrap: wrap;">
+
+      <div style="flex: none; width: 1520px; height: 760px; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden; font-size: 13px;">
+        <div style="position: absolute; inset: 0; display: flex; flex-direction: column;">
+          <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(97,218,251,.18), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(97,218,251,.18)); border-bottom: 1px solid #16233a;">
+            <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+            <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+            <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+          </div>
+          <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 16px; gap: 2px; color: #223650; font-size: 11.5px; white-space: pre;">
+            <div>● Read the whole spec folder. Starting on the relay handshake.</div>
+            <div style="height: 18px;"></div>
+            <div>● Bash(cargo test -p flightdeck-relay -- --nocapture)</div>
+            <div>  ⎿ Compiling flightdeck-relay v1.16.0</div>
+          </div>
+          <div style="height: 32px; flex: none; display: flex; align-items: center; gap: 12px; border-top: 1px solid #16233a; background: #04090f; font-size: 12.5px;">
+            <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #3d3a2a; color: #7d7358; font-weight: 700;">MODE: TERMINAL</span>
+            <span style="color: #24374f;">│</span><span style="color: #35496a;">Ctrl-g command palette</span>
+          </div>
+        </div>
+        <div style="position: absolute; inset: 0; background: rgba(4,9,15,.74);"></div>
+
+        <div style="position: absolute; left: 50%; top: 76px; width: 780px; margin-left: -390px; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb, 0 30px 70px -14px rgba(0,0,0,.85);">
+          <div style="display: flex; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07); font-size: 12.5px;">
+            <span style="color: #61dafb; font-weight: 700;">Web Interface</span>
+            <span style="color: #4d5f79;">Esc to close</span>
+          </div>
+          <div style="padding: 16px; display: flex; flex-direction: column; gap: 14px; font-size: 12.5px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="color: #5ddc9a;">●</span>
+              <span style="color: #edf4ff; font-weight: 700;">serving</span>
+              <span style="color: #24374f;">│</span>
+              <span style="color: #a9b8cf;">127.0.0.1:7420</span>
+              <span style="color: #24374f;">│</span>
+              <span style="color: #6d819d;">loopback only — nothing off this machine can reach it</span>
+            </div>
+
+            <div style="display: flex; gap: 12px; align-items: stretch;">
+              <span style="display: flex; align-items: center; gap: 9px; padding: 9px 16px; background: #61dafb; color: #07111f; font-weight: 700; font-size: 13px;"><span style="background: rgba(7,17,31,.22); padding: 1px 6px;">Enter</span>Open in browser</span>
+              <span style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 1px 6px;">c</span>Copy URL</span>
+              <span style="flex: 1;"></span>
+              <span style="display: flex; align-items: center; gap: 7px; color: #4d5f79; font-size: 11px;">launches the host's default browser <span style="padding: 1px 6px; box-shadow: inset 0 0 0 1px #24374f;">host only</span></span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: #04090f; box-shadow: inset 0 0 0 1px #16233a; color: #dce7f7;">
+              <span style="color: #4d5f79;">url</span>
+              <span>http://127.0.0.1:7420</span>
+              <span style="flex: 1;"></span>
+              <span style="color: #6d819d; font-size: 11px;">already authenticated — no code needed on this machine</span>
+            </div>
+
+            <div style="height: 1px; background: #101d31;"></div>
+
+            <div style="display: flex; flex-direction: column; gap: 7px;">
+              <div style="display: flex; align-items: center; gap: 9px;">
+                <span style="color: #61dafb;">▸</span>
+                <span style="background: #101d31; padding: 1px 6px; color: #f5d76e;">n</span>
+                <span style="color: #edf4ff; font-weight: 700;">Allow other devices on this network to connect</span>
+                <span style="color: #4d5f79;">→</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d; line-height: 1.7;">Rebinds to <span style="color: #a9b8cf;">0.0.0.0</span>, then asks which address to publish and issues a scannable code. Reaching FlightDeck from outside this network is your own tunnel — this switch does not do it.</div>
+            </div>
+          </div>
+          <div style="display: flex; gap: 14px; padding: 8px 14px; border-top: 1px solid #101d31; color: #4d5f79; font-size: 11.5px;">
+            <span><span style="color: #f5d76e;">Enter</span> open</span>
+            <span><span style="color: #f5d76e;">c</span> copy</span>
+            <span><span style="color: #f5d76e;">n</span> network access</span>
+            <span><span style="color: #f5d76e;">s</span> stop server</span>
+            <span><span style="color: #f5d76e;">Esc</span> close</span>
+            <span style="flex: 1;"></span>
+            <span>State A — the common case never shows a code</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="flex: none; width: 1520px; height: 760px; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden; font-size: 13px;">
+        <div style="position: absolute; inset: 0; display: flex; flex-direction: column;">
+          <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(224,163,74,.16), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(224,163,74,.16)); border-bottom: 1px solid #16233a;">
+            <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+            <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+            <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+          </div>
+          <div style="flex: 1;"></div>
+        </div>
+        <div style="position: absolute; inset: 0; background: rgba(4,9,15,.74);"></div>
+
+        <div style="position: absolute; left: 50%; top: 60px; width: 900px; margin-left: -450px; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb, 0 30px 70px -14px rgba(0,0,0,.85);">
+          <div style="display: flex; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07); font-size: 12.5px;">
+            <span style="color: #61dafb; font-weight: 700;">Web Interface — network access</span>
+            <span style="color: #4d5f79;">Esc to close</span>
+          </div>
+          <div style="display: flex; gap: 1px; background: #101d31;">
+            <div style="width: 320px; flex: none; padding: 16px; background: #050d19; display: flex; flex-direction: column; gap: 12px; align-items: center;">
+              <div style="width: 236px; height: 236px; background: #edf4ff; position: relative; display: flex; align-items: center; justify-content: center;">
+                <div style="position: absolute; left: 14px; top: 14px; width: 46px; height: 46px; box-shadow: inset 0 0 0 9px #07111f;"></div>
+                <div style="position: absolute; right: 14px; top: 14px; width: 46px; height: 46px; box-shadow: inset 0 0 0 9px #07111f;"></div>
+                <div style="position: absolute; left: 14px; bottom: 14px; width: 46px; height: 46px; box-shadow: inset 0 0 0 9px #07111f;"></div>
+                <div style="position: absolute; left: 14px; right: 14px; top: 74px; bottom: 74px; background: repeating-linear-gradient(90deg, #07111f 0 8px, transparent 8px 16px), repeating-linear-gradient(0deg, #07111f 0 8px, transparent 8px 16px); opacity: .16;"></div>
+                <span style="position: relative; font-size: 10.5px; color: #07111f; background: #edf4ff; padding: 3px 6px; text-align: center; line-height: 1.5;">QR placeholder<br />http://192.168.2.14:7420/#8412</span>
+              </div>
+              <div style="display: flex; flex-direction: column; align-items: center; gap: 3px;">
+                <span style="font-size: 30px; letter-spacing: .34em; color: #edf4ff; font-weight: 700; padding-left: .34em;">8412</span>
+                <span style="color: #f5d76e; font-size: 11.5px;">expires in 97s</span>
+                <span style="color: #4d5f79; font-size: 11px;"><span style="color: #f5d76e;">r</span> hide code · <span style="color: #f5d76e;">Space</span> new code</span>
+              </div>
+            </div>
+            <div style="flex: 1; padding: 16px; background: #050d19; display: flex; flex-direction: column; gap: 13px; font-size: 12.5px;">
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <span style="color: #e0a34a;">●</span>
+                <span style="color: #edf4ff; font-weight: 700;">serving on this network</span>
+                <span style="color: #24374f;">│</span>
+                <span style="color: #6d819d;">0.0.0.0:7420</span>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 5px;">
+                <div style="color: #6d819d; font-size: 11px; letter-spacing: .12em; text-transform: uppercase;">Publish which address</div>
+                <div style="display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: rgba(97,218,251,.1); box-shadow: inset 2px 0 0 #61dafb;"><span style="color: #61dafb;">▸</span><span style="color: #61dafb;">‹en0›</span><span style="color: #edf4ff; font-weight: 700;">192.168.2.14</span><span style="flex: 1;"></span><span style="color: #4d5f79; font-size: 11px;">wifi · reachable by your phone</span></div>
+                <div style="display: flex; align-items: center; gap: 10px; padding: 6px 10px; color: #a9b8cf;"><span style="color: transparent;">▸</span><span style="color: #4d5f79;">‹bridge100›</span><span>192.168.64.1</span><span style="flex: 1;"></span><span style="color: #4d5f79; font-size: 11px;">vm bridge</span></div>
+                <div style="display: flex; align-items: center; gap: 10px; padding: 6px 10px; color: #a9b8cf;"><span style="color: transparent;">▸</span><span style="color: #4d5f79;">‹tailscale0›</span><span>100.87.14.3</span><span style="flex: 1;"></span><span style="color: #4d5f79; font-size: 11px;">your own tunnel</span></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 7px; padding: 11px 12px; background: rgba(255,107,107,.07); box-shadow: inset 2px 0 0 #ff6b6b;">
+                <div style="color: #ff6b6b; font-weight: 700; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;">What you are allowing</div>
+                <div style="color: #f4e3e4; line-height: 1.7;">Anyone on this network who has the code can read your repositories, type into your agents, and push branches.</div>
+                <div style="color: #d8b6b8; font-size: 11.5px; line-height: 1.65;">The code lasts 120s and buys a cookie in one browser. Revoke it and that browser is locked out on its next request.</div>
+              </div>
+
+              <div style="display: flex; flex-wrap: wrap; gap: 9px;">
+                <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 1px 6px; color: #f5d76e;">l</span>Back to local only</span>
+                <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #4a2226; color: #f4e3e4;"><span style="background: #2a1418; padding: 1px 6px; color: #ff6b6b;">x</span>Revoke browser access</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px; color: #6d819d; font-size: 11.5px;"><span style="color: #5ddc9a;">●</span>1 browser holds access <span style="color: #4d5f79;">· 192.168.2.20 · Safari/iOS · 14m</span></div>
+            </div>
+          </div>
+          <div style="display: flex; gap: 14px; padding: 8px 14px; border-top: 1px solid #101d31; color: #4d5f79; font-size: 11.5px;">
+            <span><span style="color: #f5d76e;">↑↓</span> address</span>
+            <span><span style="color: #f5d76e;">Space</span> new code</span>
+            <span><span style="color: #f5d76e;">r</span> hide</span>
+            <span><span style="color: #f5d76e;">x</span> revoke</span>
+            <span><span style="color: #f5d76e;">Esc</span> close</span>
+            <span style="flex: 1;"></span>
+            <span>State B — same overlay, one door away</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: #16233a; border: 1px solid #16233a; max-width: 1520px;">
+      <div style="background: #07111f; padding: 15px 18px; display: flex; flex-direction: column; gap: 7px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">Yes, the QR encodes the code</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;">A QR that only carries the URL trades a real, frequent cost — typing four digits on a phone keyboard, at the exact moment the user is trying to walk away from their desk — for a hazard we cannot detect and the user can. So we encode it, and give the user the control instead: the code and QR render <span style="color: #f5d76e;">hidden by default when a screen-recording API is active</span>, and <span style="color: #f5d76e;">r</span> hides them at any time. 120 seconds, one exchange, revocable from the desktop.</p>
+      </div>
+      <div style="background: #07111f; padding: 15px 18px; display: flex; flex-direction: column; gap: 7px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">D4 — the desktop owns geometry</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;">The browser letterboxes rather than scales: the host's grid renders at its natural size, centred on the terminal ground, with the leftover margin left dark and a <span style="color: #4d5f79;">120×34 · host owns geometry</span> chip in the git bar. Upscaling a bitmap grid would make crisp type — the one thing the browser is genuinely better at — into the one thing it does worst.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2b — BROWSER-SIDE ACCESS SCREENS ══ -->
+  <div id="2b" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2b</span>
+      <span style="font-size: 14px;">Browser-side access — code entry, rejected, revoked</span>
+      <span style="font-size: 12px; color: #5f7391;">three separate screens, because three different things went wrong</span>
+    </div>
+    <div style="display: flex; gap: 20px; width: 1520px;">
+
+      <div style="flex: 1; min-width: 0; height: 460px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; font-size: 12.5px;">
+        <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: center; background: linear-gradient(90deg, rgba(97,218,251,.18), rgba(97,218,251,.02) 30%, rgba(97,218,251,.02) 70%, rgba(97,218,251,.18)); border-bottom: 1px solid #16233a;">
+          <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        </div>
+        <div style="flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 20px;">
+          <div style="width: 100%; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb;">
+            <div style="padding: 7px 12px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07); color: #61dafb; font-weight: 700;">Enter your code</div>
+            <div style="padding: 14px 12px; display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; gap: 8px;">
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #edf4ff; background: #04090f; box-shadow: inset 0 0 0 1px #24374f;">8</span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #edf4ff; background: #04090f; box-shadow: inset 0 0 0 1px #24374f;">4</span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; background: #04090f; box-shadow: inset 0 0 0 1px #61dafb;"><span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span></span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; background: #04090f; box-shadow: inset 0 0 0 1px #24374f;"></span>
+              </div>
+              <div style="color: #a9b8cf; line-height: 1.7;">On the machine running FlightDeck, press <span style="color: #f5d76e;">Ctrl-g</span> and run <span style="color: #61dafb;">Web Interface</span>. The overlay shows a four-digit code, good for two minutes.</div>
+              <div style="color: #6d819d; font-size: 11.5px; line-height: 1.7;">Your last code stopped working because this browser's access was cleared, or you are on a different browser.</div>
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; background: #61dafb; color: #07111f; font-weight: 700; align-self: flex-start;"><span style="background: rgba(7,17,31,.22); padding: 1px 6px;">Enter</span>Connect</span>
+            </div>
+          </div>
+        </div>
+        <div style="flex: none; padding: 7px 12px; border-top: 1px solid #16233a; background: #050c16; color: #4d5f79; font-size: 11px;">no session · 192.168.2.14:7420</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; height: 460px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; font-size: 12.5px;">
+        <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: center; background: linear-gradient(90deg, rgba(255,107,107,.16), rgba(97,218,251,.02) 30%, rgba(97,218,251,.02) 70%, rgba(255,107,107,.16)); border-bottom: 1px solid #16233a;">
+          <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        </div>
+        <div style="flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 20px;">
+          <div style="width: 100%; background: #180d10; box-shadow: inset 0 0 0 1px #ff6b6b;">
+            <div style="padding: 7px 12px; border-bottom: 1px solid #4a2226; background: rgba(255,107,107,.1); color: #ff6b6b; font-weight: 700;">That code did not work</div>
+            <div style="padding: 14px 12px; display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; gap: 8px;">
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #f4e3e4; background: #04090f; box-shadow: inset 0 0 0 1px #ff6b6b;">8</span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #f4e3e4; background: #04090f; box-shadow: inset 0 0 0 1px #ff6b6b;">4</span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #f4e3e4; background: #04090f; box-shadow: inset 0 0 0 1px #ff6b6b;">1</span>
+                <span style="width: 46px; height: 56px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #f4e3e4; background: #04090f; box-shadow: inset 0 0 0 1px #ff6b6b;">9</span>
+              </div>
+              <div style="color: #f4e3e4; line-height: 1.7;">It expired, or it was mistyped. Codes last <span style="color: #ff6b6b;">120 seconds</span> and only work once.</div>
+              <div style="display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; background: rgba(255,107,107,.06); box-shadow: inset 2px 0 0 #ff6b6b; color: #d8b6b8; font-size: 11.5px; line-height: 1.6;">
+                <div><span style="color: #ff6b6b;">1</span> go to the machine running FlightDeck</div>
+                <div><span style="color: #ff6b6b;">2</span> <span style="color: #f5d76e;">Ctrl-g</span> → <span style="color: #61dafb;">Web Interface</span> → <span style="color: #f5d76e;">Space</span> for a fresh code</div>
+              </div>
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; background: #ff6b6b; color: #180d10; font-weight: 700; align-self: flex-start;"><span style="background: rgba(24,13,16,.25); padding: 1px 6px;">Enter</span>Try again</span>
+            </div>
+          </div>
+        </div>
+        <div style="flex: none; padding: 7px 12px; border-top: 1px solid #16233a; background: #050c16; color: #4d5f79; font-size: 11px;">3 attempts left before this address is rate-limited for 60s</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; height: 460px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; font-size: 12.5px;">
+        <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: center; background: linear-gradient(90deg, rgba(224,163,74,.16), rgba(97,218,251,.02) 30%, rgba(97,218,251,.02) 70%, rgba(224,163,74,.16)); border-bottom: 1px solid #16233a;">
+          <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        </div>
+        <div style="flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; padding: 20px;">
+          <div style="position: absolute; inset: 0; display: flex; flex-direction: column; padding: 12px 14px; gap: 2px; color: #2b3d52; font-size: 11px; white-space: pre;">
+            <div>● Re-running the fan-out test now, then I will push</div>
+            <div>✻ Churning for 2m 14s · esc to interrupt</div>
+          </div>
+          <div style="position: absolute; inset: 0; background: rgba(4,9,15,.72);"></div>
+          <div style="position: relative; width: 100%; background: #150f06; box-shadow: inset 0 0 0 1px #e0a34a;">
+            <div style="padding: 7px 12px; border-bottom: 1px solid #4a3a1c; background: rgba(224,163,74,.12); color: #e0a34a; font-weight: 700; display: flex; justify-content: space-between;"><span>Access revoked</span><span style="color: #8a7448; font-weight: 400;">from the desktop</span></div>
+            <div style="padding: 14px 12px; display: flex; flex-direction: column; gap: 12px;">
+              <div style="color: #f2e6d2; line-height: 1.7;">Someone at the FlightDeck machine withdrew this browser's access <span style="color: #e0a34a;">12s ago</span>. Nothing is broken and nothing is lost — you are simply no longer allowed in.</div>
+              <div style="color: #b9a37c; font-size: 11.5px; line-height: 1.7;">The agents kept running. Everything you can see below this dialog is a photograph from the moment access ended.</div>
+              <div style="display: flex; gap: 9px;">
+                <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; background: #e0a34a; color: #150f06; font-weight: 700;"><span style="background: rgba(21,15,6,.25); padding: 1px 6px;">Enter</span>Enter a new code</span>
+                <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #4a3a1c; color: #b9a37c;"><span style="background: #2a2210; padding: 1px 6px;">Esc</span>Stay here</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div style="flex: none; padding: 7px 12px; border-top: 1px solid #16233a; background: #050c16; color: #8a7448; font-size: 11px;">amber, not red — this is a decision someone made, not a failure</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2c — CONNECTION STATES ══ -->
+  <div id="2c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2c</span>
+      <span style="font-size: 14px;">Connection indicator — every state, on the real status bar</span>
+      <span style="font-size: 12px; color: #5f7391;">right-aligned, always in the same place · the mode chip never changes meaning</span>
+    </div>
+    <div style="width: 1520px; display: flex; flex-direction: column; gap: 10px;">
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">connected</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #16233a; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+          <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">Ctrl-g</span> command palette</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #5ddc9a;">●</span>connected <span style="color: #6d819d;">18ms</span></span>
+          <span style="color: #24374f;">│</span><span style="padding-right: 12px; color: #8a9cb8;">desktop + this tab</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">connecting</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #16233a; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+          <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">Ctrl-g</span> command palette</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #61dafb;">{{ spinner }}</span>connecting <span style="color: #6d819d;">attaching to 192.168.2.14</span></span>
+          <span style="padding-right: 12px;"></span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">reconnecting</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #4a3a1c; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #3d3a2a; color: #a9967a; font-weight: 700;">MODE: TERMINAL</span>
+          <span style="color: #24374f;">│</span><span style="color: #6d819d;">keystrokes are being held</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #f2e6d2;"><span style="color: #e0a34a;">{{ spinner }}</span>reconnecting <span style="color: #b9a37c;">attempt 3 · retry in 4s</span></span>
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #e0a34a; color: #150f06; font-weight: 700;">terminal stale 34s</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">disconnected</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #4a2226; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #3a2226; color: #a4757a; font-weight: 700;">MODE: —</span>
+          <span style="color: #24374f;">│</span><span style="color: #d8b6b8;">the host stopped answering · nothing you type will arrive</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #f4e3e4;"><span style="color: #ff6b6b;">●</span>disconnected <span style="color: #a4757a;">gave up after 6 attempts</span></span>
+          <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #ff6b6b; color: #180d10; font-weight: 700;"><span style="background: rgba(24,13,16,.25); padding: 1px 6px;">r</span>Retry now</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">version mismatch</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #1e3a5a; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+          <span style="color: #24374f;">│</span><span style="color: #a9b8cf;">the host updated under you — this tab is running v1.16.0</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #6aa8ff;">●</span>connected <span style="color: #6d819d;">21ms</span></span>
+          <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #6aa8ff; color: #041020; font-weight: 700;"><span style="background: rgba(4,16,32,.25); padding: 1px 6px;">Enter</span>Reload for v1.17.0</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">revoked</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #4a3a1c; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #3d3a2a; color: #a9967a; font-weight: 700;">MODE: —</span>
+          <span style="color: #24374f;">│</span><span style="color: #f2e6d2;">access withdrawn from the desktop — the host is fine</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #f2e6d2;"><span style="color: #e0a34a;">●</span>not allowed</span>
+          <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #e0a34a; color: #150f06; font-weight: 700;"><span style="background: rgba(21,15,6,.25); padding: 1px 6px;">Enter</span>Enter a code</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">host quit <span style="color: #4d5f79;">(Q5)</span></span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px solid #24374f; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #24374f; color: #a9b8cf; font-weight: 700;">FLIGHTDECK STOPPED</span>
+          <span style="color: #24374f;">│</span><span style="color: #a9b8cf;">you quit FlightDeck from this tab · 6 agents were stopped</span>
+          <span style="flex: 1;"></span>
+          <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #6d819d;">○</span>host exited cleanly <span style="color: #6d819d;">16:42</span></span>
+          <span style="padding-right: 12px; color: #6d819d;">start it again on the machine to reconnect</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="width: 150px; flex: none; color: #6d819d; font-size: 11.5px; text-align: right;">not to be confused</span>
+        <div style="flex: 1; height: 32px; display: flex; align-items: center; gap: 12px; background: #04090f; border: 1px dashed #24374f; font-size: 12.5px;">
+          <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+          <span style="color: #24374f;">│</span><span style="color: #6d819d;">turn 1's update chip — about the <span style="color: #a9b8cf;">host binary</span>, not this tab</span>
+          <span style="flex: 1;"></span>
+          <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">● v1.17.0 available</span>
+        </div>
+      </div>
+
+      <p style="margin: 4px 0 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; max-width: 110ch; text-wrap: pretty;">Three rules hold the strip together: the <span style="color: #a9b8cf;">position never moves</span>, so a glance always lands on it; anything that costs the user control also <span style="color: #e0a34a;">drains the mode chip</span>, because the mode is a lie while input is not arriving; and the whole bar takes the state's frame colour, which is the only chrome in the app that ever changes hue.</p>
+    </div>
+  </div>
+
+  <!-- ══ 2d — ASLEEP vs STALE ══ -->
+  <div id="2d" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2d</span>
+      <span style="font-size: 14px;">Live · asleep · stale · asleep-and-stale · catching up</span>
+      <span style="font-size: 12px; color: #5f7391;">asleep desaturates cool; stale casts amber and freezes a clock — they read differently even together</span>
+    </div>
+    <div style="display: flex; gap: 14px; width: 1520px;">
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f; border: 1px solid #16233a;">
+        <div style="flex: none; padding: 5px 10px; background: #f5d76e; color: #07111f; font-weight: 700; font-size: 11.5px;">agent · live</div>
+        <div style="height: 300px; padding: 9px 10px; display: flex; flex-direction: column; white-space: pre; font-size: 11px; line-height: 1.62; color: #dce7f7; overflow: hidden;">
+          <div><span style="color: #5ddc9a;">●</span> <span style="font-weight: 700;">Edit</span>(relay/src/session.rs)</div>
+          <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #5ddc9a;">+ viewers: Vec&lt;…&gt;</span></div>
+          <div>     <span style="color: #ff6b6b;">- viewers: HashMap</span></div>
+          <div style="height: 18px;"></div>
+          <div><span style="color: #5ddc9a;">●</span> Re-running the suite,</div>
+          <div>  then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div><span style="color: #f5d76e;">✻</span> <span style="color: #8a9cb8;">Churning 2m 14s</span></div>
+          <div style="height: 18px;"></div>
+          <div><span style="color: #61dafb;">›</span> <span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span></div>
+        </div>
+        <div style="flex: none; padding: 6px 10px; border-top: 1px solid #16233a; background: #050c16; color: #6d819d; font-size: 10.5px;">full colour · caret blinking · your keys arrive</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f; border: 1px solid #16233a;">
+        <div style="flex: none; padding: 5px 10px; background: #3d3a2a; color: #a9967a; font-weight: 700; font-size: 11.5px;">agent · asleep <span style="color: #7d7358; font-weight: 400;">(App mode)</span></div>
+        <div style="height: 300px; padding: 9px 10px; display: flex; flex-direction: column; white-space: pre; font-size: 11px; line-height: 1.62; color: #7d90ab; overflow: hidden;">
+          <div>● Edit(relay/src/session.rs)</div>
+          <div>  ⎿ + viewers: Vec&lt;…&gt;</div>
+          <div>     - viewers: HashMap</div>
+          <div style="height: 18px;"></div>
+          <div>● Re-running the suite,</div>
+          <div>  then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div>✻ Churning 2m 14s</div>
+          <div style="height: 18px;"></div>
+          <div>› </div>
+        </div>
+        <div style="flex: none; padding: 6px 10px; border-top: 1px solid #16233a; background: #050c16; color: #8a9cb8; font-size: 10.5px;">terminal asleep — keystrokes go to FlightDeck · <span style="color: #d68bf5;">Enter</span> to wake</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #0d0b06; border: 1px solid #4a3a1c;">
+        <div style="flex: none; padding: 5px 10px; background: #e0a34a; color: #150f06; font-weight: 700; font-size: 11.5px; display: flex; justify-content: space-between;"><span>agent · stale</span><span>16:41:08</span></div>
+        <div style="height: 300px; position: relative; padding: 9px 10px; display: flex; flex-direction: column; white-space: pre; font-size: 11px; line-height: 1.62; color: #c9b184; overflow: hidden;">
+          <div>● Edit(relay/src/session.rs)</div>
+          <div>  ⎿ <span style="color: #a89065;">+ viewers: Vec&lt;…&gt;</span></div>
+          <div>     <span style="color: #a89065;">- viewers: HashMap</span></div>
+          <div style="height: 18px;"></div>
+          <div>● Re-running the suite,</div>
+          <div>  then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div>✻ Churning 2m 14s</div>
+          <div style="height: 18px;"></div>
+          <div>› </div>
+          <div style="position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(224,163,74,.11) 0 1px, transparent 1px 4px); pointer-events: none;"></div>
+          <div style="position: absolute; left: 10px; right: 10px; bottom: 10px; padding: 6px 9px; background: rgba(21,15,6,.9); box-shadow: inset 0 0 0 1px #e0a34a; color: #f2e6d2; font-size: 10.5px; white-space: normal; line-height: 1.55;">frozen 34s ago — this is a photograph. Nothing you type is arriving.</div>
+        </div>
+        <div style="flex: none; padding: 6px 10px; border-top: 1px solid #4a3a1c; background: #150f06; color: #b9a37c; font-size: 10.5px;">amber cast + scanlines + frozen clock · caret gone, not blinking</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #0b0c0a; border: 1px solid #4a3a1c;">
+        <div style="flex: none; padding: 5px 10px; background: #6b5a34; color: #150f06; font-weight: 700; font-size: 11.5px; display: flex; justify-content: space-between;"><span>asleep + stale</span><span>16:41:08</span></div>
+        <div style="height: 300px; position: relative; padding: 9px 10px; display: flex; flex-direction: column; white-space: pre; font-size: 11px; line-height: 1.62; color: #8f8977; overflow: hidden;">
+          <div>● Edit(relay/src/session.rs)</div>
+          <div>  ⎿ + viewers: Vec&lt;…&gt;</div>
+          <div>     - viewers: HashMap</div>
+          <div style="height: 18px;"></div>
+          <div>● Re-running the suite,</div>
+          <div>  then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div>✻ Churning 2m 14s</div>
+          <div style="height: 18px;"></div>
+          <div>› </div>
+          <div style="position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(224,163,74,.09) 0 1px, transparent 1px 4px); pointer-events: none;"></div>
+          <div style="position: absolute; left: 10px; right: 10px; bottom: 10px; padding: 6px 9px; background: rgba(11,12,10,.92); box-shadow: inset 0 0 0 1px #6b5a34; color: #cfc7ae; font-size: 10.5px; white-space: normal; line-height: 1.55;">frozen 34s ago · and FlightDeck has focus, so keys would go to the sidebar anyway.</div>
+        </div>
+        <div style="flex: none; padding: 6px 10px; border-top: 1px solid #4a3a1c; background: #12120e; color: #9a9280; font-size: 10.5px;">desaturated <span style="color: #cfc7ae;">and</span> amber-cast · the scanlines are what survive both</div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f; border: 1px solid #1e3a5a;">
+        <div style="flex: none; padding: 5px 10px; background: #61dafb; color: #07111f; font-weight: 700; font-size: 11.5px; display: flex; justify-content: space-between;"><span>catching up</span><span>{{ spinner }}</span></div>
+        <div style="height: 300px; position: relative; padding: 9px 10px; display: flex; flex-direction: column; white-space: pre; font-size: 11px; line-height: 1.62; color: #dce7f7; overflow: hidden;">
+          <div><span style="color: #5ddc9a;">●</span> <span style="font-weight: 700;">Edit</span>(relay/src/session.rs)</div>
+          <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #5ddc9a;">+ viewers: Vec&lt;…&gt;</span></div>
+          <div>     <span style="color: #ff6b6b;">- viewers: HashMap</span></div>
+          <div style="height: 18px;"></div>
+          <div><span style="color: #5ddc9a;">●</span> Re-running the suite,</div>
+          <div>  then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div><span style="color: #f5d76e;">✻</span> <span style="color: #8a9cb8;">Churning 2m 14s</span></div>
+          <div style="height: 18px;"></div>
+          <div style="color: #35496a;">▏replaying 41 KB…</div>
+          <div style="position: absolute; left: 0; right: 0; bottom: 44px; height: 2px; background: #101d31;"><div style="width: 62%; height: 2px; background: #61dafb;"></div></div>
+          <div style="position: absolute; left: 10px; right: 10px; bottom: 10px; padding: 6px 9px; background: rgba(5,13,25,.92); box-shadow: inset 0 0 0 1px #61dafb; color: #dce7f7; font-size: 10.5px; white-space: normal; line-height: 1.55;">live again · replaying what you missed from byte 1 204 992</div>
+        </div>
+        <div style="flex: none; padding: 6px 10px; border-top: 1px solid #1e3a5a; background: #050c16; color: #6d819d; font-size: 10.5px;">colour is back, so it is trustworthy · input queues until the replay lands</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2e — ACTIVITY FEED ══ -->
+  <div id="2e" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2e</span>
+      <span style="font-size: 14px;">Activity feed — the entire substitute for OS notifications</span>
+      <span style="font-size: 12px; color: #5f7391;">right-edge slide-over over the viewport · <span style="color: #f5d76e;">a</span> in App mode, or the unread chip · never a modal</span>
+    </div>
+
+    <div style="width: 1520px; height: 620px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; overflow: hidden; font-size: 12.5px;">
+      <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(97,218,251,.18), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(97,218,251,.18)); border-bottom: 1px solid #16233a;">
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+        <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+      </div>
+      <div style="height: 30px; flex: none; display: flex; align-items: stretch; padding: 0 8px; border-bottom: 1px solid #16233a; background: #050c16;">
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px; background: rgb(16,38,68); box-shadow: inset 0 -2px 0 #61dafb;"><span style="color: #ff6b6b; animation: fdPulse 1s infinite;">{{ spinner }}</span><span style="color: #edf4ff; font-weight: 500;">flightdeck</span><span style="color: #ff6b6b; opacity: .8;">✕</span></div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;"><span style="color: #ff6b6b;">●</span><span style="color: #a9b8cf;">api-gateway</span></div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;"><span style="color: #5ddc9a;">●</span><span style="color: #a9b8cf;">web</span></div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; padding: 0 10px; color: #61dafb;">+ project</div>
+      </div>
+
+      <div style="flex: 1; min-height: 0; display: flex;">
+        <div style="width: 230px; flex: none; background: #060e1a; border-right: 1px solid #16233a; opacity: .6; padding: 8px 10px; font-size: 11.5px;">
+          <div style="color: #a9b8cf; font-weight: 700; letter-spacing: .2em; font-size: 10.5px; text-transform: uppercase; text-align: center; padding-bottom: 8px; border-bottom: 1px solid #101d31;">Agents</div>
+          <div style="padding: 8px 0 8px 8px; box-shadow: inset 2px 0 0 #f5d76e;">
+            <div style="display: flex; gap: 6px;"><span style="color: #f5d76e;">▸</span><span style="color: #ff6b6b;">{{ spinner }}</span><span style="color: #f5d76e; font-weight: 700;">fix-login-redirect</span></div>
+            <div style="padding-left: 18px; color: #6d819d;">Claude Code <span style="color: #61dafb;">[in progress]</span></div>
+          </div>
+          <div style="padding: 8px 0 8px 8px; border-top: 1px solid #101d31;">
+            <div style="display: flex; gap: 6px;"><span style="color: transparent;">▸</span><span style="color: #5ddc9a;">●</span><span>add-tests-api</span></div>
+            <div style="padding-left: 18px; color: #6d819d;">OpenCode <span style="color: #5ddc9a;">[idle]</span></div>
+          </div>
+        </div>
+
+        <div style="flex: 1; min-width: 0; position: relative; display: flex; flex-direction: column;">
+          <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px; white-space: pre; font-size: 11.5px; line-height: 1.62; color: #2f4460;">
+            <div>● Re-running the suite, then I will push flightdeck/fix-login-redirect.</div>
+            <div style="height: 18px;"></div>
+            <div>✻ Churning for 2m 14s · esc to interrupt</div>
+          </div>
+          <div style="position: absolute; inset: 0; background: rgba(4,9,15,.55);"></div>
+
+          <div style="position: absolute; right: 0; top: 0; bottom: 0; width: 470px; background: #050d19; box-shadow: inset 1px 0 0 #61dafb, -18px 0 44px -12px rgba(0,0,0,.7); display: flex; flex-direction: column;">
+            <div style="flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07);">
+              <span style="color: #61dafb; font-weight: 700;">Activity</span>
+              <span style="color: #4d5f79;">all projects</span>
+              <span style="flex: 1;"></span>
+              <span style="color: #4d5f79; font-size: 11px;"><span style="color: #f5d76e;">a</span> close</span>
+            </div>
+            <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">
+
+              <div style="display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border-bottom: 1px solid #101d31; background: rgba(255,107,107,.07); box-shadow: inset 2px 0 0 #ff6b6b;">
+                <div style="display: flex; align-items: baseline; gap: 8px;">
+                  <span style="color: #ff6b6b;">●</span>
+                  <span style="color: #edf4ff; font-weight: 700;">migrate-schema-v4</span>
+                  <span style="color: #4d5f79;">api-gateway</span>
+                  <span style="flex: 1;"></span>
+                  <span style="color: #6d819d; font-size: 11px;">40s ago</span>
+                </div>
+                <div style="padding-left: 20px; color: #a9b8cf;"><span style="color: #61dafb;">in progress</span> <span style="color: #4d5f79;">→</span> <span style="color: #ff6b6b;">waiting</span> <span style="color: #6d819d;">· asked a question</span></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border-bottom: 1px solid #101d31; background: rgba(255,107,107,.05); box-shadow: inset 2px 0 0 #ff6b6b;">
+                <div style="display: flex; align-items: baseline; gap: 8px;">
+                  <span style="color: #ff6b6b;">●</span>
+                  <span style="color: #edf4ff; font-weight: 700;">flaky-e2e-runner</span>
+                  <span style="color: #4d5f79;">flightdeck</span>
+                  <span style="flex: 1;"></span>
+                  <span style="color: #6d819d; font-size: 11px;">4m ago</span>
+                </div>
+                <div style="padding-left: 20px; color: #a9b8cf;"><span style="color: #61dafb;">in progress</span> <span style="color: #4d5f79;">→</span> <span style="color: #ff6b6b;">error</span> <span style="color: #6d819d;">· agent exited (code 1)</span></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border-bottom: 1px solid #101d31; background: rgba(93,220,154,.05); box-shadow: inset 2px 0 0 #5ddc9a;">
+                <div style="display: flex; align-items: baseline; gap: 8px;">
+                  <span style="color: #5ddc9a;">●</span>
+                  <span style="color: #edf4ff; font-weight: 700;">add-tests-api</span>
+                  <span style="color: #4d5f79;">flightdeck</span>
+                  <span style="flex: 1;"></span>
+                  <span style="color: #6d819d; font-size: 11px;">11m ago</span>
+                </div>
+                <div style="padding-left: 20px; color: #a9b8cf;"><span style="color: #61dafb;">in progress</span> <span style="color: #4d5f79;">→</span> <span style="color: #5ddc9a;">idle</span> <span style="color: #6d819d;">· finished, 18 files touched</span></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border-bottom: 1px solid #101d31;">
+                <div style="display: flex; align-items: baseline; gap: 8px;">
+                  <span style="color: #61dafb;">●</span>
+                  <span style="color: #dce7f7;">perf-audit-images</span>
+                  <span style="color: #4d5f79;">web</span>
+                  <span style="flex: 1;"></span>
+                  <span style="color: #6d819d; font-size: 11px;">26m ago</span>
+                </div>
+                <div style="padding-left: 20px; color: #8a9cb8;"><span style="color: #5ddc9a;">idle</span> <span style="color: #4d5f79;">→</span> <span style="color: #61dafb;">reviewing</span> <span style="color: #6d819d;">· set by hand on the desktop</span></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border-bottom: 1px solid #101d31;">
+                <div style="display: flex; align-items: baseline; gap: 8px;">
+                  <span style="color: #6d819d;">○</span>
+                  <span style="color: #dce7f7;">hotfix-csp-header</span>
+                  <span style="color: #4d5f79;">flightdeck</span>
+                  <span style="flex: 1;"></span>
+                  <span style="color: #6d819d; font-size: 11px;">31m ago</span>
+                </div>
+                <div style="padding-left: 20px; color: #8a9cb8;"><span style="color: #6d819d;">unknown</span> <span style="color: #4d5f79;">→</span> <span style="color: #6d819d;">unknown</span> <span style="color: #6d819d;">· Codex CLI reports no lifecycle</span></div>
+              </div>
+
+              <div style="flex: 1;"></div>
+              <div style="flex: none; padding: 8px 12px; border-top: 1px solid #101d31; color: #4d5f79; font-size: 11px; line-height: 1.6;">the host keeps the last <span style="color: #6d819d;">200 events / 24h</span>, so a fresh tab opens on history, not silence. The desktop still posts its own OS notifications — this is a second record, not the only one.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="height: 30px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-top: 1px solid #16233a; background: #050c16;">
+        <span style="color: #6aa8ff;">⎇</span><span style="color: #edf4ff; font-weight: 700;">flightdeck/fix-login-redirect</span>
+        <span style="color: #24374f;">│</span><span style="color: #5ddc9a;">clean</span>
+        <span style="color: #24374f;">│</span><span style="color: #4d5f79;">120×34 · host owns geometry</span>
+      </div>
+      <div style="height: 32px; flex: none; display: flex; align-items: center; gap: 12px; border-top: 1px solid #16233a; background: #04090f;">
+        <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #d68bf5; color: #07111f; font-weight: 700;">MODE: APP</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">↑↓</span> sessions</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">a</span> activity</span>
+        <span style="flex: 1;"></span>
+        <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #5ddc9a;">●</span>connected</span>
+        <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #ff6b6b; color: #180d10; font-weight: 700;">▲ 2 need you</span>
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 20px; flex-wrap: wrap; width: 1520px;">
+      <div style="flex: 1; min-width: 420px; display: flex; flex-direction: column; gap: 10px;">
+        <div style="color: #6d819d; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;">Unread, feed closed — three tiers</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="height: 32px; display: flex; align-items: center; gap: 10px; background: #04090f; border: 1px solid #16233a; font-size: 12.5px;">
+            <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+            <span style="flex: 1;"></span>
+            <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #ff6b6b; color: #180d10; font-weight: 700; animation: fdPulse 2.4s infinite;">▲ 2 need you</span>
+          </div>
+          <div style="height: 32px; display: flex; align-items: center; gap: 10px; background: #04090f; border: 1px solid #16233a; font-size: 12.5px;">
+            <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+            <span style="flex: 1;"></span>
+            <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #5ddc9a; color: #07111f; font-weight: 700;">▲ 3 finished</span>
+          </div>
+          <div style="height: 32px; display: flex; align-items: center; gap: 10px; background: #04090f; border: 1px solid #16233a; font-size: 12.5px;">
+            <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+            <span style="flex: 1;"></span>
+            <span style="padding-right: 12px; color: #6d819d;">▵ activity <span style="color: #4d5f79;">a</span></span>
+          </div>
+        </div>
+        <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #8a9cb8; text-wrap: pretty;">The chip takes the colour of the <span style="color: #a9b8cf;">most urgent</span> unread event and states what it is — attention beats finished beats quiet, the same precedence the project dots already use. Red breathes once every 2.4s. Nothing ever blocks the screen.</p>
+      </div>
+
+      <div style="flex: 1; min-width: 420px; display: flex; flex-direction: column; gap: 10px;">
+        <div style="color: #6d819d; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;">Empty state · and the shared-selection consequence</div>
+        <div style="background: #050d19; box-shadow: inset 0 0 0 1px #16334a;">
+          <div style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.05); font-size: 12.5px;"><span style="color: #61dafb; font-weight: 700;">Activity</span><span style="color: #4d5f79;">all projects</span></div>
+          <div style="padding: 22px 16px; display: flex; flex-direction: column; gap: 8px; align-items: center; text-align: center;">
+            <span style="color: #6d819d; font-size: 12.5px;">Nothing has changed in 24 hours.</span>
+            <span style="color: #4d5f79; font-size: 11.5px; line-height: 1.7; max-width: 44ch;">Status transitions land here — an agent finishing, stalling on a question, or failing. Six sessions are idle right now.</span>
+          </div>
+          <div style="display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; border-top: 1px solid #101d31; background: rgba(214,139,245,.06); box-shadow: inset 2px 0 0 #d68bf5; color: #cbb0d8; font-size: 11.5px; line-height: 1.65;"><span style="color: #d68bf5; font-weight: 700;">D3</span><span>Clicking an entry selects that session <span style="color: #edf4ff;">on the desktop too</span>. The row says so on hover — <span style="color: #4d5f79;">jump · also moves the desktop</span> — and that is the only warning it needs; selection is reversible and cheap.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2f — TAKEOVER ══ -->
+  <div id="2f" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2f</span>
+      <span style="font-size: 14px;">Takeover — arriving, evicted, and the desktop's notice</span>
+      <span style="font-size: 12px; color: #5f7391;">courtesy, not a permission check · magenta, because nothing here is broken</span>
+    </div>
+    <div style="display: flex; gap: 20px; width: 1520px; align-items: flex-start;">
+
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px;">
+      <div style="flex: none; height: 470px; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden;">
+        <div style="position: absolute; inset: 0; background: rgba(4,9,15,.76);"></div>
+        <div style="position: absolute; left: 18px; right: 18px; top: 28px; background: #100a18; box-shadow: inset 0 0 0 1px #d68bf5;">
+          <div style="display: flex; justify-content: space-between; padding: 7px 12px; border-bottom: 1px solid #3a2450; background: rgba(214,139,245,.1); font-size: 12.5px;"><span style="color: #d68bf5; font-weight: 700;">Someone else is driving</span><span style="color: #8a6ba0;">arriving browser</span></div>
+          <div style="padding: 14px 12px; display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+            <div style="color: #ede2f5; line-height: 1.7;">Another browser is controlling this instance. FlightDeck accepts one browser at a time, so taking over will disconnect theirs.</div>
+            <div style="display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; background: rgba(214,139,245,.06); box-shadow: inset 2px 0 0 #d68bf5; color: #cbb0d8; font-size: 11.5px; line-height: 1.6;">
+              <div><span style="color: #8a6ba0;">address</span> 192.168.2.20</div>
+              <div><span style="color: #8a6ba0;">browser</span> Safari · iOS 18</div>
+              <div><span style="color: #8a6ba0;">connected</span> 14 minutes, active 20s ago</div>
+            </div>
+            <div style="color: #a98fbd; font-size: 11.5px; line-height: 1.65;">Probably you, on your phone. Anyone holding the code can do this — it is not a lock, just a warning so neither of you wonders why the keys stopped working.</div>
+            <div style="display: flex; gap: 9px; flex-wrap: wrap;">
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; background: #d68bf5; color: #100a18; font-weight: 700;"><span style="background: rgba(16,10,24,.25); padding: 1px 6px;">Enter</span>Take over</span>
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #3a2450; color: #cbb0d8;"><span style="background: #1d1228; padding: 1px 6px;">w</span>Watch read-only</span>
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 1px 6px;">Esc</span>Cancel</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p style="margin: 0; color: #8a9cb8; font-size: 12px; line-height: 1.7; text-wrap: pretty;">Cancelling still leaves a live read-only view — observation costs the host nothing and answers “is it done yet?” without evicting anyone.</p>
+    </div>
+
+      <div style="flex: 1; min-width: 0; flex-basis: 0; height: 470px; position: relative; background: #0b0c0a; border: 1px solid #4a3a1c; overflow: hidden;">
+        <div style="position: absolute; inset: 0; display: flex; flex-direction: column; padding: 10px 12px; white-space: pre; font-size: 11px; line-height: 1.62; color: #8f8977;">
+          <div>● Re-running the suite, then pushing the branch.</div>
+          <div style="height: 18px;"></div>
+          <div>✻ Churning 2m 14s</div>
+        </div>
+        <div style="position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(224,163,74,.09) 0 1px, transparent 1px 4px);"></div>
+        <div style="position: absolute; inset: 0; background: rgba(11,12,10,.72);"></div>
+        <div style="position: absolute; left: 18px; right: 18px; top: 60px; background: #100a18; box-shadow: inset 0 0 0 1px #d68bf5;">
+          <div style="display: flex; justify-content: space-between; padding: 7px 12px; border-bottom: 1px solid #3a2450; background: rgba(214,139,245,.1); font-size: 12.5px;"><span style="color: #d68bf5; font-weight: 700;">Another browser took over</span><span style="color: #8a6ba0;">evicted · 3s ago</span></div>
+          <div style="padding: 14px 12px; display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+            <div style="color: #ede2f5; line-height: 1.7;">A browser at <span style="color: #d68bf5;">192.168.2.11</span> is controlling FlightDeck now. Your keystrokes stopped arriving mid-session; the last one that landed was <span style="color: #d68bf5;">3s ago</span>.</div>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; background: rgba(224,163,74,.07); box-shadow: inset 2px 0 0 #e0a34a; color: #f2e6d2; font-size: 11.5px;">the terminal behind this dialog is stale from the moment you lost control</div>
+            <div style="color: #a98fbd; font-size: 11.5px; line-height: 1.65;">Reclaiming is one click and does the same thing to them. No trip to the desktop needed — you still hold the credential.</div>
+            <div style="display: flex; gap: 9px;">
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; background: #d68bf5; color: #100a18; font-weight: 700;"><span style="background: rgba(16,10,24,.25); padding: 1px 6px;">Enter</span>Take it back</span>
+              <span style="display: flex; align-items: center; gap: 7px; padding: 6px 12px; box-shadow: inset 0 0 0 1px #3a2450; color: #cbb0d8;"><span style="background: #1d1228; padding: 1px 6px;">w</span>Watch read-only</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="flex: 1; min-width: 0; flex-basis: 0; display: flex; flex-direction: column; gap: 12px;">
+        <div style="flex: none; height: 306px; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden;">
+          <div style="position: absolute; inset: 0; display: flex; flex-direction: column; padding: 10px 12px; white-space: pre; font-size: 11px; line-height: 1.62; color: #35496a;">
+            <div>● Re-running the suite, then pushing the branch.</div>
+            <div style="height: 18px;"></div>
+            <div>✻ Churning 2m 14s</div>
+          </div>
+          <div style="position: absolute; left: 14px; right: 14px; bottom: 46px; background: #0e0a14; box-shadow: inset 0 0 0 1px #d68bf5, 0 14px 30px -10px rgba(0,0,0,.7);">
+            <div style="display: flex; align-items: center; gap: 9px; padding: 8px 11px; font-size: 11.5px;">
+              <span style="color: #d68bf5;">●</span>
+              <span style="color: #ede2f5;">browser control moved</span>
+              <span style="color: #8a6ba0;">192.168.2.20 → 192.168.2.11</span>
+              <span style="flex: 1;"></span>
+              <span style="color: #4d5f79;">dismisses in 6s</span>
+            </div>
+          </div>
+          <div style="position: absolute; left: 0; right: 0; bottom: 0; height: 30px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-top: 1px solid #16233a; background: #04090f; font-size: 11.5px;">
+            <span style="padding: 0 8px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+            <span style="color: #24374f;">│</span><span style="color: #6d819d;">desktop, unaffected</span>
+          </div>
+        </div>
+        <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #8a9cb8; text-wrap: pretty;">On the host it is a transient strip in D13's origin vocabulary and nothing more — the desktop never loses control, so a dialog would be interrupting someone who has no decision to make. The viewer chip stays <span style="color: #a9b8cf;">desktop + this tab</span>: two named seats, not a counter that implies a crowd. M3's multi-viewer list is the same panel with rows.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2g — REFERENCE SHEET ══ -->
+  <div id="2g" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">2g</span>
+      <span style="font-size: 14px;">Colour and type — semantic names, ship as custom properties</span>
+    </div>
+
+    <div style="width: 1520px; display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
+      <div style="flex: 1; min-width: 700px; border: 1px solid #16233a;">
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 7px 14px; background: #050c16; border-bottom: 1px solid #16233a; color: #6d819d; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;"><span></span><span>token</span><span>value</span><span>meaning</span><span>on ground</span></div>
+
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #edf4ff;"></span><span style="color: #edf4ff;">--fd-text</span><span style="color: #6d819d;">#edf4ff</span><span style="color: #a9b8cf;">primary text, selected rows</span><span style="color: #5ddc9a;">17.1</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #dce7f7;"></span><span style="color: #dce7f7;">--fd-text-soft</span><span style="color: #6d819d;">#dce7f7</span><span style="color: #a9b8cf;">terminal body, setting labels</span><span style="color: #5ddc9a;">15.4</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #a9b8cf;"></span><span style="color: #a9b8cf;">--fd-text-muted</span><span style="color: #6d819d;">#a9b8cf</span><span style="color: #a9b8cf;">prose, inactive tab labels</span><span style="color: #5ddc9a;">9.4</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #8a9cb8;"></span><span style="color: #8a9cb8;">--fd-text-second</span><span style="color: #6d819d;">#8a9cb8</span><span style="color: #a9b8cf;">secondary, connection label</span><span style="color: #5ddc9a;">6.8</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px; background: rgba(93,220,154,.05);"><span style="height: 14px; background: #6d819d;"></span><span style="color: #6d819d;">--fd-text-quiet</span><span style="color: #6d819d;">#6d819d</span><span style="color: #a9b8cf;"><span style="color: #5ddc9a;">lifted floor for facts</span> — agent name, <span style="color: #6d819d;">no-upstream</span>, <span style="color: #6d819d;">git: ?</span></span><span style="color: #5ddc9a;">4.8</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #4d5f79;"></span><span style="color: #4d5f79;">--fd-text-decor</span><span style="color: #6d819d;">#4d5f79</span><span style="color: #a9b8cf;">key hints, counts, captions — <span style="color: #e0a34a;">never a git fact</span></span><span style="color: #e0a34a;">2.9</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px; background: rgba(93,220,154,.05);"><span style="height: 14px; background: #7d90ab;"></span><span style="color: #7d90ab;">--fd-term-asleep</span><span style="color: #6d819d;">#7d90ab</span><span style="color: #a9b8cf;"><span style="color: #5ddc9a;">lifted from #5d6f8a</span> — an entire terminal renders in this</span><span style="color: #5ddc9a;">5.6</span></div>
+
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #f5d76e;"></span><span style="color: #f5d76e;">--fd-focus</span><span style="color: #6d819d;">#f5d76e</span><span style="color: #a9b8cf;">selection, key names, agent tab, Terminal mode</span><span style="color: #5ddc9a;">13.4</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #61dafb;"></span><span style="color: #61dafb;">--fd-accent</span><span style="color: #6d819d;">#61dafb</span><span style="color: #a9b8cf;">interactive, upstream, manual override, shell tab</span><span style="color: #5ddc9a;">11.7</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #5ddc9a;"></span><span style="color: #5ddc9a;">--fd-ok</span><span style="color: #6d819d;">#5ddc9a</span><span style="color: #a9b8cf;">idle, healthy, additions, connected</span><span style="color: #5ddc9a;">11.0</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #ff6b6b;"></span><span style="color: #ff6b6b;">--fd-alert</span><span style="color: #6d819d;">#ff6b6b</span><span style="color: #a9b8cf;">attention, error, ✕, working spinner, disconnected</span><span style="color: #5ddc9a;">6.8</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px; background: rgba(224,163,74,.06);"><span style="height: 14px; background: #e0a34a;"></span><span style="color: #e0a34a;">--fd-stale</span><span style="color: #6d819d;">#e0a34a</span><span style="color: #a9b8cf;"><span style="color: #e0a34a;">new</span> — stale terminal, reconnecting, revoked: “still true a moment ago”</span><span style="color: #5ddc9a;">8.6</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #d68bf5;"></span><span style="color: #d68bf5;">--fd-elsewhere</span><span style="color: #6d819d;">#d68bf5</span><span style="color: #a9b8cf;">drift, recovered, App mode, <span style="color: #d68bf5;">and takeover</span> — “another actor”</span><span style="color: #5ddc9a;">8.0</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #6aa8ff;"></span><span style="color: #6aa8ff;">--fd-info</span><span style="color: #6d819d;">#6aa8ff</span><span style="color: #a9b8cf;">branch glyph, (global) origin, reload-to-update</span><span style="color: #5ddc9a;">7.8</span></div>
+
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #07111f; box-shadow: inset 0 0 0 1px #24374f;"></span><span style="color: #a9b8cf;">--fd-ground</span><span style="color: #6d819d;">#07111f</span><span style="color: #a9b8cf;">frame ground · <span style="color: #6d819d;">--fd-chrome</span> #050c16 recessed strips · <span style="color: #6d819d;">--fd-canvas</span> #04090f</span><span style="color: #4d5f79;">—</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; border-bottom: 1px solid #101d31; font-size: 11.5px;"><span style="height: 14px; background: #16233a;"></span><span style="color: #a9b8cf;">--fd-rule</span><span style="color: #6d819d;">#16233a</span><span style="color: #a9b8cf;">frame border · <span style="color: #6d819d;">--fd-rule-inner</span> #101d31 · <span style="color: #6d819d;">--fd-sep</span> #24374f the │ glyph</span><span style="color: #4d5f79;">—</span></div>
+        <div style="display: grid; grid-template-columns: 28px 210px 108px 1fr 74px; gap: 12px; padding: 6px 14px; align-items: center; font-size: 11.5px;"><span style="height: 14px; background: #3a5a8a;"></span><span style="color: #a9b8cf;">--fd-tui-select</span><span style="color: #6d819d;">#3a5a8a</span><span style="color: #a9b8cf;">selection · <span style="color: #6d819d;">--fd-tui-tab</span> rgb(16,38,68) — both verbatim from the TUI</span><span style="color: #4d5f79;">—</span></div>
+      </div>
+
+      <div style="flex: 1; min-width: 420px; display: flex; flex-direction: column; gap: 20px;">
+        <div style="border: 1px solid #16233a;">
+          <div style="padding: 7px 14px; background: #050c16; border-bottom: 1px solid #16233a; color: #6d819d; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;">Type — four sizes, one family</div>
+          <div style="padding: 14px; display: flex; flex-direction: column; gap: 12px;">
+            <div style="display: flex; align-items: baseline; gap: 12px;"><span style="width: 96px; color: #6d819d; font-size: 11px;">--fd-t-meta 11</span><span style="font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #a9b8cf;">eyebrows · origin tags · captions</span></div>
+            <div style="display: flex; align-items: baseline; gap: 12px;"><span style="width: 96px; color: #6d819d; font-size: 11px;">--fd-t-body 12.5</span><span style="font-size: 12.5px; color: #dce7f7;">chrome, terminals, dialogs, everything</span></div>
+            <div style="display: flex; align-items: baseline; gap: 12px;"><span style="width: 96px; color: #6d819d; font-size: 11px;">--fd-t-title 14</span><span style="font-size: 14px; color: #edf4ff;">artboard and overlay titles</span></div>
+            <div style="display: flex; align-items: baseline; gap: 12px;"><span style="width: 96px; color: #6d819d; font-size: 11px;">--fd-t-code 30</span><span style="font-size: 24px; letter-spacing: .3em; color: #edf4ff;">8412</span></div>
+            <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #8a9cb8; text-wrap: pretty;">Turn 1's seven sizes inside 3.5px were three sizes pretending to be seven — 10.5/11/11.5 are indistinguishable at arm's length, and 12/12.5/13 differ only by rounding. Four steps, one of them reserved for the pairing code, which is the only place the app shouts.</p>
+          </div>
+        </div>
+
+        <div style="border: 1px solid #16233a;">
+          <div style="padding: 7px 14px; background: #050c16; border-bottom: 1px solid #16233a; color: #6d819d; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;">The dim tier — lifted, not inherited</div>
+          <div style="padding: 14px; display: flex; flex-direction: column; gap: 10px; font-size: 12px; line-height: 1.7; color: #a9b8cf;">
+            <p style="margin: 0; text-wrap: pretty;"><span style="color: #edf4ff;">Facts move up.</span> Anything a user could act on wrongly now sits at <span style="color: #6d819d;">--fd-text-quiet</span> (4.8:1): <span style="color: #6d819d;">no-upstream</span>, <span style="color: #6d819d;">git: ?</span>, the agent display name, <span style="color: #6d819d;">(default)</span> origin tags. Absence of information is still information.</p>
+            <p style="margin: 0; text-wrap: pretty;"><span style="color: #edf4ff;">The old dim survives for decoration only</span> — key-hint letters that repeat a label already at full contrast, item counts, the <span style="color: #4d5f79;">│</span> separator. If deleting it would lose a fact, it cannot be this colour.</p>
+            <p style="margin: 0; text-wrap: pretty;"><span style="color: #edf4ff;">The asleep terminal is lifted to 5.6:1</span> and stays a deliberate exception to nothing: it is a whole screen of text, so 3.7:1 was the least defensible value in the palette. It now reads as “not listening”, not “barely there”.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<section style="display: flex; flex-direction: column; gap: 64px; padding: 56px; font-family: 'JetBrains Mono', ui-monospace, monospace; background: #04090f; color: #edf4ff;">
+
+  <header style="display: flex; flex-direction: column; gap: 10px; max-width: 900px;">
+    <div style="display: flex; align-items: center; gap: 12px; font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: #5f7391;">
+      <span style="padding: 2px 7px; border: 1px solid #1b2c45; color: #61dafb;">turn 1</span>
+      <span>flightdeck web — full-fidelity browser control surface</span>
+    </div>
+    <h1 style="margin: 0; font-size: 26px; font-weight: 500; letter-spacing: -.01em;">The TUI, drawn properly</h1>
+    <p style="margin: 0; font-size: 13px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty; max-width: 74ch;">Monospace everywhere, 1px rules instead of box-drawing, real focus glow instead of a 1-cell border. Palette-primary keyboard model: <span style="color: #f5d76e;">Ctrl-g</span> is the only chord the app claims; everything else is a searchable command. Zero browser chrome — every frame below fills the tab edge to edge.</p>
+  </header>
+
+  <!-- ══ 1a — MAIN, TERMINAL MODE ══ -->
+  <div id="1a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1a</span>
+      <span style="font-size: 14px; color: #edf4ff;">Main screen — Terminal mode</span>
+      <span style="font-size: 12px; color: #5f7391;">focus glow on the viewport · sidebar recedes · 3 projects, 6 sessions across the whole status spectrum</span>
+    </div>
+
+    <div style="width: 1520px; height: 880px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; overflow: hidden; font-size: 13px; line-height: 1.5;">
+
+      <!-- logo band -->
+      <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(97,218,251,.18), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(97,218,251,.18)); border-bottom: 1px solid #16233a;">
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+        <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+      </div>
+
+      <!-- project tabs -->
+      <div style="height: 30px; flex: none; display: flex; align-items: stretch; gap: 0; padding: 0 8px; border-bottom: 1px solid #16233a; background: #050c16;">
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px; background: rgb(16,38,68); box-shadow: inset 0 -2px 0 #61dafb;">
+          <span style="color: #ff6b6b; animation: fdPulse 1s infinite;">{{ spinner }}</span>
+          <span style="color: #edf4ff; font-weight: 500;">flightdeck</span>
+          <span style="color: #ff6b6b; opacity: .8;">✕</span>
+        </div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;">
+          <span style="color: #ff6b6b;">●</span>
+          <span style="color: #a9b8cf;">api-gateway</span>
+          <span style="color: #ff6b6b; opacity: .5;">✕</span>
+        </div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;">
+          <span style="color: #5ddc9a;">●</span>
+          <span style="color: #a9b8cf;">web</span>
+          <span style="color: #ff6b6b; opacity: .5;">✕</span>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; gap: 6px; padding: 0 10px; color: #61dafb;">
+          <span>+ project</span>
+        </div>
+      </div>
+
+      <!-- body -->
+      <div style="flex: 1; min-height: 0; display: flex; flex-direction: {{ bodyDir }};">
+
+        <!-- sidebar (unfocused) -->
+        <div style="width: 300px; flex: none; display: flex; flex-direction: column; background: #060e1a; border-right: 1px solid #16233a; opacity: .72;">
+          <div style="height: 28px; flex: none; display: flex; align-items: center; justify-content: center; color: #a9b8cf; font-weight: 700; letter-spacing: .22em; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #16233a;">Agents</div>
+          <div style="flex: 1; min-height: 0; overflow: hidden;">
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31; background: rgba(245,215,110,.05); box-shadow: inset 2px 0 0 #f5d76e;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: #f5d76e;">▸</span>
+                <span style="color: #ff6b6b;">{{ spinner }}</span>
+                <span style="color: #f5d76e; font-weight: 700; flex: 1;">fix-login-redirect</span>
+                <span style="color: #ff6b6b; opacity: .8;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d;">Claude Code <span style="color: #61dafb;">[in progress]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #f5d76e;">~dirty</span><span style="color: #61dafb;">+3 -0</span><span style="color: #d68bf5;">drift:3</span></div>
+            </div>
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: transparent;">▸</span>
+                <span style="color: #5ddc9a;">●</span>
+                <span style="color: #edf4ff; flex: 1;">add-tests-api</span>
+                <span style="color: #ff6b6b; opacity: .5;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d;">OpenCode <span style="color: #5ddc9a;">[idle]</span></div>
+              <div style="padding-left: 20px; color: #4d5f79;">no-upstream</div>
+            </div>
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: transparent;">▸</span>
+                <span style="color: #ff6b6b;">●</span>
+                <span style="color: #edf4ff; flex: 1;">migrate-schema-v4</span>
+                <span style="color: #ff6b6b; opacity: .5;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d;">Codex CLI <span style="color: #ff6b6b;">[waiting]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #f5d76e;">~dirty</span><span style="color: #61dafb;">+1 -2</span></div>
+            </div>
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: transparent;">▸</span>
+                <span style="color: #ff6b6b;">●</span>
+                <span style="color: #edf4ff; flex: 1;">flaky-e2e-runner</span>
+                <span style="color: #ff6b6b; opacity: .5;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d;">Claude Code <span style="color: #ff6b6b;">[error]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #d68bf5;">[recovered]</span><span style="color: #d68bf5;">drift:7</span></div>
+            </div>
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: transparent;">▸</span>
+                <span style="color: #61dafb;">●</span>
+                <span style="color: #edf4ff; flex: 1;">perf-audit-images</span>
+                <span style="color: #ff6b6b; opacity: .5;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d;">Claude Code <span style="color: #61dafb;">[reviewing]</span> <span style="color: #4d5f79;">·set</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #6d819d;">really:</span><span style="color: #5ddc9a;">idle</span></div>
+            </div>
+
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #101d31;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: transparent;">▸</span>
+                <span style="color: #ff6b6b; animation: fdPulse 1.1s infinite;">{{ spinner }}</span>
+                <span style="color: #edf4ff; flex: 1;">hotfix-csp-header</span>
+                <span style="color: #ff6b6b; opacity: .5;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #6d819d; font-style: italic;">creating worktree…</div>
+              <div style="padding-left: 20px; color: #4d5f79;">git: ?</div>
+            </div>
+
+          </div>
+          <div style="flex: none; padding: 8px 12px; border-top: 1px solid #101d31; color: #4d5f79; font-size: 11px;">6 sessions · Ctrl-g → “new agent”</div>
+        </div>
+
+        <!-- main pane (focused) -->
+        <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; margin: 4px; box-shadow: inset 0 0 0 1px rgba(97,218,251,.85), 0 0 26px -4px rgba(97,218,251,.4); background: #07111f;">
+
+          <div style="height: 30px; flex: none; display: flex; align-items: stretch; padding: 0 6px; gap: 0; border-bottom: 1px solid #16233a; background: #050c16;">
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">
+              <span>agent</span>
+              <span style="color: #8a2020;">✕</span>
+            </div>
+            <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; color: #7d90ab;">
+              <span>shell 1</span>
+              <span style="color: #ff6b6b; opacity: .5;">✕</span>
+            </div>
+            <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; color: #7d90ab;">
+              <span>shell 2</span>
+              <span style="color: #ff6b6b; opacity: .5;">✕</span>
+            </div>
+            <div style="flex: 1;"></div>
+            <div style="display: flex; align-items: center; gap: 6px; margin: 4px 0; padding: 0 10px; background: #5ddc9a; color: #07111f; font-weight: 700;">+ agent</div>
+            <div style="width: 6px;"></div>
+            <div style="display: flex; align-items: center; gap: 6px; margin: 4px 0; padding: 0 10px; background: #26518f; color: #edf4ff; font-weight: 500;">+ shell</div>
+          </div>
+
+          <div style="flex: 1; min-height: 0; padding: 10px 14px; overflow: hidden; font-size: 12.5px; line-height: 1.62; color: #dce7f7; display: flex; flex-direction: column; white-space: pre;">
+            <div><span style="color: #5ddc9a;">●</span> Read the whole spec folder. Starting on the relay handshake.</div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #5ddc9a;">●</span> <span style="font-weight: 700;">Bash</span>(cargo test -p flightdeck-relay -- --nocapture)</div>
+            <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #8a9cb8;">   Compiling flightdeck-relay v1.16.0 (/Users/dev/flightdeck/relay)</span></div>
+            <div>     <span style="color: #8a9cb8;">    Finished test profile in 4.81s</span></div>
+            <div>     <span style="color: #8a9cb8;">     Running unittests src/lib.rs</span></div>
+            <div>     <span style="color: #5ddc9a;">test handshake::pair_code_expires_after_120s ... ok</span></div>
+            <div>     <span style="color: #5ddc9a;">test handshake::rejects_replayed_nonce ...... ok</span></div>
+            <div>     <span style="color: #ff6b6b;">test session::viewer_fanout_preserves_order . FAILED</span></div>
+            <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #4d5f79;">Allowed by auto mode classifier</span></div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #5ddc9a;">●</span> The fan-out test fails because <span style="color: #61dafb;">relay/src/session.rs:214</span> writes to viewers</div>
+            <div>  from a HashMap iteration, so ordering is non-deterministic once a second</div>
+            <div>  browser attaches. Switching to an insertion-ordered <span style="color: #f5d76e;">Vec&lt;ViewerHandle&gt;</span>.</div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #5ddc9a;">●</span> <span style="font-weight: 700;">Edit</span>(relay/src/session.rs)</div>
+            <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #5ddc9a;">+  viewers: Vec&lt;ViewerHandle&gt;,</span></div>
+            <div>     <span style="color: #ff6b6b;">-  viewers: HashMap&lt;ViewerId, ViewerHandle&gt;,</span></div>
+            <div>     <span style="color: #8a9cb8;">   18 additions, 11 removals across 2 files</span></div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #5ddc9a;">●</span> Re-running the suite, then I will push <span style="color: #61dafb;">flightdeck/fix-login-redirect</span>.</div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #f5d76e;">✻</span> <span style="color: #8a9cb8;">Churning for 2m 14s · esc to interrupt</span></div>
+            <div style="height: 18px;"></div>
+            <div><span style="color: #61dafb;">›</span> <span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span></div>
+            <div>  <span style="color: #4d5f79;">▸▸ auto mode on (shift+tab to cycle) · ← for agents</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- git bar -->
+      <div style="height: 30px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-top: 1px solid #16233a; background: #050c16; font-size: 12.5px;">
+        <span style="color: #6aa8ff;">⎇</span><span style="color: #edf4ff; font-weight: 700;">flightdeck/fix-login-redirect</span>
+        <span style="color: #24374f;">│</span>
+        <span><span style="color: #5ddc9a;">+3</span> <span style="color: #f5d76e;">~2</span> <span style="color: #ff6b6b;">-1</span> <span style="color: #4d5f79;">(6 files)</span></span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #61dafb;">↑3 ↓0</span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #d68bf5;">base +4</span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #4d5f79;">base: main</span>
+      </div>
+
+      <!-- status bar -->
+      <div style="height: 32px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 0 0 0; border-top: 1px solid #16233a; background: #04090f; font-size: 12.5px;">
+        <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700; letter-spacing: .06em;">MODE: TERMINAL</span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #a9b8cf;"><span style="color: #f5d76e;">Esc Esc</span> app commands</span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #a9b8cf;"><span style="color: #f5d76e;">Ctrl-g</span> command palette</span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #a9b8cf;"><span style="color: #f5d76e;">click outside</span> release keys</span>
+        <span style="flex: 1;"></span>
+        <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #5ddc9a;">●</span>connected <span style="color: #4d5f79;">18ms</span></span>
+        <span style="color: #24374f;">│</span>
+        <span style="color: #8a9cb8;">2 viewers <span style="color: #4d5f79;">(this tab + desktop)</span></span>
+        <span style="align-self: stretch; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">● v1.16.0 available</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1b — MAIN, APP MODE ══ -->
+  <div id="1b" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1b</span>
+      <span style="font-size: 14px; color: #edf4ff;">Main screen — App mode</span>
+      <span style="font-size: 12px; color: #5f7391;">glow moves to the sidebar · terminal dims to muted gray, bold removed · same pixels otherwise</span>
+    </div>
+
+    <div style="width: 1520px; height: 700px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; overflow: hidden; font-size: 13px; line-height: 1.5;">
+      <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(214,139,245,.16), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(214,139,245,.16)); border-bottom: 1px solid #16233a;">
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+        <span style="color: #61dafb; font-size: 12px; font-weight: 700; letter-spacing: .42em;">· FLIGHTDECK ·</span>
+        <span style="color: #61dafb; opacity: .55; font-size: 12px; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+      </div>
+
+      <div style="height: 30px; flex: none; display: flex; align-items: stretch; padding: 0 8px; border-bottom: 1px solid #16233a; background: #050c16;">
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px; background: rgb(16,38,68); box-shadow: inset 0 -2px 0 #d68bf5;">
+          <span style="color: #ff6b6b; animation: fdPulse 1s infinite;">{{ spinner }}</span>
+          <span style="color: #edf4ff; font-weight: 500;">flightdeck</span>
+          <span style="color: #ff6b6b; opacity: .8;">✕</span>
+        </div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;"><span style="color: #ff6b6b;">●</span><span style="color: #a9b8cf;">api-gateway</span><span style="color: #ff6b6b; opacity: .5;">✕</span></div>
+        <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 0 12px;"><span style="color: #5ddc9a;">●</span><span style="color: #a9b8cf;">web</span><span style="color: #ff6b6b; opacity: .5;">✕</span></div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; padding: 0 10px; color: #61dafb;">+ project</div>
+      </div>
+
+      <div style="flex: 1; min-height: 0; display: flex;">
+        <div style="width: 300px; flex: none; display: flex; flex-direction: column; background: #070f1d; margin: 4px; box-shadow: inset 0 0 0 1px rgba(214,139,245,.9), 0 0 26px -4px rgba(214,139,245,.4);">
+          <div style="height: 28px; flex: none; display: flex; align-items: center; justify-content: center; color: #edf4ff; font-weight: 700; letter-spacing: .22em; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #1c2740;">Agents</div>
+          <div style="flex: 1; min-height: 0; overflow: hidden;">
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #141f33; background: rgba(245,215,110,.09); box-shadow: inset 2px 0 0 #f5d76e;">
+              <div style="display: flex; align-items: center; gap: 7px;">
+                <span style="color: #f5d76e;">▸</span><span style="color: #ff6b6b;">{{ spinner }}</span>
+                <span style="color: #f5d76e; font-weight: 700; flex: 1;">fix-login-redirect</span><span style="color: #ff6b6b;">✕</span>
+              </div>
+              <div style="padding-left: 20px; color: #8a9cb8;">Claude Code <span style="color: #61dafb;">[in progress]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #f5d76e;">~dirty</span><span style="color: #61dafb;">+3 -0</span><span style="color: #d68bf5;">drift:3</span></div>
+            </div>
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #141f33;">
+              <div style="display: flex; align-items: center; gap: 7px;"><span style="color: transparent;">▸</span><span style="color: #5ddc9a;">●</span><span style="color: #edf4ff; flex: 1;">add-tests-api</span><span style="color: #ff6b6b; opacity: .5;">✕</span></div>
+              <div style="padding-left: 20px; color: #8a9cb8;">OpenCode <span style="color: #5ddc9a;">[idle]</span></div>
+              <div style="padding-left: 20px; color: #4d5f79;">no-upstream</div>
+            </div>
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #141f33;">
+              <div style="display: flex; align-items: center; gap: 7px;"><span style="color: transparent;">▸</span><span style="color: #ff6b6b;">●</span><span style="color: #edf4ff; flex: 1;">migrate-schema-v4</span><span style="color: #ff6b6b; opacity: .5;">✕</span></div>
+              <div style="padding-left: 20px; color: #8a9cb8;">Codex CLI <span style="color: #ff6b6b;">[waiting]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #f5d76e;">~dirty</span><span style="color: #61dafb;">+1 -2</span></div>
+            </div>
+            <div style="padding: 8px 10px 10px; border-bottom: 1px solid #141f33;">
+              <div style="display: flex; align-items: center; gap: 7px;"><span style="color: transparent;">▸</span><span style="color: #ff6b6b;">●</span><span style="color: #edf4ff; flex: 1;">flaky-e2e-runner</span><span style="color: #ff6b6b; opacity: .5;">✕</span></div>
+              <div style="padding-left: 20px; color: #8a9cb8;">Claude Code <span style="color: #ff6b6b;">[error]</span></div>
+              <div style="padding-left: 20px; display: flex; gap: 8px;"><span style="color: #d68bf5;">[recovered]</span><span style="color: #d68bf5;">drift:7</span></div>
+            </div>
+          </div>
+          <div style="flex: none; padding: 8px 12px; border-top: 1px solid #141f33; color: #8a9cb8; font-size: 11px;"><span style="color: #d68bf5;">↑↓</span> move · <span style="color: #d68bf5;">Enter</span> focus terminal</div>
+        </div>
+
+        <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; border-left: 1px solid #16233a;">
+          <div style="height: 30px; flex: none; display: flex; align-items: stretch; padding: 0 6px; border-bottom: 1px solid #16233a; background: #050c16; opacity: .5;">
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #3d3a2a; color: #a9b8cf;"><span>agent</span><span style="color: #6d5050;">✕</span></div>
+            <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; color: #55647d;">shell 1 <span style="opacity: .5;">✕</span></div>
+            <div style="align-self: center; color: #24374f; padding: 0 4px;">│</div>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 0 12px; color: #55647d;">shell 2 <span style="opacity: .5;">✕</span></div>
+            <div style="flex: 1;"></div>
+            <div style="display: flex; align-items: center; margin: 4px 0; padding: 0 10px; background: #2b4034; color: #7d90ab;">+ agent</div>
+            <div style="width: 6px;"></div>
+            <div style="display: flex; align-items: center; margin: 4px 0; padding: 0 10px; background: #1d2c44; color: #7d90ab;">+ shell</div>
+          </div>
+          <div style="flex: 1; min-height: 0; padding: 10px 14px; overflow: hidden; font-size: 12.5px; line-height: 1.62; color: #5d6f8a; display: flex; flex-direction: column; white-space: pre;">
+            <div>● Read the whole spec folder. Starting on the relay handshake.</div>
+            <div style="height: 18px;"></div>
+            <div>● Bash(cargo test -p flightdeck-relay -- --nocapture)</div>
+            <div>  ⎿    Compiling flightdeck-relay v1.16.0 (/Users/dev/flightdeck/relay)</div>
+            <div>        Finished test profile in 4.81s</div>
+            <div>        test handshake::pair_code_expires_after_120s ... ok</div>
+            <div>        test session::viewer_fanout_preserves_order . FAILED</div>
+            <div style="height: 18px;"></div>
+            <div>● The fan-out test fails because relay/src/session.rs:214 writes to viewers</div>
+            <div>  from a HashMap iteration, so ordering is non-deterministic once a second</div>
+            <div>  browser attaches. Switching to an insertion-ordered Vec&lt;ViewerHandle&gt;.</div>
+            <div style="height: 18px;"></div>
+            <div>✻ Churning for 2m 14s · esc to interrupt</div>
+          </div>
+          <div style="flex: none; padding: 6px 14px; border-top: 1px solid #16233a; color: #4d5f79; font-size: 11.5px; background: #050c16;">terminal asleep — keystrokes go to FlightDeck · <span style="color: #d68bf5;">Enter</span> or click to wake it</div>
+        </div>
+      </div>
+
+      <div style="height: 30px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-top: 1px solid #16233a; background: #050c16; font-size: 12.5px;">
+        <span style="color: #6aa8ff;">⎇</span><span style="color: #edf4ff; font-weight: 700;">flightdeck/fix-login-redirect</span>
+        <span style="color: #24374f;">│</span><span><span style="color: #5ddc9a;">+3</span> <span style="color: #f5d76e;">~2</span> <span style="color: #ff6b6b;">-1</span> <span style="color: #4d5f79;">(6 files)</span></span>
+        <span style="color: #24374f;">│</span><span style="color: #61dafb;">↑3 ↓0</span>
+        <span style="color: #24374f;">│</span><span style="color: #d68bf5;">base +4</span>
+        <span style="color: #24374f;">│</span><span style="color: #4d5f79;">base: main</span>
+      </div>
+
+      <div style="height: 32px; flex: none; display: flex; align-items: center; gap: 12px; border-top: 1px solid #16233a; background: #04090f; font-size: 12.5px;">
+        <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #d68bf5; color: #07111f; font-weight: 700; letter-spacing: .06em;">MODE: APP</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">Enter</span> focus terminal</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">Ctrl-g</span> command palette</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">?</span> help</span>
+        <span style="flex: 1;"></span>
+        <span style="display: flex; align-items: center; gap: 6px; color: #8a9cb8;"><span style="color: #5ddc9a;">●</span>connected <span style="color: #4d5f79;">18ms</span></span>
+        <span style="padding-right: 14px; color: #8a9cb8;">2 viewers</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1c — SPLIT VIEW ══ -->
+  <div id="1c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1c</span>
+      <span style="font-size: 14px; color: #edf4ff;">Split view — 3 terminals (Ctrl-b, or palette → Toggle Split View)</span>
+      <span style="font-size: 12px; color: #5f7391;">tab bar is replaced by per-column label rows · focus glow tracks the active column</span>
+    </div>
+
+    <div style="width: 1520px; height: 560px; background: #07111f; border: 1px solid #16233a; display: flex; flex-direction: column; overflow: hidden; font-size: 12.5px; line-height: 1.55;">
+      <div style="height: 30px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; background: linear-gradient(90deg, rgba(97,218,251,.18), rgba(97,218,251,.02) 26%, rgba(97,218,251,.02) 74%, rgba(97,218,251,.18)); border-bottom: 1px solid #16233a;">
+        <span style="color: #61dafb; opacity: .55; letter-spacing: -.5px;">████▓▓▓▒▒▒░░░</span>
+        <span style="color: #61dafb; font-weight: 700; letter-spacing: .42em; font-size: 12px;">· FLIGHTDECK ·</span>
+        <span style="color: #61dafb; opacity: .55; letter-spacing: -.5px;">░░░▒▒▒▓▓▓████</span>
+      </div>
+      <div style="flex: 1; min-height: 0; display: flex;">
+        <div style="width: 220px; flex: none; background: #060e1a; border-right: 1px solid #16233a; opacity: .72; padding: 8px 10px;">
+          <div style="color: #a9b8cf; font-weight: 700; letter-spacing: .2em; font-size: 10.5px; text-transform: uppercase; text-align: center; padding-bottom: 8px; border-bottom: 1px solid #101d31;">Agents</div>
+          <div style="padding: 8px 0; box-shadow: inset 2px 0 0 #f5d76e; padding-left: 8px;">
+            <div style="display: flex; gap: 6px; align-items: center;"><span style="color: #f5d76e;">▸</span><span style="color: #ff6b6b;">{{ spinner }}</span><span style="color: #f5d76e; font-weight: 700;">fix-login-redirect</span></div>
+            <div style="padding-left: 18px; color: #6d819d;">Claude Code <span style="color: #61dafb;">[in progress]</span></div>
+          </div>
+          <div style="padding: 8px 0 8px 8px; border-top: 1px solid #101d31;">
+            <div style="display: flex; gap: 6px; align-items: center;"><span style="color: transparent;">▸</span><span style="color: #5ddc9a;">●</span><span>add-tests-api</span></div>
+            <div style="padding-left: 18px; color: #6d819d;">OpenCode <span style="color: #5ddc9a;">[idle]</span></div>
+          </div>
+        </div>
+
+        <div style="flex: 1; min-width: 0; display: flex; gap: 1px; background: #16233a; padding: 4px;">
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f; box-shadow: inset 0 0 0 1px rgba(97,218,251,.85), 0 0 22px -6px rgba(97,218,251,.4);">
+            <div style="flex: none; padding: 4px 10px; background: #f5d76e; color: #07111f; font-weight: 700; display: flex; justify-content: space-between;"><span>agent</span><span style="opacity: .7;">1/3</span></div>
+            <div style="flex: 1; min-height: 0; padding: 8px 10px; overflow: hidden; color: #dce7f7; font-size: 11.5px; line-height: 1.6; display: flex; flex-direction: column; white-space: pre;">
+              <div><span style="color: #5ddc9a;">●</span> <span style="font-weight: 700;">Edit</span>(relay/src/session.rs)</div>
+              <div>  <span style="color: #4d5f79;">⎿</span> <span style="color: #5ddc9a;">+ viewers: Vec&lt;ViewerHandle&gt;</span></div>
+              <div>     <span style="color: #ff6b6b;">- viewers: HashMap&lt;…&gt;</span></div>
+              <div style="height: 18px;"></div>
+              <div><span style="color: #5ddc9a;">●</span> Re-running the fan-out test</div>
+              <div>  now, then I will push the</div>
+              <div>  branch for review.</div>
+              <div style="height: 18px;"></div>
+              <div><span style="color: #f5d76e;">✻</span> <span style="color: #8a9cb8;">Churning 2m 14s</span></div>
+              <div style="height: 18px;"></div>
+              <div><span style="color: #61dafb;">›</span> <span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span></div>
+            </div>
+          </div>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f;">
+            <div style="flex: none; padding: 4px 10px; background: #1d3a52; color: #a9b8cf; display: flex; justify-content: space-between;"><span>shell 1</span><span style="opacity: .6;">2/3</span></div>
+            <div style="flex: 1; min-height: 0; padding: 8px 10px; overflow: hidden; color: #cbd8ea; font-size: 11.5px; line-height: 1.6; display: flex; flex-direction: column; white-space: pre;">
+              <div><span style="color: #5ddc9a;">➜</span> <span style="color: #61dafb;">fix-login-redirect</span> pnpm test:e2e</div>
+              <div> <span style="color: #4d5f79;">RUN</span>  v2.1.4 /worktrees/fix-login</div>
+              <div style="height: 18px;"></div>
+              <div> <span style="color: #5ddc9a;">✓</span> auth/session.spec.ts  <span style="color: #4d5f79;">(11)</span></div>
+              <div> <span style="color: #5ddc9a;">✓</span> auth/redirect.spec.ts <span style="color: #4d5f79;">(7)</span></div>
+              <div> <span style="color: #ff6b6b;">✗</span> auth/logout.spec.ts   <span style="color: #4d5f79;">(3)</span></div>
+              <div>   <span style="color: #ff6b6b;">→ expected 302, got 200</span></div>
+              <div style="height: 18px;"></div>
+              <div> Tests  <span style="color: #ff6b6b;">1 failed</span> | <span style="color: #5ddc9a;">20 passed</span></div>
+              <div><span style="color: #5ddc9a;">➜</span> <span style="color: #61dafb;">fix-login-redirect</span> <span style="background: #3a5a8a; color: #fff;">&nbsp;</span></div>
+            </div>
+          </div>
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; background: #07111f;">
+            <div style="flex: none; padding: 4px 10px; background: #1d3a52; color: #a9b8cf; display: flex; justify-content: space-between;"><span>shell 2</span><span style="opacity: .6;">3/3</span></div>
+            <div style="flex: 1; min-height: 0; padding: 8px 10px; overflow: hidden; color: #cbd8ea; font-size: 11.5px; line-height: 1.6; display: flex; flex-direction: column; white-space: pre;">
+              <div><span style="color: #5ddc9a;">➜</span> <span style="color: #61dafb;">fix-login-redirect</span> git log --oneline -6</div>
+              <div><span style="color: #f5d76e;">a19c4f2</span> fix(auth): honour returnTo</div>
+              <div><span style="color: #f5d76e;">7b2e8d0</span> test: cover logout redirect</div>
+              <div><span style="color: #f5d76e;">3c9a114</span> refactor: viewer fan-out</div>
+              <div><span style="color: #4d5f79;">e40b7aa</span> chore: bump relay deps</div>
+              <div><span style="color: #4d5f79;">9d1f003</span> docs: relay handshake notes</div>
+              <div><span style="color: #4d5f79;">55ce8b1</span> feat: pair-code expiry</div>
+              <div style="height: 18px;"></div>
+              <div><span style="color: #5ddc9a;">➜</span> <span style="color: #61dafb;">fix-login-redirect</span> <span style="color: #4d5f79;">▍</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="height: 32px; flex: none; display: flex; align-items: center; gap: 12px; border-top: 1px solid #16233a; background: #04090f; font-size: 12.5px;">
+        <span style="align-self: stretch; display: flex; align-items: center; padding: 0 12px; background: #f5d76e; color: #07111f; font-weight: 700;">MODE: TERMINAL</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">SPLIT</span> 3 terminals</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">←/→</span> move focus</span>
+        <span style="color: #24374f;">│</span><span style="color: #a9b8cf;"><span style="color: #f5d76e;">Ctrl-g</span> palette → “split”</span>
+        <span style="flex: 1;"></span>
+        <span style="padding-right: 14px; color: #8a9cb8;"><span style="color: #5ddc9a;">●</span> connected</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1d + 1g row ══ -->
+  <div style="display: flex; flex-wrap: wrap; gap: 56px;">
+
+    <div id="1d" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 14px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1d</span>
+        <span style="font-size: 14px;">Command palette — filtered</span>
+      </div>
+      <div style="width: 900px; height: 620px; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden;">
+        <div style="position: absolute; inset: 0; background: #07111f; opacity: .5; padding: 12px; color: #35496a; font-size: 11.5px; overflow: hidden; display: flex; flex-direction: column; white-space: pre;">
+          <div>● Read the whole spec folder. Starting on the relay handshake.</div>
+          <div style="height: 18px;"></div>
+          <div>● Bash(cargo test -p flightdeck-relay -- --nocapture)</div>
+          <div>  ⎿ Compiling flightdeck-relay v1.16.0</div>
+          <div>     test handshake::pair_code_expires_after_120s ... ok</div>
+        </div>
+        <div style="position: absolute; inset: 0; background: rgba(4,9,15,.72);"></div>
+        <div style="position: absolute; left: 40px; right: 40px; top: 54px; bottom: 54px; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb, 0 24px 60px -12px rgba(0,0,0,.8); display: flex; flex-direction: column;">
+          <div style="flex: none; display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07);">
+            <span style="color: #61dafb; font-weight: 700;">Command Palette</span>
+            <span style="color: #4d5f79;">Esc to close</span>
+          </div>
+          <div style="flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #16334a;">
+            <span style="color: #61dafb;">&gt;</span>
+            <span style="color: #edf4ff; font-size: 14px;">wor</span>
+            <span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite; font-size: 14px;">&nbsp;</span>
+            <span style="flex: 1;"></span>
+            <span style="color: #4d5f79; font-size: 11.5px;">7 of 31 commands</span>
+          </div>
+          <div style="flex: 1; min-height: 0; display: flex; gap: 1px; background: #16334a;">
+            <div style="flex: 1; padding: 12px 14px; background: #050d19; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px;">
+              <div style="color: #f5d76e; font-weight: 700; letter-spacing: .12em; font-size: 11px; text-transform: uppercase; padding-bottom: 4px;">Worktree</div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; background: #61dafb; color: #07111f; font-weight: 700;"><span>Rebase Worktree</span><span>Enter</span></div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #dce7f7;"><span>Abandon <span style="color: #f5d76e;">Wor</span>ktree</span><span style="color: #ff6b6b; font-size: 11px;">destructive</span></div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #dce7f7;"><span>Open <span style="color: #f5d76e;">Wor</span>ktree in File Manager</span><span style="color: #4d5f79; font-size: 11px;">host only</span></div>
+              <div style="height: 10px;"></div>
+              <div style="color: #f5d76e; font-weight: 700; letter-spacing: .12em; font-size: 11px; text-transform: uppercase; padding-bottom: 4px;">Agent Session Tabs</div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #dce7f7;"><span>New Agent Session Tab</span><span style="color: #4d5f79; font-size: 11px;">new worktree</span></div>
+            </div>
+            <div style="flex: 1; padding: 12px 14px; background: #050d19; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px;">
+              <div style="color: #f5d76e; font-weight: 700; letter-spacing: .12em; font-size: 11px; text-transform: uppercase; padding-bottom: 4px;">Git</div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #dce7f7;"><span>Show Git Status</span><span style="color: #4d5f79; font-size: 11px;">worktree detail</span></div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #dce7f7;"><span>Pull Base <span style="color: #4d5f79;">(rebase)</span></span><span style="color: #4d5f79; font-size: 11px;">base: main</span></div>
+              <div style="height: 10px;"></div>
+              <div style="color: #f5d76e; font-weight: 700; letter-spacing: .12em; font-size: 11px; text-transform: uppercase; padding-bottom: 4px;">Recent</div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #7d90ab;"><span>Push Branch</span><span style="color: #4d5f79; font-size: 11px;">2m ago</span></div>
+              <div style="display: flex; justify-content: space-between; padding: 4px 8px; color: #7d90ab;"><span>Toggle Split View</span><span style="color: #4d5f79; font-size: 11px;">6m ago</span></div>
+            </div>
+          </div>
+          <div style="flex: none; padding: 7px 14px; border-top: 1px solid #16334a; color: #4d5f79; font-size: 11.5px; display: flex; gap: 14px;">
+            <span><span style="color: #f5d76e;">↑↓</span> move</span>
+            <span><span style="color: #f5d76e;">Tab</span> next column</span>
+            <span><span style="color: #f5d76e;">Enter</span> run</span>
+            <span style="flex: 1;"></span>
+            <span>the palette is the primary surface — every action in FlightDeck is here</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="1g" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 14px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1g</span>
+        <span style="font-size: 14px;">Destructive confirmation — the whole dialog family's template</span>
+      </div>
+      <div style="width: 560px; height: 620px; display: flex; flex-direction: column; gap: 20px;">
+        <div style="flex: 1; min-height: 0; position: relative; background: #07111f; border: 1px solid #16233a; overflow: hidden;">
+          <div style="position: absolute; inset: 0; background: rgba(4,9,15,.74);"></div>
+          <div style="position: absolute; left: 22px; right: 22px; top: 40px; background: #180d10; box-shadow: inset 0 0 0 1px #ff6b6b, 0 24px 60px -12px rgba(0,0,0,.8);">
+            <div style="display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #4a2226; background: rgba(255,107,107,.1);">
+              <span style="color: #ff6b6b; font-weight: 700;">Rebase Worktree</span>
+              <span style="color: #a4757a; font-size: 11.5px;">step 1 of 2</span>
+            </div>
+            <div style="padding: 14px; display: flex; flex-direction: column; gap: 12px; font-size: 12.5px; line-height: 1.65;">
+              <div style="color: #f4e3e4;">Rebase <span style="color: #f5d76e; font-weight: 700;">flightdeck/fix-login-redirect</span> onto <span style="color: #f5d76e; font-weight: 700;">main</span> (base moved 4 commits); agent is running — its HEAD will be rewritten? Rewrites history; aborts on conflict.</div>
+              <div style="display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; background: rgba(255,107,107,.06); box-shadow: inset 2px 0 0 #ff6b6b; color: #d8b6b8; font-size: 11.5px;">
+                <div><span style="color: #ff6b6b;">▸</span> Claude Code is mid-tool-call and will be interrupted</div>
+                <div><span style="color: #ff6b6b;">▸</span> 6 uncommitted files stay in the worktree</div>
+                <div><span style="color: #ff6b6b;">▸</span> on conflict the rebase aborts and nothing changes</div>
+              </div>
+              <div style="display: flex; gap: 10px; padding-top: 2px;">
+                <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; background: #ff6b6b; color: #180d10; font-weight: 700;"><span style="background: rgba(24,13,16,.25); padding: 0 5px;">y</span>Continue</span>
+                <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #4a2226; color: #d8b6b8;"><span style="background: #2a1418; padding: 0 5px;">n</span>Cancel</span>
+              </div>
+            </div>
+          </div>
+          <div style="position: absolute; left: 22px; right: 22px; bottom: 34px; background: #0a1626; box-shadow: inset 0 0 0 1px #ff6b6b, 0 24px 60px -12px rgba(0,0,0,.8);">
+            <div style="display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #4a2226; background: rgba(255,107,107,.1);">
+              <span style="color: #ff6b6b; font-weight: 700;">Rebase Worktree</span>
+              <span style="color: #a4757a; font-size: 11.5px;">step 2 of 2 — confirm</span>
+            </div>
+            <div style="padding: 14px; display: flex; flex-direction: column; gap: 11px; font-size: 12.5px;">
+              <div style="color: #a9b8cf; line-height: 1.65;">This browser is remote. Type the session name to run the rebase on the host.</div>
+              <div style="display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: #04090f; box-shadow: inset 0 0 0 1px #ff6b6b;">
+                <span style="color: #edf4ff;">fix-login-redi</span>
+                <span style="background: #ff6b6b; color: #180d10; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span>
+                <span style="flex: 1;"></span>
+                <span style="color: #4d5f79; font-size: 11px;">fix-login-redirect</span>
+              </div>
+              <div style="display: flex; gap: 10px;">
+                <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; background: #3a2226; color: #8f6f73;"><span style="background: rgba(0,0,0,.3); padding: 0 5px;">Enter</span>Rebase</span>
+                <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 0 5px;">Esc</span>Cancel</span>
+                <span style="flex: 1;"></span>
+                <span style="color: #4d5f79; font-size: 11px; align-self: center;">every button shows its key</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #8a9cb8; text-wrap: pretty;">Same shell for every dialog: titled 1px accent frame, keyed buttons, consequences listed before the verb. Cyan frame = confirm/select, blue = notification, red = destructive. Abandon and Quit are the only two that reach step 2.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1e — NEW AGENT DIALOG, BOTH STATES ══ -->
+  <div id="1e" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1e</span>
+      <span style="font-size: 14px;">New Agent Session Tab — branch state (left) and run-from-base (right)</span>
+    </div>
+    <div style="display: flex; gap: 28px; flex-wrap: wrap;">
+      <div style="width: 720px; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb;">
+        <div style="display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07); font-size: 12.5px;">
+          <span style="color: #61dafb; font-weight: 700;">New Agent Session Tab</span>
+          <span style="color: #4d5f79;">↑/↓ agent · type branch · Tab = run from base</span>
+        </div>
+        <div style="padding: 14px; display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+          <div style="display: flex; flex-direction: column; gap: 3px;">
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; background: rgba(97,218,251,.12); box-shadow: inset 2px 0 0 #61dafb;"><span style="color: #61dafb;">(•)</span><span style="color: #edf4ff; font-weight: 700;">Claude Code</span><span style="flex: 1;"></span><span style="color: #4d5f79; font-size: 11px;">default</span></div>
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; color: #a9b8cf;"><span style="color: #4d5f79;">( )</span><span>OpenCode</span></div>
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; color: #a9b8cf;"><span style="color: #4d5f79;">( )</span><span>Codex CLI</span><span style="flex: 1;"></span><span style="color: #4d5f79; font-size: 11px;">no lifecycle hooks — status stays neutral</span></div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <div style="color: #7d90ab; font-size: 11px; letter-spacing: .12em; text-transform: uppercase;">Branch</div>
+            <div style="display: flex; align-items: center; gap: 2px; padding: 7px 10px; background: #04090f; box-shadow: inset 0 0 0 1px #61dafb;">
+              <span style="color: #4d5f79;">flightdeck/</span><span style="color: #edf4ff;">refactor-relay-fanout</span>
+              <span style="background: #61dafb; color: #07111f; animation: fdCaret 1.05s steps(1) infinite;">&nbsp;</span>
+              <span style="flex: 1;"></span>
+              <span style="color: #5ddc9a; font-size: 11px;">✓ available</span>
+            </div>
+            <div style="color: #4d5f79; font-size: 11px;">creates ~/worktrees/refactor-relay-fanout from main</div>
+          </div>
+          <div style="display: flex; gap: 10px; padding-top: 2px;">
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; background: #61dafb; color: #07111f; font-weight: 700;"><span style="background: rgba(7,17,31,.22); padding: 0 5px;">Enter</span>Create</span>
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 0 5px;">Tab</span>Run from base: <span style="color: #4d5f79;">off</span></span>
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 0 5px;">Esc</span>Cancel</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="width: 720px; background: #050d19; box-shadow: inset 0 0 0 1px #f5d76e; align-self: flex-start;">
+        <div style="display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #4a3f1c; background: rgba(245,215,110,.09); font-size: 12.5px;">
+          <span style="color: #f5d76e; font-weight: 700;">New Agent Session Tab — run from base</span>
+          <span style="color: #7a6c3c;">no worktree</span>
+        </div>
+        <div style="padding: 14px; display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+          <div style="color: #f0e6c9; line-height: 1.65;">Runs on base branch <span style="color: #f5d76e; font-weight: 700;">'main'</span> in the project root — no worktree. The agent edits the repository you are standing in.</div>
+          <div style="display: flex; flex-direction: column; gap: 3px;">
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; background: rgba(245,215,110,.1); box-shadow: inset 2px 0 0 #f5d76e;"><span style="color: #f5d76e;">(•)</span><span style="color: #edf4ff; font-weight: 700;">Claude Code</span></div>
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; color: #a9b8cf;"><span style="color: #4d5f79;">( )</span><span>OpenCode</span></div>
+            <div style="display: flex; align-items: center; gap: 9px; padding: 5px 10px; color: #a9b8cf;"><span style="color: #4d5f79;">( )</span><span>Codex CLI</span></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: rgba(245,215,110,.05); box-shadow: inset 2px 0 0 #f5d76e; color: #c9b98a; font-size: 11.5px;">branch field hidden — there is nothing to name</div>
+          <div style="display: flex; gap: 10px;">
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; background: #f5d76e; color: #07111f; font-weight: 700;"><span style="background: rgba(7,17,31,.22); padding: 0 5px;">Enter</span>Create</span>
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #4a3f1c; color: #e8dcb4;"><span style="background: #2a2410; padding: 0 5px;">Tab</span>Run from base: <span style="color: #f5d76e;">main</span></span>
+            <span style="display: flex; align-items: center; gap: 7px; padding: 5px 12px; box-shadow: inset 0 0 0 1px #24374f; color: #a9b8cf;"><span style="background: #101d31; padding: 0 5px;">Esc</span>Cancel</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1f — CONFIGURATION MANAGER ══ -->
+  <div id="1f" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1f</span>
+      <span style="font-size: 14px;">Configuration manager — scope switch and the three origin tags</span>
+      <span style="font-size: 12px; color: #5f7391;">the layered-inheritance display: the tag column is the whole point</span>
+    </div>
+    <div style="width: 1040px; background: #050d19; box-shadow: inset 0 0 0 1px #61dafb; font-size: 12.5px;">
+      <div style="display: flex; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #16334a; background: rgba(97,218,251,.07);">
+        <span style="color: #61dafb; font-weight: 700;">Configuration</span>
+        <span style="color: #4d5f79;">Esc to close</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #101d31;">
+        <span style="display: flex; gap: 1px; background: #16334a;">
+          <span style="padding: 4px 14px; color: #a9b8cf; background: #050d19;">Global</span>
+          <span style="padding: 4px 14px; background: #61dafb; color: #07111f; font-weight: 700;">Project (flightdeck)</span>
+        </span>
+        <span style="color: #4d5f79;">Editing: <span style="color: #a9b8cf;">~/Projects/flightdeck/.flightdeck/config.toml</span></span>
+        <span style="flex: 1;"></span>
+        <span style="color: #f5d76e;">Unsaved changes</span>
+      </div>
+      <div style="display: flex; flex-direction: column;">
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px; color: #4d5f79; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 1px solid #101d31;"><span></span><span>value</span><span>setting</span><span>origin</span></div>
+
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">OS notifications</span><span style="color: #6aa8ff;">(global)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #4d5f79;">[ ]</span><span style="color: #dce7f7;">Notification sounds</span><span style="color: #4d5f79;">(default)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">Notify when finished</span><span style="color: #5ddc9a;">(set here)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">Notify when waiting</span><span style="color: #5ddc9a;">(set here)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">Notify when failed</span><span style="color: #6aa8ff;">(global)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">Check for updates</span><span style="color: #4d5f79;">(default)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px; background: rgba(97,218,251,.09); box-shadow: inset 2px 0 0 #61dafb;"><span style="color: #61dafb;">▸</span><span style="color: #61dafb;">‹right›</span><span style="color: #edf4ff; font-weight: 700;">Agent tab position</span><span style="color: #5ddc9a;">(set here)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #61dafb;">‹Claude Code›</span><span style="color: #dce7f7;">Default agent</span><span style="color: #6aa8ff;">(global)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #f5d76e;">‹yellow›</span><span style="color: #dce7f7;">Terminal mode color</span><span style="color: #4d5f79;">(default)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #d68bf5;">‹magenta›</span><span style="color: #dce7f7;">App mode color</span><span style="color: #5ddc9a;">(set here)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #61dafb;">‹bright›</span><span style="color: #dce7f7;">Mode border</span><span style="color: #6aa8ff;">(global)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">Dim terminal in app mode</span><span style="color: #4d5f79;">(default)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #5ddc9a;">[x]</span><span style="color: #dce7f7;">FlightDeck Remote (phone + browser link)</span><span style="color: #5ddc9a;">(set here)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px;"><span></span><span style="color: #a9b8cf;">wss://…</span><span style="color: #dce7f7;">Relay URL</span><span style="color: #4d5f79;">(default)</span></div>
+        <div style="display: grid; grid-template-columns: 22px 124px 1fr 150px; align-items: center; gap: 12px; padding: 5px 14px; color: #55647d;"><span></span><span>—</span><span>Use F2 to leave terminal focus <span style="color: #4d5f79;">· web: Esc Esc or click outside</span></span><span>(host only)</span></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-top: 1px solid #101d31; background: rgba(245,215,110,.05); color: #c9b98a; font-size: 11.5px;"><span style="color: #f5d76e;">note</span> the default relay is rate-restricted — self-host for continuous browser control.</div>
+      <div style="display: flex; flex-wrap: wrap; gap: 14px; padding: 8px 14px; border-top: 1px solid #101d31; color: #4d5f79; font-size: 11.5px;">
+        <span><span style="color: #f5d76e;">↑↓</span> move</span>
+        <span><span style="color: #f5d76e;">Space</span> toggle / edit</span>
+        <span><span style="color: #f5d76e;">Tab</span> switch scope</span>
+        <span><span style="color: #f5d76e;">c</span> clear override</span>
+        <span><span style="color: #f5d76e;">s</span> save</span>
+        <span style="opacity: .55;"><span>e</span> edit in $EDITOR <span>— desktop only</span></span>
+        <span><span style="color: #f5d76e;">Esc</span> close</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 1h — DECISIONS ══ -->
+  <div id="1h" style="display: flex; flex-direction: column; gap: 14px; max-width: 1040px;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: .1em; color: #07111f; background: #61dafb; padding: 3px 8px;">1h</span>
+      <span style="font-size: 14px;">Positions this design takes</span>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: #16233a; border: 1px solid #16233a;">
+      <div style="background: #07111f; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">Keyboard — palette-primary</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;"><span style="color: #f5d76e;">Ctrl-g</span> is the only chord FlightDeck Web claims, because it is the only one no major browser takes. Every other command is reachable by its searchable name, with the old key shown beside it in the palette so desktop muscle memory is taught rather than broken. Bare-key App-mode nav (<span style="color: #f5d76e;">↑↓ ←→ ? Enter</span>) and the Alt/Shift-modified nav survive untouched.</p>
+      </div>
+      <div style="background: #07111f; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">Leaving terminal focus</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;">Click anywhere outside the viewport, or double-tap <span style="color: #f5d76e;">Esc</span> within 400ms. A single Esc still passes through to the hosted agent, which is what the agent expects. The status bar states both routes permanently — no discovery required.</p>
+      </div>
+      <div style="background: #07111f; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">Dark only — the argument</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;">The main pane is a VT100 surface rendering ANSI colors the agent chose against a dark ground. A light theme would either invert that output — misrepresenting what the agent actually printed — or leave a near-black rectangle covering 70% of a white screen. FlightDeck Web is dark-only, and honest about why: it is a terminal, not a document.</p>
+      </div>
+      <div style="background: #07111f; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #61dafb; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;">Sidebar right, and narrow</div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.7; color: #a9b8cf; text-wrap: pretty;"><span style="color: #f5d76e;">ui.agent_tab_position = right</span> mirrors the body row; the focus glow, the <span style="color: #ff6b6b;">✕</span> column and the selection stripe all flip with it — nothing else moves. Below 900px the sidebar becomes a slide-over invoked from a session chip in the project row, and the git bar folds into the status bar.</p>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;sidebarPosition&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;left&quot;,&quot;right&quot;],&quot;default&quot;:&quot;left&quot;,&quot;tsType&quot;:&quot;'left' | 'right'&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
+const FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+class Component extends DCLogic {
+  state = { i: 0 };
+  componentDidMount() { this.t = setInterval(() => this.setState(s => ({ i: (s.i + 1) % FRAMES.length })), 80); }
+  componentWillUnmount() { clearInterval(this.t); }
+  renderVals() {
+    return {
+      spinner: FRAMES[this.state.i],
+      bodyDir: (this.props.sidebarPosition ?? "left") === "right" ? "row-reverse" : "row"
+    };
+  }
+}
+
+</script>
+</body>
+</html>
