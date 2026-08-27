@@ -10,6 +10,69 @@ use std::path::Path;
 /// Scrollback lines kept by each terminal's VT parser.
 const SCROLLBACK: usize = 2000;
 
+/// The smallest VT grid a terminal is ever driven at.
+///
+/// `vt100 0.16.2` asserts unchecked cursor-position invariants while printing
+/// (`screen.rs:827/870/896`, `grid.rs:689` — all `Option::unwrap()` on
+/// `drawing_cell(pos)` / `drawing_row(pos.row)`) and panics on a grid below a
+/// few rows or columns. Wide characters are the trigger: `col_wrap`
+/// (`grid.rs:679`) computes `size.cols - width`, which underflows for a width-2
+/// character in a narrow grid and wraps silently in release builds. Measured
+/// failures: one row panics at every width up to 41, and widths 1/3/5/7 panic at
+/// every height. 0.16.2 is the newest published release, so there is no upgrade
+/// to take and the floor has to live here.
+///
+/// The floor sits above the measured boundary (2 rows, 8 columns) to leave room
+/// for cases the reproduction did not cover. Below it the agent's view is
+/// clipped rather than shrunk further — unavoidable at these sizes, and far
+/// better than taking the whole app down.
+pub const MIN_GRID_ROWS: u16 = 4;
+/// Companion to [`MIN_GRID_ROWS`].
+pub const MIN_GRID_COLS: u16 = 20;
+
+/// Lift `size` to the smallest grid the VT parser tolerates.
+///
+/// Applied at both places a grid gets sized — construction and [`Terminal::resize`]
+/// — so every caller is covered: the layout-derived viewport size, split view's
+/// per-column sizes, and the resize-every-session path. The PTY is told the same
+/// clamped size as the parser, so the agent renders for the grid we parse.
+fn clamp_grid(size: PtySize) -> PtySize {
+    PtySize {
+        rows: size.rows.max(MIN_GRID_ROWS),
+        cols: size.cols.max(MIN_GRID_COLS),
+    }
+}
+
+thread_local! {
+    /// Set only while [`Terminal::process_output`] is inside `vt100`, so the
+    /// process-wide panic hook can tell a panic we handle from one we do not.
+    static PARSER_PANIC_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread is inside a guarded `vt100` parse whose panic is
+/// already handled. The panic hook installed in `run()` uses this to stay quiet
+/// and leave the terminal alone.
+pub fn parser_panic_expected() -> bool {
+    PARSER_PANIC_EXPECTED.with(std::cell::Cell::get)
+}
+
+/// Sets [`PARSER_PANIC_EXPECTED`] for its lifetime. Clearing happens in `Drop`,
+/// so it is correct on the unwinding path too.
+struct ExpectedParserPanic;
+
+impl ExpectedParserPanic {
+    fn new() -> Self {
+        PARSER_PANIC_EXPECTED.with(|f| f.set(true));
+        Self
+    }
+}
+
+impl Drop for ExpectedParserPanic {
+    fn drop(&mut self) {
+        PARSER_PANIC_EXPECTED.with(|f| f.set(false));
+    }
+}
+
 /// What a terminal hosts: the primary agent, an additional agent (a second
 /// agent process running in the same worktree), or a child shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +98,12 @@ impl Terminal {
     /// Construct a terminal wrapping a spawned session, with a VT parser sized
     /// to the terminal's viewport.
     fn new(kind: TerminalKind, title: String, session: Box<dyn PtySession>, size: PtySize) -> Self {
+        let size = clamp_grid(size);
         Terminal {
             kind,
             title,
             session,
-            parser: vt100::Parser::new(size.rows.max(1), size.cols.max(1), SCROLLBACK),
+            parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK),
             selection: None,
         }
     }
@@ -55,8 +119,46 @@ impl Terminal {
     }
 
     /// Feed raw PTY output bytes into the VT parser (updates the screen grid).
+    ///
+    /// Guarded, because `vt100 0.16.2` can panic while printing and there is no
+    /// released version that does not. `Grid::set_size` truncates each row with a
+    /// plain `Vec::resize` (`grid.rs:78-80` -> `row.rs:73-76`), so shrinking the
+    /// column count through the middle of a wide (width-2) character drops the
+    /// continuation half and leaves the first half flagged `is_wide()` in the new
+    /// last column. The next print onto that cell reaches `screen.rs:870`, which
+    /// unwraps `drawing_cell_mut(col + 1)` on the library's own assumption that a
+    /// wide cell is always followed by its other half — and gets `None`.
+    ///
+    /// [`MIN_GRID_COLS`] does not help here: the stranded cell can sit at any
+    /// column, so the panic is reachable at any grid size. Rather than let a
+    /// resize take the whole app down, the panic is contained and the parser is
+    /// rebuilt. The rebuild is not optional: the panic unwinds out of
+    /// `Screen::text` mid-mutation and the stranded cell is still there, so
+    /// reusing the parser would just panic again on the next chunk.
+    ///
+    /// Cost when this fires: the pane's scrollback and screen contents are lost
+    /// and the agent repaints. That is a far better failure than losing every
+    /// pane and the user's session.
     pub fn process_output(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        if Self::feed(&mut self.parser, bytes).is_ok() {
+            return;
+        }
+        // Start from a clean grid at the same size, then let the chunk land on it.
+        let (rows, cols) = self.parser.screen().size();
+        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+        self.selection = None;
+        let _ = Self::feed(&mut self.parser, bytes);
+    }
+
+    /// Run one `vt100` parse, containing a panic from inside the library.
+    ///
+    /// The hook installed in `run()` checks [`parser_panic_expected`] so a panic
+    /// caught here does not tear down the user's terminal modes or print a
+    /// backtrace over a live UI.
+    fn feed(parser: &mut vt100::Parser, bytes: &[u8]) -> std::result::Result<(), ()> {
+        let _expected = ExpectedParserPanic::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)))
+            .map_err(|_| ())
     }
 
     /// Reply to a Device Status Report cursor-position query (`ESC[6n`) found in
@@ -252,10 +354,10 @@ impl Terminal {
     /// Resize both the VT screen grid and the underlying PTY (SPECS §23). The
     /// active selection is dropped, as content reflows under a new width.
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
+        // Never below the floor the VT parser tolerates (see [`clamp_grid`]).
+        let size = clamp_grid(size);
         self.selection = None;
-        self.parser
-            .screen_mut()
-            .set_size(size.rows.max(1), size.cols.max(1));
+        self.parser.screen_mut().set_size(size.rows, size.cols);
         self.session.resize(size)
     }
 }
@@ -527,6 +629,200 @@ mod tests {
 
     fn sz() -> PtySize {
         PtySize::default()
+    }
+
+    /// Regression: resizing to a tiny grid and then feeding output must not
+    /// panic. `vt100 0.16.2` asserts unchecked cursor-position invariants while
+    /// printing (screen.rs:827/870/896, grid.rs:689) and blows up on a grid
+    /// below a few rows/columns — `col_wrap` computes `size.cols - width`, which
+    /// underflows for a wide (width-2) character in a narrow grid and wraps
+    /// silently in release builds. A user hit this by resizing the window
+    /// violently while an agent was printing emoji.
+    #[test]
+    fn tiny_resize_then_wide_output_does_not_panic() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "opencode", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output(b"hello world");
+
+        // Every size a violently-resized window can ask for, including the ones
+        // that panicked: rows == 1 at any width, and odd widths below 9.
+        for (rows, cols) in [
+            (1u16, 1u16),
+            (1, 2),
+            (1, 3),
+            (2, 1),
+            (2, 3),
+            (2, 5),
+            (3, 7),
+            (1, 41),
+            (4, 1),
+            (0, 0),
+        ] {
+            term.resize(PtySize { rows, cols }).unwrap();
+            // Wide characters are the trigger; plain ASCII exercises the rest.
+            term.process_output("漢".as_bytes());
+            term.process_output("🎉".as_bytes());
+            term.process_output(b"\r\nX");
+        }
+    }
+
+    /// The clamp must be observable on the grid, not just avoid the panic — the
+    /// agent is told the same floor, so its own rendering matches what we parse.
+    #[test]
+    fn grid_never_shrinks_below_the_safe_floor() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "opencode", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+
+        term.resize(PtySize { rows: 1, cols: 1 }).unwrap();
+        assert_eq!(term.screen().size(), (MIN_GRID_ROWS, MIN_GRID_COLS));
+
+        // A size above the floor is honoured exactly.
+        term.resize(PtySize {
+            rows: 30,
+            cols: 100,
+        })
+        .unwrap();
+        assert_eq!(term.screen().size(), (30, 100));
+
+        // Only the dimension below the floor is lifted.
+        term.resize(PtySize { rows: 40, cols: 2 }).unwrap();
+        assert_eq!(term.screen().size(), (40, MIN_GRID_COLS));
+    }
+
+    /// A terminal spawned into a tiny viewport starts at the floor too — the
+    /// constructor is the other path that sizes a fresh grid.
+    #[test]
+    fn spawning_into_a_tiny_viewport_starts_at_the_floor() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &pty,
+                "opencode",
+                &[],
+                Path::new(CWD),
+                PtySize { rows: 1, cols: 1 },
+            )
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        assert_eq!(term.screen().size(), (MIN_GRID_ROWS, MIN_GRID_COLS));
+        term.process_output("🎉 hello".as_bytes());
+    }
+
+    /// The continuous-drag gesture that killed the app before: shrink one column
+    /// at a time while an agent with wide characters on screen repaints.
+    #[test]
+    fn a_window_drag_while_the_agent_prints_wide_chars_survives() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &pty,
+                "claude",
+                &[],
+                Path::new(CWD),
+                PtySize {
+                    rows: 24,
+                    cols: 100,
+                },
+            )
+            .unwrap();
+        let term = session.active_mut().unwrap();
+
+        for cols in (20u16..=100).rev() {
+            for row in 1..=8u16 {
+                term.process_output(format!("\x1b[{row};1H").as_bytes());
+                term.process_output(
+                    "working \u{1f389} on \u{6f22}\u{5b57} files \u{2705} step \u{1f389} of \u{6f22}\u{5b57} many".as_bytes(),
+                );
+            }
+            term.resize(PtySize { rows: 24, cols }).unwrap();
+            for row in 1..=8u16 {
+                term.process_output(format!("\x1b[{row};1H").as_bytes());
+                term.process_output("z".repeat(cols as usize).as_bytes());
+            }
+        }
+
+        // The grid still tracks the requested size and the pane is still usable.
+        assert_eq!(term.screen().size(), (24, MIN_GRID_COLS));
+        term.process_output("still alive \u{1f389}".as_bytes());
+    }
+
+    /// The panic hook must stand aside for a parser panic we contain, and still
+    /// fire for anything else. A hook runs on *every* panic, caught or not, so if
+    /// this regressed the first recovered pane would tear down the user's
+    /// terminal modes and print a backtrace over a live UI.
+    ///
+    /// Counts only panics raised on this thread: the hook is process-wide, and
+    /// tests run in parallel.
+    #[test]
+    fn panic_hook_stands_aside_only_for_contained_parser_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let here = std::thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let previous = std::panic::take_hook();
+        // Mirrors the hook installed in `run()`.
+        std::panic::set_hook(Box::new(move |_| {
+            if parser_panic_expected() {
+                return;
+            }
+            if std::thread::current().id() == here {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // Strand a wide character by shrinking through it, then print onto it.
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &pty,
+                "claude",
+                &[],
+                Path::new(CWD),
+                PtySize { rows: 10, cols: 40 },
+            )
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output("\x1b[1;23H\u{6f22}".as_bytes());
+        term.resize(PtySize { rows: 10, cols: 23 }).unwrap();
+        term.process_output("\x1b[1;23Ha".as_bytes());
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "hook ran for a parser panic that process_output already handled"
+        );
+        assert!(!parser_panic_expected(), "guard leaked past the parse");
+        // The pane is still usable, on a fresh grid at the same size.
+        assert_eq!(term.screen().size(), (10, 23));
+        term.process_output("still alive \u{1f389}".as_bytes());
+
+        // A panic we do not handle must still reach the hook.
+        let _ = std::panic::catch_unwind(|| panic!("unrelated"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hook must still run for panics we do not handle"
+        );
+
+        std::panic::set_hook(previous);
     }
 
     // Windows/ConPTY: a Device Status Report cursor-position query (`ESC[6n`)
