@@ -151,8 +151,6 @@ fn map_app_mode(key: KeyEvent) -> KeyAction {
         KeyCode::Char('u') if ctrl => KeyAction::Dispatch(Command::PullBase),
         // Ctrl-k: Close Agent Tab.
         KeyCode::Char('k') if ctrl => KeyAction::Dispatch(Command::CloseAgentTab { action: None }),
-        // ?: Help / keybindings.
-        KeyCode::Char('?') if no_mod => KeyAction::OpenHelp,
 
         // --- Agent Tab Navigation (SPECS §23) ----------------------------
         // Bare Up/Down: previous / next Agent Tab. The Alt-modified variants are
@@ -210,6 +208,23 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
         // Ctrl-q: Quit.
         KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
+        // F1 / Alt-h: Help / keybindings (both modes). Global so help is
+        // reachable with a terminal focused, which is when a user actually
+        // reaches for it; the cost is that hosted agents never see bare F1 or
+        // Alt-h. Modified F1 and bare 'h' are left to the PTY.
+        //
+        // Alt-h exists because Apple keyboards reserve F1 as a media key
+        // (brightness) unless the user enables standard function keys, so on a
+        // Mac laptop F1 never reaches the terminal. Alt-h carries its own macOS
+        // caveat — Option+letter composes a special character unless "Use
+        // Option as Meta key" is on — but that is the same requirement Alt-o
+        // and Alt-1..9 already impose, so it adds no new configuration burden.
+        //
+        // Pressing the same key again while the overlay is open opens the
+        // FlightDeck repository; that lives in the overlay key handling
+        // (`handle_key`), not here, since this map has no view of the overlay.
+        KeyCode::F(1) if key.modifiers.is_empty() => Some(KeyAction::OpenHelp),
+        KeyCode::Char('h') if alt && !ctrl && !shift => Some(KeyAction::OpenHelp),
 
         // --- Project navigation (multi-project) --------------------------
         // Shift-Left / Shift-Right cycle the open projects. Global so they work
@@ -502,9 +517,77 @@ mod tests {
     }
 
     #[test]
-    fn app_mode_question_mark_help() {
+    fn app_mode_question_mark_is_no_longer_help() {
+        // Help used to be App-mode-only on '?'. It is now F1 / Alt-h, global in
+        // both modes, so '?' is an ordinary unbound key in App mode.
         assert_eq!(
             map_key(InputMode::App, key(KeyCode::Char('?'))),
+            KeyAction::None
+        );
+    }
+
+    #[test]
+    fn f1_opens_help_in_app_mode() {
+        assert_eq!(
+            map_key(InputMode::App, key(KeyCode::F(1))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn f1_opens_help_in_terminal_mode() {
+        // F1 is global: a focused terminal must not swallow it as passthrough,
+        // otherwise help is unreachable exactly when a user reaches for it.
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::F(1))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn modified_f1_still_passes_through() {
+        // Only bare F1 is claimed; Ctrl/Alt/Shift-F1 stay the PTY's.
+        assert_eq!(
+            map_key(InputMode::Terminal, ctrl(KeyCode::F(1))),
+            KeyAction::Passthrough(encode_key(ctrl(KeyCode::F(1))))
+        );
+    }
+
+    #[test]
+    fn f3_still_passes_through() {
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::F(3))),
+            KeyAction::Passthrough(encode_key(key(KeyCode::F(3))))
+        );
+    }
+
+    #[test]
+    fn alt_h_opens_help_in_both_modes() {
+        // The reachable-everywhere companion to F1: macOS reserves F1 as a
+        // media key on Apple keyboards, so a non-function-key route matters.
+        assert_eq!(
+            map_key(InputMode::App, alt(KeyCode::Char('h'))),
+            KeyAction::OpenHelp
+        );
+        assert_eq!(
+            map_key(InputMode::Terminal, alt(KeyCode::Char('h'))),
+            KeyAction::OpenHelp
+        );
+    }
+
+    #[test]
+    fn bare_h_still_passes_through_to_the_pty() {
+        // Only the Alt-modified 'h' is claimed; typing 'h' must reach the agent.
+        assert_eq!(
+            map_key(InputMode::Terminal, key(KeyCode::Char('h'))),
+            KeyAction::Passthrough(encode_key(key(KeyCode::Char('h'))))
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_h_is_not_the_help_key() {
+        assert_ne!(
+            map_key(InputMode::Terminal, ctrl(KeyCode::Char('h'))),
             KeyAction::OpenHelp
         );
     }

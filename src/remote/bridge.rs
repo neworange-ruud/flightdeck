@@ -394,6 +394,11 @@ impl RemoteBridge {
             // outbound feed — the phone has not joined yet. Handled by the
             // pairing overlay, not the bridge.
             RemoteInbound::PairingOffered { .. } => {}
+            // A handshake that never reached `auth_ok` is purely a UI concern
+            // (the pairing overlay explains itself). The bridge already pauses
+            // on anything other than `Link(Connected)`, and this arrives with no
+            // `Link` transition of its own, so there is nothing to do here.
+            RemoteInbound::HandshakeFailed { .. } => {}
             RemoteInbound::Envelope(env) => {
                 if self.pairing.is_none() {
                     self.pairing = Some(env.pairing_id.clone());

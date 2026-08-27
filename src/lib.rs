@@ -268,19 +268,39 @@ pub fn run() -> Result<()> {
     let _ =
         save_and_set_terminal_title(&format!("flightdeck — {}", derive_project_name(&repo_root)));
 
+    // Undo the modes above if we panic. `ratatui::try_init` installs a hook that
+    // leaves raw mode and the alternate screen, but it knows nothing about the
+    // mouse capture, bracketed paste, keyboard flags, or title we enabled after
+    // it — and the teardown below is unwound straight past. Without this, a panic
+    // drops the user at a shell whose every mouse movement arrives as escape
+    // sequences printed as text. Chained ahead of ratatui's hook, which still
+    // restores the screen and prints the panic afterwards.
+    {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // A panic from inside the VT parser is caught and handled by
+            // `Terminal::process_output`, which rebuilds the parser and carries
+            // on. Tearing the terminal down and printing a backtrace over a live
+            // UI for a panic that never reaches the top of the stack would turn a
+            // recovered pane into a dead session.
+            if crate::terminal::session::parser_panic_expected() {
+                return;
+            }
+            restore_terminal_modes(keyboard_enhanced);
+            previous(info);
+        }));
+    }
+
     // Seed the PTY size from the terminal viewport (not the whole screen) so
     // agents wrap at the right width — for every open project.
     if let Ok(size) = terminal.size() {
-        let reserve =
-            crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui);
-        let vp = viewport_pty_size(
-            PtySize {
-                rows: size.height,
-                cols: size.width,
-            },
-            reserve,
-        );
+        let full = PtySize {
+            rows: size.height,
+            cols: size.width,
+        };
         for p in workspace.projects.iter_mut() {
+            let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
+            let vp = viewport_pty_size(full, p.state.mode(), reserve);
             p.state.set_pty_size(vp);
         }
     }
@@ -350,12 +370,7 @@ pub fn run() -> Result<()> {
     // because `ratatui::restore` `eprintln!`s on failure, and `eprintln!` itself
     // panics when stderr is gone (the exact Konsole-close case), which would
     // abort the process. `try_restore` just returns the error for us to ignore.
-    if keyboard_enhanced {
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    let _ = restore_terminal_title();
+    restore_terminal_modes(keyboard_enhanced);
     let _ = ratatui::try_restore();
     // Show the cursor ourselves, then skip the `Terminal`'s own `Drop`. ratatui's
     // Drop `eprintln!`s when showing the cursor fails, and `eprintln!` panics when
@@ -1694,6 +1709,18 @@ fn event_loop(
                             }
                         }
                     }
+                    RemoteInbound::HandshakeFailed { reason, retrying } => {
+                        // The relay link never reached `auth_ok`, so no pairing
+                        // code can arrive. Tell the overlay why: a refusal (no
+                        // relay password configured, for instance) fails the
+                        // attempt, a transient failure just explains the wait.
+                        // Without this the overlay showed "Requesting a pairing
+                        // code from the relay…" forever while the client
+                        // backoff-looped in silence.
+                        if let Some(ps) = pairing_session.as_mut() {
+                            ps.on_handshake_failed(reason, *retrying);
+                        }
+                    }
                     RemoteInbound::PairingRejected { .. } => {
                         // The relay no longer recognizes our pairing; the client
                         // dropped the stale record and will re-offer. Give the
@@ -1835,8 +1862,10 @@ fn event_loop(
         terminal
             .draw(|frame| {
                 let area = frame.area();
+                let chrome = crate::tui::layout::chrome_for(area, p.state.mode());
                 let ml = crate::tui::layout::compute(
                     area,
+                    chrome,
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
@@ -1869,13 +1898,12 @@ fn event_loop(
                 handle_paste(data, workspace, env, &mut ui)?;
             }
             Event::Resize(cols, rows) => {
-                let reserve = crate::tui::mode_style::border_enabled(
-                    &workspace.active_project().state.config.ui,
-                );
-                let size = viewport_pty_size(PtySize { rows, cols }, reserve);
+                let full = PtySize { rows, cols };
                 // Resize every project's sessions so a background agent's output
                 // wraps correctly the moment the user switches back to it.
                 for p in workspace.projects.iter_mut() {
+                    let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
+                    let size = viewport_pty_size(full, p.state.mode(), reserve);
                     p.state.set_pty_size(size);
                     resize_sessions(&mut p.state, size);
                 }
@@ -2061,7 +2089,12 @@ fn remote_pairing_view(session: &PairingSession, now_ms: u64) -> RemotePairing {
     use crate::remote::pairing::{qr_art, PairingPhase};
     match session.phase() {
         PairingPhase::Idle | PairingPhase::Offering => RemotePairing {
-            status_line: "Requesting a pairing code from the relay…".to_string(),
+            // A stalling relay handshake names itself here; only a genuinely
+            // quiet wait gets the bland line.
+            status_line: session
+                .stall_reason()
+                .map(str::to_string)
+                .unwrap_or_else(|| "Requesting a pairing code from the relay…".to_string()),
             ..RemotePairing::default()
         },
         PairingPhase::Displaying {
@@ -2885,11 +2918,32 @@ fn spawn_status_refresh(
     true
 }
 
+/// Undo every terminal mode FlightDeck turned on after `ratatui::try_init`.
+///
+/// Shared by the normal teardown and the panic hook so the two can never drift:
+/// a panic that skipped any of these leaves the user's shell echoing mouse
+/// escape sequences as text. All best effort — a terminal that ignored the
+/// enable will ignore the disable.
+fn restore_terminal_modes(keyboard_enhanced: bool) {
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = restore_terminal_title();
+}
+
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents
 /// must wrap at the viewport width (total minus the sidebar/borders), not the
-/// whole screen.
-fn viewport_pty_size(full: PtySize, reserve_border: bool) -> PtySize {
-    let ml = crate::tui::layout::compute(Rect::new(0, 0, full.cols, full.rows), reserve_border);
+/// whole screen. `mode` matters because collapsed chrome hands the sidebar's
+/// columns and the hidden bars' rows to the viewport.
+fn viewport_pty_size(full: PtySize, mode: InputMode, reserve_border: bool) -> PtySize {
+    let area = Rect::new(0, 0, full.cols, full.rows);
+    let ml = crate::tui::layout::compute(
+        area,
+        crate::tui::layout::chrome_for(area, mode),
+        reserve_border,
+    );
     PtySize {
         rows: ml.terminal.height.max(1),
         cols: ml.terminal.width.max(1),
@@ -2938,8 +2992,10 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
     // The project tab row (workspace-level) is checked before the active
     // project's own layout: a click switches/opens/closes a project.
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        let chrome = crate::tui::layout::chrome_for(area, workspace.active_project().state.mode());
         let ml = crate::tui::layout::compute(
             area,
+            chrome,
             crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
@@ -3203,6 +3259,7 @@ fn active_target(state: &AppState) -> ChildTarget {
 fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(ChildTarget, Rect)> {
     let ml = crate::tui::layout::compute(
         area,
+        crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if state.split_view {
@@ -3226,6 +3283,7 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
 fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Option<Rect> {
     let ml = crate::tui::layout::compute(
         area,
+        crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if !state.split_view {
@@ -3411,6 +3469,104 @@ fn encode_mouse_button(
 /// Route a key press. Returns `Ok(true)` when the loop should quit. Workspace-
 /// level actions (switch project) act on `workspace`; everything else acts on
 /// the active project's [`AppState`].
+/// The FlightDeck repository, taken from `Cargo.toml` at compile time so the
+/// URL can never drift from the crate metadata.
+const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Whether a key press arriving while an overlay is open is the "open the
+/// FlightDeck repository" gesture — a second press of a help key on the help
+/// panel — rather than an ordinary dismissal.
+///
+/// Either global help key counts, so the gesture is "press it again" whichever
+/// key you reached for. It keys off the help overlay *being open*, not off how
+/// it was opened, so opening help from the command palette and then pressing F1
+/// works exactly like F1 then F1.
+fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
+    if !matches!(overlay, UiOverlay::Help) {
+        return false;
+    }
+    let bare_f1 = key.code == KeyCode::F(1) && key.modifiers.is_empty();
+    let alt_h = key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::ALT;
+    bare_f1 || alt_h
+}
+
+#[cfg(test)]
+mod help_repo_gesture_tests {
+    use super::*;
+
+    fn f1() -> KeyEvent {
+        KeyEvent::new(KeyCode::F(1), KeyModifiers::empty())
+    }
+
+    #[test]
+    fn f1_on_the_help_overlay_is_the_gesture() {
+        assert!(is_help_repo_gesture(&UiOverlay::Help, f1()));
+    }
+
+    #[test]
+    fn f1_without_the_help_overlay_is_not_the_gesture() {
+        // With no overlay F1 must fall through to the key map and *open* help;
+        // on another overlay it must dismiss, as any key does.
+        assert!(!is_help_repo_gesture(&UiOverlay::None, f1()));
+        assert!(!is_help_repo_gesture(&UiOverlay::About, f1()));
+    }
+
+    #[test]
+    fn alt_h_on_the_help_overlay_is_also_the_gesture() {
+        // "Press the help key again" must hold for whichever help key was used.
+        assert!(is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)
+        ));
+    }
+
+    #[test]
+    fn bare_h_on_the_help_overlay_still_dismisses() {
+        assert!(!is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty())
+        ));
+    }
+
+    #[test]
+    fn other_keys_on_the_help_overlay_are_not_the_gesture() {
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::F(2)] {
+            assert!(
+                !is_help_repo_gesture(&UiOverlay::Help, KeyEvent::new(code, KeyModifiers::empty())),
+                "{code:?} must still dismiss the help overlay",
+            );
+        }
+    }
+
+    #[test]
+    fn modified_f1_on_the_help_overlay_is_not_the_gesture() {
+        assert!(!is_help_repo_gesture(
+            &UiOverlay::Help,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn the_repository_url_is_a_github_https_url() {
+        assert!(
+            REPOSITORY_URL.starts_with("https://github.com/"),
+            "Cargo.toml `repository` must stay a GitHub https URL, got: {REPOSITORY_URL}",
+        );
+    }
+
+    #[test]
+    fn the_repository_url_survives_the_windows_cmd_launcher() {
+        // Windows opens URLs via `cmd /c start`, which re-parses the argument.
+        // A `repository` value carrying a cmd metacharacter would be mangled on
+        // Windows only — a platform-specific break CI cannot catch, since no
+        // test spawns a real browser. Assert the requirement at the call site.
+        assert!(
+            crate::tui::opener::url_is_cmd_safe(REPOSITORY_URL),
+            "Cargo.toml `repository` must be free of cmd metacharacters, got: {REPOSITORY_URL}",
+        );
+    }
+}
+
 fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<bool> {
     // 1. An active prompt captures all input first.
     if ui.prompt.is_some() {
@@ -3427,7 +3583,16 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return handle_palette_key(key, workspace, env, ui).map(|_| false);
     }
 
-    // 3. A non-interactive overlay (help, git status, message): any key dismisses.
+    // 3a. A second bare F1 while the help overlay is open opens the FlightDeck
+    //     repository in the browser. The panel deliberately stays up: pressing
+    //     F1 again is a shortcut out of help, not a way to leave it. Failures
+    //     are silent by design — see `is_help_repo_gesture`.
+    if is_help_repo_gesture(&ui.overlay, key) {
+        let _ = crate::tui::opener::open_url(REPOSITORY_URL);
+        return Ok(false);
+    }
+
+    // 3b. A non-interactive overlay (help, git status, message): any key dismisses.
     if !matches!(ui.overlay, UiOverlay::None) {
         ui.clear();
         return Ok(false);
@@ -5233,7 +5398,19 @@ fn resize_if_changed(term: &mut crate::terminal::session::Terminal, size: PtySiz
 /// Idempotent via [`resize_if_changed`], so calling it every frame is cheap and
 /// transparently handles every transition (toggle, tab switch, child add/close,
 /// terminal resize) without threading resize calls through each command.
+///
+/// Also re-derives `state.pty_size` from the current mode, so toggling between
+/// APP and TERMINAL resizes the agent PTY to match the chrome that is drawn.
 fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
+    // Collapse follows the input mode, not just the window size, so re-derive
+    // the viewport every frame rather than only on `Event::Resize`.
+    // `resize_if_changed` below makes the frames where nothing moved free.
+    state.pty_size = viewport_pty_size(
+        full,
+        state.mode(),
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+    );
+
     let Some(idx) = state.selected_tab else {
         return;
     };
@@ -5242,6 +5419,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
+            crate::tui::layout::chrome_for(area, state.mode()),
             crate::tui::mode_style::border_enabled(&state.config.ui),
         );
         let region = crate::tui::layout::split_region(&ml);
@@ -5277,6 +5455,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
+            crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&state.config.ui),
         );
         let size = PtySize {
@@ -5785,7 +5964,7 @@ mod tests {
             rows: 40,
             cols: 120,
         };
-        let vp = viewport_pty_size(full, false);
+        let vp = viewport_pty_size(full, InputMode::App, false);
         assert!(vp.cols < full.cols, "viewport narrower than full screen");
         assert!(vp.rows < full.rows, "viewport shorter than full screen");
         assert!(vp.cols >= 1 && vp.rows >= 1);
@@ -5797,10 +5976,61 @@ mod tests {
             rows: 40,
             cols: 120,
         };
-        let plain = viewport_pty_size(full, false);
-        let framed = viewport_pty_size(full, true);
+        let plain = viewport_pty_size(full, InputMode::App, false);
+        let framed = viewport_pty_size(full, InputMode::App, true);
         assert_eq!(framed.cols, plain.cols - 2);
         assert_eq!(framed.rows, plain.rows - 2);
+    }
+
+    #[test]
+    fn collapsed_viewport_is_larger_only_where_the_window_is_small() {
+        // Below both thresholds: terminal mode collapses and reclaims space.
+        let small = PtySize {
+            rows: 24,
+            cols: 100,
+        };
+        let app = viewport_pty_size(small, InputMode::App, false);
+        let terminal = viewport_pty_size(small, InputMode::Terminal, false);
+        assert!(terminal.rows > app.rows, "collapsing reclaims chrome rows");
+        assert!(
+            terminal.cols > app.cols,
+            "collapsing reclaims sidebar columns"
+        );
+
+        // A large window never collapses, so both modes agree exactly.
+        let large = PtySize {
+            rows: 50,
+            cols: 200,
+        };
+        assert_eq!(
+            viewport_pty_size(large, InputMode::App, false),
+            viewport_pty_size(large, InputMode::Terminal, false)
+        );
+    }
+
+    #[test]
+    fn terminal_at_follows_the_collapsed_sidebar_in_terminal_mode() {
+        use crate::persistence::project_state::default_state;
+
+        let mut state = AppState::new(
+            Config::default(),
+            default_state("main"),
+            "/repo",
+            "/repo/state.json",
+        );
+        // Below both collapse thresholds (108 cols, 32 rows).
+        let area = Rect::new(0, 0, 100, 24);
+
+        // App mode keeps the 28-column sidebar, so column 5 is not the terminal.
+        state.focus_app();
+        assert!(terminal_at(area, &state, 5, 10).is_none());
+
+        // Terminal mode collapses the sidebar to a 3-column strip, so the same
+        // point is now inside the viewport.
+        state.focus_terminal();
+        let (_, viewport) =
+            terminal_at(area, &state, 5, 10).expect("collapsed viewport covers column 5");
+        assert_eq!(viewport.x, crate::tui::layout::COLLAPSED_SIDEBAR_WIDTH);
     }
 
     #[test]
