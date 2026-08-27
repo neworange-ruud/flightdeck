@@ -24,6 +24,7 @@ pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
+pub mod web;
 
 // No-op stand-in when the real self-updater is not built: either the
 // `self-update` feature is off (a pure-Rust build with no C toolchain), or the

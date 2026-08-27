@@ -83,6 +83,28 @@ base64 = "0.22"
 # the version p256/ecdsa expect, so one dependency serves both.
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# --- FlightDeck Web (embedded browser control surface, src/web/) -----------
+# See specs/WEB_INTERFACE.md. The axum/tokio server itself is added with the
+# tokio port (D6/D7); the crates below are the leaf dependencies of the modules
+# that need no runtime.
+#
+# Constant-time comparison for the bootstrap code and the persistent token
+# (Q4). The relay already reaches for `subtle` for exactly this, so the desktop
+# uses the same crate rather than hand-rolling a comparison that an optimiser is
+# free to short-circuit.
+subtle = "2.6"
+# The `webui/` SPA is baked into the binary so a release stays a single file and
+# the server never resolves paths on disk (D9). `mime-guess` attaches a content
+# type to each embedded file, which the asset route serves verbatim.
+rust-embed = { version = "8", features = ["mime-guess"] }
+# Network-interface enumeration for the access overlay's address picker (Q1.2).
+# Pure Rust over getifaddrs/GetAdaptersAddresses, so it adds no C toolchain and
+# behaves the same on macOS, Linux and Windows — the parity requirement in
+# .agents/skills/flightdeck-cross-platform-parity. Classification (wifi / bridge
+# / tunnel) is our own heuristic on top of the names it returns; see
+# src/web/interfaces.rs.
+if-addrs = "0.13"
+
 # Self-update deps, built on every platform EXCEPT Windows. Target-gating them
 # here (rather than only behind the `self-update` feature) keeps the Windows
 # build pure-Rust even when that default feature is enabled: axoupdater's graph
