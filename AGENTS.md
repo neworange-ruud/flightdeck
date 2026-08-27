@@ -50,3 +50,50 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+<!-- Kept OUTSIDE the managed BEADS INTEGRATION block above, which bd regenerates from a content hash. -->
+
+## Beads conventions for this repo
+
+**One database, whole project.** `.beads/` is repo-scoped: it syncs over this
+repo's git remote via `refs/dolt/data`. Do not create a second database for a
+new work area — dependencies cannot span databases, and you would lose the
+cross-area links that make `bd ready` and `bd blocked` trustworthy. A separate
+database is only right for a genuinely separate repo (then use `bd federation`
+if the two must talk).
+
+**The `remote-control-` prefix is a historical misnomer, not a scope.** It was
+set with `bd init -p remote-control` when the iOS/relay work was the only work;
+the default would have been the directory name. It is now the tracker for the
+whole project — it already holds project-wide memories (e.g.
+`ship-gate-covers-remote-workspace`). Read `remote-control-<id>` as "flightdeck
+issue <id>" and ignore the words. Never re-init to rename it: there is no rename
+command, IDs are cited in commit messages, PR bodies and issue cross-links, and
+re-init is destructive (`--destroy-token`, `--discard-remote`).
+
+**Label every issue with its area.** The prefix carries no meaning, so `area:*`
+is how work is grouped. Every issue gets at least one, and genuinely
+cross-cutting work gets several (the seq-deadlock bug was
+`area:relay area:desktop area:ios`).
+
+| Label | Covers |
+| --- | --- |
+| `area:desktop` | `src/remote/` — the Rust desktop bridge |
+| `area:relay` | `remote/` — the relay + protocol workspace |
+| `area:ios` | `ios/` — the Swift app |
+| `area:tui` | `src/tui/` — panes, input, rendering |
+| `area:web` | `web/` — the site and privacy policy |
+| `area:containers` | `containers/` — agent isolation images |
+| `area:ci` | `.github/workflows/` — CI, release, TestFlight |
+| `area:ops` | infrastructure, mailboxes, App Store admin |
+| `area:git` | worktree and git-plumbing logic |
+
+```bash
+bd list --label=area:relay          # everything touching the relay
+bd ready --label=area:tui           # ready work in one area
+bd label add <id> [<id>...] area:x  # ids first, label last
+```
+
+Extend the table rather than inventing an unlisted `area:` value. `ios`, `rust`
+and `multi-pairing` are legacy labels on closed issues — do not add more; they
+are superseded by `area:*`.
