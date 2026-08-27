@@ -226,6 +226,16 @@ pub enum WebInbound {
         seat: Seat,
         /// Per-terminal byte cursors it wants to resume from.
         cursors: Vec<TermCursor>,
+        /// The [`ViewerId`] of the connection this one is resuming
+        /// ([`Attach::resume_viewer`]), when the browser named one.
+        ///
+        /// Forwarded rather than kept here because this module remembers what it
+        /// *forwarded* and `src/web/stream.rs` remembers what a PTY actually
+        /// *took* — and only the latter can safely dedup a replayed keystroke
+        /// queue (§5.1). Without this field the applier's watermark would reset
+        /// to zero on every reconnect and a browser replaying its held queue
+        /// would have every keystroke typed twice.
+        resume_viewer: Option<ViewerId>,
     },
     /// A browser's socket closed.
     ViewerDetached {
@@ -1725,6 +1735,7 @@ async fn handle_attach(
         label,
         seat,
         cursors: attach.cursors,
+        resume_viewer: attach.resume_viewer,
     });
     // Any attach can change the seat map — a first attach adds a row, a
     // re-attach may have just evicted the incumbent. Eviction is exactly this

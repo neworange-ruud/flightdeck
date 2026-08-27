@@ -1457,3 +1457,827 @@ fn every_attached_viewer_is_told_about_the_shutdown() {
     }
     assert_eq!(told, 3, "all three viewers must be told before the close");
 }
+
+// ===========================================================================
+// Terminals: bytes out, keystrokes in (D2, D4, D8, Q3, §5.1)
+// ===========================================================================
+//
+// These drive the real socket into **real
+// `flightdeck::terminal::session::Terminal`s**, each backed by a
+// `flightdeck::testing::FakePtySession` that records every `write_input` and
+// every `resize` it is handed. That recording is the point: D4's guarantee is
+// not "the host politely declines a viewer's geometry", it is "no such call is
+// ever made", and only a counting seam can tell those two apart.
+
+use flightdeck::contracts::domain::{ProcessState, PtySize};
+use flightdeck::terminal::session::Session;
+use flightdeck::testing::{FakePty, FakePtyHandle};
+use flightdeck::web::protocol::{Ack, AckOutcome, ServerMsg as SM, TermBytes, TermCursor};
+use flightdeck::web::stream::{
+    child_terminal_id, primary_terminal_id, write_into_session, TerminalHost, TerminalStreams,
+    Written,
+};
+
+/// The tabs the host has open — the `AppState` half of the TUI's
+/// [`TerminalHost`], reduced to what a terminal write needs.
+///
+/// It resolves a wire id through the *same* `write_into_session` the TUI uses,
+/// so a divergence between this test's idea of a stale id and production's
+/// would be a compile-level impossibility rather than a review question.
+#[derive(Default)]
+struct Tabs {
+    tabs: Vec<(String, Session)>,
+}
+
+impl TerminalHost for Tabs {
+    fn write_terminal_input(
+        &mut self,
+        terminal_id: &flightdeck::web::protocol::TerminalId,
+        bytes: &[u8],
+    ) -> Written {
+        for (tab_id, session) in self.tabs.iter_mut() {
+            let tab_id = tab_id.clone();
+            if let Some(written) = write_into_session(session, &tab_id, terminal_id, bytes) {
+                return written;
+            }
+        }
+        Written::NoSuchTerminal
+    }
+}
+
+/// The host side of the terminal stream, assembled the way `src/lib.rs`
+/// assembles it: one [`TerminalStreams`] registry plus the tabs it streams.
+struct Fleet {
+    streams: TerminalStreams,
+    tabs: Tabs,
+    backend: FakePty,
+}
+
+impl Fleet {
+    fn new(replay_bytes: usize) -> Fleet {
+        Fleet {
+            streams: TerminalStreams::new(replay_bytes),
+            tabs: Tabs::default(),
+            backend: FakePty::new(),
+        }
+    }
+
+    /// Open a tab with a primary agent terminal, returning the handle that
+    /// records what its PTY was asked to do.
+    fn tab(&mut self, tab_id: &str) -> FakePtyHandle {
+        let handle = self.backend.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(
+                &self.backend,
+                "agent",
+                &[],
+                std::path::Path::new("."),
+                PtySize {
+                    rows: 34,
+                    cols: 120,
+                },
+            )
+            .expect("the fake backend spawns");
+        self.streams.open(primary_terminal_id(tab_id));
+        self.tabs.tabs.push((tab_id.to_string(), session));
+        handle
+    }
+
+    /// Add a child shell to an existing tab, returning its handle and its
+    /// **mint-keyed** id (never its index — see `TerminalId`'s own doc).
+    fn child(&mut self, tab_id: &str) -> (FakePtyHandle, flightdeck::web::protocol::TerminalId) {
+        let handle = self.backend.queue_session();
+        let (_, session) = self
+            .tabs
+            .tabs
+            .iter_mut()
+            .find(|(id, _)| id == tab_id)
+            .expect("that tab is open");
+        let index = session
+            .spawn_child(
+                &self.backend,
+                "bash",
+                &[],
+                std::path::Path::new("."),
+                PtySize {
+                    rows: 34,
+                    cols: 120,
+                },
+            )
+            .expect("the fake backend spawns");
+        let id = child_terminal_id(
+            tab_id,
+            session
+                .child(index)
+                .expect("the child is there")
+                .stream_id(),
+        );
+        self.streams.open(id.clone());
+        (handle, id)
+    }
+
+    /// One tick of `drain_pty_output`: read every live PTY, feed the desktop's
+    /// own `vt100` parser, **and** tee the same bytes to the browser (D2).
+    fn pump(&mut self, handle: &WebServerHandle) {
+        for (tab_id, session) in self.tabs.tabs.iter_mut() {
+            if let Some(primary) = session.primary_mut() {
+                let bytes = primary.session_mut().try_read_output().unwrap_or_default();
+                if !bytes.is_empty() {
+                    primary.process_output(&bytes);
+                    if let Some(frame) = self
+                        .streams
+                        .pty_output(&primary_terminal_id(tab_id), &bytes)
+                    {
+                        handle.send(server::WebOutbound::All(SM::TermBytes(frame)));
+                    }
+                }
+            }
+            for c in 0..session.child_count() {
+                let Some(child) = session.child_mut(c) else {
+                    continue;
+                };
+                let stream_id = child.stream_id();
+                let bytes = child.session_mut().try_read_output().unwrap_or_default();
+                if bytes.is_empty() {
+                    continue;
+                }
+                child.process_output(&bytes);
+                if let Some(frame) = self
+                    .streams
+                    .pty_output(&child_terminal_id(tab_id, stream_id), &bytes)
+                {
+                    handle.send(server::WebOutbound::All(SM::TermBytes(frame)));
+                }
+            }
+        }
+    }
+
+    /// One tick of the inbound drain, exactly as the TUI runs it.
+    fn drain(&mut self, events: Vec<WebInbound>, handle: &WebServerHandle) {
+        for event in events {
+            for out in self.streams.apply_inbound(&event, &mut self.tabs) {
+                handle.send(out);
+            }
+        }
+    }
+}
+
+/// Let the server's async side catch up with what the synchronous test just did.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+async fn next_term_bytes(ws: &mut Ws) -> TermBytes {
+    frame_matching(ws, |frame| match frame {
+        SM::TermBytes(bytes) => Some(bytes),
+        _ => None,
+    })
+    .await
+}
+
+async fn next_ack(ws: &mut Ws) -> Ack {
+    frame_matching(ws, |frame| match frame {
+        SM::Ack(ack) => Some(ack),
+        _ => None,
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// D2: bytes out
+// ---------------------------------------------------------------------------
+
+/// D2 + Q3: raw PTY bytes reach an attached viewer, each frame carrying the
+/// offset of its own first byte, contiguous across chunks — and the desktop's
+/// own `vt100` parse still sees the same bytes.
+#[test]
+fn pty_bytes_reach_an_attached_viewer_with_monotonic_offsets() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        agent.push_output(b"hello ".to_vec());
+        fleet.pump(&harness.handle);
+        agent.push_output(b"world".to_vec());
+        fleet.pump(&harness.handle);
+
+        let first = next_term_bytes(&mut ws).await;
+        assert_eq!(first.terminal_id.as_str(), "tab-1:primary");
+        assert_eq!(first.data, b"hello ".to_vec());
+        assert_eq!(first.offset, 0);
+        assert!(!first.truncated);
+
+        let second = next_term_bytes(&mut ws).await;
+        assert_eq!(second.data, b"world".to_vec());
+        assert_eq!(
+            second.offset,
+            first.next_offset(),
+            "offsets must be contiguous, or a resuming viewer's cursor lies"
+        );
+    });
+
+    // D2's other half: the desktop's parse was not disturbed by the tee.
+    let (_, session) = &fleet.tabs.tabs[0];
+    let screen = session.primary().expect("a primary").screen();
+    assert!(
+        screen.contents().contains("hello world"),
+        "the desktop's own vt100 parse must still have the bytes: {:?}",
+        screen.contents()
+    );
+}
+
+/// D14 as revised: a controller and a concurrent observer both receive every
+/// byte, and only the controller's keystrokes reach a PTY. Both halves in one
+/// test, because it is the *combination* that D14 permits.
+#[test]
+fn a_controller_and_an_observer_both_see_bytes_but_only_one_types() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+
+    on_runtime(async {
+        let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut driver, SeatRequest::Control).await;
+        await_snapshot(&mut driver).await;
+        let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut watcher, SeatRequest::Observe).await;
+        await_snapshot(&mut watcher).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        agent.push_output(b"shared output".to_vec());
+        fleet.pump(&harness.handle);
+
+        for ws in [&mut driver, &mut watcher] {
+            let frame = next_term_bytes(ws).await;
+            assert_eq!(
+                frame.data,
+                b"shared output".to_vec(),
+                "an observer is a first-class reader (D14)"
+            );
+        }
+
+        // The observer types. The server refuses it before it ever reaches the
+        // host, so the PTY sees nothing — and the observer is *told*, never
+        // silently dropped (§5.1).
+        send(
+            &mut watcher,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-1"),
+                data: b"rm -rf /\r".to_vec(),
+            }),
+        )
+        .await;
+        let ack = next_ack(&mut watcher).await;
+        assert_eq!(ack.outcome, AckOutcome::Ignored);
+        assert!(ack.detail.is_some(), "the observer is told why");
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+        assert!(
+            agent.input().is_empty(),
+            "an observer's keystrokes must never reach a PTY, got {:?}",
+            String::from_utf8_lossy(&agent.input())
+        );
+
+        // The controller types, and it lands.
+        send(
+            &mut driver,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-1"),
+                data: b"ls\r".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+        let ack = next_ack(&mut driver).await;
+        assert_eq!(ack.outcome, AckOutcome::Applied);
+        assert_eq!(agent.input(), b"ls\r".to_vec());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Q3: reconnect and resume
+// ---------------------------------------------------------------------------
+
+/// Q3's Tail case, over a real socket: the viewer sends the cursor it saved,
+/// and is handed the exact continuation — nothing re-sent, nothing skipped.
+#[test]
+fn a_reconnecting_viewer_resumes_from_its_byte_cursor() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    let terminal = primary_terminal_id("tab-1");
+
+    on_runtime(async {
+        // First connection: sees the first chunk, then the link dies.
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        agent.push_output(b"first-half ".to_vec());
+        fleet.pump(&harness.handle);
+        let seen = next_term_bytes(&mut ws).await;
+        let cursor = seen.next_offset();
+        drop(ws);
+
+        // Output continues while nobody is watching.
+        agent.push_output(b"second-half".to_vec());
+        fleet.pump(&harness.handle);
+
+        // Reconnect, presenting the cursor.
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        send(
+            &mut ws,
+            &ClientMsg::Attach(Attach {
+                protocol_version: PROTOCOL_VERSION,
+                seat: SeatRequest::TakeOver,
+                cursors: vec![TermCursor {
+                    terminal_id: terminal.clone(),
+                    next_offset: cursor,
+                }],
+                resume_viewer: None,
+                viewport: None,
+                client: None,
+            }),
+        )
+        .await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let resumed = next_term_bytes(&mut ws).await;
+        assert_eq!(resumed.offset, cursor, "a tail begins where the viewer was");
+        assert_eq!(
+            resumed.data,
+            b"second-half".to_vec(),
+            "exactly the bytes it missed, and no others"
+        );
+        assert!(
+            !resumed.truncated,
+            "nothing aged out, so nothing may be claimed lost"
+        );
+    });
+}
+
+/// Q3's Truncated case: the ring wrapped while the viewer was away, so it is
+/// handed everything retained, flagged, starting *ahead* of where it asked.
+/// That inequality is the gap, and the flag is what lets the browser say it
+/// missed output instead of pretending continuity.
+#[test]
+fn a_reconnecting_viewer_whose_cursor_aged_out_is_told_it_missed_output() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    // A ring far smaller than what the terminal is about to print.
+    let mut fleet = Fleet::new(8);
+    let agent = fleet.tab("tab-1");
+    let terminal = primary_terminal_id("tab-1");
+
+    on_runtime(async {
+        agent.push_output(b"0123456789ABCDEF".to_vec());
+        fleet.pump(&harness.handle);
+
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        send(
+            &mut ws,
+            &ClientMsg::Attach(Attach {
+                protocol_version: PROTOCOL_VERSION,
+                seat: SeatRequest::Control,
+                cursors: vec![TermCursor {
+                    terminal_id: terminal.clone(),
+                    next_offset: 2,
+                }],
+                resume_viewer: None,
+                viewport: None,
+                client: None,
+            }),
+        )
+        .await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let resumed = next_term_bytes(&mut ws).await;
+        assert!(
+            resumed.truncated,
+            "the viewer must be told output was discarded before it could see it"
+        );
+        assert_eq!(resumed.data, b"89ABCDEF".to_vec());
+        assert_eq!(resumed.offset, 8, "the oldest byte still retained");
+        assert!(
+            resumed.offset > 2,
+            "the frame starting ahead of the cursor *is* the gap"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// §5.1: queued, in order, exactly once
+// ---------------------------------------------------------------------------
+
+/// Input reaches the terminal it names, and only that one. The child is
+/// addressed by its mint, so this also proves the id is not positional.
+#[test]
+fn input_reaches_the_terminal_it_names_and_no_other() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    let (shell, shell_id) = fleet.child("tab-1");
+    let other_agent = fleet.tab("tab-2");
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        send(
+            &mut ws,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: shell_id.clone(),
+                data: b"pwd\r".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(ack.seq, 1);
+        assert_eq!(ack.outcome, AckOutcome::Applied);
+        assert_eq!(shell.input(), b"pwd\r".to_vec());
+        assert!(
+            agent.input().is_empty() && other_agent.input().is_empty(),
+            "a keystroke must not spray across terminals"
+        );
+    });
+}
+
+/// §5.1 end to end: keystrokes typed while the link is down are queued by the
+/// browser, replayed **in order** when it returns, and the ones the host
+/// already applied are not applied a second time.
+///
+/// The browser's queue is modelled here the way turn 2 specifies it: replay in
+/// seq order, dropping nothing, and let the host's watermark decide what was
+/// already taken.
+#[test]
+fn input_held_across_a_reconnect_arrives_in_order_exactly_once() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    let terminal = primary_terminal_id("tab-1");
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        let first = await_snapshot(&mut ws).await;
+        assert_eq!(
+            first.last_input_seq, 0,
+            "a fresh viewer has applied nothing"
+        );
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        // Two keystrokes land, and the browser is told about both.
+        for (seq, data) in [(1u64, &b"a"[..]), (2, &b"b"[..])] {
+            send(
+                &mut ws,
+                &ClientMsg::Input(Input {
+                    seq,
+                    terminal_id: terminal.clone(),
+                    data: data.to_vec(),
+                }),
+            )
+            .await;
+        }
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+        for expected in [1u64, 2] {
+            let ack = next_ack(&mut ws).await;
+            assert_eq!(ack.seq, expected);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+        }
+        let previous_viewer = first.viewer_id.clone();
+        drop(ws);
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        // The link is down. The user keeps typing; the browser holds 3, 4, 5.
+        let held: Vec<(u64, Vec<u8>)> =
+            vec![(3, b"c".to_vec()), (4, b"d".to_vec()), (5, b"e".to_vec())];
+
+        // Back. The host carries the previous connection's watermark onto the
+        // new viewer id, which is what makes `last_input_seq` honest.
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        send(
+            &mut ws,
+            &ClientMsg::Attach(Attach {
+                protocol_version: PROTOCOL_VERSION,
+                seat: SeatRequest::TakeOver,
+                cursors: Vec::new(),
+                resume_viewer: Some(previous_viewer.clone()),
+                viewport: None,
+                client: None,
+            }),
+        )
+        .await;
+        let resumed = await_snapshot(&mut ws).await;
+        settle().await;
+        // Nothing bespoke here: the ordinary drain carries the watermark onto
+        // the new viewer id, because `Attach { resume_viewer }` told it to.
+        fleet.drain(harness.inbound(), &harness.handle);
+        assert_eq!(
+            resumed.last_input_seq, 2,
+            "the returning browser is told exactly what already landed"
+        );
+
+        // The browser replays its whole queue in seq order — including the two
+        // it has now learned were applied, to prove they are not typed twice.
+        for (seq, data) in [(1u64, b"a".to_vec()), (2, b"b".to_vec())]
+            .into_iter()
+            .chain(held)
+        {
+            send(
+                &mut ws,
+                &ClientMsg::Input(Input {
+                    seq,
+                    terminal_id: terminal.clone(),
+                    data,
+                }),
+            )
+            .await;
+        }
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let mut outcomes = Vec::new();
+        for _ in 0..5 {
+            let ack = next_ack(&mut ws).await;
+            outcomes.push((ack.seq, ack.outcome));
+        }
+        assert_eq!(
+            outcomes,
+            vec![
+                (1, AckOutcome::Ignored),
+                (2, AckOutcome::Ignored),
+                (3, AckOutcome::Applied),
+                (4, AckOutcome::Applied),
+                (5, AckOutcome::Applied),
+            ],
+            "every frame is answered: the replayed ones ignored, the held ones applied"
+        );
+        assert_eq!(
+            agent.input(),
+            b"abcde".to_vec(),
+            "in order, once each: no loss, no duplication, no reordering"
+        );
+    });
+}
+
+/// A refusal path (SPECS §26): a keystroke aimed at a terminal the host no
+/// longer has is **rejected with a reason** rather than vanishing, and the
+/// watermark does not move, so the same seq stays re-sendable.
+#[test]
+fn input_for_a_terminal_the_host_does_not_have_is_refused_out_loud() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        send(
+            &mut ws,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-that-was-closed"),
+                data: b"still here?\r".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(ack.seq, 1);
+        assert_eq!(ack.outcome, AckOutcome::Rejected);
+        assert!(
+            ack.detail.is_some(),
+            "a rejection with no reason is a silent drop with extra steps"
+        );
+        assert!(agent.input().is_empty());
+
+        // The refusal did not consume the seq: a retry at the same number, once
+        // the terminal is back, still applies.
+        send(
+            &mut ws,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-1"),
+                data: b"retry\r".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(ack.outcome, AckOutcome::Applied);
+        assert_eq!(agent.input(), b"retry\r".to_vec());
+    });
+}
+
+/// The other refusal path: the terminal is still listed, but its process has
+/// exited. The browser can see it, so it gets the accurate reason rather than
+/// "no such terminal".
+#[test]
+fn input_for_an_exited_terminal_is_refused_with_the_accurate_reason() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    agent.set_state(ProcessState::Exited(0));
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        send(
+            &mut ws,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-1"),
+                data: b"anyone there?\r".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(ack.outcome, AckOutcome::Rejected);
+        let detail = ack.detail.unwrap_or_default();
+        assert!(
+            detail.contains("exited"),
+            "the browser is told the process is gone, not that the terminal is: {detail}"
+        );
+        assert!(agent.input().is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// D4: the browser can never resize a PTY
+// ---------------------------------------------------------------------------
+
+/// **D4, proved rather than asserted about types.**
+///
+/// A viewer sends `Resize { viewport: 240×80 }` — a viewport nothing like the
+/// host's 120×34 grid — over a real socket. The frame reaches the host
+/// (asserted, so this is not passing because the frame went missing), is fed
+/// through the very same inbound drain the TUI runs, and lands on real
+/// `Terminal`s whose `PtySession`s **count every `resize` call they receive**.
+/// The count must still be zero.
+///
+/// The counter is then proved non-vacuous on the *same* fake session: the
+/// desktop's own resize path (`Terminal::resize`, which is what
+/// `resize_if_changed` calls every frame) is invoked and the count becomes one.
+/// Without that second half, "zero resizes" could mean "the fake never counts",
+/// which would prove nothing at all.
+#[test]
+fn a_resize_frame_never_resizes_a_pty() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    let (shell, _shell_id) = fleet.child("tab-1");
+
+    // Spawning sizes a PTY once, through the backend rather than through
+    // `resize`, so both counters start empty. Baseline it explicitly: the whole
+    // test is about a count, and a count needs a known zero.
+    assert!(agent.resizes().is_empty(), "baseline: no resizes yet");
+    assert!(shell.resizes().is_empty(), "baseline: no resizes yet");
+
+    let saw_resize = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        // A viewport wildly unlike the host's 120x34 grid, sent twice, plus a
+        // keystroke behind it so the host is demonstrably still processing this
+        // viewer's frames after the resizes.
+        for (cols, rows) in [(240u16, 80u16), (37, 11)] {
+            send(
+                &mut ws,
+                &ClientMsg::Resize(flightdeck::web::protocol::Resize {
+                    viewport: flightdeck::web::protocol::Viewport { cols, rows },
+                }),
+            )
+            .await;
+        }
+        send(
+            &mut ws,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: primary_terminal_id("tab-1"),
+                data: b"x".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+
+        let events = harness.inbound();
+        let resizes = events
+            .iter()
+            .filter(|e| matches!(e, WebInbound::Resize { .. }))
+            .count();
+        fleet.drain(events, &harness.handle);
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(
+            ack.outcome,
+            AckOutcome::Applied,
+            "the host kept processing this viewer's frames after the resizes"
+        );
+        resizes
+    });
+
+    assert_eq!(
+        saw_resize, 2,
+        "the Resize frames must really have reached the host, or this test proves nothing"
+    );
+    assert_eq!(
+        agent.resizes(),
+        Vec::new(),
+        "D4: a viewer's viewport must never reach portable_pty"
+    );
+    assert_eq!(
+        shell.resizes(),
+        Vec::new(),
+        "D4: not for the selected terminal, and not for any other either"
+    );
+
+    // The PTY grid is still the host's, untouched.
+    let (_, session) = &fleet.tabs.tabs[0];
+    let (rows, cols) = session.primary().expect("a primary").screen().size();
+    assert_eq!(
+        (cols, rows),
+        (120, 34),
+        "the host's grid is unchanged by anything the browser said"
+    );
+
+    // ...and the counter is not vacuous: the *desktop's* resize path, the one
+    // `sync_terminal_sizes` drives every frame, does register.
+    let (_, session) = &mut fleet.tabs.tabs[0];
+    session
+        .primary_mut()
+        .expect("a primary")
+        .resize(PtySize {
+            rows: 40,
+            cols: 100,
+        })
+        .expect("the desktop may resize its own PTY");
+    assert_eq!(
+        agent.resizes(),
+        vec![PtySize {
+            rows: 40,
+            cols: 100
+        }],
+        "the seam does count resizes — so the zero above is a real zero"
+    );
+}

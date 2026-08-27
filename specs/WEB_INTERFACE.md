@@ -512,7 +512,7 @@ string.
 statuses, and the host-side store enforces it by taking the reason from the
 caller rather than deriving one.
 
-### R2 — the browser's status/git model is wider than the wire's
+### R2 — the browser's status/git model is wider than the wire's · **resolved: mapped in the adapter**
 
 `webui/src/state/model.ts` models per-session git as a three-way union —
 `known` / `no_upstream` / `unknown` — and carries a session-level
@@ -521,10 +521,42 @@ bool plus a `collected` bool, which admits an impossible fourth state, and it
 has nowhere to say "Codex CLI reports no lifecycle" as data.
 
 `no-upstream` and `git: ?` are load-bearing facts (2g names both, and §5.1's
-lifted dim tier exists for them), so the browser must not infer either. Whoever
-wires the live socket resolves this in one of two ways and says which: widen
-protocol v1 to match, or map in the adapter with a comment. **Inferring is not
-one of the options.**
+lifted dim tier exists for them), so the browser must not infer either.
+
+**Resolved when the live socket was wired: mapped host-side, in
+`src/web/stream/host_state.rs`.** The wire is unchanged; `git_bar()` is the one
+function that emits a `GitBar`, and the module doc there carries the reasoning
+in full. In short:
+
+1. **The lifecycle half needed nothing.** Protocol v1 already carries
+   `SessionView::lifecycle_reporting` alongside `agent_display_name` — a fact
+   plus a name, from which the browser writes `unknown → unknown · Codex CLI
+   reports no lifecycle`. The host sends the fact, the design owns the wording.
+   R2's note was written before that field existed. The host derives the flag
+   from `agents::setup::status_backend`, i.e. from the *same* function that
+   decides whether to attach a lifecycle integration at launch, so the flag
+   cannot drift from the behaviour it describes.
+2. **The two git bools are a faithful encoding of the three-way union**, because
+   both are derived from one `Option<&WorktreeStatus>`: `has_upstream: true` is
+   unreachable without `collected: true`. Read as a union —
+   `!collected` → `unknown` (`git: ?`); `collected && !has_upstream` →
+   `no_upstream`; `collected && has_upstream` → `known`. Nothing is inferred
+   from a missing field, from zeroed counts, or from an empty branch:
+   `collected: false` is sent deliberately, and `is_git_unknown()` is the single
+   predicate that reads it.
+
+**Why not widen the wire.** The encoding has two peers and the decoder lives in
+`webui/`, which protocol v1 is already built against. A wire change the SPA is
+not changed to match in the same commit does not make the model narrower — it
+makes the two halves disagree, which is a worse failure than a bool pair with a
+documented reading and a test.
+
+The test that keeps this honest is
+`git_bar_never_claims_an_upstream_it_has_not_looked_for`
+(`src/web/stream/tests.rs`), which asserts the impossible fourth state never
+escapes the adapter. If a later turn does widen `GitBar` to a tagged union —
+changing the SPA in the same change — `git_bar()` is the only host-side place
+that moves, and that test is rewritten rather than deleted.
 
 ### R3 — the letterbox and palette invariants are enforced by tests
 

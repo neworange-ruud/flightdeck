@@ -92,12 +92,30 @@ pub struct Terminal {
     parser: vt100::Parser,
     /// The active mouse text selection, if any (SPECS §20).
     selection: Option<Selection>,
+    /// Per-session mint counter, assigned once at spawn and never reused.
+    ///
+    /// This exists so a terminal has an identity that is **not** its position
+    /// in [`Session::children`]. `specs/WEB_INTERFACE.md` D2/Q3 keys a replay
+    /// ring buffer and every browser byte cursor by terminal id, and a
+    /// positional id would be a correctness bug there rather than a cosmetic
+    /// one: close child 1 and the old child 2 inherits index 1, so a resuming
+    /// viewer would resume the wrong stream at a plausible-looking offset.
+    ///
+    /// Always 0 for the primary, which needs no counter — there is at most one
+    /// primary per session and it is identified as such.
+    stream_id: u64,
 }
 
 impl Terminal {
     /// Construct a terminal wrapping a spawned session, with a VT parser sized
     /// to the terminal's viewport.
-    fn new(kind: TerminalKind, title: String, session: Box<dyn PtySession>, size: PtySize) -> Self {
+    fn new(
+        kind: TerminalKind,
+        title: String,
+        session: Box<dyn PtySession>,
+        size: PtySize,
+        stream_id: u64,
+    ) -> Self {
         let size = clamp_grid(size);
         Terminal {
             kind,
@@ -105,7 +123,14 @@ impl Terminal {
             session,
             parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK),
             selection: None,
+            stream_id,
         }
+    }
+
+    /// The mint counter this terminal was spawned with. See [`Terminal::stream_id`]
+    /// (the field) for why it is not the child index.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
     }
 
     /// The terminal's process state.
@@ -369,6 +394,10 @@ pub struct Session {
     primary: Option<Terminal>,
     children: Vec<Terminal>,
     selected_child: Option<usize>,
+    /// Next value for [`Terminal::stream_id`]. Monotonic for the life of the
+    /// session and **never** decremented when a child is closed, which is the
+    /// whole point: a closed child's id is retired, not recycled.
+    next_stream_id: u64,
 }
 
 impl Session {
@@ -405,6 +434,7 @@ impl Session {
             cmd.to_string(),
             session,
             size,
+            0,
         ));
         Ok(())
     }
@@ -447,8 +477,15 @@ impl Session {
         size: PtySize,
     ) -> Result<usize> {
         let session = backend.spawn(cmd, args, &[], cwd, size)?;
-        self.children
-            .push(Terminal::new(kind, cmd.to_string(), session, size));
+        self.next_stream_id += 1;
+        let stream_id = self.next_stream_id;
+        self.children.push(Terminal::new(
+            kind,
+            cmd.to_string(),
+            session,
+            size,
+            stream_id,
+        ));
         let index = self.children.len() - 1;
         self.selected_child = Some(index);
         Ok(index)

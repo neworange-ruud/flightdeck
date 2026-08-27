@@ -59,6 +59,13 @@ pub enum PaletteAction {
     PairPhone,
     /// Forget the paired phone (FlightDeck Remote), after a confirmation.
     UnpairPhone,
+    /// Start the embedded web interface (`specs/WEB_INTERFACE.md` D10): bind the
+    /// listener and report the address, warning when it is routable (D5).
+    /// Workspace-level — it owns a TCP listener, not `AppState`.
+    StartWebInterface,
+    /// Stop the embedded web interface: tell every attached browser why, then
+    /// release the listener (Q5).
+    StopWebInterface,
 }
 
 /// All §22 command-palette entries, in display order.
@@ -199,6 +206,16 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::UnpairPhone,
     },
     PaletteEntry {
+        group: "Remote",
+        label: "Start Web Interface",
+        action: PaletteAction::StartWebInterface,
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Stop Web Interface",
+        action: PaletteAction::StopWebInterface,
+    },
+    PaletteEntry {
         group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
@@ -228,8 +245,9 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
 /// Phone") bring the total to 28, plus "About FlightDeck" makes 29, plus "Open
 /// Worktree in File Manager" makes 30, plus "Change Project Default Base"
-/// makes 31.
-pub const REQUIRED_ACTION_COUNT: usize = 31;
+/// makes 31, plus the two FlightDeck Web lifecycle actions ("Start Web
+/// Interface" / "Stop Web Interface", D10) makes 33.
+pub const REQUIRED_ACTION_COUNT: usize = 33;
 
 /// The command palette model (SPECS §22).
 ///
@@ -246,6 +264,11 @@ pub struct CommandPalette {
     /// is hidden while unpaired (there is nothing to forget). Defaults to
     /// `false` (unpaired) so an un-configured palette offers pairing.
     is_paired: bool,
+    /// Whether the embedded web server is listening (`specs/WEB_INTERFACE.md`
+    /// D10). Gates the two FlightDeck Web entries exactly as `is_paired` gates
+    /// the phone ones: "Start" is hidden while it runs, "Stop" while it does
+    /// not. Defaults to `false`, so a fresh palette offers starting it.
+    web_running: bool,
     /// Whether this is an isolated run (SPECS §32), which hides the project
     /// entries and "New Agent Session Tab". Presentation only — the flows
     /// themselves refuse independently, because keybindings bypass the palette.
@@ -266,6 +289,15 @@ impl CommandPalette {
         self.selected = 0;
     }
 
+    /// Set whether the embedded web server is listening, which decides the
+    /// visibility of the two FlightDeck Web entries (see
+    /// [`CommandPalette::web_running`]). Resets the selection so it can never
+    /// point past the (possibly shorter) filtered list.
+    pub fn set_web_running(&mut self, web_running: bool) {
+        self.web_running = web_running;
+        self.selected = 0;
+    }
+
     /// Set whether this is an isolated run, which decides the visibility of the
     /// project and new-session entries. Resets the selection so it can never
     /// point past the shorter filtered list.
@@ -283,6 +315,9 @@ impl CommandPalette {
             PaletteAction::PairPhone => !self.is_paired,
             // Nothing to unpair unless a pairing exists.
             PaletteAction::UnpairPhone => self.is_paired,
+            // Exactly one of the two web lifecycle actions is ever offered.
+            PaletteAction::StartWebInterface => !self.web_running,
+            PaletteAction::StopWebInterface => self.web_running,
             // An isolated run has one session in one project (SPECS §32).
             PaletteAction::OpenProject
             | PaletteAction::CloseProject
@@ -435,6 +470,8 @@ mod tests {
             "Open Configuration",
             "Pair Phone",
             "Unpair Phone",
+            "Start Web Interface",
+            "Stop Web Interface",
             "Toggle Split View",
             "Show Help",
             "About FlightDeck",
@@ -494,10 +531,11 @@ mod tests {
 
     #[test]
     fn filter_empty_shows_all() {
-        // A fresh (unpaired) palette shows every action except "Unpair Phone",
-        // which is gated behind an existing pairing.
+        // A fresh palette shows every action except the two hidden halves of
+        // the gated pairs: "Unpair Phone" (nothing is paired) and "Stop Web
+        // Interface" (nothing is listening).
         let palette = CommandPalette::new();
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
     }
 
     #[test]
@@ -521,8 +559,44 @@ mod tests {
             "cannot pair when already paired"
         );
         assert!(labels.contains(&"Unpair Phone"), "unpair must be offered");
-        // Exactly one of the two Remote entries is visible in either state.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        // Exactly one of each gated pair is visible in either state.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+    }
+
+    /// D10: exactly one of the two FlightDeck Web lifecycle actions is offered
+    /// at a time, so the palette can never ask the user to start a server that
+    /// is already listening or stop one that is not.
+    #[test]
+    fn exactly_one_web_lifecycle_action_is_offered() {
+        let stopped = CommandPalette::new();
+        let labels: Vec<&str> = stopped.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Start Web Interface"));
+        assert!(
+            !labels.contains(&"Stop Web Interface"),
+            "nothing to stop while the server is not listening"
+        );
+
+        let mut running = CommandPalette::new();
+        running.set_web_running(true);
+        let labels: Vec<&str> = running.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Stop Web Interface"));
+        assert!(
+            !labels.contains(&"Start Web Interface"),
+            "cannot start a server that is already listening"
+        );
+        assert_eq!(running.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+    }
+
+    /// The gate must reset the selection, or a shorter filtered list could be
+    /// indexed past its end — the same hazard `set_paired` guards.
+    #[test]
+    fn set_web_running_resets_selection() {
+        let mut palette = CommandPalette::new();
+        palette.select_next();
+        palette.select_next();
+        assert_eq!(palette.selected_index(), 2);
+        palette.set_web_running(true);
+        assert_eq!(palette.selected_index(), 0);
     }
 
     #[test]
@@ -618,8 +692,9 @@ mod tests {
 
         palette.clear_filter();
         assert_eq!(palette.filter(), "");
-        // Unpaired: all actions except the pairing-gated "Unpair Phone".
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        // Unpaired and not listening: all actions except the hidden half of
+        // each gated pair.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
     }
 
     #[test]

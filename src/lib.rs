@@ -1226,6 +1226,17 @@ struct Ui {
     /// gated by the actual pairing state (a `RemoteBridge` this UI cannot borrow
     /// directly). `false` whenever remote is disabled.
     remote_paired: bool,
+    /// Set by the "Start Web Interface" palette action; the event loop (which
+    /// owns the listener) starts it next tick (D10).
+    pending_web_start: bool,
+    /// Set by "Stop Web Interface"; the event loop drains the viewers and
+    /// releases the listener (Q5).
+    pending_web_stop: bool,
+    /// Whether the embedded web server is currently listening. Refreshed each
+    /// tick and read when opening the palette, so exactly one of the two
+    /// lifecycle commands is ever offered — the same gating idiom as
+    /// [`Ui::remote_paired`].
+    web_running: bool,
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -1322,6 +1333,167 @@ impl<'a> Env<'a> {
             container: self.container,
             command: self.command,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the embedded browser surface (`specs/WEB_INTERFACE.md`)
+// ---------------------------------------------------------------------------
+
+/// Everything the event loop needs to run the embedded web interface.
+///
+/// One of these exists for the whole process whether or not the server is
+/// running, because the pieces have different lifetimes: the credential store
+/// is shared with the server so a revocation lands on the very next connection
+/// (D5), and the inbound channel and the replay registry must survive
+/// `Stop Web Interface` followed by `Start Web Interface` — recreating the
+/// registry would throw away every terminal's scrollback on a restart.
+///
+/// **The tee only runs while the server does.** A replay ring is
+/// `[web] replay_bytes` (256 KiB by default) per live terminal, and `[web]
+/// enabled` is off by default, so a user who never opens a browser must not pay
+/// for buffers nobody will read. The accepted cost is the other way round: the
+/// first viewer after `Start Web Interface` paints from the moment the server
+/// started, not from the start of the session. That is honest on the wire — the
+/// stream really does begin there, `offset` and `replay_from` say so — and Q2
+/// already accepts one imperfect first repaint. Seeding the ring from the
+/// desktop's `vt100` grid was considered and rejected: that grid is a *parse
+/// result*, and writing it into a byte stream would be inventing bytes the PTY
+/// never emitted.
+struct WebSurface {
+    /// Shared with the server (D5): the TUI mints bootstrap codes and revokes,
+    /// the server verifies on every connection.
+    credentials: Arc<Mutex<crate::web::credentials::CredentialStore>>,
+    /// Per-terminal replay rings plus the per-viewer input watermark.
+    streams: crate::web::stream::TerminalStreams,
+    /// Handed to `server::start`; kept so a restart reuses the same channel.
+    inbound_tx: Sender<crate::web::server::WebInbound>,
+    /// Drained every tick.
+    inbound_rx: Receiver<crate::web::server::WebInbound>,
+    /// `Some` while the server is running.
+    handle: Option<crate::web::server::WebServerHandle>,
+    /// The last state published, so `publish_state` is paired with the deltas
+    /// that describe the difference rather than a server-side guess.
+    published: crate::web::server::HostState,
+}
+
+impl WebSurface {
+    /// Build the surface. Does **not** start the server — `[web] enabled` is
+    /// the TUI's decision to make (D10), and the server deliberately ignores it.
+    fn new(config: &crate::contracts::domain::WebConfig) -> WebSurface {
+        let path = crate::web::credentials::web_credentials_path()
+            // No `$HOME`: run without persistence rather than failing, the same
+            // idiom as `remote.json`. The token then lasts one session.
+            .unwrap_or_else(|| std::path::PathBuf::from("web.json"));
+        let store = crate::web::credentials::CredentialStore::open(
+            Arc::new(RealFs),
+            Arc::new(RealClock),
+            path,
+        );
+        let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        WebSurface {
+            credentials: Arc::new(Mutex::new(store)),
+            streams: crate::web::stream::TerminalStreams::new(config.replay_bytes),
+            inbound_tx,
+            inbound_rx,
+            handle: None,
+            published: crate::web::server::HostState::default(),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Start listening, returning the bound address and whether it is reachable
+    /// off this machine (D5 — the caller warns when it is).
+    fn start(
+        &mut self,
+        config: &crate::contracts::domain::WebConfig,
+        initial: crate::web::server::HostState,
+    ) -> std::result::Result<
+        (std::net::SocketAddr, crate::web::server::BindExposure),
+        crate::web::server::StartError,
+    > {
+        if let Some(handle) = self.handle.as_ref() {
+            return Ok((handle.bound_addr(), handle.exposure()));
+        }
+        self.published = initial.clone();
+        let handle = crate::web::server::start(
+            config,
+            Arc::clone(&self.credentials),
+            Arc::new(RealClock),
+            initial,
+            self.inbound_tx.clone(),
+        )?;
+        let reported = (handle.bound_addr(), handle.exposure());
+        self.handle = Some(handle);
+        Ok(reported)
+    }
+
+    /// Tell every viewer why the socket is closing, then release the listener
+    /// (Q5). The replay rings and watermarks survive, so a later start resumes
+    /// rather than restarts.
+    fn stop(&mut self, notice: crate::web::server::ShutdownNotice) {
+        if let Some(handle) = self.handle.take() {
+            handle.stop(notice);
+        }
+        // Nothing can be attached any more, so no viewport is current. The
+        // watermarks stay: they are keyed by viewer id and a returning browser
+        // still needs them to avoid retyping its held queue.
+        self.published = crate::web::server::HostState::default();
+    }
+
+    /// One chunk of raw PTY output, from `drain_pty_output`'s tee.
+    fn tee(&mut self, tab_id: &str, child: Option<usize>, mint: u64, bytes: &[u8]) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let terminal_id = match child {
+            None => crate::web::stream::primary_terminal_id(tab_id),
+            Some(_) => crate::web::stream::child_terminal_id(tab_id, mint),
+        };
+        if let Some(frame) = self.streams.pty_output(&terminal_id, bytes) {
+            handle.send(crate::web::server::WebOutbound::All(
+                crate::web::protocol::ServerMsg::TermBytes(frame),
+            ));
+        }
+    }
+}
+
+/// The [`TerminalHost`] the web interface writes keystrokes through: every open
+/// project's tabs, searched by wire terminal id.
+///
+/// Every project, not just the active one, because a browser can be looking at
+/// a session in a project that is not on screen and D3's shared selection moves
+/// the desktop to it — but the keystroke must land even in the tick before that
+/// happens.
+///
+/// [`TerminalHost`]: crate::web::stream::TerminalHost
+struct WorkspaceTerminals<'a> {
+    projects: &'a mut [Project],
+}
+
+impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
+    fn write_terminal_input(
+        &mut self,
+        terminal_id: &crate::web::protocol::TerminalId,
+        bytes: &[u8],
+    ) -> crate::web::stream::Written {
+        for project in self.projects.iter_mut() {
+            for tab in project.state.tabs.iter_mut() {
+                let tab_id = tab.meta.id.clone();
+                if let Some(written) = crate::web::stream::write_into_session(
+                    &mut tab.session,
+                    &tab_id,
+                    terminal_id,
+                    bytes,
+                ) {
+                    return written;
+                }
+            }
+        }
+        crate::web::stream::Written::NoSuchTerminal
     }
 }
 
@@ -1666,6 +1838,20 @@ fn event_loop(
         .map(|s| s.established.is_some())
         .unwrap_or(false);
 
+    // FlightDeck Web (optional): the embedded browser surface. Constructed
+    // always (it is cheap and holds no buffers until the server runs) and
+    // started here only when `[web] enabled` opted in — D10 makes auto-start the
+    // TUI's decision, which is why `server::start` deliberately ignores the flag.
+    let mut web_surface = WebSurface::new(&workspace.active_project().state.config.web);
+    if workspace.active_project().state.config.web.enabled {
+        let config = workspace.active_project().state.config.web.clone();
+        let initial = build_web_host_state(workspace, &web_surface.streams, now0);
+        match web_surface.start(&config, initial) {
+            Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
+            Err(e) => ui.message(format!("Web interface did not start: {e}")),
+        }
+    }
+
     loop {
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
@@ -1678,7 +1864,12 @@ fn event_loop(
             let is_active = idx == active;
             let p = &mut workspace.projects[idx];
 
-            drain_pty_output(&mut p.state, now_ms, |sid, which, bytes| {
+            drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
+                // FlightDeck Web (D2): the raw chunk into this terminal's replay
+                // ring, and straight out to every attached viewer. Only while the
+                // server is running — see `WebSurface` on the memory this costs
+                // and why it is not paid by a user who never starts it.
+                web_surface.tee(sid, which, mint, bytes);
                 if let Some(b) = remote_bridge.as_mut() {
                     // Primary (None) bytes no longer build the transcript — it is
                     // reconstructed from the agent's session file each tick (see
@@ -1919,6 +2110,69 @@ fn event_loop(
             );
         }
 
+        // --- FlightDeck Web: drain what the browsers said, then publish the
+        //     state and the deltas that describe how it changed.
+        //
+        //     Ordering matters and is deliberate. Inbound is drained *first*, so
+        //     a selection the browser just moved (D3) is reflected in the state
+        //     published on this same tick rather than a tick later. And publish
+        //     comes after `sync_terminal_sizes` above, so the geometry the
+        //     browser letterboxes is the grid the PTY actually has (D4). ---
+        if web_surface.running() {
+            let inbound: Vec<crate::web::server::WebInbound> =
+                web_surface.inbound_rx.try_iter().collect();
+            for event in inbound {
+                // Selection changes and the activity feed's `mark_read` are the
+                // other tasks' half of the M1 surface; this loop owns the byte
+                // stream and the keystrokes, and answers each with its own ack.
+                let mut host = WorkspaceTerminals {
+                    projects: &mut workspace.projects,
+                };
+                let out = web_surface.streams.apply_inbound(&event, &mut host);
+                if let Some(handle) = web_surface.handle.as_ref() {
+                    for frame in out {
+                        handle.send(frame);
+                    }
+                }
+            }
+
+            let next = build_web_host_state(workspace, &web_surface.streams, now_ms);
+            if next != web_surface.published {
+                // Publish, *then* the matching deltas: publishing changes what
+                // the next attach sees and notifies nobody, deliberately, so the
+                // host is the one that says what changed (see `HostState`).
+                let frames = crate::web::stream::deltas(&web_surface.published, &next);
+                if let Some(handle) = web_surface.handle.as_ref() {
+                    handle.publish_state(next.clone());
+                    for delta in frames {
+                        handle.send(crate::web::server::WebOutbound::All(
+                            crate::web::protocol::ServerMsg::Delta(delta),
+                        ));
+                    }
+                }
+                web_surface.published = next;
+            }
+        }
+
+        // --- Start / stop the web interface, when the palette asked (D10). ---
+        if ui.pending_web_start {
+            ui.pending_web_start = false;
+            let config = workspace.active_project().state.config.web.clone();
+            let initial = build_web_host_state(workspace, &web_surface.streams, now_ms);
+            match web_surface.start(&config, initial) {
+                Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
+                Err(e) => ui.message(format!("Web interface did not start: {e}")),
+            }
+        }
+        if ui.pending_web_stop {
+            ui.pending_web_stop = false;
+            if web_surface.running() {
+                web_surface.stop(crate::web::server::ShutdownNotice::server_stopped());
+                ui.message("Web interface stopped.".to_string());
+            }
+        }
+        ui.web_running = web_surface.running();
+
         // --- Render: the project tab row (workspace-level) plus the active
         //     project's full UI. The project row is painted first so any
         //     centered overlay drawn by `draw` still wins on tiny screens. ---
@@ -2002,6 +2256,11 @@ fn event_loop(
         }
     }
 
+    // Tell any attached browser that FlightDeck itself is going away, before the
+    // listener closes (Q5), so it enters a terminal state instead of spinning in
+    // "reconnecting…" against a host that no longer exists.
+    web_surface.stop(crate::web::server::ShutdownNotice::host_quit(None));
+
     // Tear down the relay client (best-effort join). A dropped handle also
     // signals the thread, so an early `?` return above still winds it down.
     if let Some(setup) = remote_setup {
@@ -2009,6 +2268,168 @@ fn event_loop(
     }
 
     Ok(())
+}
+
+/// Build the state the browser paints from, out of every open project.
+///
+/// This is the whole desktop → wire adaptation, assembled from
+/// [`crate::web::stream`]'s per-piece converters so the interesting decisions
+/// (R2's git mapping, the lifecycle fact, a terminal's byte-stream numbers) live
+/// next to their tests rather than in the event loop.
+///
+/// Every project is included, not just the active one: a browser can be looking
+/// at a session in a background project, and D3's shared selection means
+/// clicking it moves the desktop rather than the browser being told it may not
+/// look.
+///
+/// Two fields are deliberately empty in this task's scope, and are the next
+/// tasks' to fill: `activity` (D11's feed store exists in
+/// [`crate::web::activity`] but nothing records into it yet) and `dialog` (D13
+/// is M2). Both are absent rather than guessed — §5.1's "unknown stays unknown"
+/// applies to an empty feed exactly as it applies to a status.
+fn build_web_host_state(
+    workspace: &Workspace,
+    streams: &crate::web::stream::TerminalStreams,
+    now_ms: u64,
+) -> crate::web::server::HostState {
+    use crate::web::protocol as wire;
+    use crate::web::stream as ws;
+
+    let active = workspace.active_project();
+    let mut projects = Vec::with_capacity(workspace.projects.len());
+    let mut selection = wire::Selection {
+        split_view: active.state.split_view,
+        ..wire::Selection::default()
+    };
+
+    for project in workspace.projects.iter() {
+        // The repository root, not the folder name: two open projects can be
+        // called `web` and the browser keys everything by this id.
+        let root = project.git.root().display().to_string();
+        let project_id = wire::ProjectId::new(root.clone());
+        let mut sessions = Vec::with_capacity(project.state.tabs.len());
+
+        for (index, tab) in project.state.tabs.iter().enumerate() {
+            let mut terminals = Vec::new();
+            if let Some(primary) = tab.session.primary() {
+                terminals.push(terminal_facts(
+                    ws::primary_terminal_id(&tab.meta.id),
+                    primary,
+                ));
+            }
+            for c in 0..tab.session.child_count() {
+                if let Some(child) = tab.session.child(c) {
+                    terminals.push(terminal_facts(
+                        ws::child_terminal_id(&tab.meta.id, child.stream_id()),
+                        child,
+                    ));
+                }
+            }
+
+            if std::ptr::eq(project, active) && project.state.selected_tab == Some(index) {
+                selection.project_id = Some(project_id.clone());
+                selection.session_id = Some(tab.id());
+                selection.terminal_id = Some(match tab.session.selected_child() {
+                    None => ws::primary_terminal_id(&tab.meta.id),
+                    Some(c) => tab
+                        .session
+                        .child(c)
+                        .map(|child| ws::child_terminal_id(&tab.meta.id, child.stream_id()))
+                        .unwrap_or_else(|| ws::primary_terminal_id(&tab.meta.id)),
+                });
+            }
+
+            sessions.push(ws::session_view(
+                &ws::SessionFacts {
+                    project_id: &project_id,
+                    tab_id: &tab.meta.id,
+                    name: &tab.meta.name,
+                    agent: &tab.meta.agent,
+                    agent_def: project.state.config.agents.get(&tab.meta.agent),
+                    phase: match tab.phase {
+                        TabPhase::Creating => wire::SessionPhase::Creating,
+                        TabPhase::Ready => wire::SessionPhase::Ready,
+                    },
+                    display: tab.display_status(now_ms),
+                    // The per-turn timer lives in the phone bridge's own turn
+                    // tracker, which this loop does not own. Reported as zero
+                    // rather than fabricated; wiring it is a follow-up.
+                    running_time_secs: 0,
+                    git: ws::GitFacts {
+                        status: project.cache.get(&tab.meta.id),
+                        fallback_branch: &tab.meta.branch,
+                    },
+                    recovered: tab.meta.recovered,
+                    attached_existing_branch: tab.meta.attached_existing_branch,
+                    terminals,
+                },
+                streams,
+            ));
+        }
+
+        projects.push(ws::project_view(
+            &project_id,
+            &project.name,
+            &root,
+            &project.state.base_branch,
+            sessions,
+        ));
+    }
+
+    crate::web::server::HostState {
+        host_version: env!("CARGO_PKG_VERSION").to_string(),
+        projects,
+        selection,
+        geometry: ws::geometry_of(active.state.pty_size),
+        replay_capacity_bytes: streams.capacity_bytes() as u64,
+        activity: Vec::new(),
+        dialog: None,
+    }
+}
+
+/// One terminal's wire facts, read off the live [`crate::terminal::session::Terminal`].
+fn terminal_facts(
+    terminal_id: crate::web::protocol::TerminalId,
+    terminal: &crate::terminal::session::Terminal,
+) -> crate::web::stream::TerminalFacts {
+    let (rows, cols) = terminal.screen().size();
+    let state = terminal.process_state();
+    crate::web::stream::TerminalFacts {
+        terminal_id,
+        role: crate::web::protocol::TerminalRole::from(terminal.kind),
+        title: terminal.title.clone(),
+        // The grid the desktop's own parser is using, which is the grid the PTY
+        // has — D4's "the host owns this", read from the horse's mouth rather
+        // than from a remembered config value.
+        geometry: crate::web::protocol::Geometry { cols, rows },
+        alive: matches!(state, ProcessState::Running | ProcessState::Starting),
+        exit_code: match state {
+            ProcessState::Exited(code) => Some(code),
+            _ => None,
+        },
+    }
+}
+
+/// The line the desktop shows when the server comes up, carrying D5's warning
+/// whenever the bound address is reachable from other machines.
+///
+/// The warning is not decoration: binding a routable address is the one web
+/// setting that changes who can reach the user's agents, and it is only ever
+/// reached because they typed it into `config.toml` themselves.
+fn web_started_message(
+    addr: std::net::SocketAddr,
+    exposure: crate::web::server::BindExposure,
+) -> String {
+    match exposure {
+        crate::web::server::BindExposure::Loopback => {
+            format!("Web interface listening on http://{addr} (this machine only).")
+        }
+        crate::web::server::BindExposure::Routable => format!(
+            "Web interface listening on http://{addr} — WARNING: reachable from your \
+             network, not just this machine. Anyone who can reach this address and \
+             holds the access code can drive your agents."
+        ),
+    }
 }
 
 /// An already-established pairing found in `remote.json` at startup: everything
@@ -3704,6 +4125,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             // Phone" when already paired and "Unpair Phone" when there is no
             // pairing to forget.
             palette.set_paired(ui.remote_paired);
+            palette.set_web_running(ui.web_running);
             // Hide the project/new-tab entries in an isolated run: one session,
             // one project (SPECS §32). The flows refuse independently; this is
             // presentation only.
@@ -5325,6 +5747,17 @@ fn run_palette_action(
             start_prompt(ui, Prompt::UnpairConfirm);
             return Ok(());
         }
+        // FlightDeck Web (D10). Deferred to the event loop, which owns the
+        // listener and can report the bound address and D5's warning; a palette
+        // action cannot bind a socket from here.
+        PaletteAction::StartWebInterface => {
+            ui.pending_web_start = true;
+            return Ok(());
+        }
+        PaletteAction::StopWebInterface => {
+            ui.pending_web_stop = true;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -5381,7 +5814,9 @@ fn run_palette_action(
         | PaletteAction::ChangeProjectBase
         | PaletteAction::OpenConfig
         | PaletteAction::PairPhone
-        | PaletteAction::UnpairPhone => Ok(()),
+        | PaletteAction::UnpairPhone
+        | PaletteAction::StartWebInterface
+        | PaletteAction::StopWebInterface => Ok(()),
     }
 }
 
@@ -5608,7 +6043,7 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 fn drain_pty_output(
     state: &mut AppState,
     _now_ms: u64,
-    mut tee: impl FnMut(&str, Option<usize>, &[u8]),
+    mut tee: impl FnMut(&str, Option<usize>, u64, &[u8]),
 ) {
     // Read once before the loop: auto-continuation gates resume-hint capture,
     // and the per-tab borrow below would otherwise conflict with reading config.
@@ -5624,11 +6059,16 @@ fn drain_pty_output(
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
-                    // Tee the raw primary bytes to the remote transcript builder
-                    // (`None` = primary; a no-op when remote is disabled).
+                    // Tee the raw primary bytes to every consumer that wants
+                    // them: the remote transcript builder and the web interface's
+                    // replay ring (`None` = primary; a no-op when both are off).
+                    // This is the one place a PTY is read, so it is the only
+                    // honest place to tee from — the browser and the desktop's
+                    // own `vt100` parse see byte-for-byte the same chunk (D2).
                     // `tab.meta` is a disjoint field from `tab.session`, so this
-                    // borrows cleanly.
-                    tee(&tab.meta.id, None, &bytes);
+                    // borrows cleanly. The `0` is the primary's unused mint: a
+                    // session has at most one primary, so it needs no counter.
+                    tee(&tab.meta.id, None, 0, &bytes);
                     Some(bytes)
                 }
                 _ => None,
@@ -5645,11 +6085,15 @@ fn drain_pty_output(
         // remote shell backed by that child (`Some(index)`) streams to the phone.
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
+                // The mint, not the index: a browser byte cursor keyed by
+                // position would resume the wrong stream after a child is
+                // closed (see `web::protocol::TerminalId`).
+                let stream_id = child.stream_id();
                 if let Ok(bytes) = child.session_mut().try_read_output() {
                     if !bytes.is_empty() {
                         child.process_output(&bytes);
                         child.answer_cursor_position_query(&bytes);
-                        tee(&tab.meta.id, Some(c), &bytes);
+                        tee(&tab.meta.id, Some(c), stream_id, &bytes);
                     }
                 }
             }
@@ -5961,6 +6405,40 @@ mod tests {
     #[test]
     fn parse_isolated_refuses_a_subcommand_given_first() {
         assert!(parse_isolated(&argv(&["flightdeck", "image", "--isolated"])).is_err());
+    }
+
+    // --- FlightDeck Web lifecycle messages (D5, D10) ----------------------
+
+    /// D5: binding a routable address is the one web setting that changes who
+    /// can reach the user's agents, so the line that reports it must warn. A
+    /// loopback bind must *not* warn, or the warning becomes noise nobody reads.
+    #[test]
+    fn a_routable_bind_is_warned_about_and_a_loopback_one_is_not() {
+        use crate::web::server::BindExposure;
+
+        let loopback = web_started_message(
+            "127.0.0.1:8477".parse().expect("a valid address"),
+            BindExposure::Loopback,
+        );
+        assert!(loopback.contains("127.0.0.1:8477"));
+        assert!(
+            !loopback.to_lowercase().contains("warning"),
+            "a loopback bind is the safe default and must not cry wolf: {loopback}"
+        );
+        assert!(loopback.contains("this machine only"));
+
+        let routable = web_started_message(
+            "0.0.0.0:8477".parse().expect("a valid address"),
+            BindExposure::Routable,
+        );
+        assert!(
+            routable.contains("WARNING"),
+            "a routable bind must say so: {routable}"
+        );
+        assert!(
+            routable.contains("drive your agents"),
+            "and must say what the consequence is, not just that there is one: {routable}"
+        );
     }
 
     // --- next_loop_step: the shutdown-flag / input decision --------------
@@ -6622,7 +7100,7 @@ mod tests {
             .unwrap();
 
         handle.push_output(b"echoed user keystrokes".to_vec());
-        drain_pty_output(&mut state, 1_000, |_, _, _| {});
+        drain_pty_output(&mut state, 1_000, |_, _, _, _| {});
 
         assert_eq!(
             state.tabs[0].display_status(1_000).interpreted,
@@ -8219,7 +8697,7 @@ mod tests {
             shell_pty.push_output(b"hi\r\n".to_vec());
             {
                 let p = &mut workspace.projects[0];
-                drain_pty_output(&mut p.state, 1_000, |sid, which, bytes| {
+                drain_pty_output(&mut p.state, 1_000, |sid, which, _mint, bytes| {
                     if let Some(ci) = which {
                         bridge.shell_pump(sid, ci, bytes);
                     }
