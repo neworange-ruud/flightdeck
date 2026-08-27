@@ -797,3 +797,183 @@
 .fd-main {
   position: relative;
 }
+
+/* ══ 1d — the command palette ═══════════════════════════════════════════════
+ * §5: palette-primary, `Ctrl-g` the only chord claimed. A layer on `.fd-frame`
+ * like 2b/2f, not a separate screen — same reasoning: a dialog over a live
+ * terminal, not instead of one. */
+.fd-palette {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+/* Same trap as `.fd-access[hidden]`/`.fd-takeover[hidden]` above: the
+ * component toggles `hidden`, and `display: flex` would otherwise leave this
+ * scrim over the app forever. */
+.fd-palette[hidden] {
+  display: none;
+}
+.fd-palette__panel {
+  width: min(900px, calc(100% - 80px));
+  height: min(620px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-palette__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-palette__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-palette__hint {
+  color: var(--fd-text-decor);
+}
+.fd-palette__filter {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-title);
+}
+.fd-palette__prompt {
+  color: var(--fd-accent);
+}
+.fd-palette__text {
+  color: var(--fd-text);
+}
+/* The block caret 1d draws: an accent-filled cell, not a thin blinking bar —
+ * `--fd-code__caret` (2b) is the same idea at a different width, so the timing
+ * is shared rather than re-invented. */
+.fd-palette__caret {
+  width: 0.6em;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-palette__caret {
+    animation: none;
+  }
+}
+.fd-palette__count {
+  font-size: var(--fd-t-meta);
+  /* A match count is a count: 2g lists counts as decoration. */
+  color: var(--fd-text-decor);
+}
+.fd-palette__status {
+  flex: none;
+  padding: 6px 14px;
+  font-size: var(--fd-t-meta);
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+}
+.fd-palette__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-palette__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-palette__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-palette__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: read-only is "still true, not broken" (2g's `--fd-stale` note), not an
+ * error — the command did nothing *because* this tab cannot drive, which is a
+ * fact about the seat, not a failure of the command. */
+.fd-palette__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-palette__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 1px;
+  /* The 1px gap between columns 1d draws as a hairline: the parent shows
+   * through it, each column paints its own ground over the rest. */
+  background: color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  overflow: auto;
+}
+.fd-palette__column {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fd-t-body);
+}
+.fd-palette__group {
+  color: var(--fd-focus);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: var(--fd-t-meta);
+  padding-bottom: 4px;
+}
+.fd-palette__group:not(:first-child) {
+  margin-top: 10px;
+}
+.fd-palette__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px;
+  color: var(--fd-text-soft);
+  background: none;
+  border: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fd-palette__row[data-selected="true"] {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-palette__match {
+  color: var(--fd-focus);
+}
+/* The selected row's own colour already reads against the accent fill, so the
+ * matched substring does not also need to stand out inside it. */
+.fd-palette__row[data-selected="true"] .fd-palette__match {
+  color: inherit;
+}
+.fd-palette__key {
+  font-weight: 700;
+}
+.fd-palette__annotation {
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+.fd-palette__row:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+.fd-palette__foot {
+  flex: none;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+.fd-palette__tagline {
+  color: var(--fd-text-decor);
+}

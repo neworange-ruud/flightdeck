@@ -105,6 +105,24 @@ const app = createApp({
   onSubmitCode: (code) => {
     void exchange(app.store, code);
   },
+  /**
+   * 1d, `remote-control-ll5.2`. `sendCommand` returns the seq it minted (it
+   * shares the counter with `Input` frames, §5.1), so this is the one place
+   * that can correlate the row that was run with the `Ack`/`Error` that
+   * settles it — `command/result` is dispatched from `socket.ts` once that
+   * arrives, never guessed at here.
+   */
+  onRunCommand: (command) => {
+    if (session === null) {
+      return;
+    }
+    const seq = session.sendCommand(command.run.name, command.run.args);
+    app.store.dispatch({
+      type: "palette/dispatched",
+      seq,
+      label: command.label,
+    });
+  },
   onStripAction: (action) => {
     if (action.kind === "reload") {
       /** Turn 2 §4: a version mismatch is a stale tab, not a negotiation, and

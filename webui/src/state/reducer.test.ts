@@ -41,6 +41,7 @@ describe("createInitialState", () => {
       host: "",
       retry: null,
       escArmedAt: null,
+      palette: null,
     });
   });
 });

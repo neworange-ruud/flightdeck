@@ -1,9 +1,10 @@
 import { decideEscape } from "../input/escape";
+import { buildCommandInventory, clampIndex, paletteColumns } from "./commands";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, Selection } from "./model";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
-import type { AppAction, AppState } from "./types";
+import type { AppAction, AppState, PaletteState } from "./types";
 
 /**
  * The one entry point later tasks dispatch through. Pure by construction: no
@@ -390,6 +391,128 @@ export function reduce(state: AppState, action: AppAction): AppState {
           projectId: action.projectId,
           sessionId: session.id,
           terminalId: session.terminals[0]?.id ?? "",
+        },
+      };
+    }
+
+    /* --- Command palette (1d) ----------------------------------------- */
+
+    case "palette/open":
+      return state.palette !== null
+        ? state
+        : {
+            ...state,
+            palette: {
+              filter: "",
+              column: 0,
+              index: 0,
+              pending: [],
+              lastOutcome: null,
+            },
+          };
+
+    case "palette/close":
+      return state.palette === null ? state : { ...state, palette: null };
+
+    case "palette/type": {
+      if (state.palette === null) {
+        return state;
+      }
+      const filter = state.palette.filter + action.char;
+      /** A changed filter is read from the top: leaving the highlight at
+       * whatever index a longer list had would point at a different, and
+       * possibly wrong, row after the list moves under it. */
+      return {
+        ...state,
+        palette: { ...state.palette, filter, column: 0, index: 0 },
+      };
+    }
+
+    case "palette/backspace": {
+      if (state.palette === null || state.palette.filter === "") {
+        return state;
+      }
+      return {
+        ...state,
+        palette: {
+          ...state.palette,
+          filter: state.palette.filter.slice(0, -1),
+          column: 0,
+          index: 0,
+        },
+      };
+    }
+
+    case "palette/move": {
+      const palette = state.palette;
+      if (palette === null) {
+        return state;
+      }
+      const { flat } = paletteColumns(buildCommandInventory(state), palette.filter);
+      const index = clampIndex(
+        palette.index + action.delta,
+        flat[palette.column].length,
+      );
+      return index === palette.index
+        ? state
+        : { ...state, palette: { ...palette, index } };
+    }
+
+    case "palette/nextColumn": {
+      const palette = state.palette;
+      if (palette === null) {
+        return state;
+      }
+      const other: 0 | 1 = palette.column === 0 ? 1 : 0;
+      const { flat } = paletteColumns(buildCommandInventory(state), palette.filter);
+      /** A `Tab` to an empty column would strand the highlight nowhere for
+       * `Enter` to run — stay put instead. */
+      if (flat[other].length === 0) {
+        return state;
+      }
+      return {
+        ...state,
+        palette: {
+          ...palette,
+          column: other,
+          index: clampIndex(palette.index, flat[other].length),
+        },
+      };
+    }
+
+    case "palette/dispatched": {
+      if (state.palette === null) {
+        return state;
+      }
+      const pending: PaletteState["pending"] = [
+        ...state.palette.pending,
+        { seq: action.seq, label: action.label },
+      ];
+      return { ...state, palette: { ...state.palette, pending } };
+    }
+
+    case "command/result": {
+      const palette = state.palette;
+      if (palette === null) {
+        return state;
+      }
+      const found = palette.pending.find((item) => item.seq === action.seq);
+      /** A seq that matches nothing pending is never guessed at (requirement
+       * 4) — the palette may have been closed and reopened since, or this
+       * frame belongs to a command some other feature sent. */
+      if (found === undefined) {
+        return state;
+      }
+      return {
+        ...state,
+        palette: {
+          ...palette,
+          pending: palette.pending.filter((item) => item.seq !== action.seq),
+          lastOutcome: {
+            label: found.label,
+            outcome: action.outcome,
+            detail: action.detail ?? null,
+          },
         },
       };
     }

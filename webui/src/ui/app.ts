@@ -1,10 +1,13 @@
 import { accessCopy, canSubmit } from "../state/access";
+import { highlightedCommand } from "../state/commands";
+import type { PaletteCommand } from "../state/commands";
 import { createInitialState } from "../state/types";
 import type { AppAction, AppState } from "../state/types";
 import type { StripAction } from "../state/connection";
 import type { ActivityEvent } from "../state/model";
 import { createAccessScreen } from "./accessScreen";
 import { createActivityFeed } from "./activityFeed";
+import { createCommandPalette } from "./commandPalette";
 import { createGitBar } from "./gitBar";
 import { createLogoBand } from "./logoBand";
 import { createProjectTabs } from "./projectTabs";
@@ -80,6 +83,15 @@ export interface AppOptions {
    * remit: one belongs to the transport, the other to the page.
    */
   readonly onStripAction?: (action: StripAction) => void;
+  /**
+   * `Enter`, or a click on a row, inside the command palette (1d,
+   * `remote-control-ll5.2`). Sending the frame and finding out what happened
+   * to it are both outside this component's remit — `main.ts` calls
+   * `SessionSocket.sendCommand`, gets back the seq the transport assigned,
+   * and dispatches `palette/dispatched` with it, exactly as `onSubmitCode`
+   * owns the one network call 2b needs.
+   */
+  readonly onRunCommand?: (command: PaletteCommand) => void;
 }
 
 export interface App {
@@ -121,6 +133,11 @@ export function createApp(options: AppOptions): App {
     onRetry: () => store.dispatch({ type: "access/retry" }),
     onDismiss: () => store.dispatch({ type: "access/dismiss" }),
   });
+  /** Artboard 1d, `remote-control-ll5.2`. Opened by `Ctrl-g` below — the only
+   * chord the app claims (§5) — and closed by `Esc` or `Ctrl-g` again. */
+  const palette = createCommandPalette({
+    onRun: (command) => runCommand(command),
+  });
 
   const statusBar = createStatusBar({
     onAction: (action) => options.onStripAction?.(action),
@@ -139,7 +156,16 @@ export function createApp(options: AppOptions): App {
       class: "fd-frame",
       attrs: { "data-mode": "app", "data-layout": "single" },
     },
-    [logo.el, projects.el, body, gitBar.el, statusBar.el, takeover.el, access.el],
+    [
+      logo.el,
+      projects.el,
+      body,
+      gitBar.el,
+      statusBar.el,
+      takeover.el,
+      access.el,
+      palette.el,
+    ],
   );
 
   /** 1c is built the first time it is needed: three xterm instances nobody can
@@ -157,6 +183,7 @@ export function createApp(options: AppOptions): App {
     feed,
     takeover,
     access,
+    palette,
   ];
 
   function render(state: AppState): void {
@@ -202,8 +229,9 @@ export function createApp(options: AppOptions): App {
    * §5, the keyboard positions the design locked in:
    *
    *   - `Ctrl-g` is the **only** chord the app claims. It is swallowed here so
-   *     the browser's own Ctrl-g never fires on a FlightDeck screen; what it
-   *     opens (the command palette) is M2 by D8, so today it opens nothing.
+   *     the browser's own Ctrl-g never fires on a FlightDeck screen, and it
+   *     toggles the command palette (1d, `remote-control-ll5.2`) — the one
+   *     thing this chord is allowed to do, per §5.
    *   - `Esc Esc` within 400 ms leaves terminal focus, and a **single `Esc`
    *     still passes through to the agent** — `esc to interrupt` is the key
    *     users press most, so the app refuses to eat it. The timing lives in
@@ -220,6 +248,16 @@ export function createApp(options: AppOptions): App {
 
     if (event.key === "g" && event.ctrlKey) {
       event.preventDefault();
+      /**
+       * Opening pre-session (no snapshot yet, or mid access/takeover prompt)
+       * would show a palette with nothing real to run — the chord still gets
+       * swallowed either way, which is the whole point of claiming it.
+       */
+      if (state.access === null && state.takeover === null) {
+        store.dispatch({
+          type: state.palette === null ? "palette/open" : "palette/close",
+        });
+      }
       return;
     }
 
@@ -233,6 +271,9 @@ export function createApp(options: AppOptions): App {
       return;
     }
     if (state.takeover !== null && takeoverKey(event, state)) {
+      return;
+    }
+    if (state.palette !== null && paletteKey(event, state)) {
       return;
     }
     if (state.feedOpen && feedKey(event)) {
@@ -368,6 +409,71 @@ export function createApp(options: AppOptions): App {
     return true;
   }
 
+  /**
+   * 1d: type to filter, `↑↓` move, `Tab` next column, `Enter` run, `Esc`
+   * close. Unlike 2b's access screens, `Tab` is claimed here — 1d's own
+   * footer names it as a keybinding (`Tab next column`), not an
+   * accessibility escape hatch, and the palette's rows are still reachable by
+   * pointer for anyone who wants that instead.
+   */
+  function paletteKey(event: KeyboardEvent, state: AppState): boolean {
+    if (state.palette === null) {
+      return false;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      store.dispatch({ type: "palette/close" });
+      return true;
+    }
+    if (event.key === "Tab") {
+      event.preventDefault();
+      store.dispatch({ type: "palette/nextColumn" });
+      return true;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      store.dispatch({ type: "palette/move", delta: -1 });
+      return true;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      store.dispatch({ type: "palette/move", delta: 1 });
+      return true;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const command = highlightedCommand(store.getState());
+      if (command !== null) {
+        runCommand(command);
+      }
+      return true;
+    }
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      store.dispatch({ type: "palette/backspace" });
+      return true;
+    }
+    /** A single printable character with no modifier. `event.key.length === 1`
+     * is what tells a letter apart from `Shift`/`ArrowLeft`/etc, all of which
+     * are otherwise-unhandled multi-character key names that fall through to
+     * the swallow below. */
+    if (isPlain(event) && event.key.length === 1) {
+      event.preventDefault();
+      store.dispatch({ type: "palette/type", char: event.key });
+      return true;
+    }
+    /** Swallow everything else: the palette is the whole keyboard while it is
+     * open, same posture as 2b's access screens. */
+    return true;
+  }
+
+  /** `Enter`, or a click on a row (`commandPalette.ts`). Sending the frame and
+   * finding out what happened to it are `main.ts`'s job — see
+   * `AppOptions.onRunCommand`. */
+  function runCommand(command: PaletteCommand): void {
+    options.onRunCommand?.(command);
+  }
+
   /** 2e's footer: `a close`. `Esc` closes it too — it is a slide-over, and
    * every slide-over in every app closes on `Esc`. */
   function feedKey(event: KeyboardEvent): boolean {
@@ -462,7 +568,8 @@ export function createApp(options: AppOptions): App {
     if (
       path.includes(feed.el) ||
       path.includes(access.el) ||
-      path.includes(takeover.el)
+      path.includes(takeover.el) ||
+      path.includes(palette.el)
     ) {
       return;
     }

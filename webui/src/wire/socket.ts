@@ -22,7 +22,7 @@
 
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
-import { snapshotFromWire } from "./adapt";
+import { snapshotFromWire, statusFromLabel } from "./adapt";
 import {
   decodeBase64,
   encodeBase64,
@@ -68,8 +68,14 @@ export interface SessionSocket {
   detachTerminal(terminalId: string): void;
   /** A keystroke for `terminalId`. Queued when the link is down (§5.1). */
   sendInput(terminalId: string, data: string): void;
-  /** A named command (`protocol::command`). */
-  sendCommand(name: string, args?: unknown): void;
+  /**
+   * A named command (`protocol::command`). Returns the seq assigned — the
+   * only place that number is minted, since it shares the counter with
+   * `Input` frames (§5.1) — so a caller that wants to know how the command
+   * turned out (the palette, `ll5.2`) can match it against a later
+   * `command/result`.
+   */
+  sendCommand(name: string, args?: unknown): number;
   close(): void;
 }
 
@@ -116,6 +122,13 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   const cursors = new Map<string, number>();
   /** Keystrokes not yet known to be applied. Never dropped, never reordered. */
   let held: QueuedInput[] = [];
+  /**
+   * Seqs `sendCommand` minted that have not been resolved yet. `seq` is one
+   * monotonic counter shared with `Input` frames (§5.1), so an `Ack`/`Error`
+   * for a command seq must not fall through to the input-ack bookkeeping
+   * below it — this set is what tells the two apart.
+   */
+  const pendingCommands = new Set<number>();
   let seq = 0;
   let viewerId: string | null = null;
   let socket: WebSocket | null = null;
@@ -249,12 +262,27 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         return;
       }
       case "activity": {
+        /**
+         * `Delta::Activity` flattens the same `protocol::ActivityEvent` the
+         * snapshot's backfill carries (`Delta` is internally tagged on
+         * `change`, and `Activity` is a newtype variant around the struct) —
+         * so `from`/`to` are real `InterpretedStatus` labels here, not a
+         * placeholder. Mapping them with `statusFromLabel`, the same function
+         * `wire/adapt.ts`'s `activityOf` uses for the backfill, is what makes
+         * "unknown stays unknown" one rule instead of two: a *genuinely*
+         * unknown-lifecycle event still renders `unknown → unknown`, because
+         * that is what `statusFromLabel("unknown", "unknown")` resolves to —
+         * it is no longer merely what every live row said regardless of what
+         * the host sent.
+         */
         const event = frame as unknown as {
           event_id: string;
           project_id: string;
           project_name: string;
           session_id: string;
           session_name: string;
+          from: string;
+          to: string;
           reason?: string;
           tier: "attention" | "finished" | "quiet";
           read?: boolean;
@@ -264,13 +292,17 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
           events: [
             {
               id: event.event_id,
+              /** A delta just happened; there is no clock-skew-free way to
+               * turn `at_ms` into "Nm ago" better than the honest present
+               * tense the backfill's `agoLabel` would eventually relax to
+               * anyway. */
               atLabel: "just now",
               projectId: event.project_id,
               projectName: event.project_name,
               sessionId: event.session_id,
               sessionName: event.session_name,
-              from: "unknown",
-              to: "unknown",
+              from: statusFromLabel(event.from, "unknown"),
+              to: statusFromLabel(event.to, "unknown"),
               reason: event.reason ?? "",
               tier: event.tier,
               read: event.read ?? false,
@@ -288,6 +320,27 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   }
 
   function onError(frame: WireError): void {
+    /**
+     * D14: an observer's `select_*` is *refused*, not Ack'd — `ServerMsg::Error
+     * { code: "read_only" }`, `seq` naming the command it refused (D14, and
+     * `tests/web_server.rs`'s `an_observers_command_is_refused_as_read_only`).
+     * Folded into the same `command/result` action an `Ack` would produce, so
+     * the palette has one place to look for "what happened", not two.
+     */
+    if (
+      frame.code === "read_only" &&
+      frame.seq !== undefined &&
+      pendingCommands.has(frame.seq)
+    ) {
+      pendingCommands.delete(frame.seq);
+      store.dispatch({
+        type: "command/result",
+        seq: frame.seq,
+        outcome: "read_only",
+        detail: frame.message,
+      });
+      return;
+    }
     if (frame.code === "version_mismatch") {
       store.dispatch({
         type: "version/mismatch",
@@ -318,6 +371,16 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   }
 
   function onAck(frame: WireAck): void {
+    if (pendingCommands.has(frame.seq)) {
+      pendingCommands.delete(frame.seq);
+      store.dispatch({
+        type: "command/result",
+        seq: frame.seq,
+        outcome: frame.outcome,
+        ...(frame.detail === undefined ? {} : { detail: frame.detail }),
+      });
+      return;
+    }
     if (frame.outcome === "applied") {
       held = held.filter((item) => item.seq > frame.seq);
       store.dispatch({ type: "input/acked", throughSeq: frame.seq });
@@ -463,11 +526,14 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     }, delay);
   }
 
-  function sendCommand(name: string, args?: unknown): void {
+  function sendCommand(name: string, args?: unknown): number {
     seq += 1;
+    const mySeq = seq;
+    pendingCommands.add(mySeq);
     send(args === undefined
-      ? { type: "command", seq, name }
-      : { type: "command", seq, name, args });
+      ? { type: "command", seq: mySeq, name }
+      : { type: "command", seq: mySeq, name, args });
+    return mySeq;
   }
 
   connect();

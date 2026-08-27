@@ -79,7 +79,15 @@ const STATUS_BY_BUCKET: Readonly<Record<WireBucket, SessionStatus>> = {
   unknown: "unknown",
 };
 
-function statusFromLabel(label: string, bucket: WireBucket): SessionStatus {
+/**
+ * Exported for `wire/socket.ts`'s live `Delta::Activity` handler, which needs
+ * the exact same "unknown stays unknown" mapping `activityOf` below uses for
+ * the snapshot backfill — see the bug this fixed: a live row was hardcoding
+ * `"unknown"` regardless of what the host actually sent, so the same event
+ * told two different stories depending on whether it arrived as backfill or
+ * live.
+ */
+export function statusFromLabel(label: string, bucket: WireBucket): SessionStatus {
   return STATUS_BY_LABEL[label.toLowerCase()] ?? STATUS_BY_BUCKET[bucket];
 }
 

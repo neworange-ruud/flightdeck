@@ -114,6 +114,59 @@ export type UiMode = "terminal" | "app";
  * tests — the state exists so 1c is a render of state, not a second app. */
 export type ViewLayout = "single" | "split";
 
+/**
+ * A `ClientMsg::Command` this browser sent and has not heard back about yet.
+ * `seq` is the transport's — assigned by `SessionSocket.sendCommand`, which is
+ * the one place that owns the counter shared with `Input` frames — so the
+ * reducer never invents one.
+ */
+export interface PendingPaletteCommand {
+  readonly seq: number;
+  readonly label: string;
+}
+
+/**
+ * What actually happened to a command this browser ran, per the host's own
+ * words — never guessed locally (requirement 4 of ll5.2: "reflects the host's
+ * Ack, not optimistic local state").
+ *
+ * `applied` / `rejected` / `ignored` mirror `WireAck.outcome` verbatim.
+ * `read_only` is a fourth case that arrives on a *different* frame —
+ * `ServerMsg::Error { code: "read_only" }` (D14: an observer's `select_*`
+ * is refused, never Ack'd) — folded in here because from the palette's point
+ * of view it answers the same question ("what happened to the command I ran")
+ * that an `Ack` does.
+ */
+export interface PaletteOutcome {
+  readonly label: string;
+  readonly outcome: "applied" | "rejected" | "ignored" | "read_only";
+  readonly detail: string | null;
+}
+
+/** Artboard 1d, plus the outcome-reporting requirement 4 adds. `null` on
+ * `AppState.palette` means the overlay is closed. */
+export interface PaletteState {
+  /** The `>` row's typed text. Matched against a command's label *and*
+   * annotation (`state/commands.ts`), but only ever highlighted in the label —
+   * see `matchCommand`. */
+  readonly filter: string;
+  /** Which of 1d's two columns `↑↓` and `Enter` act on; `Tab` moves it. */
+  readonly column: 0 | 1;
+  /** Index into that column's filtered rows, clamped on every change so a
+   * component never has to guard against reading past the end of a shorter
+   * list after a keystroke narrows it. */
+  readonly index: number;
+  /** Commands sent and not yet Ack'd/refused. Almost always at most one, but
+   * a list rather than a single slot: nothing stops a fast typist from firing
+   * a second `Enter` before the first command's `Ack` lands, and dropping the
+   * first result on the floor would be exactly the optimism requirement 4
+   * forbids. */
+  readonly pending: readonly PendingPaletteCommand[];
+  /** The most recent settled result, or `null` before any command has been
+   * run this time the palette was opened. */
+  readonly lastOutcome: PaletteOutcome | null;
+}
+
 /** The whole app's reducer-owned state. */
 export interface AppState {
   readonly connection: ConnectionStatus;
@@ -205,6 +258,10 @@ export interface AppState {
    * read inside the reducer. `null` means no window is open.
    */
   readonly escArmedAt: number | null;
+
+  /** Artboard 1d. `null` when the palette is closed — `Ctrl-g` is the only
+   * chord that opens it (§5), and it is the only chord the app claims. */
+  readonly palette: PaletteState | null;
 }
 
 export function createInitialState(): AppState {
@@ -245,6 +302,7 @@ export function createInitialState(): AppState {
     host: "",
     retry: null,
     escArmedAt: null,
+    palette: null,
   };
 }
 
@@ -423,6 +481,48 @@ export type AppAction =
       readonly type: "selection/jump";
       readonly projectId: string;
       readonly sessionId: string;
+    }
+
+  /* --- Command palette (1d, remote-control-ll5.2) ------------------------ */
+
+  /** `Ctrl-g`, the only chord the app claims (§5). `app.ts` toggles: this
+   * action only ever opens, closed by `palette/close`. */
+  | { readonly type: "palette/open" }
+  /** `Esc`, or click-outside — see `app.ts`'s palette key handler. */
+  | { readonly type: "palette/close" }
+  /** A printable character landed in the `>` row. Resets the cursor to the
+   * top row of column 0: a filter that just changed should be read from the
+   * top, not leave the highlight wherever a longer list had left it. */
+  | { readonly type: "palette/type"; readonly char: string }
+  | { readonly type: "palette/backspace" }
+  /** `↑↓`. `delta` is `-1`/`+1`; the reducer clamps rather than wraps. */
+  | { readonly type: "palette/move"; readonly delta: number }
+  /** `Tab`. A no-op when the other column has nothing to move to. */
+  | { readonly type: "palette/nextColumn" }
+  /**
+   * `Enter` ran a command and the transport assigned it a seq
+   * (`SessionSocket.sendCommand`'s return value) — see `main.ts`'s
+   * `onRunCommand`. Queues it in `pending` rather than guessing an outcome;
+   * `command/result` is the only thing allowed to resolve it.
+   */
+  | {
+      readonly type: "palette/dispatched";
+      readonly seq: number;
+      readonly label: string;
+    }
+  /**
+   * The host's answer to a queued command arrived — either `ServerMsg::Ack`
+   * (`applied`/`rejected`/`ignored`) or `ServerMsg::Error { code: "read_only" }`
+   * folded into `outcome: "read_only"` (see `PaletteOutcome`). A `seq` that
+   * matches nothing in `state.palette.pending` (the palette was closed and
+   * reopened, or this is some other feature's frame) is a no-op — never
+   * guessed at, per requirement 4.
+   */
+  | {
+      readonly type: "command/result";
+      readonly seq: number;
+      readonly outcome: "applied" | "rejected" | "ignored" | "read_only";
+      readonly detail?: string;
     };
 
 /**
