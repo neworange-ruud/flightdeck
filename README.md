@@ -216,8 +216,13 @@ is the dependable fallback because terminal shortcut collisions are unavoidable.
   palette. Bare `Esc` passes through to hosted agents. If modified Esc is not
   distinguishable in your terminal, enable the optional F2 binding in the
   configuration manager.
-- **App mode** — keystrokes control FlightDeck. `Enter` focuses the terminal;
-  `?` shows help.
+- **App mode** — keystrokes control FlightDeck. `Enter` focuses the terminal.
+
+`F1` (or `Alt-h`) shows the help / keybindings panel, and works in **both**
+modes. Pressing the same key again while the panel is open opens the FlightDeck
+repository on GitHub. On Apple keyboards F1 is a brightness key unless standard
+function keys are enabled, and `Alt-h` needs "Use Option as Meta key" — where
+neither is convenient, `Ctrl-g` → *Show Help* always works.
 
 Common shortcuts: `Ctrl-g` palette · `Ctrl-q` quit (or palette → *Quit*) ·
 `Shift-←/→` previous/next **project** · `Ctrl-n` new tab · `Ctrl-p` push ·
@@ -230,7 +235,7 @@ restart agent · `Alt-o` open the worktree in your file manager. The `Alt`- and
 `Shift`-modified navigation works in **both**
 modes, so you can switch projects and tabs without leaving terminal focus; in
 App mode the bare arrow keys also work (handy because some terminals intercept
-`Alt`+arrows). The full table is in the in-app help (`?`).
+`Alt`+arrows). The full table is in the in-app help (`F1`).
 
 **Multiple projects**: the **project tab row** at the top switches between open
 project folders. Open another with the **`+ project`** button (or palette →

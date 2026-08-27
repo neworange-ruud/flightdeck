@@ -1649,10 +1649,25 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 // Status bar (SPECS §23)
 // ---------------------------------------------------------------------------
 
+/// The global help keys, as one label. Both status-bar modes render this
+/// constant; the help panel's own Global entry repeats it as a literal because
+/// `shortcut_line` needs a `'static` str, and a test asserts the two match so
+/// they cannot drift apart.
+pub const HELP_KEYS: &str = "F1 / Alt-h";
+
 /// Draw the mode status bar (SPECS §23).
 ///
-/// Terminal mode includes the configured leave-focus key and command palette.
-/// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: command palette | ?: help`
+/// Terminal mode: `MODE: TERMINAL | <leave-focus>: app mode | Ctrl-g: palette | F1 / Alt-h: help`
+/// App mode:      `MODE: APP | Enter: focus terminal | Ctrl-g: palette | F1 / Alt-h: help`
+///
+/// The bar is a no-wrap Paragraph in the main pane (`x = SIDEBAR_WIDTH`), so it
+/// truncates on a narrow terminal and the trailing help hint is lost first.
+/// "palette"/"app mode" are abbreviated to keep the widest bar inside ~102
+/// columns — adding the help hint at no cost to the width it already needed.
+///
+/// Both help keys are listed, and identically on every OS: unlike the
+/// leave-focus key they are the same binding everywhere, so a platform-varying
+/// label would imply a difference that does not exist.
 pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = status_bar_text(
         state.mode(),
@@ -1689,9 +1704,11 @@ pub fn status_bar_text(
                 crate::tui::platform::leave_focus_key(use_f2),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw(": app commands | "),
+            Span::raw(": app mode | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": command palette"),
+            Span::raw(": palette | "),
+            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
+            Span::raw(": help"),
         ],
         InputMode::App => vec![
             Span::raw(" "),
@@ -1706,8 +1723,8 @@ pub fn status_bar_text(
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(": focus terminal | "),
             Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": command palette | "),
-            Span::styled("?", Style::default().fg(Color::Yellow)),
+            Span::raw(": palette | "),
+            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
             Span::raw(": help"),
         ],
     };
@@ -1979,7 +1996,7 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
         shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
         shortcut_line("  Alt-o", "Open worktree in file manager"),
-        shortcut_line("  ?", "Help / keybindings"),
+        shortcut_line("  F1 / Alt-h", "Help / keybindings"),
         Line::raw(""),
         Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
         shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
@@ -2022,15 +2039,17 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
         Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
         shortcut_line("  Ctrl-s", "Set manual status"),
         shortcut_line("  Ctrl-r", "Restart primary agent"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  Esc / q to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
 
+    // The hints live on the bottom border, not in the shortcut list: the list is
+    // taller than the overlay on any ordinary terminal, so a trailing content
+    // line is truncated away exactly when a user needs it.
     let block = Block::default()
         .title(" Help / Keybindings ")
+        .title_bottom(Span::styled(
+            " Press the help key again: open on GitHub · Esc / q: close ",
+            Style::default().fg(Color::DarkGray),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
@@ -3638,9 +3657,48 @@ mod tests {
             flat.contains(crate::tui::platform::leave_focus_key(false)),
             "must mention the platform-default leave-focus key"
         );
-        assert!(flat.contains("app commands"), "must say app commands");
+        assert!(flat.contains("app mode"), "must say app mode");
         assert!(flat.contains("Ctrl-g"), "must mention Ctrl-g");
-        assert!(flat.contains("command palette"), "must mention palette");
+        assert!(flat.contains("palette"), "must mention palette");
+        // Help is global, so terminal focus must advertise it too — this is the
+        // mode where a user reaches for help and cannot type '?'.
+        assert!(flat.contains(HELP_KEYS), "must mention both help keys");
+        assert!(flat.contains("help"), "must say help");
+    }
+
+    #[test]
+    fn status_bar_help_hint_does_not_vary_by_platform() {
+        // F1 and Alt-h are bound on every OS; only their ergonomics differ. A
+        // platform-varying label (as leave_focus_key does) would imply a
+        // difference in the binding that does not exist.
+        for mode in [InputMode::Terminal, InputMode::App] {
+            let ui = crate::contracts::UiConfig::default();
+            let line = status_bar_text(mode, &ui, None);
+            let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(flat.contains("F1 / Alt-h"), "{mode:?} must show both keys");
+        }
+    }
+
+    #[test]
+    fn status_bar_help_hint_fits_the_documented_minimum_width() {
+        // The bar is a Paragraph with no wrap, so anything past the pane width
+        // is silently cut — and the help hint sits last, so it is the first
+        // thing lost. The bar lives in the main pane, not the full width, so
+        // the budget is (terminal width - SIDEBAR_WIDTH). 102 is the width the
+        // widest bar (Terminal mode) needs; this fails if the bar grows.
+        let mut term = test_terminal(102, 10);
+        let state = empty_state();
+        let cache = empty_cache();
+        term.draw(|frame| {
+            draw(frame, &state, &cache, &UiOverlay::None, 0);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains(HELP_KEYS),
+            "the help hint must fit a 102-column terminal, got: {text}"
+        );
     }
 
     #[test]
@@ -3663,9 +3721,13 @@ mod tests {
         assert!(flat.contains("Enter"), "must mention Enter");
         assert!(flat.contains("focus terminal"), "must say focus terminal");
         assert!(flat.contains("Ctrl-g"), "must mention Ctrl-g");
-        assert!(flat.contains("command palette"), "must mention palette");
-        assert!(flat.contains('?'), "must mention '?'");
+        assert!(flat.contains("palette"), "must mention palette");
+        assert!(flat.contains(HELP_KEYS), "must mention both help keys");
         assert!(flat.contains("help"), "must mention help");
+        assert!(
+            !flat.contains('?'),
+            "'?' is no longer a help key and must not be advertised as one"
+        );
     }
 
     #[test]
@@ -3948,6 +4010,64 @@ mod tests {
             draw(frame, &state, &cache, &UiOverlay::Help, 0);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn help_overlay_advertises_the_f1_repository_gesture() {
+        // The gesture is invisible unless the panel says so — nobody presses a
+        // key twice on a hunch. The hints live on the block's bottom border, so
+        // they survive even when the shortcut list is taller than the overlay.
+        let mut term = test_terminal(120, 50);
+        term.draw(|frame| {
+            draw_help_overlay(frame, frame.area(), false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains(HELP_KEYS),
+            "the shortcut list must name every help key, and must stay in step \
+             with the status bar's HELP_KEYS, got: {text}"
+        );
+        assert!(
+            text.contains("Press the help key again"),
+            "must advertise the second-press gesture, got: {text}"
+        );
+        assert!(
+            text.contains("GitHub"),
+            "must say where the second press leads, got: {text}"
+        );
+        assert!(
+            text.contains("Esc"),
+            "must keep the close hint, got: {text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_hints_stay_visible_on_a_short_terminal() {
+        // The shortcut list overflows a small overlay; border titles must not.
+        let mut term = test_terminal(80, 24);
+        term.draw(|frame| {
+            draw_help_overlay(frame, frame.area(), false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        // Assert on the border hint's own wording, not on "F1" — that also
+        // appears in the shortcut list, which would let this pass even if the
+        // hint were truncated away.
+        assert!(
+            text.contains("Press the help key again"),
+            "border hint must survive truncation, got: {text}"
+        );
+        assert!(
+            text.contains("GitHub"),
+            "border hint must survive truncation, got: {text}"
+        );
+        assert!(
+            text.contains("Esc / q: close"),
+            "border hint must survive truncation, got: {text}"
+        );
     }
 
     #[test]

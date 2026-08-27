@@ -1,15 +1,13 @@
 //! Open a directory in the OS file manager (Finder / Explorer / the desktop's
 //! `xdg-open` handler).
 //!
-//! Mirrors `tui::clipboard`: a per-OS default with a config escape hatch, and a
-//! spawn that never blocks the TUI. We deliberately do not wait for the
-//! launcher to exit — a file manager with no already-running instance (GNOME
-//! Files, for one) stays in the foreground for the life of its window, so
-//! waiting would freeze FlightDeck. That means non-zero exit codes go
-//! unreported; spawn failures (missing command, not executable) do not.
+//! Mirrors `tui::clipboard`: a per-OS default with a config escape hatch. The
+//! platform launcher and the non-blocking spawn itself live in
+//! [`crate::tui::opener`], shared with the browser.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+
+use crate::tui::opener;
 
 /// Resolve the launcher program and its fixed arguments.
 ///
@@ -20,18 +18,7 @@ pub fn launcher(configured: &str) -> (String, Vec<String>) {
     let mut parts = configured.split_whitespace().map(str::to_string);
     match parts.next() {
         Some(program) => (program, parts.collect()),
-        None => (default_program().to_string(), Vec::new()),
-    }
-}
-
-/// The platform's default opener.
-fn default_program() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer.exe"
-    } else {
-        "xdg-open"
+        None => (opener::default_program().to_string(), Vec::new()),
     }
 }
 
@@ -39,26 +26,7 @@ fn default_program() -> &'static str {
 /// when the launcher cannot be started.
 pub fn open(path: &Path, configured: &str) -> Result<(), String> {
     let (program, args) = launcher(configured);
-    let child = Command::new(&program)
-        .args(&args)
-        .arg(path)
-        // Null stdio: a chatty launcher must never write into the alternate
-        // screen and corrupt the TUI.
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not open file manager: '{program}' failed to start ({e})"))?;
-
-    // Reap the child off-thread. `xdg-open` exits immediately, and FlightDeck is
-    // long-running, so an unwaited child would linger as a zombie for the rest
-    // of the session. The thread lives only as long as the launcher process.
-    std::thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-    });
-
-    Ok(())
+    opener::spawn_detached(&program, &args, path.as_os_str(), "file manager")
 }
 
 #[cfg(test)]

@@ -8,6 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **F1 (or Alt-h) opens help, anywhere.** Both open the help / keybindings panel in App and Terminal focus, so help is reachable without leaving the terminal first. Pressing the same key again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 and Alt-h are claimed — modified F1 and a bare `h` still reach the agent. Two keys because Apple keyboards reserve F1 as a brightness key unless standard function keys are enabled, while `Alt-h` needs "Use Option as Meta key" on macOS — the same requirement `Alt-o` already carries. `Ctrl-g` → *Show Help* works unconditionally on every platform.
+
+### Improvements
+
+- The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
+- The status bar now advertises the help keys in **both** modes, not just App mode — help is global, so terminal focus should say so. To pay for the extra text, `Ctrl-g: command palette` is shortened to `Ctrl-g: palette` and `app commands` to `app mode`, keeping the bar within roughly the width it already required.
 - Collapse FlightDeck's chrome in small windows while in terminal focus: the
   project tab row and git info bar hide and the agents sidebar shrinks to a
   one-glyph strip, giving the agent three more rows and 25 more columns.
@@ -56,6 +62,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - A crash no longer leaves your shell printing mouse movement as escape
   sequences: mouse capture, bracketed paste, and keyboard flags are restored on
   the panic path as well as on a clean exit.
+
+### Breaking changes
+
+- **`?` no longer opens help.** It only ever worked in App mode, which made it unreachable from terminal focus — exactly where help is wanted. It is replaced by `F1` / `Alt-h`, which work in both modes. `?` is now an unbound key in App mode.
 
 ## [1.16.0] - 2026-08-24
 
