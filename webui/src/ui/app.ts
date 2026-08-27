@@ -1,5 +1,10 @@
+import { accessCopy, canSubmit } from "../state/access";
 import { createInitialState } from "../state/types";
 import type { AppAction, AppState } from "../state/types";
+import type { StripAction } from "../state/connection";
+import type { ActivityEvent } from "../state/model";
+import { createAccessScreen } from "./accessScreen";
+import { createActivityFeed } from "./activityFeed";
 import { createGitBar } from "./gitBar";
 import { createLogoBand } from "./logoBand";
 import { createProjectTabs } from "./projectTabs";
@@ -7,6 +12,7 @@ import { createSidebar } from "./sidebar";
 import { createSplitView } from "./splitView";
 import { createStatusBar } from "./statusBar";
 import { createStore } from "./store";
+import { createTakeover } from "./takeover";
 import { createTerminalPane } from "./terminalPane";
 import { createTerminalTabs } from "./terminalTabs";
 import { el } from "./dom";
@@ -33,11 +39,26 @@ import type { TerminalMount } from "./terminalStage";
  * changes, because no component reads anything but `AppState`.
  *
  * `remote-control-l7ya` (access screens, connection states, takeover, activity
- * feed) adds *siblings*, not edits: a screen chooser above `createApp` for the
- * access/pairing states, `data-tone="stale"` on the pane for 2c/2d, and a feed
- * slide-over appended to the frame. The connection-dependent chrome it needs
- * already exists — `modeChip` drains on any non-connected state (§5.1) and
- * `connectionLabel` holds the two held-input phrases.
+ * feed) landed as three overlay siblings appended to this frame — the access
+ * layer (2b), the takeover layer (2f) and the feed slide-over (2e) — plus the
+ * keyboard rules below. One deliberate deviation from the plan it was handed:
+ * the access screens are a **layer inside this frame**, not a screen chosen
+ * above `createApp`, because 2b draws all three panels inside the app frame
+ * (logo band above, footer strip below, and a running agent visible behind the
+ * revoked one — which 2b describes in words as "a photograph from the moment
+ * access ended"). See `src/ui/accessScreen.ts`.
+ *
+ * ## What still has to move when the socket lands
+ *
+ * Besides the `Esc` handler below, `remote-control-hgqy` owns four dispatches
+ * this file only *reports* the intent of, via `onDispatch`:
+ *
+ * | Intent reported here | Frame it becomes |
+ * | --- | --- |
+ * | `takeover/claim` | re-`Attach { seat: SeatRequest::TakeOver }` (there is no takeover frame) |
+ * | `takeover/observe` | re-`Attach { seat: SeatRequest::Observe }` |
+ * | `selection/jump` | `ClientMsg::Command { select_session }` (D3) |
+ * | a `retry`/`reload`/`code` strip action | reconnect, `location.reload()`, or the access screen |
  */
 
 export interface AppOptions {
@@ -47,6 +68,18 @@ export interface AppOptions {
   readonly onDispatch?: (action: AppAction, state: AppState) => void;
   /** Clock for the `Esc Esc` window; overridden in tests. */
   readonly now?: () => number;
+  /**
+   * 2b's `Enter Connect`: exchange the four digits for a cookie
+   * (`POST /auth/exchange`). Injected because it is the one thing on this
+   * screen that talks to the network, and no test should.
+   */
+  readonly onSubmitCode?: (code: string) => void;
+  /**
+   * 2c's one keyed button per state — `r Retry now`, `Enter Reload for
+   * v1.17.0`. Reconnecting and reloading are both outside this component's
+   * remit: one belongs to the transport, the other to the page.
+   */
+  readonly onStripAction?: (action: StripAction) => void;
 }
 
 export interface App {
@@ -69,12 +102,35 @@ export function createApp(options: AppOptions): App {
   const tabs = createTerminalTabs(store);
   const pane = createTerminalPane(options.mount);
   const gitBar = createGitBar();
-  const statusBar = createStatusBar();
+
+  /** 2e's slide-over lives inside the terminal area, at its right edge. */
+  const feed = createActivityFeed({
+    onJump: (event: ActivityEvent) => jumpTo(event),
+    onClose: () => store.dispatch({ type: "feed/set", open: false }),
+  });
+  const takeover = createTakeover({
+    onClaim: () => store.dispatch({ type: "takeover/claim" }),
+    onObserve: () => store.dispatch({ type: "takeover/observe" }),
+    /** D14/2f: cancelling is not a dead end — it leaves a live read-only view,
+     * which is why it dispatches the same action `w` does. */
+    onCancel: () => store.dispatch({ type: "takeover/observe" }),
+  });
+  const access = createAccessScreen({
+    onSubmit: () => submitCode(),
+    onDigit: (digit) => store.dispatch({ type: "access/digit", digit }),
+    onRetry: () => store.dispatch({ type: "access/retry" }),
+    onDismiss: () => store.dispatch({ type: "access/dismiss" }),
+  });
+
+  const statusBar = createStatusBar({
+    onAction: (action) => options.onStripAction?.(action),
+    onOpenFeed: () => toggleFeed(),
+  });
 
   const main = el(
     "div",
     { class: "fd-main", attrs: { "aria-label": "Terminal" } },
-    [tabs.el, pane.el],
+    [tabs.el, pane.el, feed.el],
   );
   const body = el("div", { class: "fd-body" }, [sidebar.el, main]);
   const frame = el(
@@ -83,7 +139,7 @@ export function createApp(options: AppOptions): App {
       class: "fd-frame",
       attrs: { "data-mode": "app", "data-layout": "single" },
     },
-    [logo.el, projects.el, body, gitBar.el, statusBar.el],
+    [logo.el, projects.el, body, gitBar.el, statusBar.el, takeover.el, access.el],
   );
 
   /** 1c is built the first time it is needed: three xterm instances nobody can
@@ -98,11 +154,22 @@ export function createApp(options: AppOptions): App {
     pane,
     gitBar,
     statusBar,
+    feed,
+    takeover,
+    access,
   ];
 
   function render(state: AppState): void {
     frame.setAttribute("data-mode", state.mode);
     frame.setAttribute("data-layout", state.layout);
+    /**
+     * The two attributes the overlays hang off. `data-access` also hides the
+     * git bar and status bar: with no session there is nothing honest for
+     * either to say, and 2b replaces both with its own footer strip.
+     */
+    frame.setAttribute("data-access", String(state.access !== null));
+    frame.setAttribute("data-takeover", String(state.takeover !== null));
+    frame.setAttribute("data-feed", String(state.feedOpen));
 
     if (state.layout === "split") {
       if (split === null) {
@@ -156,6 +223,65 @@ export function createApp(options: AppOptions): App {
       return;
     }
 
+    /**
+     * The overlays claim the keyboard before the main screen does, in the order
+     * they are stacked. An access screen is the whole app for as long as it is
+     * up (there is nothing to type into behind it), and a takeover prompt is a
+     * decision the user has to make before their keys mean anything.
+     */
+    if (state.access !== null && accessKey(event, state)) {
+      return;
+    }
+    if (state.takeover !== null && takeoverKey(event, state)) {
+      return;
+    }
+    if (state.feedOpen && feedKey(event)) {
+      return;
+    }
+
+    /** 2e: `a` opens the feed in App mode. Not in Terminal mode, where `a` is
+     * a letter the agent is waiting for. */
+    if (isPlain(event) && event.key === "a" && state.mode === "app") {
+      event.preventDefault();
+      toggleFeed();
+      return;
+    }
+
+    /**
+     * 2c's `r Retry now`, gated on the one state that offers it. `r` is a
+     * letter, so it may only be claimed where nothing is listening for letters
+     * — and `disconnected` is by definition that: "nothing you type will
+     * arrive".
+     */
+    if (isPlain(event) && event.key === "r" && state.connection === "disconnected") {
+      event.preventDefault();
+      options.onStripAction?.({
+        key: "r",
+        label: "Retry now",
+        kind: "retry",
+        tone: "alert",
+      });
+      return;
+    }
+
+    /** 2c's `Enter Enter a code`, in the one state where `Enter` is free:
+     * revoked means no input is being delivered anywhere. */
+    if (
+      isPlain(event) &&
+      event.key === "Enter" &&
+      state.connection === "revoked" &&
+      state.access === null
+    ) {
+      event.preventDefault();
+      store.dispatch({
+        type: "access/required",
+        screen: "code_entry",
+        attemptsRemaining: null,
+        lockoutSeconds: null,
+      });
+      return;
+    }
+
     if (event.key === "Escape" && state.mode === "terminal") {
       event.preventDefault();
       store.dispatch({ type: "input/esc", at: now() });
@@ -169,6 +295,146 @@ export function createApp(options: AppOptions): App {
   });
 
   /**
+   * 2b's keyboard. Digits fill the four boxes, `Backspace` takes one back,
+   * `Enter` submits a full code — and on a screen that takes no code, `Enter`
+   * starts a new one and `Esc` puts the overlay away without touching the
+   * credential.
+   */
+  function accessKey(event: KeyboardEvent, state: AppState): boolean {
+    const current = state.access;
+    if (current === null || !isPlain(event)) {
+      return false;
+    }
+    const copy = accessCopy(current);
+    /**
+     * `Tab` is never ours. Both overlays are operable by pointer *and* by
+     * keyboard — the buttons are real buttons — and swallowing `Tab` would
+     * leave a keyboard-only user with a panel they can see and cannot reach.
+     */
+    if (event.key === "Tab") {
+      return false;
+    }
+    if (copy.acceptsCode && /^[0-9]$/.test(event.key)) {
+      event.preventDefault();
+      store.dispatch({ type: "access/digit", digit: event.key });
+      return true;
+    }
+    if (copy.acceptsCode && event.key === "Backspace") {
+      event.preventDefault();
+      store.dispatch({ type: "access/backspace" });
+      return true;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (copy.acceptsCode) {
+        submitCode();
+      } else if (copy.primary !== null) {
+        store.dispatch({ type: "access/retry" });
+      }
+      return true;
+    }
+    if (event.key === "Escape" && copy.secondary !== null) {
+      event.preventDefault();
+      store.dispatch({ type: "access/dismiss" });
+      return true;
+    }
+    /** Swallow everything else: a stray keystroke must not reach the terminal
+     * behind an access screen, which is a photograph anyway. */
+    return true;
+  }
+
+  /** 2f: `Enter` take over · `w` watch read-only · `Esc` cancel (arriving). */
+  function takeoverKey(event: KeyboardEvent, state: AppState): boolean {
+    if (state.takeover === null || !isPlain(event) || event.key === "Tab") {
+      return false;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      store.dispatch({ type: "takeover/claim" });
+      return true;
+    }
+    if (event.key === "w") {
+      event.preventDefault();
+      store.dispatch({ type: "takeover/observe" });
+      return true;
+    }
+    if (event.key === "Escape" && state.takeover.kind === "arriving") {
+      event.preventDefault();
+      /** Cancel leaves a live read-only view (2f) — the same destination as
+       * `w`, which is why there is no third action to dispatch. */
+      store.dispatch({ type: "takeover/observe" });
+      return true;
+    }
+    return true;
+  }
+
+  /** 2e's footer: `a close`. `Esc` closes it too — it is a slide-over, and
+   * every slide-over in every app closes on `Esc`. */
+  function feedKey(event: KeyboardEvent): boolean {
+    if (!isPlain(event)) {
+      return false;
+    }
+    if (event.key === "a" || event.key === "Escape") {
+      event.preventDefault();
+      store.dispatch({ type: "feed/set", open: false });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Opening the feed marks what it shows as read, which is what makes the
+   * unread chip drain when you look at it. The host owns the authoritative
+   * record (`Delta::Activity` carries `read`), so this is the local half and
+   * `remote-control-hgqy` sends the matching frame from `onDispatch`.
+   */
+  function toggleFeed(): void {
+    const state = store.getState();
+    const open = !state.feedOpen;
+    store.dispatch({ type: "feed/set", open });
+    if (open) {
+      const unread = state.activity
+        .filter((event) => !event.read)
+        .map((event) => event.id);
+      if (unread.length > 0) {
+        store.dispatch({ type: "activity/read", ids: unread });
+      }
+    }
+  }
+
+  function submitCode(): void {
+    const state = store.getState();
+    if (state.access === null || !canSubmit(state.access)) {
+      return;
+    }
+    options.onSubmitCode?.(state.access.code);
+  }
+
+  /**
+   * D3 across projects. A feed row names a session that is usually *not* in the
+   * selected project, so this dispatches `selection/jump` — and because
+   * selection is instance-wide, it moves the desktop too, which is what the
+   * row's own hover copy says it will.
+   */
+  function jumpTo(event: ActivityEvent): void {
+    store.dispatch({
+      type: "selection/jump",
+      projectId: event.projectId,
+      sessionId: event.sessionId,
+    });
+    store.dispatch({ type: "feed/set", open: false });
+  }
+
+  /**
+   * A key with no modifier. Every single-letter rule above has to check this,
+   * or `Ctrl-a`/`Cmd-r` would be swallowed and the user would lose select-all
+   * and reload — two things a browser is entitled to keep.
+   */
+  function isPlain(event: KeyboardEvent): boolean {
+    return !event.ctrlKey && !event.metaKey && !event.altKey;
+  }
+
+  /**
    * The pointer half of the same rule: clicking the terminal wakes it, and
    * **clicking outside releases the keys** — the escape hatch for a user who
    * does not want to learn a chord, and the reason 1a's status bar advertises
@@ -177,6 +443,27 @@ export function createApp(options: AppOptions): App {
   frame.addEventListener("click", (event: MouseEvent) => {
     const target = event.target;
     if (!(target instanceof Node)) {
+      return;
+    }
+    /**
+     * An overlay is not "outside the terminal" in the sense this rule means —
+     * it is *over* it. Clicking the feed, an access keypad or a takeover button
+     * must not also release the keys, or every choice made in an overlay would
+     * quietly change the mode underneath it.
+     */
+    /**
+     * `composedPath()`, not `contains()`. The path is fixed when the event is
+     * dispatched, and an overlay's own handler has usually re-rendered its
+     * list by the time this bubble arrives — a feed row that dispatched
+     * `selection/jump` is *detached* from the DOM before we get here, so
+     * `contains()` would answer "not in the feed" and quietly release the keys.
+     */
+    const path = event.composedPath();
+    if (
+      path.includes(feed.el) ||
+      path.includes(access.el) ||
+      path.includes(takeover.el)
+    ) {
       return;
     }
     const inTerminal =

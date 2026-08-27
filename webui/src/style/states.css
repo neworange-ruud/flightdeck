@@ -1,0 +1,786 @@
+/*
+ * FlightDeck Web — the states artboards 2b/2c/2d/2e/2f draw
+ * (remote-control-l7ya).
+ *
+ * Under the same two rules as main.css, both enforced by
+ * src/ui/tokens.guard.test.ts:
+ *
+ *   1. No colour literal. Every colour is `var(--fd-*)` from tokens.css, or a
+ *      `color-mix()` OF those tokens where an artboard used a wash, a tint or a
+ *      dimmed fill the palette does not name. A mix still says which token it
+ *      means; a hex value says nothing and drifts silently when 2g moves.
+ *   2. Four type sizes only, from `--fd-t-meta | -body | -title | -code`.
+ *
+ * Turn 2 named exactly one new colour, `--fd-stale`, and left the *surfaces*
+ * built from it unnamed — every dimmed chip fill, every 8%-wash panel ground,
+ * every dark frame border. Those are expressed below as mixes with the token
+ * they are made of, and every one of them is listed as a token-turn candidate
+ * in the task report. The percentages land on the artboards' values; the point
+ * is that the token remains the subject of the sentence.
+ */
+
+/* ══ 2c — the connection strip ═════════════════════════════════════════════
+ * Rule 3 of 2c: the whole bar takes the state's frame colour, and it is the
+ * only chrome in the app that ever changes hue. One attribute does it. */
+.fd-statusbar[data-frame="neutral"] {
+  border-top-color: var(--fd-rule);
+}
+/* "still true a moment ago": the amber sunk into the canvas until it reads as
+ * a border rather than a line of text. Same recipe for the panel borders
+ * below, which is why they look like one family. */
+.fd-statusbar[data-frame="stale"] {
+  border-top-color: color-mix(in srgb, var(--fd-stale) 32%, var(--fd-canvas));
+}
+.fd-statusbar[data-frame="alert"] {
+  border-top-color: color-mix(in srgb, var(--fd-alert) 28%, var(--fd-canvas));
+}
+.fd-statusbar[data-frame="info"] {
+  border-top-color: color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+}
+/* A host that exited on purpose gets the separator grey: no hue at all, which
+ * is the point — nothing is wrong, there is simply nothing there. */
+.fd-statusbar[data-frame="stopped"] {
+  border-top-color: var(--fd-sep);
+}
+
+/* Q5: not drained but *replaced*. "No mode" understates a host that has
+ * exited — there is nothing left to have a mode in. */
+.fd-mode[data-tone="stopped"] {
+  background: var(--fd-sep);
+  color: var(--fd-text-muted);
+}
+/* 2c draws the drained chip as a dimmed fill, not a full-strength amber block:
+ * a chip that shouts MODE: — in the same weight as MODE: TERMINAL would read
+ * as a mode rather than the absence of one. */
+.fd-mode[data-tone="drained"] {
+  background: color-mix(in srgb, var(--fd-stale) 22%, var(--fd-canvas));
+  color: color-mix(in srgb, var(--fd-stale) 55%, var(--fd-text-quiet));
+}
+.fd-statusbar[data-frame="alert"] .fd-mode[data-tone="drained"] {
+  background: color-mix(in srgb, var(--fd-alert) 20%, var(--fd-canvas));
+  color: color-mix(in srgb, var(--fd-alert) 45%, var(--fd-text-quiet));
+}
+
+/* The sentence that replaces the key hints in every state that has something
+ * to say about the user's keystrokes. A fact, so never --fd-text-decor. */
+.fd-statusbar__message {
+  color: var(--fd-text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-statusbar[data-frame="alert"] .fd-statusbar__message,
+.fd-statusbar[data-frame="stale"] .fd-statusbar__message {
+  color: var(--fd-text-soft);
+}
+.fd-statusbar__note {
+  color: var(--fd-text-quiet);
+}
+
+/* 2c's amber `terminal stale 34s` chip, at the bar's right edge. */
+.fd-stalechip {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--fd-stale);
+  /* The darkest ground the palette names, so amber-on-dark stays readable
+   * without inventing a second brown. */
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+
+/* The one keyed button a state offers: `r Retry now`, `Enter Reload for …`. */
+.fd-stripaction {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  font-weight: 700;
+}
+.fd-stripaction[data-tone="alert"] {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+}
+.fd-stripaction[data-tone="info"] {
+  background: var(--fd-info);
+  color: color-mix(in srgb, var(--fd-info) 10%, var(--fd-canvas));
+}
+.fd-stripaction[data-tone="stale"] {
+  background: var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+}
+/* The key's own box: the button's ground, lifted just enough to read as a
+ * key cap on top of a bright fill. */
+.fd-stripaction__key,
+.fd-key-box {
+  padding: 1px 6px;
+  background: color-mix(in srgb, var(--fd-canvas) 25%, transparent);
+}
+.fd-stripaction:focus-visible,
+.fd-unread:focus-visible,
+.fd-feed__row:focus-visible,
+.fd-feed__close:focus-visible,
+.fd-access__primary:focus-visible,
+.fd-access__secondary:focus-visible,
+.fd-code__key:focus-visible,
+.fd-takeover__action:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+
+/* ══ 2e — the unread chip, in its four renderings ══════════════════════════
+ * It takes the colour of the most urgent unread event, and states what it is:
+ * attention beats finished beats quiet. */
+.fd-unread {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  font-weight: 700;
+}
+.fd-unread[data-tier="attention"] {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+  /* 2e: red breathes once every 2.4s. Slow on purpose — this is the only
+   * moving thing in the chrome, and a fast pulse would be a nag. */
+  animation: fd-breathe 2.4s ease-in-out infinite;
+}
+.fd-unread[data-tier="finished"] {
+  background: var(--fd-ok);
+  color: var(--fd-ground);
+}
+/* The quiet tier and the all-read state look the same on purpose: the feed
+ * has to stay reachable, so the chip never disappears — it just stops
+ * claiming anything. */
+.fd-unread[data-tier="quiet"],
+.fd-unread[data-tier="read"] {
+  background: none;
+  color: var(--fd-text-quiet);
+  font-weight: 400;
+}
+.fd-unread[data-tier="quiet"] .fd-key,
+.fd-unread[data-tier="read"] .fd-key {
+  color: var(--fd-text-decor);
+}
+@keyframes fd-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.72;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-unread[data-tier="attention"] {
+    animation: none;
+  }
+}
+
+/* ══ 2d — stale, asleep-and-stale, catching up ═════════════════════════════
+ * The distinction this section exists to protect: asleep means "your
+ * keystrokes are going somewhere else" and the picture is still true; stale
+ * means "this is a photograph". They must never look like each other. */
+.fd-pane {
+  position: relative;
+}
+/* Amber cast. A hue-preserving tint over the whole grid rather than a colour
+ * on the text, because xterm.js writes per-cell colours inline and there is
+ * nothing to recolour from out here. */
+.fd-pane[data-tone="stale"] .fd-letterbox {
+  color: color-mix(in srgb, var(--fd-stale) 62%, var(--fd-text-soft));
+  filter: sepia(0.35) saturate(0.7);
+}
+/* Both at once, and legible as a third state: desaturated cool *and* cast
+ * amber. The two treatments cancel toward grey, which is exactly why the
+ * scanlines — not the colour — are what carry this state. */
+.fd-pane[data-tone="asleep_stale"] .fd-letterbox {
+  color: color-mix(in srgb, var(--fd-stale) 40%, var(--fd-term-asleep));
+  filter: saturate(0.2) sepia(0.25);
+}
+.fd-pane[data-tone="asleep_stale"] .xterm-bold {
+  font-weight: 400;
+}
+/* 2d: the caret is *removed* on a photograph, not stopped. A blinking caret is
+ * the strongest "I am listening" signal a terminal has. */
+.fd-pane[data-caret="off"] .xterm-cursor,
+.fd-pane[data-caret="off"] .xterm-cursor-layer {
+  display: none;
+}
+/* The carrier of both frozen states. `pointer-events: none` is load-bearing:
+ * this lies over the terminal, and swallowing clicks would break
+ * click-to-focus in the state where a user is most likely to click. */
+.fd-pane__scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    color-mix(in srgb, var(--fd-stale) 11%, transparent) 0 1px,
+    transparent 1px 4px
+  );
+}
+.fd-pane[data-tone="asleep_stale"] .fd-pane__scanlines {
+  background: repeating-linear-gradient(
+    0deg,
+    color-mix(in srgb, var(--fd-stale) 9%, transparent) 0 1px,
+    transparent 1px 4px
+  );
+}
+/* The banner both frozen states and the replay share. */
+.fd-pane__banner {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  font-size: var(--fd-t-meta);
+  line-height: 1.55;
+  background: color-mix(in srgb, var(--fd-canvas) 92%, transparent);
+  box-shadow: inset 0 0 0 1px var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 20%, var(--fd-text-soft));
+}
+.fd-pane[data-tone="catching_up"] .fd-pane__banner {
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  color: var(--fd-text-soft);
+}
+.fd-pane[data-tone="asleep_stale"] .fd-pane__banner {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-stale) 55%, var(--fd-term-asleep));
+}
+/* The frozen clock. A wall-clock time, not a duration: it is checkable
+ * against the user's own memory of when they last looked. */
+.fd-pane__clock {
+  color: var(--fd-stale);
+  font-weight: 700;
+}
+.fd-pane__banner-text {
+  flex: 1;
+  min-width: 0;
+}
+/* §5.1's promise with a number on it — a promise a user can check. */
+.fd-pane__held {
+  color: var(--fd-text-quiet);
+}
+/* A real <progress>: a styled div would need an inline width, which is both
+ * forbidden in ui/ and the wrong element for a screen reader. */
+.fd-replay {
+  appearance: none;
+  width: 120px;
+  height: 2px;
+  border: 0;
+  background: var(--fd-rule-inner);
+}
+.fd-replay::-webkit-progress-bar {
+  background: var(--fd-rule-inner);
+}
+.fd-replay::-webkit-progress-value {
+  background: var(--fd-accent);
+}
+.fd-replay::-moz-progress-bar {
+  background: var(--fd-accent);
+}
+
+/* ══ 2b — the access layer ═════════════════════════════════════════════════
+ * A layer inside the frame, not a screen of its own: 2b draws all three panels
+ * with the logo band above them and a footer strip below, and the revoked one
+ * has a running agent visible behind it. */
+.fd-access {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  /* The scrim 2b puts over the frame. Dark enough that the panel is
+   * unambiguous, sheer enough that "everything below this dialog is a
+   * photograph" is a statement the user can verify by looking. */
+  background: color-mix(in srgb, var(--fd-canvas) 74%, transparent);
+}
+.fd-frame {
+  position: relative;
+}
+/* With no session there is nothing honest for either strip to say, and 2b
+ * replaces both with its own footer. */
+.fd-frame[data-access="true"] .fd-gitbar,
+.fd-frame[data-access="true"] .fd-statusbar {
+  display: none;
+}
+.fd-access__panel {
+  width: min(560px, calc(100% - 40px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 0 16px;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-access__panel {
+  /* 2b's rejected panel sits on a red-tinted ground, so the frame reads as one
+   * object rather than a red border around a neutral box. */
+  background: color-mix(in srgb, var(--fd-alert) 9%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-alert);
+}
+.fd-access[data-tone="stale"] .fd-access__panel {
+  background: color-mix(in srgb, var(--fd-stale) 9%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-stale);
+}
+.fd-access__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-access[data-tone="alert"] .fd-access__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-alert) 28%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-alert) 10%, transparent);
+}
+.fd-access[data-tone="stale"] .fd-access__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-stale) 28%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-stale) 12%, transparent);
+}
+.fd-access__title {
+  font-weight: 700;
+  color: var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-access__title {
+  color: var(--fd-alert);
+}
+.fd-access[data-tone="stale"] .fd-access__title {
+  color: var(--fd-stale);
+}
+/* "from the desktop" / "this address" — who or what did this. A fact. */
+.fd-access__eyebrow {
+  color: var(--fd-text-quiet);
+}
+.fd-access__body,
+.fd-access__detail,
+.fd-access__refused {
+  margin: 0;
+  padding: 0 12px;
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-access__body {
+  color: var(--fd-text-soft);
+}
+.fd-access__detail {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-access__refused {
+  color: var(--fd-alert);
+  letter-spacing: 0.3em;
+}
+/* 2b's numbered recovery steps. Both of them are on the *other* machine,
+ * which is the fact the user needs first. */
+.fd-access__steps {
+  margin: 0 12px;
+  padding: 10px 12px 10px 30px;
+  color: var(--fd-text-muted);
+  background: color-mix(in srgb, var(--fd-alert) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-alert);
+  line-height: 1.7;
+}
+.fd-access__actions,
+.fd-takeover__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding: 0 12px;
+}
+.fd-access__primary,
+.fd-access__secondary,
+.fd-takeover__action {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+}
+.fd-access__primary {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-access[data-tone="alert"] .fd-access__primary {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+}
+.fd-access[data-tone="stale"] .fd-access__primary {
+  background: var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+}
+.fd-access__secondary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+
+/* The four boxes, and the pairing code's own type size — the one place in the
+ * app that shouts (2g reserves --fd-t-code for exactly this). */
+.fd-code__wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 12px 0;
+}
+.fd-code {
+  display: flex;
+  gap: 8px;
+}
+.fd-code__box {
+  width: 46px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fd-t-code);
+  color: var(--fd-text);
+  background: var(--fd-canvas);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-code__box[data-caret="true"] {
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-code__box {
+  box-shadow: inset 0 0 0 1px var(--fd-alert);
+}
+.fd-code__caret {
+  width: 0.6em;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@keyframes fd-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-code__caret {
+    animation: none;
+  }
+}
+/* A keypad, because a phone is the device this screen exists for — 2a's QR
+ * points a phone here, and a phone has no keyboard to catch keydown from. */
+.fd-code__pad {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  max-width: 320px;
+}
+.fd-code__key {
+  padding: 8px 0;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--fd-accent) 12%, var(--fd-canvas));
+  color: var(--fd-text-soft);
+}
+.fd-access__foot {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+  font-size: var(--fd-t-meta);
+}
+/* The address is the one string on this screen a user might check, so it is a
+ * fact on the lifted floor — never decoration, and never invented. */
+.fd-access__host {
+  color: var(--fd-text-quiet);
+}
+.fd-access__attempts {
+  color: var(--fd-stale);
+}
+
+/* ══ 2f — takeover ═════════════════════════════════════════════════════════
+ * Magenta, because nothing here is broken: --fd-elsewhere is "another actor
+ * acted". D14 makes this courtesy, not a permission check. */
+.fd-takeover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 76%, transparent);
+}
+.fd-takeover__panel {
+  width: min(600px, calc(100% - 36px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 14px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 8%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-elsewhere);
+}
+.fd-takeover__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-elsewhere) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-elsewhere) 10%, transparent);
+}
+.fd-takeover__title {
+  color: var(--fd-elsewhere);
+  font-weight: 700;
+}
+.fd-takeover__eyebrow {
+  color: color-mix(in srgb, var(--fd-elsewhere) 55%, var(--fd-text-quiet));
+}
+.fd-takeover__body {
+  margin: 0;
+  padding: 0 12px;
+  color: var(--fd-text-soft);
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-takeover__who {
+  color: var(--fd-elsewhere);
+}
+.fd-takeover__detail {
+  margin: 0;
+  padding: 0 12px;
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  color: color-mix(in srgb, var(--fd-elsewhere) 45%, var(--fd-text-muted));
+  text-wrap: pretty;
+}
+/* Two different facts — someone else is driving; what you see is old — kept in
+ * two colours, because merged into one they stop being distinguishable. */
+.fd-takeover__stale {
+  margin: 0 12px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--fd-stale) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 22%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__facts {
+  margin: 0 12px;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__facts dt {
+  color: color-mix(in srgb, var(--fd-elsewhere) 50%, var(--fd-text-quiet));
+}
+.fd-takeover__facts dd {
+  margin: 0;
+  color: var(--fd-text-soft);
+}
+.fd-takeover__action--primary {
+  background: var(--fd-elsewhere);
+  color: color-mix(in srgb, var(--fd-elsewhere) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+.fd-takeover__action--secondary {
+  background: none;
+  color: color-mix(in srgb, var(--fd-elsewhere) 35%, var(--fd-text-muted));
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-elsewhere) 30%, var(--fd-canvas));
+}
+.fd-takeover__action--tertiary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-takeover__action--secondary .fd-key-box,
+.fd-takeover__action--tertiary .fd-key-box,
+.fd-access__secondary .fd-key-box {
+  background: color-mix(in srgb, var(--fd-accent) 10%, var(--fd-canvas));
+  color: var(--fd-focus);
+}
+
+/* ══ 2e — the feed slide-over ══════════════════════════════════════════════
+ * A right-edge slide-over over the viewport, never a modal: D11 makes this the
+ * only notification channel there is, and a channel that blocked the screen
+ * would interrupt the terminal you are reading to tell you about one you are
+ * not. No aria-modal, no focus trap, no click-swallowing scrim. */
+.fd-feed {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(470px, 100%);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow:
+    inset 1px 0 0 var(--fd-accent),
+    -18px 0 44px -12px color-mix(in srgb, var(--fd-canvas) 70%, transparent);
+}
+.fd-feed__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-feed__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+/* D11: global across projects, which is the whole reason it is useful. */
+.fd-feed__scope {
+  color: var(--fd-text-quiet);
+}
+.fd-feed__close {
+  font: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-feed__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.fd-feed__row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--fd-rule-inner);
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 9px 12px;
+}
+/* The chip's precedence, on the rows themselves: attention, then finished,
+ * then nothing at all. An unread row is washed and barred; a read one is not,
+ * so "what is new" survives scrolling. */
+.fd-feed__row[data-tier="attention"][data-read="false"] {
+  background: color-mix(in srgb, var(--fd-alert) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-alert);
+}
+.fd-feed__row[data-tier="finished"][data-read="false"] {
+  background: color-mix(in srgb, var(--fd-ok) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-ok);
+}
+.fd-feed__line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.fd-feed__session {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-feed__row[data-read="true"] .fd-feed__session {
+  color: var(--fd-text-soft);
+  font-weight: 400;
+}
+/* Project attribution is a fact: the session that needs you is usually in a
+ * project you are not looking at. */
+.fd-feed__project {
+  color: var(--fd-text-quiet);
+}
+.fd-feed__when {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-feed__transition {
+  padding-left: 20px;
+  color: var(--fd-text-muted);
+}
+/* D3, said out loud. Visible on hover and on keyboard focus — a title alone is
+ * invisible on a phone, which is the device this shape exists for. */
+.fd-feed__jump {
+  padding-left: 20px;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  visibility: hidden;
+}
+.fd-feed__row:hover .fd-feed__jump,
+.fd-feed__row:focus-visible .fd-feed__jump {
+  visibility: visible;
+}
+.fd-feed__empty {
+  padding: 22px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  text-align: center;
+}
+.fd-feed__empty-title {
+  margin: 0;
+  color: var(--fd-text-quiet);
+}
+.fd-feed__empty-body {
+  margin: 0;
+  max-width: 44ch;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-feed__foot {
+  flex: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--fd-rule-inner);
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  line-height: 1.6;
+}
+/* The retention window is a fact about what you can and cannot expect to
+ * find here, so it sits on the lifted floor. */
+.fd-feed__retention {
+  color: var(--fd-text-quiet);
+}
+
+/* The asleep footer ("keystrokes go to FlightDeck · Enter to wake it") is true
+ * only while the picture is current. On a photograph, waking the terminal does
+ * nothing — the banner is what has something to say — and on a replay the
+ * bar is. Anything else would be an instruction that does not work. */
+.fd-pane[data-tone="stale"] .fd-pane__foot,
+.fd-pane[data-tone="asleep_stale"] .fd-pane__foot,
+.fd-pane[data-tone="catching_up"] .fd-pane__foot {
+  display: none;
+}
+
+/* The two overlay layers are absolutely positioned inside these, so both need
+ * to be containing blocks. `.fd-frame` gets its own rule above. */
+.fd-main {
+  position: relative;
+}

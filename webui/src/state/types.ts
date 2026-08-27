@@ -1,4 +1,21 @@
-import type { Project, Selection, Snapshot, UpdateInfo } from "./model";
+import type {
+  AccessScreen,
+  AccessState,
+  ActivityEvent,
+  Incumbent,
+  Project,
+  ReplayProgress,
+  Seat,
+  SeatInfo,
+  Selection,
+  ShutdownState,
+  Snapshot,
+  Staleness,
+  TakeoverState,
+  UpdateInfo,
+  VersionMismatch,
+} from "./model";
+import { shouldRetry } from "./model";
 
 /**
  * App-state seam for the web SPA.
@@ -37,7 +54,27 @@ export type ConnectionStatus =
   | "connected"
   | "reconnecting"
   | "catching_up"
-  | "disconnected";
+  | "disconnected"
+  /**
+   * Turn 2, 2c. Two states the scaffold did not have, both *terminal* — the
+   * browser stops retrying and names the reason:
+   *
+   * `revoked` — the credential was withdrawn from the desktop
+   * (`ShutdownReason::TokenRevoked`, `ErrorCode::Unauthorized`). 2c: "access
+   * withdrawn from the desktop — the host is fine". Amber, not red: this is a
+   * decision someone made, not a failure.
+   *
+   * `stopped` — a `ServerMsg::Shutdown` arrived for any non-retryable reason
+   * (Q5). The details live in `AppState.shutdown`; this is the bucket the
+   * status bar switches on.
+   *
+   * Version mismatch is deliberately **not** here. 2c draws it as
+   * `● connected 21ms` with the mode chip intact, because nothing about the
+   * connection or about control is wrong — the tab is merely old. It lives in
+   * `AppState.versionMismatch` instead.
+   */
+  | "revoked"
+  | "stopped";
 
 /**
  * The PTY grid size. D4: the desktop always owns this — the browser never
@@ -45,6 +82,14 @@ export type ConnectionStatus =
  * around it (turn 2 revision: no scaling, no `FitAddon`). See
  * `src/term/terminal.ts` for the rendering side of that invariant.
  */
+/** The retry counter 2c prints while reconnecting, and after giving up. */
+export interface RetryInfo {
+  /** Which attempt is in flight, 1-based, as 2c counts them. */
+  readonly attempt: number;
+  /** Seconds until the next attempt, or `null` once retrying has stopped. */
+  readonly inSeconds: number | null;
+}
+
 export interface TerminalGeometry {
   readonly cols: number;
   readonly rows: number;
@@ -79,6 +124,17 @@ export interface AppState {
    * what "queued, never dropped, never reordered" (turn 2 §5.1) means at the
    * state layer. Drained by `input/flush` once the link is ready. */
   readonly pendingInput: readonly string[];
+  /**
+   * `Input::seq` of the **last** keystroke ever queued; `0` before the first.
+   * Never reset — not on a reconnect, not on a flush — because a monotonic
+   * counter is the whole mechanism behind §5.1's "never doubled".
+   *
+   * The queue carries no per-item seq of its own: `pendingInput[i]` has seq
+   * `inputSeq - (pendingInput.length - 1 - i)`, so there is exactly one number
+   * to keep honest instead of two that can drift. `firstPendingSeq` and
+   * `dropAckedInput` below are the only code allowed to do that arithmetic.
+   */
+  readonly inputSeq: number;
 
   /** Everything the host told us about, empty until the first snapshot. */
   readonly projects: readonly Project[];
@@ -96,6 +152,53 @@ export interface AppState {
   readonly latencyMs: number | null;
   readonly update: UpdateInfo | null;
   /**
+   * The named seats of the viewer chip (2f). Empty falls back to `viewers`.
+   */
+  readonly seats: readonly SeatInfo[];
+  /** D14: what *this* browser is allowed to do. `observing` is a real mode
+   * reachable from both directions of 2f, not a degraded error state. */
+  readonly seat: Seat;
+  /** 2f's prompt, or `null` when nobody is contending for the seat. */
+  readonly takeover: TakeoverState | null;
+
+  /**
+   * The four 2b screens, or `null` once this browser holds a good cookie.
+   * Non-null means the access overlay is up and the frame below it is a
+   * photograph — which is exactly what 2b's revoked panel says in words.
+   */
+  readonly access: AccessState | null;
+  /** Q5's terminal state. Non-null means **stop retrying**; see `reduce`. */
+  readonly shutdown: ShutdownState | null;
+  /** Turn 2 §4: the host updated under this tab. Reload, do not retry. */
+  readonly versionMismatch: VersionMismatch | null;
+  /** 2d's frozen clock, set while the picture is a photograph. */
+  readonly staleness: Staleness | null;
+  /** 2d's catching-up bar (Q3's byte cursor), or `null` when not replaying. */
+  readonly replay: ReplayProgress | null;
+
+  /**
+   * The host this tab is talking to, e.g. `192.168.2.14:7420` — 2b's footer
+   * strip (`no session · …`) and 2c's `attaching to …`.
+   *
+   * It comes from `location.host`, which is the only source that cannot be
+   * wrong: it is literally the address the user reached. Empty until
+   * `host/set`, and rendered as nothing rather than as a guess — a fabricated
+   * address on a security screen would be the first lie the user sees.
+   */
+  readonly host: string;
+  /**
+   * 2c's `attempt 3 · retry in 4s` and `gave up after 6 attempts`. One field
+   * for both, because they are the same two facts: `inSeconds: null` means the
+   * retrying has stopped.
+   */
+  readonly retry: RetryInfo | null;
+
+  /** D11's feed, oldest first exactly as the host sent it. */
+  readonly activity: readonly ActivityEvent[];
+  /** Whether the right-edge slide-over is open (2e). Never a modal. */
+  readonly feedOpen: boolean;
+
+  /**
    * When the last unpaired `Esc` was seen, for the 400 ms `Esc Esc` window
    * (§5). Stored rather than kept in a component so the decision is a pure
    * reduction; the timestamp always arrives on the action, never from a clock
@@ -109,6 +212,7 @@ export function createInitialState(): AppState {
     connection: "connecting",
     geometry: null,
     pendingInput: [],
+    inputSeq: 0,
     projects: [],
     selection: null,
     /** Nothing is focused before the first snapshot, and App mode is the
@@ -120,6 +224,26 @@ export function createInitialState(): AppState {
     viewers: 0,
     latencyMs: null,
     update: null,
+    seats: [],
+    /** Optimistic-free default: a browser that has not attached yet holds no
+     * seat it can prove, and `observing` is the honest weaker claim. */
+    seat: "observing",
+    takeover: null,
+    /**
+     * `null`, not a code-entry screen: whether this browser needs a code is the
+     * host's answer (`GET /auth/session`), and guessing "you are locked out"
+     * before asking would flash an access screen at every authenticated user on
+     * every reload.
+     */
+    access: null,
+    shutdown: null,
+    versionMismatch: null,
+    staleness: null,
+    replay: null,
+    activity: [],
+    feedOpen: false,
+    host: "",
+    retry: null,
     escArmedAt: null,
   };
 }
@@ -154,4 +278,191 @@ export type AppAction =
    * window is evaluated by `decideEscape`, and either the key is queued for
    * the agent or focus is released.
    */
-  | { readonly type: "input/esc"; readonly at: number };
+  | { readonly type: "input/esc"; readonly at: number }
+
+  /* --- Turn 2: the states 2b–2f render (remote-control-l7ya) -------------- */
+
+  /**
+   * §5.1's other half. `input/flush` says "everything queued was delivered";
+   * this says "the host has applied everything up to `throughSeq`", which is
+   * what `Snapshot { last_input_seq }` reports on a **reattach**.
+   *
+   * Both exist because a reconnect is not a flush: some prefix of the queue was
+   * already applied before the socket died, and re-sending it would double the
+   * user's keystrokes. Dropping the acknowledged prefix and re-sending the rest
+   * *in order* is what makes "never dropped, never reordered, never doubled"
+   * one behaviour rather than three hopes.
+   */
+  | { readonly type: "input/acked"; readonly throughSeq: number }
+
+  /**
+   * Q5. `ServerMsg::Shutdown` arrived, so this is a deliberate end, not a
+   * network failure: the reducer moves to a terminal `connection` and — for
+   * every reason except `restarting` — **refuses later `reconnecting`
+   * transitions**, which is where "stop retrying" is actually enforced. A
+   * transport that keeps trying anyway cannot un-stop the UI.
+   */
+  | { readonly type: "connection/shutdown"; readonly shutdown: ShutdownState }
+  /** Turn 2 §4: `check_version()` / `ErrorCode::VersionMismatch`. */
+  | {
+      readonly type: "version/mismatch";
+      readonly mismatch: VersionMismatch;
+    }
+  /** 2d's frozen clock. `null` clears it (the picture is live again). */
+  | { readonly type: "staleness/set"; readonly staleness: Staleness | null }
+  /** 2d's catching-up bar. `null` clears it (the replay landed). */
+  | { readonly type: "replay/set"; readonly replay: ReplayProgress | null }
+
+  /* --- Access (2b) ------------------------------------------------------- */
+
+  /**
+   * The host says this browser needs a code: `GET /auth/session` answered
+   * `authenticated: false`, or a request came back `401`/`429`. `screen` is the
+   * host's own `AccessScreen` spelling — never a guess made here.
+   */
+  | {
+      readonly type: "access/required";
+      readonly screen: AccessScreen;
+      readonly attemptsRemaining: number | null;
+      readonly lockoutSeconds: number | null;
+    }
+  /** A digit was typed into 2b's four boxes. Extra digits are ignored, not
+   * wrapped: a fifth keystroke means the user mistyped, not that they meant to
+   * start over. */
+  | { readonly type: "access/digit"; readonly digit: string }
+  | { readonly type: "access/backspace" }
+  /**
+   * `POST /auth/exchange` refused. The body's numbers are the host's
+   * (`attempts_remaining`, `retry_after_ms`); the browser renders them and
+   * computes nothing.
+   */
+  | {
+      readonly type: "access/refused";
+      readonly screen: AccessScreen;
+      readonly attemptsRemaining: number | null;
+      readonly lockoutSeconds: number | null;
+    }
+  /** The exchange succeeded — the cookie is set and the overlay comes down. */
+  | { readonly type: "access/granted" }
+  /**
+   * Someone withdrew this browser's access from the desktop (2b/2c).
+   *
+   * `revokedAgo` is nullable because the two ways we learn this carry different
+   * information: a `Shutdown { reason: TokenRevoked }` arrives the moment it
+   * happens, so "12s ago" is knowable, while an HTTP `401` on a later request
+   * says only that it happened. `null` renders the sentence without a time
+   * rather than with an invented one.
+   */
+  | { readonly type: "access/revoked"; readonly revokedAgo: string | null }
+  /** 2b's `Enter a new code` — back to a blank keypad from any other screen. */
+  | { readonly type: "access/retry" }
+  /**
+   * 2b's `Esc Stay here`, and **not** the same thing as `access/granted`.
+   *
+   * The overlay comes down; nothing about the credential changed. The user
+   * asked to keep reading the photograph underneath, which 2b treats as a real
+   * choice, and the connection stays `revoked` so the strip still offers
+   * `Enter a code`. Reporting this as "granted" would be the app lying about
+   * its own auth state.
+   */
+  | { readonly type: "access/dismiss" }
+
+  /* --- Seats and takeover (2f, D14) -------------------------------------- */
+
+  /** A `Delta::Seats` arrived: the chip's named occupants, and our own seat. */
+  | {
+      readonly type: "seats/changed";
+      readonly seats: readonly SeatInfo[];
+      readonly seat: Seat;
+    }
+  /** `ErrorCode::SeatHeld` — 2f's arriving panel. */
+  | { readonly type: "takeover/held"; readonly incumbent: Incumbent }
+  /**
+   * A `Delta::Seats` took control away from us. **Not** a `Shutdown`: the
+   * socket stays open, so this is a prompt over a live connection and the
+   * evicted browser can keep watching.
+   */
+  | {
+      readonly type: "takeover/evicted";
+      readonly byAddress: string;
+      readonly lastInputAgo: string;
+    }
+  /**
+   * 2f's `Take over` / `Take it back`. There is no takeover frame in protocol
+   * v1 — the caller re-sends `Attach { seat: SeatRequest::TakeOver }` — so this
+   * action only moves local state and lets the seam do the asking.
+   */
+  | { readonly type: "takeover/claim" }
+  /**
+   * 2f's `w Watch read-only`, and its `Esc Cancel`, which land in the same
+   * place: **a live read-only view**. D14 makes observation a real mode, so
+   * cancelling a takeover is not a dead end and eviction is not an ejection.
+   */
+  | { readonly type: "takeover/observe" }
+
+  /* --- Activity feed (2e, D11) ------------------------------------------- */
+
+  /** A `Delta::Activity` (or the snapshot's backfill) — appended, oldest first. */
+  | {
+      readonly type: "activity/received";
+      readonly events: readonly ActivityEvent[];
+    }
+  /** Read-marking. The host owns the record; this is the local half. */
+  | { readonly type: "activity/read"; readonly ids: readonly string[] }
+  | { readonly type: "feed/set"; readonly open: boolean }
+  | { readonly type: "host/set"; readonly host: string }
+  | { readonly type: "retry/set"; readonly retry: RetryInfo | null }
+
+  /**
+   * D3 across projects: a feed row names a session in a project that is not the
+   * selected one, so `selection/session` (which searches only inside the
+   * current project) cannot express it. Selecting from the feed also moves the
+   * desktop, which is why the row says `jump · also moves the desktop`.
+   */
+  | {
+      readonly type: "selection/jump";
+      readonly projectId: string;
+      readonly sessionId: string;
+    };
+
+/**
+ * Seq of `pendingInput[0]`, or the seq the *next* keystroke will get when the
+ * queue is empty. Exported because the transport needs it to label the frames
+ * it sends, and because the arithmetic must exist in exactly one place.
+ */
+export function firstPendingSeq(state: AppState): number {
+  return state.inputSeq - state.pendingInput.length + 1;
+}
+
+/**
+ * The queue with everything the host has already applied removed, preserving
+ * the order of the rest. A `throughSeq` behind the queue drops nothing; one
+ * ahead of it drops everything. Both are normal on a reconnect.
+ */
+export function dropAckedInput(
+  state: AppState,
+  throughSeq: number,
+): readonly string[] {
+  const first = firstPendingSeq(state);
+  const drop = Math.min(
+    state.pendingInput.length,
+    Math.max(0, throughSeq - first + 1),
+  );
+  return drop === 0 ? state.pendingInput : state.pendingInput.slice(drop);
+}
+
+/**
+ * Q5 enforced in one place: whether a *later* connection transition is allowed
+ * to claim the link is coming back.
+ *
+ * A browser that has been told `Shutdown { reason }` for anything but a restart
+ * is looking at a host that is gone, and "reconnecting…" would be a lie that
+ * wastes the user's time. `revoked` is the same shape of fact: the credential
+ * is dead, so retrying the socket cannot help — the user needs a code.
+ */
+export function isTerminalConnection(state: AppState): boolean {
+  if (state.connection === "revoked") {
+    return true;
+  }
+  return state.shutdown !== null && !shouldRetry(state.shutdown.reason);
+}

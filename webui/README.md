@@ -7,10 +7,67 @@ release stays a single file and the server never resolves paths on disk.
 
 The main screen (artboards 1a Terminal mode, 1b App mode, 1c split view) is
 built: seven regions rendered from a **fixture snapshot**, driven entirely
-through the reducer. Two tasks plug into it without touching a component —
-`remote-control-hgqy` swaps the fixture for the live websocket (see
-"Where the socket goes" below), and `remote-control-l7ya` adds the access
-screens, connection states, takeover and activity feed as siblings.
+through the reducer. So are the turn-2 screens — the four access screens (2b),
+every connection state (2c), the five terminal treatments (2d), the activity
+feed (2e) and the takeover trio (2f). One task still plugs in without touching
+a component: `remote-control-hgqy` swaps the fixture for the live websocket
+(see "Where the socket goes" below).
+
+## The turn-2 screens
+
+Three overlay layers on the same frame, plus one rewritten status bar. All four
+are state-driven — nothing keeps its own visibility in the DOM — so every rule
+below is a unit test rather than a screenshot.
+
+| Layer | Artboard | Opened by |
+| --- | --- | --- |
+| `ui/accessScreen.ts` | 2b, four screens | `state.access !== null` |
+| `ui/takeover.ts` | 2f, arriving + evicted | `state.takeover !== null` |
+| `ui/activityFeed.ts` | 2e, right-edge slide-over | `a` in App mode, or the unread chip |
+| `ui/statusBar.ts` | 2c, nine rows | every state |
+
+The vocabulary lives in pure modules, one per artboard, so the *rules* are
+testable without a DOM: `state/connection.ts` (2c's strip and 2d's pane tone),
+`state/access.ts` (2b's copy), `state/activity.ts` (2e's tier precedence),
+`state/seats.ts` (the viewer chip). `access/bootstrap.ts` and `access/client.ts`
+are the two things that touch the outside world — the URL fragment and the two
+auth routes.
+
+### Five rules that are easy to break by accident
+
+1. **`Shutdown` never shows "reconnecting" (Q5).** Enforced in the *reducer*,
+   not in the transport: once `state.shutdown` holds a non-retryable reason,
+   `connection/changed → reconnecting` is refused. A transport that keeps
+   dialling still cannot paint a lie. Only `ShutdownReason::Restarting` retries,
+   and an unknown reason does **not**.
+2. **Input is queued, in order, exactly once (§5.1).** `pendingInput` carries
+   the keystrokes and `inputSeq` carries the seq of the last one — one number,
+   not two that can drift. On a reattach, `input/acked { throughSeq }` drops the
+   prefix `Snapshot { last_input_seq }` says the host already applied, and
+   re-sends the rest in order. `input/esc` takes a seq like any other keystroke;
+   forgetting that was a real bug the test caught.
+3. **The connection strip never moves.** The mechanism is structural:
+   `.fd-spacer` is always the element immediately before `.fd-conn`. Do not add
+   a second spacer after it, and do not give the connection group a margin.
+4. **The desktop's seat row is always `Seat::Controlling`.** A "find the
+   controller" that only looks at `seat` finds two rows and names the desktop as
+   the browser that evicted you. Ask `webController()` — a viewer *and*
+   controlling — and nothing else.
+5. **The feed is never a modal.** `role="complementary"`, no `aria-modal`, no
+   focus trap, no click-swallowing scrim. D11 makes it the only notification
+   channel there is, so a version that blocked the screen would interrupt the
+   terminal you are reading to tell you about one you are not.
+
+### One deliberate deviation from the plan
+
+The access screens were specced as "a screen chooser above `createApp`". They
+shipped as a **layer inside the frame** instead, because 2b draws all three
+panels that way: logo band above, footer strip below, and a running agent
+visible behind the revoked one — which 2b describes in words as *"a photograph
+from the moment access ended"*. A sibling screen could not show that, and would
+have had to reproduce the band and the footer to look right. `data-access` on
+the frame hides the git bar and status bar, which have nothing honest to say
+with no session.
 
 ## Gate commands
 
@@ -22,8 +79,10 @@ and the `remote/` cargo workspace — see
 npm install
 npm run build        # -> dist/, which the Rust build embeds
 npx tsc --noEmit      # strict typecheck, no emit
-npm run test          # vitest (D15): reducer, status vocabulary, Esc-Esc
-                      # timing, the seven regions, and the palette guard
+npm run test          # vitest (D15): the reducer (both halves), the status and
+                      # connection vocabularies, Esc-Esc timing, the tier
+                      # precedence, the fragment/auth path, the seven regions,
+                      # the turn-2 screens, and the palette guard
 ```
 
 `npm run dev` starts a Vite dev server for iteration; it is not part of the
@@ -66,6 +125,17 @@ not of shape:
 | `createApp({ onDispatch })` logs a selection | `onDispatch` emits `ClientMsg::Command` (D3) |
 | `state.pendingInput` accumulates | flushed as ordered `ClientMsg::Input` (§5.1) |
 | `connection: "connected"` set at boot | `connection/changed` from the transport |
+| — | `ServerMsg::Shutdown` → `connection/shutdown` (Q5) |
+| — | `Delta::Seats` → `seats/changed` / `takeover/evicted` |
+| — | `ErrorCode::SeatHeld` → `takeover/held` |
+| — | `Delta::Activity` → `activity/received` |
+| — | `Ack` / `Snapshot { last_input_seq }` → `input/acked` |
+| — | `check_version()` mismatch → `version/mismatch` |
+
+The access half is **already live**, not a fixture: `src/main.ts` consumes the
+bootstrap code from the URL fragment, strips it from history, exchanges it at
+`POST /auth/exchange`, and asks `GET /auth/session` whether an existing cookie
+still works before anything opens a socket.
 
 `src/ui/app.ts` carries the same table as a doc comment, next to the one
 behaviour that has to move when input goes live: the `Esc` handler must become
@@ -112,9 +182,11 @@ webui/
 │   ├── main.ts          entry point: fixture in, main screen out
 │   ├── state/           model.ts, status.ts, fixture.ts + the reducer seam
 │   ├── input/           escape.ts — the 400 ms `Esc Esc` window (§5)
-│   ├── ui/              the seven regions, one file each, plus app.ts/store.ts
+│   ├── access/          bootstrap.ts (Q4's fragment), client.ts (the two routes)
+│   ├── ui/              the seven regions + three overlay layers, one file each
 │   ├── term/            xterm.js construction (terminal.ts) — no FitAddon
-│   └── style/           tokens.css (palette + type scale), main.css, fonts.css
+│   └── style/           tokens.css (palette + type scale), main.css,
+│                         states.css (2b–2f), fonts.css
 ├── dist/.gitkeep         tracked placeholder; dist/* itself is gitignored
 ├── vite.config.ts        also the vitest config (env: node; DOM per-file)
 └── tsconfig.json         strict

@@ -354,8 +354,14 @@ describe("region 7 — status bar", () => {
     expect(bar).toContain("click outside release keys");
     expect(bar).toContain("connected");
     expect(bar).toContain("18ms");
-    expect(bar).toContain("2 viewers");
-    expect(bar).toContain("(this tab + desktop)");
+    /**
+     * 1a drew `2 viewers (this tab + desktop)`. **Turn 2 supersedes it**: 2c
+     * and 2f both draw `desktop + this tab` — "two named seats, not a counter
+     * that implies a crowd" — and the reason a second seat is not alarming is
+     * that you can *see* it is your own desktop, which a number cannot show.
+     */
+    expect(bar).toContain("desktop + this tab");
+    expect(bar).not.toContain("2 viewers");
     expect(h.text(".fd-update")).toContain("v1.16.0 available");
   });
 

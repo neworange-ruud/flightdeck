@@ -1,4 +1,4 @@
-import type { Project, Snapshot } from "./model";
+import type { ActivityEvent, Project, SeatInfo, Snapshot } from "./model";
 
 /**
  * The fixture snapshot the main screen renders against today.
@@ -336,9 +336,130 @@ export function fixtureSnapshot(): Snapshot {
     },
     /** D4: 1a's chip reads `120×34 · host owns geometry`. */
     geometry: { cols: 120, rows: 34 },
-    /** 1a: `2 viewers (this tab + desktop)`. */
+    /** 1a drew a count; 2c/2f name the seats instead — see `fixtureSeats`. */
     viewers: 2,
     latencyMs: 18,
     update: { version: "v1.16.0" },
+    /** 1a is a browser that holds the keyboard, so the host granted it the
+     * controlling seat. An observer would see `MODE: —`, correctly. */
+    seat: "controlling",
+    seats: fixtureSeats(),
+    activity: fixtureActivity(),
   };
+}
+
+/**
+ * 2c/2f's viewer chip: `desktop + this tab`.
+ *
+ * **Two named seats, not a counter that implies a crowd.** The desktop is
+ * first because it is always there and is not a viewer at all (its
+ * `SeatInfo::viewer_id` is `null` on the wire); this tab is second because it
+ * is the one the reader is looking at.
+ */
+export function fixtureSeats(): readonly SeatInfo[] {
+  return [
+    {
+      label: "desktop",
+      seat: "controlling",
+      isDesktop: true,
+      sinceLabel: "since launch",
+    },
+    {
+      label: "this tab",
+      seat: "controlling",
+      isDesktop: false,
+      sinceLabel: "14 minutes, active 20s ago",
+    },
+  ];
+}
+
+/**
+ * The five rows artboard 2e draws, plus one cross-project row.
+ *
+ * **Copy is verbatim from 2e** — the transitions and the `reason` strings
+ * (`asked a question`, `agent exited (code 1)`, `finished, 18 files touched`,
+ * `set by hand on the desktop`, `Codex CLI reports no lifecycle`) are the part
+ * a user actually reads, and they come from the host's `ActivityEvent.reason`
+ * rather than being reconstructed from `from`/`to` — which could not produce
+ * "18 files touched" at all.
+ *
+ * **Ids follow the fixture, not the artboard.** 2e attributes
+ * `migrate-schema-v4` to `api-gateway` and `perf-audit-images` to `web`, while
+ * artboard 1a puts both under `flightdeck`. A feed row whose ids named a
+ * session that does not exist would make `jump` (D3) silently do nothing, which
+ * is the one thing these rows must not do — so the ids point at the sessions 1a
+ * really draws, and the last row deliberately lives in another project so the
+ * cross-project jump is exercised.
+ *
+ * Oldest first, matching `Snapshot::activity`'s documented backfill order.
+ */
+export function fixtureActivity(): readonly ActivityEvent[] {
+  return [
+    {
+      id: "e-1",
+      atLabel: "31m ago",
+      projectId: "p-flightdeck",
+      projectName: "flightdeck",
+      sessionId: "s-hotfix-csp-header",
+      sessionName: "hotfix-csp-header",
+      /** §5.1: unknown stays unknown, on both ends of the arrow. */
+      from: "unknown",
+      to: "unknown",
+      reason: "Codex CLI reports no lifecycle",
+      tier: "quiet",
+      read: true,
+    },
+    {
+      id: "e-2",
+      atLabel: "26m ago",
+      projectId: "p-flightdeck",
+      projectName: "flightdeck",
+      sessionId: "s-perf-audit-images",
+      sessionName: "perf-audit-images",
+      from: "idle",
+      to: "reviewing",
+      reason: "set by hand on the desktop",
+      tier: "quiet",
+      read: true,
+    },
+    {
+      id: "e-3",
+      atLabel: "11m ago",
+      projectId: "p-flightdeck",
+      projectName: "flightdeck",
+      sessionId: "s-add-tests-api",
+      sessionName: "add-tests-api",
+      from: "in_progress",
+      to: "idle",
+      reason: "finished, 18 files touched",
+      tier: "finished",
+      read: false,
+    },
+    {
+      id: "e-4",
+      atLabel: "4m ago",
+      projectId: "p-flightdeck",
+      projectName: "flightdeck",
+      sessionId: "s-flaky-e2e-runner",
+      sessionName: "flaky-e2e-runner",
+      from: "in_progress",
+      to: "error",
+      reason: "agent exited (code 1)",
+      tier: "attention",
+      read: false,
+    },
+    {
+      id: "e-5",
+      atLabel: "40s ago",
+      projectId: "p-api-gateway",
+      projectName: "api-gateway",
+      sessionId: "s-rotate-jwt-secret",
+      sessionName: "rotate-jwt-secret",
+      from: "in_progress",
+      to: "waiting",
+      reason: "asked a question",
+      tier: "attention",
+      read: false,
+    },
+  ];
 }

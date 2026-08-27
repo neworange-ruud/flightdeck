@@ -11,6 +11,9 @@ describe("createInitialState", () => {
       connection: "connecting",
       geometry: null,
       pendingInput: [],
+      /** Never reset, so §5.1's "never doubled" has a monotonic counter to
+       * lean on; `0` means nothing has ever been queued. */
+      inputSeq: 0,
       projects: [],
       selection: null,
       /** App mode is the honest default: the app cannot promise keystrokes
@@ -21,6 +24,22 @@ describe("createInitialState", () => {
       viewers: 0,
       latencyMs: null,
       update: null,
+      seats: [],
+      /** The honest weaker claim before an attach has been answered (D14). */
+      seat: "observing",
+      takeover: null,
+      /** Whether a code is needed is the host's answer, not a guess. */
+      access: null,
+      shutdown: null,
+      versionMismatch: null,
+      staleness: null,
+      replay: null,
+      activity: [],
+      feedOpen: false,
+      /** Empty rather than a guessed address — 2b prints this on a security
+       * screen, so it is set from `location.host` or not at all. */
+      host: "",
+      retry: null,
       escArmedAt: null,
     });
   });
