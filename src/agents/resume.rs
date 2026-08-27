@@ -3,7 +3,7 @@
 //! The robust source is each agent's own on-disk session store (it exists no
 //! matter how the agent exited — clean `/exit`, killed on shutdown, terminal
 //! closed), keyed by the worktree directory:
-//!   claude: `~/.claude/projects/<cwd with '/' and '.' → '-'>/<uuid>.jsonl`
+//!   claude: `~/.claude/projects/<cwd with '/', '\', '.' and ':' → '-'>/<uuid>.jsonl`
 //!   codex:  `~/.codex/sessions/**/rollout-*.jsonl`, each starting with a
 //!           `session_meta` line carrying `payload.session_id` + `payload.cwd`.
 //!
@@ -120,16 +120,23 @@ pub fn newest_new_session(
         .map(|(id, _)| id.clone())
 }
 
-/// Claude's project directory for `cwd`: the absolute path with every path
-/// separator (`/` or, on Windows, `\`) and `.` replaced by `-`, under
-/// `<home>/.claude/projects/`. Both separators are folded so the mangling
+/// Claude's project directory for `cwd`: the absolute path with every character
+/// Claude Code itself folds — both path separators (`/` and, on Windows, `\`),
+/// `.`, and the Windows drive colon — replaced by `-`, under
+/// `<home>/.claude/projects/`. Every one of those is folded so the mangling
 /// matches Claude Code's own encoding regardless of the host platform.
+///
+/// The colon matters on Windows: Claude Code stores a session for
+/// `C:\repo` under `C--repo`, so leaving `:` intact asked for
+/// `C:-repo` — a name Windows cannot even represent, so `read_dir`
+/// failed outright, no session file was ever found, and the phone's transcript
+/// stayed empty for every Windows agent.
 fn claude_project_dir(cwd: &Path, home: &Path) -> PathBuf {
     let mangled: String = cwd
         .to_string_lossy()
         .chars()
         .map(|c| {
-            if c == '/' || c == '\\' || c == '.' {
+            if matches!(c, '/' | '\\' | '.' | ':') {
                 '-'
             } else {
                 c
@@ -382,6 +389,37 @@ mod tests {
             ids,
             vec!["3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()]
         );
+    }
+
+    /// A Windows worktree: the drive colon folds to `-` like every separator, so
+    /// `C:\Repos\proj` resolves to `C--Repos-proj` — the name Claude Code
+    /// actually writes. Left unfolded the lookup asked for `C:-Repos-proj`,
+    /// which Windows cannot name at all, so no session was ever found and the
+    /// phone's transcript stayed empty.
+    #[test]
+    fn claude_store_folds_windows_drive_colon() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new(r"C:\Repos\proj\.flightdeck\worktrees\feat");
+        let dir = home
+            .path()
+            .join(".claude/projects/C--Repos-proj--flightdeck-worktrees-feat");
+        touch(
+            &dir.join("8f21c0aa-1b3e-4c55-9d0f-77ab21c4e900.jsonl"),
+            "{}\n",
+        );
+
+        let ids: Vec<String> = store_session_ids("claude", cwd, home.path())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["8f21c0aa-1b3e-4c55-9d0f-77ab21c4e900".to_string()]
+        );
+
+        let (path, format) = newest_session_path("claude", cwd, home.path()).unwrap();
+        assert_eq!(path, dir.join("8f21c0aa-1b3e-4c55-9d0f-77ab21c4e900.jsonl"));
+        assert_eq!(format, SessionFormat::Claude);
     }
 
     #[test]

@@ -326,8 +326,10 @@ pub enum HitTarget {
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
+    let chrome = layout::chrome_for(area, state.mode());
     let ml = layout::compute(
         area,
+        chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
     if rect_contains(ml.sidebar, col, row) {
@@ -337,7 +339,8 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), col, row).unwrap_or(HitTarget::Sidebar),
+            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, col, row)
+                .unwrap_or(HitTarget::Sidebar),
         );
     }
     if state.split_view {
@@ -390,24 +393,37 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
 /// Map a click in the sidebar `area` to an agent tab hit: the `✕` close control
 /// (on the name row, at the far right) or the tab row itself. Returns `None` for
 /// clicks that are not on a tab (header/heading/empty space below the tabs).
-fn sidebar_hit(area: Rect, tab_count: usize, col: u16, row: u16) -> Option<HitTarget> {
+/// In the collapsed strip each agent occupies a single row and there is no close control.
+fn sidebar_hit(
+    area: Rect,
+    tab_count: usize,
+    chrome: layout::Chrome,
+    col: u16,
+    row: u16,
+) -> Option<HitTarget> {
     let inner = Block::default().borders(Borders::RIGHT).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
-    let first = inner.y.saturating_add(SIDEBAR_HEADER_ROWS);
+    // The collapsed strip is one row per agent with no heading above it.
+    let (header_rows, rows_per_tab) = match chrome {
+        layout::Chrome::Full => (SIDEBAR_HEADER_ROWS, SIDEBAR_ROWS_PER_TAB),
+        layout::Chrome::Collapsed => (0, 1),
+    };
+    let first = inner.y.saturating_add(header_rows);
     if row < first {
         return None;
     }
     let rel = row - first;
-    let idx = (rel / SIDEBAR_ROWS_PER_TAB) as usize;
+    let idx = (rel / rows_per_tab) as usize;
     if idx >= tab_count {
         return None;
     }
-    // Within a tab block the rows are: divider(0), name(1), agent(2), git(3).
-    // The `✕` lives on the name row at the far right; give it a forgiving
-    // 3-column target so it stays easy to click.
-    if rel % SIDEBAR_ROWS_PER_TAB == 1 {
+    // Within a full tab block the rows are: divider(0), name(1), agent(2),
+    // git(3). The `✕` lives on the name row at the far right; give it a
+    // forgiving 3-column target so it stays easy to click. The collapsed strip
+    // has no close control — use APP mode to close an agent.
+    if chrome == layout::Chrome::Full && rel % rows_per_tab == 1 {
         let close_col = inner.x.saturating_add(inner.width).saturating_sub(1);
         if col >= close_col.saturating_sub(2) {
             return Some(HitTarget::CloseAgentTab(idx));
@@ -538,15 +554,17 @@ pub fn draw(
     now_ms: u64,
 ) {
     let area = frame.area();
+    let chrome = layout::chrome_for(area, state.mode());
     let ml = layout::compute(
         area,
+        chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
     );
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
-    draw_sidebar(frame, state, cache, ml.sidebar, now_ms);
+    draw_sidebar(frame, state, cache, ml.sidebar, chrome, now_ms);
     if state.split_view {
         // Split view reclaims the tab-bar row and lays the selected tab's
         // terminals out side by side in equal-width columns.
@@ -588,9 +606,13 @@ pub fn draw(
         }
     }
 
-    let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
-    frame.render_widget(info_divider, ml.info_divider);
-    draw_info_bar(frame, state, cache, ml.info_bar);
+    // Collapsed chrome gives the git info bar's rows to the terminal; git
+    // details stay reachable through the git status overlay.
+    if chrome == layout::Chrome::Full {
+        let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
+        frame.render_widget(info_divider, ml.info_divider);
+        draw_info_bar(frame, state, cache, ml.info_bar);
+    }
     let status_divider = Paragraph::new(divider_line(ml.status_divider.width as usize));
     frame.render_widget(status_divider, ml.status_divider);
     draw_status_bar(frame, state, ml.status_bar);
@@ -766,6 +788,13 @@ pub fn draw_project_tab_bar(
     active: usize,
     now_ms: u64,
 ) {
+    // A zero-height (or zero-width) area means the row is collapsed. Bail out
+    // before building any sub-rect: `project_new_button` derives a fixed
+    // height of 1 for its rect regardless of `area`, so without this guard it
+    // would paint onto whatever row follows the collapsed project tab row.
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let mut spans: Vec<Span> = Vec::new();
     for (i, p) in projects.iter().enumerate() {
         if i > 0 {
@@ -827,8 +856,14 @@ pub fn draw_sidebar(
     state: &AppState,
     cache: &GitStatusCache,
     area: Rect,
+    chrome: layout::Chrome,
     now_ms: u64,
 ) {
+    if chrome == layout::Chrome::Collapsed {
+        draw_sidebar_collapsed(frame, state, area, now_ms);
+        return;
+    }
+
     // When the live-pane border feature is on, the focused pane's frame
     // already supplies the separating vertical line, so the sidebar's own
     // right divider is suppressed here — otherwise two adjacent vertical
@@ -963,6 +998,68 @@ pub fn draw_sidebar(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draw the collapsed agent strip: one indicator glyph per agent, no heading
+/// and no close control, for windows too small to afford the full sidebar.
+fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
+    let block = Block::default().borders(Borders::RIGHT);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = state
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            Line::from(collapsed_agent_span(
+                tab,
+                state.selected_tab == Some(i),
+                now_ms,
+            ))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The single-cell indicator for one agent in the collapsed strip: the
+/// selection arrow, a spinner while it works, or its status dot. Same glyphs
+/// and colours the full sidebar draws on each agent's name line, with the text
+/// removed.
+fn collapsed_agent_span(
+    tab: &crate::app::state::RuntimeTab,
+    selected: bool,
+    now_ms: u64,
+) -> Span<'static> {
+    use crate::contracts::InterpretedStatus::{Running, Starting, Working};
+
+    if selected {
+        return Span::styled(
+            "▸",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let spinner = || {
+        Span::styled(
+            spinner_frame(now_ms).to_string(),
+            Style::default().fg(Color::Red),
+        )
+    };
+    if tab.phase == TabPhase::Creating {
+        return spinner();
+    }
+    let ds = tab.display_status(now_ms);
+    if matches!(ds.interpreted, Starting | Running | Working) {
+        return spinner();
+    }
+    let color = ds
+        .manual
+        .map(|_| Color::Cyan)
+        .unwrap_or_else(|| status_label_color(ds.interpreted).1);
+    Span::styled("●", Style::default().fg(color))
 }
 
 /// Build a sidebar tab name line: `<marker><lead><name>` on the left with a
@@ -1960,22 +2057,184 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool) {
     frame.render_widget(para, overlay_area);
 }
 
-/// Draw the desktop pairing overlay (Settings → Remote, spec §5.2): the QR code
-/// (rendered as black-on-white half-block cells so a phone camera can scan it),
-/// the 4-digit code, an expiry countdown, and the pairing status. When the
-/// terminal is too small for the QR it honestly shows the code plus a note.
-pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rect) {
+/// The overlay's minimum content width, so a codes-only surface still reads as a
+/// dialog rather than a sliver.
+const PAIRING_MIN_CONTENT_W: u16 = 44;
+/// Left + right border plus one column of padding on each side.
+const PAIRING_BORDERED_CHROME_W: u16 = 4;
+/// Top + bottom border rows.
+const PAIRING_BORDER_H: u16 = 2;
+
+/// How the pairing overlay decided to lay itself out for a given terminal size:
+/// which frame it drew and which optional rows survived the height budget.
+///
+/// Split out from the drawing so the fit logic — the part that decides whether a
+/// phone can scan anything at all — is unit-testable at exact terminal sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingLayout {
+    /// Draw the titled border (false = borderless, which buys back two rows).
+    bordered: bool,
+    /// Render the QR art.
+    show_qr: bool,
+    /// Render the "terminal too small" note (only when a QR exists but no room).
+    note: Vec<String>,
+    /// Content width the text is wrapped to.
+    content_w: u16,
+    /// Wrapped status-line rows.
+    status: Vec<String>,
+    /// Whether a claim code row is rendered (never dropped when present).
+    has_code: bool,
+    /// Optional rows that fit, in drop order.
+    show_countdown: bool,
+    show_gap_after_art: bool,
+    show_esc: bool,
+    show_gap_before_status: bool,
+}
+
+impl PairingLayout {
+    /// Total content rows this layout renders (excluding the border).
+    fn content_h(&self, qr_h: u16) -> u16 {
+        (if self.show_qr { qr_h } else { 0 })
+            + self.note.len() as u16
+            + u16::from(self.show_gap_after_art)
+            + u16::from(self.has_code)
+            + u16::from(self.show_countdown)
+            + u16::from(self.show_gap_before_status)
+            + self.status.len() as u16
+            + u16::from(self.show_esc)
+    }
+}
+
+/// Decide the pairing overlay's layout for `area`.
+///
+/// The QR is what a phone actually scans, so it is fitted **first** and the
+/// chrome around it is what gives way: the countdown, the spacers and the "Esc
+/// to close" hint are dropped in that order, and if the box's own border is what
+/// tips the QR off screen the border goes too. The previous fixed 10-row chrome
+/// budget meant a real 57x29 `fdr1:` QR needed a 61x39 terminal — so a
+/// default-size Windows Terminal (~120x30) only ever showed the fallback note,
+/// never a scannable code.
+fn pairing_layout(pairing: &RemotePairing, area: Rect) -> PairingLayout {
     let qr_w = pairing.qr_width as u16;
     let qr_h = pairing.qr_rows.len() as u16;
-    // Non-QR chrome: title border + code + countdown + blank lines + status +
-    // footer. A generous fixed budget so the fit test is conservative.
-    const CHROME_H: u16 = 10;
-    let qr_fits =
-        !pairing.qr_rows.is_empty() && qr_w + 4 <= area.width && qr_h + CHROME_H <= area.height;
+    let has_qr = !pairing.qr_rows.is_empty();
+    let has_code = pairing.code.is_some();
 
-    let content_w = if qr_fits { qr_w.max(44) } else { 44 };
-    let box_w = (content_w + 4).min(area.width);
-    let box_h = if qr_fits { qr_h + CHROME_H } else { CHROME_H }.min(area.height);
+    // The only row that never gives way beside the art: the claim code, so the
+    // manual path always stays available. The status line *is* droppable while a
+    // QR is on screen — "Scan the QR or type the code" says nothing the visible
+    // QR and code do not, and giving it up is what lets a 29-row QR plus its
+    // code land in a 30-row terminal. With no QR the status is the only
+    // explanation there is, so it becomes required (see `budget` below).
+    let qr_content_w = qr_w.max(PAIRING_MIN_CONTENT_W);
+    let art_required_h = u16::from(has_code);
+    let qr_bordered = has_qr
+        && qr_content_w + PAIRING_BORDERED_CHROME_W <= area.width
+        && qr_h + PAIRING_BORDER_H + art_required_h <= area.height;
+    let qr_borderless = has_qr
+        && !qr_bordered
+        && qr_content_w <= area.width
+        && qr_h + art_required_h <= area.height;
+
+    let show_qr = qr_bordered || qr_borderless;
+    let bordered = !qr_borderless;
+    let content_w = if show_qr {
+        qr_content_w
+    } else {
+        PAIRING_MIN_CONTENT_W
+    }
+    .min(area.width.saturating_sub(if bordered {
+        PAIRING_BORDERED_CHROME_W
+    } else {
+        0
+    }))
+    .max(1);
+
+    let status_lines = wrap_message(&pairing.status_line, content_w as usize);
+    // Name the smallest terminal that would show the QR (the borderless fit) —
+    // a bare "too small" leaves the user guessing which dimension to grow.
+    let note_text = format!(
+        "Terminal too small for the QR (needs {}x{}, have {}x{}) — enter the code below.",
+        qr_content_w,
+        qr_h + art_required_h,
+        area.width,
+        area.height
+    );
+
+    let mut budget = area
+        .height
+        .saturating_sub(if bordered { PAIRING_BORDER_H } else { 0 })
+        .saturating_sub(if show_qr { qr_h } else { 0 })
+        .saturating_sub(u16::from(has_code))
+        // With no art, the status is required rather than budgeted.
+        .saturating_sub(if show_qr {
+            0
+        } else {
+            status_lines.len() as u16
+        });
+    let mut take = |n: u16| -> bool {
+        if n > 0 && budget >= n {
+            budget -= n;
+            true
+        } else {
+            false
+        }
+    };
+
+    let note = if has_qr && !show_qr {
+        let lines = wrap_message(&note_text, content_w as usize);
+        if take(lines.len() as u16) {
+            lines
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    // Highest-value optional row first: with the QR up, the status only makes it
+    // in when there is height to spare.
+    let status = if show_qr && !take(status_lines.len() as u16) {
+        Vec::new()
+    } else {
+        status_lines
+    };
+    let show_countdown = pairing.seconds_remaining.is_some() && take(1);
+    let show_gap_after_art = (show_qr || !note.is_empty()) && take(1);
+    let show_esc = take(1);
+    let show_gap_before_status = take(1);
+
+    PairingLayout {
+        bordered,
+        show_qr,
+        note,
+        content_w,
+        status,
+        has_code,
+        show_countdown,
+        show_gap_after_art,
+        show_esc,
+        show_gap_before_status,
+    }
+}
+
+/// Draw the desktop pairing overlay (Settings → Remote, spec §5.2): the QR code
+/// (rendered as black-on-white half-block cells so a phone camera can scan it),
+/// the 4-digit code, an expiry countdown, and the pairing status. The layout
+/// adapts to the terminal ([`pairing_layout`]); when even a borderless QR cannot
+/// fit it honestly shows the code plus the size the QR would need.
+pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rect) {
+    let qr_h = pairing.qr_rows.len() as u16;
+    let l = pairing_layout(pairing, area);
+
+    let box_w = (l.content_w
+        + if l.bordered {
+            PAIRING_BORDERED_CHROME_W
+        } else {
+            0
+        })
+    .min(area.width);
+    let box_h =
+        (l.content_h(qr_h) + if l.bordered { PAIRING_BORDER_H } else { 0 }).min(area.height);
     let overlay = layout::centered_overlay(area, box_w, box_h);
     frame.render_widget(Clear, overlay);
 
@@ -1986,26 +2245,33 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
     } else {
         Color::Cyan
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
-        .title(" Pair Phone ");
-    let inner = block.inner(overlay);
-    frame.render_widget(block, overlay);
+    let inner = if l.bordered {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .title(" Pair Phone ");
+        let inner = block.inner(overlay);
+        frame.render_widget(block, overlay);
+        inner
+    } else {
+        overlay
+    };
 
     let mut lines: Vec<Line> = Vec::new();
-    if qr_fits {
+    if l.show_qr {
         // Each row: black modules (foreground) on a white background.
         let style = Style::default().fg(Color::Black).bg(Color::White);
         for row in &pairing.qr_rows {
             lines.push(Line::from(Span::styled(row.clone(), style)));
         }
-        lines.push(Line::raw(""));
-    } else if !pairing.qr_rows.is_empty() {
+    }
+    for note in &l.note {
         lines.push(Line::from(Span::styled(
-            "Terminal too small for the QR — enter the code below.",
+            note.clone(),
             Style::default().fg(Color::Yellow),
         )));
+    }
+    if l.show_gap_after_art {
         lines.push(Line::raw(""));
     }
     if let Some(code) = &pairing.code {
@@ -2016,22 +2282,27 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    if let Some(secs) = pairing.seconds_remaining {
+    if let (true, Some(secs)) = (l.show_countdown, pairing.seconds_remaining) {
         lines.push(Line::from(Span::styled(
             format!("expires in {secs}s"),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        pairing.status_line.clone(),
-        Style::default().fg(accent),
-    )));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Esc to close",
-        Style::default().fg(Color::DarkGray),
-    )));
+    if l.show_gap_before_status {
+        lines.push(Line::raw(""));
+    }
+    for row in &l.status {
+        lines.push(Line::from(Span::styled(
+            row.clone(),
+            Style::default().fg(accent),
+        )));
+    }
+    if l.show_esc {
+        lines.push(Line::from(Span::styled(
+            "Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     let para = Paragraph::new(lines).alignment(Alignment::Center);
     frame.render_widget(para, inner);
@@ -2643,6 +2914,241 @@ mod tests {
         assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::Sidebar));
     }
 
+    // --- Collapsed chrome (small windows in terminal mode) -----------------
+
+    /// Read the glyph in the first column of `row` from a rendered buffer.
+    fn strip_glyph(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        buffer[(0, row)].symbol().to_string()
+    }
+
+    /// Read a full row of a rendered buffer as a string.
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn collapsed_sidebar_draws_one_glyph_per_agent() {
+        let mut state = state_with_tabs(3);
+        state.selected_tab = Some(1);
+        // Tab 2 is mid-creation, so it must show a spinner rather than a dot.
+        state.tabs[2].phase = TabPhase::Creating;
+
+        let mut term = test_terminal(layout::COLLAPSED_SIDEBAR_WIDTH, 6);
+        term.draw(|frame| {
+            draw_sidebar(
+                frame,
+                &state,
+                &empty_cache(),
+                Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6),
+                layout::Chrome::Collapsed,
+                0,
+            )
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+
+        // Row 0 is tab 0 (idle → dot), row 1 the selection arrow, row 2 a spinner.
+        assert_eq!(strip_glyph(&buffer, 0), "●");
+        assert_eq!(strip_glyph(&buffer, 1), "▸");
+        assert_eq!(
+            strip_glyph(&buffer, 2),
+            spinner_frame(0).to_string(),
+            "a tab being created shows a spinner, not a status dot"
+        );
+        // No heading: there is no room for the word "Agents".
+        let all: String = (0..6_u16)
+            .flat_map(|y| (0..layout::COLLAPSED_SIDEBAR_WIDTH).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!all.contains("Agents"));
+    }
+
+    #[test]
+    fn collapsed_sidebar_hit_maps_one_row_per_agent_and_never_closes() {
+        let area = Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6);
+        // One row per tab, starting at the sidebar's first row — no heading offset.
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 0),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 2),
+            Some(HitTarget::AgentTab(2))
+        );
+        // Past the last agent resolves to nothing (the caller falls back to chrome).
+        assert_eq!(sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 3), None);
+        // The rightmost inner column selects; it is never a close control.
+        assert_eq!(
+            sidebar_hit(area, 3, layout::Chrome::Collapsed, 1, 1),
+            Some(HitTarget::AgentTab(1))
+        );
+    }
+
+    /// A window below both thresholds, so terminal mode collapses the chrome.
+    const SMALL: (u16, u16) = (100, 24);
+
+    #[test]
+    fn small_window_in_terminal_mode_hides_the_info_bar_and_narrows_the_sidebar() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+        state.focus_terminal();
+
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let all: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        // The sidebar heading and the git info bar are both gone. "⎇" is the
+        // info bar's branch marker and appears nowhere else in the main view.
+        assert!(!all.contains("Agents"), "collapsed sidebar has no heading");
+        assert!(!all.contains('⎇'), "collapsed layout has no git info bar");
+        // The status bar stays — it carries the mode and the command hints.
+        assert!(
+            !buffer_row(&buffer, h - 1).trim().is_empty(),
+            "the status bar must still be drawn when collapsed"
+        );
+    }
+
+    #[test]
+    fn same_small_window_in_app_mode_keeps_full_chrome() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+        state.focus_app();
+
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let all: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        assert!(all.contains("Agents"), "app mode keeps the full sidebar");
+        assert!(all.contains('⎇'), "app mode keeps the git info bar");
+    }
+
+    /// Reproduces the event loop's draw order (src/lib.rs, around line 1253):
+    /// `draw_project_tab_bar` is called first with the layout's
+    /// `project_tabs` rect, then `draw` is called with the full area — `draw`
+    /// recomputes the same chrome and layout internally and paints the
+    /// divider row on top of whatever `draw_project_tab_bar` left behind.
+    fn draw_composition(
+        term: &mut Terminal<TestBackend>,
+        state: &AppState,
+        projects: &[ProjectTabInfo],
+    ) {
+        term.draw(|frame| {
+            let area = frame.area();
+            let chrome = layout::chrome_for(area, state.mode());
+            let ml = layout::compute(area, chrome, mode_style::border_enabled(&state.config.ui));
+            draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
+            draw(frame, state, &empty_cache(), &UiOverlay::None, 0);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn collapsed_composition_leaves_the_divider_row_clean() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_terminal();
+        assert_eq!(
+            layout::chrome_for(Rect::new(0, 0, w, h), state.mode()),
+            layout::Chrome::Collapsed
+        );
+
+        let projects = vec![ProjectTabInfo {
+            name: "alpha".to_string(),
+            attention: false,
+            busy: false,
+        }];
+        let mut term = test_terminal(w, h);
+        draw_composition(&mut term, &state, &projects);
+        let buffer = term.backend().buffer().clone();
+
+        // The divider sits at row 1 when collapsed: header row 0, divider row
+        // 1, no project tab row in between. No cell in it may carry the
+        // "+ project" button's background — that background surviving means
+        // the button's fixed-height rect painted through onto the divider
+        // underneath it.
+        for x in 0..w {
+            assert_ne!(
+                buffer[(x, 1)].bg,
+                PROJECT_TAB_ACTIVE_BG,
+                "divider row cell ({x}, 1) carries the project-tab button's background"
+            );
+        }
+    }
+
+    #[test]
+    fn full_composition_leaves_the_divider_row_clean() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_app();
+        assert_eq!(
+            layout::chrome_for(Rect::new(0, 0, w, h), state.mode()),
+            layout::Chrome::Full
+        );
+
+        let projects = vec![ProjectTabInfo {
+            name: "alpha".to_string(),
+            attention: false,
+            busy: false,
+        }];
+        let mut term = test_terminal(w, h);
+        draw_composition(&mut term, &state, &projects);
+        let buffer = term.backend().buffer().clone();
+
+        // The project tab row (row 1, below the header) renders normally...
+        let tab_row: String = (0..w)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
+        assert!(tab_row.contains("alpha"), "project tab row: {tab_row:?}");
+        // ...and the divider row below it (row 2) is still clean.
+        for x in 0..w {
+            assert_ne!(
+                buffer[(x, 2)].bg,
+                PROJECT_TAB_ACTIVE_BG,
+                "divider row cell ({x}, 2) carries the project-tab button's background"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_test_uses_the_collapsed_strip_in_a_small_terminal_mode_window() {
+        let (w, h) = SMALL;
+        let mut state = state_with_tabs(2);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, w, h);
+
+        // Body starts at row 2 (header row 0, divider row 1) — no project row.
+        assert_eq!(hit_test(area, &state, 0, 2), Some(HitTarget::AgentTab(0)));
+        assert_eq!(hit_test(area, &state, 0, 3), Some(HitTarget::AgentTab(1)));
+        // The strip's border column is sidebar chrome, not an agent.
+        assert_eq!(
+            hit_test(area, &state, layout::COLLAPSED_SIDEBAR_WIDTH - 1, 2),
+            Some(HitTarget::Sidebar)
+        );
+        // Just past the strip is the main pane, not the sidebar.
+        assert_ne!(
+            hit_test(area, &state, layout::COLLAPSED_SIDEBAR_WIDTH, 2),
+            Some(HitTarget::Sidebar)
+        );
+
+        // App mode restores the full sidebar geometry on the same window.
+        state.focus_app();
+        assert_eq!(hit_test(area, &state, 0, 2), None);
+    }
+
     #[test]
     fn terminal_viewport_renders_parsed_pty_output() {
         // Regression: the active terminal's PTY output must actually render
@@ -2920,7 +3426,7 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area, false));
+        let region = layout::split_region(&layout::compute(area, layout::Chrome::Full, false));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
@@ -3325,7 +3831,11 @@ mod tests {
         state.focus_terminal();
 
         let area = Rect::new(0, 0, 120, 40);
-        let ml = layout::compute(area, mode_style::border_enabled(&state.config.ui));
+        let ml = layout::compute(
+            area,
+            layout::Chrome::Full,
+            mode_style::border_enabled(&state.config.ui),
+        );
         let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
         let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
 
@@ -3852,5 +4362,150 @@ mod tests {
         // App mode + setting off → no dim.
         ui.dim_terminal_in_app_mode = false;
         assert!(!super::dim_terminal(false, &ui));
+    }
+
+    // --- Pairing overlay layout (remote pairing on small terminals) --------
+
+    /// A `RemotePairing` carrying art the size a real `fdr1:` payload produces:
+    /// 57 cells wide, 29 half-block rows (measured through
+    /// `remote::pairing::qr_art`). The exact numbers are the point — they are
+    /// what the fixed chrome budget used to push off screen.
+    fn displaying_pairing() -> RemotePairing {
+        RemotePairing {
+            status_line: "Scan the QR or type the code on your phone — waiting…".to_string(),
+            code: Some("4729".to_string()),
+            qr_rows: vec!["#".repeat(57); 29],
+            qr_width: 57,
+            seconds_remaining: Some(120),
+            done: false,
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn pairing_layout_shows_qr_and_code_in_thirty_row_terminal() {
+        // A default-size Windows Terminal: 29 QR rows + the code line is exactly
+        // 30, so the QR gets in — borderless, with the droppable status gone.
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 120, 30));
+        assert!(l.show_qr, "the QR must fit a 120x30 terminal");
+        assert!(!l.bordered, "the border must give way before the QR does");
+        assert!(l.has_code, "the manual code is never dropped");
+        assert!(l.status.is_empty(), "the status yields at this height");
+        assert!(!l.show_countdown && !l.show_esc);
+        assert_eq!(
+            l.content_h(29),
+            30,
+            "must fill the height exactly, not exceed it"
+        );
+    }
+
+    #[test]
+    fn pairing_layout_keeps_border_and_chrome_when_tall_enough() {
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 120, 40));
+        assert!(l.show_qr && l.bordered);
+        assert_eq!(l.status.len(), 1);
+        assert!(l.show_countdown, "the countdown returns once there is room");
+        assert!(l.show_esc);
+        assert!(l.content_h(29) + PAIRING_BORDER_H <= 40);
+    }
+
+    #[test]
+    fn pairing_layout_restores_chrome_in_priority_order_as_height_grows() {
+        // Each extra row buys back the next-most-useful piece of chrome, and no
+        // layout ever claims more rows than the terminal has.
+        let p = displaying_pairing();
+        let mut seen_status = false;
+        let mut seen_countdown = false;
+        for h in 30..=40u16 {
+            let l = pairing_layout(&p, Rect::new(0, 0, 120, h));
+            let used = l.content_h(29) + if l.bordered { PAIRING_BORDER_H } else { 0 };
+            assert!(used <= h, "layout at height {h} used {used} rows");
+            assert!(l.show_qr, "the QR fits every height from 30 up");
+            if !l.status.is_empty() {
+                seen_status = true;
+            }
+            if l.show_countdown {
+                assert!(seen_status, "the status is restored before the countdown");
+                seen_countdown = true;
+            }
+            if l.show_esc {
+                assert!(seen_countdown, "the countdown is restored before the hint");
+            }
+        }
+        assert!(seen_countdown, "a 40-row terminal shows the countdown");
+    }
+
+    #[test]
+    fn pairing_layout_names_the_size_the_qr_needs_when_it_cannot_fit() {
+        let l = pairing_layout(&displaying_pairing(), Rect::new(0, 0, 80, 20));
+        assert!(!l.show_qr);
+        assert!(l.bordered, "the fallback keeps the dialog frame");
+        let note = l.note.join(" ");
+        assert!(
+            note.contains("57x30") && note.contains("80x20"),
+            "the note must name both the needed and the actual size: {note}"
+        );
+        assert!(l.has_code, "the code is what the user falls back to");
+        assert!(
+            !l.status.is_empty(),
+            "with no QR the status is required, wrapped to the 44-column box"
+        );
+    }
+
+    #[test]
+    fn pairing_layout_wraps_a_long_relay_failure_message() {
+        // The relay-refused message is far longer than the overlay is wide; it
+        // must wrap rather than be truncated to its first 44 columns.
+        let pairing = RemotePairing {
+            status_line: "the relay refused the connection: relay password required. \
+                          Check [remote] relay_url / relay_password in your configuration, \
+                          then try again."
+                .to_string(),
+            code: None,
+            qr_rows: Vec::new(),
+            qr_width: 0,
+            seconds_remaining: None,
+            done: false,
+            failed: true,
+        };
+        let l = pairing_layout(&pairing, Rect::new(0, 0, 120, 30));
+        assert!(
+            l.status.len() > 2,
+            "long failure text must wrap: {:?}",
+            l.status
+        );
+        for row in &l.status {
+            assert!(row.chars().count() <= l.content_w as usize);
+        }
+        assert!(l.note.is_empty(), "no QR was offered, so no size note");
+    }
+
+    #[test]
+    fn draw_remote_overlay_paints_qr_rows_in_a_thirty_row_terminal() {
+        let pairing = displaying_pairing();
+        let mut term = test_terminal(120, 30);
+        term.draw(|f| {
+            let area = f.area();
+            draw_remote_overlay(f, &pairing, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains(&"#".repeat(57)),
+            "a full QR row must reach the buffer at 120x30"
+        );
+        assert!(text.contains("Code  4729"));
+    }
+
+    #[test]
+    fn draw_remote_overlay_survives_a_tiny_terminal() {
+        let pairing = displaying_pairing();
+        let mut term = test_terminal(20, 4);
+        term.draw(|f| {
+            let area = f.area();
+            draw_remote_overlay(f, &pairing, area);
+        })
+        .unwrap();
     }
 }

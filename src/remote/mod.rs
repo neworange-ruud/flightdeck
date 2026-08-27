@@ -157,6 +157,26 @@ pub enum RemoteInbound {
         /// The `seq` the relay will accept next; the next envelope must use it.
         next_seq: u64,
     },
+    /// The relay handshake ended before `auth_ok`, so the connection never went
+    /// live: no pairing code can be minted and no envelope can flow. Carries a
+    /// short, human-readable `reason` so the pairing overlay can say *why*
+    /// instead of sitting on "Requesting a pairing code from the relay…"
+    /// forever while the supervisor backoff-loops invisibly.
+    ///
+    /// `retrying` separates the two kinds of failure the UI must word
+    /// differently:
+    /// * `true` — a reconnect could plausibly fix it (DNS/TCP/TLS failure, the
+    ///   relay closing or timing out mid-handshake). The overlay keeps waiting
+    ///   and just explains the delay.
+    /// * `false` — the relay actively *refused* this device (a missing or wrong
+    ///   `relay_password`, an unknown device). No amount of backoff clears a
+    ///   configuration problem, so the overlay fails the attempt and says so.
+    HandshakeFailed {
+        /// Short human-readable cause, safe to show in the UI (no secrets).
+        reason: String,
+        /// Whether reconnecting could plausibly succeed (see above).
+        retrying: bool,
+    },
 }
 
 /// A message from the app to the relay-client thread.

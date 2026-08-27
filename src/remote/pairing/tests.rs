@@ -228,3 +228,67 @@ fn four_digit_code_is_always_four_ascii_digits() {
         assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 }
+
+// ── Handshake-failure reporting ─────────────────────────────────────────────
+
+#[test]
+fn a_relay_refusal_fails_the_attempt_with_a_config_hint() {
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_handshake_failed(
+        "the relay refused the connection: relay password required",
+        false,
+    );
+    match s.phase() {
+        PairingPhase::Failed { message } => {
+            assert!(message.contains("relay password required"));
+            assert!(
+                message.contains("relay_password"),
+                "the message must point at the setting to fix: {message}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(s.stall_reason(), None);
+}
+
+#[test]
+fn a_retryable_failure_keeps_offering_but_explains_the_wait() {
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_handshake_failed("cannot reach the relay: tcp connect failed", true);
+    assert!(matches!(s.phase(), PairingPhase::Offering));
+    let stall = s
+        .stall_reason()
+        .expect("a stall reason for the status line");
+    assert!(stall.contains("tcp connect failed"), "{stall}");
+    assert!(stall.contains("retrying"), "{stall}");
+}
+
+#[test]
+fn a_late_failure_never_wipes_a_live_code_or_a_finished_pairing() {
+    // A reconnect failing *after* the relay minted a code must not blank the QR
+    // the user is mid-scan of.
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_offered(
+        PairingId::new("pair_a".to_string()),
+        "4729".to_string(),
+        9_999,
+    );
+    s.on_handshake_failed("the relay refused the connection: nope", false);
+    assert!(matches!(s.phase(), PairingPhase::Displaying { .. }));
+    assert_eq!(s.stall_reason(), None);
+
+    // Nor an established pairing.
+    let mut s2 = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s2.on_offered(
+        PairingId::new("pair_b".to_string()),
+        "4729".to_string(),
+        9_999,
+    );
+    s2.on_claimed(
+        PairingId::new("pair_b".to_string()),
+        Some(STANDARD.encode(public_x963(&PHONE_SCALAR))),
+    );
+    assert!(s2.is_established());
+    s2.on_handshake_failed("cannot reach the relay: gone", true);
+    assert!(s2.is_established());
+}

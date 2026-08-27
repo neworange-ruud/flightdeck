@@ -14,10 +14,54 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
 - The status bar now advertises the help keys in **both** modes, not just App mode — help is global, so terminal focus should say so. To pay for the extra text, `Ctrl-g: command palette` is shortened to `Ctrl-g: palette` and `app commands` to `app mode`, keeping the bar within roughly the width it already required.
+- Collapse FlightDeck's chrome in small windows while in terminal focus: the
+  project tab row and git info bar hide and the agents sidebar shrinks to a
+  one-glyph strip, giving the agent three more rows and 25 more columns.
+  Switching to app mode restores everything.
+
+### Improvements
+
+- **The pairing QR now fits an ordinary terminal window.** A real pairing QR is
+  57 columns by 29 rows, and the overlay reserved a fixed 10 rows around it — so
+  anything shorter than 39 rows (a default-size terminal window included) only
+  ever showed "Terminal too small for the QR" and a code to type by hand. The
+  overlay now fits the QR first and gives up its own chrome to do it: the
+  countdown, the spacers, the "Esc to close" hint and finally the border step
+  aside in that order, which lands a full QR in a 30-row window. When it truly
+  cannot fit, the note names the size the QR needs and the size you have.
 
 ### Bug fixes
 
-- None yet.
+- **The phone now shows the agent's replies on Windows.** FlightDeck rebuilds the
+  mobile chat from the agent's own session file, and it derived Claude Code's
+  store directory by folding path separators and `.` to `-` — but not the Windows
+  drive colon. So a `C:\repo` worktree was looked up under `C:-repo`, a name
+  Windows cannot even represent: the directory read failed, no session file was
+  ever found, and every Windows agent's transcript stayed permanently empty on
+  the remote app. The colon now folds like every other separator, matching what
+  Claude Code actually writes (`C--repo`).
+
+- **Pairing a phone no longer waits silently on a relay that said no.** If the
+  relay refused the connection — most often no `relay_password` set for the
+  hosted relay — the pairing overlay sat on "Requesting a pairing code from the
+  relay…" forever while the client reconnected in the background, giving no hint
+  that a code was never coming. The overlay now says what the relay said and
+  points at the settings to fix, and a relay that is merely unreachable explains
+  the wait instead of looking identical to a refusal.
+- Stop FlightDeck dying when the window is resized while an agent is printing
+  emoji or CJK text. Narrowing the window can cut a double-width character in
+  half, which the terminal parser cannot survive — and the crash took the whole
+  app down, every project and every pane with it. The parser is now contained per
+  pane: the affected pane clears, the agent repaints it, and everything else
+  keeps running. That one pane loses its scrollback, which is the price of not
+  losing the session.
+- Hold each terminal's grid at a floor of 4 rows by 20 columns. The same parser
+  panics outright on a grid a single column wide or a single row tall, so in a
+  very small window the agent's view is now clipped rather than shrunk past that
+  point.
+- A crash no longer leaves your shell printing mouse movement as escape
+  sequences: mouse capture, bracketed paste, and keyboard flags are restored on
+  the panic path as well as on a clean exit.
 
 ### Breaking changes
 
