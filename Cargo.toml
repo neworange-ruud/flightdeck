@@ -57,8 +57,16 @@ flightdeck-remote-protocol = { path = "remote/protocol" }
 # `connect_async`/`client_async_tls` helpers) + `handshake`; TLS (wss) is added
 # per-platform below (rustls off-Windows, SChannel on Windows) so neither target
 # needs a C toolchain — see the two target tables. The crate re-exports the
-# `tungstenite` types (`Message`, `Error`), so there is no second WebSocket crate
-# in the graph.
+# `tungstenite` types (`Message`, `Error`), so this line adds no *third*
+# implementation of its own.
+#
+# There ARE two tungstenite versions in the desktop graph, deliberately: this
+# 0.30 as the relay CLIENT, and 0.29 pulled in by `axum`'s `ws` feature for the
+# web server's handshake (see the `axum` entry below). Unifying them would mean
+# pinning axum to whatever version happens to match, or hand-rolling the RFC 6455
+# server upgrade; neither is worth it, and the duplication costs binary size
+# only. Do not "fix" it by downgrading the relay client — the client half is the
+# one carrying E2E transport code with three P0 bugs behind it.
 tokio-tungstenite = "0.30"
 # The shared async runtime (src/remote/runtime.rs). Unconditional and
 # non-optional on every platform: the relay client cannot run without it, and
@@ -122,6 +130,31 @@ subtle = "2.6"
 # the server never resolves paths on disk (D9). `mime-guess` attaches a content
 # type to each embedded file, which the asset route serves verbatim.
 rust-embed = { version = "8", features = ["mime-guess"] }
+# The HTTP + WebSocket server itself (D6, src/web/server.rs). `default-features
+# = false` because axum's defaults carry `form`/`query`/`multipart`-adjacent
+# extractors, `matched-path`, `original-uri`, `tower-log` and `tracing` that this
+# server has no route for; what it needs is exactly four:
+#   http1 — the only protocol a browser needs over a loopback/LAN socket (no h2:
+#           it buys multiplexing we do not use and a larger graph),
+#   json  — the credential-exchange request/response bodies (Q4),
+#   tokio — `axum::serve` + `ConnectInfo`, so the peer's real socket address is
+#           available to the per-address rate limiter,
+#   ws    — the `/ws` upgrade that protocol v1 rides on (D12).
+#
+# **This does add a second WebSocket implementation to the graph**, which the
+# `tokio-tungstenite` note above previously claimed did not exist: axum's `ws`
+# feature pins tokio-tungstenite 0.29 for the *server* handshake, while
+# `src/remote/client.rs` keeps the 0.30 it uses as a *client*. The two
+# never meet — different direction, different socket, no shared types — and the
+# alternative (hand-rolling the RFC 6455 server upgrade against 0.30 so the
+# versions unify) would mean owning the handshake, masking and framing code that
+# is the one part of a WebSocket server nobody should write twice.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "ws",
+] }
 # Network-interface enumeration for the access overlay's address picker (Q1.2).
 # Pure Rust over getifaddrs/GetAdaptersAddresses, so it adds no C toolchain and
 # behaves the same on macOS, Linux and Windows — the parity requirement in
