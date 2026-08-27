@@ -22,6 +22,38 @@ cargo fmt --check
 
 - `-D warnings` and `--locked` are mandatory. Fix clippy lints in the change;
   do not `#[allow]` them away.
+
+### Two more build surfaces the commands above do NOT cover
+
+The root gate only covers the root `flightdeck` package. There are two others,
+and touching them means running their gates too.
+
+**`remote/` — a separate cargo workspace** (members: `protocol`, `relay`).
+`cargo fmt --check` from the root does not format it, and `flightdeck-relay` is
+not a root dependency, so `-p flightdeck-relay` fails from the root. CI runs it
+via `relay.yml`. When touching `remote/protocol` or `remote/relay`:
+
+```bash
+cd remote
+cargo fmt --all --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+**`webui/` — the browser control surface** (Vite + TypeScript + xterm.js, baked
+into the binary with `rust-embed`; see `specs/WEB_INTERFACE.md` D9). When
+touching it:
+
+```bash
+cd webui
+npm run build        # must succeed — the Rust build embeds its output
+npx tsc --noEmit
+npm run test         # vitest
+```
+
+The Playwright end-to-end job is separate and governed by the flake policy in
+`specs/WEB_INTERFACE.md` Q6 — retries 2 in CI, 0 locally, quarantine within a
+working day. Do not silence it by raising retries.
 - Dangerous / refusal paths need tests, not only success paths (SPECS §26).
 - A Stop hook runs the fast subset (`fmt --check` + `clippy`) automatically; the
   full `cargo test` run is still your responsibility.

@@ -312,25 +312,86 @@ brief covering the M1 gaps is `specs/WEBAPP_DESIGN_BRIEFING_T2.md`
 
 ---
 
-## 6. Open questions
+## 6. Open questions — provisional answers
 
-- **Q1 — The QR is useless on loopback.** D5 binds `127.0.0.1` by default but
-  shows a QR. Either the QR appears only once bound to a routable address, or the
-  overlay offers "enable LAN access" inline as part of the flow. Needs a decision
-  and a design.
-- **Q2 — Replay ring buffer size.** Bytes per terminal, and whether it is
-  configurable. Proposal: 256 KiB per terminal, `[web] replay_bytes`.
-- **Q3 — Reconnect semantics.** Confirm resume-from-byte-cursor (D12 refinement)
-  versus full re-replay, and what the viewer shows while catching up.
-- **Q4 — Token transport.** Bookmarkability (D10) implies the token survives in
-  the URL or a cookie. Proposal: token arrives in the URL fragment on first
-  visit, is exchanged for an `HttpOnly` cookie, and the fragment is stripped.
-- **Q5 — Behaviour when the desktop quits** while a browser is attached: what the
-  browser shows, and whether the server drains or drops.
-- **Q6 — Playwright flake policy** — retry/quarantine rules agreed before the job
-  lands, per D15's stated cost.
+**Every question below has a provisional answer, and implementation should build
+it as written.** They are recorded as questions because they were not settled by
+the interview, not because work should wait for them. Treat each as decided
+unless you have a concrete reason to differ — in which case change it here, in
+the same commit as the code, and say why.
 
----
+This exists so that long unattended stretches of implementation are never blocked
+on a conversation. A provisional answer that turns out wrong is cheap; a stalled
+milestone is not.
+
+### Q1 — The QR is meaningless on loopback · **answered**
+
+Resolved by `specs/WEBAPP_DESIGN_BRIEFING_T2.md` §3. The access overlay has two
+states and the transition between them is part of the flow:
+
+- **Local only (default).** Primary action is **Open in browser** — FlightDeck
+  launches the default browser already authenticated. No QR, no code. A copyable
+  URL for a second browser, and a door to network access that states its
+  consequence.
+- **Network enabled.** The QR now earns its place, encoding
+  `http://<lan-ip>:<port>/#<code>`, alongside the code in large type, an explicit
+  address choice, and the warning.
+
+### Q2 — Replay ring buffer size · **provisional**
+
+**256 KiB per terminal**, configurable as `[web] replay_bytes`. Bytes, not lines,
+because the buffer sits in front of a VT parser and lines are not yet a concept.
+Discard oldest first. On attach, replay the whole buffer; a viewer that joins
+mid-escape-sequence gets one imperfect repaint, which xterm.js recovers from on
+the next full redraw.
+
+### Q3 — Reconnect semantics · **provisional**
+
+**Resume from a byte cursor.** Every terminal frame carries a per-terminal
+monotonic byte offset, and this is in protocol v1 (see the D12 refinement). On
+reconnect the viewer sends its last offset; the host resumes from there if the
+offset is still inside the ring buffer, and otherwise sends a full replay with an
+explicit `truncated: true` so the viewer can say it missed output rather than
+pretending continuity. The viewer shows a catching-up state while draining.
+
+### Q4 — Token transport · **provisional**
+
+Two separate credentials, per `specs/WEBAPP_DESIGN_BRIEFING_T2.md` §3:
+
+```
+short code    ~120s bootstrap, shown on the desktop with a countdown
+                   │  exchanged once
+                   ▼
+HttpOnly cookie    long-lived, per browser, revocable from the desktop
+```
+
+The bootstrap code arrives in the **URL fragment** on first visit so it never
+reaches the server in a request line or a log, is exchanged for the cookie, and
+the fragment is stripped from history. Bookmarks then work with no credential
+visible anywhere.
+
+### Q5 — The host quits while a browser is attached · **provisional**
+
+**The server drains rather than dropping.** Before the listener closes, it sends
+an explicit `Shutdown { reason }` frame, so the browser can distinguish a
+deliberate quit from a network failure — which is the whole point, because
+"reconnecting…" against a host that is gone is a lie that wastes the user's time.
+
+On receiving it the browser enters a **terminal state and stops retrying**,
+naming the reason. If the quit was initiated from *this* browser, it shows an
+acknowledgement of its own action instead of a failure.
+
+### Q6 — Playwright flake policy · **provisional**
+
+Agreed before the job lands, per D15's accepted cost:
+
+- `retries: 2` in CI, `retries: 0` locally, so flake is visible when developing.
+- A test that fails twice consecutively on `main` is **quarantined** the same
+  working day — marked `fixme` with a filed bug — rather than left to erode trust
+  in the suite.
+- The job is **non-blocking for its first two weeks**, then becomes required.
+  This repo has three open iOS flake issues (`remote-control-7lo`, `ba5`, `7lr`);
+  the policy exists so the browser suite does not become a fourth.
 
 ## 7. Reference
 
