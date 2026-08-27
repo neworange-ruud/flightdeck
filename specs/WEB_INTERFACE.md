@@ -296,7 +296,9 @@ leave terminal focus, with a single `Esc` still passing through to the agent;
 dark-only; `● connected 18ms` and a viewer count in the status bar; slide-over
 sidebar below 900px.
 
-**Not yet designed — needed before the milestone that uses them:**
+**Not yet designed — needed before the milestone that uses them.** The turn-2
+brief covering the M1 gaps is `specs/WEBAPP_DESIGN_BRIEFING_T2.md`
+(`remote-control-l83`); turn 3 covers the rest (`remote-control-v4s`):
 
 | Gap | Needed by | Brief item |
 | --- | --- | --- |
@@ -333,6 +335,8 @@ sidebar below 900px.
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.
+- `specs/WEBAPP_DESIGN_BRIEFING_T2.md` — turn 2: access/QR (resolves Q1),
+  connection and staleness states, takeover, activity feed, reference sheet.
 - `specs/REMOTE_PROTOCOL.md` §8–§9 — the phone protocol we are deliberately *not*
   extending (D12).
 - `specs/SPECS.md` §19–§24 — terminal model, layout, git panel, interaction model,
