@@ -491,6 +491,65 @@ control, which works everywhere and is what the user actually controls:
 This keeps the security posture honest — never claiming a protection we cannot
 deliver — and keeps behaviour identical across platforms, which parity requires.
 
+## 6.5 Refinements made during implementation
+
+Kept here because §6's rule cuts both ways: a provisional answer that turns out
+wrong is cheap, but a change made in code and *not* written down is how a spec
+starts lying. Each entry below was decided while building M1, in the commit that
+made it.
+
+### R1 — `ActivityEvent` carries a `reason` string
+
+Turn 2 requires feed rows to read `asked a question`, `agent exited (code 1)`,
+`finished, 18 files touched` (artboard 2e, §5.1). Protocol v1 as first written
+carried `from`, `to`, `manual` and `tier` but no reason, and a browser cannot
+reconstruct one — `finished, 18 files touched` is not derivable from a status
+pair at all. `reason` is therefore a wire field, `#[serde(default)]` to the empty
+string.
+
+**It is never padded with a guess.** An empty reason renders as no reason.
+§5.1's "unknown stays unknown" governs the reason exactly as it governs the
+statuses, and the host-side store enforces it by taking the reason from the
+caller rather than deriving one.
+
+### R2 — the browser's status/git model is wider than the wire's
+
+`webui/src/state/model.ts` models per-session git as a three-way union —
+`known` / `no_upstream` / `unknown` — and carries a session-level
+`lifecycleNote`. Protocol v1 encodes the same information as a `has_upstream`
+bool plus a `collected` bool, which admits an impossible fourth state, and it
+has nowhere to say "Codex CLI reports no lifecycle" as data.
+
+`no-upstream` and `git: ?` are load-bearing facts (2g names both, and §5.1's
+lifted dim tier exists for them), so the browser must not infer either. Whoever
+wires the live socket resolves this in one of two ways and says which: widen
+protocol v1 to match, or map in the adapter with a comment. **Inferring is not
+one of the options.**
+
+### R3 — the letterbox and palette invariants are enforced by tests
+
+D4's "no `FitAddon`, never scale" and 2g's four type sizes and named tokens are
+guarded by `webui/src/ui/tokens.guard.test.ts`, which fails the suite on a hex
+or `rgb()` literal outside `tokens.css`, on a `font-size` that is not a
+`var(--fd-t-*)`, on an inline style write, and on `FitAddon` / `addon-fit` /
+`transform: scale` appearing anywhere. Both guards were verified to fail when
+deliberately violated.
+
+This is recorded as a decision because it constrains future work: a value the
+artboards use that 2g never named is expressed as a `color-mix()` of named
+tokens and reported as a token-turn candidate, rather than reintroduced as a
+literal. Current candidates: `--fd-wash-select`, `--fd-glow-focus`,
+`--fd-glow-elsewhere`, `--fd-sidebar-ground`, `--fd-chip-shell`.
+
+### R4 — D4's per-frame invariant is `sync_terminal_sizes`
+
+D4 and §7 previously cited `sync_selected_tab_sizes` and `resize_sessions`.
+Neither exists. The function is `sync_terminal_sizes` (`src/lib.rs:5405`),
+calling `resize_if_changed` (`src/lib.rs:5387`). Corrected in both places; the
+invariant is unchanged and still load-bearing.
+
+---
+
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.
