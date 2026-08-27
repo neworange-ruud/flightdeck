@@ -107,6 +107,12 @@ pub struct PairingSession {
     claim_token: Option<String>,
     /// The peer (phone) key-agreement public key, once claimed.
     peer_ka_b64: Option<String>,
+    /// The last *transient* reason the relay handshake has not produced a code
+    /// yet (network failure, relay timeout). Replaces the bland "Requesting a
+    /// pairing code…" status while the client keeps retrying, so a desktop that
+    /// cannot reach the relay says so instead of waiting mutely. A terminal
+    /// refusal is not stored here — it becomes [`PairingPhase::Failed`].
+    stall_reason: Option<String>,
 }
 
 impl PairingSession {
@@ -137,6 +143,7 @@ impl PairingSession {
             pairing_id: None,
             claim_token: None,
             peer_ka_b64: None,
+            stall_reason: None,
         }
     }
 
@@ -215,6 +222,40 @@ impl PairingSession {
         self.phase = PairingPhase::Failed {
             message: message.into(),
         };
+    }
+
+    /// Apply a [`crate::remote::RemoteInbound::HandshakeFailed`] report: a relay
+    /// handshake that never reached `auth_ok`, so the code we are waiting for
+    /// cannot arrive.
+    ///
+    /// * `retrying` — the client will try again (network blip, relay timeout):
+    ///   stay in [`PairingPhase::Offering`] but remember `reason` so the overlay
+    ///   explains the wait instead of showing a bland "requesting…".
+    /// * not `retrying` — the relay refused this device (missing/wrong
+    ///   `relay_password`, unknown device): reconnecting cannot fix a config
+    ///   fault, so fail the attempt outright with the relay's own words.
+    ///
+    /// Ignored once a code is on screen or the pairing completed — a late report
+    /// from a *reconnect* must not wipe a live code or a finished pairing.
+    pub fn on_handshake_failed(&mut self, reason: &str, retrying: bool) {
+        if !matches!(self.phase, PairingPhase::Offering) {
+            return;
+        }
+        if retrying {
+            self.stall_reason = Some(format!("{reason} — retrying…"));
+        } else {
+            self.stall_reason = None;
+            self.fail(format!(
+                "{reason}. Check [remote] relay_url / relay_password in your \
+                 configuration, then try again."
+            ));
+        }
+    }
+
+    /// The transient reason a code has not arrived yet, if the relay handshake
+    /// is currently failing (see [`Self::on_handshake_failed`]).
+    pub fn stall_reason(&self) -> Option<&str> {
+        self.stall_reason.as_deref()
     }
 
     /// The seconds remaining until the token expires, given the current wall
