@@ -27,7 +27,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   palette) since an isolated run is one session with nothing else to switch
   to; Finish/Local Merge, Rebase, and Abandon Worktree are already refused
   for free because the tab runs on the base branch. A permanent `ISOLATED`
-  badge in the status bar and a leading note in the help overlay (`?`) make
+  badge in the status bar and a leading note in the help overlay (`F1` / `Alt-h`) make
   the mode unmistakable. Combining the flag with a subcommand
   (`flightdeck -I doctor`) is a startup error rather than a silent ignore.
   A normal run's status *root* is unchanged (still the worktree), but its
@@ -52,8 +52,6 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   project tab row and git info bar hide and the agents sidebar shrinks to a
   one-glyph strip, giving the agent three more rows and 25 more columns.
   Switching to app mode restores everything.
-
-### Improvements
 
 - **The pairing QR now fits an ordinary terminal window.** A real pairing QR is
   57 columns by 29 rows, and the overlay reserved a fixed 10 rows around it — so
