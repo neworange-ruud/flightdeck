@@ -1,0 +1,69 @@
+name: Web UI
+
+# The browser control surface (specs/WEB_INTERFACE.md D9) is a Vite +
+# TypeScript SPA with its own npm toolchain — a THIRD build surface beside the
+# root `flightdeck` crate and the `remote/` workspace (see
+# .agents/skills/shipping-flightdeck-changes).
+#
+# It needs its own job because the Rust gate cannot catch its failures: a clean
+# checkout carries only the tracked `webui/dist/.gitkeep`, and
+# src/web/assets.rs deliberately degrades to an explanatory page when the SPA
+# is absent. So `cargo test` passes happily against a `webui/` that does not
+# typecheck or whose tests fail, and the breakage would only surface at release
+# time — in a released binary. This job is what closes that gap.
+#
+# Push on main only (post-merge); PRs own feature-branch CI. Running push on
+# `flightdeck/**` too would double every run (push ref vs pull_request ref never
+# share a concurrency group). Same rationale as ci.yml and relay.yml.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "webui/**"
+      - ".github/workflows/webui.yml"
+  pull_request:
+    paths:
+      - "webui/**"
+      - ".github/workflows/webui.yml"
+
+concurrency:
+  group: webui-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: webui
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      # `npm ci` (not `install`) so the lockfile is authoritative here exactly
+      # as it is on the release runners — a job that silently resolved
+      # different versions than the release build would be worse than no job.
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Test
+        run: npm run test
+      # Last, because the Rust build embeds this output: if `npm run build`
+      # cannot produce assets, no released binary can serve the app.
+      - name: Build
+        run: npm run build
+
+  # One OS is enough: this toolchain is Node and TypeScript, with no
+  # OS-specific behaviour. The cross-platform parity requirement in
+  # .agents/skills/flightdeck-cross-platform-parity binds the Rust host code
+  # (paths, PTYs, interface enumeration), not the SPA, which runs in a browser.
+  # The release pipeline does build webui/ on all three runners
+  # (.github/workflows/build-setup.steps), so a genuinely platform-specific npm
+  # failure would still be caught before a release ships.

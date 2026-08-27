@@ -133,6 +133,18 @@ jobs:
       - name: "Enable macOS hardened runtime for codesign"
         if: "runner.os == 'macOS'"
         run: "echo \"CODESIGN_OPTIONS=runtime\" >> \"$GITHUB_ENV\""
+      - name: "Set up Node for the webui build"
+        uses: "actions/setup-node@v4"
+        with:
+          "cache": "npm"
+          "cache-dependency-path": "webui/package-lock.json"
+          "node-version": "22"
+      - name: "Build the webui SPA"
+        run: |
+          cd webui
+          npm ci
+          npm run build
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

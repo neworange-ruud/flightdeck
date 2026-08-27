@@ -6,3 +6,28 @@
   # cargo-dist passes CODESIGN_OPTIONS verbatim to `codesign --options`, so
   # `runtime` enables the hardened runtime on the Developer ID signature.
   run: echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
+
+# The browser control surface (webui/) is a Vite + TypeScript SPA baked into the
+# binary with rust-embed (specs/WEB_INTERFACE.md D9). A clean checkout carries
+# only the tracked `webui/dist/.gitkeep` placeholder, so WITHOUT this step a
+# released binary embeds nothing and serves src/web/assets.rs's "webui was not
+# built" page instead of the control surface. It must therefore run on every
+# release runner — macOS, Linux and Windows — before `dist build`.
+- name: Set up Node for the webui build
+  uses: actions/setup-node@v4
+  with:
+    node-version: "22"
+    cache: npm
+    cache-dependency-path: webui/package-lock.json
+- name: Build the webui SPA
+  # Forced to bash (git-bash on the Windows runner) so one script covers all
+  # three platforms rather than needing a pwsh variant. The `cd` is inline
+  # rather than a `working-directory:` key because cargo-dist's step generator
+  # silently DROPS that key when it inlines these steps into release.yml — the
+  # npm commands would then run at the repo root and fail. Verified by reading
+  # the generated release.yml after `dist generate`.
+  shell: bash
+  run: |
+    cd webui
+    npm ci
+    npm run build
