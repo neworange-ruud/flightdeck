@@ -74,8 +74,8 @@ The PTY stays sized to the desktop TUI's pane. The browser scales the fixed grid
 to its viewport with CSS.
 
 This **revises** an earlier preference for last-active-viewer ownership, because
-of a concrete finding in the code: `sync_selected_tab_sizes` calls
-`resize_if_changed` (`src/lib.rs:5389`) **every frame** for the selected tab, so
+of a concrete finding in the code: `sync_terminal_sizes` calls
+`resize_if_changed` (`src/lib.rs:5387`) **every frame** for the selected tab, so
 any viewer-set geometry would be reverted within one frame unless the render path
 learned to draw a PTY grid that is not its own pane size. Desktop-owns keeps that
 invariant exactly as it is, adds no state, and eliminates SIGWINCH churn.
@@ -500,7 +500,7 @@ deliver — and keeps behaviour identical across platforms, which parity require
   extending (D12).
 - `specs/SPECS.md` §19–§24 — terminal model, layout, git panel, interaction model,
   keyboard modes, status detection.
-- `src/lib.rs:5374-5395` — `resize_sessions` / `resize_if_changed`, the per-frame
+- `src/lib.rs:5387-5405` — `sync_terminal_sizes` / `resize_if_changed`, the per-frame
   geometry invariant behind D4.
 - `src/lib.rs:2637` — the phone-opened-shell geometry precedent that does not
   generalise.

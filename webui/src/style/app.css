@@ -1,0 +1,49 @@
+/*
+ * Base layout. This is scaffold only — the real main screen (artboards
+ * 1a/1b/1c) is remote-control-sk4u. What's here just proves the palette, the
+ * font and a letterboxed xterm.js mount all work end to end.
+ */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--fd-canvas);
+  color: var(--fd-text);
+  font-family: var(--fd-font-mono);
+  font-size: var(--fd-t-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * The terminal mount point. D4 (turn 2): the host's grid renders at its
+ * natural pixel size and is CENTRED on the terminal ground; leftover space
+ * stays dark canvas. Do NOT add `width: 100%` / `height: 100%` here and do
+ * NOT reach for xterm.js's `FitAddon` anywhere in this app — see
+ * src/term/terminal.ts for the long version of why.
+ */
+.fd-term-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--fd-ground);
+}
+
+.fd-term-mount {
+  border: 1px solid var(--fd-rule);
+}

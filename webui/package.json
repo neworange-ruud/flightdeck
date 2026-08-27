@@ -1,0 +1,22 @@
+{
+  "name": "flightdeck-webui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "FlightDeck Web SPA — the browser control surface embedded in the desktop binary via rust-embed (specs/WEB_INTERFACE.md D9). Built with Vite + TypeScript + xterm.js, no framework.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^6.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}

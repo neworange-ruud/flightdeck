@@ -1,0 +1,54 @@
+/*
+ * JetBrains Mono, vendored — not linked from a CDN.
+ *
+ * Why vendored rather than `@import url(https://fonts.googleapis.com/...)`:
+ * this stylesheet ships inside the binary (rust-embed, D9) and must render
+ * correctly with zero network access beyond the initial page load itself —
+ * the whole point of "a release stays a single file". A CDN `@font-face`
+ * would silently fall back to the browser's default monospace font on a
+ * loopback-only or air-gapped host, which is exactly the deployment this
+ * server is built for (D1). A runtime `fetch()` of the font has the same
+ * problem for the LAN case in D5.
+ *
+ * So the three weights the design actually uses (400 body, 500 titles, 700
+ * badges/emphasis — see 2g and 1a's h1) are vendored as static files in
+ * `public/fonts/`, Latin subset only, WOFF2 only (universally supported by
+ * every browser this app targets; the WOFF fallback and the other Unicode
+ * subsets in the upstream @fontsource/jetbrains-mono package are dropped to
+ * keep the embedded binary small — this is a monospace code/log surface, not
+ * a document editor, and D1 already scopes this to operators on one LAN).
+ * License: SIL OFL 1.1, copied verbatim to public/fonts/JETBRAINS-MONO-LICENSE.txt.
+ * Source: https://github.com/JetBrains/JetBrainsMono via
+ * https://www.npmjs.com/package/@fontsource/jetbrains-mono (subsetting only;
+ * the glyphs are unmodified).
+ *
+ * `font-display: swap` is intentionally NOT used here — a flash of a
+ * proportional fallback font on a monospace terminal grid would reflow the
+ * whole layout mid-paint. `font-display: block` gives a short invisible
+ * window instead, which is the safer default for exactly one small local
+ * font file that is almost always already warm in the OS disk cache after
+ * the first load.
+ */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("/fonts/jetbrains-mono-latin-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: block;
+  src: url("/fonts/jetbrains-mono-latin-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("/fonts/jetbrains-mono-latin-700.woff2") format("woff2");
+}

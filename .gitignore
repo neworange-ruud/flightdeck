@@ -25,3 +25,12 @@
 *.p8
 *.p12
 *.mobileprovision
+
+# webui/ — the browser control surface (specs/WEB_INTERFACE.md D9). Built
+# output is embedded into the binary by src/web/assets.rs via `rust-embed`,
+# which requires the folder to exist at Rust *compile* time even before any
+# npm build has run — hence `webui/dist/.gitkeep` stays tracked while
+# everything `npm run build` writes into `webui/dist/` is ignored below.
+/webui/node_modules/
+/webui/dist/*
+!/webui/dist/.gitkeep
