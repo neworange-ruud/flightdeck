@@ -85,6 +85,13 @@ export function reduce(state: AppState, action: AppAction): AppState {
         /** D3: the host's selection wins. A browser that kept its own would be
          * a second source of truth, which is the drift this decision removes. */
         selection: snapshot.selection,
+        /**
+         * D3/D8 (`remote-control-ll5.7`): split view is shared instance state,
+         * so the host's own snapshot is what moves `layout` — never a local
+         * toggle. A `Delta::Selection` does the same thing on a live update;
+         * see `wire/socket.ts`'s `onDelta`.
+         */
+        layout: snapshot.splitView ? "split" : "single",
         geometry: snapshot.geometry,
         viewers: snapshot.viewers,
         latencyMs: snapshot.latencyMs,

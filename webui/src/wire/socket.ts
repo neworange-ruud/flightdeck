@@ -261,6 +261,35 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         }
         return;
       }
+      case "selection": {
+        /**
+         * `Delta::Selection` (D3/D8, `remote-control-ll5.7`): the instance's
+         * shared selection moved, possibly because *this* browser's own
+         * `toggle_split_view` command was applied, possibly because the
+         * desktop (or another browser) moved it. `split_view` is applied
+         * immediately and directly — it is the host's own word on the
+         * matter, not a guess — which is what lets a toggle's effect show up
+         * without waiting on the coalesced resync below.
+         *
+         * The rest of the envelope (`project_id`/`session_id`/`terminal_id`)
+         * is intentionally *not* applied field-by-field here: unlike
+         * `layout`, `AppState.selection` has no "apply this one field" action
+         * for a wire delta, only the browser-initiated `selection/*` actions
+         * (D3, `main.ts`). `requestSnapshotSoon` — the same fallback every
+         * other unhandled delta already takes — reconciles it via a whole
+         * `Snapshot`, so a session/terminal change made elsewhere still
+         * lands, just one coalesced round trip later rather than never.
+         */
+        const splitView = frame.split_view as boolean | undefined;
+        if (splitView !== undefined) {
+          store.dispatch({
+            type: "layout/set",
+            layout: splitView ? "split" : "single",
+          });
+        }
+        requestSnapshotSoon();
+        return;
+      }
       case "activity": {
         /**
          * `Delta::Activity` flattens the same `protocol::ActivityEvent` the

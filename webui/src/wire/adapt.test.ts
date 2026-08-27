@@ -242,6 +242,31 @@ describe("snapshot", () => {
       terminalId: "",
     });
   });
+
+  /** `remote-control-ll5.7`: D3/D8's split-view flag, carried on
+   * `Selection` rather than invented locally. */
+  describe("split_view", () => {
+    it("maps a true flag through", () => {
+      const mapped = snapshotFromWire({
+        ...wire,
+        selection: { ...wire.selection, split_view: true },
+      });
+      expect(mapped.splitView).toBe(true);
+    });
+
+    it("maps a false flag through", () => {
+      const mapped = snapshotFromWire({
+        ...wire,
+        selection: { ...wire.selection, split_view: false },
+      });
+      expect(mapped.splitView).toBe(false);
+    });
+
+    it("defaults to false rather than guessing when the host omits it", () => {
+      const mapped = snapshotFromWire({ ...wire, selection: {} });
+      expect(mapped.splitView).toBe(false);
+    });
+  });
 });
 
 describe("base64", () => {

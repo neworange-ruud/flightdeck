@@ -8,12 +8,13 @@ import type { AppState } from "./types";
  * ## Why this list is short
  *
  * Artboard 1d draws ~8 rows across two groups the design calls `Worktree` and
- * `Git` — `Rebase Worktree`, `Show Git Status`, `Push Branch`, `Toggle Split
- * View`, and so on. None of those are commands this build can actually run:
- * they belong to the dialog family (`remote-control-ll5.3`/`.4`), the git
- * commands task (`.5`) or split-view toggling (`.7`) — each a separate M2 task
- * this one is explicitly told not to build. Protocol v1 today only defines six
- * command names (`src/web/protocol.rs`'s `command` module):
+ * `Git` — `Rebase Worktree`, `Show Git Status`, `Push Branch`, and so on. Most
+ * of those are still not commands this build can actually run: they belong to
+ * the dialog family (`remote-control-ll5.3`/`.4`) or the git commands task
+ * (`.5`), each a separate M2 task this one is explicitly told not to build.
+ * `Toggle Split View` is the one exception — `remote-control-ll5.7` added it,
+ * once `toggle_split_view` existed on the wire (`src/web/protocol.rs`'s
+ * `command` module). Protocol v1 otherwise defines six command names:
  * `select_project`, `select_session`, `select_terminal`,
  * `mark_activity_read`, `request_snapshot`, `release_seat`.
  *
@@ -59,7 +60,17 @@ const GROUP_COLUMN: Readonly<Record<string, 0 | 1>> = {
   Projects: 1,
   Worktree: 1,
   Session: 1,
+  View: 1,
 };
+
+/**
+ * The wire name for split-view toggling (`remote-control-ll5.1`'s
+ * `command::TOGGLE_SPLIT_VIEW`, verified against `src/web/commands.rs` and
+ * `src/web/protocol.rs`). Named once, here, so nothing else in this build
+ * spells it out again — the same convention `state/config.ts`'s
+ * `SAVE_CONFIG_COMMAND` uses for the one other cross-cutting command name.
+ */
+export const TOGGLE_SPLIT_VIEW_COMMAND = "toggle_split_view";
 
 function columnOf(group: string): 0 | 1 {
   return GROUP_COLUMN[group] ?? 1;
@@ -154,6 +165,21 @@ export function buildCommandInventory(
     group: "Session",
     run: { name: "release_seat" },
     annotation: "give up control",
+  });
+
+  /**
+   * Artboard 1c/1d (`remote-control-ll5.7`). D3: split view is shared
+   * instance state, so this is a `Command` like any other row here — the
+   * host applies it (or refuses an observer with `ReadOnly`, D14) and
+   * `AppState.layout` only ever moves from what comes back (`snapshot/received`,
+   * `Delta::Selection`). This row never flips `layout` itself.
+   */
+  commands.push({
+    id: "toggle_split_view",
+    label: "Toggle Split View",
+    group: "View",
+    run: { name: TOGGLE_SPLIT_VIEW_COMMAND },
+    annotation: state.layout === "split" ? "split → single" : "single → split",
   });
 
   const unread = state.activity.filter((event) => !event.read);

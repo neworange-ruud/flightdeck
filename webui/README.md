@@ -134,6 +134,7 @@ is decoration only (key-hint letters, counts, the `│` separator).
 | `Delta::Seats` | `seats/changed` |
 | `Delta::Geometry` | `geometry/set` — xterm is rebuilt at the host's grid (D4) |
 | `Delta::Activity` | `activity/received` |
+| `Delta::Selection` | `layout/set` from its `split_view` (D3/D8, `remote-control-ll5.7`) + a coalesced `request_snapshot` for the rest |
 | every other `Delta` | a coalesced `request_snapshot` command |
 | `ServerMsg::Ack` | `input/acked` |
 | `ErrorCode::SeatHeld` | `takeover/held`, then a re-attach as `observe` (D14) |

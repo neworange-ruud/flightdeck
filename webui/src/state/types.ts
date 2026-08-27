@@ -111,8 +111,10 @@ export interface TerminalGeometry {
 export type UiMode = "terminal" | "app";
 
 /** Single viewport (1a/1b) or the three-column split (1c). Toggling split from
- * the browser is M2 (D8), so nothing in M1 dispatches `layout/set` except
- * tests — the state exists so 1c is a render of state, not a second app. */
+ * the browser was M2 (D8); `remote-control-ll5.7` closes it. `layout/set` is
+ * dispatched from the host's own word on the matter — `snapshot/received`
+ * and a live `Delta::Selection` (`wire/socket.ts`) — never from a click
+ * handler guessing what the toggle did. */
 export type ViewLayout = "single" | "split";
 
 /**
@@ -365,6 +367,10 @@ export type AppAction =
   | { readonly type: "selection/session"; readonly sessionId: string }
   | { readonly type: "selection/terminal"; readonly terminalId: string }
   | { readonly type: "mode/set"; readonly mode: UiMode }
+  /** D3/D8: dispatched from the host's word — `snapshot/received`'s
+   * `splitView` and a live `Delta::Selection` — never from the palette row
+   * that *asks* for a toggle. See `commands.ts`'s `toggle_split_view` entry
+   * and `wire/socket.ts`'s `onDelta`. */
   | { readonly type: "layout/set"; readonly layout: ViewLayout }
   | { readonly type: "split/focus"; readonly column: number }
   /**

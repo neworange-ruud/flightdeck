@@ -254,6 +254,72 @@ describe("outcomes follow the host's Ack, never optimism", () => {
   });
 });
 
+/**
+ * `remote-control-ll5.7`. D3: the toggle is a `Command`, exactly like every
+ * other palette row — clicking it must never flip `state.layout` itself, and
+ * `state.layout` only ever moves once the host's own word arrives
+ * (`snapshot/received`/`Delta::Selection`, see `wire/socket.test.ts` and
+ * `reducer.test.ts` for that half).
+ */
+describe("Toggle Split View (remote-control-ll5.7)", () => {
+  it("is reachable from the palette and runs as a Command, not a local flip", () => {
+    const h = render();
+    expect(h.state().layout).toBe("single");
+    h.key("g", { ctrlKey: true });
+    type(h, "toggle split");
+
+    const row = h.q(".fd-palette__row");
+    expect(row.textContent).toContain("Toggle Split View");
+    row.click();
+
+    expect(h.runCommands).toHaveLength(1);
+    expect(h.runCommands[0]?.run).toEqual({ name: "toggle_split_view" });
+    // Running it does not itself claim anything happened, and it certainly
+    // does not flip the layout before the host has said anything.
+    expect(h.state().layout).toBe("single");
+  });
+
+  it("the layout only moves once the host's Selection says so, not on the Ack", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    h.app.store.dispatch({
+      type: "palette/dispatched",
+      seq: 11,
+      label: "Toggle Split View",
+    });
+    h.app.store.dispatch({ type: "command/result", seq: 11, outcome: "applied" });
+
+    expect(h.text(".fd-palette__status")).toBe("Toggle Split View: done");
+    // The Ack alone is not the host's Selection — layout is untouched.
+    expect(h.state().layout).toBe("single");
+
+    // What the host's own snapshot (or a live Delta::Selection) does.
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    expect(h.state().layout).toBe("split");
+  });
+
+  it("D14: an observer sees the read-only refusal and the layout never moves", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    h.app.store.dispatch({
+      type: "palette/dispatched",
+      seq: 12,
+      label: "Toggle Split View",
+    });
+    h.app.store.dispatch({
+      type: "command/result",
+      seq: 12,
+      outcome: "read_only",
+      detail: "this tab is watching read-only; take over to drive",
+    });
+
+    expect(h.text(".fd-palette__status")).toBe(
+      "Toggle Split View: read-only — this tab is watching read-only; take over to drive",
+    );
+    expect(h.state().layout).toBe("single");
+  });
+});
+
 describe("keyboard navigation", () => {
   it("↑↓ move the highlighted row within a column", () => {
     const h = render();

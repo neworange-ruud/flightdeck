@@ -231,4 +231,70 @@ describe("reduce — the main screen", () => {
     expect(split.layout).toBe("split");
     expect(reduce(split, { type: "split/focus", column: 2 }).splitFocus).toBe(2);
   });
+
+  /**
+   * `remote-control-ll5.7`: split view is shared instance state (D3), so
+   * `AppState.layout` may only ever move from the host's own word — the
+   * snapshot it sent (here) or a live `Delta::Selection`
+   * (`wire/socket.test.ts`). Never from a click handler, never from the
+   * `Ack`/`command/result` a toggle earns (below).
+   */
+  it("snapshot/received sets layout from the host's split_view flag", () => {
+    const withSplit = reduce(createInitialState(), {
+      type: "snapshot/received",
+      snapshot: { ...fixtureSnapshot(), splitView: true },
+    });
+    expect(withSplit.layout).toBe("split");
+
+    const withoutSplit = reduce(createInitialState(), {
+      type: "snapshot/received",
+      snapshot: { ...fixtureSnapshot(), splitView: false },
+    });
+    expect(withoutSplit.layout).toBe("single");
+  });
+
+  it("a toggle_split_view command's Ack never flips layout by itself", () => {
+    const before = loaded();
+    expect(before.layout).toBe("single");
+
+    const palette = {
+      filter: "",
+      column: 0 as const,
+      index: 0,
+      pending: [{ seq: 1, label: "Toggle Split View" }],
+      lastOutcome: null,
+    };
+    const applied = reduce(
+      { ...before, palette },
+      { type: "command/result", seq: 1, outcome: "applied" as const },
+    );
+    expect(applied.layout).toBe("single");
+    expect(applied.palette?.lastOutcome?.outcome).toBe("applied");
+  });
+
+  it("D14: a read-only refusal leaves layout untouched", () => {
+    const before = loaded();
+    const palette = {
+      filter: "",
+      column: 0 as const,
+      index: 0,
+      pending: [{ seq: 2, label: "Toggle Split View" }],
+      lastOutcome: null,
+    };
+    const refused = reduce(
+      { ...before, palette },
+      {
+        type: "command/result",
+        seq: 2,
+        outcome: "read_only" as const,
+        detail: "this tab is watching read-only; take over to drive",
+      },
+    );
+    expect(refused.layout).toBe("single");
+    expect(refused.palette?.lastOutcome).toEqual({
+      label: "Toggle Split View",
+      outcome: "read_only",
+      detail: "this tab is watching read-only; take over to drive",
+    });
+  });
 });

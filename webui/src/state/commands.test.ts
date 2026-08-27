@@ -122,6 +122,36 @@ describe("buildCommandInventory", () => {
     expect(commands.filter((c) => c.group === "Sessions")).toHaveLength(0);
     expect(commands.filter((c) => c.group === "Projects")).toHaveLength(0);
   });
+
+  /**
+   * `remote-control-ll5.7`. This is a real command this build can send today
+   * — unlike the rest of the palette's `View`/`Worktree`/`Git` rows still
+   * blocked on a future task, `toggle_split_view` exists on the wire
+   * (`src/web/protocol.rs`'s `command` module). It carries no args and needs
+   * no selection, so it is offered even before the first snapshot, exactly
+   * like `request_snapshot`/`release_seat`.
+   */
+  it("offers Toggle Split View, with no args, even before the first snapshot", () => {
+    const commands = buildCommandInventory(createInitialState());
+    const toggle = commands.find((c) => c.id === "toggle_split_view");
+    expect(toggle).toBeDefined();
+    expect(toggle?.label).toBe("Toggle Split View");
+    expect(toggle?.run).toEqual({ name: "toggle_split_view" });
+    expect(toggle?.hostOnly).not.toBe(true);
+  });
+
+  it("Toggle Split View's annotation names the direction the toggle would take", () => {
+    const single = { ...stateWithSnapshot(), layout: "single" as const };
+    const split = { ...stateWithSnapshot(), layout: "split" as const };
+    expect(
+      buildCommandInventory(single).find((c) => c.id === "toggle_split_view")
+        ?.annotation,
+    ).toBe("single → split");
+    expect(
+      buildCommandInventory(split).find((c) => c.id === "toggle_split_view")
+        ?.annotation,
+    ).toBe("split → single");
+  });
 });
 
 describe("matchCommand", () => {

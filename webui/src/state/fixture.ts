@@ -334,6 +334,11 @@ export function fixtureSnapshot(): Snapshot {
       sessionId: "s-fix-login-redirect",
       terminalId: "t-agent",
     },
+    /** 1a/1b are drawn single-pane; 1c is reached by dispatching
+     * `layout/set` on top of this fixture (see `mainScreen.test.ts`), not by
+     * this flag — a fixture that started split would draw 1c for every test
+     * that loads it. */
+    splitView: false,
     /** D4: 1a's chip reads `120×34 · host owns geometry`. */
     geometry: { cols: 120, rows: 34 },
     /** 1a drew a count; 2c/2f name the seats instead — see `fixtureSeats`. */

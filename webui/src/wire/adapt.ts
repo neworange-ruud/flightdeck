@@ -259,6 +259,12 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
   return {
     projects,
     selection,
+    /** `remote-control-ll5.7`: `Selection::split_view` is a plain `bool` on
+     * the wire (never absent), but the field is typed optional here because
+     * `WireSelection` itself is a partial shape wherever a host predates the
+     * flag — `?? false` is the same "never invent a fact" fallback the
+     * project/session/terminal ids above already use, just for a bool. */
+    splitView: wire.selection.split_view ?? false,
     geometry: { cols: wire.geometry.cols, rows: wire.geometry.rows },
     /** The chip counts seats, and the desktop is one of them. */
     viewers: wire.seats.length,

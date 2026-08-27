@@ -142,6 +142,16 @@ export interface UpdateInfo {
 export interface Snapshot {
   readonly projects: readonly Project[];
   readonly selection: Selection;
+  /**
+   * D3/D8, `remote-control-ll5.7`: whether the *instance* — desktop included —
+   * is in split view. Kept beside `selection` rather than folded into it,
+   * because `Selection` here is the browser's local click-target shape
+   * (`projectId`/`sessionId`/`terminalId`) and adding a fourth, unrelated flag
+   * to it would ripple through every `selection/*` reducer case that spreads
+   * it. `AppState.layout` (`ViewLayout`) is derived from this exactly once, in
+   * `reduce`'s `snapshot/received` — never guessed at, never flipped locally.
+   */
+  readonly splitView: boolean;
   /** D4: host-owned. The browser letterboxes this; it never negotiates it. */
   readonly geometry: { readonly cols: number; readonly rows: number };
   /**
