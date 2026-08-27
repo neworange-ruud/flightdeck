@@ -93,6 +93,18 @@ export function hostOnlyBadge(): HTMLElement {
 }
 
 /**
+ * One footer keybinding hint, e.g. `Tab` `switch scope` — 1d's and 1f's own
+ * footers are built entirely from these. Shared here rather than duplicated
+ * per overlay, since the two markups are identical down to the class names.
+ */
+export function hint(key: string, label: string): HTMLElement {
+  return el("span", { class: "fd-hint" }, [
+    el("span", { class: "fd-key", text: key }),
+    ` ${label}`,
+  ]);
+}
+
+/**
  * The pulsing glyph 1a draws as `{{ spinner }}`.
  *
  * The frame character is real text content (not a CSS `content:` animation) so

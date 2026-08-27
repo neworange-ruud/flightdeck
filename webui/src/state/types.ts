@@ -16,6 +16,7 @@ import type {
   VersionMismatch,
 } from "./model";
 import { shouldRetry } from "./model";
+import type { ConfigEdit, ConfigScope } from "./config";
 
 /**
  * App-state seam for the web SPA.
@@ -262,6 +263,41 @@ export interface AppState {
   /** Artboard 1d. `null` when the palette is closed — `Ctrl-g` is the only
    * chord that opens it (§5), and it is the only chord the app claims. */
   readonly palette: PaletteState | null;
+
+  /** Artboard 1f (`remote-control-ll5.6`). `null` when the configuration
+   * manager is closed — opened by the palette's "Open Configuration" row. */
+  readonly config: ConfigState | null;
+}
+
+/** A `save_config` command this browser sent and has not heard back about. */
+export interface PendingConfigSave {
+  readonly seq: number;
+}
+
+/** The host's answer to a save, mirroring `PaletteOutcome` — never guessed at
+ * locally (requirement 5 of ll5.6: "the host is the authority"). */
+export interface ConfigOutcome {
+  readonly outcome: "applied" | "rejected" | "ignored" | "read_only";
+  readonly detail: string | null;
+}
+
+/** Artboard 1f's whole overlay state. */
+export interface ConfigState {
+  /** `Tab` switches between these two (SPECS §8's configuration manager). */
+  readonly scope: ConfigScope;
+  /** `↑↓` moves this among `selectableConfigFields()`; `c` acts on it. */
+  readonly selectedKey: string;
+  /**
+   * Local, unsaved edits — keyed by `ConfigField.key`. `s` turns this into a
+   * `save_config` command; a real `applied` `Ack` is what clears it, never
+   * the keypress itself (requirement 5: no optimism). Non-empty is what 1f's
+   * "Unsaved changes" banner renders on.
+   */
+  readonly edits: Readonly<Record<string, ConfigEdit>>;
+  /** Almost always at most one, for the same reason `PaletteState.pending` is
+   * a list: nothing stops a second `s` before the first save's `Ack` lands. */
+  readonly pending: readonly PendingConfigSave[];
+  readonly lastOutcome: ConfigOutcome | null;
 }
 
 export function createInitialState(): AppState {
@@ -303,6 +339,7 @@ export function createInitialState(): AppState {
     retry: null,
     escArmedAt: null,
     palette: null,
+    config: null,
   };
 }
 
@@ -517,12 +554,41 @@ export type AppAction =
    * matches nothing in `state.palette.pending` (the palette was closed and
    * reopened, or this is some other feature's frame) is a no-op — never
    * guessed at, per requirement 4.
+   *
+   * `seq` is one counter shared by every `Command` this tab sends (§5.1), so
+   * this action also settles a config save (`state.config.pending`,
+   * `remote-control-ll5.6`) — the reducer checks both queues rather than the
+   * palette owning the action type outright.
    */
   | {
       readonly type: "command/result";
       readonly seq: number;
       readonly outcome: "applied" | "rejected" | "ignored" | "read_only";
       readonly detail?: string;
+    }
+
+  /* --- Configuration manager (1f, remote-control-ll5.6) ------------------ */
+
+  /** Opened by the palette's "Open Configuration" row. Always opens on
+   * Project scope, matching 1f's own default. */
+  | { readonly type: "config/open" }
+  | { readonly type: "config/close" }
+  /** `Tab`. */
+  | { readonly type: "config/scope" }
+  /** `↑↓`. `delta` is `-1`/`+1`, clamped like the palette's own `move`. */
+  | { readonly type: "config/move"; readonly delta: number }
+  /** A row was clicked directly — same destination as `config/move`, without
+   * requiring the keyboard to get there first. */
+  | { readonly type: "config/select"; readonly key: string }
+  /** `c`: clears the *project* override on the selected field, staged locally
+   * until `s` saves it. A no-op in Global scope, or on a field with nothing to
+   * clear — SPECS §8 ties `c` to a *project* override specifically. */
+  | { readonly type: "config/clear" }
+  /** `s` sent the staged edits as a `save_config` command and the transport
+   * assigned it `seq` — mirrors `palette/dispatched`. */
+  | {
+      readonly type: "config/dispatched";
+      readonly seq: number;
     };
 
 /**

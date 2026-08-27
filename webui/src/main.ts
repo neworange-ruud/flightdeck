@@ -1,6 +1,7 @@
 import { consumeBootstrapCode, windowUrlBar } from "./access/bootstrap";
 import { checkSession, exchangeCode } from "./access/client";
 import type { AccessResult } from "./access/client";
+import { SAVE_CONFIG_COMMAND } from "./state/config";
 import { createApp } from "./ui/app";
 import { mountTerminal } from "./term/terminal";
 import type { Store } from "./ui/store";
@@ -122,6 +123,21 @@ const app = createApp({
       seq,
       label: command.label,
     });
+  },
+  /**
+   * 1f, `remote-control-ll5.6`. `SAVE_CONFIG_COMMAND` is a placeholder —
+   * protocol v1 has no `save_config` command yet (see `state/config.ts`'s
+   * module doc and the ll5.6 task report for the shape `remote-control-ll5.1`
+   * needs to add). Sending it today gets whatever the host does with an
+   * unrecognised command name, and `command/result` renders exactly that —
+   * never a fabricated success.
+   */
+  onSaveConfig: (request) => {
+    if (session === null) {
+      return;
+    }
+    const seq = session.sendCommand(SAVE_CONFIG_COMMAND, request);
+    app.store.dispatch({ type: "config/dispatched", seq });
   },
   onStripAction: (action) => {
     if (action.kind === "reload") {

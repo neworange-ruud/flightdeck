@@ -1,6 +1,7 @@
 import { accessCopy, canSubmit } from "../state/access";
 import { highlightedCommand } from "../state/commands";
 import type { PaletteCommand } from "../state/commands";
+import type { ConfigSaveRequest } from "../state/config";
 import { createInitialState } from "../state/types";
 import type { AppAction, AppState } from "../state/types";
 import type { StripAction } from "../state/connection";
@@ -8,6 +9,7 @@ import type { ActivityEvent } from "../state/model";
 import { createAccessScreen } from "./accessScreen";
 import { createActivityFeed } from "./activityFeed";
 import { createCommandPalette } from "./commandPalette";
+import { createConfigManager } from "./configManager";
 import { createGitBar } from "./gitBar";
 import { createLogoBand } from "./logoBand";
 import { createProjectTabs } from "./projectTabs";
@@ -92,6 +94,14 @@ export interface AppOptions {
    * owns the one network call 2b needs.
    */
   readonly onRunCommand?: (command: PaletteCommand) => void;
+  /**
+   * `s` inside the configuration manager (1f, `remote-control-ll5.6`).
+   * Sending the frame and finding out what happened to it are both outside
+   * this component's remit, same as `onRunCommand` — `main.ts` calls
+   * `SessionSocket.sendCommand(SAVE_CONFIG_COMMAND, request)`, gets back the
+   * seq the transport assigned, and dispatches `config/dispatched` with it.
+   */
+  readonly onSaveConfig?: (request: ConfigSaveRequest) => void;
 }
 
 export interface App {
@@ -138,6 +148,9 @@ export function createApp(options: AppOptions): App {
   const palette = createCommandPalette({
     onRun: (command) => runCommand(command),
   });
+  /** Artboard 1f, `remote-control-ll5.6`. Opened by the palette's "Open
+   * Configuration" row (see `runCommand` below), closed by `Esc`. */
+  const config = createConfigManager(store);
 
   const statusBar = createStatusBar({
     onAction: (action) => options.onStripAction?.(action),
@@ -165,6 +178,7 @@ export function createApp(options: AppOptions): App {
       takeover.el,
       access.el,
       palette.el,
+      config.el,
     ],
   );
 
@@ -184,6 +198,7 @@ export function createApp(options: AppOptions): App {
     takeover,
     access,
     palette,
+    config,
   ];
 
   function render(state: AppState): void {
@@ -274,6 +289,9 @@ export function createApp(options: AppOptions): App {
       return;
     }
     if (state.palette !== null && paletteKey(event, state)) {
+      return;
+    }
+    if (state.config !== null && configKey(event, state)) {
       return;
     }
     if (state.feedOpen && feedKey(event)) {
@@ -471,7 +489,84 @@ export function createApp(options: AppOptions): App {
    * finding out what happened to it are `main.ts`'s job — see
    * `AppOptions.onRunCommand`. */
   function runCommand(command: PaletteCommand): void {
+    /**
+     * "Open Configuration" (1f, `remote-control-ll5.6`) never leaves the
+     * browser — same as `Ctrl-g` opening *this* palette, it is a local UI
+     * toggle, not a `Command` frame. The palette closes as it hands off, so
+     * only one full-screen overlay is ever up at once.
+     */
+    if (command.id === "open_configuration") {
+      store.dispatch({ type: "palette/close" });
+      store.dispatch({ type: "config/open" });
+      return;
+    }
     options.onRunCommand?.(command);
+  }
+
+  /**
+   * 1f: `↑↓` move, `Tab` switch scope, `c` clear a project override, `s`
+   * save, `Esc` close. `e` is claimed and swallowed — the footer's `host
+   * only` badge is the whole story from a browser (D16); there is nothing
+   * for this build to run.
+   */
+  function configKey(event: KeyboardEvent, state: AppState): boolean {
+    if (state.config === null || !isPlain(event)) {
+      return false;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      store.dispatch({ type: "config/close" });
+      return true;
+    }
+    if (event.key === "Tab") {
+      event.preventDefault();
+      store.dispatch({ type: "config/scope" });
+      return true;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      store.dispatch({ type: "config/move", delta: -1 });
+      return true;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      store.dispatch({ type: "config/move", delta: 1 });
+      return true;
+    }
+    if (event.key === "c") {
+      event.preventDefault();
+      store.dispatch({ type: "config/clear" });
+      return true;
+    }
+    if (event.key === "s") {
+      event.preventDefault();
+      saveConfig();
+      return true;
+    }
+    /** Swallow everything else — same posture as the palette and the access
+     * screens: this overlay is the whole keyboard while it is open. */
+    return true;
+  }
+
+  /**
+   * Turns whatever is staged in `state.config.edits` into one `save_config`
+   * command. A no-op with nothing staged: `s` on a config that was never
+   * touched has nothing honest to send, and sending an empty change set would
+   * still cost a round trip to say so.
+   */
+  function saveConfig(): void {
+    const config = store.getState().config;
+    if (config === null) {
+      return;
+    }
+    const changes = Object.entries(config.edits).map(([key, edit]) => ({
+      key,
+      action: edit.kind,
+    }));
+    if (changes.length === 0) {
+      return;
+    }
+    options.onSaveConfig?.({ scope: config.scope, changes });
   }
 
   /** 2e's footer: `a close`. `Esc` closes it too — it is a slide-over, and
@@ -569,7 +664,8 @@ export function createApp(options: AppOptions): App {
       path.includes(feed.el) ||
       path.includes(access.el) ||
       path.includes(takeover.el) ||
-      path.includes(palette.el)
+      path.includes(palette.el) ||
+      path.includes(config.el)
     ) {
       return;
     }

@@ -1,10 +1,11 @@
 import { decideEscape } from "../input/escape";
 import { buildCommandInventory, clampIndex, paletteColumns } from "./commands";
+import { CONFIG_FIELDS, selectableConfigFields } from "./config";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, Selection } from "./model";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
-import type { AppAction, AppState, PaletteState } from "./types";
+import type { AppAction, AppState, ConfigState, PaletteState } from "./types";
 
 /**
  * The one entry point later tasks dispatch through. Pure by construction: no
@@ -492,29 +493,143 @@ export function reduce(state: AppState, action: AppAction): AppState {
     }
 
     case "command/result": {
+      /** One counter, one action, two possible owners (§5.1) — try the
+       * palette first, then the config manager, and touch neither if `seq`
+       * matches nothing in either: a seq that matches nothing pending is
+       * never guessed at (requirement 4), the same rule for both queues. */
       const palette = state.palette;
-      if (palette === null) {
-        return state;
+      const paletteFound = palette?.pending.find(
+        (item) => item.seq === action.seq,
+      );
+      if (palette !== null && paletteFound !== undefined) {
+        return {
+          ...state,
+          palette: {
+            ...palette,
+            pending: palette.pending.filter((item) => item.seq !== action.seq),
+            lastOutcome: {
+              label: paletteFound.label,
+              outcome: action.outcome,
+              detail: action.detail ?? null,
+            },
+          },
+        };
       }
-      const found = palette.pending.find((item) => item.seq === action.seq);
-      /** A seq that matches nothing pending is never guessed at (requirement
-       * 4) — the palette may have been closed and reopened since, or this
-       * frame belongs to a command some other feature sent. */
-      if (found === undefined) {
+
+      const config = state.config;
+      const configFound = config?.pending.find(
+        (item) => item.seq === action.seq,
+      );
+      if (config !== null && configFound !== undefined) {
+        return {
+          ...state,
+          config: {
+            ...config,
+            pending: config.pending.filter((item) => item.seq !== action.seq),
+            /**
+             * Only a real `applied` Ack clears the staged edits — requirement
+             * 5's "never optimism". A `rejected`/`ignored`/`read_only` result
+             * leaves them staged so the user sees exactly what did not make
+             * it and can retry with `s`.
+             */
+            edits: action.outcome === "applied" ? {} : config.edits,
+            lastOutcome: { outcome: action.outcome, detail: action.detail ?? null },
+          },
+        };
+      }
+
+      return state;
+    }
+
+    /* --- Configuration manager (1f) ------------------------------------ */
+
+    case "config/open":
+      return state.config !== null
+        ? state
+        : {
+            ...state,
+            config: {
+              scope: "project",
+              selectedKey: selectableConfigFields()[0]?.key ?? "",
+              edits: {},
+              pending: [],
+              lastOutcome: null,
+            },
+          };
+
+    case "config/close":
+      return state.config === null ? state : { ...state, config: null };
+
+    case "config/scope": {
+      const config = state.config;
+      if (config === null) {
         return state;
       }
       return {
         ...state,
-        palette: {
-          ...palette,
-          pending: palette.pending.filter((item) => item.seq !== action.seq),
-          lastOutcome: {
-            label: found.label,
-            outcome: action.outcome,
-            detail: action.detail ?? null,
-          },
+        config: {
+          ...config,
+          scope: config.scope === "project" ? "global" : "project",
         },
       };
+    }
+
+    case "config/move": {
+      const config = state.config;
+      if (config === null) {
+        return state;
+      }
+      const fields = selectableConfigFields();
+      const currentIndex = fields.findIndex((f) => f.key === config.selectedKey);
+      const nextIndex = clampIndex(
+        (currentIndex === -1 ? 0 : currentIndex) + action.delta,
+        fields.length,
+      );
+      const key = fields[nextIndex]?.key ?? config.selectedKey;
+      return key === config.selectedKey
+        ? state
+        : { ...state, config: { ...config, selectedKey: key } };
+    }
+
+    case "config/select": {
+      const config = state.config;
+      if (config === null || config.selectedKey === action.key) {
+        return state;
+      }
+      return { ...state, config: { ...config, selectedKey: action.key } };
+    }
+
+    case "config/clear": {
+      const config = state.config;
+      /** SPECS §8: `c` clears a *project* override. Global scope, or a field
+       * with no project override to clear, is a no-op rather than a guess at
+       * what else `c` might mean there. */
+      if (config === null || config.scope !== "project") {
+        return state;
+      }
+      const field = CONFIG_FIELDS.find((f) => f.key === config.selectedKey);
+      if (field === undefined || field.hostOnly === true) {
+        return state;
+      }
+      return {
+        ...state,
+        config: {
+          ...config,
+          edits: { ...config.edits, [field.key]: { kind: "clear" } },
+        },
+      };
+    }
+
+    case "config/dispatched": {
+      const config = state.config;
+      if (config === null) {
+        return state;
+      }
+      const pending: ConfigState["pending"] = [
+        ...config.pending,
+        { seq: action.seq },
+      ];
+      return { ...state, config: { ...config, pending } };
     }
 
     default: {

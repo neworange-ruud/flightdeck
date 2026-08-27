@@ -171,6 +171,22 @@ export function buildCommandInventory(
   }
 
   /**
+   * Artboard 1f (`remote-control-ll5.6`). SPECS §8: "command palette → 'Open
+   * Configuration'" is how the manager opens. Unlike every other row here,
+   * `run` is never sent anywhere — `ui/app.ts`'s `runCommand` special-cases
+   * this `id` and dispatches `config/open` locally, the same way `Ctrl-g`
+   * opens *this* palette without a `Command` frame of its own. `run.name`
+   * exists only so this stays a normal `PaletteCommand`; it is never read.
+   */
+  commands.push({
+    id: "open_configuration",
+    label: "Open Configuration",
+    group: "Session",
+    run: { name: "open_configuration" },
+    annotation: "global + project settings",
+  });
+
+  /**
    * D16. `run.name` is a placeholder — protocol v1 has no command by this
    * name yet. See the module doc: `remote-control-ll5.1` owns adding it, and
    * the badge stays visible and honest in the meantime rather than hiding a

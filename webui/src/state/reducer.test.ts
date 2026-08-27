@@ -42,6 +42,7 @@ describe("createInitialState", () => {
       retry: null,
       escArmedAt: null,
       palette: null,
+      config: null,
     });
   });
 });

@@ -977,3 +977,222 @@
 .fd-palette__tagline {
   color: var(--fd-text-decor);
 }
+
+/* ══ 1f — the configuration manager (remote-control-ll5.6) ═══════════════
+ * Same posture as 1d: a layer on `.fd-frame`, opened by the palette's "Open
+ * Configuration" row and never open at the same time as the palette
+ * (`ui/app.ts`'s `runCommand` closes one before opening the other), so the
+ * two share a z-index rather than needing to be ordered against each other. */
+.fd-config {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-config[hidden] {
+  display: none;
+}
+.fd-config__panel {
+  width: min(1040px, calc(100% - 80px));
+  height: min(640px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  font-size: var(--fd-t-body);
+}
+.fd-config__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-config__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-config__hint {
+  color: var(--fd-text-decor);
+}
+.fd-config__scope {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__scopes {
+  display: flex;
+  gap: 1px;
+  background: var(--fd-rule);
+}
+.fd-config__scope-tab {
+  padding: 4px 14px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  color: var(--fd-text-muted);
+  background: var(--fd-ground);
+  cursor: pointer;
+}
+.fd-config__scope-tab[data-active="true"] {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-config__path-label {
+  color: var(--fd-text-decor);
+}
+.fd-config__path {
+  color: var(--fd-text-muted);
+}
+.fd-config__unsaved {
+  color: var(--fd-focus);
+}
+.fd-config__unsaved[hidden] {
+  display: none;
+}
+.fd-config__status {
+  flex: none;
+  padding: 6px 14px;
+  font-size: var(--fd-t-meta);
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-config__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-config__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-config__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: a refused save because this tab is read-only is "still true, not
+ * broken" (2g's `--fd-stale` note), same reasoning as the palette's own
+ * `read_only` status. */
+.fd-config__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-config__columns {
+  flex: none;
+  display: grid;
+  grid-template-columns: 22px 124px 1fr 150px;
+  gap: 12px;
+  padding: 5px 14px;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.fd-config__row {
+  display: grid;
+  grid-template-columns: 22px 124px 1fr 150px;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 14px;
+  color: var(--fd-text-soft);
+  cursor: pointer;
+}
+.fd-config__row[data-host-only="true"] {
+  cursor: default;
+  color: var(--fd-text-decor);
+}
+/* The selected row's wash + left rule, same recipe 1d's selected row and the
+ * main pane's focus glow both use for "this is the one the accent points
+ * at" — a mix of the token, not a new literal. */
+.fd-config__row[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-accent) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-accent);
+}
+.fd-config__row[data-selected="true"] .fd-config__label {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-config__cursor {
+  color: var(--fd-accent);
+}
+/* The value column's colour says what *kind* of value it is, not an
+ * arbitrary swatch per choice — see the ll5.6 task report for why per-choice
+ * colour-matching (1f's mock renders each colour option in the colour it
+ * names) was not reproduced: it would need a name→token table repurposing
+ * status tokens for a second, unrelated meaning, which is exactly what 2g's
+ * "if deleting it would lose a fact" rule warns against. */
+.fd-config__value {
+  color: var(--fd-text-decor);
+}
+.fd-config__value[data-kind="toggle"][data-checked="true"] {
+  color: var(--fd-ok);
+}
+.fd-config__value[data-kind="choice"] {
+  color: var(--fd-accent);
+}
+.fd-config__value[data-kind="text"] {
+  color: var(--fd-text-muted);
+}
+.fd-config__origin[data-origin="set_here"] {
+  color: var(--fd-ok);
+}
+.fd-config__origin[data-origin="global"] {
+  color: var(--fd-info);
+}
+.fd-config__origin[data-origin="default"] {
+  color: var(--fd-text-decor);
+}
+/* Shared by the panel's static relay note and a field's D5 routable-bind
+ * warning — both are a caution, not an error (2g's `--fd-focus` family, the
+ * same one 1f's own mock uses for its note bar). */
+.fd-config__note {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 9px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--fd-focus) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-focus) 5%, transparent);
+  color: color-mix(in srgb, var(--fd-focus) 55%, var(--fd-text-muted));
+  font-size: var(--fd-t-meta);
+}
+.fd-config__note-label {
+  color: var(--fd-focus);
+  font-weight: 700;
+}
+/* A per-field warning sits inline in the row list rather than pinned to the
+ * panel's edge, so it drops the border and indents under the setting label. */
+.fd-config__note--inline {
+  border-top: 0;
+  padding: 4px 14px 8px 158px;
+}
+.fd-config__foot {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid var(--fd-rule-inner);
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+/* `e edit in $EDITOR` (D16): visible, badged, never hidden — same posture as
+ * 1d's host-only rows, just spelled as a footer hint instead of a row tag. */
+.fd-config__editor-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.7;
+}

@@ -7,7 +7,7 @@ import {
   type PaletteGroup,
 } from "../state/commands";
 import type { AppState, PaletteOutcome, PaletteState } from "../state/types";
-import { clear, el, hostOnlyBadge } from "./dom";
+import { clear, el, hint, hostOnlyBadge } from "./dom";
 import type { Region } from "./dom";
 
 /**
@@ -81,9 +81,9 @@ export function createCommandPalette(
       status,
       el("div", { class: "fd-palette__body" }, [columnEls[0], columnEls[1]]),
       el("div", { class: "fd-palette__foot" }, [
-        foothint("↑↓", "move"),
-        foothint("Tab", "next column"),
-        foothint("Enter", "run"),
+        hint("↑↓", "move"),
+        hint("Tab", "next column"),
+        hint("Enter", "run"),
         el("div", { class: "fd-spacer" }),
         el("span", {
           class: "fd-palette__tagline",
@@ -220,11 +220,4 @@ function rowTag(command: PaletteCommand, selected: boolean): HTMLElement | null 
     return el("span", { class: "fd-palette__annotation", text: command.annotation });
   }
   return null;
-}
-
-function foothint(key: string, label: string): HTMLElement {
-  return el("span", { class: "fd-hint" }, [
-    el("span", { class: "fd-key", text: key }),
-    ` ${label}`,
-  ]);
 }
