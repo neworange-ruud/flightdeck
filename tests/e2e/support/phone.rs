@@ -12,11 +12,12 @@
 //!
 //! The relay's own `remote/relay/tests/support/mod.rs::TestClient` speaks the
 //! identical handshake, but it lives in the separate `remote/` Cargo workspace
-//! and is built on **async** `tokio-tungstenite`. The root `flightdeck` crate
-//! (which owns this test target) deliberately uses **blocking** `tungstenite`
-//! and has no async runtime (see the `Cargo.toml` note on the `tungstenite`
-//! dep). So this driver cannot reuse `TestClient` directly — it re-implements
-//! the same frame sequence synchronously. The mirrored `TestClient` methods are
+//! and is built on **async** `tokio-tungstenite`, whose types are not the same
+//! instances as this workspace's. This driver therefore re-implements the same
+//! frame sequence over the **blocking** `tungstenite` server/client (a
+//! dev-dependency of the root crate, see its `Cargo.toml` note), which also
+//! keeps the harness independent of the runtime and `select!` machinery the
+//! desktop client under test now uses. The mirrored `TestClient` methods are
 //! called out at each step below.
 //!
 //! # Handshake (phone role), mirroring `TestClient`
@@ -144,7 +145,7 @@ impl Conn {
     fn send(&mut self, frame: &RelayFrame) {
         let json = serde_json::to_string(frame).expect("relay frame serializes");
         self.ws
-            .send(Message::Text(json))
+            .send(Message::Text(json.into()))
             .unwrap_or_else(|e| panic!("send {frame:?}: {e}"));
     }
 
@@ -156,7 +157,7 @@ impl Conn {
         loop {
             match self.ws.read() {
                 Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<RelayFrame>(&text) {
+                    match serde_json::from_str::<RelayFrame>(text.as_str()) {
                         // Relay-plane background chatter that is never an answer
                         // to a handshake step or an application message.
                         Ok(RelayFrame::PeerPresence { .. }) | Ok(RelayFrame::Pong { .. }) => {}
@@ -166,7 +167,7 @@ impl Conn {
                 }
                 Ok(Message::Close(_)) => panic!("relay closed the connection mid-session"),
                 // Control / binary / raw frames: ignore (tungstenite auto-pongs
-                // pings). Catch-all mirrors `src/remote/client.rs::read_frame`.
+                // pings). Catch-all mirrors `src/remote/client.rs::read_next`.
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(

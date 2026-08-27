@@ -1,36 +1,100 @@
-//! The relay connection thread.
+//! The relay connection task.
 //!
-//! A single detached `std::thread` owns a **blocking** [`tungstenite`] WebSocket
-//! and runs the full client-side relay-plane state machine:
+//! One [`tokio`] task owns an **async** [`tokio_tungstenite`] WebSocket and runs
+//! the full client-side relay-plane state machine. It runs on the process's
+//! single shared runtime ([`crate::remote::runtime`]) — the same runtime
+//! `src/web/server.rs` (axum) spawns onto — so the desktop has exactly one async
+//! runtime and one set of I/O idioms for both remote transports
+//! (`specs/WEB_INTERFACE.md` D6).
 //!
 //! ```text
-//! connect → hello → auth_challenge → auth_response → auth_ok
-//!         → resume (per pairing, from the last held seq)
-//!         → pump: drain outbound / read inbound / periodic ping
+//!   supervisor (one task, restarted sessions, backoff 1s..60s + jitter)
+//!   │
+//!   ├─▶ connect ──▶ hello ──▶ hello_ok ──▶ auth_challenge
+//!   │                                        │
+//!   │             (returning desktop)        │        (fresh desktop)
+//!   │            persisted pairing ids       │      no pairings yet: wait
+//!   │                    │                   │      ≤1s for the app's
+//!   │                    ▼                   ▼      RequestPairing, then
+//!   │              auth_response ◀──── pairing_offer ──▶ pairing_offer_ok
+//!   │                    │
+//!   │                    ▼
+//!   │                 auth_ok ──▶ resume(pairing, from last held seq) …
+//!   │                    │
+//!   │                    ▼
+//!   │   ┌── pump: one `tokio::select!` per event ───────────────────┐
+//!   │   │  stop signal ....... Bye + close, do not reconnect       │
+//!   │   │  liveness elapsed .. tear down a half-open socket        │
+//!   │   │  outbound channel .. envelope / ack / offer / unpair      │
+//!   │   │  inbound frame ..... envelope, ack, pong, presence, …    │
+//!   │   │  ping tick ......... latency probe every 20 s            │
+//!   │   │  flush tick ........ debounced cursor persist            │
+//!   │   └──────────────────────────────────────────────────────────┘
+//!   │                    │
+//!   └────── session ended ┘  (backoff, then reconnect)
 //! ```
 //!
-//! On any drop or fatal frame it reports [`RemoteLinkState::Disconnected`] and
-//! reconnects with exponential backoff + jitter (1s..60s). It has no async
-//! runtime — deliberately, because the TUI is synchronous.
+//! ## What the tokio port changed, and what it deliberately did not
 //!
-//! ## Non-blocking reads without async
+//! The **public surface is unchanged**: [`RemoteHandle::start`] still takes a
+//! `std::sync::mpsc` pair, [`RemoteHandle::stop`] still blocks briefly until the
+//! link is down, and the TUI event loop stays fully synchronous — it never sees
+//! a future. `src/lib.rs` did not change for this port.
 //!
-//! The socket's underlying `TcpStream` gets a ~100 ms `SO_RCVTIMEO`. A read that
-//! finds no data returns `WouldBlock`/`TimedOut`, which the pump treats as "idle
-//! this tick" — so the same loop can also drain the outbound channel and fire
-//! pings roughly every 100 ms, and notice [`RemoteHandle::stop`] promptly. The
-//! timeout is set on a `try_clone`d handle *after* the (blocking) handshake, so
-//! the upgrade itself is never cut short. tungstenite buffers partial frames, so
-//! a mid-frame timeout resumes cleanly on the next read.
+//! What went away is the machinery that *substituted* for async. The old client
+//! was a blocking `std::thread` that set a ~100 ms `SO_RCVTIMEO` on the TCP
+//! socket so a read could time out, letting one loop also drain the outbound
+//! channel, fire pings and notice `stop()`. That trick cost a per-platform
+//! `set_read_timeout` walk over every `MaybeTlsStream` variant (a wildcard arm
+//! there silently left the pump reading at the 10 s handshake timeout — the
+//! Windows bug in remote-control-2jy), and it woke the thread ten times a second
+//! forever. Every one of those wakeups is now an event in the pump's
+//! `tokio::select!`, so the task sleeps until something actually happens.
+//!
+//! Where each behaviour moved:
+//!
+//! | Behaviour | Was | Now |
+//! | --- | --- | --- |
+//! | non-blocking reads | `SO_RCVTIMEO` + `WouldBlock` = idle | `select!` on `stream.next()` |
+//! | prompt `stop()` | `AtomicBool` polled every ~100 ms | [`watch`] channel, a `select!` branch |
+//! | ping every 20 s | `last_ping.elapsed()` per tick | `PING_INTERVAL` `interval` tick |
+//! | liveness deadline | `last_inbound.elapsed()` per tick | a pinned `Sleep`, reset on each frame |
+//! | wedged writes | `SO_SNDTIMEO` | `WRITE_TIMEOUT` around every `send` |
+//! | debounced cursor persist | `maybe_flush` per tick | `maybe_flush` per event + a flush tick |
+//! | backoff sleep | `interruptible_sleep` poll loop | `select!` on `sleep` vs. stop |
+//!
+//! Unchanged by design: the session state machine and every fault it handles
+//! (backoff-reset stability, resume-from-last-held-seq, auth-rejection
+//! self-heal, seq realign/resync, superseded-pairing retirement, terminal
+//! version-incompatible), the persistence seam, and the wire frames.
+//!
+//! ## Crossing the sync/async boundary
+//!
+//! Two adapters, both local to this module, keep the public channel types as
+//! they were:
+//!
+//! * **app → task**: a small named thread blocks on the `std::sync::mpsc`
+//!   receiver and forwards into an unbounded tokio channel the session can
+//!   `select!` on. See `RemoteHandle::start_tuned`.
+//! * **task → app**: `InboundTx`, a `Mutex` around the `std::sync::mpsc`
+//!   sender. `Sender` is `Send` but deliberately not `Sync`, so a `&Sender`
+//!   held across an `.await` would make the session future non-`Send` and
+//!   therefore unspawnable on a multi-thread runtime.
 
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tungstenite::{Message, WebSocket};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
+use tokio::time::{interval_at, sleep, sleep_until, timeout, Instant as Deadline};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::contracts::real::RealFs;
 use crate::contracts::RemoteConfig;
@@ -44,13 +108,15 @@ use flightdeck_remote_protocol::{DeviceId, PairingId, Role, PROTOCOL_VERSION};
 
 // --- Tuning constants ------------------------------------------------------
 
-/// How long a read blocks before yielding so the pump can also send/stop.
-const READ_POLL: Duration = Duration::from_millis(100);
-/// Generous timeout for the (blocking) TCP+TLS+WebSocket upgrade.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on a blocking connect so `stop()` is never delayed for long.
+/// Bound on the TCP connect (including DNS) so `stop()` is never delayed long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Write timeout so a wedged socket surfaces as an error, not a hang.
+/// Generous timeout for the TLS + WebSocket upgrade, which follows the connect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Write timeout so a wedged socket surfaces as an error, not a hang. In the
+/// blocking client this was `SO_SNDTIMEO` on the TCP socket; async writes have no
+/// such knob, and an `await` that never completes would also park the pump's
+/// `select!` — starving the very liveness deadline meant to catch a dead link —
+/// so every send is wrapped in this timeout instead.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Latency-probe interval.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -58,9 +124,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// (Pong, Envelope, Ack — anything) arrives for this long. A half-open socket
 /// (laptop sleep/wake, wifi↔cell handoff, relay redeploy, NAT idle-reap) stays
 /// "open" with the tiny pings sitting in the kernel send buffer, so
-/// [`WRITE_TIMEOUT`] never trips and idle reads loop forever — without this the
-/// dead link is never noticed (remote-control-0ef.1). Coordinated with the
-/// relay's own server-side idle sweep (both 60s) and a multiple of
+/// [`WRITE_TIMEOUT`] never trips and the socket never yields a read — without
+/// this the dead link is never noticed (remote-control-0ef.1). Coordinated with
+/// the relay's own server-side idle sweep (both 60s) and a multiple of
 /// [`PING_INTERVAL`] so a couple of lost pongs don't cause a spurious teardown.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Minimum time a session must stay authenticated before a clean drop is allowed
@@ -75,11 +141,17 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(15);
 /// `auth_challenge` for the app's pending `RequestPairing` to arrive on the
 /// outbound channel, so it can offer during the pre-auth window (see
 /// [`run_session`]). This closes the startup race where the app loop enqueues
-/// the pairing bootstrap a beat after the session thread connects. If nothing
+/// the pairing bootstrap a beat after the session task connects. If nothing
 /// arrives in time the client falls back to a plain (offer-less) auth, so a
 /// desktop with nothing to offer is never stranded. Kept well under
 /// [`AUTH_DEADLINE`].
 const PENDING_OFFER_WAIT: Duration = Duration::from_secs(1);
+/// How long [`RemoteHandle::stop`] waits for the task to send its `Bye` and
+/// close the socket. The blocking client joined its thread unbounded; a bound is
+/// safer here because the caller is the TUI thread on its way out, and every
+/// teardown step the task still has to take is itself capped by
+/// [`WRITE_TIMEOUT`].
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Backoff floor (first retry) in milliseconds.
 const BACKOFF_BASE_MS: u64 = 1_000;
@@ -100,6 +172,13 @@ const BACKOFF_CAP_MS: u64 = 60_000;
 /// redelivery already tolerates (a rewound outbound cursor self-heals via the
 /// `seq_violation` resync, remote-control-bbf).
 const CURSOR_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Floor for the pump's flush tick. The blocking pump re-checked the gate on
+/// every ~100 ms poll, so an idle-but-dirty gate always reached disk; an async
+/// pump has no idle ticks, so it schedules one explicitly. A floor is required
+/// because `tokio::time::interval` panics on a zero period, and tests set
+/// [`ClientTuning::cursor_flush_interval`] to zero to disable the debounce.
+const CURSOR_FLUSH_TICK_FLOOR: Duration = Duration::from_millis(25);
 
 /// How many *consecutive* auth rejections of a persisted pairing (the relay
 /// answering our auth-first `auth_response` with `auth_failed`/`unknown_pairing`)
@@ -130,7 +209,7 @@ struct ClientTuning {
     /// other tests running in the same process.
     fail_next_envelope_writes: Arc<AtomicU32>,
     /// See [`CURSOR_FLUSH_INTERVAL`]. Tests that assert a debounced cursor has
-    /// reached the store set this to [`Duration::ZERO`] so every pump tick
+    /// reached the store set this to [`Duration::ZERO`] so every pump event
     /// flushes a dirty gate immediately; production uses the real interval.
     cursor_flush_interval: Duration,
 }
@@ -192,7 +271,17 @@ pub enum RemoteLinkState {
 /// Where the client loads/saves its [`RemoteState`] (pairings + cursors). The
 /// production impl uses the real `~/.flightdeck/remote.json`; tests inject an
 /// in-memory store.
-pub trait RemoteStore: Send {
+///
+/// `Sync` is required (on top of `Send`) because the session holds a
+/// `&dyn RemoteStore` across `.await` points, and a future is only `Send` — and
+/// so only spawnable on the shared multi-thread runtime — if the references it
+/// holds are. Every implementation in the tree already satisfies it.
+///
+/// The two methods stay **synchronous**, so a save is a blocking file write on a
+/// runtime worker. That is deliberate: the writes are small, already coalesced
+/// by `CursorFlushGate`, and keeping the trait sync is what lets tests
+/// implement it with a plain `Mutex`.
+pub trait RemoteStore: Send + Sync {
     /// Load the current state (or a default on any error).
     fn load(&self) -> RemoteState;
     /// Persist the state (best-effort; errors are swallowed).
@@ -233,13 +322,50 @@ impl RemoteStore for FileRemoteStore {
     }
 }
 
+// --- task → app channel ----------------------------------------------------
+
+/// The app-bound `std::sync::mpsc::Sender`, wrapped so the session task can hold
+/// a shared reference to it across `.await` points.
+///
+/// `Sender<T>` is `Send` but deliberately **not** `Sync`, so a `&Sender` living
+/// inside a future makes that future non-`Send` — and a non-`Send` future cannot
+/// be spawned on the shared multi-thread runtime. The public API must keep
+/// handing the TUI a plain `std::sync::mpsc` pair (nothing in `src/lib.rs`
+/// changes), so the fix is local and cheap: one `Mutex` whose only user is this
+/// task, never held across an await, and never contended.
+struct InboundTx(std::sync::Mutex<Sender<RemoteInbound>>);
+
+impl InboundTx {
+    fn new(tx: Sender<RemoteInbound>) -> Self {
+        InboundTx(std::sync::Mutex::new(tx))
+    }
+
+    /// Best-effort send; a closed channel (the app is gone) is ignored, exactly
+    /// as every `let _ = tx.send(..)` in the blocking client was.
+    fn send(&self, msg: RemoteInbound) {
+        if let Ok(tx) = self.0.lock() {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
 // --- Handle ----------------------------------------------------------------
 
 /// A running relay client. Dropping it (or calling [`Self::stop`]) tears the
-/// connection thread down.
+/// connection down: the stop [`watch`] sender is dropped, which the session task
+/// observes as a shutdown request.
+///
+/// The handle owns no runtime — the runtime is process-wide and shared with the
+/// web server ([`crate::remote::runtime`]), so stopping the relay client must
+/// never shut a runtime down under the other consumer.
 pub struct RemoteHandle {
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    /// Dropped or set to `true` to request shutdown. `None` when no task was
+    /// started (no runtime available), which makes [`Self::stop`] a no-op.
+    stop: Option<watch::Sender<bool>>,
+    /// Held by the task for its lifetime; when the task ends the sender drops and
+    /// this receiver reports `Disconnected`, which is how [`Self::stop`] waits
+    /// for the socket to be closed without needing a runtime context.
+    done: Option<Receiver<()>>,
 }
 
 impl RemoteHandle {
@@ -288,39 +414,83 @@ impl RemoteHandle {
         outbound_rx: Receiver<RemoteOutbound>,
         tuning: ClientTuning,
     ) -> RemoteHandle {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = Arc::clone(&stop);
-        let join = std::thread::Builder::new()
-            .name("flightdeck-remote".to_string())
-            .spawn(move || {
-                run(
-                    cfg,
-                    identity,
-                    store,
-                    inbound_tx,
-                    outbound_rx,
-                    stop_thread,
-                    tuning,
-                );
-            })
-            .ok();
-        RemoteHandle { stop, join }
-    }
+        // No runtime means no relay client — and no panic. This mirrors the
+        // blocking client, which returned a handle with no `JoinHandle` when
+        // `std::thread::spawn` failed: the app runs exactly as before, minus
+        // FlightDeck Remote.
+        let Some(runtime) = crate::remote::runtime::try_shared() else {
+            crate::remote::debuglog::log("client START skipped — no async runtime");
+            return RemoteHandle {
+                stop: None,
+                done: None,
+            };
+        };
 
-    /// Signal the thread to shut down and wait for it to finish.
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        // app → task. The app keeps its plain `std::sync::mpsc::Sender`; a small
+        // named thread blocks on the receiving end and forwards into a tokio
+        // channel the session can `select!` on. Blocking `recv()` (rather than a
+        // polling `recv_timeout`) is the point: the thread parks with zero
+        // wakeups until the app actually sends something. It exits when the app
+        // drops its sender (shutdown) or when the session task has gone away and
+        // the forward fails, so it holds nothing open past the app's lifetime.
+        let (async_out_tx, async_out_rx) = unbounded_channel::<RemoteOutbound>();
+        let forwarder = std::thread::Builder::new()
+            .name("flightdeck-remote-outbound".to_string())
+            .spawn(move || {
+                while let Ok(msg) = outbound_rx.recv() {
+                    if async_out_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        if forwarder.is_err() {
+            crate::remote::debuglog::log("client START failed — no outbound forwarder thread");
+            return RemoteHandle {
+                stop: None,
+                done: None,
+            };
+        }
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn(async move {
+            // Owned by the task: dropped when it returns, which is what unblocks
+            // `stop()`. Never sent on — its drop is the signal.
+            let _done = done_tx;
+            run(
+                cfg,
+                identity,
+                store,
+                InboundTx::new(inbound_tx),
+                async_out_rx,
+                stop_rx,
+                tuning,
+            )
+            .await;
+        });
+        RemoteHandle {
+            stop: Some(stop_tx),
+            done: Some(done_rx),
         }
     }
-}
 
-impl Drop for RemoteHandle {
-    fn drop(&mut self) {
-        // If stop() was not called, at least signal the thread so it winds down
-        // rather than holding the socket open past app exit.
-        self.stop.store(true, Ordering::Relaxed);
+    /// Signal the task to shut down and wait (briefly) for it to finish, so the
+    /// socket is closed and the relay has seen our `Bye` before the process exits.
+    ///
+    /// Callable from any thread — including from inside an async context, which
+    /// is why it waits on a plain channel rather than `Handle::block_on` (that
+    /// panics when called from within a runtime).
+    pub fn stop(mut self) {
+        // Dropping the watch sender is itself a shutdown signal, so a failed
+        // `send` (no receivers left — the task already ended) is fine.
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(done) = self.done.take() {
+            // `Err` = the task's `done_tx` dropped (it finished) or the grace
+            // period elapsed; either way there is nothing left to wait for.
+            let _ = done.recv_timeout(STOP_GRACE);
+        }
     }
 }
 
@@ -370,121 +540,112 @@ fn client_info() -> ClientInfo {
     }
 }
 
-// --- Socket abstraction (plain ws + wss) -----------------------------------
+// --- Shutdown signalling ---------------------------------------------------
+
+/// Resolve as soon as shutdown has been requested — either explicitly, or by the
+/// [`RemoteHandle`] being dropped (which drops the sender).
+///
+/// Cancel-safe: `watch::Receiver::changed` may be dropped and re-created freely,
+/// so this can sit in a `select!` that another branch wins, as often as needed.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            // The handle was dropped without `stop()`; wind down anyway rather
+            // than holding the socket open past app exit.
+            return;
+        }
+    }
+}
+
+/// Non-awaiting check, for the supervisor's loop conditions.
+fn stop_requested(stop: &watch::Receiver<bool>) -> bool {
+    *stop.borrow()
+}
+
+// --- Socket ----------------------------------------------------------------
 
 /// A connected relay socket. `wss` works on every platform, but through a
 /// different TLS backend per target: rustls off Windows, SChannel (via
 /// `native-tls`) on Windows, where rustls' aws-lc dependency would cost the
-/// release runner a C toolchain. See the two tungstenite entries in Cargo.toml.
-enum RelaySocket {
-    Plain(Box<WebSocket<TcpStream>>),
-    Tls(Box<WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>>),
-}
+/// release runner a C toolchain. See the two tokio-tungstenite entries in
+/// Cargo.toml.
+///
+/// Unlike the blocking client this is a single concrete type rather than a
+/// plain/TLS enum: `MaybeTlsStream` already implements `AsyncRead`/`AsyncWrite`
+/// for every backend, so nothing here has to know which one it got. That also
+/// retires the per-variant `set_read_timeout` walk the blocking pump needed —
+/// the source of remote-control-2jy's Windows bug, where the catch-all arm
+/// silently left the pump reading at the handshake timeout.
+type RelaySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-impl RelaySocket {
-    // tungstenite's `Error` is a deliberately large enum; propagating its
-    // `Result` here is unavoidable, so silence `result_large_err`.
-    #[allow(clippy::result_large_err)]
-    fn read(&mut self) -> tungstenite::Result<Message> {
-        match self {
-            RelaySocket::Plain(ws) => ws.read(),
-            RelaySocket::Tls(ws) => ws.read(),
-        }
-    }
+/// The write half. Split from the read half so the pump can `select!` on
+/// incoming frames while its handlers write acks, resumes and pings.
+type RelaySink = SplitSink<RelaySocket, Message>;
+/// The read half.
+type RelayRx = SplitStream<RelaySocket>;
 
-    #[allow(clippy::result_large_err)]
-    fn send(&mut self, msg: Message) -> tungstenite::Result<()> {
-        match self {
-            RelaySocket::Plain(ws) => ws.send(msg),
-            RelaySocket::Tls(ws) => ws.send(msg),
-        }
-    }
-
-    fn close(&mut self) {
-        match self {
-            RelaySocket::Plain(ws) => {
-                let _ = ws.close(None);
-            }
-            RelaySocket::Tls(ws) => {
-                let _ = ws.close(None);
-            }
-        }
-    }
-
-    /// Set the read timeout on the *actual* TCP socket tungstenite reads from.
-    ///
-    /// This must go through the live stream handle rather than a `try_clone()`d
-    /// descriptor: `SO_RCVTIMEO` is shared across dup'd descriptors on Unix but
-    /// not across a Windows `WSADuplicateSocket` handle, so retiming a clone left
-    /// the pump reading at the 10s handshake timeout on Windows — making dropped
-    /// connections take ~10s to notice and reconnects miss their deadline.
-    fn set_read_timeout(&self, dur: Duration) {
-        use tungstenite::stream::MaybeTlsStream;
-        let _ = match self {
-            RelaySocket::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
-            // Every backend variant is spelled out on purpose. A catch-all arm
-            // here silently no-ops for whichever backend it swallows, leaving
-            // the pump reading at the handshake timeout — the exact bug the
-            // doc comment above describes, but invisible instead of loud.
-            RelaySocket::Tls(ws) => match ws.get_ref() {
-                MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(dur)),
-                #[cfg(not(windows))]
-                MaybeTlsStream::Rustls(s) => s.sock.set_read_timeout(Some(dur)),
-                #[cfg(windows)]
-                MaybeTlsStream::NativeTls(s) => s.get_ref().set_read_timeout(Some(dur)),
-                // `MaybeTlsStream` is `#[non_exhaustive]`, so a wildcard is
-                // required even with both known variants covered.
-                _ => Ok(()),
-            },
-        };
-    }
-}
-
-/// Serialize a relay frame and write it as a WebSocket text message.
-#[allow(clippy::result_large_err)]
-fn send_frame(sock: &mut RelaySocket, frame: &RelayFrame) -> tungstenite::Result<()> {
+/// Serialize a relay frame and write it as a WebSocket text message, bounded by
+/// [`WRITE_TIMEOUT`] so a wedged socket cannot park the pump forever.
+async fn send_frame(sink: &mut RelaySink, frame: &RelayFrame) -> Result<(), String> {
     let json = serde_json::to_string(frame).expect("relay frame serializes");
-    sock.send(Message::Text(json))
+    match timeout(WRITE_TIMEOUT, sink.send(Message::Text(json.into()))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("write failed: {e}")),
+        Err(_) => Err(format!(
+            "write timed out after {}s",
+            WRITE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
-/// The outcome of one read attempt on the socket.
+/// Send the WebSocket close frame, best-effort and bounded.
+async fn close(sink: &mut RelaySink) {
+    let _ = timeout(WRITE_TIMEOUT, sink.close()).await;
+}
+
+/// The outcome of one read on the socket.
 enum Incoming {
     /// A parsed relay frame.
     Frame(Box<RelayFrame>),
-    /// No data within the poll timeout (or a control frame we ignore).
-    Idle,
+    /// A message we do not act on: malformed/unknown text, or a binary/ping/pong
+    /// control frame (tungstenite answers WebSocket pings itself).
+    Ignored,
     /// The socket closed or errored — the connection is over.
     Closed,
 }
 
-fn is_would_block(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
-/// Read one frame with the pump's poll timeout. Unknown/malformed text and
-/// control frames are reported as [`Incoming::Idle`] so the pump keeps going.
-fn read_frame(sock: &mut RelaySocket) -> Incoming {
-    match sock.read() {
-        Ok(Message::Text(s)) => match serde_json::from_str::<RelayFrame>(&s) {
+/// Await the next message and classify it. Unknown/malformed text and control
+/// frames are reported as [`Incoming::Ignored`] so the session keeps going.
+///
+/// Cancel-safe: the framing state lives in the `WebSocketStream`, so dropping
+/// this future mid-frame (a `select!` another branch won) resumes cleanly on the
+/// next call — the same property the blocking client relied on when a
+/// `SO_RCVTIMEO` read timed out mid-frame.
+async fn read_next(stream: &mut RelayRx) -> Incoming {
+    match stream.next().await {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<RelayFrame>(text.as_str()) {
             Ok(frame) => Incoming::Frame(Box::new(frame)),
-            Err(_) => Incoming::Idle,
+            Err(_) => Incoming::Ignored,
         },
-        Ok(Message::Close(_)) => Incoming::Closed,
-        Ok(_) => Incoming::Idle, // binary/ping/pong/raw — ignore (auto-pong handled)
-        Err(tungstenite::Error::Io(e)) if is_would_block(&e) => Incoming::Idle,
-        Err(_) => Incoming::Closed,
+        Some(Ok(Message::Close(_))) => Incoming::Closed,
+        Some(Ok(_)) => Incoming::Ignored,
+        Some(Err(_)) => Incoming::Closed,
+        // The stream ended.
+        None => Incoming::Closed,
     }
 }
 
 // --- Connect ---------------------------------------------------------------
 
-/// Resolve and open the relay socket, performing the (blocking) WebSocket
-/// upgrade, then tighten the read timeout for the pump loop.
-fn connect(url: &str) -> Result<RelaySocket, String> {
-    use tungstenite::client::IntoClientRequest;
+/// Resolve and open the relay socket: TCP connect, then the TLS + WebSocket
+/// upgrade. Both phases are bounded and reported separately, so an unreachable
+/// relay never looks like a TLS fault (and vice versa) in the message that
+/// reaches the pairing overlay.
+async fn connect(url: &str) -> Result<RelaySocket, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let request = url
         .into_client_request()
@@ -500,37 +661,40 @@ fn connect(url: &str) -> Result<RelaySocket, String> {
         .to_string();
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
 
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("dns resolution failed: {e}"))?
-        .next()
-        .ok_or_else(|| "relay host resolved to no address".to_string())?;
-
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("tcp connect failed: {e}"))?;
-    // Generous read timeout for the (blocking) WebSocket upgrade; tightened to
-    // the pump's poll cadence on the live socket once the handshake completes.
-    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
-    tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-
-    let sock = if secure {
-        // Same call on every platform: with exactly one TLS backend enabled for
-        // this target, `client_tls`'s no-connector path picks it up and hands
-        // back the matching `MaybeTlsStream` variant.
-        let (ws, _resp) =
-            tungstenite::client_tls(request, tcp).map_err(|e| format!("tls upgrade: {e}"))?;
-        RelaySocket::Tls(Box::new(ws))
-    } else {
-        let (ws, _resp) =
-            tungstenite::client(request, tcp).map_err(|e| format!("ws upgrade: {e}"))?;
-        RelaySocket::Plain(Box::new(ws))
+    // tokio resolves the host on its blocking pool, so DNS shares the connect
+    // budget instead of blocking a runtime worker.
+    let tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => return Err(format!("tcp connect failed: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "tcp connect timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        }
     };
 
-    sock.set_read_timeout(READ_POLL);
-    Ok(sock)
+    // Same call on every platform: with exactly one TLS backend enabled for this
+    // target, `client_async_tls`'s no-connector path picks it up and hands back
+    // the matching `MaybeTlsStream` variant. A `ws://` url takes the plain path
+    // through the same call.
+    let phase = if secure { "tls" } else { "ws" };
+    match timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::client_async_tls(request, tcp),
+    )
+    .await
+    {
+        Ok(Ok((sock, _resp))) => Ok(sock),
+        Ok(Err(e)) => Err(format!("{phase} upgrade: {e}")),
+        Err(_) => Err(format!(
+            "{phase} upgrade timed out after {}s",
+            HANDSHAKE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
-// --- The thread body -------------------------------------------------------
+// --- The task body ---------------------------------------------------------
 
 /// Why a single connection session ended.
 enum SessionEnd {
@@ -582,11 +746,11 @@ fn ended_unauthed() -> SessionEnd {
 /// code…" while the supervisor backoff-loops invisibly (the Windows-pairing
 /// report: a relay that refuses the connection looked identical to a relay that
 /// was simply slow). Best-effort — a closed channel means the app is gone.
-fn report_handshake_failure(inbound_tx: &Sender<RemoteInbound>, reason: String, retrying: bool) {
+fn report_handshake_failure(inbound_tx: &InboundTx, reason: String, retrying: bool) {
     crate::remote::debuglog::log(&format!(
         "client HANDSHAKE failed retrying={retrying} reason={reason}"
     ));
-    let _ = inbound_tx.send(RemoteInbound::HandshakeFailed { reason, retrying });
+    inbound_tx.send(RemoteInbound::HandshakeFailed { reason, retrying });
 }
 
 /// Whether a just-ended session justifies resetting the reconnect backoff to
@@ -598,18 +762,18 @@ fn session_resets_backoff(authed_for: Option<Duration>, min_stable: Duration) ->
     matches!(authed_for, Some(d) if d >= min_stable)
 }
 
-fn report(inbound_tx: &Sender<RemoteInbound>, state: RemoteLinkState) {
-    let _ = inbound_tx.send(RemoteInbound::Link(state));
+fn report(inbound_tx: &InboundTx, state: RemoteLinkState) {
+    inbound_tx.send(RemoteInbound::Link(state));
 }
 
 /// The reconnect supervisor: attempt after attempt with backoff until stopped.
-fn run(
+async fn run(
     cfg: RemoteConfig,
     identity: DeviceIdentity,
     store: Box<dyn RemoteStore>,
-    inbound_tx: Sender<RemoteInbound>,
-    outbound_rx: Receiver<RemoteOutbound>,
-    stop: Arc<AtomicBool>,
+    inbound_tx: InboundTx,
+    mut outbound_rx: UnboundedReceiver<RemoteOutbound>,
+    mut stop: watch::Receiver<bool>,
     tuning: ClientTuning,
 ) {
     let mut attempt: u32 = 0;
@@ -620,11 +784,11 @@ fn run(
     // first on the next one so its `seq` is not skipped on the wire (0ef.9).
     let mut pending: Option<RemoteOutbound> = None;
     // Keep persisted state authoritative for the private key regardless of what
-    // was on disk when the thread started.
+    // was on disk when the task started.
     let mut state = store.load();
     state.device_private_key = identity.private_key_base64();
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop_requested(&stop) {
         report(&inbound_tx, RemoteLinkState::Connecting);
         let end = run_session(
             &cfg,
@@ -632,11 +796,12 @@ fn run(
             &mut state,
             store.as_ref(),
             &inbound_tx,
-            &outbound_rx,
-            &stop,
+            &mut outbound_rx,
+            &mut stop,
             &tuning,
             pending.take(),
-        );
+        )
+        .await;
 
         match end {
             SessionEnd::Stopped => {
@@ -651,11 +816,10 @@ fn run(
                 // Terminal: retrying can never succeed until the app is updated,
                 // so surface an actionable state and stop reconnecting rather than
                 // backoff-loop forever in silence (0ef.20).
-                eprintln!(
-                    "flightdeck-remote: relay protocol version incompatible \
-                     (we offer v{our_version}, relay supports v{relay_min}..=v{relay_max}); \
-                     update FlightDeck. Not reconnecting."
-                );
+                crate::remote::debuglog::log(&format!(
+                    "client VERSION incompatible ours={our_version} relay={relay_min}..={relay_max} \
+                     — not reconnecting"
+                ));
                 report(
                     &inbound_tx,
                     RemoteLinkState::Incompatible {
@@ -702,13 +866,12 @@ fn run(
                         .collect();
                     state.pairings.clear();
                     store.save(&state);
-                    eprintln!(
-                        "flightdeck-remote: relay rejected our pairing \
-                         {AUTH_REJECT_REOFFER_THRESHOLD}x (no longer recognized); \
-                         dropped {} stale pairing(s), will re-offer on next connect",
+                    crate::remote::debuglog::log(&format!(
+                        "client AUTH rejected {AUTH_REJECT_REOFFER_THRESHOLD}x — dropped {} stale \
+                         pairing(s), will re-offer on next connect",
                         dropped.len()
-                    );
-                    let _ = inbound_tx.send(RemoteInbound::PairingRejected {
+                    ));
+                    inbound_tx.send(RemoteInbound::PairingRejected {
                         pairing_ids: dropped,
                     });
                     auth_reject_streak = 0;
@@ -716,21 +879,15 @@ fn run(
                 }
             }
         }
-        if stop.load(Ordering::Relaxed) {
+        if stop_requested(&stop) {
             break;
         }
-        interruptible_sleep(backoff_delay(attempt, jitter_unit()), &stop);
-    }
-}
-
-/// Sleep up to `dur`, waking early (within ~100 ms) if `stop` is set.
-fn interruptible_sleep(dur: Duration, stop: &AtomicBool) {
-    let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Relaxed) {
-            return;
+        // Backoff, woken early by `stop()` instead of the blocking client's
+        // 100 ms poll loop.
+        tokio::select! {
+            _ = stopped(&mut stop) => break,
+            _ = sleep(backoff_delay(attempt, jitter_unit())) => {}
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -773,21 +930,28 @@ fn resolve_relay_password(env: Option<String>, cfg_value: &str) -> Option<String
     Some(cfg_value.to_string()).filter(|s| !s.trim().is_empty())
 }
 
+/// A deadline far enough out to stand in for "never" in a `select!` branch whose
+/// precondition is false. Used instead of unwrapping an absent deadline, so the
+/// branch is inert rather than panicking if the macro ever evaluates it.
+fn never() -> Deadline {
+    Deadline::now() + Duration::from_secs(3_600)
+}
+
 /// One connection session: connect, authenticate, resume, then pump.
 #[allow(clippy::too_many_arguments)]
-fn run_session(
+async fn run_session(
     cfg: &RemoteConfig,
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
-    inbound_tx: &Sender<RemoteInbound>,
-    outbound_rx: &Receiver<RemoteOutbound>,
-    stop: &AtomicBool,
+    inbound_tx: &InboundTx,
+    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    stop: &mut watch::Receiver<bool>,
     tuning: &ClientTuning,
     pending_in: Option<RemoteOutbound>,
 ) -> SessionEnd {
     let url = effective_url(cfg, state);
-    let mut sock = match connect(&url) {
+    let sock = match connect(&url).await {
         Ok(s) => s,
         Err(e) => {
             // Expose the connect-error detail for diagnostics instead of
@@ -803,6 +967,15 @@ fn run_session(
             return ended_unauthed();
         }
     };
+    let (mut sink, mut stream) = sock.split();
+
+    // This machine's display name, announced on `auth_response` (spec §10.1).
+    // Resolved once per connect — which is exactly the "computed fresh each
+    // connect, never cached" rule — and on the blocking pool, because it may
+    // spawn `hostname` and a runtime worker must not be parked on a subprocess.
+    let machine = tokio::task::spawn_blocking(machine_name)
+        .await
+        .unwrap_or(None);
 
     // hello.
     let hello = RelayFrame::Hello {
@@ -812,7 +985,7 @@ fn run_session(
         client: client_info(),
         relay_password: effective_relay_password(cfg),
     };
-    if send_frame(&mut sock, &hello).is_err() {
+    if send_frame(&mut sink, &hello).await.is_err() {
         report_handshake_failure(
             inbound_tx,
             "the connection dropped while greeting the relay".to_string(),
@@ -846,7 +1019,8 @@ fn run_session(
     //     including that id. If no request arrives within `PENDING_OFFER_WAIT`,
     //     fall back to a plain auth so an idle desktop — and the offer-less
     //     mock-relay tests — behave as before.
-    let deadline = Instant::now() + AUTH_DEADLINE;
+    let deadline = sleep(AUTH_DEADLINE);
+    tokio::pin!(deadline);
     let mut saw_hello_ok = false;
     // The challenge nonce, captured until we decide to answer it.
     let mut challenge_nonce: Option<String> = None;
@@ -854,7 +1028,7 @@ fn run_session(
     let mut sent_auth = false;
     // Fresh-desktop bootstrap bookkeeping.
     let mut offer_sent = false;
-    let mut offer_wait_until: Option<Instant> = None;
+    let mut offer_wait_until: Option<Deadline> = None;
     // Whether we answered the challenge auth-first as a returning desktop (i.e.
     // with persisted pairing ids, no pre-auth offer). Gates treating a relay
     // `auth_failed` as a pairing rejection worth self-healing (1jy) — a fresh
@@ -866,28 +1040,40 @@ fn run_session(
     let mut deferred: Vec<RemoteOutbound> = Vec::new();
 
     loop {
-        if stop.load(Ordering::Relaxed) {
-            let _ = send_frame(&mut sock, &RelayFrame::Bye { reason: None });
-            sock.close();
-            return SessionEnd::Stopped;
-        }
-        if Instant::now() > deadline {
-            report_handshake_failure(
-                inbound_tx,
-                "the relay did not finish the handshake in time".to_string(),
-                true,
-            );
-            return ended_unauthed();
-        }
+        // The fresh-desktop pre-auth window: open only while we hold a challenge
+        // nonce we have not answered and have not yet offered. Outside it the
+        // outbound channel is deliberately NOT drained — a returning desktop's
+        // traffic waits for the pump, exactly as under the blocking client.
+        let offer_window =
+            offer_wait_until.is_some() && challenge_nonce.is_some() && !offer_sent && !sent_auth;
+        let offer_lapses_at = offer_wait_until.unwrap_or_else(never);
 
-        // Fresh-desktop pre-auth window: watch for the pending pairing request so
-        // we can offer before authing (or fall back once the wait lapses).
-        if let (Some(nonce), Some(wait_until)) = (challenge_nonce.as_ref(), offer_wait_until) {
-            if !offer_sent && !sent_auth {
-                match outbound_rx.try_recv() {
-                    Ok(RemoteOutbound::RequestPairing { claim_token_hint }) => {
+        tokio::select! {
+            // Ordered: shutdown and the handshake deadline outrank protocol
+            // progress, and each branch is a single bounded step, so nothing here
+            // can starve anything else.
+            biased;
+
+            _ = stopped(stop) => {
+                let _ = send_frame(&mut sink, &RelayFrame::Bye { reason: None }).await;
+                close(&mut sink).await;
+                return SessionEnd::Stopped;
+            }
+
+            _ = &mut deadline => {
+                report_handshake_failure(
+                    inbound_tx,
+                    "the relay did not finish the handshake in time".to_string(),
+                    true,
+                );
+                return ended_unauthed();
+            }
+
+            queued = outbound_rx.recv(), if offer_window => {
+                match queued {
+                    Some(RemoteOutbound::RequestPairing { claim_token_hint }) => {
                         let offer = build_pairing_offer(identity, claim_token_hint);
-                        if send_frame(&mut sock, &offer).is_err() {
+                        if send_frame(&mut sink, &offer).await.is_err() {
                             report_handshake_failure(
                                 inbound_tx,
                                 "the connection dropped while requesting a pairing code"
@@ -898,133 +1084,145 @@ fn run_session(
                         }
                         offer_sent = true;
                     }
-                    Ok(other) => deferred.push(other),
-                    Err(TryRecvError::Empty) => {
-                        if Instant::now() >= wait_until {
-                            if !send_auth_response(&mut sock, identity, nonce, state) {
-                                return ended_unauthed();
-                            }
-                            sent_auth = true;
-                        }
-                    }
-                    Err(TryRecvError::Disconnected) => {
+                    Some(other) => deferred.push(other),
+                    None => {
                         // The app dropped its sender (shutting down).
-                        let _ = send_frame(&mut sock, &RelayFrame::Bye { reason: None });
-                        sock.close();
+                        let _ = send_frame(&mut sink, &RelayFrame::Bye { reason: None }).await;
+                        close(&mut sink).await;
                         return SessionEnd::Stopped;
                     }
                 }
             }
-        }
 
-        match read_frame(&mut sock) {
-            Incoming::Idle => continue,
-            Incoming::Closed => {
-                report_handshake_failure(
-                    inbound_tx,
-                    "the relay closed the connection during the handshake".to_string(),
-                    true,
-                );
-                return ended_unauthed();
+            _ = sleep_until(offer_lapses_at), if offer_window => {
+                // Nothing to offer in time: fall back to a plain auth so an idle
+                // desktop is never stranded mid-handshake.
+                let Some(nonce) = challenge_nonce.as_ref() else {
+                    return ended_unauthed();
+                };
+                if !send_auth_response(&mut sink, identity, nonce, state, machine.clone()).await {
+                    return ended_unauthed();
+                }
+                sent_auth = true;
             }
-            Incoming::Frame(frame) => match *frame {
-                RelayFrame::HelloOk { .. } => saw_hello_ok = true,
-                RelayFrame::VersionIncompatible {
-                    your_version,
-                    min_supported,
-                    max_supported,
-                } => {
-                    // Terminal condition (0ef.20): the relay's supported range
-                    // does not include our version, so reconnecting can never
-                    // succeed until the app updates. Surface it distinctly rather
-                    // than treating it as a transient drop that backoff-loops.
-                    return SessionEnd::VersionIncompatible {
-                        our_version: your_version,
-                        relay_min: min_supported,
-                        relay_max: max_supported,
-                    };
-                }
-                RelayFrame::AuthChallenge { nonce, .. }
-                    if saw_hello_ok && challenge_nonce.is_none() =>
-                {
-                    if state.pairing_ids().is_empty() {
-                        // Fresh desktop: defer auth until we have offered (or the
-                        // pending-offer wait lapses above).
-                        offer_wait_until = Some(Instant::now() + PENDING_OFFER_WAIT);
-                        challenge_nonce = Some(nonce);
-                    } else {
-                        // Returning desktop: auth-first, exactly as before.
-                        if !send_auth_response(&mut sock, identity, &nonce, state) {
-                            return ended_unauthed();
-                        }
-                        sent_auth = true;
-                        auth_first = true;
-                        challenge_nonce = Some(nonce);
-                    }
-                }
-                RelayFrame::PairingOfferOk {
-                    pairing_id,
-                    claim_token,
-                    expires_at_ms,
-                } if offer_sent && !sent_auth => {
-                    // The pre-auth offer registered our device and minted the
-                    // pairing; surface the code, then auth including the new id.
-                    persist_pairing_offer(
-                        state,
-                        store,
+
+            incoming = read_next(&mut stream) => match incoming {
+                Incoming::Ignored => continue,
+                Incoming::Closed => {
+                    report_handshake_failure(
                         inbound_tx,
-                        pairing_id,
-                        claim_token,
-                        expires_at_ms,
+                        "the relay closed the connection during the handshake".to_string(),
+                        true,
                     );
-                    match challenge_nonce.as_ref() {
-                        Some(nonce) => {
-                            if !send_auth_response(&mut sock, identity, nonce, state) {
+                    return ended_unauthed();
+                }
+                Incoming::Frame(frame) => match *frame {
+                    RelayFrame::HelloOk { .. } => saw_hello_ok = true,
+                    RelayFrame::VersionIncompatible {
+                        your_version,
+                        min_supported,
+                        max_supported,
+                    } => {
+                        // Terminal condition (0ef.20): the relay's supported range
+                        // does not include our version, so reconnecting can never
+                        // succeed until the app updates. Surface it distinctly rather
+                        // than treating it as a transient drop that backoff-loops.
+                        return SessionEnd::VersionIncompatible {
+                            our_version: your_version,
+                            relay_min: min_supported,
+                            relay_max: max_supported,
+                        };
+                    }
+                    RelayFrame::AuthChallenge { nonce, .. }
+                        if saw_hello_ok && challenge_nonce.is_none() =>
+                    {
+                        if state.pairing_ids().is_empty() {
+                            // Fresh desktop: defer auth until we have offered (or the
+                            // pending-offer wait lapses above).
+                            offer_wait_until = Some(Deadline::now() + PENDING_OFFER_WAIT);
+                            challenge_nonce = Some(nonce);
+                        } else {
+                            // Returning desktop: auth-first, exactly as before.
+                            if !send_auth_response(
+                                &mut sink, identity, &nonce, state, machine.clone(),
+                            )
+                            .await
+                            {
                                 return ended_unauthed();
                             }
                             sent_auth = true;
+                            auth_first = true;
+                            challenge_nonce = Some(nonce);
                         }
-                        None => return ended_unauthed(),
                     }
-                }
-                RelayFrame::AuthOk { pairing_ids } if sent_auth => {
-                    on_authenticated(&mut sock, state, inbound_tx, pairing_ids);
-                    break;
-                }
-                RelayFrame::Error { code, message, .. } => {
-                    // The relay told us why, so pass that on verbatim-ish: a
-                    // refusal here (a missing/wrong `relay_password`, an unknown
-                    // device) is a *configuration* fault that no amount of
-                    // reconnecting clears, and the pairing overlay used to sit on
-                    // "Requesting a pairing code…" through every silent retry.
-                    report_handshake_failure(
-                        inbound_tx,
-                        format!("the relay refused the connection: {message}"),
-                        // `rate_limited` and friends do clear on their own, so
-                        // only an outright rejection of this device counts as
-                        // terminal.
-                        !matches!(
-                            code,
-                            RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
-                        ),
-                    );
-                    // A returning desktop that authed-first and got rejected: the
-                    // relay does not recognize our device/pairing (its store was
-                    // likely wiped). Surface it as a distinct end so the
-                    // supervisor can self-heal after repeated rejections instead
-                    // of reconnecting on a dead pairing forever (1jy). Any other
-                    // error (or a fresh-desktop offer failure) stays a plain end.
-                    if auth_first
-                        && matches!(
-                            code,
-                            RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
-                        )
-                    {
-                        return SessionEnd::AuthRejected;
+                    RelayFrame::PairingOfferOk {
+                        pairing_id,
+                        claim_token,
+                        expires_at_ms,
+                    } if offer_sent && !sent_auth => {
+                        // The pre-auth offer registered our device and minted the
+                        // pairing; surface the code, then auth including the new id.
+                        persist_pairing_offer(
+                            state,
+                            store,
+                            inbound_tx,
+                            pairing_id,
+                            claim_token,
+                            expires_at_ms,
+                        );
+                        match challenge_nonce.clone() {
+                            Some(nonce) => {
+                                if !send_auth_response(
+                                    &mut sink, identity, &nonce, state, machine.clone(),
+                                )
+                                .await
+                                {
+                                    return ended_unauthed();
+                                }
+                                sent_auth = true;
+                            }
+                            None => return ended_unauthed(),
+                        }
                     }
-                    return ended_unauthed();
-                }
-                _ => continue, // unexpected pre-auth frame; ignore
+                    RelayFrame::AuthOk { pairing_ids } if sent_auth => {
+                        on_authenticated(&mut sink, state, inbound_tx, pairing_ids).await;
+                        break;
+                    }
+                    RelayFrame::Error { code, message, .. } => {
+                        // The relay told us why, so pass that on verbatim-ish: a
+                        // refusal here (a missing/wrong `relay_password`, an unknown
+                        // device) is a *configuration* fault that no amount of
+                        // reconnecting clears, and the pairing overlay used to sit on
+                        // "Requesting a pairing code…" through every silent retry.
+                        report_handshake_failure(
+                            inbound_tx,
+                            format!("the relay refused the connection: {message}"),
+                            // `rate_limited` and friends do clear on their own, so
+                            // only an outright rejection of this device counts as
+                            // terminal.
+                            !matches!(
+                                code,
+                                RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
+                            ),
+                        );
+                        // A returning desktop that authed-first and got rejected: the
+                        // relay does not recognize our device/pairing (its store was
+                        // likely wiped). Surface it as a distinct end so the
+                        // supervisor can self-heal after repeated rejections instead
+                        // of reconnecting on a dead pairing forever (1jy). Any other
+                        // error (or a fresh-desktop offer failure) stays a plain end.
+                        if auth_first
+                            && matches!(
+                                code,
+                                RelayErrorCode::AuthFailed | RelayErrorCode::UnknownPairing
+                            )
+                        {
+                            return SessionEnd::AuthRejected;
+                        }
+                        return ended_unauthed();
+                    }
+                    _ => continue, // unexpected pre-auth frame; ignore
+                },
             },
         }
     }
@@ -1044,7 +1242,7 @@ fn run_session(
     // again, hold it once more for the next session.
     if let Some(out) = pending_in {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sock, identity, state, store, &mut gate, tuning, out)
+            handle_outbound(&mut sink, identity, state, store, &mut gate, tuning, out).await
         {
             gate.flush(store, state);
             return SessionEnd::Ended {
@@ -1058,7 +1256,7 @@ fn run_session(
     // steady-state pump takes over (normally nothing).
     for out in deferred {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sock, identity, state, store, &mut gate, tuning, out)
+            handle_outbound(&mut sink, identity, state, store, &mut gate, tuning, out).await
         {
             gate.flush(store, state);
             return SessionEnd::Ended {
@@ -1070,7 +1268,8 @@ fn run_session(
 
     // Authenticated. Pump until the socket drops or we are told to stop.
     pump(
-        &mut sock,
+        &mut sink,
+        &mut stream,
         identity,
         state,
         store,
@@ -1081,17 +1280,19 @@ fn run_session(
         &mut gate,
         authed_at,
     )
+    .await
 }
 
 /// Sign `nonce_b64` and send the `auth_response`, activating whatever pairings
 /// the persisted state currently holds (empty for an offer-less fresh desktop,
 /// or including a just-offered pairing once its `pairing_offer_ok` landed).
 /// Returns `false` if signing or the socket write failed.
-fn send_auth_response(
-    sock: &mut RelaySocket,
+async fn send_auth_response(
+    sink: &mut RelaySink,
     identity: &DeviceIdentity,
     nonce_b64: &str,
     state: &RemoteState,
+    machine_name: Option<String>,
 ) -> bool {
     let signature = match identity.sign_nonce_base64(nonce_b64) {
         Ok(sig) => sig,
@@ -1107,11 +1308,11 @@ fn send_auth_response(
             .collect(),
         // Announce this Mac's display name on every connect so the phone's
         // per-pairing default auto-updates when the machine is renamed
-        // (spec §10.1). Computed fresh each connect — never cached — so a rename
-        // propagates on the next reconnect.
-        machine_name: machine_name(),
+        // (spec §10.1). Resolved once per connect by [`run_session`] — never
+        // cached across connects — so a rename propagates on the next reconnect.
+        machine_name,
     };
-    send_frame(sock, &resp).is_ok()
+    send_frame(sink, &resp).await.is_ok()
 }
 
 /// This desktop's human-readable machine name for the phone's feed (spec §10.1).
@@ -1123,6 +1324,8 @@ fn send_auth_response(
 /// case the frame carries `null` and the phone keeps its previous/fallback name.
 /// The result is length-bounded to 64 characters; the relay bounds it again and
 /// the phone sanitizes it before display.
+///
+/// Blocking (it may spawn a subprocess), so callers run it on the blocking pool.
 fn machine_name() -> Option<String> {
     fn clean(raw: &str) -> Option<String> {
         let trimmed = raw.trim();
@@ -1177,7 +1380,7 @@ fn build_pairing_offer(identity: &DeviceIdentity, claim_token_hint: Option<Strin
 fn persist_pairing_offer(
     state: &mut RemoteState,
     store: &dyn RemoteStore,
-    inbound_tx: &Sender<RemoteInbound>,
+    inbound_tx: &InboundTx,
     pairing_id: PairingId,
     claim_token: String,
     expires_at_ms: i64,
@@ -1192,7 +1395,7 @@ fn persist_pairing_offer(
         p.claim_token = Some(claim_token.clone());
     }
     store.save(state);
-    let _ = inbound_tx.send(RemoteInbound::PairingOffered {
+    inbound_tx.send(RemoteInbound::PairingOffered {
         pairing_id,
         claim_token,
         expires_at_ms,
@@ -1201,10 +1404,10 @@ fn persist_pairing_offer(
 
 /// After `auth_ok`: report Connected, then `resume` each active pairing from the
 /// highest seq we already hold, and surface the pairings to the app.
-fn on_authenticated(
-    sock: &mut RelaySocket,
+async fn on_authenticated(
+    sink: &mut RelaySink,
     state: &RemoteState,
-    inbound_tx: &Sender<RemoteInbound>,
+    inbound_tx: &InboundTx,
     pairing_ids: Vec<PairingId>,
 ) {
     report(inbound_tx, RemoteLinkState::Connected { latency_ms: 0 });
@@ -1214,12 +1417,13 @@ fn on_authenticated(
             .map(|p| p.last_received_seq)
             .unwrap_or(0);
         let _ = send_frame(
-            sock,
+            sink,
             &RelayFrame::Resume {
                 pairing_id: pid.clone(),
                 from_seq,
             },
-        );
+        )
+        .await;
         // Only surface `Paired` — which drives the outbound bridge to send a
         // fresh snapshot — for a pairing whose phone has already joined (i.e. an
         // *established* one, so the E2E channel is live and the snapshot is
@@ -1239,7 +1443,7 @@ fn on_authenticated(
                 .pairing(pid.as_str())
                 .and_then(|p| p.peer_device_id.clone())
                 .map(DeviceId::new);
-            let _ = inbound_tx.send(RemoteInbound::Paired {
+            inbound_tx.send(RemoteInbound::Paired {
                 pairing_id: pid,
                 peer_device_id,
             });
@@ -1304,8 +1508,9 @@ impl CursorFlushGate {
         self.last_flush = Instant::now();
     }
 
-    /// Flush if dirty and the debounce interval has elapsed — called once per pump
-    /// tick.
+    /// Flush if dirty and the debounce interval has elapsed — called after every
+    /// pump event, and on the pump's flush tick so an idle-but-dirty gate still
+    /// reaches disk.
     fn maybe_flush(&mut self, store: &dyn RemoteStore, state: &RemoteState) {
         if self.dirty && self.last_flush.elapsed() >= self.interval {
             store.save(state);
@@ -1323,104 +1528,129 @@ impl CursorFlushGate {
     }
 }
 
-/// The steady-state loop: drain outbound, fire pings, read inbound frames.
+/// The steady-state loop: one `select!` per event — outbound traffic, inbound
+/// frames, the ping tick, the liveness deadline, the debounced-persist tick, and
+/// the stop signal. The blocking pump did the same work on a ~100 ms poll; here
+/// the task sleeps until one of those actually happens.
 #[allow(clippy::too_many_arguments)]
-fn pump(
-    sock: &mut RelaySocket,
+async fn pump(
+    sink: &mut RelaySink,
+    stream: &mut RelayRx,
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
-    inbound_tx: &Sender<RemoteInbound>,
-    outbound_rx: &Receiver<RemoteOutbound>,
-    stop: &AtomicBool,
+    inbound_tx: &InboundTx,
+    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    stop: &mut watch::Receiver<bool>,
     tuning: &ClientTuning,
     gate: &mut CursorFlushGate,
     authed_at: Instant,
 ) -> SessionEnd {
-    let mut last_ping = Instant::now();
-    // Last time ANY inbound frame arrived (Pong, Envelope, Ack, presence …). A
-    // half-open socket delivers nothing yet never errors on our tiny pinging, so
-    // we tear the session down once this exceeds the liveness deadline instead of
-    // looping on idle reads forever (remote-control-0ef.1). Seeded at auth so a
-    // silent socket is caught even if the very first frame never arrives.
-    let mut last_inbound = Instant::now();
-    // The reconnect-ending outcomes break out with a value so the single flush
-    // below persists any debounced cursor before the session ends (0ef.11). The
-    // two stop-and-`Bye` paths flush inline and early-return, since they also
-    // close the socket.
-    let end = 'pump: loop {
-        if stop.load(Ordering::Relaxed) {
-            gate.flush(store, state);
-            let _ = send_frame(sock, &RelayFrame::Bye { reason: None });
-            sock.close();
-            return SessionEnd::Stopped;
-        }
+    // `interval_at` (not `interval`) so the first tick is one full period away:
+    // `interval` fires immediately, which would ping the instant we authenticate.
+    let mut ping = interval_at(Deadline::now() + PING_INTERVAL, PING_INTERVAL);
+    // Skip missed ticks rather than bursting through a backlog after a suspend.
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Half-open detection: no inbound frame for the liveness window → the link
-        // is silently dead; tear it down so the supervisor reconnects (0ef.1).
-        if last_inbound.elapsed() >= tuning.liveness_timeout {
-            crate::remote::debuglog::log(&format!(
-                "client LIVENESS timeout ({}s) — tearing down half-open session",
-                tuning.liveness_timeout.as_secs()
-            ));
-            break 'pump SessionEnd::Ended {
-                authed_for: Some(authed_at.elapsed()),
-                pending: None,
-            };
-        }
+    let flush_period = tuning.cursor_flush_interval.max(CURSOR_FLUSH_TICK_FLOOR);
+    let mut flush = interval_at(Deadline::now() + flush_period, flush_period);
+    flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Drain everything the app queued for us.
-        loop {
-            match outbound_rx.try_recv() {
-                Ok(out) => {
+    // Liveness: a pinned timer reset by every inbound frame. A half-open socket
+    // delivers nothing yet never errors on our tiny pings, so we tear the session
+    // down once this elapses instead of waiting on a read that never comes
+    // (remote-control-0ef.1). Armed at auth so a silent socket is caught even if
+    // the very first frame never arrives.
+    let liveness = sleep(tuning.liveness_timeout);
+    tokio::pin!(liveness);
+
+    let end = loop {
+        // Set when an inbound frame proved the link alive; the timer is reset
+        // after the `select!` rather than inside a branch, so nothing borrows it
+        // twice.
+        let mut alive = false;
+
+        tokio::select! {
+            // Ordered rather than random so the pump keeps the blocking client's
+            // priorities: shutdown first, then the liveness verdict, then drain
+            // what the app queued, then read. Each branch is one bounded step.
+            biased;
+
+            _ = stopped(stop) => {
+                gate.flush(store, state);
+                let _ = send_frame(sink, &RelayFrame::Bye { reason: None }).await;
+                close(sink).await;
+                return SessionEnd::Stopped;
+            }
+
+            _ = &mut liveness => {
+                crate::remote::debuglog::log(&format!(
+                    "client LIVENESS timeout ({}s) — tearing down half-open session",
+                    tuning.liveness_timeout.as_secs()
+                ));
+                break SessionEnd::Ended {
+                    authed_for: Some(authed_at.elapsed()),
+                    pending: None,
+                };
+            }
+
+            queued = outbound_rx.recv() => match queued {
+                Some(out) => {
                     if let Sent::Broke { retry } =
-                        handle_outbound(sock, identity, state, store, gate, tuning, out)
+                        handle_outbound(sink, identity, state, store, gate, tuning, out).await
                     {
-                        break 'pump SessionEnd::Ended {
+                        break SessionEnd::Ended {
                             authed_for: Some(authed_at.elapsed()),
                             pending: retry,
                         };
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+                None => {
                     // The app dropped its sender (shutting down).
                     gate.flush(store, state);
-                    let _ = send_frame(sock, &RelayFrame::Bye { reason: None });
-                    sock.close();
+                    let _ = send_frame(sink, &RelayFrame::Bye { reason: None }).await;
+                    close(sink).await;
                     return SessionEnd::Stopped;
                 }
-            }
-        }
+            },
 
-        if last_ping.elapsed() >= PING_INTERVAL {
-            let _ = send_frame(
-                sock,
-                &RelayFrame::Ping {
-                    client_time_ms: now_ms(),
-                },
-            );
-            last_ping = Instant::now();
-        }
-
-        match read_frame(sock) {
-            Incoming::Idle => {}
-            Incoming::Closed => {
-                break 'pump SessionEnd::Ended {
-                    authed_for: Some(authed_at.elapsed()),
-                    pending: None,
-                }
-            }
-            Incoming::Frame(frame) => {
-                // Any inbound frame proves the link is alive — reset the deadline.
-                last_inbound = Instant::now();
-                if !handle_frame(sock, state, store, gate, inbound_tx, *frame) {
-                    break 'pump SessionEnd::Ended {
+            incoming = read_next(stream) => match incoming {
+                Incoming::Ignored => {}
+                Incoming::Closed => {
+                    break SessionEnd::Ended {
                         authed_for: Some(authed_at.elapsed()),
                         pending: None,
-                    };
+                    }
                 }
+                Incoming::Frame(frame) => {
+                    // Any *relay* frame proves the link is alive. A WebSocket-level
+                    // pong deliberately does not: the blocking pump only ever reset
+                    // its deadline on a parsed frame, and a relay that answered
+                    // nothing but ws pings is exactly the half-open case 0ef.1 is
+                    // about.
+                    alive = true;
+                    if !handle_frame(sink, state, store, gate, inbound_tx, *frame).await {
+                        break SessionEnd::Ended {
+                            authed_for: Some(authed_at.elapsed()),
+                            pending: None,
+                        };
+                    }
+                }
+            },
+
+            _ = ping.tick() => {
+                let _ = send_frame(sink, &RelayFrame::Ping { client_time_ms: now_ms() }).await;
             }
+
+            // Nothing to do beyond the coalesced persist below; this tick exists
+            // only so an idle-but-dirty gate still reaches disk.
+            _ = flush.tick() => {}
+        }
+
+        if alive {
+            liveness
+                .as_mut()
+                .reset(Deadline::now() + tuning.liveness_timeout);
         }
 
         // Coalesced cursor persist: at most one `remote.json` rewrite per
@@ -1433,8 +1663,8 @@ fn pump(
 }
 
 /// Handle one app→relay message. Returns [`Sent::Broke`] if the socket broke.
-fn handle_outbound(
-    sock: &mut RelaySocket,
+async fn handle_outbound(
+    sink: &mut RelaySink,
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
@@ -1478,7 +1708,9 @@ fn handle_outbound(
             // A forced failure (test seam) short-circuits the real write so it is
             // never delivered; production always evaluates the real send.
             if tuning.take_forced_write_failure()
-                || send_frame(sock, &RelayFrame::Envelope(envelope)).is_err()
+                || send_frame(sink, &RelayFrame::Envelope(envelope))
+                    .await
+                    .is_err()
             {
                 crate::remote::debuglog::log(&format!(
                     "client SEND envelope FAILED (socket) pairing={key} seq={seq} — holding to re-send"
@@ -1512,7 +1744,10 @@ fn handle_outbound(
             Sent::Ok
         }
         RemoteOutbound::Ack { pairing_id, cursor } => {
-            if send_frame(sock, &RelayFrame::Ack { pairing_id, cursor }).is_ok() {
+            if send_frame(sink, &RelayFrame::Ack { pairing_id, cursor })
+                .await
+                .is_ok()
+            {
                 Sent::Ok
             } else {
                 Sent::Broke { retry: None }
@@ -1523,7 +1758,7 @@ fn handle_outbound(
             // desktop this rides the post-auth pump; a fresh desktop offers
             // pre-auth instead (see [`run_session`]). Same offer either way.
             let offer = build_pairing_offer(identity, claim_token_hint);
-            if send_frame(sock, &offer).is_ok() {
+            if send_frame(sink, &offer).await.is_ok() {
                 Sent::Ok
             } else {
                 Sent::Broke { retry: None }
@@ -1542,7 +1777,6 @@ fn handle_outbound(
     }
 }
 
-/// Handle one relay→client frame. Returns `false` on a fatal frame (reconnect).
 /// Remove every pairing that `keeping` supersedes — any OTHER pairing to the
 /// SAME phone — from `state`, and return their ids so the caller can tell the
 /// relay to revoke them (remote-control-4wk).
@@ -1578,12 +1812,13 @@ fn retire_superseded_pairings(
     superseded
 }
 
-fn handle_frame(
-    sock: &mut RelaySocket,
+/// Handle one relay→client frame. Returns `false` on a fatal frame (reconnect).
+async fn handle_frame(
+    sink: &mut RelaySink,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     gate: &mut CursorFlushGate,
-    inbound_tx: &Sender<RemoteInbound>,
+    inbound_tx: &InboundTx,
     frame: RelayFrame,
 ) -> bool {
     match frame {
@@ -1622,15 +1857,16 @@ fn handle_frame(
                 gate.mark_dirty();
                 let seq = env.seq;
                 let pairing_id = env.pairing_id.clone();
-                let _ = inbound_tx.send(RemoteInbound::Envelope(env));
+                inbound_tx.send(RemoteInbound::Envelope(env));
                 // Auto-ack contiguous receipt so the relay can trim its queue.
                 let _ = send_frame(
-                    sock,
+                    sink,
                     &RelayFrame::Ack {
                         pairing_id,
                         cursor: seq,
                     },
-                );
+                )
+                .await;
             }
             // else: a duplicate (redelivery) — silently drop (spec §6.4).
             true
@@ -1673,7 +1909,7 @@ fn handle_frame(
                 peer,
                 presence
             ));
-            let _ = inbound_tx.send(RemoteInbound::Presence {
+            inbound_tx.send(RemoteInbound::Presence {
                 pairing_id,
                 peer,
                 state: presence,
@@ -1742,16 +1978,17 @@ fn handle_frame(
                         pairing_id.as_str()
                     ));
                     let _ = send_frame(
-                        sock,
+                        sink,
                         &RelayFrame::Revoke {
                             pairing_id: PairingId::new(stale.clone()),
                         },
-                    );
+                    )
+                    .await;
                 }
                 store.save(state);
                 gate.mark_clean();
             }
-            let _ = inbound_tx.send(RemoteInbound::PairingClaimed {
+            inbound_tx.send(RemoteInbound::PairingClaimed {
                 pairing_id,
                 peer_device_id,
                 peer_key_agreement_public_key,
@@ -1772,7 +2009,7 @@ fn handle_frame(
             state.pairings.retain(|p| p.pairing_id != key);
             store.save(state);
             gate.mark_clean();
-            let _ = inbound_tx.send(RemoteInbound::PairingRevoked { pairing_id });
+            inbound_tx.send(RemoteInbound::PairingRevoked { pairing_id });
             true
         }
         RelayFrame::Error {
@@ -1810,7 +2047,7 @@ fn handle_frame(
                     store.save(state);
                     gate.mark_clean();
                 }
-                let _ = inbound_tx.send(RemoteInbound::SeqRealign {
+                inbound_tx.send(RemoteInbound::SeqRealign {
                     pairing_id: pid,
                     next_seq,
                 });
@@ -1851,13 +2088,14 @@ fn handle_frame(
                     gate.mark_clean();
                 }
                 let _ = send_frame(
-                    sock,
+                    sink,
                     &RelayFrame::Resume {
                         pairing_id: pid.clone(),
                         from_seq: 0,
                     },
-                );
-                let _ = inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
+                )
+                .await;
+                inbound_tx.send(RemoteInbound::SeqResync { pairing_id: pid });
             }
             true
         }

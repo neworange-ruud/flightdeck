@@ -1,16 +1,19 @@
 //! FlightDeck Remote — the desktop relay client.
 //!
 //! This module owns the desktop half of the phone <-> desktop link: a single
-//! long-lived outbound WebSocket connection to the hosted relay. It mirrors the
-//! update-check thread idiom ([`crate::update::start_check`]) — a detached
-//! `std::thread` owning a **blocking** [`tungstenite`] socket — because the TUI
-//! has no async runtime and must stay single-threaded and synchronous.
+//! long-lived outbound WebSocket connection to the hosted relay. It is a
+//! [`tokio`] task on the process's one shared runtime ([`runtime`]) — the same
+//! runtime the embedded web server uses (`specs/WEB_INTERFACE.md` D6) — while the
+//! TUI event loop itself stays single-threaded and synchronous and talks to the
+//! task over `std::sync::mpsc` channels.
 //!
 //! Layers:
 //! * [`identity`] — the per-device ECDSA P-256 keypair and its wire encodings.
 //! * [`state`] — `~/.flightdeck/remote.json`: the private key, pairings, and the
 //!   per-direction sequence cursors that make `resume`/`ack`/dedup work.
-//! * [`client`] — the connection thread: connect → hello → auth → resume → pump,
+//! * [`runtime`] — the one async runtime, owned by a dedicated thread and shared
+//!   with `src/web/server.rs` so the binary never starts a second one.
+//! * [`client`] — the connection task: connect → hello → auth → resume → pump,
 //!   with exponential backoff + jitter reconnect and periodic latency pings.
 //!
 //! ## What this module does NOT do
@@ -23,11 +26,12 @@
 //!
 //! ## Threading & channels
 //!
-//! [`client::RemoteHandle::start`] takes a [`Sender<RemoteInbound>`] (thread →
-//! app) and a [`Receiver<RemoteOutbound>`] (app → thread). The app drains
-//! [`RemoteInbound`] non-blockingly each render tick and never blocks on the
-//! socket; the thread drains [`RemoteOutbound`] each ~100 ms poll. Shutdown is a
-//! shared atomic flag flipped by [`client::RemoteHandle::stop`].
+//! [`client::RemoteHandle::start`] takes a [`Sender<RemoteInbound>`] (task → app)
+//! and a [`Receiver<RemoteOutbound>`] (app → task) — plain `std::sync::mpsc`,
+//! unchanged by the move to tokio. The app drains [`RemoteInbound`]
+//! non-blockingly each render tick and never blocks on the socket; the task is
+//! woken by whichever channel or timer fires, rather than polling on a tick.
+//! Shutdown is [`client::RemoteHandle::stop`] (or simply dropping the handle).
 
 pub mod bridge;
 pub mod client;
@@ -39,6 +43,7 @@ pub mod identity;
 pub mod notifier;
 pub mod opencode;
 pub mod pairing;
+pub mod runtime;
 pub mod shell;
 pub mod state;
 pub mod transcript;
