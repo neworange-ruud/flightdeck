@@ -123,9 +123,31 @@ fn activity_event() -> ActivityEvent {
         from: InterpretedStatus::Working,
         to: InterpretedStatus::WaitingForInput,
         manual: None,
+        reason: "asked a question".into(),
         tier: ActivityTier::Attention,
         read: false,
     }
+}
+
+#[test]
+fn activity_reason_round_trips_and_defaults_to_empty_never_a_guess() {
+    // The reason is the part of a feed row a user actually reads (artboard
+    // 2e), so it has to survive the wire.
+    let event = activity_event();
+    let wire = serde_json::to_string(&event).unwrap();
+    let back: ActivityEvent = serde_json::from_str(&wire).unwrap();
+    assert_eq!(back.reason, "asked a question");
+    assert_eq!(back, event);
+
+    // A payload with no reason at all decodes to the empty string rather than
+    // failing or inventing one. Turn 2 §5.1's "unknown stays unknown" applies
+    // to the reason exactly as it does to the statuses: the honest answer to
+    // "why did this happen" is sometimes nothing, and it must never be padded
+    // out to look informative.
+    let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    value.as_object_mut().unwrap().remove("reason");
+    let without: ActivityEvent = serde_json::from_value(value).unwrap();
+    assert_eq!(without.reason, "");
 }
 
 fn dialog_view() -> DialogView {

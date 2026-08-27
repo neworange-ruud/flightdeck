@@ -907,6 +907,17 @@ pub struct ActivityEvent {
     /// carries manual overrides as well as lifecycle changes.
     #[serde(with = "manual_label", default)]
     pub manual: Option<ManualStatus>,
+    /// Why the transition happened, in the design's own words: `"asked a
+    /// question"`, `"agent exited (code 1)"`, `"finished, 18 files touched"`
+    /// (artboard 2e). This is the part of a feed row a user actually reads, so
+    /// it belongs on the wire rather than being reconstructed in the browser
+    /// from `from`/`to` — which could not produce "18 files touched" at all.
+    ///
+    /// Empty when the host has nothing honest to say. It must never be padded
+    /// with a guess: turn 2 §5.1's "unknown stays unknown" applies to the
+    /// reason exactly as it applies to the statuses.
+    #[serde(default)]
+    pub reason: String,
     /// Urgency tier for the unread chip.
     pub tier: ActivityTier,
     /// Whether this viewer has seen it. Backfilled events are read or unread
