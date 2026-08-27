@@ -3713,7 +3713,7 @@ mod tests {
         // difference in the binding that does not exist.
         for mode in [InputMode::Terminal, InputMode::App] {
             let ui = crate::contracts::UiConfig::default();
-            let line = status_bar_text(mode, &ui, None);
+            let line = status_bar_text(mode, &ui, None, false);
             let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(flat.contains("F1 / Alt-h"), "{mode:?} must show both keys");
         }
@@ -4137,7 +4137,7 @@ mod tests {
         // they survive even when the shortcut list is taller than the overlay.
         let mut term = test_terminal(120, 50);
         term.draw(|frame| {
-            draw_help_overlay(frame, frame.area(), false);
+            draw_help_overlay(frame, frame.area(), false, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -4166,7 +4166,7 @@ mod tests {
         // The shortcut list overflows a small overlay; border titles must not.
         let mut term = test_terminal(80, 24);
         term.draw(|frame| {
-            draw_help_overlay(frame, frame.area(), false);
+            draw_help_overlay(frame, frame.area(), false, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();

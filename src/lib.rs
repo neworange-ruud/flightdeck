@@ -8062,7 +8062,7 @@ mod tests {
                 width: 80,
                 height: 24,
             };
-            let ml = crate::tui::layout::compute(area, false);
+            let ml = crate::tui::layout::compute(area, crate::tui::layout::Chrome::Full, false);
             let names: Vec<String> = ws.projects.iter().map(|p| p.name.clone()).collect();
             let row = crate::tui::layout::HEADER_HEIGHT;
             // Find a column that hits the second project's tab, wherever the
