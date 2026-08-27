@@ -717,6 +717,11 @@ impl Shared {
             replay_capacity_bytes: state.replay_capacity_bytes,
             activity: state.activity.clone(),
             dialog: state.dialog.clone(),
+            // Static for the life of the build, so it rides on the snapshot
+            // rather than on `HostState`: there is no change for a `Delta` to
+            // describe, and the browser needs it in the same frame it paints
+            // the palette from.
+            commands: crate::web::commands::inventory(),
         }
     }
 
@@ -1756,12 +1761,32 @@ fn sanitize_label(raw: &str) -> String {
         .to_string()
 }
 
+/// Answer one [`ClientMsg::Command`](crate::web::protocol::ClientMsg::Command).
+///
+/// Every decision comes from [`crate::web::commands::INVENTORY`] — the same
+/// table the browser's palette was built from — in a fixed order:
+///
+/// 1. **Unknown name** → [`ErrorCode::NotSupported`], socket kept. The M2 door's
+///    failure mode: a newer browser asks for something this build does not have
+///    and is told so.
+/// 2. **Read-only seat** → [`ErrorCode::ReadOnly`], before anything else is
+///    considered (D14). It comes first deliberately: an observer must not learn
+///    which commands *would* have worked, and no command added later can slip
+///    past the check by being handled earlier.
+/// 3. **A refusal this build states statically** → answered here, and the frame
+///    never reaches the TUI. That is what makes `quit` safe by construction
+///    (D16): there is no path from a bare frame to a dispatch.
+/// 4. **Anything else** → forwarded as [`WebInbound::Command`]. The TUI applies
+///    it through its own palette path and sends the [`Ack`], for the same reason
+///    input is not acked here: this module has forwarded a frame, which is not
+///    the same claim as "the host did it".
 async fn handle_command(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
     command: crate::web::protocol::Command,
     sink: &mut Sink,
 ) {
+    use crate::web::commands::{self, Route};
     use crate::web::protocol::command as names;
 
     let seat = shared
@@ -1769,10 +1794,43 @@ async fn handle_command(
         .seat_of(viewer_id)
         .unwrap_or(Seat::Observing);
 
-    match command.name.as_str() {
+    let Some(spec) = commands::lookup(&command.name) else {
+        let _ = send_msg(
+            sink,
+            &ServerMsg::Error(WireError {
+                seq: Some(command.seq),
+                ..WireError::new(
+                    ErrorCode::NotSupported,
+                    format!("this FlightDeck does not implement `{}`", command.name),
+                )
+            }),
+        )
+        .await;
+        return;
+    };
+
+    if spec.requires_control() && seat != Seat::Controlling {
+        // Read-only means read-only. D3 makes the selection shared with the
+        // desktop, so letting an observer move it would be input by another
+        // name — and the same holds for every command that changes anything.
+        let _ = send_msg(
+            sink,
+            &ServerMsg::Error(WireError {
+                seq: Some(command.seq),
+                ..WireError::new(
+                    ErrorCode::ReadOnly,
+                    "this tab is watching read-only; take over to drive",
+                )
+            }),
+        )
+        .await;
+        return;
+    }
+
+    match spec.route {
         // Answerable here, from the published state, for any seat: it is how a
         // viewer that believes it has drifted recovers.
-        names::REQUEST_SNAPSHOT => {
+        Route::Server if spec.name == names::REQUEST_SNAPSHOT => {
             let last_input_seq = shared.registry().input_cursor(viewer_id);
             let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
             let _ = send_msg(sink, &ServerMsg::Snapshot(snapshot)).await;
@@ -1780,54 +1838,43 @@ async fn handle_command(
         }
         // Seat bookkeeping is this module's job (D14), so it never travels to
         // the TUI and back.
-        names::RELEASE_SEAT => {
+        Route::Server => {
+            debug_assert_eq!(spec.name, names::RELEASE_SEAT);
             shared.registry().release(viewer_id);
             let _ = send_msg(sink, &applied(command.seq)).await;
             shared.announce_seats();
         }
-        names::SELECT_PROJECT
-        | names::SELECT_SESSION
-        | names::SELECT_TERMINAL
-        | names::MARK_ACTIVITY_READ => {
-            if seat != Seat::Controlling {
-                // Read-only means read-only. D3 makes the selection shared with
-                // the desktop, so letting an observer move it would be input by
-                // another name.
-                let _ = send_msg(
-                    sink,
-                    &ServerMsg::Error(WireError {
-                        seq: Some(command.seq),
-                        ..WireError::new(
-                            ErrorCode::ReadOnly,
-                            "this tab is watching read-only; take over to drive",
-                        )
-                    }),
-                )
-                .await;
-                return;
-            }
-            // The TUI applies it and acks (`WebOutbound::Viewer`), for the same
-            // reason input is not acked here.
-            shared.notify(WebInbound::Command {
-                viewer_id: viewer_id.clone(),
-                command,
-            });
+        // D16: the host knows the command and will not run it for a browser.
+        // Acked, not ignored — a `host only` action that silently did nothing
+        // would be indistinguishable from one that worked.
+        Route::Rejected(reason) => {
+            let _ = send_msg(
+                sink,
+                &ServerMsg::Ack(Ack {
+                    seq: command.seq,
+                    outcome: AckOutcome::Rejected,
+                    detail: Some(reason.to_string()),
+                }),
+            )
+            .await;
         }
-        _ => {
-            // The M2 door's failure mode: a newer browser asking for a command
-            // this build does not implement is told no, clearly, and keeps its
-            // socket.
+        // The action exists but the browser has no surface for what it opens.
+        // Refused rather than half-opened (see `crate::web::commands`).
+        Route::NotSupported(reason) => {
             let _ = send_msg(
                 sink,
                 &ServerMsg::Error(WireError {
                     seq: Some(command.seq),
-                    ..WireError::new(
-                        ErrorCode::NotSupported,
-                        format!("this FlightDeck does not implement `{}`", command.name),
-                    )
+                    ..WireError::new(ErrorCode::NotSupported, reason)
                 }),
             )
             .await;
+        }
+        Route::Selection(_) | Route::ActivityRead | Route::Palette(_) => {
+            shared.notify(WebInbound::Command {
+                viewer_id: viewer_id.clone(),
+                command,
+            });
         }
     }
 }

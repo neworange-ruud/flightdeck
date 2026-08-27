@@ -20,9 +20,11 @@
 //! | [`assets`] | D9 | the `webui/` SPA baked in with `rust-embed` |
 //! | [`server`] | D6 | axum on the shared tokio runtime |
 //! | [`stream`] | D2, D8, D14 | PTY bytes out, keystrokes in, takeover |
+//! | [`commands`] | D3, D13, D16 | wire name to palette action, one table |
 
 pub mod activity;
 pub mod assets;
+pub mod commands;
 pub mod credentials;
 pub mod interfaces;
 pub mod protocol;

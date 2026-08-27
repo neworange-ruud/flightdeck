@@ -2736,3 +2736,365 @@ fn an_observer_cannot_mark_the_feed_read() {
     );
     assert!(store.events().all(|event| !event.read));
 }
+
+// ===========================================================================
+// The command surface (D3, D13, D16; SPECS §5, §22)
+// ===========================================================================
+//
+// These drive **real `Command` frames over the real socket** and then run the
+// host's half exactly as the tick loop does: look the name up in
+// `flightdeck::web::commands::INVENTORY`, and hand the action it carries to the
+// same dispatcher the TUI's palette calls. Nothing here writes a `Command`
+// value of its own — a test that hand-rolled the effect would pass while the
+// wire name pointed somewhere else entirely, which is the failure the inventory
+// exists to prevent.
+
+use flightdeck::app::commands::{Command as AppCommand, Effect};
+use flightdeck::app::state::{AppState, Services};
+use flightdeck::contracts::domain::{Config, ProjectState, STATE_VERSION};
+use flightdeck::testing::{FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeGit};
+use flightdeck::web::commands::{self, Route, HOST_ONLY_REFUSAL, QUIT_REFUSAL};
+use flightdeck::web::protocol::{command as names, CommandTarget};
+
+/// Send one command frame from a controlling browser, and hand back the socket
+/// so the answer can be read off it.
+async fn control(addr: &str, cookie: &str) -> Ws {
+    let mut ws = ws_connect(addr, Some(cookie)).await.expect("upgrade");
+    attach(&mut ws, SeatRequest::Control).await;
+    await_snapshot(&mut ws).await;
+    ws
+}
+
+async fn command(ws: &mut Ws, seq: u64, name: &str) {
+    send(
+        ws,
+        &ClientMsg::Command(WireCommand {
+            seq,
+            name: name.to_string(),
+            args: None,
+        }),
+    )
+    .await;
+}
+
+async fn next_error(ws: &mut Ws) -> flightdeck::web::protocol::WireError {
+    frame_matching(ws, |frame| match frame {
+        ServerMsg::Error(error) => Some(error),
+        _ => None,
+    })
+    .await
+}
+
+/// Nothing reached the host: the refusal happened at the socket, so no code path
+/// existed that could have applied it.
+fn assert_nothing_forwarded(harness: &Harness) {
+    // Give the server a moment to have forwarded it, if it were going to.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !harness
+            .inbound()
+            .iter()
+            .any(|event| matches!(event, WebInbound::Command { .. })),
+        "the frame must be refused at the socket, never forwarded to the host"
+    );
+}
+
+/// The browser must not have to guess what this build can run: the inventory
+/// rides on the snapshot, and every row it names is a row the host accepts.
+#[test]
+fn the_snapshot_carries_the_hosts_command_inventory() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    let snapshot = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await
+    });
+
+    assert!(
+        snapshot.commands.len() > 30,
+        "the whole §22 surface, not a handful: {}",
+        snapshot.commands.len()
+    );
+    for view in &snapshot.commands {
+        assert!(
+            commands::lookup(&view.run.name).is_some(),
+            "the host offered `{}`, which it does not accept",
+            view.run.name
+        );
+        assert!(!view.label.is_empty() && !view.group.is_empty());
+    }
+
+    // D16: both desktop-only actions are present, badged, and say why they will
+    // be refused — visible and honest rather than hidden.
+    for name in [names::OPEN_WORKTREE_IN_FILE_MANAGER, names::EDIT_IN_EDITOR] {
+        let view = snapshot
+            .commands
+            .iter()
+            .find(|view| view.run.name == name)
+            .unwrap_or_else(|| panic!("`{name}` must be offered, not hidden"));
+        assert!(view.host_only, "`{name}` must carry the host-only badge");
+        assert_eq!(view.refusal.as_deref(), Some(HOST_ONLY_REFUSAL));
+    }
+
+    // The three D3 selection rows are templates: the browser fills the id.
+    let select_session = snapshot
+        .commands
+        .iter()
+        .find(|view| view.run.name == names::SELECT_SESSION)
+        .expect("the selection rows are on the wire");
+    assert_eq!(select_session.target, Some(CommandTarget::Session));
+    assert!(select_session.run.args.is_none());
+
+    // The names the SPA had to invent before this existed are now real, and
+    // nothing in the inventory is a name the host cannot resolve.
+    assert!(snapshot
+        .commands
+        .iter()
+        .any(|view| view.run.name == names::RESTART_AGENT));
+    assert!(snapshot
+        .commands
+        .iter()
+        .any(|view| view.run.name == names::TOGGLE_SPLIT_VIEW));
+}
+
+/// A real frame drives a real effect: `toggle_split_view` travels over the
+/// socket, is looked up in the inventory, and the action it carries — the very
+/// value the TUI's palette row holds — flips real `AppState`.
+#[test]
+fn a_real_command_frame_drives_a_real_effect() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    on_runtime(command(&mut ws, 31, names::TOGGLE_SPLIT_VIEW));
+    let (viewer_id, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::TOGGLE_SPLIT_VIEW);
+
+    // The host's half, as the tick loop runs it: the inventory hands over the
+    // palette action, and the app core applies it. The test never names the
+    // command itself.
+    let spec = commands::lookup(&forwarded.name).expect("a forwarded name is a known name");
+    let action = match &spec.route {
+        Route::Palette(action) => action.clone(),
+        other => panic!("expected a palette route, got {other:?}"),
+    };
+    let cmd = match &action {
+        flightdeck::tui::palette::PaletteAction::Dispatch(cmd) => cmd.clone(),
+        other => panic!("expected a direct dispatch, got {other:?}"),
+    };
+    assert_eq!(
+        cmd,
+        AppCommand::ToggleSplitView,
+        "the wire name must reach the palette's own action"
+    );
+
+    let mut app = app_state();
+    let git = FakeGit::new();
+    let fs = FakeFs::new();
+    let pty = FakePty::new();
+    let clock = FakeClock::new("2026-08-28T10:00:00Z");
+    let container = FakeContainerRuntime::new();
+    let runner = FakeCommandRunner::new();
+    let services = Services {
+        git: &git,
+        fs: &fs,
+        pty: &pty,
+        clock: &clock,
+        container: &container,
+        command: &runner,
+    };
+    assert!(!app.split_view);
+    let effect = app.dispatch(cmd, &services).expect("the dispatch succeeds");
+    assert!(app.split_view, "the frame changed real host state");
+    let detail = match effect {
+        Effect::Message(m) => Some(m),
+        other => panic!("expected a message, got {other:?}"),
+    };
+
+    // And the browser is told what happened, by seq, rather than guessing.
+    harness.handle.send(server::WebOutbound::Viewer {
+        viewer_id,
+        msg: ServerMsg::Ack(Ack {
+            seq: forwarded.seq,
+            outcome: AckOutcome::Applied,
+            detail,
+        }),
+    });
+    let ack = on_runtime(next_ack(&mut ws));
+    assert_eq!(ack.seq, 31);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert!(
+        ack.detail.is_some(),
+        "the ack carries what the desktop showed"
+    );
+}
+
+/// D16: a desktop-only action is answered with its host-only outcome. Not a
+/// fake success (the window would open on a machine the user is not at) and not
+/// silence (indistinguishable from a success).
+#[test]
+fn a_desktop_only_command_is_acked_with_its_host_only_outcome() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    for (seq, name) in [
+        (41, names::OPEN_WORKTREE_IN_FILE_MANAGER),
+        (42, names::EDIT_IN_EDITOR),
+    ] {
+        on_runtime(command(&mut ws, seq, name));
+        let ack = on_runtime(next_ack(&mut ws));
+        assert_eq!(ack.seq, seq);
+        assert_eq!(
+            ack.outcome,
+            AckOutcome::Rejected,
+            "`{name}` must not report a success that happened on another machine"
+        );
+        assert_eq!(ack.detail.as_deref(), Some(HOST_ONLY_REFUSAL));
+    }
+    assert_nothing_forwarded(&harness);
+}
+
+/// D16: `quit` stops FlightDeck and every agent in it. A bare frame naming it is
+/// refused pending the two-step confirmation, and — the part that matters — it
+/// never reaches the host, so no path exists that could have run it.
+#[test]
+fn a_bare_quit_frame_cannot_kill_flightdeck() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    on_runtime(command(&mut ws, 51, names::QUIT));
+    let ack = on_runtime(next_ack(&mut ws));
+    assert_eq!(ack.seq, 51);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert_eq!(ack.detail.as_deref(), Some(QUIT_REFUSAL));
+    assert_nothing_forwarded(&harness);
+
+    // The refusal is not fatal to the socket either: the tab keeps working.
+    on_runtime(command(&mut ws, 52, names::REQUEST_SNAPSHOT));
+    on_runtime(await_snapshot(&mut ws));
+}
+
+/// D14: read-only means read-only, for the whole surface and not just for the
+/// four M1 names — the seat check runs before the command's own route is even
+/// considered, so nothing added later can slip past it.
+#[test]
+fn an_observers_palette_command_is_refused_as_read_only() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Observe).await;
+        await_snapshot(&mut ws).await;
+
+        // One that would run, one that would be refused anyway, and one that is
+        // desktop-only: an observer gets `read_only` for all three, and learns
+        // nothing about which would have worked.
+        for (seq, name) in [
+            (61, names::RESTART_AGENT),
+            (62, names::QUIT),
+            (63, names::OPEN_WORKTREE_IN_FILE_MANAGER),
+        ] {
+            command(&mut ws, seq, name).await;
+            let error = next_error(&mut ws).await;
+            assert_eq!(error.code, ErrorCode::ReadOnly, "for `{name}`");
+            assert_eq!(error.seq, Some(seq));
+        }
+    });
+    assert_nothing_forwarded(&harness);
+}
+
+/// A command whose effect is a dialog is refused with a stated reason rather
+/// than half-opened: acking `Applied` while a modal appeared on the desktop's
+/// screen — which this browser can neither see nor answer — would be the worst
+/// of both worlds (D13 is `remote-control-ll5.3`).
+#[test]
+fn a_dialog_opening_command_is_refused_rather_than_half_opened() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    for (seq, name) in [
+        (71, names::NEW_AGENT_SESSION_TAB),
+        (72, names::ABANDON_WORKTREE),
+        (73, names::SET_MANUAL_STATUS),
+    ] {
+        on_runtime(command(&mut ws, seq, name));
+        let error = on_runtime(next_error(&mut ws));
+        assert_eq!(error.code, ErrorCode::NotSupported, "for `{name}`");
+        assert_eq!(error.seq, Some(seq));
+        assert!(
+            error.message.len() > 30,
+            "`{name}` must say why: {}",
+            error.message
+        );
+    }
+    assert_nothing_forwarded(&harness);
+
+    // Still alive, like any other refusal.
+    on_runtime(command(&mut ws, 74, names::REQUEST_SNAPSHOT));
+    on_runtime(await_snapshot(&mut ws));
+}
+
+/// SPECS §5: no browser-reachable path rewrites history or creates a PR. Proven
+/// over the wire in both directions — the history-touching names are offered
+/// (the row is visible) and refused, and every name the host *will* run carries
+/// a command that neither rewrites history nor opens a PR.
+#[test]
+fn no_browser_reachable_command_rewrites_history_or_opens_a_pr() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    for (seq, name) in [
+        (81, names::REBASE_WORKTREE),
+        (82, names::PULL_BASE),
+        (83, names::PUSH_BRANCH),
+        (84, names::FINISH_LOCAL_MERGE),
+    ] {
+        on_runtime(command(&mut ws, seq, name));
+        let error = on_runtime(next_error(&mut ws));
+        assert_eq!(error.code, ErrorCode::NotSupported, "for `{name}`");
+        assert_eq!(error.seq, Some(seq));
+    }
+    assert_nothing_forwarded(&harness);
+
+    // The other direction: whatever the host does forward cannot be one of
+    // them, whichever route a future change puts it on.
+    for spec in commands::INVENTORY {
+        if let Some(cmd) = commands::dispatched_command(&spec.route) {
+            assert!(
+                !commands::rewrites_history(cmd) && !commands::creates_pull_request(cmd),
+                "`{}` would dispatch {cmd:?} from a browser",
+                spec.name
+            );
+        }
+    }
+}
+
+/// An `AppState` with no tabs — enough for the global view commands, which is
+/// what these tests drive.
+fn app_state() -> AppState {
+    AppState::new(
+        Config::default(),
+        ProjectState {
+            version: STATE_VERSION,
+            project_root_relative: ".".to_string(),
+            base_branch: "main".to_string(),
+            tabs: Vec::new(),
+        },
+        std::path::Path::new("."),
+        std::path::Path::new("state.json"),
+    )
+}

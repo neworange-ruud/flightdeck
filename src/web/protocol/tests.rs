@@ -192,6 +192,25 @@ fn snapshot() -> Snapshot {
         replay_capacity_bytes: 256 * 1024,
         activity: vec![activity_event()],
         dialog: Some(dialog_view()),
+        commands: vec![command_view()],
+    }
+}
+
+/// One palette row as the host describes it, exercising every optional field so
+/// the round-trip test cannot skip one.
+fn command_view() -> CommandView {
+    CommandView {
+        id: "open_worktree_in_file_manager".into(),
+        label: "Open Worktree in File Manager".into(),
+        group: "Worktree".into(),
+        run: CommandRun {
+            name: "open_worktree_in_file_manager".into(),
+            args: None,
+        },
+        host_only: true,
+        annotation: Some("host only".into()),
+        target: None,
+        refusal: Some("Run it from the desktop.".into()),
     }
 }
 

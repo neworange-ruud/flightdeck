@@ -1046,6 +1046,90 @@ pub struct Snapshot {
     /// The open dialog, if any (D13).
     #[serde(default)]
     pub dialog: Option<DialogView>,
+    /// The host's command inventory: every name this build accepts, with the
+    /// label, group and `host only` flag the palette needs (D16, artboard 1d).
+    ///
+    /// Sent with the snapshot rather than compiled into the SPA because the
+    /// host is the only thing that knows what it implements. A browser built
+    /// against a different FlightDeck therefore renders *that* host's surface,
+    /// and a name the host does not have cannot appear in the palette at all.
+    /// See [`CommandView`] for how a row becomes a frame.
+    #[serde(default)]
+    pub commands: Vec<CommandView>,
+}
+
+/// One row of the browser's command palette, as the host describes it.
+///
+/// The shape deliberately mirrors `webui/src/state/commands.ts`'s
+/// `PaletteCommand` (`{ id, label, group, run, hostOnly?, annotation? }`) so the
+/// SPA's palette can render a host-supplied row without a second model — only
+/// the snake_case → camelCase rename the adapter already does for every other
+/// wire type. Two fields are additions the browser did not have:
+///
+/// * [`CommandView::target`] — the row is a *template*: expand it into one row
+///   per project / session / terminal / unread event and fill `run.args`.
+/// * [`CommandView::refusal`] — the host will refuse this name today, for the
+///   stated reason. The row still renders (D16: visible and honest beats
+///   hidden), and sending it returns this same sentence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandView {
+    /// Stable id for keyed rendering. Equal to `run.name` for a plain row; a
+    /// template row's expansions append their target id (`select_session:t1`).
+    pub id: String,
+    /// The label the user reads and filters on, matching the TUI's palette.
+    pub label: String,
+    /// The palette group heading (`Worktree`, `Git`, `Terminals`, …).
+    pub group: String,
+    /// The frame to send when the row is chosen.
+    pub run: CommandRun,
+    /// D16: the effect lands on the host's machine. Rendered as the `host only`
+    /// badge and never hidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_only: bool,
+    /// Artboard 1d's right-hand tag (`current`, `3 unread`, …), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+    /// Set when the row is a template needing a target id in `run.args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<CommandTarget>,
+    /// Set when this build will refuse the name, with the reason it refuses.
+    /// Absent means the host runs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// The [`Command`] frame a [`CommandView`] row sends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRun {
+    /// The command name; see [`command`].
+    pub name: String,
+    /// Pre-filled arguments, if the row needs none from the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+}
+
+/// What a template [`CommandView`] expands over, and which `run.args` key the
+/// browser fills with the chosen target's id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandTarget {
+    /// One row per open project; `args: { project_id }`.
+    Project,
+    /// One row per session in the selected project; `args: { session_id }`.
+    Session,
+    /// One row per terminal in the selected session; `args: { terminal_id }`.
+    Terminal,
+    /// A single row carrying every unread event id; `args: { event_ids }`.
+    UnreadActivity,
+    /// A target kind this build does not know. The row is skipped rather than
+    /// rendered without its argument.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// `skip_serializing_if` for a plain `bool` — a `false` flag stays off the wire.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One state change, pushed as it happens.
@@ -1499,9 +1583,13 @@ pub struct Resize {
     pub viewport: Viewport,
 }
 
-/// Named M1 commands. String constants rather than an enum so [`Command::name`]
-/// stays open (see [`Command`]), while the host and the SPA still share one
-/// spelling.
+/// Every command name the host answers. String constants rather than an enum so
+/// [`Command::name`] stays open (see [`Command`]), while the host and the SPA
+/// still share one spelling.
+///
+/// The spellings live here; which palette action each one *runs*, and whether it
+/// runs at all, lives in [`super::commands`] — one table, so a palette action
+/// cannot become silently unreachable from a browser.
 pub mod command {
     /// Select a project (D3 — moves the desktop too).
     pub const SELECT_PROJECT: &str = "select_project";
@@ -1516,6 +1604,75 @@ pub mod command {
     pub const REQUEST_SNAPSHOT: &str = "request_snapshot";
     /// Give up the controlling seat voluntarily and become an observer (D14).
     pub const RELEASE_SEAT: &str = "release_seat";
+
+    // -- the palette surface (§22's actions, by wire name) -----------------
+
+    /// Open a project folder picker (SPECS §22 "Open Project").
+    pub const OPEN_PROJECT: &str = "open_project";
+    /// Close the active project.
+    pub const CLOSE_PROJECT: &str = "close_project";
+    /// Switch to the next open project.
+    pub const NEXT_PROJECT: &str = "next_project";
+    /// Switch to the previous open project.
+    pub const PREVIOUS_PROJECT: &str = "previous_project";
+    /// Create a branch + worktree and spawn an agent (SPECS §4, §16, §17).
+    pub const NEW_AGENT_SESSION_TAB: &str = "new_agent_session_tab";
+    /// Rename the selected session tab (SPECS §18).
+    pub const RENAME_AGENT_SESSION_TAB: &str = "rename_agent_session_tab";
+    /// Close the selected session tab (SPECS §25's option set).
+    pub const CLOSE_AGENT_SESSION_TAB: &str = "close_agent_session_tab";
+    /// Move to the next session tab.
+    pub const SWITCH_AGENT_SESSION_TAB: &str = "switch_agent_session_tab";
+    /// Restart the selected session's primary agent (SPECS §10, §23).
+    pub const RESTART_AGENT: &str = "restart_agent";
+    /// Rebase the selected worktree onto its base branch (SPECS §5.1).
+    pub const REBASE_WORKTREE: &str = "rebase_worktree";
+    /// Remove the selected worktree (SPECS §5/§15).
+    pub const ABANDON_WORKTREE: &str = "abandon_worktree";
+    /// Reveal the selected worktree in the OS file manager (D16: host only).
+    pub const OPEN_WORKTREE_IN_FILE_MANAGER: &str = "open_worktree_in_file_manager";
+    /// Open a config file in the host's `$EDITOR` (D16: host only).
+    pub const EDIT_IN_EDITOR: &str = "edit_in_editor";
+    /// Push the selected session's branch (SPECS §14).
+    pub const PUSH_BRANCH: &str = "push_branch";
+    /// Local merge-back into the base branch (SPECS §13, §15).
+    pub const FINISH_LOCAL_MERGE: &str = "finish_local_merge";
+    /// Pull the base branch in the base folder (SPECS §5.2).
+    pub const PULL_BASE: &str = "pull_base";
+    /// Show the git status panel (SPECS §21).
+    pub const SHOW_GIT_STATUS: &str = "show_git_status";
+    /// Open a child shell terminal (SPECS §19).
+    pub const NEW_CHILD_TERMINAL: &str = "new_child_terminal";
+    /// Close the selected child shell terminal.
+    pub const CLOSE_CHILD_TERMINAL: &str = "close_child_terminal";
+    /// Spawn an additional agent in the selected session's worktree.
+    pub const NEW_AGENT: &str = "new_agent";
+    /// Close the selected additional agent terminal.
+    pub const CLOSE_AGENT: &str = "close_agent";
+    /// Move to the next child terminal.
+    pub const SWITCH_CHILD_TERMINAL: &str = "switch_child_terminal";
+    /// Open a shell in the selected session's worktree (SPECS §10/§22).
+    pub const OPEN_SHELL: &str = "open_shell";
+    /// Set or clear the manual status override (SPECS §24).
+    pub const SET_MANUAL_STATUS: &str = "set_manual_status";
+    /// Open the configuration manager (SPECS §8).
+    pub const OPEN_CONFIGURATION: &str = "open_configuration";
+    /// Begin pairing a phone (FlightDeck Remote).
+    pub const PAIR_PHONE: &str = "pair_phone";
+    /// Forget the paired phone.
+    pub const UNPAIR_PHONE: &str = "unpair_phone";
+    /// Start the embedded web interface (D10).
+    pub const START_WEB_INTERFACE: &str = "start_web_interface";
+    /// Stop the embedded web interface (Q5).
+    pub const STOP_WEB_INTERFACE: &str = "stop_web_interface";
+    /// Lay the selected session's terminals out side by side.
+    pub const TOGGLE_SPLIT_VIEW: &str = "toggle_split_view";
+    /// Show help / keybindings (SPECS §23).
+    pub const SHOW_HELP: &str = "show_help";
+    /// Show the About dialog.
+    pub const ABOUT_FLIGHTDECK: &str = "about_flightdeck";
+    /// Quit FlightDeck and every agent with it (D16: never from a bare frame).
+    pub const QUIT: &str = "quit";
 }
 
 /// A named command with free-form arguments — **the M2 door** (D13).

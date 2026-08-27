@@ -249,6 +249,17 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// Interface" / "Stop Web Interface", D10) makes 33.
 pub const REQUIRED_ACTION_COUNT: usize = 33;
 
+/// Every §22 palette row, in display order, unfiltered and ungated.
+///
+/// The desktop reaches these through [`CommandPalette::filtered`], which hides
+/// the rows that do not apply to the current pairing / web / isolation state.
+/// This accessor exists for the *other* consumer:
+/// [`crate::web::commands`] maps each row to a wire name so a browser can run
+/// it, and its coverage test walks this list to prove none was missed.
+pub fn all_entries() -> &'static [PaletteEntry] {
+    ALL_ENTRIES
+}
+
 /// The command palette model (SPECS §22).
 ///
 /// Holds the filter text and the current selection index into the filtered list.

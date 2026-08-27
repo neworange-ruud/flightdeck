@@ -1237,6 +1237,31 @@ struct Ui {
     /// lifecycle commands is ever offered — the same gating idiom as
     /// [`Ui::remote_paired`].
     web_running: bool,
+    /// What the last dispatch produced, recorded so a browser's `Command` frame
+    /// can be acked honestly instead of being told `Applied` while the desktop
+    /// showed the user a refusal.
+    ///
+    /// The desktop reads its outcome off the screen — that is what
+    /// [`Ui::message`] is for — but a browser cannot, and
+    /// `specs/WEB_INTERFACE.md` §5.1 does not allow a guess. So the classifying
+    /// sites ([`apply_effect`], [`dispatch_command`]'s error arm, and
+    /// [`switch_project`]'s isolated refusal) record what they decided here, and
+    /// [`run_web_command`] clears it before dispatching and reads it after.
+    /// Overwritten constantly by the desktop's own keypresses, which is fine:
+    /// only the value written during one web dispatch is ever read.
+    web_outcome: Option<WebDispatch>,
+}
+
+/// What one dispatch produced, in the vocabulary a
+/// [`crate::web::protocol::Ack`] needs (see [`Ui::web_outcome`]).
+#[derive(Debug, Clone)]
+enum WebDispatch {
+    /// It happened. The string is the sentence the desktop showed, if any.
+    Applied(Option<String>),
+    /// A safety guard said no, with its reason. Nothing happened.
+    Refused(String),
+    /// The dispatch itself failed, with the error. Nothing happened.
+    Failed(String),
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -1727,6 +1752,7 @@ fn resume_active_project_agents(workspace: &mut Workspace, env: &Env) {
 /// isolated run, which has exactly one project by construction (SPECS §32).
 fn switch_project(workspace: &mut Workspace, env: &Env, sel: Selector, ui: &mut Ui) {
     if workspace.active_project().state.isolated {
+        ui.web_outcome = Some(WebDispatch::Refused(ISOLATED_REFUSAL.to_string()));
         ui.message(ISOLATED_REFUSAL);
         return;
     }
@@ -2252,31 +2278,28 @@ fn event_loop(
             let inbound: Vec<crate::web::server::WebInbound> =
                 web_surface.inbound_rx.try_iter().collect();
             for event in inbound {
-                // D11's read-marking is host state, not stream state: the flag
-                // lives on the event in `WebSurface::activity` so a second tab
-                // — or the same tab tomorrow — backfills a feed that agrees
-                // about what has already been seen, instead of every tab
-                // opening on the same wall of unread. The server has already
-                // refused this frame from a read-only seat, so reaching here
-                // means a controller sent it.
-                //
-                // Selection changes (D3) are still the other task's half of the
-                // M1 surface; this loop owns the byte stream, the keystrokes and
-                // the feed, and answers each with its own ack.
+                // A `Command` frame is the browser's palette pressing Enter:
+                // `run_web_command` routes it into the same `run_palette_action`
+                // the desktop's own palette calls, and answers with the ack that
+                // dispatch earned. The server has already refused an unknown
+                // name, a read-only seat's frame (D14) and every command whose
+                // effect must not land for a browser (D16, including `quit`), so
+                // reaching here means a controller sent something runnable.
                 if let crate::web::server::WebInbound::Command { viewer_id, command } = &event {
-                    if command.name == crate::web::protocol::command::MARK_ACTIVITY_READ {
-                        let ack = crate::web::activity::apply_mark_read(
-                            &mut web_surface.activity,
-                            command,
-                        );
-                        if let Some(handle) = web_surface.handle.as_ref() {
-                            handle.send(crate::web::server::WebOutbound::Viewer {
-                                viewer_id: viewer_id.clone(),
-                                msg: crate::web::protocol::ServerMsg::Ack(ack),
-                            });
-                        }
-                        continue;
+                    let ack = run_web_command(
+                        command,
+                        workspace,
+                        env,
+                        &mut ui,
+                        &mut web_surface.activity,
+                    );
+                    if let Some(handle) = web_surface.handle.as_ref() {
+                        handle.send(crate::web::server::WebOutbound::Viewer {
+                            viewer_id: viewer_id.clone(),
+                            msg: crate::web::protocol::ServerMsg::Ack(ack),
+                        });
                     }
+                    continue;
                 }
                 let mut host = WorkspaceTerminals {
                     projects: &mut workspace.projects,
@@ -4442,13 +4465,48 @@ fn dispatch_command(
     // maps its effect onto the UI.
     match state.dispatch(cmd, services) {
         Ok(effect) => apply_effect(effect, state, ui),
-        Err(e) => ui.message(format!("Error: {e}")),
+        Err(e) => {
+            ui.web_outcome = Some(WebDispatch::Failed(e.to_string()));
+            ui.message(format!("Error: {e}"));
+        }
     }
     Ok(())
 }
 
 /// Map a dispatch [`Effect`] onto the [`Ui`] overlays/prompts (SPECS §22).
+///
+/// Also records the outcome in [`Ui::web_outcome`], so the same dispatch can be
+/// acked to a browser without a second interpretation of what it did. A
+/// prompt-opening effect is recorded as a refusal: from a browser's point of
+/// view a modal that appeared on someone else's screen is not an application.
 fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
+    ui.web_outcome = Some(match &effect {
+        Effect::Refused(m) => WebDispatch::Refused(m.clone()),
+        // Warnings map to applied-with-caveat, exactly as `fold_remote_effect`
+        // does for the phone; a caller whose command treats a warning as
+        // "nothing happened" must intercept it before dispatching.
+        Effect::Message(m) | Effect::Warning(m) => WebDispatch::Applied(Some(m.clone())),
+        Effect::PrUrl(url) => WebDispatch::Applied(Some(url.clone())),
+        Effect::AttachedExisting { branch } => {
+            WebDispatch::Applied(Some(format!("Attached to existing branch {branch}")))
+        }
+        Effect::None | Effect::Quit => WebDispatch::Applied(None),
+        Effect::OpenInFileManager { .. } => {
+            WebDispatch::Refused(crate::web::commands::HOST_ONLY_REFUSAL.to_string())
+        }
+        Effect::PushWarning(_)
+        | Effect::AbandonWarning { .. }
+        | Effect::MergeConfirm { .. }
+        | Effect::RebaseConfirm { .. }
+        | Effect::CloseTabOptions(_)
+        | Effect::GitStatus { .. }
+        | Effect::ShowHelp
+        | Effect::ShowAbout => WebDispatch::Refused(
+            "This opened a dialog on the desktop, which a browser cannot see or \
+             answer in this build."
+                .to_string(),
+        ),
+    });
     match effect {
         Effect::None => ui.clear(),
         Effect::Quit => ui.should_quit = true,
@@ -5982,6 +6040,262 @@ fn run_palette_action(
         | PaletteAction::StartWebInterface
         | PaletteAction::StopWebInterface => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the browser's command surface (specs/WEB_INTERFACE.md §1)
+// ---------------------------------------------------------------------------
+
+/// Apply one browser [`Command`](crate::web::protocol::Command) frame and return
+/// the [`Ack`](crate::web::protocol::Ack) to send back to that viewer.
+///
+/// **The browser is a second way to choose a palette row, not a second way to
+/// run one** (§1). Nothing here performs a command: a
+/// [`crate::web::commands::Route::Palette`] row carries the very
+/// [`PaletteAction`] the TUI's palette hands to [`run_palette_action`] on Enter,
+/// and this passes it into that same function. There is deliberately no arm
+/// that reimplements an effect — that drift is what the decision exists to
+/// prevent.
+///
+/// The `Ack` is derived from what the dispatch actually did
+/// ([`Ui::web_outcome`]), never assumed: a command that hit a safety guard acks
+/// `Rejected` with the guard's own sentence, so the browser shows the same
+/// refusal the desktop user would have read.
+///
+/// The refusing arms are defence in depth. [`crate::web::server`] answers them
+/// before a frame is ever forwarded — which is why a bare frame naming `quit`
+/// cannot reach a dispatch — so reaching them here would mean the table and the
+/// server had disagreed.
+fn run_web_command(
+    command: &crate::web::protocol::Command,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    activity: &mut crate::web::activity::ActivityStore,
+) -> crate::web::protocol::Ack {
+    use crate::web::commands::Route;
+    use crate::web::protocol::{Ack, AckOutcome};
+
+    let ack = |outcome, detail: Option<String>| Ack {
+        seq: command.seq,
+        outcome,
+        detail,
+    };
+
+    let Some(spec) = crate::web::commands::lookup(&command.name) else {
+        return ack(
+            AckOutcome::Rejected,
+            Some(format!(
+                "`{}` is not a command this FlightDeck has.",
+                command.name
+            )),
+        );
+    };
+
+    match &spec.route {
+        // D11: read-marking is host state, so a second tab — or the same tab
+        // tomorrow — backfills a feed that agrees about what has been seen.
+        Route::ActivityRead => crate::web::activity::apply_mark_read(activity, command),
+        // D3: the selection is shared, so this moves the desktop too.
+        Route::Selection(target) => {
+            match apply_web_selection(*target, command.args.as_ref(), workspace, env, ui) {
+                Ok(detail) => ack(AckOutcome::Applied, detail),
+                Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
+            }
+        }
+        Route::Palette(action) => {
+            ui.web_outcome = None;
+            let dispatched = run_palette_action(action.clone(), workspace, env, ui);
+            match (dispatched, ui.web_outcome.take()) {
+                (Err(e), _) => ack(AckOutcome::Rejected, Some(e.to_string())),
+                (Ok(()), Some(WebDispatch::Refused(reason))) => {
+                    ack(AckOutcome::Rejected, Some(reason))
+                }
+                (Ok(()), Some(WebDispatch::Failed(error))) => {
+                    ack(AckOutcome::Rejected, Some(error))
+                }
+                (Ok(()), Some(WebDispatch::Applied(detail))) => ack(AckOutcome::Applied, detail),
+                // Nothing classified an outcome, which for the forwarded set
+                // means it did its work quietly (a selection move, a split-view
+                // toggle). Applied with no sentence rather than an invented one.
+                (Ok(()), None) => ack(AckOutcome::Applied, None),
+            }
+        }
+        Route::Server => ack(
+            AckOutcome::Ignored,
+            Some(format!(
+                "`{}` is answered by the server and should not have reached the host.",
+                spec.name
+            )),
+        ),
+        Route::Rejected(reason) | Route::NotSupported(reason) => {
+            ack(AckOutcome::Rejected, Some((*reason).to_string()))
+        }
+    }
+}
+
+/// Move the shared selection (D3) on behalf of a browser, through the same
+/// functions the desktop's own palette and mouse clicks use: [`switch_project`]
+/// for a project, [`Command::SwitchAgentTab`] for a session, [`select_target`]
+/// for a terminal.
+///
+/// `Ok(detail)` is the sentence to ack with; `Err(reason)` is a refusal — a
+/// stale id from a browser whose snapshot has drifted, or a guard (an isolated
+/// run has one project by construction) saying no.
+fn apply_web_selection(
+    target: crate::web::commands::SelectionTarget,
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> std::result::Result<Option<String>, String> {
+    use crate::web::commands::SelectionTarget;
+
+    match target {
+        SelectionTarget::Project => {
+            let id = web_string_arg(args, "project_id")?;
+            let index = workspace
+                .projects
+                .iter()
+                // The same id `build_web_host_state` mints: the repository root.
+                .position(|p| p.git.root().display().to_string() == id)
+                .ok_or_else(|| stale_id("project", &id))?;
+            select_web_project(workspace, env, ui, index)?;
+            Ok(Some(format!(
+                "Selected project {}",
+                workspace.active_project().name
+            )))
+        }
+        SelectionTarget::Session => {
+            let id = web_string_arg(args, "session_id")?;
+            let (project, tab) =
+                locate_web_session(workspace, &id).ok_or_else(|| stale_id("session", &id))?;
+            select_web_session(workspace, env, ui, project, tab)?;
+            Ok(Some(format!(
+                "Selected session {}",
+                workspace.projects[project].state.tabs[tab].meta.name
+            )))
+        }
+        SelectionTarget::Terminal => {
+            let id = web_string_arg(args, "terminal_id")?;
+            let (project, tab, child) =
+                locate_web_terminal(workspace, &id).ok_or_else(|| stale_id("terminal", &id))?;
+            // A terminal implies its session (D3 keeps one selection for the
+            // whole instance), so the session moves first.
+            select_web_session(workspace, env, ui, project, tab)?;
+            let p = &mut workspace.projects[project];
+            let services = env.services(&p.git);
+            select_target(&mut p.state, &services, child);
+            Ok(None)
+        }
+    }
+}
+
+/// One required string argument off a `Command` frame's `args` object.
+fn web_string_arg(
+    args: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<String, String> {
+    args.and_then(|args| args.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("This command needs a `{key}` argument."))
+}
+
+/// The refusal for an id the host does not have — almost always a browser whose
+/// snapshot predates a close (Q3), which is why it says so rather than just
+/// failing.
+fn stale_id(kind: &str, id: &str) -> String {
+    format!("No {kind} `{id}` is open — this tab's view is out of date; ask for a fresh snapshot.")
+}
+
+/// Make `index` the active project unless it already is, reusing
+/// [`switch_project`] so the isolated-run refusal (SPECS §32) and the agent
+/// resume both still happen.
+fn select_web_project(
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    index: usize,
+) -> std::result::Result<(), String> {
+    if workspace.active == index {
+        return Ok(());
+    }
+    ui.web_outcome = None;
+    switch_project(workspace, env, Selector::Index(index), ui);
+    match ui.web_outcome.take() {
+        Some(WebDispatch::Refused(reason)) | Some(WebDispatch::Failed(reason)) => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Select one session, switching project first if it lives in another one — a
+/// browser can be looking at a background project, and D3 says the desktop
+/// follows.
+fn select_web_session(
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    project: usize,
+    tab: usize,
+) -> std::result::Result<(), String> {
+    select_web_project(workspace, env, ui, project)?;
+    if workspace.projects[project].state.selected_tab == Some(tab) {
+        return Ok(());
+    }
+    let p = &mut workspace.projects[project];
+    let services = env.services(&p.git);
+    ui.web_outcome = None;
+    dispatch_command(
+        Command::SwitchAgentTab(Selector::Index(tab)),
+        &mut p.state,
+        &services,
+        ui,
+    )
+    .map_err(|e| e.to_string())?;
+    match ui.web_outcome.take() {
+        Some(WebDispatch::Refused(reason)) | Some(WebDispatch::Failed(reason)) => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Find a wire session id among every open project's tabs.
+fn locate_web_session(workspace: &Workspace, session_id: &str) -> Option<(usize, usize)> {
+    workspace.projects.iter().enumerate().find_map(|(pi, p)| {
+        p.state
+            .tabs
+            .iter()
+            .position(|tab| tab.meta.id == session_id)
+            .map(|ti| (pi, ti))
+    })
+}
+
+/// Find a wire terminal id among every open project's terminals, returning the
+/// [`ChildTarget`] that selects it.
+///
+/// The ids are rebuilt with [`crate::web::stream`]'s own minters rather than
+/// parsed, so this cannot drift from the spelling the snapshot published.
+fn locate_web_terminal(
+    workspace: &Workspace,
+    terminal_id: &str,
+) -> Option<(usize, usize, ChildTarget)> {
+    for (pi, p) in workspace.projects.iter().enumerate() {
+        for (ti, tab) in p.state.tabs.iter().enumerate() {
+            if crate::web::stream::primary_terminal_id(&tab.meta.id).as_str() == terminal_id {
+                return Some((pi, ti, ChildTarget::Primary));
+            }
+            for c in 0..tab.session.child_count() {
+                let matches = tab.session.child(c).is_some_and(|child| {
+                    crate::web::stream::child_terminal_id(&tab.meta.id, child.stream_id()).as_str()
+                        == terminal_id
+                });
+                if matches {
+                    return Some((pi, ti, ChildTarget::Child(c)));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -9225,7 +9539,7 @@ mod tests {
             }
         }
 
-        fn one_project_workspace(isolated: bool) -> Workspace {
+        pub(super) fn one_project_workspace(isolated: bool) -> Workspace {
             let mut config = config_with_agent(AgentDef {
                 key: "codex".to_string(),
                 display_name: "Codex".to_string(),
@@ -9256,7 +9570,7 @@ mod tests {
             }
         }
 
-        fn two_project_workspace(active_isolated: bool) -> Workspace {
+        pub(super) fn two_project_workspace(active_isolated: bool) -> Workspace {
             let mut ws = one_project_workspace(active_isolated);
             let mut other_config = config_with_agent(AgentDef {
                 key: "claude".to_string(),
@@ -9288,7 +9602,7 @@ mod tests {
             ws
         }
 
-        fn env<'a>(
+        pub(super) fn env<'a>(
             fs: &'a FakeFs,
             pty: &'a FakePty,
             clock: &'a FakeClock,
@@ -9602,6 +9916,202 @@ mod tests {
                 "a normal run still creates the global base on open: {:?}",
                 fs.writes()
             );
+        }
+    }
+
+    /// The host half of the browser's command surface: `run_web_command` routes
+    /// a real wire frame into the TUI's own palette path and acks what that
+    /// dispatch actually did (`specs/WEB_INTERFACE.md` §1, D3, D16).
+    ///
+    /// The refusing cases are tested here as well as in `tests/web_server.rs`
+    /// deliberately: the server refuses them before forwarding, so these prove
+    /// the second line of defence would hold if the two ever disagreed.
+    mod web_command_surface {
+        use super::isolated_refusals::{env, one_project_workspace, two_project_workspace};
+        use super::*;
+        use crate::web::activity::ActivityStore;
+        use crate::web::protocol::{command as names, AckOutcome, Command as WireCommand};
+        use serde_json::json;
+
+        fn frame(seq: u64, name: &str, args: Option<serde_json::Value>) -> WireCommand {
+            WireCommand {
+                seq,
+                name: name.to_string(),
+                args,
+            }
+        }
+
+        /// Run one wire frame against `workspace`, returning the ack the browser
+        /// would receive. Builds the fake services fresh, as the event loop
+        /// builds the real ones per tick.
+        fn run(
+            workspace: &mut Workspace,
+            ui: &mut Ui,
+            command: &WireCommand,
+        ) -> crate::web::protocol::Ack {
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let mut activity = ActivityStore::new();
+            run_web_command(command, workspace, &e, ui, &mut activity)
+        }
+
+        /// D3: the selection is shared, so a browser choosing a project moves
+        /// the desktop onto it. The id is the one `build_web_host_state` mints —
+        /// the repository root — read off the workspace rather than spelled out.
+        #[test]
+        fn selecting_a_project_moves_the_desktop_too() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            let id = ws.projects[1].git.root().display().to_string();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::SELECT_PROJECT, Some(json!({ "project_id": id }))),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert_eq!(ack.seq, 1);
+            assert_eq!(ws.active, 1, "the desktop followed the browser");
+        }
+
+        /// A browser whose snapshot predates a close names an id the host does
+        /// not have. Refused with a sentence that says what to do about it, not
+        /// silently ignored.
+        #[test]
+        fn a_stale_id_is_refused_with_a_reason() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    2,
+                    names::SELECT_SESSION,
+                    Some(json!({ "session_id": "tab-that-was-closed" })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("out of date"), "{detail}");
+        }
+
+        /// A missing argument is a refusal, not a panic and not a guess.
+        #[test]
+        fn a_selection_with_no_target_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(3, names::SELECT_TERMINAL, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("terminal_id"));
+        }
+
+        /// The ack is what the dispatch earned. `toggle_split_view` goes through
+        /// `run_palette_action`, and the sentence the desktop showed is the
+        /// sentence the browser gets.
+        #[test]
+        fn a_palette_command_acks_what_the_dispatch_did() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            assert!(!ws.projects[0].state.split_view);
+
+            let ack = run(&mut ws, &mut ui, &frame(4, names::TOGGLE_SPLIT_VIEW, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(
+                ws.projects[0].state.split_view,
+                "the browser drove the real app state"
+            );
+            assert_eq!(ack.detail.as_deref(), Some("Split view on."));
+        }
+
+        /// A guard's refusal reaches the browser verbatim instead of becoming a
+        /// fake success: an isolated run has one project by construction (SPECS
+        /// §32), and says so in the same words the desktop would show.
+        #[test]
+        fn a_refused_dispatch_acks_the_guards_own_sentence() {
+            let mut ws = one_project_workspace(true);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(5, names::NEXT_PROJECT, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(ack.detail.as_deref(), Some(ISOLATED_REFUSAL));
+        }
+
+        /// D16, defence in depth: even if a frame naming `quit` reached the host
+        /// applier, there is no arm that dispatches it — it is refused with the
+        /// same sentence the socket would have used, and nothing quits.
+        #[test]
+        fn a_quit_frame_that_reaches_the_applier_still_cannot_quit() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(6, names::QUIT, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::QUIT_REFUSAL)
+            );
+            assert!(!ui.should_quit, "no browser frame may set the quit flag");
+        }
+
+        /// The same for a desktop-only action: refused with D16's sentence, and
+        /// no file manager is spawned on the host's machine.
+        #[test]
+        fn a_desktop_only_frame_is_refused_with_the_host_only_sentence() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(7, names::OPEN_WORKTREE_IN_FILE_MANAGER, None),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::HOST_ONLY_REFUSAL)
+            );
+        }
+
+        /// A name this build does not have never reaches a dispatch, at either
+        /// layer.
+        #[test]
+        fn an_unknown_name_is_refused_by_the_applier_too() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(8, "git_force_push", None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("git_force_push"));
+        }
+
+        /// D11: read-marking still works through the unified applier — the frame
+        /// that used to be special-cased in the drain now routes off the same
+        /// table as everything else.
+        #[test]
+        fn marking_activity_read_still_routes_through_the_table() {
+            let spec = crate::web::commands::lookup(names::MARK_ACTIVITY_READ)
+                .expect("the feed command is in the inventory");
+            assert_eq!(spec.route, crate::web::commands::Route::ActivityRead);
         }
     }
 }

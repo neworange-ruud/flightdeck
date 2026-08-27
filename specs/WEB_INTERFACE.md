@@ -662,6 +662,63 @@ own on-disk reply log records the line), and that the rendered grid is the host'
 `cols`×`rows` with the geometry chip saying so. The keystroke test was checked
 for vacuity by disabling the input path and watching it fail.
 
+### R7 — the command inventory is host state on the wire, and one table owns it
+
+M1 shipped six command names and the SPA had to invent two more
+(`open_worktree_in_file_manager`, `edit_in_editor`) so D16's badges could be real
+UI. Both halves of that are now fixed by one decision: **the host owns the
+command inventory and sends it**, in `Snapshot::commands`.
+
+`src/web/commands.rs` holds a single `INVENTORY` table — wire name, label, group,
+`host_only`, annotation, route — and it is the only source for all three
+consumers: `src/web/server.rs` refuses any name not in it, `src/lib.rs` routes
+what is, and the snapshot field is built from it. One row on the wire is
+
+```
+{ id, label, group, run: { name, args? }, host_only?, annotation?, target?, refusal? }
+```
+
+matching `webui/src/state/commands.ts`'s `PaletteCommand` field for field (modulo
+the snake_case → camelCase rename the adapter already does for every wire type),
+plus two additions: `target` (`project` / `session` / `terminal` /
+`unread_activity`) marks a *template* row the browser expands into one row per
+target, filling `run.args`; `refusal`, when present, is the sentence the host
+will answer with if the row is sent, so a row can be shown honestly rather than
+hidden. It rides on the snapshot rather than on `HostState` because it is static
+for the life of the build — there is no change for a `Delta` to describe.
+
+**Dispatch goes through the TUI's own palette path, not a copy of it.** A row's
+route carries the very `PaletteAction` the desktop's palette hands to
+`run_palette_action` on Enter, and `run_web_command` passes it into that same
+function; the ack is derived from what the dispatch reported (`Ui::web_outcome`),
+so a guard's refusal reaches the browser in the guard's own words. §1's "drives
+the same code paths" is therefore structural: there is no arm anywhere that
+performs a command's effect a second time.
+
+**Three consequences worth stating, because they are constraints on later tasks:**
+
+1. *Nothing can become silently unreachable.* `exposure_of` is an exhaustive
+   match over `PaletteAction` (and through it `Command`) with no wildcard arm, so
+   a new palette action fails to compile until it is classified, and a test walks
+   `palette::all_entries()` to prove the name it claims is really in the table —
+   labels and groups included, so the two palettes cannot drift apart.
+2. *The git-ownership boundary holds by construction (SPECS §5).* A forwarding
+   row ignores the frame's `args` entirely — the action and every `confirm` flag
+   inside it come from the table — so no frame can smuggle a confirmed
+   destructive operation, and the two history-rewriting commands
+   (`rebase_worktree`, `pull_base`) are not on a forwarding route at all.
+3. *Refusals are typed, and the type says who owns the follow-up.* A command
+   whose effect lands on the host's machine (D16's two) or must not land
+   unconfirmed (`quit`, `stop_web_interface`) is answered `Ack{Rejected}` with the
+   reason and **never forwarded**, which is what makes "a bare frame naming quit
+   cannot kill the process" a property of the code rather than of a check.
+   Everything whose browser-side surface belongs to another M2 task — the dialog
+   family (ll5.3), destructive confirmations (ll5.4), git (ll5.5), the
+   configuration manager (ll5.6), help/about/git-status (ll5.8) — is answered
+   `ErrorCode::NotSupported` with a reason naming what is missing, rather than
+   dispatched into a modal on a screen the browser cannot see. Each of those
+   tasks flips its rows' route; nothing else has to move.
+
 ---
 
 ## 7. Reference
@@ -677,4 +734,6 @@ for vacuity by disabling the input path and watching it fail.
   geometry invariant behind D4.
 - `src/lib.rs:2637` — the phone-opened-shell geometry precedent that does not
   generalise.
+- `src/web/commands.rs` — the one table behind the browser's command surface
+  (R7): wire name to palette action, `host only` badges, refusals.
 - `src/remote/client.rs` — the blocking relay client retired by D6/D7.
