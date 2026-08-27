@@ -312,6 +312,22 @@ is the first project; the **project tab row** at the top switches between them.
   Each project's own tabs are still recovered from its `state.json`, and agents
   are **never auto-relaunched** (restart one with `Ctrl-r`).
 
+## Isolated runs
+
+```bash
+flightdeck --isolated   # or: flightdeck -I
+```
+
+`-I, --isolated`: Throwaway run: one fresh session in the current directory. No
+continuation, no worktrees, no other projects, and nothing written to the
+project.
+
+Use it to poke at a repository or try out FlightDeck itself without leaving a
+trace: one Agent Session Tab in the repo root, marked with a permanent
+`ISOLATED` badge, and no `.flightdeck/config.toml`, `.gitignore` entry, or
+`state.json` gets written. Cannot be combined with a subcommand
+(`flightdeck -I doctor` is an error). See SPECS §32 for the full contract.
+
 ## Agent status indicators
 
 Every Agent Tab shows its agent's live status — a one-cell indicator next to the

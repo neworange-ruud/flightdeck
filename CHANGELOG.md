@@ -8,6 +8,40 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **`flightdeck --isolated` / `-I`: a throwaway run.** Launches exactly one
+  fresh Agent Session Tab, running the default agent in the repository root on
+  the branch already checked out — no worktree, no git mutation, and nothing
+  continued from a previous run (`state.json` and the workspace file are never
+  read). FlightDeck writes nothing of its own for the whole run: no first-run
+  `config.toml`, no `.gitignore` entry, no global config base, and nothing on
+  exit either, though existing config on disk is still read and honoured.
+  `ui.auto_continue` is forced off (so even Restart Agent stays a fresh
+  session) and the update check is disabled (no network call, no cache
+  write). Agent status plumbing (the Claude/Codex/OpenCode lifecycle hooks)
+  is redirected to a per-process temp directory outside the project, removed
+  after every session is terminated; a containerized run is the one
+  exception and keeps writing into the bind-mounted worktree, since a temp
+  directory outside it would not be reachable from inside the container.
+  Open Project, Close Project, Next/Previous Project, and New Agent Session
+  Tab are refused with one consistent message (and hidden from the command
+  palette) since an isolated run is one session with nothing else to switch
+  to; Finish/Local Merge, Rebase, and Abandon Worktree are already refused
+  for free because the tab runs on the base branch. A permanent `ISOLATED`
+  badge in the status bar and a leading note in the help overlay (`?`) make
+  the mode unmistakable. Combining the flag with a subcommand
+  (`flightdeck -I doctor`) is a startup error rather than a silent ignore.
+  A normal run's status *root* is unchanged (still the worktree), but its
+  generated hook bodies now carry an absolute status-file path instead of
+  the old cwd-relative one, so a normal run's hooks are not byte-identical
+  to before this series. "Open Configuration" stays available in an
+  isolated run (it is a viewer, not a write action) but no longer creates
+  `~/.flightdeck/config.toml` merely by being opened, and saving from it can
+  no longer undo the forced `ui.auto_continue = false` for the run — both
+  guards live where the config is replaced (`AppState::reload_config`), so
+  they hold regardless of call site. Closing the only session tab quits the
+  run — an isolated run is that one session, and every route back to an agent
+  is refused, so staying open would leave an empty shell whose only exit is
+  Ctrl-q. See SPECS §32.
 - **F1 (or Alt-h) opens help, anywhere.** Both open the help / keybindings panel in App and Terminal focus, so help is reachable without leaving the terminal first. Pressing the same key again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 and Alt-h are claimed — modified F1 and a bare `h` still reach the agent. Two keys because Apple keyboards reserve F1 as a brightness key unless standard function keys are enabled, while `Alt-h` needs "Use Option as Meta key" on macOS — the same requirement `Alt-o` already carries. `Ctrl-g` → *Show Help* works unconditionally on every platform.
 
 ### Improvements
@@ -32,6 +66,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- A base-branch Agent Session Tab now records the branch actually checked out
+  rather than the configured base, so Push Branch pushes the right ref. A
+  detached HEAD (which git reports as the literal string `"HEAD"`, not an
+  error) and a genuine git failure both fall back to the base branch instead.
 - **The phone now shows the agent's replies on Windows.** FlightDeck rebuilds the
   mobile chat from the agent's own session file, and it derived Claude Code's
   store directory by folding path separators and `.` to `-` — but not the Windows

@@ -33,6 +33,11 @@ struct FakeFsState {
     dirs: HashSet<PathBuf>,
     /// Symlinks as `link -> target`.
     symlinks: BTreeMap<PathBuf, PathBuf>,
+    /// Every path handed to a mutating `FileSystem` method, in call order.
+    /// Seeding helpers (`with_file`/`with_dir`) deliberately do not record, so
+    /// a test can assert "this code path wrote nothing" against a pre-seeded
+    /// filesystem.
+    writes: Vec<PathBuf>,
 }
 
 impl FakeFs {
@@ -77,6 +82,20 @@ impl FakeFs {
     pub fn symlink_target(&self, link: &Path) -> Option<PathBuf> {
         self.inner.lock().unwrap().symlinks.get(link).cloned()
     }
+
+    /// Every path passed to a mutating `FileSystem` method, in call order,
+    /// duplicates included. Seeding via `with_file`/`with_dir` is not recorded.
+    pub fn writes(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().writes.clone()
+    }
+
+    /// The journalled writes whose path lies under `root`.
+    pub fn writes_under(&self, root: &Path) -> Vec<PathBuf> {
+        self.writes()
+            .into_iter()
+            .filter(|p| p.starts_with(root))
+            .collect()
+    }
 }
 
 fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
@@ -105,6 +124,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.dirs.insert(p.to_path_buf());
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -122,6 +142,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.files.insert(p.to_path_buf(), contents.to_string());
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -135,6 +156,7 @@ impl FileSystem for FakeFs {
         }
         mark_parents(&mut st.dirs, link);
         st.symlinks.insert(link.to_path_buf(), target.to_path_buf());
+        st.writes.push(link.to_path_buf());
         Ok(())
     }
 
@@ -149,6 +171,7 @@ impl FileSystem for FakeFs {
         }
         entry.push_str(line);
         entry.push('\n');
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 
@@ -182,6 +205,7 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         st.files.retain(|path, _| !path.starts_with(p));
         st.dirs.retain(|dir| dir != p && !dir.starts_with(p));
+        st.writes.push(p.to_path_buf());
         Ok(())
     }
 }
@@ -200,6 +224,9 @@ pub struct FakeGit {
 struct FakeGitState {
     root: PathBuf,
     current_branch: String,
+    /// When set, [`GitExecutor::current_branch`] fails with this `Git` message
+    /// (e.g. to simulate a detached HEAD, which has no branch name).
+    current_branch_error: Option<String>,
     branches: HashSet<String>,
     /// Per-cwd dirty flag; `None` key holds the default.
     dirty: HashMap<PathBuf, bool>,
@@ -245,6 +272,7 @@ impl Default for FakeGit {
             inner: Mutex::new(FakeGitState {
                 root: PathBuf::from("/repo"),
                 current_branch: "main".to_string(),
+                current_branch_error: None,
                 branches: ["main".to_string()].into_iter().collect(),
                 dirty: HashMap::new(),
                 default_dirty: false,
@@ -310,6 +338,13 @@ impl FakeGit {
     /// branch has been created and its name is known.
     pub fn set_current_branch(&self, branch: impl Into<String>) {
         self.inner.lock().unwrap().current_branch = branch.into();
+    }
+
+    /// Make [`GitExecutor::current_branch`] fail, as it would on a detached
+    /// HEAD, which has no branch name to report.
+    pub fn with_current_branch_error(self, message: impl Into<String>) -> Self {
+        self.inner.lock().unwrap().current_branch_error = Some(message.into());
+        self
     }
 
     /// Set the default dirty state used when a `cwd` has no specific override.
@@ -480,7 +515,11 @@ impl GitExecutor for FakeGit {
     }
 
     fn current_branch(&self, _cwd: &Path) -> Result<String> {
-        Ok(self.inner.lock().unwrap().current_branch.clone())
+        let st = self.inner.lock().unwrap();
+        if let Some(msg) = st.current_branch_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
+        Ok(st.current_branch.clone())
     }
 
     fn is_dirty(&self, cwd: &Path) -> Result<bool> {
@@ -1204,5 +1243,73 @@ mod tests {
         assert!(pty
             .spawn("ok", &[], &[], Path::new("/wt"), PtySize::default())
             .is_ok());
+    }
+
+    #[test]
+    fn fake_fs_records_every_mutating_call() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new();
+        fs.write(Path::new("/repo/a.txt"), "x").unwrap();
+        fs.create_dir_all(Path::new("/repo/sub")).unwrap();
+        fs.append_line(Path::new("/repo/.gitignore"), "ignored")
+            .unwrap();
+        fs.symlink(Path::new("/repo/a.txt"), Path::new("/repo/link"))
+            .unwrap();
+        fs.remove_dir_all(Path::new("/repo/sub")).unwrap();
+
+        let writes = fs.writes();
+        assert_eq!(
+            writes,
+            vec![
+                PathBuf::from("/repo/a.txt"),
+                PathBuf::from("/repo/sub"),
+                PathBuf::from("/repo/.gitignore"),
+                PathBuf::from("/repo/link"),
+                PathBuf::from("/repo/sub"),
+            ],
+            "every mutating call must be journalled in order, including remove_dir_all"
+        );
+    }
+
+    #[test]
+    fn fake_fs_symlink_refusal_is_not_journalled() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new().with_file("/repo/link", "already here");
+        let err = fs.symlink(Path::new("/repo/a.txt"), Path::new("/repo/link"));
+        assert!(err.is_err(), "symlinking over an existing path must fail");
+        assert!(
+            fs.writes().is_empty(),
+            "a rejected symlink must leave no journal entry"
+        );
+    }
+
+    #[test]
+    fn fake_fs_writes_under_filters_by_root() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new();
+        fs.write(Path::new("/repo/inside.txt"), "x").unwrap();
+        fs.write(Path::new("/tmp/outside.txt"), "x").unwrap();
+
+        assert_eq!(
+            fs.writes_under(Path::new("/repo")),
+            vec![PathBuf::from("/repo/inside.txt")]
+        );
+        assert!(
+            fs.writes_under(Path::new("/nowhere")).is_empty(),
+            "a root with no writes under it yields nothing"
+        );
+    }
+
+    #[test]
+    fn fake_fs_reads_are_not_journalled() {
+        use crate::contracts::traits::FileSystem;
+        let fs = FakeFs::new().with_file("/repo/a.txt", "x");
+        let _ = fs.read_to_string(Path::new("/repo/a.txt"));
+        let _ = fs.exists(Path::new("/repo/a.txt"));
+        let _ = fs.is_dir(Path::new("/repo"));
+        assert!(
+            fs.writes().is_empty(),
+            "seeding and reading must not count as writes"
+        );
     }
 }

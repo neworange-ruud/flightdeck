@@ -379,15 +379,19 @@ impl RuntimeTab {
     }
 }
 
-/// Path to a tab's agent status event file inside its worktree (SPECS §24).
+/// Path to a tab's agent status event file under `status_root` (SPECS §24, §32).
 ///
 /// The agent's status hook/plugin writes one of the keywords understood by
-/// [`status_keyword_to_interpreted`] here; FlightDeck polls it. The path is
-/// derived purely from the worktree so the hook can compute the same path from
-/// its own working directory without any injected configuration. It is covered
-/// by the `.flightdeck/agent-status` `.gitignore` entry added at init.
-pub fn agent_status_file(worktree_abs: &Path) -> PathBuf {
-    worktree_abs.join(".flightdeck").join("agent-status")
+/// [`status_keyword_to_interpreted`] here; FlightDeck polls it. `status_root`
+/// is the tab's worktree in a normal run (in which case this reproduces the
+/// pre-isolated-mode path exactly), and a redirect target — normally a temp
+/// directory — in an isolated one; the hook body carries the same absolute
+/// path so it writes to this exact file regardless of the agent's own working
+/// directory. Covered by the `.flightdeck/agent-status` `.gitignore` entry
+/// added at init (for a normal run; an isolated run's root is outside the
+/// project and is not tracked at all).
+pub fn agent_status_file(status_root: &Path) -> PathBuf {
+    status_root.join(".flightdeck").join("agent-status")
 }
 
 /// Map a status-file keyword (written by an agent hook/plugin) to an
@@ -538,6 +542,15 @@ pub struct AppState {
     /// check completes (or when up to date / the check is disabled). Drives the
     /// status-bar update hint. Runtime-only.
     pub update_available: Option<String>,
+    /// Isolated run (SPECS §32): a throwaway session that continues nothing and
+    /// writes nothing of its own. Runtime-only — never serialized, never a
+    /// configuration setting, because a persisted file that suppressed
+    /// persistence would be a trap.
+    pub isolated: bool,
+    /// Where the agent status plumbing lives when it must stay out of the
+    /// project directory (SPECS §32). `None` means the tab's own worktree,
+    /// which is the normal behavior.
+    pub isolated_status_root: Option<PathBuf>,
 }
 
 impl AppState {
@@ -567,6 +580,8 @@ impl AppState {
             notify_grace_until_ms: 0,
             split_view: false,
             update_available: None,
+            isolated: false,
+            isolated_status_root: None,
         }
     }
 
@@ -574,9 +589,25 @@ impl AppState {
     /// (SPECS §8). Called after the configuration manager (or an `$EDITOR` edit)
     /// changes the global/project config; running tabs are untouched — only
     /// newly-spawned agents and config-derived UI reflect the change.
-    pub fn reload_config(&mut self, config: Config) {
+    pub fn reload_config(&mut self, mut config: Config) {
+        // An isolated run forces `auto_continue` off for the whole run (SPECS
+        // §32), so even Restart Agent starts fresh. The config manager can
+        // reload a config loaded fresh from disk (where the field defaults to
+        // `true`) via Open Configuration -> save; re-apply the force here so
+        // that flow cannot silently undo the startup invariant.
+        if self.isolated {
+            config.ui.auto_continue = false;
+        }
         self.registry = AgentRegistry::from_config(&config);
         self.config = config;
+    }
+
+    /// Mark this run isolated (SPECS §32), optionally redirecting the agent
+    /// status plumbing to `status_root` so it stays out of the project
+    /// directory. Call once, during startup, before the event loop.
+    pub fn set_isolated(&mut self, status_root: Option<PathBuf>) {
+        self.isolated = true;
+        self.isolated_status_root = status_root;
     }
 
     // -----------------------------------------------------------------------
@@ -794,6 +825,11 @@ impl AppState {
     /// Persist `state.json` via the filesystem service (SPECS §9). Called after
     /// mutations that change tab metadata.
     fn persist(&self, services: &Services) -> Result<()> {
+        // An isolated run continues nothing, so it records nothing: this is the
+        // single funnel every `state.json` write passes through (SPECS §32).
+        if self.isolated {
+            return Ok(());
+        }
         let state = self.to_project_state(services.clock.now_millis());
         save_state(services.fs, &self.state_path, &state)
     }
@@ -1071,17 +1107,32 @@ impl AppState {
             )));
         }
 
-        // The tab name falls back to the base branch when the field was left
-        // blank (the branch textbox is disabled in base mode).
+        // The branch a base tab is *actually* on. `base` is the configured base
+        // branch, which is not necessarily what HEAD points at in the project
+        // root — and `meta.branch` is what Push Branch pushes, so recording the
+        // base here would push the wrong ref. Two cases fall back to the base:
+        // a genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
+        // unavailable), and a detached HEAD, which `git rev-parse --abbrev-ref
+        // HEAD` reports not as an error but as the literal string "HEAD" —
+        // recording that verbatim would name the tab "HEAD" and hand Push a
+        // refname git rejects.
+        let head = match services.git.current_branch(&self.repo_root) {
+            Ok(b) if b == "HEAD" => base.clone(),
+            Ok(b) => b,
+            Err(_) => base.clone(),
+        };
+
+        // The tab name falls back to the checked-out branch when the field was
+        // left blank (the branch textbox is disabled in base mode).
         let display_name = if name.trim().is_empty() {
-            base.clone()
+            head.clone()
         } else {
             name.trim().to_string()
         };
         let slug = {
             let s = slugify(&display_name);
             if s.is_empty() {
-                slugify(&base)
+                slugify(&head)
             } else {
                 s
             }
@@ -1095,7 +1146,7 @@ impl AppState {
             name: display_name,
             slug,
             agent: key,
-            branch: base.clone(),
+            branch: head.clone(),
             // The project root, relative to itself.
             worktree_path_relative: ".".to_string(),
             base_branch: base.clone(),
@@ -1125,7 +1176,7 @@ impl AppState {
 
         Ok(WorktreeJob {
             tab_id: id,
-            branch: base.clone(),
+            branch: head,
             base_branch: base,
             worktree_abs: self.repo_root.clone(),
             // Nothing to materialize — the root worktree already exists.
@@ -1193,7 +1244,7 @@ impl AppState {
             return Err(e);
         }
 
-        let status_file = agent_status_file(&worktree_abs);
+        let status_file = agent_status_file(&self.status_root(&worktree_abs));
         let (initial_status, status_file_seen) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         let tab = &mut self.tabs[idx];
@@ -1302,6 +1353,14 @@ impl AppState {
         self.fix_selection_after_removal(idx);
         self.persist(services)?;
         match container_result {
+            // An isolated run IS its one session (SPECS §32): New Agent Session
+            // Tab is refused and the "+ agent" fallback lands on that same
+            // refusal, so a tabless isolated run has no route back to an agent.
+            // Closing the last session therefore ends the run rather than
+            // stranding the user in an empty shell whose only exit is Ctrl-q.
+            // Only on a clean close: if the container could not be removed the
+            // warning is worth reading, and quitting would flash it past.
+            Ok(()) if self.isolated && self.tabs.is_empty() => Ok(Effect::Quit),
             Ok(()) => Ok(Effect::Message("Closed Agent Tab.".to_string())),
             Err(e) => Ok(Effect::Warning(format!(
                 "Closed Agent Tab, but removing its container failed: {e}. It may still be running."
@@ -1843,6 +1902,29 @@ impl AppState {
         }
     }
 
+    /// Where this run keeps the agent status plumbing for a tab whose working
+    /// directory is `worktree` (SPECS §32). Normally the worktree itself; an
+    /// isolated run redirects it out of the project. Containerized runs always
+    /// use the worktree, because a temp directory outside it is not
+    /// bind-mounted into the container (specs/ISOLATED_MODE.md §8.2).
+    ///
+    /// `isolated_status_root`, when set, is returned as-is regardless of
+    /// `worktree` — it is a single, process-wide redirect target
+    /// (`isolated_status_dir()`), not computed per tab. This is only correct
+    /// because isolated mode allows exactly one tab (a second base-branch or
+    /// worktree tab is refused, SPECS §32) and secondary in-tab agents never
+    /// reach `prepare_status_launch`. If that constraint is ever relaxed,
+    /// this must derive a per-tab subdirectory instead of every tab
+    /// colliding on one status file and one plugin dir.
+    fn status_root(&self, worktree: &Path) -> PathBuf {
+        if self.config.containers.enabled {
+            return worktree.to_path_buf();
+        }
+        self.isolated_status_root
+            .clone()
+            .unwrap_or_else(|| worktree.to_path_buf())
+    }
+
     /// Resolve how to launch (or reattach) a primary terminal (SPECS §31).
     ///
     /// - Local mode (`containers.enabled == false`): the agent command directly.
@@ -1859,7 +1941,13 @@ impl AppState {
         allow_attach: bool,
     ) -> Result<PrimarySpawn> {
         if !self.config.containers.enabled {
-            let status = prepare_status_launch(services.fs, agent, worktree_abs, false)?;
+            let status = prepare_status_launch(
+                services.fs,
+                agent,
+                worktree_abs,
+                &self.status_root(worktree_abs),
+                false,
+            )?;
             let mut launch_agent = agent.clone();
             launch_agent.args = status.args;
             let launch = build_launch(&launch_agent, worktree_abs);
@@ -1905,7 +1993,16 @@ impl AppState {
         // Clear any stale exited container so `--name` does not clash.
         let _ = services.container.remove_container(&name, true);
 
-        let status = prepare_status_launch(services.fs, agent, worktree_abs, true)?;
+        // Containerized: always the worktree (§8.2), so `self.status_root`
+        // would be redundant here — but calling it keeps this call site honest
+        // about the same rule the helper enforces.
+        let status = prepare_status_launch(
+            services.fs,
+            agent,
+            worktree_abs,
+            &self.status_root(worktree_abs),
+            true,
+        )?;
         let mut launch_agent = agent.clone();
         launch_agent.args = status.args;
         let mut spec = self.container_spec(
@@ -2109,7 +2206,7 @@ impl AppState {
             }
         }
 
-        let status_file = agent_status_file(&cwd);
+        let status_file = agent_status_file(&self.status_root(&cwd));
         let tab_id = self.tabs[idx].meta.id.clone();
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
         // Fresh container: start it detached before attaching its PTY.
@@ -2438,6 +2535,50 @@ mod tests {
         assert_eq!(app.registry.all().len(), 1);
         assert!(app.registry.get("codex").is_none());
         assert!(app.registry.get("opencode").is_some());
+    }
+
+    #[test]
+    fn reload_config_on_an_isolated_state_keeps_auto_continue_forced_off() {
+        // Startup forces auto_continue off for the whole isolated run (SPECS
+        // §32) so even Restart Agent starts fresh. The config manager's save
+        // flow replaces the whole Config via reload_config with one loaded
+        // fresh from disk, where auto_continue defaults to true — that must
+        // not silently undo the invariant.
+        let mut app = fresh_state(crate::config::schema::default_config("p", "main"));
+        app.set_isolated(None);
+        assert!(app.isolated);
+
+        let mut next = crate::config::schema::default_config("p", "main");
+        next.ui.auto_continue = true;
+        app.reload_config(next);
+
+        assert!(
+            !app.config.ui.auto_continue,
+            "an isolated run must keep auto_continue forced off across a config reload"
+        );
+    }
+
+    #[test]
+    fn reload_config_on_a_non_isolated_state_takes_the_new_auto_continue_value() {
+        // The isolated guard must be a no-op for a normal run, or every
+        // normal save that flips this setting would silently be ignored. Start
+        // from `false` and reload to `true`: a fix that always forces the
+        // field off (rather than only when isolated) would leave this at
+        // `false` and fail here.
+        let mut starting = crate::config::schema::default_config("p", "main");
+        starting.ui.auto_continue = false;
+        let mut app = fresh_state(starting);
+        assert!(!app.isolated, "isolated is off by default");
+        assert!(!app.config.ui.auto_continue);
+
+        let mut next = crate::config::schema::default_config("p", "main");
+        next.ui.auto_continue = true;
+        app.reload_config(next);
+
+        assert!(
+            app.config.ui.auto_continue,
+            "a non-isolated run must honour the new value from a config reload"
+        );
     }
 
     // --- Switching with no selected tab is a graceful no-op ---------------
@@ -2838,6 +2979,96 @@ mod tests {
             "primary agent runs in the project root, got {:?}",
             spawns[0].2
         );
+    }
+
+    #[test]
+    fn base_tab_records_the_checked_out_branch_not_the_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // Base is "main", but the repo root currently has "spike" checked out.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert!(app.tabs[0].meta.runs_on_base);
+        assert_eq!(
+            app.tabs[0].meta.branch, "spike",
+            "the tab must name the branch it is actually on — push uses this field"
+        );
+        assert_eq!(
+            app.tabs[0].meta.base_branch, "main",
+            "the configured base is unchanged"
+        );
+        assert_eq!(
+            app.tabs[0].meta.name, "spike",
+            "the blank name falls back to the branch"
+        );
+        assert!(
+            !job.needs_create,
+            "a base tab still materializes no worktree"
+        );
+        assert!(git.added_worktrees().is_empty(), "and runs no git mutation");
+    }
+
+    #[test]
+    fn base_tab_falls_back_to_base_when_head_is_detached() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // A detached HEAD is not an error from `current_branch` — real git's
+        // `rev-parse --abbrev-ref HEAD` reports it as the literal string
+        // "HEAD" and exits 0. That is the path production actually takes.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("HEAD");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs[0].meta.branch, "main");
+    }
+
+    #[test]
+    fn base_tab_falls_back_to_base_when_current_branch_errors() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // A genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
+        // being unavailable) also falls back to the base.
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch_error("fatal: not a git repository");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs[0].meta.branch, "main");
     }
 
     #[test]
@@ -3351,6 +3582,86 @@ mod tests {
         assert_eq!(app.selected_tab, None);
     }
 
+    #[test]
+    fn closing_the_last_tab_in_an_isolated_run_quits() {
+        // SPECS §32: an isolated run IS its one session. Once that session is
+        // closed there is nothing left to do, and every route back to a session
+        // is refused, so staying open would strand the user in an empty shell
+        // whose only exit is Ctrl-q.
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "myagent");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.set_isolated(Some(PathBuf::from("/tmp/fd-isolated-test")));
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &svc)
+            .expect("the isolated base tab is created");
+        app.finalize_new_tab(&job.tab_id, &svc).unwrap();
+
+        let effect = app
+            .dispatch(
+                Command::CloseAgentTab {
+                    action: Some(CloseAction::ForceTerminate),
+                },
+                &svc,
+            )
+            .unwrap();
+
+        assert!(handle.terminated(), "the session is still torn down");
+        assert!(app.tabs.is_empty());
+        assert!(
+            matches!(effect, Effect::Quit),
+            "closing the only session of an isolated run must quit, got {effect:?}"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_in_a_normal_run_does_not_quit() {
+        // The control half: without this, a fix that always quit on the last
+        // tab would pass the test above while breaking every normal run.
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let _handle = pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        app.dispatch(
+            Command::NewAgentTab {
+                name: "Task".to_string(),
+                agent_key: None,
+            },
+            &svc,
+        )
+        .unwrap();
+
+        let effect = app
+            .dispatch(
+                Command::CloseAgentTab {
+                    action: Some(CloseAction::ForceTerminate),
+                },
+                &svc,
+            )
+            .unwrap();
+
+        assert!(app.tabs.is_empty());
+        assert!(
+            matches!(effect, Effect::Message(_)),
+            "a normal run stays open with no tabs, got {effect:?}"
+        );
+    }
+
     // --- §26 / §24: manual status applied AND process state represented --
 
     #[test]
@@ -3413,6 +3724,55 @@ mod tests {
         .unwrap();
         let id = app.tabs[0].id();
         (app, git, fs, pty, clock, id)
+    }
+
+    #[test]
+    fn isolated_state_never_writes_state_json() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        app.set_isolated(None);
+        assert!(app.isolated);
+
+        // Renaming persists in a normal run; in an isolated one it must not.
+        let before = fs.writes().len();
+        app.dispatch(
+            Command::RenameAgentTab {
+                new_name: "renamed".to_string(),
+            },
+            &services(&git, &fs, &pty, &clock),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.tabs[0].meta.name, "renamed",
+            "the rename still applies in memory"
+        );
+        assert_eq!(
+            fs.writes().len(),
+            before,
+            "an isolated run must not write state.json: {:?}",
+            fs.writes()
+        );
+    }
+
+    #[test]
+    fn non_isolated_state_still_writes_state_json() {
+        // Regression guard: the guard must not disable persistence generally.
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        assert!(!app.isolated, "isolated is off by default");
+        app.dispatch(
+            Command::RenameAgentTab {
+                new_name: "renamed".to_string(),
+            },
+            &services(&git, &fs, &pty, &clock),
+        )
+        .unwrap();
+        assert!(
+            fs.writes().iter().any(|p| p.ends_with("state.json")),
+            "a normal run still persists: {:?}",
+            fs.writes()
+        );
     }
 
     /// A config with one real agent and OS notifications enabled (on by default,
@@ -4342,6 +4702,47 @@ mod tests {
         assert_eq!(git.pushes().len(), 1);
     }
 
+    #[test]
+    fn base_tab_push_pushes_the_checked_out_branch_not_the_base() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        // Base is "main", but the repo root has "spike" checked out. This is
+        // the whole point of the fix: Push must push "spike", not "main".
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let job = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
+        assert_eq!(app.tabs[0].meta.branch, "spike");
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
+        app.finalize_new_tab(&job.tab_id, &svc).unwrap();
+
+        // Clean worktree (default_dirty is false), so push needs no confirm.
+        let effect = app
+            .dispatch(Command::PushBranch { confirm: None }, &svc)
+            .unwrap();
+        assert!(
+            matches!(effect, Effect::Message(_)),
+            "expected a plain success message, got {effect:?}"
+        );
+
+        let pushes = git.pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(
+            pushes[0].1, "spike",
+            "Push must push the branch actually checked out, not the configured base"
+        );
+    }
+
     // --- §21: git status overlay surfaces the PR compare URL after push ---
 
     #[test]
@@ -5196,6 +5597,48 @@ mod tests {
         // The tab records that it is containerized + the image used.
         assert!(app.tabs[0].meta.containerized);
         assert_eq!(app.tabs[0].meta.container_image, Some(image));
+    }
+
+    #[test]
+    fn containerized_status_plumbing_stays_in_the_worktree_even_when_isolated() {
+        // SPECS §8.2 ruling: a temp status root outside the worktree is never
+        // bind-mounted into the container, so a containerized run must keep the
+        // in-worktree status root regardless of the isolated flag.
+        let image = project_image();
+        let mut app = fresh_state(exec_config());
+        app.set_isolated(Some(PathBuf::from("/tmp/fd-isolated-container-guard")));
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(image);
+        let command = FakeCommandRunner::new();
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        app.dispatch(new_tab_cmd(), &svc).unwrap();
+
+        assert!(
+            fs.writes_under(Path::new("/tmp/fd-isolated-container-guard"))
+                .is_empty(),
+            "a containerized run must never write status plumbing to the isolated temp root: {:?}",
+            fs.writes_under(Path::new("/tmp/fd-isolated-container-guard"))
+        );
+        let worktree = to_absolute(
+            Path::new(REPO),
+            Path::new(&app.tabs[0].meta.worktree_path_relative),
+        );
+        assert!(
+            fs.exists(&worktree.join(".flightdeck/runtime/status/opencode/plugins/flightdeck.js")),
+            "the plugin must still land in the bind-mounted worktree: {:?}",
+            fs.writes()
+        );
     }
 
     #[test]
