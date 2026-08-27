@@ -668,3 +668,414 @@ fn most_urgent_unread_ignores_already_read_events_at_a_more_urgent_tier() {
     assert_eq!(summary.count_at_tier, 1);
     assert_eq!(summary.total_unread, 1);
 }
+
+// ===========================================================================
+// `observe`: what the host may honestly say about a status change (§5.1)
+// ===========================================================================
+
+fn display(
+    process: ProcessState,
+    interpreted: InterpretedStatus,
+    manual: Option<ManualStatus>,
+) -> DisplayStatus {
+    DisplayStatus {
+        process,
+        interpreted,
+        manual,
+    }
+}
+
+/// A well-behaved agent that reports a lifecycle, working then waiting. The
+/// design's row reads `in progress → waiting · asked a question`, and *asked a
+/// question* is the half the host cannot know: the status hook writes the word
+/// `waiting`, never the reason for it.
+#[test]
+fn a_waiting_agent_gets_no_reason_because_why_it_waits_never_reaches_the_host() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(
+            ProcessState::Running,
+            InterpretedStatus::WaitingForInput,
+            None,
+        ),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.from, InterpretedStatus::Working);
+    assert_eq!(observed.to, InterpretedStatus::WaitingForInput);
+    assert_eq!(
+        observed.reason, "",
+        "empty, never the design's `asked a question` — that is a guess about \
+         the agent's intent, and §5.1 forbids padding the reason with one"
+    );
+}
+
+/// The other unknowable row: `finished, 18 files touched`. The count lives in
+/// the git-status cache, on its own refresh schedule for the active project
+/// only, so no honest number exists at transition time.
+#[test]
+fn a_finished_agent_gets_no_reason_rather_than_an_invented_file_count() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Running, InterpretedStatus::Idle, None),
+        "OpenCode",
+        true,
+    );
+    assert_eq!(observed.to, InterpretedStatus::Idle);
+    assert_eq!(observed.reason, "");
+}
+
+#[test]
+fn a_non_zero_exit_reports_the_code_the_process_actually_returned() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Exited(1), InterpretedStatus::Failed, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.to, InterpretedStatus::Failed);
+    assert_eq!(observed.reason, "agent exited (code 1)");
+}
+
+#[test]
+fn a_clean_exit_reports_its_code_too_rather_than_going_silent() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Exited(0), InterpretedStatus::Completed, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.reason, "agent exited (code 0)");
+}
+
+/// `to: Failed` cannot distinguish "ran and returned 1" from "never started",
+/// so the reason is where that fact has to live.
+#[test]
+fn an_agent_that_never_started_says_so_rather_than_reporting_an_exit_code() {
+    let observed = observe(
+        display(ProcessState::Starting, InterpretedStatus::Starting, None),
+        display(ProcessState::Failed, InterpretedStatus::Failed, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.reason, "agent failed to start");
+}
+
+#[test]
+fn a_lost_session_gets_no_reason_because_to_already_says_it() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Lost, InterpretedStatus::SessionLost, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.to, InterpretedStatus::SessionLost);
+    assert_eq!(observed.reason, "");
+}
+
+#[test]
+fn a_manual_override_is_reported_as_set_by_hand_on_the_desktop() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Idle, None),
+        display(
+            ProcessState::Running,
+            InterpretedStatus::Idle,
+            Some(ManualStatus::InProgress),
+        ),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(observed.reason, "set by hand on the desktop");
+    assert_eq!(observed.manual, Some(ManualStatus::InProgress));
+    assert_eq!(
+        (observed.from, observed.to),
+        (InterpretedStatus::Idle, InterpretedStatus::Idle),
+        "the agent itself did not move, and saying it did would be a fabrication"
+    );
+}
+
+/// §5.1's hard rule, and the honesty this whole module exists to protect: an
+/// agent with no lifecycle hooks is `unknown → unknown`, **even though the
+/// process state would happily imply a transition**. `Exited(0)` → "completed"
+/// is exactly the inference the spec forbids.
+#[test]
+fn an_agent_with_no_lifecycle_hooks_stays_unknown_at_both_ends() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Unknown, None),
+        display(ProcessState::Exited(0), InterpretedStatus::Completed, None),
+        "Codex CLI",
+        false,
+    );
+    assert_eq!(observed.from, InterpretedStatus::Unknown);
+    assert_eq!(
+        observed.to,
+        InterpretedStatus::Unknown,
+        "the process really did exit 0, but this agent never told us what that \
+         meant for its turn, so the feed must not translate it into `completed`"
+    );
+    assert_eq!(observed.reason, "Codex CLI reports no lifecycle");
+}
+
+/// The reason wording matches the browser's own `lifecycleNote`
+/// (`${agent_display_name} reports no lifecycle`), so a feed row and a sidebar
+/// row cannot disagree about the same agent.
+#[test]
+fn the_no_lifecycle_reason_names_the_agent_the_way_the_sidebar_does() {
+    let observed = observe(
+        display(ProcessState::NotStarted, InterpretedStatus::Unknown, None),
+        display(ProcessState::Running, InterpretedStatus::Running, None),
+        "my-custom-wrapper",
+        false,
+    );
+    assert_eq!(observed.reason, "my-custom-wrapper reports no lifecycle");
+}
+
+/// Both honesty rules compose: a hand-set status on a no-lifecycle agent gets
+/// the reason the user's own action earns, and still refuses to name a
+/// lifecycle transition nobody reported.
+#[test]
+fn a_manual_override_on_a_no_lifecycle_agent_keeps_unknown_at_both_ends() {
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Unknown, None),
+        display(
+            ProcessState::Running,
+            InterpretedStatus::Unknown,
+            Some(ManualStatus::Done),
+        ),
+        "Codex CLI",
+        false,
+    );
+    assert_eq!(observed.reason, "set by hand on the desktop");
+    assert_eq!(observed.from, InterpretedStatus::Unknown);
+    assert_eq!(observed.to, InterpretedStatus::Unknown);
+    assert_eq!(observed.manual, Some(ManualStatus::Done));
+}
+
+/// The tier a row lands in is derived from `to` by the store, so the honesty
+/// above has to survive the round trip into an event: an unknown-lifecycle row
+/// must be `quiet`, not `finished`, however cleanly the process exited.
+#[test]
+fn an_unknown_lifecycle_row_is_recorded_quiet_not_finished() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let observed = observe(
+        display(ProcessState::Running, InterpretedStatus::Unknown, None),
+        display(ProcessState::Exited(0), InterpretedStatus::Completed, None),
+        "Codex CLI",
+        false,
+    );
+    store.record(
+        &clock,
+        Transition {
+            project_id: ProjectId::new("flightdeck"),
+            project_name: "flightdeck".to_string(),
+            session_id: TabId("hotfix-csp-header".to_string()),
+            session_name: "hotfix-csp-header".to_string(),
+            from: observed.from,
+            to: observed.to,
+            manual: observed.manual,
+            reason: observed.reason,
+        },
+    );
+    let event = store.events().next().expect("one event");
+    assert_eq!(event.tier, ActivityTier::Quiet);
+    assert_eq!(event.reason, "Codex CLI reports no lifecycle");
+}
+
+// ===========================================================================
+// `apply_mark_read`: the browser's read-marking command (D11)
+// ===========================================================================
+
+fn mark_read_command(seq: u64, args: Option<serde_json::Value>) -> Command {
+    Command {
+        seq,
+        name: crate::web::protocol::command::MARK_ACTIVITY_READ.to_string(),
+        args,
+    }
+}
+
+/// Two unread events, ids returned in record order.
+fn store_with_two_unread() -> (FakeClock, ActivityStore, EventId, EventId) {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let first = store.record(
+        &clock,
+        transition(
+            "p",
+            "s1",
+            InterpretedStatus::Working,
+            InterpretedStatus::WaitingForInput,
+            "",
+        ),
+    );
+    let second = store.record(
+        &clock,
+        transition(
+            "p",
+            "s2",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    (clock, store, first, second)
+}
+
+#[test]
+fn marking_named_events_read_applies_and_leaves_the_rest_unread() {
+    let (_clock, mut store, first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(
+            7,
+            Some(serde_json::json!({ "event_ids": [first.as_str()] })),
+        ),
+    );
+    assert_eq!(ack.seq, 7);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert_eq!(ack.detail, None);
+    let summary = store.unread_summary().expect("one event is still unread");
+    assert_eq!(summary.total_unread, 1);
+    assert_eq!(summary.tier, ActivityTier::Finished);
+}
+
+/// "Mark all read" has no ids to name, so an absent argument object *is* the
+/// request rather than a malformed one.
+#[test]
+fn a_command_with_no_args_marks_everything_read() {
+    let (_clock, mut store, _first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(&mut store, &mark_read_command(1, None));
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert_eq!(store.unread_summary(), None);
+}
+
+#[test]
+fn an_args_object_without_event_ids_marks_everything_read() {
+    let (_clock, mut store, _first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(1, Some(serde_json::json!({}))),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert_eq!(store.unread_summary(), None);
+}
+
+/// An id the store no longer retains is a no-op, not an error — §5.1's bounds
+/// evicted it while the tab still held it. But nothing was done, so claiming
+/// `Applied` would be a small lie.
+#[test]
+fn an_id_the_store_no_longer_retains_is_ignored_not_applied() {
+    let (_clock, mut store, _first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(3, Some(serde_json::json!({ "event_ids": ["evt-evicted"] }))),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Ignored);
+    assert_eq!(ack.detail.as_deref(), Some("no retained event matched"));
+    assert_eq!(
+        store
+            .unread_summary()
+            .expect("nothing was marked")
+            .total_unread,
+        2
+    );
+}
+
+#[test]
+fn a_partly_evicted_list_applies_and_says_how_many_missed() {
+    let (_clock, mut store, first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(
+            4,
+            Some(serde_json::json!({ "event_ids": [first.as_str(), "evt-evicted"] })),
+        ),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert_eq!(
+        ack.detail.as_deref(),
+        Some("1 of 2 events are no longer retained"),
+        "the browser hears about the miss instead of being silently misled"
+    );
+}
+
+#[test]
+fn an_empty_list_asks_for_nothing_and_is_ignored() {
+    let (_clock, mut store, _first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(5, Some(serde_json::json!({ "event_ids": [] }))),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Ignored);
+    assert_eq!(ack.detail.as_deref(), Some("no event ids given"));
+    assert_eq!(
+        store
+            .unread_summary()
+            .expect("nothing was marked")
+            .total_unread,
+        2
+    );
+}
+
+#[test]
+fn event_ids_that_is_not_a_list_is_rejected_with_a_reason() {
+    let (_clock, mut store, _first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(6, Some(serde_json::json!({ "event_ids": "evt-1" }))),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    let detail = ack.detail.expect("a rejection states why");
+    assert!(detail.contains("event_ids"), "got: {detail}");
+    assert_eq!(
+        store
+            .unread_summary()
+            .expect("nothing was marked")
+            .total_unread,
+        2
+    );
+}
+
+#[test]
+fn a_non_string_entry_in_event_ids_is_rejected_rather_than_skipped() {
+    let (_clock, mut store, first, _second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(
+            8,
+            Some(serde_json::json!({ "event_ids": [first.as_str(), 42] })),
+        ),
+    );
+    assert_eq!(
+        ack.outcome,
+        AckOutcome::Rejected,
+        "a malformed frame is the browser's bug and deserves to hear about it"
+    );
+    assert_eq!(
+        store
+            .unread_summary()
+            .expect("nothing was marked")
+            .total_unread,
+        2,
+        "a rejected frame must not half-apply"
+    );
+}
+
+/// Read state is host state, not per-tab state (D11): whoever marks it read
+/// changes what the *next* snapshot backfills for everyone.
+#[test]
+fn marking_read_survives_into_the_events_a_later_reader_sees() {
+    let (_clock, mut store, first, second) = store_with_two_unread();
+    let ack = apply_mark_read(
+        &mut store,
+        &mark_read_command(
+            9,
+            Some(serde_json::json!({ "event_ids": [first.as_str(), second.as_str()] })),
+        ),
+    );
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert!(
+        store.events().all(|event| event.read),
+        "a second tab attaching now must not be shown a wall of unread"
+    );
+}

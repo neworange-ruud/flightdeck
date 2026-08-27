@@ -68,8 +68,8 @@ use crate::config::schema::{default_config, default_global_config};
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
-    Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus,
-    Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
+    AgentDef, Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor,
+    ManualStatus, Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -1366,6 +1366,20 @@ struct WebSurface {
     credentials: Arc<Mutex<crate::web::credentials::CredentialStore>>,
     /// Per-terminal replay rings plus the per-viewer input watermark.
     streams: crate::web::stream::TerminalStreams,
+    /// D11's activity feed: the browser's **entire** substitute for OS
+    /// notifications, because Web Push is structurally blocked under D1.
+    ///
+    /// Recorded into **whether or not the server is running**, unlike the replay
+    /// rings above. The two costs are not comparable: a ring is 256 KiB per live
+    /// terminal, while the feed is bounded at
+    /// [`crate::web::activity::MAX_EVENTS`] small events for the whole process
+    /// — tens of kilobytes at worst, and proportional to transitions that
+    /// actually happened rather than to bytes an agent happened to print. Paying
+    /// it always is what makes `Start Web Interface` → open a tab land on
+    /// history instead of silence, which is the requirement D11 exists for; and
+    /// it is why the feed survives a `Stop` / `Start` cycle for the same reason
+    /// the rings do.
+    activity: crate::web::activity::ActivityStore,
     /// Handed to `server::start`; kept so a restart reuses the same channel.
     inbound_tx: Sender<crate::web::server::WebInbound>,
     /// Drained every tick.
@@ -1394,6 +1408,7 @@ impl WebSurface {
         WebSurface {
             credentials: Arc::new(Mutex::new(store)),
             streams: crate::web::stream::TerminalStreams::new(config.replay_bytes),
+            activity: crate::web::activity::ActivityStore::new(),
             inbound_tx,
             inbound_rx,
             handle: None,
@@ -1464,6 +1479,59 @@ impl WebSurface {
                 store.mint_fixed_bootstrap_code(digits);
             }
         }
+    }
+
+    /// Record one desktop status change into D11's feed — the second record of
+    /// the signal `take_finish_notifications` has just turned into an OS
+    /// notification.
+    ///
+    /// The honesty policy (which reason strings are real, and §5.1's
+    /// `unknown → unknown` for an agent with no lifecycle hooks) lives in
+    /// [`crate::web::activity::observe`], and the fact it keys off is
+    /// [`crate::web::stream::lifecycle_reporting`] — the same helper
+    /// `build_web_host_state` uses for the sidebar, so a feed row and a session
+    /// row can never disagree about whether an agent reports a lifecycle.
+    fn record_transition(
+        &mut self,
+        clock: &dyn Clock,
+        project_id: crate::web::protocol::ProjectId,
+        project_name: &str,
+        agent: Option<&AgentDef>,
+        change: crate::app::state::TabStatusChange,
+    ) {
+        let observed = crate::web::activity::observe(
+            change.was,
+            change.now,
+            agent
+                .map(|def| def.display_name.as_str())
+                .unwrap_or(&change.agent_key),
+            crate::web::stream::lifecycle_reporting(agent),
+        );
+        self.activity.record(
+            clock,
+            crate::web::activity::Transition {
+                project_id,
+                project_name: project_name.to_string(),
+                session_id: change.tab_id,
+                session_name: change.tab_name,
+                from: observed.from,
+                to: observed.to,
+                manual: observed.manual,
+                reason: observed.reason,
+            },
+        );
+    }
+
+    /// The retained feed for a `HostState`, both §5.1 bounds enforced against
+    /// `clock` **first**.
+    ///
+    /// Eviction is a read-time fact by design (see `crate::web::activity`'s
+    /// module doc): no background timer exists, so an idle feed only ages itself
+    /// down to artboard 2e's "Nothing has changed in 24 hours" because the code
+    /// that builds a read view asks it to.
+    fn activity_events(&mut self, clock: &dyn Clock) -> Vec<crate::web::protocol::ActivityEvent> {
+        self.activity.evict(clock);
+        self.activity.events().cloned().collect()
     }
 
     /// One chunk of raw PTY output, from `drain_pty_output`'s tee.
@@ -1877,7 +1945,8 @@ fn event_loop(
         .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
     if workspace.active_project().state.config.web.enabled {
         let config = workspace.active_project().state.config.web.clone();
-        let initial = build_web_host_state(workspace, &web_surface.streams, now0);
+        let activity = web_surface.activity_events(env.clock);
+        let initial = build_web_host_state(workspace, &web_surface.streams, activity, now0);
         match web_surface.start(&config, initial) {
             Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
             Err(e) => ui.message(format!("Web interface did not start: {e}")),
@@ -1948,6 +2017,35 @@ fn event_loop(
             for mut note in p.state.take_finish_notifications(now_ms) {
                 note.title = format!("{}: {}", p.name, note.title);
                 notifier.notify(&note);
+            }
+
+            // FlightDeck Web (D11): the same lifecycle signal, recorded a second
+            // time for the browser's activity feed. Deliberately a *tee at the
+            // source* rather than a second read of the notifications above:
+            // `take_finish_notifications` spends each tab's arming and drops
+            // whatever `[notifications]` disabled or the startup grace window
+            // suppressed, so a feed built from its output would be missing
+            // exactly the events D11 exists to deliver. Running after it is
+            // therefore free of consequence for the desktop — the two keep
+            // separate per-tab edge memory — and this record happens whether or
+            // not the server is up, so a browser opened later lands on history
+            // rather than silence (`WebSurface::activity`).
+            let changes = p.state.take_status_transitions(now_ms);
+            if !changes.is_empty() {
+                // Built only when there is something to attribute, so a quiet
+                // tick costs no allocation on a loop that runs at frame rate.
+                let project_id =
+                    crate::web::protocol::ProjectId::new(p.git.root().display().to_string());
+                for change in changes {
+                    let agent = p.state.registry.get(&change.agent_key);
+                    web_surface.record_transition(
+                        env.clock,
+                        project_id.clone(),
+                        &p.name,
+                        agent,
+                        change,
+                    );
+                }
             }
         }
 
@@ -2154,9 +2252,32 @@ fn event_loop(
             let inbound: Vec<crate::web::server::WebInbound> =
                 web_surface.inbound_rx.try_iter().collect();
             for event in inbound {
-                // Selection changes and the activity feed's `mark_read` are the
-                // other tasks' half of the M1 surface; this loop owns the byte
-                // stream and the keystrokes, and answers each with its own ack.
+                // D11's read-marking is host state, not stream state: the flag
+                // lives on the event in `WebSurface::activity` so a second tab
+                // — or the same tab tomorrow — backfills a feed that agrees
+                // about what has already been seen, instead of every tab
+                // opening on the same wall of unread. The server has already
+                // refused this frame from a read-only seat, so reaching here
+                // means a controller sent it.
+                //
+                // Selection changes (D3) are still the other task's half of the
+                // M1 surface; this loop owns the byte stream, the keystrokes and
+                // the feed, and answers each with its own ack.
+                if let crate::web::server::WebInbound::Command { viewer_id, command } = &event {
+                    if command.name == crate::web::protocol::command::MARK_ACTIVITY_READ {
+                        let ack = crate::web::activity::apply_mark_read(
+                            &mut web_surface.activity,
+                            command,
+                        );
+                        if let Some(handle) = web_surface.handle.as_ref() {
+                            handle.send(crate::web::server::WebOutbound::Viewer {
+                                viewer_id: viewer_id.clone(),
+                                msg: crate::web::protocol::ServerMsg::Ack(ack),
+                            });
+                        }
+                        continue;
+                    }
+                }
                 let mut host = WorkspaceTerminals {
                     projects: &mut workspace.projects,
                 };
@@ -2168,7 +2289,8 @@ fn event_loop(
                 }
             }
 
-            let next = build_web_host_state(workspace, &web_surface.streams, now_ms);
+            let activity = web_surface.activity_events(env.clock);
+            let next = build_web_host_state(workspace, &web_surface.streams, activity, now_ms);
             if next != web_surface.published {
                 // Publish, *then* the matching deltas: publishing changes what
                 // the next attach sees and notifies nobody, deliberately, so the
@@ -2190,7 +2312,8 @@ fn event_loop(
         if ui.pending_web_start {
             ui.pending_web_start = false;
             let config = workspace.active_project().state.config.web.clone();
-            let initial = build_web_host_state(workspace, &web_surface.streams, now_ms);
+            let activity = web_surface.activity_events(env.clock);
+            let initial = build_web_host_state(workspace, &web_surface.streams, activity, now_ms);
             match web_surface.start(&config, initial) {
                 Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
                 Err(e) => ui.message(format!("Web interface did not start: {e}")),
@@ -2318,14 +2441,19 @@ fn event_loop(
 /// clicking it moves the desktop rather than the browser being told it may not
 /// look.
 ///
-/// Two fields are deliberately empty in this task's scope, and are the next
-/// tasks' to fill: `activity` (D11's feed store exists in
-/// [`crate::web::activity`] but nothing records into it yet) and `dialog` (D13
-/// is M2). Both are absent rather than guessed — §5.1's "unknown stays unknown"
-/// applies to an empty feed exactly as it applies to a status.
+/// `activity` is the retained D11 feed, already evicted against both §5.1
+/// bounds by [`WebSurface::activity_events`] — carried in whole so a freshly
+/// attached tab's `Snapshot` backfills history rather than opening on silence,
+/// and so `crate::web::stream::deltas` can spot a genuinely new event and turn
+/// it into a `Delta::Activity` without the tab reloading.
+///
+/// `dialog` is deliberately empty: D13 is M2. Absent rather than guessed —
+/// §5.1's "unknown stays unknown" applies to a dialog exactly as it applies to a
+/// status.
 fn build_web_host_state(
     workspace: &Workspace,
     streams: &crate::web::stream::TerminalStreams,
+    activity: Vec<crate::web::protocol::ActivityEvent>,
     now_ms: u64,
 ) -> crate::web::server::HostState {
     use crate::web::protocol as wire;
@@ -2418,7 +2546,7 @@ fn build_web_host_state(
         selection,
         geometry: ws::geometry_of(active.state.pty_size),
         replay_capacity_bytes: streams.capacity_bytes() as u64,
-        activity: Vec::new(),
+        activity,
         dialog: None,
     }
 }

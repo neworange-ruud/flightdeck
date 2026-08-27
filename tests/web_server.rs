@@ -24,14 +24,17 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+use flightdeck::agents::status::DisplayStatus;
 use flightdeck::contracts::domain::WebConfig;
 use flightdeck::contracts::real::{RealClock, RealFs};
 use flightdeck::contracts::traits::Clock;
+use flightdeck::contracts::{InterpretedStatus, ProcessState, TabId};
 use flightdeck::remote::runtime;
+use flightdeck::web::activity::{apply_mark_read, ActivityStore, Transition};
 use flightdeck::web::credentials::CredentialStore;
 use flightdeck::web::protocol::{
-    Attach, ClientMsg, Delta, ErrorCode, Input, Seat, SeatRequest, ServerMsg, ShutdownReason,
-    PROTOCOL_VERSION,
+    AckOutcome, ActivityTier, Attach, ClientMsg, Command as WireCommand, Delta, ErrorCode, Input,
+    ProjectId, Seat, SeatRequest, ServerMsg, ShutdownReason, PROTOCOL_VERSION,
 };
 use flightdeck::web::server::{
     self, BindExposure, HostState, ShutdownNotice, WebInbound, WebServerHandle, COOKIE_NAME,
@@ -1469,10 +1472,10 @@ fn every_attached_viewer_is_told_about_the_shutdown() {
 // not "the host politely declines a viewer's geometry", it is "no such call is
 // ever made", and only a counting seam can tell those two apart.
 
-use flightdeck::contracts::domain::{ProcessState, PtySize};
+use flightdeck::contracts::domain::PtySize;
 use flightdeck::terminal::session::Session;
 use flightdeck::testing::{FakePty, FakePtyHandle};
-use flightdeck::web::protocol::{Ack, AckOutcome, ServerMsg as SM, TermBytes, TermCursor};
+use flightdeck::web::protocol::{Ack, ServerMsg as SM, TermBytes, TermCursor};
 use flightdeck::web::stream::{
     child_terminal_id, primary_terminal_id, write_into_session, TerminalHost, TerminalStreams,
     Written,
@@ -2280,4 +2283,456 @@ fn a_resize_frame_never_resizes_a_pty() {
         }],
         "the seam does count resizes — so the zero above is a real zero"
     );
+}
+
+// ===========================================================================
+// The activity feed (D11, turn 2 §5.1)
+// ===========================================================================
+//
+// D11 is the browser's *entire* substitute for OS notifications — Web Push is
+// structurally blocked under D1 — so these drive the two halves that make it
+// worth having: a tab already open must learn a transition without reloading,
+// and a tab opened afterwards must land on history rather than silence.
+//
+// They deliberately go through the same `web::activity` store and the same
+// `web::stream::deltas` the event loop uses. A test that hand-rolled a
+// `Delta::Activity` would pass happily while the loop shipped nothing.
+
+/// The event loop's publish step in miniature (see `build_web_host_state` and
+/// the `web_surface.running()` block in `src/lib.rs`): enforce both retention
+/// bounds, carry the retained feed into the state, publish, then send the deltas
+/// that describe the difference.
+fn publish_activity(
+    handle: &WebServerHandle,
+    published: &mut HostState,
+    store: &mut ActivityStore,
+    clock: &dyn Clock,
+) {
+    store.evict(clock);
+    let next = HostState {
+        activity: store.events().cloned().collect(),
+        ..published.clone()
+    };
+    let frames = flightdeck::web::stream::deltas(published, &next);
+    handle.publish_state(next.clone());
+    for delta in frames {
+        handle.send(server::WebOutbound::All(ServerMsg::Delta(delta)));
+    }
+    *published = next;
+}
+
+/// Record one transition the way `WebSurface::record_transition` does — through
+/// `activity::observe`, so the reason string in these assertions is the one the
+/// host would really produce rather than one the test made up.
+fn record(
+    store: &mut ActivityStore,
+    clock: &dyn Clock,
+    session: &str,
+    was: (ProcessState, InterpretedStatus),
+    now: (ProcessState, InterpretedStatus),
+    lifecycle_reporting: bool,
+) {
+    let observed = flightdeck::web::activity::observe(
+        DisplayStatus {
+            process: was.0,
+            interpreted: was.1,
+            manual: None,
+        },
+        DisplayStatus {
+            process: now.0,
+            interpreted: now.1,
+            manual: None,
+        },
+        "Claude Code",
+        lifecycle_reporting,
+    );
+    store.record(
+        clock,
+        Transition {
+            project_id: ProjectId::new("/repo/flightdeck"),
+            project_name: "flightdeck".to_string(),
+            session_id: TabId(session.to_string()),
+            session_name: session.to_string(),
+            from: observed.from,
+            to: observed.to,
+            manual: observed.manual,
+            reason: observed.reason,
+        },
+    );
+}
+
+/// Block until the host is handed an inbound command, the way the TUI's tick
+/// loop finds one in its channel.
+fn wait_for_command(harness: &Harness) -> (flightdeck::web::protocol::ViewerId, WireCommand) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::time::Instant::now() < deadline {
+        for event in harness.inbound() {
+            if let WebInbound::Command { viewer_id, command } = event {
+                return (viewer_id, command);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the host was never told about the command");
+}
+
+/// The live half: a tab that is already looking at the app learns about a
+/// transition as a `Delta::Activity`, with no reload and no re-snapshot.
+#[test]
+fn an_attached_viewer_learns_a_new_transition_without_reloading() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    let mut ws = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        let snapshot = await_snapshot(&mut ws).await;
+        assert!(
+            snapshot.activity.is_empty(),
+            "nothing has happened yet, and the host does not invent history"
+        );
+        ws
+    });
+
+    record(
+        &mut store,
+        &clock,
+        "flaky-e2e-runner",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Exited(1), InterpretedStatus::Failed),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    let event = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Delta(Delta::Activity(event)) => Some(event),
+        _ => None,
+    }));
+    assert_eq!(event.session_name, "flaky-e2e-runner");
+    assert_eq!(event.project_name, "flightdeck");
+    assert_eq!(event.from, InterpretedStatus::Working);
+    assert_eq!(event.to, InterpretedStatus::Failed);
+    assert_eq!(event.reason, "agent exited (code 1)");
+    assert_eq!(event.tier, ActivityTier::Attention);
+    assert!(!event.read);
+}
+
+/// A publish that changes nothing about the feed must not replay it: the
+/// backfill list is resent whole on every tick, and a browser that appended it
+/// again would show every row twice.
+#[test]
+fn republishing_the_same_feed_sends_no_further_activity_deltas() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    record(
+        &mut store,
+        &clock,
+        "add-tests-api",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::Idle),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    let mut ws = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        ws
+    });
+
+    // Two more ticks with nothing new, then one genuinely new event. The first
+    // `Delta::Activity` to arrive must be the new one.
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+    record(
+        &mut store,
+        &clock,
+        "migrate-schema-v4",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::WaitingForInput),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    let event = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Delta(Delta::Activity(event)) => Some(event),
+        _ => None,
+    }));
+    assert_eq!(
+        event.session_name, "migrate-schema-v4",
+        "the already-delivered row must not have been replayed"
+    );
+    assert_eq!(
+        event.reason, "",
+        "`asked a question` is not a fact any hook reports, so the row carries \
+         no reason rather than a plausible one"
+    );
+}
+
+/// The reason D11's retention exists: a tab opened *after* the fact must land on
+/// history. This is the bug `remote-control-5yy.1` was filed for — the store was
+/// correct and nothing fed it, so a fresh tab opened on silence.
+#[test]
+fn a_freshly_attached_viewer_backfills_the_retained_feed() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    // Two transitions with nobody watching, including one from an agent that
+    // reports no lifecycle at all (§5.1: `unknown → unknown`, never a guess).
+    record(
+        &mut store,
+        &clock,
+        "add-tests-api",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::Idle),
+        true,
+    );
+    record(
+        &mut store,
+        &clock,
+        "hotfix-csp-header",
+        (ProcessState::Running, InterpretedStatus::Unknown),
+        (ProcessState::Exited(0), InterpretedStatus::Completed),
+        false,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        let snapshot = await_snapshot(&mut ws).await;
+        assert_eq!(
+            snapshot.activity.len(),
+            2,
+            "a fresh tab opens on history, not silence"
+        );
+        // Oldest first, as `Snapshot::activity` documents.
+        assert_eq!(snapshot.activity[0].session_name, "add-tests-api");
+        assert_eq!(snapshot.activity[1].session_name, "hotfix-csp-header");
+        assert!(snapshot.activity.iter().all(|event| !event.read));
+
+        let unknown = &snapshot.activity[1];
+        assert_eq!(unknown.from, InterpretedStatus::Unknown);
+        assert_eq!(
+            unknown.to,
+            InterpretedStatus::Unknown,
+            "the process exited 0, but this agent never said what that meant"
+        );
+        assert_eq!(unknown.reason, "Claude Code reports no lifecycle");
+        assert_eq!(unknown.tier, ActivityTier::Quiet);
+    });
+}
+
+/// Read-marking end to end, and why it is host state: one tab opening the feed
+/// must not leave a second tab facing the same wall of unread.
+#[test]
+fn marking_the_feed_read_is_host_state_a_second_tab_sees() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    record(
+        &mut store,
+        &clock,
+        "add-tests-api",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::Idle),
+        true,
+    );
+    record(
+        &mut store,
+        &clock,
+        "flaky-e2e-runner",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Exited(1), InterpretedStatus::Failed),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    let (mut ws, ids) = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        let snapshot = await_snapshot(&mut ws).await;
+        let ids: Vec<String> = snapshot
+            .activity
+            .iter()
+            .map(|event| event.event_id.as_str().to_string())
+            .collect();
+        (ws, ids)
+    });
+    assert_eq!(ids.len(), 2);
+
+    // What the SPA sends (`webui/src/main.ts`): the ids it has just shown.
+    on_runtime(send(
+        &mut ws,
+        &ClientMsg::Command(WireCommand {
+            seq: 11,
+            name: flightdeck::web::protocol::command::MARK_ACTIVITY_READ.to_string(),
+            args: Some(serde_json::json!({ "event_ids": ids })),
+        }),
+    ));
+
+    // The tick loop's half: apply it to the store and ack the sender.
+    let (viewer_id, command) = wait_for_command(&harness);
+    let ack = apply_mark_read(&mut store, &command);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    harness.handle.send(server::WebOutbound::Viewer {
+        viewer_id,
+        msg: ServerMsg::Ack(ack),
+    });
+    let delivered = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Ack(ack) => Some(ack),
+        _ => None,
+    }));
+    assert_eq!(delivered.seq, 11);
+    assert_eq!(delivered.outcome, AckOutcome::Applied);
+
+    // Next tick republishes, and a second tab attaches to a feed that agrees.
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+    on_runtime(async {
+        let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut second, SeatRequest::Observe).await;
+        let snapshot = await_snapshot(&mut second).await;
+        assert_eq!(snapshot.activity.len(), 2);
+        assert!(
+            snapshot.activity.iter().all(|event| event.read),
+            "the second tab must not be shown a wall of unread the first already cleared"
+        );
+    });
+}
+
+/// Failure path: a malformed command is refused with a stated reason rather than
+/// silently succeeding, and nothing is half-applied.
+#[test]
+fn a_malformed_mark_activity_read_is_rejected_and_changes_nothing() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    record(
+        &mut store,
+        &clock,
+        "add-tests-api",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::Idle),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    let mut ws = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Control).await;
+        await_snapshot(&mut ws).await;
+        ws
+    });
+    on_runtime(send(
+        &mut ws,
+        &ClientMsg::Command(WireCommand {
+            seq: 12,
+            name: flightdeck::web::protocol::command::MARK_ACTIVITY_READ.to_string(),
+            args: Some(serde_json::json!({ "event_ids": "evt-1" })),
+        }),
+    ));
+
+    let (viewer_id, command) = wait_for_command(&harness);
+    let ack = apply_mark_read(&mut store, &command);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack.detail.is_some(), "a rejection has to state why");
+    harness.handle.send(server::WebOutbound::Viewer {
+        viewer_id,
+        msg: ServerMsg::Ack(ack),
+    });
+
+    let delivered = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Ack(ack) => Some(ack),
+        _ => None,
+    }));
+    assert_eq!(delivered.seq, 12);
+    assert_eq!(delivered.outcome, AckOutcome::Rejected);
+    assert!(
+        store.events().all(|event| !event.read),
+        "a rejected frame must not half-apply"
+    );
+}
+
+/// Failure path: D14's read-only observation is real. The feed's read flag is
+/// shared host state, so an observer flipping it would change what the
+/// controller's next snapshot says — the server refuses the frame before the
+/// host ever hears about it.
+#[test]
+fn an_observer_cannot_mark_the_feed_read() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let clock = RealClock;
+    let mut store = ActivityStore::new();
+    let mut published = HostState::default();
+
+    record(
+        &mut store,
+        &clock,
+        "add-tests-api",
+        (ProcessState::Running, InterpretedStatus::Working),
+        (ProcessState::Running, InterpretedStatus::Idle),
+        true,
+    );
+    publish_activity(&harness.handle, &mut published, &mut store, &clock);
+
+    on_runtime(async {
+        // A controller first, so the second socket really is an observer.
+        let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut driver, SeatRequest::Control).await;
+        await_snapshot(&mut driver).await;
+
+        let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut watcher, SeatRequest::Observe).await;
+        await_snapshot(&mut watcher).await;
+
+        send(
+            &mut watcher,
+            &ClientMsg::Command(WireCommand {
+                seq: 13,
+                name: flightdeck::web::protocol::command::MARK_ACTIVITY_READ.to_string(),
+                args: Some(serde_json::json!({ "event_ids": ["evt-1"] })),
+            }),
+        )
+        .await;
+
+        let error = frame_matching(&mut watcher, |frame| match frame {
+            ServerMsg::Error(error) => Some(error),
+            _ => None,
+        })
+        .await;
+        assert_eq!(error.code, ErrorCode::ReadOnly);
+        assert_eq!(error.seq, Some(13));
+    });
+
+    assert!(
+        !harness
+            .inbound()
+            .iter()
+            .any(|event| matches!(event, WebInbound::Command { .. })),
+        "the refusal happens at the socket; the host is never asked to apply it"
+    );
+    assert!(store.events().all(|event| !event.read));
 }

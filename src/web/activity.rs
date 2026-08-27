@@ -78,43 +78,61 @@
 //! that enum's own doc comment as code, so a fourth tier added to
 //! `ActivityTier` fails to compile here rather than silently sorting wrong.
 //!
-//! ## The reason string: a gap in the committed wire type
+//! ## The reason string, and what the host may not say
 //!
-//! [`super::protocol::ActivityEvent`] — finished and committed — carries
-//! `from`, `to`, `manual`, `tier`, timestamps and identity, but **no reason
-//! string**. The design's rows are not honest without one (`"asked a
-//! question"`, `"agent exited (code 1)"`, `"finished, 18 files touched"`,
-//! artboard 2e) — the status pair alone does not distinguish *why* an agent
-//! moved from `in progress` to `error`. Since `protocol.rs` is out of scope for
-//! this module, the reason travels on [`protocol::ActivityEvent::reason`]
-//! itself, so a caller building a `Snapshot` or a `Delta::Activity` hands the
-//! stored event over whole and cannot lose the one part of a row a user
-//! actually reads (artboard 2e).
-//! module owes the orchestrator: **`protocol::ActivityEvent` needs a `reason:
-//! String` field before the browser can render the design's rows verbatim.**
-//! This module does not add it, per instruction; it reports the gap instead.
+//! [`super::protocol::ActivityEvent::reason`] carries the one part of a feed row
+//! a user actually reads: the status pair alone does not distinguish *why* an
+//! agent moved from `in progress` to `error`. [`observe`] is the single place
+//! that decides what goes in it, and it is deliberately stingy. The design's
+//! rows show three kinds of reason (artboard 2e) and the host can only be honest
+//! about some of them:
+//!
+//! | Artboard row | What the host really knows |
+//! | --- | --- |
+//! | `agent exited (code 1)` | [`ProcessState::Exited`] carries the code — supplied verbatim. |
+//! | `set by hand on the desktop` | The manual override moved — a fact, supplied. |
+//! | `Codex CLI reports no lifecycle` | [`crate::agents::setup::status_backend`] says so — supplied. |
+//! | `asked a question` | **Not knowable.** The status hook writes `waiting`; *why* it is waiting never reaches the host. |
+//! | `finished, 18 files touched` | **Not knowable here.** The file count lives in the git-status cache, refreshed on its own schedule for the active project only, so any number at transition time would be stale or absent. |
+//!
+//! The two unknowable rows get an **empty** reason. §5.1's "unknown stays
+//! unknown" applies to the reason exactly as it applies to the statuses, and a
+//! plausible number is worse than no number: a user who trusts "18 files
+//! touched" and acts on it has been misled by us, not by their agent.
 //!
 //! ## A second record, not the only one
 //!
 //! This is **not** the desktop's sole source of lifecycle awareness. The
-//! desktop already posts OS notifications from the very same interpreted-
-//! status transitions, via [`crate::app::state::AppState::take_finish_notifications`]
+//! desktop posts OS notifications from the very same interpreted-status
+//! transitions, via [`crate::app::state::AppState::take_finish_notifications`]
 //! (which watches `notify_phase(interpreted)` transitions and hands the result
-//! to a [`crate::contracts::Notifier`]). That call site and this store's
-//! [`ActivityStore::record`] must eventually be driven by **the same**
-//! transition detection, or the OS notification and the browser's feed row for
-//! the same event could disagree — see the module doc's framing in `mod.rs`
-//! ("Sources the same lifecycle signals the desktop's OS notifications use —
-//! this is a second record, not a replacement"). Wiring `record` calls to that
-//! exact detection is the job of whichever module drives the event loop, not
-//! this one; this comment exists so that wiring is done once, deliberately,
-//! against the same source, rather than re-derived and left to drift.
+//! to a [`crate::contracts::Notifier`]).
+//!
+//! Both records are driven from the same signal —
+//! [`crate::app::state::AppState::take_status_transitions`] reads the identical
+//! `RuntimeTab::display_status` value `notify_phase` classifies — but the feed
+//! **tees the source rather than consuming the notifications**. It has to:
+//! `take_finish_notifications` is destructive (it spends each tab's
+//! `notify_armed` on every settled edge) and it drops everything the user
+//! disabled in `[notifications]` or that the startup grace window suppressed, so
+//! a feed built from its *output* would have holes in exactly the places D11
+//! exists to cover. The two therefore keep separate per-tab edge memory
+//! (`notify_armed` for the desktop, `activity_seen` for the feed) and neither can
+//! starve the other, whatever order the event loop calls them in.
+//!
+//! The feed is also deliberately **wider** than the notifications: §5.1 gives it
+//! a `quiet` tier for moves that would never earn an alert (a manual override,
+//! `unknown → unknown`), because a browser tab has nothing else to learn them
+//! from.
 
 use std::collections::VecDeque;
 
-use crate::contracts::{Clock, InterpretedStatus, ManualStatus, TabId};
+use crate::agents::status::DisplayStatus;
+use crate::contracts::{Clock, InterpretedStatus, ManualStatus, ProcessState, TabId};
 
-use super::protocol::{ActivityEvent, ActivityTier, EventId, ProjectId, StatusBucket};
+use super::protocol::{
+    Ack, AckOutcome, ActivityEvent, ActivityTier, Command, EventId, ProjectId, StatusBucket,
+};
 
 #[cfg(test)]
 mod tests;
@@ -334,5 +352,205 @@ impl ActivityStore {
             count_at_tier: counts[rank],
             total_unread,
         })
+    }
+}
+
+// ===========================================================================
+// From a desktop status change to an honest feed row (§5.1)
+// ===========================================================================
+
+/// Reason for a transition the user caused themselves (artboard 2e).
+const REASON_MANUAL: &str = "set by hand on the desktop";
+
+/// Reason for an agent that never came up at all — distinct from a non-zero
+/// exit, and not something `to: Failed` alone can tell you.
+const REASON_SPAWN_FAILED: &str = "agent failed to start";
+
+/// The honest wire values for one observed desktop status change: what
+/// [`Transition`]'s `from`, `to`, `manual` and `reason` may say about it.
+///
+/// Separated from [`Transition`] because the caller supplies the project and
+/// session identity (which this module cannot know) while this module owns the
+/// honesty policy (which the event loop should not have to re-derive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    /// Status before the change, as the feed may report it.
+    pub from: InterpretedStatus,
+    /// Status after it, as the feed may report it.
+    pub to: InterpretedStatus,
+    /// The manual override in force afterwards, if any.
+    pub manual: Option<ManualStatus>,
+    /// Why, in the design's words — **empty when the host has nothing honest to
+    /// say**. See the module doc's reason-string table.
+    pub reason: String,
+}
+
+/// Turn one observed change in a tab's [`DisplayStatus`] into the values a feed
+/// row may honestly carry (§5.1).
+///
+/// `lifecycle_reporting` is the fact
+/// [`crate::web::stream::lifecycle_reporting`] computes from
+/// [`crate::agents::setup::status_backend`] — *not* a guess about whether the
+/// agent happens to have said anything lately. When it is `false` the returned
+/// pair is **always** `unknown → unknown`, whatever the process state implies:
+/// §5.1 requires a credible "we don't know" for an agent with no lifecycle
+/// hooks, and `Exited(0)` → "completed" is precisely the inference it forbids.
+/// The process state still gets to explain the *reason*, because "the agent
+/// exited with code 1" is an observation rather than an interpretation of an
+/// agent's internal state.
+///
+/// Reason precedence, most specific first:
+///
+/// 1. **The manual override moved** → [`REASON_MANUAL`]. The user did this, so
+///    nothing else is a better explanation — including a process event that
+///    landed on the same tick, which is rare and is why this is documented
+///    rather than merged.
+/// 2. **The agent reports no lifecycle** → `"<Agent> reports no lifecycle"`,
+///    matching the browser's own `lifecycleNote` wording so a feed row and a
+///    sidebar row cannot disagree about the same agent.
+/// 3. **The process ended** → `"agent exited (code N)"` from
+///    [`ProcessState::Exited`], or [`REASON_SPAWN_FAILED`] for
+///    [`ProcessState::Failed`].
+/// 4. **Otherwise** → empty. Notably `to: WaitingForInput` gets *no* reason: the
+///    design's `asked a question` is not a fact any hook reports.
+pub fn observe(
+    was: DisplayStatus,
+    now: DisplayStatus,
+    agent_display_name: &str,
+    lifecycle_reporting: bool,
+) -> Observed {
+    let reason = if was.manual != now.manual {
+        REASON_MANUAL.to_string()
+    } else if !lifecycle_reporting {
+        format!("{agent_display_name} reports no lifecycle")
+    } else {
+        match now.process {
+            ProcessState::Exited(code) => format!("agent exited (code {code})"),
+            ProcessState::Failed => REASON_SPAWN_FAILED.to_string(),
+            // Everything else is already said by `to`. Restating it would be
+            // noise, and inventing anything more would be a guess.
+            ProcessState::NotStarted
+            | ProcessState::Starting
+            | ProcessState::Running
+            | ProcessState::Stopped
+            | ProcessState::Lost => String::new(),
+        }
+    };
+
+    let (from, to) = if lifecycle_reporting {
+        (was.interpreted, now.interpreted)
+    } else {
+        (InterpretedStatus::Unknown, InterpretedStatus::Unknown)
+    };
+
+    Observed {
+        from,
+        to,
+        manual: now.manual,
+        reason,
+    }
+}
+
+// ===========================================================================
+// Read-marking, from the browser's command frame (D11)
+// ===========================================================================
+
+/// The `event_ids` argument of
+/// [`crate::web::protocol::command::MARK_ACTIVITY_READ`].
+const ARG_EVENT_IDS: &str = "event_ids";
+
+/// Apply one [`crate::web::protocol::command::MARK_ACTIVITY_READ`] frame and
+/// return the [`Ack`] the event loop owes the browser that sent it.
+///
+/// The read flag lives on the **host**, not in the tab, and that is the whole
+/// point: D11 makes the feed the browser's only notification channel, so two
+/// tabs (or the same tab reopened tomorrow) must agree about what has already
+/// been seen. A tab that marks the feed read here changes what every later
+/// [`crate::web::protocol::Snapshot`] backfills.
+///
+/// Argument shapes, and what each honestly deserves:
+///
+/// - **No `args` at all** → mark everything retained read. "Mark all read" has
+///   no ids to name, so its absence is the request rather than a malformed one.
+/// - **`event_ids: [..]`** → mark those. Ids the store no longer retains are a
+///   no-op, not an error ([`ActivityStore::mark_read`]) — they were evicted
+///   under §5.1's bounds while the tab still held them, which is expected. The
+///   ack says how many missed so a browser is not silently misled.
+/// - **`event_ids: []`** → [`AckOutcome::Ignored`]. Nothing was asked for and
+///   nothing was done; claiming `Applied` would be a small lie.
+/// - **A list where nothing matched** → [`AckOutcome::Ignored`] too, for the
+///   same reason.
+/// - **`event_ids` present but not a list of strings** → [`AckOutcome::Rejected`]
+///   with the detail. A malformed frame is the browser's bug and it deserves to
+///   hear about it rather than to see a silent success.
+pub fn apply_mark_read(store: &mut ActivityStore, command: &Command) -> Ack {
+    let rejected = |detail: String| Ack {
+        seq: command.seq,
+        outcome: AckOutcome::Rejected,
+        detail: Some(detail),
+    };
+    let ignored = |detail: &str| Ack {
+        seq: command.seq,
+        outcome: AckOutcome::Ignored,
+        detail: Some(detail.to_string()),
+    };
+
+    let ids: Vec<EventId> = match command.args.as_ref() {
+        None => {
+            store.mark_all_read();
+            return Ack {
+                seq: command.seq,
+                outcome: AckOutcome::Applied,
+                detail: None,
+            };
+        }
+        Some(args) => match args.get(ARG_EVENT_IDS) {
+            None => {
+                store.mark_all_read();
+                return Ack {
+                    seq: command.seq,
+                    outcome: AckOutcome::Applied,
+                    detail: None,
+                };
+            }
+            Some(serde_json::Value::Array(values)) => {
+                let mut ids = Vec::with_capacity(values.len());
+                for value in values {
+                    match value.as_str() {
+                        Some(id) => ids.push(EventId::new(id)),
+                        None => {
+                            return rejected(format!(
+                                "{ARG_EVENT_IDS} must be a list of event ids, but one entry was {value}"
+                            ))
+                        }
+                    }
+                }
+                ids
+            }
+            Some(other) => {
+                return rejected(format!(
+                    "{ARG_EVENT_IDS} must be a list of event ids, not {other}"
+                ))
+            }
+        },
+    };
+
+    if ids.is_empty() {
+        return ignored("no event ids given");
+    }
+    let marked = ids.iter().filter(|id| store.mark_read(id)).count();
+    if marked == 0 {
+        return ignored("no retained event matched");
+    }
+    Ack {
+        seq: command.seq,
+        outcome: AckOutcome::Applied,
+        detail: (marked < ids.len()).then(|| {
+            format!(
+                "{} of {} events are no longer retained",
+                ids.len() - marked,
+                ids.len()
+            )
+        }),
     }
 }
