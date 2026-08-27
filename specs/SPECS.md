@@ -392,6 +392,48 @@ Supported initial agents:
 
 Agent definitions must be config-driven.
 
+### `[web]` section — FlightDeck Web (`specs/WEB_INTERFACE.md`)
+
+The embedded browser server (M1) is configured by an optional `[web]` table,
+layered like every other section (absent → shipped defaults below):
+
+```toml
+[web]
+enabled = false        # auto-start on launch (D10); otherwise palette-only
+port = 7420
+bind = "127.0.0.1"      # loopback by default (D5)
+replay_bytes = 262144   # 256 KiB per-terminal replay buffer (Q2)
+```
+
+- **`enabled`** (bool, default `false`) — auto-start the web interface on
+  launch. A user who only wants it occasionally leaves this off and uses the
+  `Start Web Interface` / `Stop Web Interface` palette commands instead (D10);
+  either path is backed by this same section.
+- **`port`** (integer, default `7420`) — the TCP port the embedded server
+  listens on. Kept stable across restarts so a bookmarked URL or saved QR code
+  keeps working. A configured `0` is rejected at load (SPECS §26): unlike a raw
+  `bind()` call, "the OS picks a random port every launch" is not an acceptable
+  resolution for a server meant to be reachable at a stable address.
+- **`bind`** (string, default `"127.0.0.1"`) — the address the server listens
+  on. **Loopback by default (D5)**: nothing outside the machine can reach it
+  unless a person deliberately types a routable address (e.g. `0.0.0.0`, a LAN
+  interface IP) — never a side effect of merging/defaulting logic, since every
+  layer (shipped default, global base, project override) falls back to
+  loopback field-by-field. Binding a routable address shows a warning in the UI
+  when the server actually starts.
+- **`replay_bytes`** (integer, default `262144`, i.e. 256 KiB) — the
+  per-terminal replay ring buffer capacity, in bytes (Q2). Bytes, not lines,
+  because the buffer sits in front of the VT parser. Replayed in full to a
+  browser tab that joins or attaches after a reconnect. A configured `0` (would
+  silently disable reconnect resume) or a value above a 64 MiB sanity ceiling
+  (a likely unit-confusion typo) is rejected at load (SPECS §26); the buffer
+  implementation itself (`src/web/replay.rs`) accepts any capacity — validating
+  a *configured* value is this config layer's job, not the buffer's.
+
+Like `[remote]`, this section is off by default and behaves bit-for-bit as
+before (no listener opened) until `enabled` is set or the palette starts it
+explicitly.
+
 ---
 
 ## 9. Runtime State

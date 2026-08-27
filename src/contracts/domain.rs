@@ -437,6 +437,83 @@ impl Default for RemoteConfig {
 }
 
 // ---------------------------------------------------------------------------
+// FlightDeck Web (embedded browser server) — the optional `[web]` section.
+// (specs/WEB_INTERFACE.md D5, D10, Q2; SPECS §8)
+// ---------------------------------------------------------------------------
+
+/// Default port for the embedded web server (`specs/WEB_INTERFACE.md` D10).
+/// Chosen to be memorable and unlikely to collide with common dev-server
+/// defaults (3000, 5173, 8080, ...).
+fn default_web_port() -> u16 {
+    7420
+}
+
+/// Default bind address: **loopback only** (`specs/WEB_INTERFACE.md` D5). This
+/// is the field-level default that back-fills a partial/absent `[web]` table,
+/// so an old config with no `bind` key at all — or one that sets only
+/// `enabled` — still resolves to loopback rather than to Rust's `u16`/`String`
+/// zero values. A routable bind (e.g. `0.0.0.0`) is an explicit, deliberate
+/// opt-in the user types themselves; it is never a merge/default artifact.
+fn default_web_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// Default per-terminal replay ring buffer capacity, in bytes: 256 KiB
+/// (`specs/WEB_INTERFACE.md` Q2). See [`crate::web::replay::ReplayBuffer`] for
+/// the buffer this sizes; that module deliberately accepts any capacity
+/// (including 0) since sanity-checking a *configured* value is this config
+/// layer's job, done in [`crate::config::schema::validate_web`].
+fn default_replay_bytes() -> usize {
+    262_144
+}
+
+/// `[web]` config section: the embedded browser server (`specs/WEB_INTERFACE.md`,
+/// M1). **Off by default** — no listener is opened and the desktop behaves
+/// bit-for-bit as before until `enabled = true` (D10), mirroring `[remote]`.
+/// When enabled, the palette's `Start Web Interface` / `Stop Web Interface`
+/// commands are backed by this same section (an explicit start still works
+/// with `enabled = false`; this only controls auto-start on launch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Auto-start the web interface on launch. Off by default: starting the
+    /// server is otherwise an explicit palette action (D10).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port the embedded server listens on. Validated by
+    /// [`crate::config::schema::validate_web`] (a configured `0` is rejected —
+    /// see that function's doc comment for why "OS picks a random port" is not
+    /// an acceptable resolution for a server a QR code/bookmark points at).
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    /// Bind address. **Loopback (`127.0.0.1`) by default** (D5) — reachable
+    /// only from this machine. Binding a routable address (e.g. `0.0.0.0`, a
+    /// LAN interface IP) is an explicit opt-in the user types themselves and
+    /// carries a warning in the UI when the server actually starts; it is
+    /// never produced by merging/defaulting logic. This field is free text —
+    /// [`crate::config::schema::validate_web`] only rejects it being empty —
+    /// so it can name any interface address the host resolves.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Per-terminal replay ring buffer capacity in bytes (Q2). Bytes, not
+    /// lines, because the buffer sits in front of the VT parser. Validated by
+    /// [`crate::config::schema::validate_web`] (a configured `0` or an
+    /// unreasonably large value is rejected).
+    #[serde(default = "default_replay_bytes")]
+    pub replay_bytes: usize,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            enabled: false,
+            port: default_web_port(),
+            bind: default_web_bind(),
+            replay_bytes: default_replay_bytes(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Container execution model (SPECS §31) — the optional `[containers]` section.
 // ---------------------------------------------------------------------------
 
@@ -573,6 +650,10 @@ pub struct Config {
     /// FlightDeck Remote (phone link). Absent table → disabled → no relay.
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// FlightDeck Web (embedded browser server, `specs/WEB_INTERFACE.md`).
+    /// Absent table → disabled → no listener opened.
+    #[serde(default)]
+    pub web: WebConfig,
     /// Container execution (SPECS §31). Absent table → disabled → local model.
     /// Accepts the legacy `[execution]` section name as a deprecated alias.
     #[serde(default, alias = "execution")]

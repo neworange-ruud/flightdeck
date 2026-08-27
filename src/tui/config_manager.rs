@@ -476,6 +476,22 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             key: "relay_url",
             kind: FieldKind::Text,
         },
+        // FlightDeck Web (embedded browser server, specs/WEB_INTERFACE.md D10),
+        // sitting beside the FlightDeck Remote row above. Only the toggle and
+        // the (string) bind address are curated here: `port` and
+        // `replay_bytes` are numeric and this manager's `FieldKind::Text`
+        // always commits a TOML *string* (see `commit_edit`), which is right
+        // for `relay_url`/`bind` but would corrupt a `u16`/`usize` field on
+        // save (`port = "7420"` fails to deserialize). Those two stay
+        // raw-TOML-only, edited via `e` ($EDITOR), same as the rest of the
+        // full surface (containers, agents, git, ...).
+        b("Auto-start Web Interface", "web", "enabled"),
+        CuratedField {
+            label: "Web interface bind address",
+            section: "web",
+            key: "bind",
+            kind: FieldKind::Text,
+        },
     ]
 }
 
@@ -721,5 +737,96 @@ mod tests {
             .unwrap();
         assert!(dim.is_bool);
         assert!(dim.bool_value);
+    }
+
+    // --- [web] curated fields (specs/WEB_INTERFACE.md D10; beside FlightDeck Remote) ---
+
+    #[test]
+    fn exposes_web_fields_disabled_and_loopback_by_default() {
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let rows = m.rows();
+        let enabled = rows
+            .iter()
+            .find(|r| r.label == "Auto-start Web Interface")
+            .unwrap();
+        assert!(enabled.is_bool);
+        assert!(!enabled.bool_value, "web interface is off by default");
+        assert_eq!(enabled.origin, Origin::Default);
+        let bind = rows
+            .iter()
+            .find(|r| r.label == "Web interface bind address")
+            .unwrap();
+        assert!(bind.is_text);
+        assert_eq!(bind.value, "127.0.0.1");
+        assert_eq!(bind.origin, Origin::Default);
+    }
+
+    #[test]
+    fn toggle_web_enabled_writes_bool_override() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Auto-start Web Interface");
+        m.toggle_selected();
+        let row = m
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "Auto-start Web Interface")
+            .unwrap();
+        assert!(row.bool_value);
+        assert_eq!(row.origin, Origin::SetHere);
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[web]"));
+        assert!(body.contains("enabled = true"));
+    }
+
+    #[test]
+    fn editing_web_bind_writes_a_text_override() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Web interface bind address");
+        m.toggle_selected();
+        assert!(m.is_editing());
+        for _ in 0.."127.0.0.1".len() {
+            m.edit_backspace();
+        }
+        for c in "0.0.0.0".chars() {
+            m.edit_push_char(c);
+        }
+        m.commit_edit();
+        let bind = m
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "Web interface bind address")
+            .unwrap();
+        assert_eq!(bind.value, "0.0.0.0");
+        assert_eq!(bind.origin, Origin::SetHere);
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[web]"));
+        assert!(body.contains("bind = \"0.0.0.0\""));
+    }
+
+    #[test]
+    fn web_enabled_from_global_shows_global_origin_in_project_scope() {
+        // Global scope sets web.enabled = true; Project scope (the manager's
+        // default) must show it inherited, not as a project override.
+        let global: toml::Table = "[web]\nenabled = true\n".parse().unwrap();
+        let m = mgr(global, toml::Table::new());
+        assert_eq!(m.scope(), ConfigScope::Project);
+        let row = m
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "Auto-start Web Interface")
+            .unwrap();
+        assert!(row.bool_value);
+        assert_eq!(row.origin, Origin::Global);
+    }
+
+    #[test]
+    fn web_port_and_replay_bytes_are_not_curated() {
+        // Numeric fields stay raw-TOML-only (see the comment in build_fields):
+        // this manager's FieldKind::Text always commits a TOML string, which
+        // would corrupt a u16/usize field on save.
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let labels: Vec<String> = m.rows().iter().map(|r| r.label.to_lowercase()).collect();
+        assert!(!labels.iter().any(|l| l.contains("port")));
+        assert!(!labels.iter().any(|l| l.contains("replay")));
     }
 }
