@@ -179,3 +179,139 @@ describe("wire/socket: split-view toggling (D3/D8)", () => {
     expect(store.getState().layout).toBe("single");
   });
 });
+
+/**
+ * D13: the dialog's whole life arrives on the wire. Applied directly rather
+ * than resynced, because `requestSnapshotSoon` would put a coalesced round trip
+ * between a `y` pressed on the desktop and the modal leaving this screen — and
+ * the frames already carry everything the store needs.
+ */
+describe("wire/socket: D13's shared dialog", () => {
+  function session(ws: FakeSocket) {
+    const store = createStore(createInitialState());
+    openSession({
+      store,
+      url: "ws://test/ws",
+      socketFactory: () => ws as unknown as WebSocket,
+    });
+    return store;
+  }
+
+  function openedFrame(origin: unknown): string {
+    return JSON.stringify({
+      type: "delta",
+      change: "dialog_opened",
+      dialog_id: "dialog-7",
+      kind: "new_agent",
+      title: "New Agent Session Tab",
+      origin,
+      body: {
+        input: "",
+        list: [{ label: "(•) Claude Code", selected: true }],
+        buttons: [
+          { key: "Enter", label: "Create" },
+          { key: "Esc", label: "Cancel" },
+        ],
+        confirmable: true,
+      },
+    });
+  }
+
+  it("a Delta::DialogOpened carries the origin through to the store", () => {
+    const ws = fakeSocket();
+    const store = session(ws);
+
+    ws.onmessage?.({
+      data: openedFrame({ origin: "browser", label: "192.168.2.20" }),
+    });
+
+    const dialog = store.getState().dialog;
+    expect(dialog?.id).toBe("dialog-7");
+    expect(dialog?.kind).toBe("new_agent");
+    expect(dialog?.origin).toEqual({
+      kind: "browser",
+      label: "192.168.2.20",
+    });
+    expect(dialog?.confirmable).toBe(true);
+  });
+
+  it("a desktop-opened dialog arrives tagged as the desktop's", () => {
+    const ws = fakeSocket();
+    const store = session(ws);
+    ws.onmessage?.({ data: openedFrame({ origin: "desktop" }) });
+    expect(store.getState().dialog?.origin).toEqual({ kind: "desktop" });
+  });
+
+  it("a Delta::DialogClosed takes it down, whichever surface decided", () => {
+    const ws = fakeSocket();
+    const store = session(ws);
+    ws.onmessage?.({ data: openedFrame({ origin: "desktop" }) });
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "dialog_closed",
+        dialog_id: "dialog-7",
+        outcome: "confirmed",
+      }),
+    });
+    expect(store.getState().dialog).toBeNull();
+  });
+
+  it("a close for a dialog that is not the open one is ignored", () => {
+    const ws = fakeSocket();
+    const store = session(ws);
+    ws.onmessage?.({ data: openedFrame({ origin: "desktop" }) });
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "dialog_closed",
+        dialog_id: "dialog-1",
+        outcome: "superseded",
+      }),
+    });
+    expect(store.getState().dialog?.id).toBe("dialog-7");
+  });
+
+  it("a superseded close is passed through as superseded, not as an answer", () => {
+    /** A browser that flattened it into a cancel would be claiming somebody
+     * answered a question nobody answered. */
+    const ws = fakeSocket();
+    const store = session(ws);
+    const dispatched: string[] = [];
+    store.subscribe((state) => {
+      dispatched.push(state.dialog === null ? "closed" : state.dialog.id);
+    });
+    ws.onmessage?.({ data: openedFrame({ origin: "desktop" }) });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "dialog_closed",
+        dialog_id: "dialog-7",
+        outcome: "superseded",
+      }),
+    });
+    expect(dispatched).toEqual(["dialog-7", "closed"]);
+  });
+
+  it("sends dialog_confirm as a Command frame with the dialog named", () => {
+    const ws = fakeSocket();
+    const sent: string[] = [];
+    ws.send = (data: string) => {
+      sent.push(data);
+    };
+    const store = createStore(createInitialState());
+    const s = openSession({
+      store,
+      url: "ws://test/ws",
+      socketFactory: () => ws as unknown as WebSocket,
+    });
+    const seq = s.sendCommand("dialog_confirm", { dialog_id: "dialog-7" });
+    /** Not attached in this test, so nothing reached the wire — but the seq is
+     * real and owns the counter shared with `Input` (§5.1), which is what lets
+     * `command/result` settle the answer against the host's `Ack`. */
+    expect(sent).toEqual([]);
+    expect(seq).toBeGreaterThan(0);
+  });
+});

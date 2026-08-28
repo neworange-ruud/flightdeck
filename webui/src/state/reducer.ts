@@ -1,11 +1,18 @@
 import { decideEscape } from "../input/escape";
 import { buildCommandInventory, clampIndex, paletteColumns } from "./commands";
 import { CONFIG_FIELDS, selectableConfigFields } from "./config";
+import { selectedChoice } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, Selection } from "./model";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
-import type { AppAction, AppState, ConfigState, PaletteState } from "./types";
+import type {
+  AppAction,
+  AppState,
+  ConfigState,
+  DialogState,
+  PaletteState,
+} from "./types";
 
 /**
  * The one entry point later tasks dispatch through. Pure by construction: no
@@ -105,6 +112,15 @@ export function reduce(state: AppState, action: AppAction): AppState {
          * appending would double every row the tab had already seen.
          */
         activity: snapshot.activity,
+        /**
+         * D13: the dialog is app state, so the host's whole picture includes
+         * it — a snapshot with none means none is open, and a snapshot that
+         * carries one is how a freshly attached tab paints a dialog it never
+         * saw open. The draft survives a re-announcement of the *same* dialog
+         * (see `dialog/opened`), so a coalesced resync mid-typing does not
+         * empty the branch field.
+         */
+        dialog: mergeDialog(state.dialog, snapshot.dialog),
       };
     }
 
@@ -545,7 +561,152 @@ export function reduce(state: AppState, action: AppAction): AppState {
         };
       }
 
+      const dialog = state.dialog;
+      const dialogFound = dialog?.pending.find(
+        (item) => item.seq === action.seq,
+      );
+      if (dialog !== null && dialogFound !== undefined) {
+        return {
+          ...state,
+          dialog: {
+            ...dialog,
+            pending: dialog.pending.filter((item) => item.seq !== action.seq),
+            /**
+             * D13: an `applied` answer does **not** close the dialog here. The
+             * host closes it, and the browser learns that from
+             * `Delta::DialogClosed` — which is the whole point of a dialog being
+             * app state rather than an overlay. Closing it locally on the Ack
+             * would be a second source of truth, and it would be wrong for the
+             * one case that matters: a form the host kept open because it needs
+             * something it did not get.
+             */
+            lastOutcome: {
+              outcome: action.outcome,
+              detail: action.detail ?? null,
+            },
+          },
+        };
+      }
+
       return state;
+    }
+
+    /* --- D13's shared dialog (1d/1e) ----------------------------------- */
+
+    case "dialog/opened": {
+      /** The same dialog re-announced (every coalesced snapshot does this)
+       * keeps the local draft: a resync must not empty the branch field the
+       * user is halfway through typing. A *different* dialog replaces it whole,
+       * draft included — it is a different question. */
+      const current = state.dialog;
+      if (current !== null && current.id === action.dialog.id) {
+        return {
+          ...state,
+          dialog: {
+            ...action.dialog,
+            draft: current.draft,
+            pending: current.pending,
+            lastOutcome: current.lastOutcome,
+          },
+        };
+      }
+      return { ...state, dialog: action.dialog };
+    }
+
+    case "dialog/closed": {
+      /** A close for a dialog that is not the open one is a no-op: a late
+       * `DialogClosed` for a dialog the host already replaced must not take the
+       * live one down with it. */
+      if (state.dialog === null || state.dialog.id !== action.dialogId) {
+        return state;
+      }
+      return { ...state, dialog: null };
+    }
+
+    case "dialog/type": {
+      const dialog = state.dialog;
+      if (dialog === null || dialog.input === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          draft: { ...dialog.draft, text: dialog.draft.text + action.char },
+        },
+      };
+    }
+
+    case "dialog/backspace": {
+      const dialog = state.dialog;
+      if (dialog === null || dialog.input === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          draft: { ...dialog.draft, text: dialog.draft.text.slice(0, -1) },
+        },
+      };
+    }
+
+    case "dialog/move": {
+      const dialog = state.dialog;
+      if (dialog === null || dialog.list.length === 0) {
+        return state;
+      }
+      const from = selectedChoice(dialog);
+      /** Clamped, not wrapped — the same rule the palette's `move` follows. */
+      const index = Math.min(
+        Math.max(from + action.delta, 0),
+        dialog.list.length - 1,
+      );
+      return { ...state, dialog: { ...dialog, draft: { ...dialog.draft, index } } };
+    }
+
+    case "dialog/choose": {
+      const dialog = state.dialog;
+      if (
+        dialog === null ||
+        action.index < 0 ||
+        action.index >= dialog.list.length
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: { ...dialog, draft: { ...dialog.draft, index: action.index } },
+      };
+    }
+
+    case "dialog/toggle": {
+      const dialog = state.dialog;
+      if (dialog === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          draft: { ...dialog.draft, toggled: !dialog.draft.toggled },
+        },
+      };
+    }
+
+    case "dialog/dispatched": {
+      const dialog = state.dialog;
+      if (dialog === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          pending: [...dialog.pending, { seq: action.seq, act: action.act }],
+          lastOutcome: null,
+        },
+      };
     }
 
     /* --- Configuration manager (1f) ------------------------------------ */
@@ -646,6 +807,30 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return unreachable;
     }
   }
+}
+
+/**
+ * The dialog after a whole-picture snapshot.
+ *
+ * Same rule as `dialog/opened`: the host's facts win, and the local draft
+ * survives only for the dialog it belongs to.
+ */
+function mergeDialog(
+  current: DialogState | null,
+  next: DialogState | null,
+): DialogState | null {
+  if (next === null) {
+    return null;
+  }
+  if (current === null || current.id !== next.id) {
+    return next;
+  }
+  return {
+    ...next,
+    draft: current.draft,
+    pending: current.pending,
+    lastOutcome: current.lastOutcome,
+  };
 }
 
 function firstSelectionIn(project: Project): Selection {

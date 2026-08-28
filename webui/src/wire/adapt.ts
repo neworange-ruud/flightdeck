@@ -34,9 +34,11 @@ import type {
   Snapshot,
   TerminalTab,
 } from "../state/model";
+import type { DialogState } from "../state/types";
 import type {
   WireActivityEvent,
   WireBucket,
+  WireDialogView,
   WireGitBar,
   WireProjectView,
   WireSeatInfo,
@@ -274,5 +276,51 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
     seats: wire.seats.map((s) => seatOf(s, wire.server_time_ms)),
     seat: wire.seat as Seat,
     activity: wire.activity.map((e) => activityOf(e, wire.server_time_ms)),
+    /** D13: `null` is the host saying no dialog is open. A tab that attaches
+     * while one is open paints it from here, because it never saw the
+     * `Delta::DialogOpened` that announced it. */
+    dialog:
+      wire.dialog === undefined || wire.dialog === null
+        ? null
+        : dialogOf(wire.dialog),
+  };
+}
+
+/**
+ * `DialogView` → `DialogState` (D13).
+ *
+ * The draft starts empty and `index: null`, which means "the host's own
+ * highlight stands" — the browser does not copy the host's selection into a
+ * local field it would then have to keep in sync. Every field below comes off
+ * the wire; nothing is invented, and a body the host omitted becomes an empty
+ * shell rather than a guessed form.
+ */
+export function dialogOf(wire: WireDialogView): DialogState {
+  const body = wire.body ?? {};
+  return {
+    id: wire.dialog_id,
+    kind: wire.kind,
+    title: wire.title,
+    origin:
+      wire.origin.origin === "browser"
+        ? { kind: "browser", label: wire.origin.label }
+        : { kind: "desktop" },
+    input: body.input ?? null,
+    list: (body.list ?? []).map((choice) => ({
+      label: choice.label,
+      selected: choice.selected,
+    })),
+    buttons: (body.buttons ?? []).map((button) => ({
+      key: button.key,
+      label: button.label,
+    })),
+    /** Absent means "the host did not say", and the honest reading of that is
+     * *not* confirmable: a browser that guessed `true` would send a confirm the
+     * host refuses, which is a worse experience than a disabled button. */
+    confirmable: body.confirmable ?? false,
+    refusal: body.refusal ?? null,
+    draft: { text: "", index: null, toggled: false },
+    pending: [],
+    lastOutcome: null,
   };
 }

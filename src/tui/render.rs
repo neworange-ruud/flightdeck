@@ -180,6 +180,16 @@ pub struct Dialog {
     pub buttons: Vec<DialogButton>,
     /// Border / accent colour (confirmations vs notifications).
     pub accent: Color,
+    /// **D13's origin label**, e.g. `opened from browser · 192.168.2.20`.
+    ///
+    /// `None` for a dialog the person at this keyboard opened — the normal case,
+    /// where an origin line would be noise. `Some` is the whole reason D13 is
+    /// acceptable: a dialog is app state, so a browser opening one puts a modal
+    /// on the desktop that *this* user did not ask for, and this line is the only
+    /// thing that explains it. `specs/WEB_INTERFACE.md` D13 calls it load-bearing,
+    /// not decoration, which is why it is a field on the render model rather than
+    /// something a caller remembers to prepend to the title.
+    pub origin: Option<String>,
 }
 
 impl Dialog {
@@ -191,6 +201,7 @@ impl Dialog {
             list: Vec::new(),
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -202,6 +213,7 @@ impl Dialog {
             list: Vec::new(),
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -220,6 +232,7 @@ impl Dialog {
             list,
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -232,7 +245,16 @@ impl Dialog {
             list: Vec::new(),
             buttons: vec![DialogButton::new(DialogAccel::Enter, "OK")],
             accent: Color::Blue,
+            origin: None,
         }
+    }
+
+    /// The same dialog, tagged with where the request to open it came from
+    /// (D13). Builder-shaped because every prompt builds its dialog from the
+    /// prompt alone and only the *event loop* knows the origin.
+    pub fn from_origin(mut self, origin: impl Into<String>) -> Dialog {
+        self.origin = Some(origin.into());
+        self
     }
 }
 
@@ -2732,6 +2754,8 @@ struct DialogLayout {
     inner: Rect,
     /// Title text, pre-wrapped to the content width.
     title_lines: Vec<String>,
+    /// D13's origin label, pre-wrapped. Empty when the dialog has no origin.
+    origin_lines: Vec<String>,
     /// Screen rect of each button, aligned with `Dialog::buttons`.
     button_rects: Vec<Rect>,
 }
@@ -2767,6 +2791,13 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         .map(|l| l.chars().count() as u16)
         .max()
         .unwrap_or(0);
+    // D13's origin line widens the box like any other content: truncating the
+    // one sentence that explains why this modal appeared would defeat it.
+    if let Some(origin) = &dialog.origin {
+        for line in wrap_message(origin, cap_w as usize) {
+            content_w = content_w.max(line.chars().count() as u16);
+        }
+    }
     if let Some(inp) = &dialog.input {
         // "> " prefix + text + cursor.
         content_w = content_w.max(inp.chars().count() as u16 + 4).max(24);
@@ -2788,6 +2819,10 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
     content_w = content_w.max(one_row.min(cap_w)).clamp(1, cap_w);
 
     let title_lines = wrap_message(&dialog.title, content_w as usize);
+    let origin_lines = match &dialog.origin {
+        Some(origin) => wrap_message(origin, content_w as usize),
+        None => Vec::new(),
+    };
 
     // Pack buttons greedily into rows within the content width.
     let mut rows: Vec<Vec<usize>> = Vec::new();
@@ -2807,8 +2842,12 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rows.push(cur);
     }
 
-    // Inner height: title + (blank + list) + (blank + input) + (blank + buttons).
+    // Inner height: title + (origin) + (blank + list) + (blank + input) +
+    // (blank + buttons).
     let mut inner_h = title_lines.len() as u16;
+    if !origin_lines.is_empty() {
+        inner_h += origin_lines.len() as u16;
+    }
     if !vlist.is_empty() {
         inner_h += 1 + vlist.len() as u16;
     }
@@ -2830,8 +2869,8 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rect.height.saturating_sub(4),
     );
 
-    // Button rects: below the title, list, and input, each row centered.
-    let mut y = inner.y + title_lines.len() as u16;
+    // Button rects: below the title, origin, list, and input, each row centered.
+    let mut y = inner.y + title_lines.len() as u16 + origin_lines.len() as u16;
     if !vlist.is_empty() {
         y += 1 + vlist.len() as u16;
     }
@@ -2858,6 +2897,7 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rect,
         inner,
         title_lines,
+        origin_lines,
         button_rects,
     }
 }
@@ -2904,6 +2944,21 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             Paragraph::new(Line::from(Span::styled(
                 line.clone(),
                 Style::default().fg(Color::White),
+            ))),
+            rect,
+        );
+        y += 1;
+    }
+    // D13's origin label, directly under the title and before everything the
+    // user might act on: they should know *why* this modal is here before they
+    // read what it is asking. Magenta is the "another actor acted" hue this
+    // codebase already uses for a remote surface having done something.
+    for line in &dl.origin_lines {
+        let rect = Rect::new(dl.inner.x, y, dl.inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                line.clone(),
+                Style::default().fg(Color::Magenta),
             ))),
             rect,
         );
@@ -4274,6 +4329,112 @@ mod tests {
         assert!(
             text.contains("[n]") && text.contains("Cancel"),
             "cancel must render"
+        );
+    }
+
+    /// **D13's load-bearing line.** A dialog a browser opened appears on the
+    /// desktop whether or not the person at this keyboard asked for it, and the
+    /// origin line is the only thing that explains it. It renders above the
+    /// buttons, so it is read before anything is decided.
+    #[test]
+    fn draw_dialog_renders_the_browser_origin_above_the_buttons() {
+        let mut term = test_terminal(80, 24);
+        let dialog = Dialog::confirm(
+            "Set status override",
+            vec![
+                DialogButton::new(DialogAccel::Char('d'), "Done"),
+                DialogButton::new(DialogAccel::Esc, "Cancel"),
+            ],
+        )
+        .from_origin("opened from browser · 192.168.2.20");
+
+        term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24_u16)
+            .map(|y| {
+                (0..80_u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let text = rows.join("\n");
+        assert!(
+            text.contains("opened from browser · 192.168.2.20"),
+            "the origin label must render verbatim:\n{text}"
+        );
+        let origin_row = rows
+            .iter()
+            .position(|row| row.contains("opened from browser"))
+            .expect("the origin row exists");
+        let title_row = rows
+            .iter()
+            .position(|row| row.contains("Set status override"))
+            .expect("the title row exists");
+        let button_row = rows
+            .iter()
+            .position(|row| row.contains("[d]"))
+            .expect("the button row exists");
+        assert!(
+            title_row < origin_row && origin_row < button_row,
+            "the origin must sit under the title and above the buttons: \
+             title={title_row} origin={origin_row} buttons={button_row}"
+        );
+    }
+
+    /// A dialog the desktop opened for itself renders no origin line: the person
+    /// reading it is the person who asked, and D13 is explicit that the label is
+    /// not decoration.
+    #[test]
+    fn draw_dialog_renders_no_origin_for_a_desktop_dialog() {
+        let mut term = test_terminal(80, 24);
+        let dialog = Dialog::confirm(
+            "Set status override",
+            vec![DialogButton::new(DialogAccel::Char('d'), "Done")],
+        );
+        assert!(dialog.origin.is_none());
+        term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!text.contains("opened from"), "no origin line: {text}");
+    }
+
+    /// The origin line is content, so it grows the box and the buttons move down
+    /// with it — the hit-test and the drawing read the same layout, and a click
+    /// that landed on a button before the line was added must still land on it.
+    #[test]
+    fn an_origin_line_grows_the_box_and_keeps_the_buttons_clickable() {
+        let area = Rect::new(0, 0, 80, 24);
+        let plain = Dialog::confirm(
+            "Close shell 2?",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Close"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        );
+        let tagged = plain
+            .clone()
+            .from_origin("opened from browser · 192.168.2.20 · Chrome on macOS");
+
+        let plain_layout = layout_dialog(area, &plain);
+        let tagged_layout = layout_dialog(area, &tagged);
+        assert!(
+            tagged_layout.rect.height > plain_layout.rect.height,
+            "the origin line needs a row of its own"
+        );
+        assert!(
+            tagged_layout.rect.width > plain_layout.rect.width,
+            "the box widens to fit the sentence rather than truncating it"
+        );
+
+        let r = tagged_layout.button_rects[0];
+        assert_eq!(
+            dialog_hit(area, &tagged, r.x + r.width / 2, r.y),
+            DialogHit::Button(0)
         );
     }
 

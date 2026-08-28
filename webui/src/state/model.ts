@@ -10,6 +10,8 @@
  * Everything here is `readonly`: the reducer replaces, it never mutates.
  */
 
+import type { DialogState } from "./types";
+
 /**
  * The status vocabulary artboard 1a renders, plus turn 2 §5.1's `unknown`.
  *
@@ -180,6 +182,15 @@ export interface Snapshot {
    * history rather than silence. The feed renders it newest first.
    */
   readonly activity: readonly ActivityEvent[];
+  /**
+   * D13: the one open dialog, or `null` when there is none.
+   *
+   * On the snapshot rather than only on a delta, because a dialog is app state:
+   * a tab that attaches while the desktop has one open must paint it, and it
+   * never saw the `Delta::DialogOpened`. `null` is the host saying there is
+   * none — never a guess.
+   */
+  readonly dialog: DialogState | null;
 }
 
 /** Look-ups used by both the reducer and the components. */

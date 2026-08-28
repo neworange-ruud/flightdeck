@@ -2,6 +2,12 @@ import { consumeBootstrapCode, windowUrlBar } from "./access/bootstrap";
 import { checkSession, exchangeCode } from "./access/client";
 import type { AccessResult } from "./access/client";
 import { SAVE_CONFIG_COMMAND } from "./state/config";
+import {
+  cancelArgs,
+  confirmArgs,
+  DIALOG_CANCEL_COMMAND,
+  DIALOG_CONFIRM_COMMAND,
+} from "./state/dialog";
 import { createApp } from "./ui/app";
 import { mountTerminal } from "./term/terminal";
 import type { Store } from "./ui/store";
@@ -138,6 +144,33 @@ const app = createApp({
     }
     const seq = session.sendCommand(SAVE_CONFIG_COMMAND, request);
     app.store.dispatch({ type: "config/dispatched", seq });
+  },
+  /**
+   * D13's shared dialog (1d/1e, `remote-control-ll5.3`). `key` names the button
+   * pressed; `null` is a cancel.
+   *
+   * Two things this deliberately does not do. It does not close the dialog — the
+   * host does, and the browser hears about it as a `Delta::DialogClosed`, which
+   * is what makes "either surface can confirm or cancel and the other reflects
+   * it" one mechanism instead of two. And it does not decide whether the answer
+   * is allowed: the host owns that (`confirmable` / `refusal`), so a refusal
+   * arrives in the host's own words through `command/result` like every other
+   * outcome.
+   */
+  onAnswerDialog: (key) => {
+    const dialog = app.store.getState().dialog;
+    if (session === null || dialog === null) {
+      return;
+    }
+    const seq =
+      key === null
+        ? session.sendCommand(DIALOG_CANCEL_COMMAND, cancelArgs(dialog))
+        : session.sendCommand(DIALOG_CONFIRM_COMMAND, confirmArgs(dialog, key));
+    app.store.dispatch({
+      type: "dialog/dispatched",
+      seq,
+      act: key === null ? "cancel" : "confirm",
+    });
   },
   onStripAction: (action) => {
     if (action.kind === "reload") {

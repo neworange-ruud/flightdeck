@@ -992,6 +992,62 @@ pub enum DialogOutcome {
     Superseded,
 }
 
+/// The shape [`DialogView::body`] carries in this build (D13).
+///
+/// `body` is a free-form `serde_json::Value` on the wire *by design* — v1 chose
+/// that so M2 could add dialog bodies without a version bump — so this type is
+/// the documented thing that goes **into** that slot rather than a second
+/// `DialogView`. It is deliberately the *shell* artboard 1d describes ("same
+/// shell for every dialog: titled accent frame, keyed buttons") rather than one
+/// struct per dialog kind: the desktop already renders every prompt from one
+/// model (`crate::tui::render::Dialog`), and giving the browser the same model
+/// is what keeps the two surfaces from drifting into two dialog systems.
+///
+/// Artboard 1e's new-agent form is this shell with a `list` (the agent radio),
+/// an `input` (the branch) and three `buttons` (`Enter` / `Tab` / `Esc`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogBody {
+    /// The text-entry field's current content, or absent when the dialog has
+    /// none. `Some("")` is an empty field, which is not the same as no field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// The choice rows (1e's agent radio, the folder browser's subdirectories).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list: Vec<DialogChoice>,
+    /// The action buttons, in display order. The first is the primary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<DialogKey>,
+    /// Whether this build accepts [`command::DIALOG_CONFIRM`] for this dialog.
+    /// `false` with a `refusal` is how a dialog whose confirmation belongs to a
+    /// later task (the two-step destructive confirmation, the git family) is
+    /// shown honestly instead of hidden — cancelling stays available either way.
+    pub confirmable: bool,
+    /// Why a browser may not confirm it, when `confirmable` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// One choice row of a [`DialogBody`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogChoice {
+    /// Rendered verbatim.
+    pub label: String,
+    /// The row the dialog currently has highlighted.
+    pub selected: bool,
+}
+
+/// One button of a [`DialogBody`]: the key that fires it and its label.
+///
+/// `key` is what [`command::DIALOG_CONFIRM`]'s `choice` argument names, so the
+/// browser can only ask for a key the dialog is showing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogKey {
+    /// `y`, `1`, `i`, `Enter`, `Tab`, `Esc` — the desktop's own accelerator.
+    pub key: String,
+    /// Rendered verbatim.
+    pub label: String,
+}
+
 // ===========================================================================
 // Server -> browser
 // ===========================================================================
@@ -1604,6 +1660,22 @@ pub mod command {
     pub const REQUEST_SNAPSHOT: &str = "request_snapshot";
     /// Give up the controlling seat voluntarily and become an observer (D14).
     pub const RELEASE_SEAT: &str = "release_seat";
+
+    // -- the shared dialog (D13) -------------------------------------------
+
+    /// Confirm the open dialog, whichever surface opened it (D13).
+    ///
+    /// `args` names the dialog and, when it has one, what the browser filled in:
+    /// `{ dialog_id, choice?, text?, toggle? }`. `choice` is the *key label* of a
+    /// button the dialog is currently showing (`y`, `1`, `i`, `Enter`) and `text`
+    /// is the input field's content, so a browser can only ever press a key the
+    /// dialog is offering — the same power the desktop's keyboard has and no
+    /// more.
+    pub const DIALOG_CONFIRM: &str = "dialog_confirm";
+    /// Cancel the open dialog, whichever surface opened it (D13). `args` is
+    /// `{ dialog_id }`; cancelling is the one dialog decision that is never
+    /// destructive, so it is accepted for every dialog kind.
+    pub const DIALOG_CANCEL: &str = "dialog_cancel";
 
     // -- the palette surface (§22's actions, by wire name) -----------------
 

@@ -15,10 +15,17 @@ import type { Store } from "./store";
  * terminal exists but is not the one you are reading".
  *
  * `+ agent` opens the new-agent dialog (artboard 1e) and `+ shell` creates a
- * terminal; D8 puts both outside M1, so they render — the design's layout is
- * the design's layout — and say which milestone owns them. Neither is
- * `host only`: D13 makes dialogs *shared* with an origin label, so their effect
- * would land in the browser too.
+ * terminal. Neither is `host only`: D13 makes dialogs *shared* with an origin
+ * label, so their effect lands in the browser too — and since
+ * `remote-control-ll5.3` the host really does open a shared dialog for both
+ * (`new_agent`, `new_child_terminal`).
+ *
+ * They stay disabled for a different reason, and the titles say which: this
+ * build's palette inventory is still the curated local list in
+ * `state/commands.ts`, not `Snapshot::commands` (R7). Inventing a wire name here
+ * is exactly what R7 stopped the SPA doing, so these two buttons wake up when
+ * `remote-control-ll5.1`'s inventory reaches the browser — one change, in one
+ * place, for every row rather than for these two.
  */
 export function createTerminalTabs(store: Store): Region {
   const bar = el("div", {
@@ -48,13 +55,17 @@ export function createTerminalTabs(store: Store): Region {
       el("button", {
         class: "fd-action fd-action--new-agent",
         text: "+ agent",
-        title: "the new-agent dialog is M2 (D8)",
+        title:
+          "the host opens a shared dialog for this (D13); the browser reaches it \
+once the palette reads Snapshot::commands (remote-control-ll5.1)",
         attrs: { type: "button", disabled: "" },
       }),
       el("button", {
         class: "fd-action fd-action--new-shell",
         text: "+ shell",
-        title: "creating terminals from the browser is M2 (D8)",
+        title:
+          "the host runs this (new_child_terminal); the browser reaches it once \
+the palette reads Snapshot::commands (remote-control-ll5.1)",
         attrs: { type: "button", disabled: "" },
       }),
     );
@@ -85,7 +96,9 @@ function terminalTab(
   const close = el("button", {
     class: "fd-tab__close",
     text: "✕",
-    title: "closing a terminal is a destructive operation — M2 (D8)",
+    title:
+      "closing a terminal opens a shared confirmation (D13); the browser reaches \
+it once the palette reads Snapshot::commands (remote-control-ll5.1)",
     attrs: {
       type: "button",
       disabled: "",

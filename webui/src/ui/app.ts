@@ -1,4 +1,5 @@
 import { accessCopy, canSubmit } from "../state/access";
+import { decidingKeys, hasToggle, primaryKey } from "../state/dialog";
 import { highlightedCommand } from "../state/commands";
 import type { PaletteCommand } from "../state/commands";
 import type { ConfigSaveRequest } from "../state/config";
@@ -10,6 +11,7 @@ import { createAccessScreen } from "./accessScreen";
 import { createActivityFeed } from "./activityFeed";
 import { createCommandPalette } from "./commandPalette";
 import { createConfigManager } from "./configManager";
+import { createDialog } from "./dialog";
 import { createGitBar } from "./gitBar";
 import { createLogoBand } from "./logoBand";
 import { createProjectTabs } from "./projectTabs";
@@ -102,6 +104,17 @@ export interface AppOptions {
    * seq the transport assigned, and dispatches `config/dispatched` with it.
    */
   readonly onSaveConfig?: (request: ConfigSaveRequest) => void;
+  /**
+   * D13's shared dialog (1d/1e, `remote-control-ll5.3`). `key` is the button
+   * pressed; `null` means cancel.
+   *
+   * Same seam as `onRunCommand`: this component reports the intent, `main.ts`
+   * sends `dialog_confirm` / `dialog_cancel` and dispatches
+   * `dialog/dispatched` with the seq the transport assigned. What it must
+   * **not** do is close the dialog — a dialog is app state, and only a
+   * `Delta::DialogClosed` from the host takes it off either surface.
+   */
+  readonly onAnswerDialog?: (key: string | null) => void;
 }
 
 export interface App {
@@ -151,6 +164,19 @@ export function createApp(options: AppOptions): App {
   /** Artboard 1f, `remote-control-ll5.6`. Opened by the palette's "Open
    * Configuration" row (see `runCommand` below), closed by `Esc`. */
   const config = createConfigManager(store);
+  /**
+   * Artboards 1d/1e, `remote-control-ll5.3`. Unlike every other overlay here,
+   * nothing local opens or closes it: it is on screen because the host
+   * published a dialog (D13), and it goes away when the host closes it.
+   */
+  const dialog = createDialog(
+    {
+      onConfirm: (key) => options.onAnswerDialog?.(key),
+      onCancel: () => options.onAnswerDialog?.(null),
+    },
+    (index) => store.dispatch({ type: "dialog/choose", index }),
+    () => store.dispatch({ type: "dialog/toggle" }),
+  );
 
   const statusBar = createStatusBar({
     onAction: (action) => options.onStripAction?.(action),
@@ -179,6 +205,7 @@ export function createApp(options: AppOptions): App {
       access.el,
       palette.el,
       config.el,
+      dialog.el,
     ],
   );
 
@@ -199,6 +226,7 @@ export function createApp(options: AppOptions): App {
     access,
     palette,
     config,
+    dialog,
   ];
 
   function render(state: AppState): void {
@@ -212,6 +240,8 @@ export function createApp(options: AppOptions): App {
     frame.setAttribute("data-access", String(state.access !== null));
     frame.setAttribute("data-takeover", String(state.takeover !== null));
     frame.setAttribute("data-feed", String(state.feedOpen));
+    /** D13: the dialog layer, like the access and takeover layers. */
+    frame.setAttribute("data-dialog", String(state.dialog !== null));
 
     if (state.layout === "split") {
       if (split === null) {
@@ -286,6 +316,16 @@ export function createApp(options: AppOptions): App {
       return;
     }
     if (state.takeover !== null && takeoverKey(event, state)) {
+      return;
+    }
+    /**
+     * A dialog outranks the palette and the configuration manager: it is a
+     * question somebody asked that has to be answered before the keyboard means
+     * anything, which is the same argument the takeover prompt above makes. It
+     * sits *below* access and takeover because those two are about whether this
+     * tab may act at all.
+     */
+    if (state.dialog !== null && dialogKey(event, state)) {
       return;
     }
     if (state.palette !== null && paletteKey(event, state)) {
@@ -549,6 +589,82 @@ export function createApp(options: AppOptions): App {
   }
 
   /**
+   * 1e's keyboard: `↑↓` move the agent radio, printable characters type the
+   * branch, `Backspace` takes one back, `Tab` toggles run-from-base, `Enter`
+   * confirms, `Esc` cancels — and a keyed button (`y`, `1`, `i`) fires that
+   * button directly, exactly as it does on the desktop.
+   *
+   * `Esc` here does **not** close the overlay locally. It sends
+   * `dialog_cancel`; the host closes the dialog on both surfaces and the panel
+   * goes away when `Delta::DialogClosed` arrives. That is the one place this
+   * overlay's keyboard differs in kind from the other four, and it is D13's
+   * "no new state" made literal.
+   */
+  function dialogKey(event: KeyboardEvent, state: AppState): boolean {
+    const dialog = state.dialog;
+    if (dialog === null || !isPlain(event)) {
+      return false;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      options.onAnswerDialog?.(null);
+      return true;
+    }
+    if (event.key === "Tab") {
+      /** Only claimed by a dialog that has the option; otherwise `Tab` stays
+       * the browser's, so a keyboard-only user can still reach the buttons. */
+      if (!hasToggle(dialog)) {
+        return false;
+      }
+      event.preventDefault();
+      store.dispatch({ type: "dialog/toggle" });
+      return true;
+    }
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      event.preventDefault();
+      store.dispatch({
+        type: "dialog/move",
+        delta: event.key === "ArrowUp" ? -1 : 1,
+      });
+      return true;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const primary = primaryKey(dialog);
+      options.onAnswerDialog?.(primary === null ? "Enter" : primary.key);
+      return true;
+    }
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      store.dispatch({ type: "dialog/backspace" });
+      return true;
+    }
+    if (event.key.length === 1) {
+      event.preventDefault();
+      /**
+       * One character, two possible meanings, and the dialog decides which:
+       * a dialog with a text field is being typed into, and a dialog without
+       * one is offering keyed buttons (`y`/`n`, `1`..`9`, `i`/`w`/`b`/`d`) —
+       * the same split the desktop's own prompt handlers make.
+       */
+      if (dialog.input !== null) {
+        store.dispatch({ type: "dialog/type", char: event.key });
+        return true;
+      }
+      const pressed = decidingKeys(dialog).find(
+        (button) => button.key === event.key,
+      );
+      if (pressed !== undefined) {
+        options.onAnswerDialog?.(pressed.key);
+      }
+      return true;
+    }
+    /** Swallow everything else: the dialog is the whole keyboard while it is
+     * open, the same posture as the palette and the access screens. */
+    return true;
+  }
+
+  /**
    * Turns whatever is staged in `state.config.edits` into one `save_config`
    * command. A no-op with nothing staged: `s` on a config that was never
    * touched has nothing honest to send, and sending an empty change set would
@@ -665,7 +781,8 @@ export function createApp(options: AppOptions): App {
       path.includes(access.el) ||
       path.includes(takeover.el) ||
       path.includes(palette.el) ||
-      path.includes(config.el)
+      path.includes(config.el) ||
+      path.includes(dialog.el)
     ) {
       return;
     }

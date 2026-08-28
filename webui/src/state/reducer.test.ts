@@ -43,6 +43,9 @@ describe("createInitialState", () => {
       escArmedAt: null,
       palette: null,
       config: null,
+      /** D13: nothing is being asked. The dialog is app state the host
+       * publishes, so a tab that has not attached yet cannot have one. */
+      dialog: null,
     });
   });
 });

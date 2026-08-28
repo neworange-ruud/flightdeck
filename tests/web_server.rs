@@ -2362,13 +2362,22 @@ fn record(
 }
 
 /// Block until the host is handed an inbound command, the way the TUI's tick
-/// loop finds one in its channel.
-fn wait_for_command(harness: &Harness) -> (flightdeck::web::protocol::ViewerId, WireCommand) {
+/// loop finds one in its channel. Returns the seat label too: D13's origin line
+/// is built from it, so a test that asserts on an origin needs the same value
+/// the real host would have used.
+fn wait_for_command(
+    harness: &Harness,
+) -> (flightdeck::web::protocol::ViewerId, String, WireCommand) {
     let deadline = std::time::Instant::now() + WAIT;
     while std::time::Instant::now() < deadline {
         for event in harness.inbound() {
-            if let WebInbound::Command { viewer_id, command } = event {
-                return (viewer_id, command);
+            if let WebInbound::Command {
+                viewer_id,
+                label,
+                command,
+            } = event
+            {
+                return (viewer_id, label, command);
             }
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -2590,7 +2599,7 @@ fn marking_the_feed_read_is_host_state_a_second_tab_sees() {
     ));
 
     // The tick loop's half: apply it to the store and ack the sender.
-    let (viewer_id, command) = wait_for_command(&harness);
+    let (viewer_id, _label, command) = wait_for_command(&harness);
     let ack = apply_mark_read(&mut store, &command);
     assert_eq!(ack.outcome, AckOutcome::Applied);
     harness.handle.send(server::WebOutbound::Viewer {
@@ -2654,7 +2663,7 @@ fn a_malformed_mark_activity_read_is_rejected_and_changes_nothing() {
         }),
     ));
 
-    let (viewer_id, command) = wait_for_command(&harness);
+    let (viewer_id, _label, command) = wait_for_command(&harness);
     let ack = apply_mark_read(&mut store, &command);
     assert_eq!(ack.outcome, AckOutcome::Rejected);
     assert!(ack.detail.is_some(), "a rejection has to state why");
@@ -2871,7 +2880,7 @@ fn a_real_command_frame_drives_a_real_effect() {
     let mut ws = on_runtime(control(&addr, &cookie));
 
     on_runtime(command(&mut ws, 31, names::TOGGLE_SPLIT_VIEW));
-    let (viewer_id, forwarded) = wait_for_command(&harness);
+    let (viewer_id, _label, forwarded) = wait_for_command(&harness);
     assert_eq!(forwarded.name, names::TOGGLE_SPLIT_VIEW);
 
     // The host's half, as the tick loop runs it: the inventory hands over the
@@ -3003,6 +3012,12 @@ fn an_observers_palette_command_is_refused_as_read_only() {
             (61, names::RESTART_AGENT),
             (62, names::QUIT),
             (63, names::OPEN_WORKTREE_IN_FILE_MANAGER),
+            // D13/D14: a dialog is shared with every viewer, but answering it is
+            // input by another name. An observer sees the modal and cannot
+            // decide it — for either half, so it cannot cancel out from under
+            // the controller either.
+            (64, names::DIALOG_CONFIRM),
+            (65, names::DIALOG_CANCEL),
         ] {
             command(&mut ws, seq, name).await;
             let error = next_error(&mut ws).await;
@@ -3013,22 +3028,148 @@ fn an_observers_palette_command_is_refused_as_read_only() {
     assert_nothing_forwarded(&harness);
 }
 
-/// A command whose effect is a dialog is refused with a stated reason rather
-/// than half-opened: acking `Applied` while a modal appeared on the desktop's
-/// screen — which this browser can neither see nor answer — would be the worst
-/// of both worlds (D13 is `remote-control-ll5.3`).
+/// **D13 over a real socket.** A browser row whose desktop behaviour is "ask
+/// something" reaches the host rather than being refused; the host publishes the
+/// dialog and the browser learns about it as a `Delta::DialogOpened` carrying the
+/// origin *it* is named by; answering it closes it with a `Delta::DialogClosed`
+/// whose outcome is the decision, not the diff's fallback.
+///
+/// The host half here is the real one: `crate::web::stream::deltas` computes the
+/// frames from two published `HostState`s, exactly as the TUI's tick does, so
+/// this test cannot pass by sending frames the host would never send.
 #[test]
-fn a_dialog_opening_command_is_refused_rather_than_half_opened() {
+fn a_dialog_opened_from_a_browser_round_trips_over_the_socket() {
+    use flightdeck::web::protocol::{
+        DialogOrigin, DialogOutcome, DialogView, ViewerId as WireViewerId,
+    };
+
     let harness = Harness::start();
     let addr = harness.addr();
     let cookie = on_runtime(harness.authenticate());
     let mut ws = on_runtime(control(&addr, &cookie));
 
-    for (seq, name) in [
-        (71, names::NEW_AGENT_SESSION_TAB),
-        (72, names::ABANDON_WORKTREE),
-        (73, names::SET_MANUAL_STATUS),
-    ] {
+    // 1. The row is forwarded, not refused: before D13 landed this answered
+    //    `ErrorCode::NotSupported`.
+    on_runtime(command(&mut ws, 91, names::NEW_AGENT_SESSION_TAB));
+    let (viewer_id, label, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::NEW_AGENT_SESSION_TAB);
+    assert!(
+        !label.is_empty(),
+        "the host needs a label to word D13's origin line"
+    );
+
+    // 2. The host does what the TUI's tick does: publish the dialog, then send
+    //    the deltas the diff derived from the change.
+    let mut published = HostState::default();
+    let opened = DialogView {
+        dialog_id: flightdeck::web::protocol::DialogId::new("dialog-1"),
+        kind: "new_agent".to_string(),
+        title: "New Agent Session Tab".to_string(),
+        origin: DialogOrigin::Browser {
+            viewer_id: Some(WireViewerId::new(viewer_id.as_str())),
+            label: label.clone(),
+        },
+        body: None,
+    };
+    let next = HostState {
+        dialog: Some(opened.clone()),
+        ..published.clone()
+    };
+    publish_dialog(&harness.handle, &mut published, next);
+
+    let arrived = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Delta(Delta::DialogOpened(view)) => Some(view),
+        _ => None,
+    }));
+    assert_eq!(arrived, opened);
+    match arrived.origin {
+        DialogOrigin::Browser { label: seen, .. } => assert_eq!(seen, label),
+        DialogOrigin::Desktop => panic!("this dialog was opened from a browser"),
+    }
+
+    // 3. A late joiner paints the dialog from the snapshot, not from a delta it
+    //    was not attached for — the dialog is state, which is D13's premise.
+    let second = on_runtime(async {
+        let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut second, SeatRequest::Observe).await;
+        await_snapshot(&mut second).await
+    });
+    assert_eq!(second.dialog.as_ref(), Some(&opened));
+
+    // 4. The browser confirms. The frame reaches the host, which closes the
+    //    dialog and reports the *decision* — `Superseded` here would mean
+    //    "somebody replaced it", which is not what happened.
+    on_runtime(async {
+        send(
+            &mut ws,
+            &ClientMsg::Command(WireCommand {
+                seq: 92,
+                name: names::DIALOG_CONFIRM.to_string(),
+                args: Some(serde_json::json!({ "dialog_id": "dialog-1" })),
+            }),
+        )
+        .await;
+    });
+    let (_, _, answered) = wait_for_command(&harness);
+    assert_eq!(answered.name, names::DIALOG_CONFIRM);
+
+    let closed = HostState {
+        dialog: None,
+        ..published.clone()
+    };
+    let mut frames = flightdeck::web::stream::deltas(&published, &closed);
+    for frame in frames.iter_mut() {
+        if let Delta::DialogClosed { outcome, .. } = frame {
+            *outcome = DialogOutcome::Confirmed;
+        }
+    }
+    harness.handle.publish_state(closed);
+    for frame in frames {
+        harness
+            .handle
+            .send(flightdeck::web::server::WebOutbound::All(ServerMsg::Delta(
+                frame,
+            )));
+    }
+
+    let (dialog_id, outcome) = on_runtime(frame_matching(&mut ws, |frame| match frame {
+        ServerMsg::Delta(Delta::DialogClosed { dialog_id, outcome }) => Some((dialog_id, outcome)),
+        _ => None,
+    }));
+    assert_eq!(dialog_id.as_str(), "dialog-1");
+    assert_eq!(outcome, DialogOutcome::Confirmed);
+}
+
+/// Publish one state and send the deltas the diff derived, the way the TUI's
+/// tick does. `published` is advanced so a caller can chain ticks.
+fn publish_dialog(
+    handle: &flightdeck::web::server::WebServerHandle,
+    published: &mut HostState,
+    next: HostState,
+) {
+    let frames = flightdeck::web::stream::deltas(published, &next);
+    handle.publish_state(next.clone());
+    for frame in frames {
+        handle.send(flightdeck::web::server::WebOutbound::All(ServerMsg::Delta(
+            frame,
+        )));
+    }
+    *published = next;
+}
+
+/// D13 shared the dialog family, but two rows still refuse, each naming the task
+/// that owns it: `abandon_worktree` needs artboard 1g's two-step confirmation
+/// (`remote-control-ll5.4`) and `show_git_status` has no browser design at all
+/// (design turn 3). Refused at the socket, so no code path exists that could
+/// half-open either.
+#[test]
+fn the_two_dialog_rows_that_still_refuse_say_which_task_owns_them() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut ws = on_runtime(control(&addr, &cookie));
+
+    for (seq, name) in [(71, names::ABANDON_WORKTREE), (72, names::SHOW_GIT_STATUS)] {
         on_runtime(command(&mut ws, seq, name));
         let error = on_runtime(next_error(&mut ws));
         assert_eq!(error.code, ErrorCode::NotSupported, "for `{name}`");

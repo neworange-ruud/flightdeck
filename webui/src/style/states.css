@@ -1196,3 +1196,253 @@
   gap: 4px;
   opacity: 0.7;
 }
+
+/* ══ 1e — D13's shared dialog (remote-control-ll5.3) ══════════════════════
+ *
+ * Artboard `1e — NEW AGENT DIALOG, BOTH STATES`, and through it every dialog:
+ * 1d's own note is that there is one shell for all of them — titled accent
+ * frame, keyed buttons, consequences before the verb.
+ *
+ * Highest z-index of the four overlays. A dialog is a question somebody asked
+ * that has to be answered before the keyboard means anything, and unlike the
+ * palette and the configuration manager it is not this browser's to dismiss —
+ * so it must never end up *under* an overlay a local keypress opened. */
+.fd-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-dialog[hidden] {
+  display: none;
+}
+.fd-dialog__panel {
+  width: min(720px, calc(100% - 80px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  font-size: var(--fd-t-body);
+}
+/* 1e's right-hand state: run-from-base recolours the whole frame to
+ * `--fd-focus`, because the dialog now describes something materially
+ * different — an agent editing the repository you are standing in, with no
+ * worktree between it and your work. */
+.fd-dialog__panel[data-toggled="true"] {
+  box-shadow: inset 0 0 0 1px var(--fd-focus);
+}
+.fd-dialog__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 7px 14px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-focus) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-focus) 9%, transparent);
+}
+.fd-dialog__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__title {
+  color: var(--fd-focus);
+}
+.fd-dialog__kind {
+  color: var(--fd-text-decor);
+}
+.fd-dialog__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+}
+/* D13's origin line: `--fd-elsewhere` is 2g's "another actor acted" hue, the
+ * same one drift, App mode and the takeover panel use — which is exactly the
+ * fact being reported. It is a fact, not decoration: deleting it loses the only
+ * explanation for a modal the reader did not open. */
+.fd-dialog__origin {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  color: color-mix(in srgb, var(--fd-elsewhere) 35%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+/* The host's sentence for a dialog this build will not confirm from a browser
+ * (`remote-control-ll5.4` / `.5`). Amber, not red: nothing is broken, the
+ * confirmation simply lives on the other surface. */
+.fd-dialog__refusal {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-stale) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 30%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__refusal[hidden],
+.fd-dialog__list[hidden],
+.fd-dialog__field[hidden],
+.fd-dialog__status[hidden] {
+  display: none;
+}
+.fd-dialog__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fd-dialog__choice {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 10px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  text-align: left;
+  color: var(--fd-text-muted);
+  background: none;
+  cursor: pointer;
+}
+.fd-dialog__choice[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-accent) 12%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-accent);
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__choice[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-focus) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-focus);
+}
+.fd-dialog__radio {
+  color: var(--fd-text-decor);
+}
+.fd-dialog__choice[data-selected="true"] .fd-dialog__radio {
+  color: var(--fd-accent);
+}
+.fd-dialog__panel[data-toggled="true"]
+  .fd-dialog__choice[data-selected="true"]
+  .fd-dialog__radio {
+  color: var(--fd-focus);
+}
+.fd-dialog__field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.fd-dialog__field-label {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.fd-dialog__input {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 7px 10px;
+  background: var(--fd-canvas);
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-dialog__typed {
+  color: var(--fd-text);
+}
+/* 1e's blinking caret. A real element rather than a CSS `content:` so the
+ * markup a test reads matches what the eye sees, the same rule
+ * `dom.ts`'s `spinnerGlyph` follows. */
+.fd-dialog__caret {
+  width: 7px;
+  align-self: stretch;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-dialog__caret {
+    animation: none;
+  }
+}
+/* 1e's right-hand replacement for the branch field: the sentence, not a
+ * disabled input, so nobody wonders whether what they typed is still in play. */
+.fd-dialog__note {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-focus) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-focus);
+  color: color-mix(in srgb, var(--fd-focus) 30%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__status {
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-dialog__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-dialog__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-dialog__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: refused because this tab is read-only is "still true, not broken" —
+ * the same reading `.fd-config__status` and the palette give it. */
+.fd-dialog__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.fd-dialog__action {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  cursor: pointer;
+}
+.fd-dialog__action--primary {
+  background: var(--fd-accent);
+  color: color-mix(in srgb, var(--fd-accent) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__action--primary {
+  background: var(--fd-focus);
+  color: color-mix(in srgb, var(--fd-focus) 12%, var(--fd-canvas));
+}
+.fd-dialog__action--secondary,
+.fd-dialog__action--tertiary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-dialog__action--secondary[data-on="true"] {
+  color: color-mix(in srgb, var(--fd-focus) 40%, var(--fd-text));
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-focus) 40%, var(--fd-canvas));
+}
+.fd-dialog__action--secondary .fd-key-box,
+.fd-dialog__action--tertiary .fd-key-box {
+  background: color-mix(in srgb, var(--fd-accent) 10%, var(--fd-canvas));
+  color: var(--fd-focus);
+}
+/* A confirm this build will not send from a browser (`ll5.4` / `.5`). Dimmed
+ * *and* explained — the sentence above it is the host's own — because a
+ * disabled button with no reason is the thing this replaces. */
+.fd-dialog__action[disabled] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.fd-dialog__choice:focus-visible,
+.fd-dialog__action:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}

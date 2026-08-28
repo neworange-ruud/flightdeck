@@ -124,6 +124,53 @@ export interface WireActivityEvent {
   readonly read?: boolean;
 }
 
+/**
+ * D13: who opened the dialog. Internally tagged on `origin`, so a `desktop`
+ * origin carries no label at all rather than an empty one.
+ */
+export type WireDialogOrigin =
+  | { readonly origin: "desktop" }
+  | {
+      readonly origin: "browser";
+      readonly viewer_id?: string | null;
+      readonly label: string;
+    };
+
+export interface WireDialogChoice {
+  readonly label: string;
+  readonly selected: boolean;
+}
+
+export interface WireDialogKey {
+  readonly key: string;
+  readonly label: string;
+}
+
+/**
+ * `DialogView::body` (`protocol::DialogBody`) — the dialog *shell* artboard 1d
+ * describes, which every dialog uses and which 1e's new-agent form is one
+ * instance of. Every field is optional on the wire (`skip_serializing_if`), so
+ * every field is optional here.
+ */
+export interface WireDialogBody {
+  readonly input?: string | null;
+  readonly list?: readonly WireDialogChoice[];
+  readonly buttons?: readonly WireDialogKey[];
+  /** `false` means the host will refuse a `dialog_confirm` for this dialog. */
+  readonly confirmable?: boolean;
+  readonly refusal?: string;
+}
+
+/** The one open dialog (D13). `kind` is open on purpose: an unknown one renders
+ * the generic shell rather than failing. */
+export interface WireDialogView {
+  readonly dialog_id: string;
+  readonly kind: string;
+  readonly title: string;
+  readonly origin: WireDialogOrigin;
+  readonly body?: WireDialogBody | null;
+}
+
 export interface WireSnapshot {
   readonly type: "snapshot";
   readonly protocol_version: number;
@@ -139,6 +186,12 @@ export interface WireSnapshot {
   readonly geometry: WireGeometry;
   readonly replay_capacity_bytes: number;
   readonly activity: readonly WireActivityEvent[];
+  /**
+   * D13: the open dialog, or absent when none is. It rides on the snapshot
+   * because a dialog is state — a tab that attaches while one is open has to
+   * paint it, and it never saw the `Delta::DialogOpened`.
+   */
+  readonly dialog?: WireDialogView | null;
 }
 
 export interface WireTermBytes {

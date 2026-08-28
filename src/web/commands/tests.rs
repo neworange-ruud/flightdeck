@@ -48,10 +48,12 @@ fn every_palette_row_is_reachable_by_name() {
 #[test]
 fn the_wire_surface_is_the_palette_plus_the_browsers_own_rows() {
     // Every §22 row, plus: three D3 selection templates, `edit_in_editor`
-    // (D16 names it but the palette does not offer it), and the three rows the
-    // browser needs for itself (snapshot, seat, read-marking).
+    // (D16 names it but the palette does not offer it), the three rows the
+    // browser needs for itself (snapshot, seat, read-marking), and D13's two
+    // dialog answers (`dialog_confirm` / `dialog_cancel`) — which the desktop
+    // answers with its keyboard, so they have no palette row on either side.
     assert_eq!(all_entries().len(), REQUIRED_ACTION_COUNT);
-    assert_eq!(INVENTORY.len(), REQUIRED_ACTION_COUNT + 7);
+    assert_eq!(INVENTORY.len(), REQUIRED_ACTION_COUNT + 9);
 }
 
 /// Two commands sharing a name would make one of them unreachable — the exact

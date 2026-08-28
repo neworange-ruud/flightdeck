@@ -216,7 +216,9 @@ or cancel. No new state.
 > **Cost accepted:** the desktop user gets a modal they did not ask for. The
 > origin label is therefore load-bearing, not decoration.
 
-M2 concern, but recorded now because D12's protocol must accommodate it.
+**Implemented in `remote-control-ll5.3`** — see R8 in §6.5 for how it reuses the
+TUI's own prompt state, what happens when a second dialog arrives while one is
+open, and the two rows that still refuse.
 
 ### D14 — One *controlling* browser, plus read-only observers
 
@@ -712,12 +714,92 @@ performs a command's effect a second time.
    unconfirmed (`quit`, `stop_web_interface`) is answered `Ack{Rejected}` with the
    reason and **never forwarded**, which is what makes "a bare frame naming quit
    cannot kill the process" a property of the code rather than of a check.
-   Everything whose browser-side surface belongs to another M2 task — the dialog
-   family (ll5.3), destructive confirmations (ll5.4), git (ll5.5), the
-   configuration manager (ll5.6), help/about/git-status (ll5.8) — is answered
+   Everything whose browser-side surface belongs to another M2 task — destructive
+   confirmations (ll5.4), git (ll5.5), the configuration manager (ll5.6),
+   help/about/git-status (ll5.8); the dialog family (ll5.3) has since landed,
+   see R8 — is answered
    `ErrorCode::NotSupported` with a reason naming what is missing, rather than
    dispatched into a modal on a screen the browser cannot see. Each of those
    tasks flips its rows' route; nothing else has to move.
+
+### R8 — D13's shared dialog reuses the TUI's prompt state, and two rows still refuse
+
+D13 says "no new state", and the implementation takes that literally: the dialog
+on the wire **is** the TUI's own `Ui::prompt` read out.
+
+1. **One dialog store.** `PromptState` (`src/lib.rs`) gained a `DialogId` and a
+   `DialogOrigin`; `web_dialog_view` serialises it into `HostState::dialog`. There
+   is no browser-side dialog kind, no second store, and no arm that performs a
+   dialog's action a second time — a browser's `dialog_confirm` is turned into the
+   very `KeyEvent`s `handle_prompt_key` already handles, so `New Agent Session
+   Tab` confirmed from a browser runs `begin_new_agent_tab_ex` because a synthetic
+   `Enter` reached the same arm a real one does.
+2. **The origin is on the render model.** `crate::tui::render::Dialog` gained
+   `origin: Option<String>`, drawn between the title and the buttons in
+   `--fd-elsewhere`'s TUI equivalent (magenta) — so it is read *before* anything
+   is decided. `None` for a desktop-opened dialog is deliberate: the reader is the
+   asker, and a line saying so would be the decoration D13 says this is not.
+   Covered by `draw_dialog_renders_the_browser_origin_above_the_buttons`.
+3. **The origin comes from one place.** `run_web_command` sets
+   `Ui::web_dialog_origin` for the duration of one browser dispatch — the same
+   idiom as `Ui::web_outcome` — and `start_prompt` reads it. So none of the two
+   dozen prompt-opening call sites knows a browser exists, and a dialog cannot be
+   published without an origin because there is no other way to open one.
+
+**Two new wire names**, `dialog_confirm` and `dialog_cancel`, both listed in
+`INVENTORY` (which is what makes the server's "refuse any name not in the table"
+a complete check) and both `requires_control()`, so an observer is told
+`read_only` rather than being allowed to answer a question that is not theirs
+(D14). `DialogView::body` carries `protocol::DialogBody` — the *shell* artboard
+1d describes (input, list, buttons, `confirmable`, `refusal`), not one struct per
+dialog kind, because the desktop already renders every prompt from one model and
+giving the browser the same model is what stops the two becoming two dialog
+systems. Artboard 1e's form is that shell with a list, an input and three keys.
+
+**A browser can only press a key the dialog is showing.** `choice` names a
+button by its key label; `text` is ignored by a dialog with no field; `toggle`
+needs a `Tab` button to exist. Anything else is refused with a sentence naming
+what the dialog *does* offer.
+
+**The `Superseded` policy.** `crate::web::stream::deltas` compares two published
+states, so all it can honestly say about a dialog that is gone is
+`DialogOutcome::Superseded` — it did not witness a decision. `handle_prompt_key`
+does witness one and records it in `Ui::dialog_decisions`; the event loop's
+`resolve_dialog_outcomes` upgrades the diff's frame with the real outcome before
+sending it. So a browser learns `Confirmed` when the desktop pressed `y`,
+`Cancelled` when either surface dismissed it, and `Superseded` only when a dialog
+really was replaced without an answer — never a silent swap. A `dialog_confirm`
+naming a dialog that has since been replaced is refused, not applied to whatever
+is on screen now, which is the mechanism behind "nobody confirms something they
+never read".
+
+**Ten of the twelve refused rows now open a dialog:** `open_project`,
+`close_project`, `new_agent_session_tab`, `rename_agent_session_tab`,
+`close_agent_session_tab`, `close_child_terminal`, `new_agent`, `close_agent`,
+`set_manual_status`, `unpair_phone`. Two still refuse, each naming its owner:
+
+* **`abandon_worktree`** — `remote-control-ll5.4`. The dialog is shared once the
+  desktop opens it and **cancellable** from a browser; confirming it needs
+  artboard 1g's two-step typed-name confirmation. Same shape for the git
+  confirmations (`push` / `merge` / `rebase`), which refuse a browser's confirm
+  with `GIT_DIALOG_REFUSAL` and remain cancellable (`remote-control-ll5.5`).
+  Cancelling is never gated: dismissing a confirmation cannot destroy anything,
+  and a shared dialog a remote surface can see but not dismiss would be worse
+  than not sharing it.
+* **`show_git_status`** — it is **not** one of D13's dialogs. Nothing is being
+  asked, so there is nothing to confirm or cancel; it opens a read-only overlay
+  and design turn 3 owns what the browser shows instead. It was grouped with the
+  dialog family before this task only because it opens a desktop overlay.
+
+**A dialog rides on the snapshot as well as on deltas**, because a dialog is
+state: a tab that attaches while one is open paints it from `Snapshot::dialog`
+and never saw the `DialogOpened`. On the browser side the local *draft* (1e's
+typed branch, the radio position, the `Tab` toggle) survives a re-announcement of
+the same dialog, so a coalesced resync mid-typing does not empty the field — and
+it is never rendered as accepted state: the confirm is settled by the host's own
+`Ack`, and an `applied` `Ack` does **not** close the panel. Only
+`Delta::DialogClosed` does, which is what makes "either surface can confirm or
+cancel and the other reflects it" one mechanism rather than two.
 
 ---
 

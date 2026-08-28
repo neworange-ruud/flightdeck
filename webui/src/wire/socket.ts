@@ -22,7 +22,7 @@
 
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
-import { snapshotFromWire, statusFromLabel } from "./adapt";
+import { dialogOf, snapshotFromWire, statusFromLabel } from "./adapt";
 import {
   decodeBase64,
   encodeBase64,
@@ -31,6 +31,7 @@ import {
   type ServerFrame,
   type WireAck,
   type WireDeltaEnvelope,
+  type WireDialogView,
   type WireError,
   type WireGeometry,
   type WireSeatInfo,
@@ -288,6 +289,36 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
           });
         }
         requestSnapshotSoon();
+        return;
+      }
+      /**
+       * D13: the dialog is app state, so both halves of its life are applied
+       * directly rather than resynced. `requestSnapshotSoon` would work, but it
+       * would put a coalesced round trip between a `y` pressed on the desktop
+       * and the modal leaving this screen — and the frame already carries
+       * everything the store needs.
+       */
+      case "dialog_opened": {
+        const view = frame as unknown as WireDialogView;
+        store.dispatch({ type: "dialog/opened", dialog: dialogOf(view) });
+        return;
+      }
+      case "dialog_closed": {
+        const closed = frame as unknown as {
+          dialog_id: string;
+          outcome: "confirmed" | "cancelled" | "superseded";
+        };
+        store.dispatch({
+          type: "dialog/closed",
+          dialogId: closed.dialog_id,
+          /**
+           * `superseded` is the host saying "replaced without a decision", and
+           * it is passed through rather than flattened into a cancel: a browser
+           * that reported it as cancelled would be claiming somebody answered a
+           * question nobody answered.
+           */
+          outcome: closed.outcome,
+        });
         return;
       }
       case "activity": {

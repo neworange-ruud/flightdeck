@@ -39,10 +39,15 @@
 //!   on the host's screen, so a fake `Applied` would be a lie), and so does
 //!   `quit`: a bare frame naming it **cannot** kill the process, it is refused
 //!   pending artboard 1g's two-step confirmation (`remote-control-ll5.4`).
-//! * [`Route::NotSupported`] — the action opens a desktop dialog the browser
-//!   cannot see. Acking `Applied` while a modal appears on the host's screen
-//!   would be the worst of both worlds, so the whole dialog family waits for
-//!   `remote-control-ll5.3` and the git family for `.5`, and says so.
+//! * [`Route::Dialog`] — D13's shared dialog. The dialog is app state, published
+//!   to both surfaces with the origin that opened it, and either surface can
+//!   confirm or cancel; these two rows are how a browser does it.
+//! * [`Route::NotSupported`] — this build has no browser-side surface for it, and
+//!   the refusal names the task that owns one. What is left after D13 landed is
+//!   the git family (`remote-control-ll5.5`), the destructive confirmation
+//!   (`.4`), the configuration manager (`.6`), help/about (`.8`) and
+//!   `show_git_status`, which is not a dialog at all — nothing is being asked,
+//!   so there is nothing to answer.
 //!
 //! ## The git-ownership boundary holds by construction (SPECS §5)
 //!
@@ -77,6 +82,10 @@ pub enum Route {
     ActivityRead,
     /// Dispatched through the TUI's own palette path with this action.
     Palette(PaletteAction),
+    /// D13: answer the dialog that is already open on both surfaces. Applied by
+    /// the TUI, by synthesising the very keypress the desktop's own dialog
+    /// buttons synthesise — so there is no second dialog engine to drift.
+    Dialog(DialogAct),
     /// Refused with [`crate::web::protocol::AckOutcome::Rejected`] and this
     /// reason: the host implements it, but its effect must not — or cannot —
     /// land for a browser.
@@ -84,6 +93,22 @@ pub enum Route {
     /// Refused with [`crate::web::protocol::ErrorCode::NotSupported`] and this
     /// reason: this build has no browser-side surface for it yet.
     NotSupported(&'static str),
+}
+
+/// Which half of D13's shared dialog a [`Route::Dialog`] row answers.
+///
+/// There are two and only two, because that is what D13 grants a browser: a
+/// dialog is app state, and either surface may **confirm** or **cancel** it.
+/// Anything else a dialog can do — moving a radio, typing into a field, toggling
+/// `run from base` — arrives as arguments on the confirm, not as a command of its
+/// own, so a half-driven dialog can never be a state the two surfaces disagree
+/// about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogAct {
+    /// Take the dialog's primary action, or the button `choice` names.
+    Confirm,
+    /// Dismiss it with no decision.
+    Cancel,
 }
 
 /// Which part of the shared selection a [`Route::Selection`] moves (D3).
@@ -128,11 +153,46 @@ pub const HOST_ONLY_REFUSAL: &str =
     "This opens a window on the machine running FlightDeck, which is not the \
      machine this browser is on. Run it from the desktop.";
 
-/// Why the dialog family is refused today (D13, `remote-control-ll5.3`).
-const DIALOG_REFUSAL: &str =
-    "This opens a dialog, and the browser's dialog surface is not implemented in \
-     this build. Refused rather than half-opened: a modal on the desktop that \
-     this browser cannot see or answer is worse than a clear no.";
+/// Why the *destructive* dialogs still refuse a browser
+/// (`remote-control-ll5.4`, artboard 1g).
+///
+/// D13 made dialogs shared, so the abandon confirmation now appears in the
+/// browser like any other — this refusal is about **opening** it from a browser
+/// row and about **confirming** it, which artboard 1g gates behind a two-step
+/// typed-name confirmation this build does not have. Cancelling is always
+/// allowed: it is the one dialog decision that cannot destroy anything.
+pub const DESTRUCTIVE_DIALOG_REFUSAL: &str =
+    "Abandoning a worktree discards work, and from a browser that needs artboard \
+     1g's two-step confirmation, which this build does not have yet. The dialog \
+     is shared once the desktop opens it (D13) and you can cancel it from here — \
+     but confirm it from the desktop.";
+
+/// Why a browser may not *confirm* a git dialog (`remote-control-ll5.5`,
+/// SPECS §5).
+///
+/// D13 shares the dialog, so a push / merge / rebase confirmation the desktop
+/// opened is visible in the browser and cancellable from it. Confirming it is
+/// the git family's own task, and SPECS §5 is the reason: every
+/// history-touching operation is gated behind a confirmation this build only
+/// knows how to collect at the desktop's keyboard.
+pub const GIT_DIALOG_REFUSAL: &str =
+    "This dialog confirms a git operation, and git commands from the browser are \
+     not implemented in this build (SPECS §5 gates every history-touching \
+     operation). You can see it and cancel it from here; confirm it from the \
+     desktop.";
+
+/// Why `Show Git Status` is still refused: it is not a dialog, and it has no
+/// browser design yet.
+///
+/// It was grouped with the dialog family before this task because it opens a
+/// desktop overlay. It is not one of D13's dialogs — nothing is being asked, so
+/// there is nothing to confirm or cancel — and design turn 3 owns what the
+/// browser shows instead. Refused with that said out loud rather than dispatched
+/// into an overlay only the desktop can read.
+pub const UNDESIGNED_OVERLAY_REFUSAL: &str =
+    "Git status opens a read-only overlay on the desktop, and the browser has no \
+     design for it yet (design turn 3). It is not one of D13's shared dialogs: \
+     nothing is being asked, so there is nothing to answer from here.";
 
 /// Why the git family is refused today (`remote-control-ll5.5`, SPECS §5).
 const GIT_REFUSAL: &str =
@@ -180,7 +240,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Projects",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::OpenProject),
     },
     CommandSpec {
         name: names::CLOSE_PROJECT,
@@ -188,7 +248,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Projects",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::CloseProject),
     },
     CommandSpec {
         name: names::NEXT_PROJECT,
@@ -213,7 +273,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Agent Session Tabs",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::NewAgentTab),
     },
     CommandSpec {
         name: names::RENAME_AGENT_SESSION_TAB,
@@ -221,7 +281,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Agent Session Tabs",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::RenameAgentTab),
     },
     CommandSpec {
         name: names::CLOSE_AGENT_SESSION_TAB,
@@ -229,7 +289,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Agent Session Tabs",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::CloseAgentTab),
     },
     CommandSpec {
         name: names::SWITCH_AGENT_SESSION_TAB,
@@ -264,7 +324,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Worktree",
         host_only: false,
         annotation: Some("destructive"),
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::NotSupported(DESTRUCTIVE_DIALOG_REFUSAL),
     },
     CommandSpec {
         name: names::OPEN_WORKTREE_IN_FILE_MANAGER,
@@ -313,7 +373,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Git",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::NotSupported(UNDESIGNED_OVERLAY_REFUSAL),
     },
     // -- terminals ---------------------------------------------------------
     CommandSpec {
@@ -330,7 +390,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Terminals",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::CloseChildTerminal)),
     },
     CommandSpec {
         name: names::NEW_AGENT,
@@ -338,7 +398,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Terminals",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::NewAgentChild),
     },
     CommandSpec {
         name: names::CLOSE_AGENT,
@@ -346,7 +406,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Terminals",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::CloseAgentTerminal)),
     },
     CommandSpec {
         name: names::SWITCH_CHILD_TERMINAL,
@@ -373,7 +433,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Status",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::SetManualStatus),
     },
     CommandSpec {
         name: names::OPEN_CONFIGURATION,
@@ -404,7 +464,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Remote",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::UnpairPhone),
     },
     CommandSpec {
         name: names::START_WEB_INTERFACE,
@@ -493,6 +553,30 @@ pub static INVENTORY: &[CommandSpec] = &[
         annotation: None,
         route: Route::ActivityRead,
     },
+    // -- D13's shared dialog ------------------------------------------------
+    //
+    // Not palette rows on either surface: the desktop answers a dialog with the
+    // keyboard, and the browser answers it with these. They are in the table
+    // because everything the browser may send is in the table — that is what
+    // makes `src/web/server.rs`'s "refuse any name not in INVENTORY" a complete
+    // check rather than a partial one — and they carry a `group` the palette
+    // never renders for exactly the same reason `request_snapshot` does.
+    CommandSpec {
+        name: names::DIALOG_CONFIRM,
+        label: "Confirm Dialog",
+        group: "Session",
+        host_only: false,
+        annotation: Some("answers the open dialog"),
+        route: Route::Dialog(DialogAct::Confirm),
+    },
+    CommandSpec {
+        name: names::DIALOG_CANCEL,
+        label: "Cancel Dialog",
+        group: "Session",
+        host_only: false,
+        annotation: Some("answers the open dialog"),
+        route: Route::Dialog(DialogAct::Cancel),
+    },
 ];
 
 /// The spec for one wire name, or `None` if this build has no such command.
@@ -517,7 +601,11 @@ impl CommandSpec {
     pub fn refusal(&self) -> Option<&'static str> {
         match self.route {
             Route::Rejected(reason) | Route::NotSupported(reason) => Some(reason),
-            Route::Server | Route::Selection(_) | Route::ActivityRead | Route::Palette(_) => None,
+            Route::Server
+            | Route::Selection(_)
+            | Route::ActivityRead
+            | Route::Palette(_)
+            | Route::Dialog(_) => None,
         }
     }
 
@@ -528,7 +616,11 @@ impl CommandSpec {
             Route::Selection(SelectionTarget::Session) => Some(CommandTarget::Session),
             Route::Selection(SelectionTarget::Terminal) => Some(CommandTarget::Terminal),
             Route::ActivityRead => Some(CommandTarget::UnreadActivity),
-            Route::Server | Route::Palette(_) | Route::Rejected(_) | Route::NotSupported(_) => None,
+            Route::Server
+            | Route::Palette(_)
+            | Route::Dialog(_)
+            | Route::Rejected(_)
+            | Route::NotSupported(_) => None,
         }
     }
 
@@ -731,6 +823,7 @@ pub fn dispatched_command(route: &Route) -> Option<&Command> {
     match route {
         Route::Palette(PaletteAction::Dispatch(cmd)) => Some(cmd),
         Route::Palette(_)
+        | Route::Dialog(_)
         | Route::Server
         | Route::Selection(_)
         | Route::ActivityRead

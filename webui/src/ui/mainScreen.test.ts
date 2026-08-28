@@ -247,11 +247,17 @@ describe("region 4 — terminal tab bar", () => {
     expect(selected.textContent).toContain("agent");
   });
 
-  it("keeps + agent and + shell visible but says they are M2", () => {
+  it("keeps + agent and + shell visible and names what still blocks them", () => {
+    /** Visible, never hidden — the design's layout is the design's layout. The
+     * *reason* changed with `remote-control-ll5.3`: the host now opens a shared
+     * dialog for both (D13), and what is missing is the palette inventory
+     * reaching the browser (R7, `remote-control-ll5.1`). A title still naming
+     * "M2" would have been a stale excuse. */
     const h = render();
     expect(h.text(".fd-action--new-agent")).toBe("+ agent");
     expect(h.text(".fd-action--new-shell")).toBe("+ shell");
-    expect(h.q(".fd-action--new-agent").title).toContain("M2");
+    expect(h.q(".fd-action--new-agent").title).toContain("Snapshot::commands");
+    expect(h.q(".fd-action--new-agent").hasAttribute("disabled")).toBe(true);
   });
 
   it("switching tab moves the shared selection", () => {

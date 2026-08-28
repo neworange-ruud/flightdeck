@@ -268,6 +268,10 @@ pub enum WebInbound {
     Command {
         /// Who asked.
         viewer_id: ViewerId,
+        /// The seat's chip label (`192.168.2.20 · Chrome on macOS`), so the host
+        /// can tag a dialog this command opens with D13's origin without having
+        /// to keep its own copy of the seat map.
+        label: String,
         /// What they asked for.
         command: crate::web::protocol::Command,
     },
@@ -907,6 +911,16 @@ impl SeatRegistry {
 
     fn seat_of(&self, id: &ViewerId) -> Option<Seat> {
         self.viewers.iter().find(|v| &v.id == id).map(|v| v.seat)
+    }
+
+    /// The viewer's chip label — the address the host observed plus whatever the
+    /// browser said about itself, already sanitised and length-capped by
+    /// [`sanitize_label`]. D13's origin line renders it verbatim.
+    fn label_of(&self, id: &ViewerId) -> Option<String> {
+        self.viewers
+            .iter()
+            .find(|v| &v.id == id)
+            .map(|v| v.label.clone())
     }
 
     /// Arbitrate one [`SeatRequest`]. The viewer must already be registered.
@@ -1870,9 +1884,15 @@ async fn handle_command(
             )
             .await;
         }
-        Route::Selection(_) | Route::ActivityRead | Route::Palette(_) => {
+        // D13: the dialog is app state on both surfaces, so answering it is the
+        // TUI's job — it holds the prompt and synthesises the keypress.
+        Route::Selection(_) | Route::ActivityRead | Route::Palette(_) | Route::Dialog(_) => {
             shared.notify(WebInbound::Command {
                 viewer_id: viewer_id.clone(),
+                label: shared
+                    .registry()
+                    .label_of(viewer_id)
+                    .unwrap_or_else(|| viewer_id.to_string()),
                 command,
             });
         }

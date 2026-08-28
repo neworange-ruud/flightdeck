@@ -17,6 +17,12 @@ import type {
 } from "./model";
 import { shouldRetry } from "./model";
 import type { ConfigEdit, ConfigScope } from "./config";
+import type {
+  DialogChoice,
+  DialogDraft,
+  DialogKey,
+  DialogOrigin,
+} from "./dialog";
 
 /**
  * App-state seam for the web SPA.
@@ -269,6 +275,19 @@ export interface AppState {
   /** Artboard 1f (`remote-control-ll5.6`). `null` when the configuration
    * manager is closed — opened by the palette's "Open Configuration" row. */
   readonly config: ConfigState | null;
+
+  /**
+   * D13's shared dialog (artboards 1d/1e, `remote-control-ll5.3`). `null` when
+   * none is open.
+   *
+   * Unlike every other overlay in this state, **this one is not the browser's
+   * to open or close**: it is app state the host published, so it appears here
+   * because a `Snapshot` or a `Delta::DialogOpened` said so and disappears
+   * because a `Delta::DialogClosed` did. A local `dialog/close` action would be
+   * the browser inventing a second source of truth, which is exactly what D13's
+   * "no new state" rules out.
+   */
+  readonly dialog: DialogState | null;
 }
 
 /** A `save_config` command this browser sent and has not heard back about. */
@@ -300,6 +319,52 @@ export interface ConfigState {
    * a list: nothing stops a second `s` before the first save's `Ack` lands. */
   readonly pending: readonly PendingConfigSave[];
   readonly lastOutcome: ConfigOutcome | null;
+}
+
+/** A `dialog_confirm` / `dialog_cancel` this browser sent and has not heard
+ * back about. Same shape as `PendingConfigSave`, for the same reason. */
+export interface PendingDialogAnswer {
+  readonly seq: number;
+  /** Which half was sent, so the panel can say `confirming…` vs `cancelling…`. */
+  readonly act: "confirm" | "cancel";
+}
+
+/** The host's answer to a dialog answer, mirroring `ConfigOutcome`. */
+export interface DialogOutcome {
+  readonly outcome: "applied" | "rejected" | "ignored" | "read_only";
+  readonly detail: string | null;
+}
+
+/**
+ * D13's shared dialog (artboards 1d/1e), as the browser holds it.
+ *
+ * Everything above `draft` is the **host's**, arriving on a `Snapshot` or a
+ * `Delta::DialogOpened`. Nothing here is ever set by a local decision except
+ * `draft` (what the user has typed and highlighted but not confirmed) and
+ * `pending`/`lastOutcome` (which command was sent and what the host said about
+ * it). See `state/dialog.ts` for why the draft is not optimism.
+ */
+export interface DialogState {
+  readonly id: string;
+  /** `new_agent`, `confirm_abandon`, … An unknown kind renders the generic
+   * shell rather than failing, which is why this is a `string`. */
+  readonly kind: string;
+  readonly title: string;
+  /** D13: who opened it. Load-bearing, not decoration. */
+  readonly origin: DialogOrigin;
+  /** The text field's host-side content, or `null` when it has no field. */
+  readonly input: string | null;
+  readonly list: readonly DialogChoice[];
+  readonly buttons: readonly DialogKey[];
+  /** `false` when the host will refuse a confirm from a browser — the
+   * destructive family (`remote-control-ll5.4`) and the git family (`.5`).
+   * Cancelling stays available, which is why this is not "read-only". */
+  readonly confirmable: boolean;
+  /** The sentence to show when `confirmable` is false. */
+  readonly refusal: string | null;
+  readonly draft: DialogDraft;
+  readonly pending: readonly PendingDialogAnswer[];
+  readonly lastOutcome: DialogOutcome | null;
 }
 
 export function createInitialState(): AppState {
@@ -342,6 +407,7 @@ export function createInitialState(): AppState {
     escArmedAt: null,
     palette: null,
     config: null,
+    dialog: null,
   };
 }
 
@@ -595,6 +661,52 @@ export type AppAction =
   | {
       readonly type: "config/dispatched";
       readonly seq: number;
+    }
+
+  /* --- D13's shared dialog (1d/1e, remote-control-ll5.3) ----------------- */
+
+  /**
+   * The host says a dialog is open: `Snapshot { dialog }` on attach, or a
+   * `Delta::DialogOpened` while attached.
+   *
+   * There is deliberately no `dialog/open` a component could dispatch. A
+   * browser asks for a dialog by *running the command that opens one* (D13:
+   * "no new state"), and learns it worked when the host publishes it.
+   *
+   * Re-dispatching for the dialog that is already open — which every coalesced
+   * snapshot does — keeps the local `draft`, so a resync mid-typing does not
+   * empty the branch field the user is in the middle of.
+   */
+  | { readonly type: "dialog/opened"; readonly dialog: DialogState }
+  /**
+   * A `Delta::DialogClosed`, or a `Snapshot` with no dialog. `outcome` is the
+   * host's own word: `confirmed`/`cancelled` when somebody decided, and
+   * `superseded` when a dialog was replaced without a decision — which the
+   * browser must not report as an answer, because nobody gave one.
+   *
+   * A `dialogId` that is not the open one is a no-op: a `DialogClosed` for a
+   * dialog we already replaced would otherwise close the live one.
+   */
+  | {
+      readonly type: "dialog/closed";
+      readonly dialogId: string;
+      readonly outcome: "confirmed" | "cancelled" | "superseded";
+    }
+  /** A printable character landed in the dialog's text field (1e's branch). */
+  | { readonly type: "dialog/type"; readonly char: string }
+  | { readonly type: "dialog/backspace" }
+  /** `↑↓` over the choice rows (1e's agent radio). Clamped, never wrapped. */
+  | { readonly type: "dialog/move"; readonly delta: number }
+  /** A choice row was clicked — the mouse half of `dialog/move`. */
+  | { readonly type: "dialog/choose"; readonly index: number }
+  /** `Tab`: 1e's `run from base branch`. Local until the confirm carries it. */
+  | { readonly type: "dialog/toggle" }
+  /** A `dialog_confirm` / `dialog_cancel` was sent and the transport assigned
+   * it `seq` — mirrors `palette/dispatched` and `config/dispatched`. */
+  | {
+      readonly type: "dialog/dispatched";
+      readonly seq: number;
+      readonly act: "confirm" | "cancel";
     };
 
 /**

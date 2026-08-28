@@ -350,6 +350,10 @@ export function fixtureSnapshot(): Snapshot {
     seat: "controlling",
     seats: fixtureSeats(),
     activity: fixtureActivity(),
+    /** D13: no dialog. 1a/1b/1c are the screen with nothing being asked; the
+     * dialog artboards (1d/1e) are reached by dispatching `dialog/opened` on
+     * top of this fixture, the same way 1c is reached with `layout/set`. */
+    dialog: null,
   };
 }
 

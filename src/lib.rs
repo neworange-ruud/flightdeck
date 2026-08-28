@@ -1250,6 +1250,30 @@ struct Ui {
     /// Overwritten constantly by the desktop's own keypresses, which is fine:
     /// only the value written during one web dispatch is ever read.
     web_outcome: Option<WebDispatch>,
+    /// D13: the origin to stamp on the next dialog this build opens.
+    ///
+    /// `Some` only for the duration of one [`run_web_command`] dispatch, exactly
+    /// like [`Ui::web_outcome`] — a dialog opened while a browser's frame is
+    /// being applied was opened *by* that browser, and every other dialog was
+    /// opened at this keyboard. Set and cleared in one place, so no prompt-
+    /// opening site has to know a browser exists.
+    web_dialog_origin: Option<crate::web::protocol::DialogOrigin>,
+    /// Dialogs that reached a real decision this tick, oldest first.
+    ///
+    /// The published-state diff (`crate::web::stream::deltas`) can see that a
+    /// dialog *went away* but not why, so it reports [`DialogOutcome::Superseded`]
+    /// — honest for a dialog that was replaced, wrong for one somebody answered.
+    /// [`handle_prompt_key`] records the real outcome here and the event loop
+    /// upgrades the diff's frame with it (`resolve_dialog_outcomes`). Drained
+    /// every tick.
+    dialog_decisions: Vec<(
+        crate::web::protocol::DialogId,
+        crate::web::protocol::DialogOutcome,
+    )>,
+    /// Monotonic counter behind [`Ui::mint_dialog_id`]. Never reset, so an id is
+    /// never reused within a process and a stale answer cannot land on a new
+    /// dialog by matching its id.
+    dialog_seq: u64,
 }
 
 /// What one dispatch produced, in the vocabulary a
@@ -1271,9 +1295,25 @@ struct PendingJob {
 }
 
 /// A prompt plus the modal dialog rendered for it (title + buttons).
+///
+/// **This is D13's "no new state".** A dialog on the wire is this struct read
+/// out (see [`web_dialog_view`]); a browser answering one is a keypress fed into
+/// [`handle_prompt_key`]. There is deliberately no second dialog store, no
+/// browser-only dialog kind, and no path that performs a dialog's action
+/// twice — the failure mode `specs/WEB_INTERFACE.md` §1 exists to prevent.
 struct PromptState {
     prompt: Prompt,
     dialog: Dialog,
+    /// Stable identity for the life of this prompt, minted by [`start_prompt`].
+    /// The browser names it when it answers, so an answer that arrives for a
+    /// dialog that has since been replaced is refused instead of applied to
+    /// whatever is on screen now.
+    id: crate::web::protocol::DialogId,
+    /// D13: who asked for it. [`DialogOrigin::Desktop`] for the person at this
+    /// keyboard; [`DialogOrigin::Browser`] when a `Command` frame opened it, in
+    /// which case the desktop renders the origin line and the browser does not
+    /// (it already knows — it asked).
+    origin: crate::web::protocol::DialogOrigin,
 }
 
 impl Ui {
@@ -1284,6 +1324,17 @@ impl Ui {
             || self.prompt.is_some()
             || self.config.is_some()
             || !matches!(self.overlay, UiOverlay::None)
+    }
+
+    /// A fresh dialog id (D13). Process-unique by construction.
+    fn mint_dialog_id(&mut self) -> crate::web::protocol::DialogId {
+        self.dialog_seq += 1;
+        crate::web::protocol::DialogId::new(format!("dialog-{}", self.dialog_seq))
+    }
+
+    /// The open dialog's id, if any.
+    fn dialog_id(&self) -> Option<crate::web::protocol::DialogId> {
+        self.prompt.as_ref().map(|p| p.id.clone())
     }
 
     /// Show a notification message as a centered modal dialog (SPECS §22).
@@ -1972,7 +2023,13 @@ fn event_loop(
     if workspace.active_project().state.config.web.enabled {
         let config = workspace.active_project().state.config.web.clone();
         let activity = web_surface.activity_events(env.clock);
-        let initial = build_web_host_state(workspace, &web_surface.streams, activity, now0);
+        let initial = build_web_host_state(
+            workspace,
+            &web_surface.streams,
+            activity,
+            web_dialog_view(&ui),
+            now0,
+        );
         match web_surface.start(&config, initial) {
             Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
             Err(e) => ui.message(format!("Web interface did not start: {e}")),
@@ -2285,9 +2342,23 @@ fn event_loop(
                 // name, a read-only seat's frame (D14) and every command whose
                 // effect must not land for a browser (D16, including `quit`), so
                 // reaching here means a controller sent something runnable.
-                if let crate::web::server::WebInbound::Command { viewer_id, command } = &event {
+                if let crate::web::server::WebInbound::Command {
+                    viewer_id,
+                    label,
+                    command,
+                } = &event
+                {
+                    // D13: a dialog this command opens is tagged with the seat
+                    // that asked, so the desktop can say `opened from browser ·
+                    // 192.168.2.20` about a modal nobody at this keyboard
+                    // requested.
+                    let origin = crate::web::protocol::DialogOrigin::Browser {
+                        viewer_id: Some(viewer_id.clone()),
+                        label: label.clone(),
+                    };
                     let ack = run_web_command(
                         command,
+                        &origin,
                         workspace,
                         env,
                         &mut ui,
@@ -2313,12 +2384,22 @@ fn event_loop(
             }
 
             let activity = web_surface.activity_events(env.clock);
-            let next = build_web_host_state(workspace, &web_surface.streams, activity, now_ms);
+            let next = build_web_host_state(
+                workspace,
+                &web_surface.streams,
+                activity,
+                web_dialog_view(&ui),
+                now_ms,
+            );
+            let decided = std::mem::take(&mut ui.dialog_decisions);
             if next != web_surface.published {
                 // Publish, *then* the matching deltas: publishing changes what
                 // the next attach sees and notifies nobody, deliberately, so the
                 // host is the one that says what changed (see `HostState`).
-                let frames = crate::web::stream::deltas(&web_surface.published, &next);
+                let mut frames = crate::web::stream::deltas(&web_surface.published, &next);
+                // D13: the diff can only say `Superseded` about a dialog that is
+                // gone. Where somebody actually decided, say so.
+                resolve_dialog_outcomes(&mut frames, &decided);
                 if let Some(handle) = web_surface.handle.as_ref() {
                     handle.publish_state(next.clone());
                     for delta in frames {
@@ -2330,13 +2411,27 @@ fn event_loop(
                 web_surface.published = next;
             }
         }
+        // Drained whether or not anyone is watching (D13). A desktop-only run
+        // still decides dialogs, and a list nobody ever reads would grow for the
+        // life of the process — so the take above is paired with a clear here
+        // rather than living inside the `running()` branch.
+        ui.dialog_decisions.clear();
 
         // --- Start / stop the web interface, when the palette asked (D10). ---
         if ui.pending_web_start {
             ui.pending_web_start = false;
             let config = workspace.active_project().state.config.web.clone();
             let activity = web_surface.activity_events(env.clock);
-            let initial = build_web_host_state(workspace, &web_surface.streams, activity, now_ms);
+            // A dialog can already be open when the server starts (the palette
+            // that ran `Start Web Interface` is gone by now, but a prompt behind
+            // it is not), so the first snapshot carries it rather than lying.
+            let initial = build_web_host_state(
+                workspace,
+                &web_surface.streams,
+                activity,
+                web_dialog_view(&ui),
+                now_ms,
+            );
             match web_surface.start(&config, initial) {
                 Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
                 Err(e) => ui.message(format!("Web interface did not start: {e}")),
@@ -2470,13 +2565,15 @@ fn event_loop(
 /// and so `crate::web::stream::deltas` can spot a genuinely new event and turn
 /// it into a `Delta::Activity` without the tab reloading.
 ///
-/// `dialog` is deliberately empty: D13 is M2. Absent rather than guessed —
-/// §5.1's "unknown stays unknown" applies to a dialog exactly as it applies to a
-/// status.
+/// `dialog` is the one open dialog (D13), read off the desktop's own prompt state
+/// by [`web_dialog_view`] and passed in rather than derived here — this function
+/// takes a `&Workspace` and a dialog lives on the [`Ui`], which is the layer
+/// above. Absent rather than guessed when none is open.
 fn build_web_host_state(
     workspace: &Workspace,
     streams: &crate::web::stream::TerminalStreams,
     activity: Vec<crate::web::protocol::ActivityEvent>,
+    dialog: Option<crate::web::protocol::DialogView>,
     now_ms: u64,
 ) -> crate::web::server::HostState {
     use crate::web::protocol as wire;
@@ -2570,7 +2667,7 @@ fn build_web_host_state(
         geometry: ws::geometry_of(active.state.pty_size),
         replay_capacity_bytes: streams.capacity_bytes() as u64,
         activity,
-        dialog: None,
+        dialog,
     }
 }
 
@@ -4494,16 +4591,29 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         Effect::OpenInFileManager { .. } => {
             WebDispatch::Refused(crate::web::commands::HOST_ONLY_REFUSAL.to_string())
         }
-        Effect::PushWarning(_)
-        | Effect::AbandonWarning { .. }
-        | Effect::MergeConfirm { .. }
-        | Effect::RebaseConfirm { .. }
-        | Effect::CloseTabOptions(_)
-        | Effect::GitStatus { .. }
-        | Effect::ShowHelp
-        | Effect::ShowAbout => WebDispatch::Refused(
-            "This opened a dialog on the desktop, which a browser cannot see or \
-             answer in this build."
+        // D13: a dialog is now app state on both surfaces, so opening one is
+        // not a refusal any more. The sentence the browser reads is
+        // `DIALOG_OPENED_DETAIL`, worded once in `run_web_command`, which is
+        // also the only caller that can tell a *newly* opened dialog from one
+        // that was already up.
+        Effect::CloseTabOptions(_) => WebDispatch::Applied(None),
+        // The two families whose *confirmation* is still someone else's task:
+        // artboard 1g's two-step destructive step (`remote-control-ll5.4`) and
+        // the git commands (`.5`). They are unreachable from a browser row —
+        // the table refuses those names — so this is the second line of defence,
+        // and it refuses in the same words `browser_may_confirm` uses.
+        Effect::AbandonWarning { .. } => {
+            WebDispatch::Refused(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL.to_string())
+        }
+        Effect::PushWarning(_) | Effect::MergeConfirm { .. } | Effect::RebaseConfirm { .. } => {
+            WebDispatch::Refused(crate::web::commands::GIT_DIALOG_REFUSAL.to_string())
+        }
+        // Not dialogs: read-only overlays with nothing to answer, and no browser
+        // design yet (`remote-control-ll5.8`, design turn 3).
+        Effect::GitStatus { .. } | Effect::ShowHelp | Effect::ShowAbout => WebDispatch::Refused(
+            "This opens a read-only overlay on the desktop, which the browser has \
+             no design for yet. Nothing is being asked, so there is nothing to \
+             answer from here."
                 .to_string(),
         ),
     });
@@ -4579,12 +4689,52 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
 }
 
 /// Begin an interactive prompt, building its modal dialog.
+///
+/// D13 lands here and nowhere else. The origin comes from
+/// [`Ui::web_dialog_origin`] — set for exactly as long as one browser frame is
+/// being applied — so every one of the two dozen call sites keeps knowing
+/// nothing about browsers, and a dialog can never be published without an
+/// origin because there is no other way to open one.
 fn start_prompt(ui: &mut Ui, prompt: Prompt) {
-    let dialog = prompt_dialog(&prompt);
+    let origin = ui
+        .web_dialog_origin
+        .clone()
+        .unwrap_or(crate::web::protocol::DialogOrigin::Desktop);
+    let mut dialog = prompt_dialog(&prompt);
+    if let Some(label) = dialog_origin_label(&origin) {
+        dialog = dialog.from_origin(label);
+    }
+    let id = ui.mint_dialog_id();
     ui.palette = None;
     ui.overlay = UiOverlay::None;
-    ui.prompt = Some(PromptState { prompt, dialog });
+    ui.prompt = Some(PromptState {
+        prompt,
+        dialog,
+        id,
+        origin,
+    });
 }
+
+/// D13's origin line, or `None` for a dialog this keyboard opened.
+///
+/// `None` for [`DialogOrigin::Desktop`] is not an omission: the person reading
+/// the modal is the person who asked for it, and a line telling them so would be
+/// the decoration D13 is explicit this is not.
+fn dialog_origin_label(origin: &crate::web::protocol::DialogOrigin) -> Option<String> {
+    match origin {
+        crate::web::protocol::DialogOrigin::Desktop => None,
+        crate::web::protocol::DialogOrigin::Browser { label, .. } => {
+            Some(format!("opened from browser · {label}"))
+        }
+    }
+}
+
+/// The ack detail for a browser command whose outcome is a dialog (D13). One
+/// sentence, so every dialog-opening row reads the same, and it says the thing
+/// the browser has to know: it is a shared question, answerable from here.
+const DIALOG_OPENED_DETAIL: &str =
+    "A dialog is open. It is on the desktop too, tagged with where it came from, \
+     and either surface can answer it.";
 
 /// Why an action is unavailable in an isolated run (SPECS §32). One string, so
 /// every refusal reads identically wherever the user meets it.
@@ -5393,6 +5543,59 @@ fn handle_prompt_key(
     env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
+    // D13: record what this keypress decided, before anything downstream can
+    // replace the prompt. One wrapper rather than an edit at each of the dozen
+    // `ui.prompt = None` / `ui.clear()` sites, because a site that forgot would
+    // report `Superseded` to the other surface — i.e. "nobody decided" about a
+    // dialog somebody just answered, which is the one thing D13 must not say.
+    let decided = ui
+        .prompt
+        .as_ref()
+        .map(|p| (p.id.clone(), dialog_decision(&p.dialog, key)));
+    let result = handle_prompt_key_inner(key, workspace, env, ui);
+    if let Some((id, outcome)) = decided {
+        let still_open = ui.prompt.as_ref().is_some_and(|p| p.id == id);
+        if !still_open {
+            ui.dialog_decisions.push((id, outcome));
+        }
+    }
+    result
+}
+
+/// What one keypress *means* for an open dialog, read off the dialog's own
+/// buttons rather than from a table of key spellings.
+///
+/// The dialogs do not agree on a cancel key — `n` in the close confirmations,
+/// `c` in the push confirmation, `Esc` in the forms — but they all agree on the
+/// *label*, because [`prompt_dialog`] writes it. So the button whose accelerator
+/// this key fires is the authority, and `Esc` is cancel everywhere by rule
+/// (`handle_prompt_key_inner` clears on it before looking at anything else).
+///
+/// Anything else that closes a dialog is a decision: `Clear` in the status menu
+/// and `Abandon` in the sidebar's close menu are choices, not dismissals.
+fn dialog_decision(dialog: &Dialog, key: KeyEvent) -> crate::web::protocol::DialogOutcome {
+    use crate::web::protocol::DialogOutcome;
+    if key.code == KeyCode::Esc {
+        return DialogOutcome::Cancelled;
+    }
+    let pressed = dialog.buttons.iter().find(|b| match b.accel {
+        DialogAccel::Char(c) => key.code == KeyCode::Char(c),
+        DialogAccel::Enter => key.code == KeyCode::Enter,
+        DialogAccel::Esc => key.code == KeyCode::Esc,
+        DialogAccel::Tab => key.code == KeyCode::Tab,
+    });
+    match pressed {
+        Some(button) if button.label == "Cancel" => DialogOutcome::Cancelled,
+        _ => DialogOutcome::Confirmed,
+    }
+}
+
+fn handle_prompt_key_inner(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
     // Esc always cancels the prompt.
     if key.code == KeyCode::Esc {
         ui.clear();
@@ -6068,6 +6271,7 @@ fn run_palette_action(
 /// server had disagreed.
 fn run_web_command(
     command: &crate::web::protocol::Command,
+    origin: &crate::web::protocol::DialogOrigin,
     workspace: &mut Workspace,
     env: &Env,
     ui: &mut Ui,
@@ -6105,20 +6309,44 @@ fn run_web_command(
         }
         Route::Palette(action) => {
             ui.web_outcome = None;
+            // D13: for as long as this dispatch runs, a dialog it opens was
+            // opened *by this browser*. `start_prompt` reads it; nothing else
+            // has to know a browser exists.
+            let was_open = ui.dialog_id();
+            ui.web_dialog_origin = Some(origin.clone());
             let dispatched = run_palette_action(action.clone(), workspace, env, ui);
-            match (dispatched, ui.web_outcome.take()) {
-                (Err(e), _) => ack(AckOutcome::Rejected, Some(e.to_string())),
-                (Ok(()), Some(WebDispatch::Refused(reason))) => {
+            ui.web_dialog_origin = None;
+            let opened = ui.dialog_id().filter(|id| Some(id) != was_open.as_ref());
+            match (dispatched, ui.web_outcome.take(), opened) {
+                (Err(e), _, _) => ack(AckOutcome::Rejected, Some(e.to_string())),
+                (Ok(()), Some(WebDispatch::Refused(reason)), _) => {
                     ack(AckOutcome::Rejected, Some(reason))
                 }
-                (Ok(()), Some(WebDispatch::Failed(error))) => {
+                (Ok(()), Some(WebDispatch::Failed(error)), _) => {
                     ack(AckOutcome::Rejected, Some(error))
                 }
-                (Ok(()), Some(WebDispatch::Applied(detail))) => ack(AckOutcome::Applied, detail),
+                // A dialog *is* the outcome (D13): the row asked a question, and
+                // the question is now open on both surfaces. Applied, because
+                // something really happened and the browser can see it — the
+                // pre-D13 `Rejected` said "a modal appeared on a screen you
+                // cannot read", which is no longer true.
+                (Ok(()), _, Some(_)) => {
+                    ack(AckOutcome::Applied, Some(DIALOG_OPENED_DETAIL.to_string()))
+                }
+                (Ok(()), Some(WebDispatch::Applied(detail)), None) => {
+                    ack(AckOutcome::Applied, detail)
+                }
                 // Nothing classified an outcome, which for the forwarded set
                 // means it did its work quietly (a selection move, a split-view
                 // toggle). Applied with no sentence rather than an invented one.
-                (Ok(()), None) => ack(AckOutcome::Applied, None),
+                (Ok(()), None, None) => ack(AckOutcome::Applied, None),
+            }
+        }
+        // D13: either surface can answer the dialog the other one opened.
+        Route::Dialog(act) => {
+            match apply_web_dialog(*act, command.args.as_ref(), workspace, env, ui) {
+                Ok(detail) => ack(AckOutcome::Applied, detail),
+                Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
             }
         }
         Route::Server => ack(
@@ -6130,6 +6358,368 @@ fn run_web_command(
         ),
         Route::Rejected(reason) | Route::NotSupported(reason) => {
             ack(AckOutcome::Rejected, Some((*reason).to_string()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: D13's shared dialog
+// ---------------------------------------------------------------------------
+
+/// The open dialog as the browser receives it, or `None` when none is open.
+///
+/// Read straight off [`Ui::prompt`] — the state the desktop is already rendering
+/// — which is what D13's "no new state" means concretely. `kind` is the machine
+/// name for the flow; `title` and `body` are the same words and the same buttons
+/// the desktop is showing, because both come from the one
+/// [`crate::tui::render::Dialog`] [`prompt_dialog`] built.
+///
+/// The origin line is **not** duplicated into the body: `DialogView::origin`
+/// already carries it structurally, and the browser words it itself. Only the
+/// desktop needs the sentence, which is why the sentence lives on the desktop's
+/// render model.
+fn web_dialog_view(ui: &Ui) -> Option<crate::web::protocol::DialogView> {
+    use crate::web::protocol as wire;
+
+    let open = ui.prompt.as_ref()?;
+    let refusal = browser_may_confirm(&open.prompt).err();
+    let body = wire::DialogBody {
+        input: open.dialog.input.clone(),
+        list: open
+            .dialog
+            .list
+            .iter()
+            .map(|item| wire::DialogChoice {
+                label: item.label.clone(),
+                selected: item.selected,
+            })
+            .collect(),
+        buttons: open
+            .dialog
+            .buttons
+            .iter()
+            .map(|button| wire::DialogKey {
+                key: dialog_accel_key(button.accel),
+                label: button.label.clone(),
+            })
+            .collect(),
+        confirmable: refusal.is_none(),
+        refusal: refusal.map(str::to_string),
+    };
+    Some(wire::DialogView {
+        dialog_id: open.id.clone(),
+        kind: dialog_kind(&open.prompt).to_string(),
+        title: open.dialog.title.clone(),
+        origin: open.origin.clone(),
+        // `serde_json::to_value` on a struct of `String`s and `bool`s cannot
+        // fail; `None` rather than an `unwrap` so a future body that could fail
+        // degrades to "no body" instead of taking the event loop with it.
+        body: serde_json::to_value(&body).ok(),
+    })
+}
+
+/// The wire `kind` for one prompt (D13). Stable strings: the browser switches on
+/// them to pick a form, and an unknown one renders the generic shell, so
+/// renaming one is a breaking change and adding one is not.
+fn dialog_kind(prompt: &Prompt) -> &'static str {
+    match prompt {
+        Prompt::NewAgentForm { .. } => "new_agent",
+        Prompt::SelectChildAgent { .. } => "new_agent_child",
+        Prompt::RenameTab { .. } => "rename_session",
+        Prompt::SetManualStatus => "set_manual_status",
+        Prompt::CloseTab { .. } => "close_session",
+        Prompt::CloseChildConfirm { .. } => "close_terminal",
+        Prompt::CloseAgentChoice { .. } => "close_session_choice",
+        Prompt::PushConfirm => "confirm_push",
+        Prompt::AbandonConfirm { .. } => "confirm_abandon",
+        Prompt::MergeConfirm { .. } => "confirm_merge",
+        Prompt::RebaseConfirm { .. } => "confirm_rebase",
+        Prompt::OpenProject { .. } => "open_project",
+        Prompt::CloseProjectConfirm { .. } => "close_project",
+        Prompt::UnpairConfirm => "unpair_phone",
+    }
+}
+
+/// Whether a browser may **confirm** this dialog, or the sentence saying why not.
+///
+/// D13 gives either surface both decisions; two later tasks take one of them
+/// back for a named set of dialogs, and this is where that boundary is stated
+/// once. Exhaustive on purpose: a prompt added later must decide.
+///
+/// Cancelling is never gated here, and deliberately: dismissing a confirmation
+/// cannot destroy anything, and a shared dialog a remote surface can see but not
+/// dismiss would be worse than not sharing it.
+fn browser_may_confirm(prompt: &Prompt) -> std::result::Result<(), &'static str> {
+    use crate::web::commands::{DESTRUCTIVE_DIALOG_REFUSAL, GIT_DIALOG_REFUSAL};
+    match prompt {
+        // `remote-control-ll5.4`, artboard 1g: discarding work needs the
+        // two-step typed-name confirmation this build has not got. The sidebar's
+        // close menu is here too — its primary button *is* Abandon.
+        Prompt::AbandonConfirm { .. } | Prompt::CloseAgentChoice { .. } => {
+            Err(DESTRUCTIVE_DIALOG_REFUSAL)
+        }
+        // `remote-control-ll5.5`, SPECS §5: the history-touching family.
+        Prompt::PushConfirm | Prompt::MergeConfirm { .. } | Prompt::RebaseConfirm { .. } => {
+            Err(GIT_DIALOG_REFUSAL)
+        }
+        Prompt::NewAgentForm { .. }
+        | Prompt::SelectChildAgent { .. }
+        | Prompt::RenameTab { .. }
+        | Prompt::SetManualStatus
+        | Prompt::CloseTab { .. }
+        | Prompt::CloseChildConfirm { .. }
+        | Prompt::OpenProject { .. }
+        | Prompt::CloseProjectConfirm { .. }
+        | Prompt::UnpairConfirm => Ok(()),
+    }
+}
+
+/// The key label for an accelerator, matching what the desktop prints on the
+/// button and what [`crate::web::protocol::DialogKey::key`] carries.
+fn dialog_accel_key(accel: DialogAccel) -> String {
+    match accel {
+        DialogAccel::Char(c) => c.to_string(),
+        DialogAccel::Enter => "Enter".to_string(),
+        DialogAccel::Esc => "Esc".to_string(),
+        DialogAccel::Tab => "Tab".to_string(),
+    }
+}
+
+/// The accelerator a key label names, if any.
+fn dialog_accel_from_key(key: &str) -> Option<DialogAccel> {
+    match key {
+        "Enter" => Some(DialogAccel::Enter),
+        "Esc" => Some(DialogAccel::Esc),
+        "Tab" => Some(DialogAccel::Tab),
+        other => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(DialogAccel::Char(c)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Answer the open dialog on behalf of a browser (D13).
+///
+/// **Every path here is a keypress.** The browser's confirm becomes the exact
+/// sequence of [`KeyEvent`]s the desktop's own keyboard (and its dialog buttons,
+/// via [`trigger_dialog_button`]) would produce, fed through
+/// [`handle_prompt_key`]. That is the whole reason there is no second dialog
+/// engine to keep in step: `New Agent Session Tab` confirmed from a browser runs
+/// [`AppState::begin_new_agent_tab_ex`] because a synthetic `Enter` reached the
+/// same arm a real one does.
+///
+/// It also bounds what a browser can ask for, structurally: `choice` must name a
+/// button the dialog is *currently showing*, `text` is ignored by a dialog with
+/// no input field, and `toggle` needs a `Tab` button to exist. A browser cannot
+/// press a key the person at the desktop cannot see.
+fn apply_web_dialog(
+    act: crate::web::commands::DialogAct,
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> std::result::Result<Option<String>, String> {
+    use crate::web::commands::DialogAct;
+
+    let named = web_string_arg(args, "dialog_id")?;
+    let Some(open) = ui.prompt.as_ref() else {
+        return Err(
+            "No dialog is open — it was answered on the other surface. Ask for a \
+             fresh snapshot."
+                .to_string(),
+        );
+    };
+    if open.id.as_str() != named {
+        // The dialog moved on between the browser rendering it and answering.
+        // Refused rather than applied to whatever is on screen now, which is
+        // exactly how somebody confirms something they never read.
+        return Err(format!(
+            "Dialog `{named}` is not the dialog that is open now — it was \
+             replaced. Ask for a fresh snapshot."
+        ));
+    }
+
+    if act == DialogAct::Cancel {
+        feed_dialog_key(KeyCode::Esc, workspace, env, ui);
+        return Ok(Some("Cancelled the dialog.".to_string()));
+    }
+
+    browser_may_confirm(&open.prompt).map_err(str::to_string)?;
+
+    let dialog = open.dialog.clone();
+    let choice = args.and_then(|a| a.get("choice")).and_then(|c| c.as_str());
+    let text = args.and_then(|a| a.get("text")).and_then(|t| t.as_str());
+    let toggle = args
+        .and_then(|a| a.get("toggle"))
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    let list_index = args
+        .and_then(|a| a.get("list_index"))
+        .and_then(|i| i.as_u64());
+
+    // The deciding key: the button `choice` names, or the primary (every
+    // `prompt_dialog` puts the affirmative action first). `Esc` is never a
+    // confirm — `dialog_cancel` is the frame for that.
+    let deciding = match choice {
+        Some(key) => {
+            let accel = dialog_accel_from_key(key)
+                .filter(|accel| dialog.buttons.iter().any(|b| b.accel == *accel))
+                .ok_or_else(|| {
+                    format!(
+                        "This dialog has no `{key}` button; it shows {}.",
+                        button_keys(&dialog)
+                    )
+                })?;
+            accel
+        }
+        None => dialog
+            .buttons
+            .first()
+            .map(|b| b.accel)
+            .ok_or_else(|| "This dialog has no buttons to press.".to_string())?,
+    };
+    if deciding == DialogAccel::Esc {
+        return Err(
+            "`Esc` cancels — send `dialog_cancel` for that, so the other surface \
+             is told the dialog was dismissed rather than confirmed."
+                .to_string(),
+        );
+    }
+
+    // 1. The `Tab` option (1e's "run from base branch"), if asked for.
+    if toggle {
+        if !dialog.buttons.iter().any(|b| b.accel == DialogAccel::Tab) {
+            return Err("This dialog has no `Tab` option to toggle.".to_string());
+        }
+        feed_dialog_key(KeyCode::Tab, workspace, env, ui);
+    }
+    // 2. The choice row (1e's agent radio). Driven to the top first, so the
+    //    index the browser sent is absolute rather than relative to wherever the
+    //    highlight happened to be — the desktop may have moved it since.
+    if let Some(index) = list_index {
+        if dialog.list.is_empty() {
+            return Err("This dialog has no list to choose from.".to_string());
+        }
+        if index as usize >= dialog.list.len() {
+            return Err(format!(
+                "This dialog has {} choices, so `list_index: {index}` names none of them.",
+                dialog.list.len()
+            ));
+        }
+        for _ in 0..dialog.list.len() {
+            feed_dialog_key(KeyCode::Up, workspace, env, ui);
+        }
+        for _ in 0..index {
+            feed_dialog_key(KeyCode::Down, workspace, env, ui);
+        }
+    }
+    // 3. The text field. Typed character by character, exactly as a person
+    //    would: the handlers own what a character means, including refusing it
+    //    while the field is disabled.
+    if let Some(text) = text {
+        if dialog.input.is_none() {
+            return Err("This dialog has no text field.".to_string());
+        }
+        for c in text.chars() {
+            if c.is_control() {
+                return Err("A dialog's text field takes printable characters only.".to_string());
+            }
+            feed_dialog_key(KeyCode::Char(c), workspace, env, ui);
+        }
+    }
+    // 4. The decision.
+    let code = match deciding {
+        DialogAccel::Char(c) => KeyCode::Char(c),
+        DialogAccel::Enter => KeyCode::Enter,
+        DialogAccel::Tab => KeyCode::Tab,
+        DialogAccel::Esc => KeyCode::Esc,
+    };
+    feed_dialog_key(code, workspace, env, ui);
+
+    if ui.prompt.is_some() {
+        // Nothing wrong happened: a form that rejects an empty branch name keeps
+        // prompting, on both surfaces. Reported as a refusal rather than as an
+        // application, because nothing was applied.
+        return Err(
+            "The dialog is still open — it needs something it did not get. It is \
+             showing why on both surfaces."
+                .to_string(),
+        );
+    }
+    // The sentence the desktop showed, if it showed one — the same rule
+    // `Ui::web_outcome` follows for a palette dispatch. Confirming a dialog and
+    // the action behind it failing are two different facts, and the browser is
+    // entitled to the second one in the host's own words rather than a cheerful
+    // "confirmed" over a red notification the desktop is reading.
+    match desktop_notification(ui) {
+        Some(sentence) if sentence.starts_with("Error:") || sentence.starts_with("Refused:") => {
+            Err(sentence)
+        }
+        Some(sentence) => Ok(Some(sentence)),
+        None => Ok(Some("Confirmed the dialog.".to_string())),
+    }
+}
+
+/// The notification dialog the desktop is showing, if any. `None` when the
+/// screen is back to the main view, which is the silent-success case.
+fn desktop_notification(ui: &Ui) -> Option<String> {
+    match &ui.overlay {
+        UiOverlay::Dialog(dialog) => Some(dialog.title.clone()),
+        _ => None,
+    }
+}
+
+/// The keys a dialog is showing, for a refusal that says what *would* work.
+fn button_keys(dialog: &Dialog) -> String {
+    let keys: Vec<String> = dialog
+        .buttons
+        .iter()
+        .map(|b| format!("`{}`", dialog_accel_key(b.accel)))
+        .collect();
+    keys.join(", ")
+}
+
+/// One synthetic keypress into the open prompt. A no-op once the prompt has
+/// closed, so a sequence that ends early (a handler that took the decision on an
+/// earlier key) cannot leak keystrokes into whatever is on screen next.
+fn feed_dialog_key(code: KeyCode, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
+    if ui.prompt.is_none() {
+        return;
+    }
+    let key = KeyEvent::new(code, KeyModifiers::NONE);
+    if let Err(e) = handle_prompt_key(key, workspace, env, ui) {
+        ui.message(format!("Error: {e}"));
+    }
+}
+
+/// Upgrade the diff's `Superseded` frames with the outcomes somebody actually
+/// decided (D13).
+///
+/// `crate::web::stream::deltas` compares two published states, so all it can
+/// honestly say about a dialog that is gone is [`DialogOutcome::Superseded`] —
+/// it did not witness a decision. [`handle_prompt_key`] did, and recorded it in
+/// [`Ui::dialog_decisions`]. This is the one place the two meet, so the browser
+/// learns `Confirmed` when the desktop pressed `y` and `Superseded` only when a
+/// dialog really was replaced without an answer.
+///
+/// A decision with no matching frame is dropped, correctly: the dialog opened
+/// and closed within one tick, so no surface was ever told it existed.
+fn resolve_dialog_outcomes(
+    frames: &mut [crate::web::protocol::Delta],
+    decided: &[(
+        crate::web::protocol::DialogId,
+        crate::web::protocol::DialogOutcome,
+    )],
+) {
+    use crate::web::protocol::Delta;
+    for frame in frames.iter_mut() {
+        if let Delta::DialogClosed { dialog_id, outcome } = frame {
+            if let Some((_, decided)) = decided.iter().find(|(id, _)| id == dialog_id) {
+                *outcome = *decided;
+            }
         }
     }
 }
@@ -9941,6 +10531,15 @@ mod tests {
             }
         }
 
+        /// The origin every frame in this module arrives with: one browser, at a
+        /// fixed address, so the origin label a dialog carries is checkable.
+        fn browser_origin() -> crate::web::protocol::DialogOrigin {
+            crate::web::protocol::DialogOrigin::Browser {
+                viewer_id: Some(crate::web::protocol::ViewerId::new("viewer-1")),
+                label: "192.168.2.20".to_string(),
+            }
+        }
+
         /// Run one wire frame against `workspace`, returning the ack the browser
         /// would receive. Builds the fake services fresh, as the event loop
         /// builds the real ones per tick.
@@ -9956,7 +10555,7 @@ mod tests {
             let runner = crate::testing::FakeCommandRunner::new();
             let e = env(&fs, &pty, &clock, &container, &runner);
             let mut activity = ActivityStore::new();
-            run_web_command(command, workspace, &e, ui, &mut activity)
+            run_web_command(command, &browser_origin(), workspace, &e, ui, &mut activity)
         }
 
         /// D3: the selection is shared, so a browser choosing a project moves
@@ -10102,6 +10701,543 @@ mod tests {
                 .detail
                 .expect("a refusal states its reason")
                 .contains("git_force_push"));
+        }
+
+        // ===============================================================
+        // D13: the shared dialog
+        // ===============================================================
+
+        /// The one dialog open on the host, as the browser would receive it.
+        fn view(ui: &Ui) -> crate::web::protocol::DialogView {
+            web_dialog_view(ui).expect("a dialog is open")
+        }
+
+        /// The body the host serialised into `DialogView::body`.
+        fn body(view: &crate::web::protocol::DialogView) -> crate::web::protocol::DialogBody {
+            serde_json::from_value(view.body.clone().expect("the dialog carries a body"))
+                .expect("the body is a DialogBody")
+        }
+
+        fn keys(body: &crate::web::protocol::DialogBody) -> Vec<String> {
+            body.buttons.iter().map(|b| b.key.clone()).collect()
+        }
+
+        /// A `dialog_confirm` / `dialog_cancel` frame for the dialog that is
+        /// open, with whatever the browser filled in.
+        fn answer(seq: u64, name: &str, ui: &Ui, args: serde_json::Value) -> WireCommand {
+            let mut object = args;
+            object["dialog_id"] = json!(ui.dialog_id().expect("a dialog is open").as_str());
+            frame(seq, name, Some(object))
+        }
+
+        /// **D13's core claim.** A browser row whose desktop behaviour is "ask
+        /// something" opens the question instead of acting, and the dialog that
+        /// appears is tagged with the browser that asked — which is what makes
+        /// the modal the desktop user did not ask for acceptable.
+        #[test]
+        fn a_command_that_needs_a_dialog_opens_one_tagged_with_its_origin() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert_eq!(ack.detail.as_deref(), Some(DIALOG_OPENED_DETAIL));
+            let view = view(&ui);
+            assert_eq!(view.kind, "new_agent");
+            assert_eq!(view.origin, browser_origin(), "D13: tagged with who asked");
+            // And the desktop is rendering the origin sentence, not just holding
+            // the structured fact.
+            assert_eq!(
+                ui.prompt.as_ref().and_then(|p| p.dialog.origin.as_deref()),
+                Some("opened from browser · 192.168.2.20"),
+            );
+        }
+
+        /// A dialog the *desktop* opened carries `DialogOrigin::Desktop` and no
+        /// origin line — and still reaches the browser, because D13 makes the
+        /// dialog app state in both directions.
+        #[test]
+        fn a_desktop_dialog_reaches_the_browser_with_no_origin_line() {
+            let ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            start_new_tab_flow(&ws.projects[0].state, &mut ui);
+
+            let view = view(&ui);
+            assert_eq!(view.origin, crate::web::protocol::DialogOrigin::Desktop);
+            assert!(ui
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.dialog.origin.is_none()));
+        }
+
+        /// Artboard 1e: the new-agent dialog reaches the browser as the same
+        /// shell the desktop is drawing — the agent radio as a list, the branch
+        /// as an input, and `Enter` / `Tab` / `Esc` as its keys.
+        #[test]
+        fn the_new_agent_dialog_carries_artboard_1es_form() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+
+            let view = view(&ui);
+            let body = body(&view);
+            assert_eq!(body.input.as_deref(), Some(""), "1e's branch field");
+            assert_eq!(body.list.len(), 1, "one registered agent, one radio row");
+            assert!(body.list[0].label.contains("Codex"));
+            assert!(body.list[0].selected, "the default agent is preselected");
+            assert_eq!(keys(&body), vec!["Enter", "Tab", "Esc"]);
+            assert!(body.confirmable, "the browser may answer this one");
+            assert_eq!(body.refusal, None);
+        }
+
+        /// 1e's right-hand state: `Tab` hides the branch field, because there is
+        /// nothing to name. Driven from the browser, and the desktop's dialog
+        /// changes with it — one dialog, two surfaces.
+        #[test]
+        fn toggling_run_from_base_from_the_browser_hides_the_branch_field() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+            assert!(body(&view(&ui)).input.is_some());
+
+            // A `Tab` with no decision key is not a thing the wire offers, so
+            // the toggle rides on the confirm — and the form is gone by then.
+            // What this asserts instead is the desktop half of the same key,
+            // proving the browser's view tracks it.
+            let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            let body = body(&view(&ui));
+            assert_eq!(body.input, None, "1e: branch field hidden on run-from-base");
+            assert!(body
+                .buttons
+                .iter()
+                .any(|b| b.label.contains("Run from base")));
+        }
+
+        /// Either surface can confirm (D13). The browser's confirm goes through
+        /// the very keypress the desktop's own `Enter` produces, so the dialog
+        /// closes and the outcome recorded for the other surface is `Confirmed`.
+        #[test]
+        fn the_browser_can_confirm_and_the_other_surface_is_told_confirmed() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            assert_eq!(view(&ui).kind, "unpair_phone");
+            let id = ui.dialog_id().expect("open");
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none(), "the dialog closed");
+            assert!(ui.pending_unpair, "the primary action really ran");
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Confirmed)]);
+        }
+
+        /// The other direction, which is the half a browser-only implementation
+        /// would get wrong: the **desktop** answers a dialog the browser opened,
+        /// and the browser is told it was confirmed rather than replaced.
+        #[test]
+        fn the_desktop_can_confirm_a_browser_opened_dialog() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            assert!(ui.prompt.is_none());
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Confirmed)]);
+        }
+
+        /// Cancelling from either surface, and the outcome the other one reads.
+        #[test]
+        fn the_browser_can_cancel_and_the_other_surface_is_told_cancelled() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+
+            let ack = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none());
+            assert!(!ui.pending_unpair, "cancelling ran nothing");
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Cancelled)]);
+        }
+
+        /// The desktop's cancel key differs per dialog (`n`, `c`, `Esc`) and the
+        /// wire outcome must not: the decision is read off the button's label,
+        /// not off a table of key spellings.
+        #[test]
+        fn a_dialogs_own_cancel_button_reports_cancelled_whatever_its_key() {
+            use crate::web::protocol::DialogOutcome;
+            let n_cancel = Dialog::confirm(
+                "Close shell 2?",
+                vec![
+                    DialogButton::new(DialogAccel::Char('y'), "Close"),
+                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                ],
+            );
+            let c_cancel = Dialog::confirm(
+                "Push the committed changes only?",
+                vec![
+                    DialogButton::new(DialogAccel::Char('p'), "Push committed"),
+                    DialogButton::new(DialogAccel::Char('c'), "Cancel"),
+                ],
+            );
+            let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(
+                dialog_decision(&n_cancel, press('n')),
+                DialogOutcome::Cancelled
+            );
+            assert_eq!(
+                dialog_decision(&n_cancel, press('y')),
+                DialogOutcome::Confirmed
+            );
+            assert_eq!(
+                dialog_decision(&c_cancel, press('c')),
+                DialogOutcome::Cancelled
+            );
+            assert_eq!(
+                dialog_decision(&c_cancel, press('p')),
+                DialogOutcome::Confirmed
+            );
+            // `Clear` in the status menu is a decision, not a dismissal.
+            let clear = Dialog::confirm(
+                "Set status override",
+                vec![DialogButton::new(DialogAccel::Char('c'), "Clear")],
+            );
+            assert_eq!(
+                dialog_decision(&clear, press('c')),
+                DialogOutcome::Confirmed
+            );
+        }
+
+        /// A browser may only press a key the dialog is showing. `choice` is the
+        /// button's own key label, so there is no way to reach an action the
+        /// person at the desktop cannot see.
+        #[test]
+        fn a_choice_the_dialog_is_not_showing_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "q" }));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("no `q` button"), "{detail}");
+            assert!(ui.prompt.is_some(), "the dialog is untouched");
+        }
+
+        /// `Esc` is a cancel, and cancelling has its own frame. Answering
+        /// `dialog_confirm` with it is refused rather than quietly treated as a
+        /// confirmation — the other surface would be told the wrong outcome.
+        #[test]
+        fn confirming_with_the_cancel_key_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "Esc" }));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("dialog_cancel"));
+            assert!(ui.prompt.is_some());
+        }
+
+        /// The destructive family (`remote-control-ll5.4`, artboard 1g): the
+        /// dialog is shared and **cancellable** from a browser, and confirming it
+        /// is refused with the sentence naming the task that owns the two-step
+        /// confirmation. Both halves matter — a shared dialog a remote surface
+        /// cannot dismiss would be worse than not sharing it.
+        #[test]
+        fn a_destructive_dialog_can_be_cancelled_but_not_confirmed_from_a_browser() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            // The desktop opens it — the browser row for it is refused by the
+            // table, which is the first line of defence.
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: true });
+
+            let view = view(&ui);
+            let body = body(&view);
+            assert_eq!(view.kind, "confirm_abandon");
+            assert!(!body.confirmable, "the browser may not confirm this one");
+            assert_eq!(
+                body.refusal.as_deref(),
+                Some(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL)
+            );
+
+            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL)
+            );
+            assert!(ui.prompt.is_some(), "nothing was abandoned");
+
+            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none(), "cancelling is always allowed");
+        }
+
+        /// The git family (`remote-control-ll5.5`, SPECS §5): same shape, its own
+        /// sentence.
+        #[test]
+        fn a_git_dialog_refuses_a_browsers_confirm_with_the_git_sentence() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(
+                &mut ui,
+                Prompt::RebaseConfirm {
+                    agent_branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
+                    drift: 2,
+                    primary_running: false,
+                },
+            );
+
+            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::GIT_DIALOG_REFUSAL)
+            );
+            assert!(ui.prompt.is_some());
+        }
+
+        /// An answer for a dialog that has been replaced is refused, not applied
+        /// to whatever is on screen now. That is the mechanism behind "nobody
+        /// confirms something they never read".
+        #[test]
+        fn an_answer_for_a_replaced_dialog_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let stale = ui.dialog_id().expect("open");
+            // The desktop moves on to a different question.
+            start_prompt(&mut ui, Prompt::SetManualStatus);
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    2,
+                    names::DIALOG_CONFIRM,
+                    Some(json!({ "dialog_id": stale.as_str() })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("replaced"), "{detail}");
+            assert!(ui.prompt.is_some(), "the live dialog is untouched");
+        }
+
+        /// Answering when nothing is open is refused with the reason, not
+        /// silently ignored: the browser's view is behind and needs to say so.
+        #[test]
+        fn an_answer_with_no_dialog_open_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    1,
+                    names::DIALOG_CANCEL,
+                    Some(json!({ "dialog_id": "dialog-9" })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("No dialog is open"));
+        }
+
+        /// An answer with no `dialog_id` is a refusal, not a guess at whichever
+        /// dialog happens to be open.
+        #[test]
+        fn an_answer_that_names_no_dialog_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+
+            let ack = run(&mut ws, &mut ui, &frame(2, names::DIALOG_CONFIRM, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("dialog_id"));
+            assert!(ui.prompt.is_some());
+        }
+
+        /// **The `Superseded` policy.** A second dialog arriving while one is
+        /// open replaces it, and the browser is told the first one was
+        /// `Superseded` — never left holding a modal it can still answer, and
+        /// never told a decision was made. The diff is what says it, because the
+        /// diff is the only thing that witnessed a dialog vanish without one.
+        #[test]
+        fn a_replaced_dialog_is_reported_superseded_and_the_new_one_opened() {
+            use crate::web::protocol::{Delta, DialogOutcome};
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let first = ui.dialog_id().expect("open");
+            let published = crate::web::server::HostState {
+                dialog: web_dialog_view(&ui),
+                ..crate::web::server::HostState::default()
+            };
+
+            start_prompt(&mut ui, Prompt::SetManualStatus);
+            let next = crate::web::server::HostState {
+                dialog: web_dialog_view(&ui),
+                ..crate::web::server::HostState::default()
+            };
+            let second = ui.dialog_id().expect("open");
+            assert_ne!(first, second, "a replacement gets its own id");
+
+            let mut frames = crate::web::stream::deltas(&published, &next);
+            resolve_dialog_outcomes(&mut frames, &ui.dialog_decisions);
+
+            assert!(
+                matches!(
+                    frames.as_slice(),
+                    [
+                        Delta::DialogClosed {
+                            outcome: DialogOutcome::Superseded,
+                            ..
+                        },
+                        Delta::DialogOpened(_),
+                    ]
+                ),
+                "{frames:?}"
+            );
+            let Delta::DialogClosed { dialog_id, .. } = &frames[0] else {
+                unreachable!()
+            };
+            assert_eq!(dialog_id, &first);
+        }
+
+        /// The other side of the same coin: where somebody *did* decide, the
+        /// diff's `Superseded` is upgraded to the real outcome. Without this the
+        /// browser would be told "replaced" about a dialog the desktop answered.
+        #[test]
+        fn a_decided_dialog_is_reported_with_the_decision_not_superseded() {
+            use crate::web::protocol::{Delta, DialogOutcome};
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+            let published = crate::web::server::HostState {
+                dialog: web_dialog_view(&ui),
+                ..crate::web::server::HostState::default()
+            };
+
+            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            run(&mut ws, &mut ui, &cancel);
+            let next = crate::web::server::HostState {
+                dialog: web_dialog_view(&ui),
+                ..crate::web::server::HostState::default()
+            };
+
+            let mut frames = crate::web::stream::deltas(&published, &next);
+            assert!(
+                matches!(
+                    frames.as_slice(),
+                    [Delta::DialogClosed {
+                        outcome: DialogOutcome::Superseded,
+                        ..
+                    }]
+                ),
+                "the diff alone can only say Superseded: {frames:?}"
+            );
+            resolve_dialog_outcomes(&mut frames, &ui.dialog_decisions);
+            assert_eq!(
+                frames,
+                vec![Delta::DialogClosed {
+                    dialog_id: id,
+                    outcome: DialogOutcome::Cancelled,
+                }]
+            );
+        }
+
+        /// D14: a read-only observer has no input, so it cannot answer a dialog
+        /// either. The check is the table's, one step before the host — an
+        /// observer is told `read_only` rather than being handed the reason a
+        /// command it may not send would have failed.
+        #[test]
+        fn an_observer_cannot_answer_a_dialog() {
+            for name in [names::DIALOG_CONFIRM, names::DIALOG_CANCEL] {
+                let spec = crate::web::commands::lookup(name).expect("in the inventory");
+                assert!(
+                    spec.requires_control(),
+                    "`{name}` must be a controller's frame (D14)"
+                );
+            }
+        }
+
+        /// A dialog id is never reused, so a stale answer cannot land on a new
+        /// dialog by matching its id.
+        #[test]
+        fn dialog_ids_are_never_reused() {
+            let mut ui = Ui::default();
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..5 {
+                start_prompt(&mut ui, Prompt::SetManualStatus);
+                assert!(seen.insert(ui.dialog_id().expect("open")));
+            }
         }
 
         /// D11: read-marking still works through the unified applier — the frame
