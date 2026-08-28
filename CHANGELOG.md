@@ -112,6 +112,27 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   separate facts rather than one string, with every time it prints dated against
   the host's clock instead of the browser's.
 
+- **More than one person can now type into the same FlightDeck.** The browser
+  used to allow exactly one driver plus any number of read-only watchers,
+  because two people typing into one terminal produces interleaved keystrokes
+  that look like a bug in the agent rather than in FlightDeck. Now any number of
+  browsers can take a writing seat — the desktop is always one of them — and
+  FlightDeck arbitrates between them with a soft input lock: whoever types takes
+  the turn, and keeps it until they pause. Someone typing into another person's
+  burst is told so, naming who is currently typing, instead of having their
+  keystrokes spliced into the other person's line or silently dropped. If you
+  need the terminal now rather than in a moment, taking over is one confirmed
+  click, and it takes nobody's seat away — the interrupted writer gets the turn
+  back as soon as you pause. No surface has priority, the desktop included.
+
+  Every surface shows the same seat list: who is connected, who may type, who is
+  typing right now, and which row is you — live, as people come and go. The
+  desktop's status bar carries the same information as a chip, so you can see
+  from the machine itself that a browser is mid-sentence.
+
+  Note that a browser tab left open across a FlightDeck update will ask to be
+  reloaded: the wire protocol changed to carry the new seat model.
+
 ### Improvements
 
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
