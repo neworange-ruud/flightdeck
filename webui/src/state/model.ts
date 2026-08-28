@@ -521,6 +521,17 @@ export interface SeatInfo {
   readonly holdsInput: boolean;
   /** The desktop is not a viewer (`SeatInfo::viewer_id == null`). */
   readonly isDesktop: boolean;
+  /**
+   * The row describing **this tab** — `SeatInfo::is_you`, decided by the host.
+   *
+   * The seat panel's rows are otherwise indistinguishable from each other: two
+   * tabs on the same machine produce two rows with the same address and the
+   * same browser, and a reader who cannot tell which one is theirs cannot use
+   * the panel to decide anything. The host knows, because it builds one frame
+   * per recipient; the browser must not try to work it out by matching its own
+   * address, which is a guess that is wrong exactly when it matters.
+   */
+  readonly isYou: boolean;
   /** `14 minutes, active 20s ago` — a label; see `Staleness` for why. */
   readonly sinceLabel: string;
 }

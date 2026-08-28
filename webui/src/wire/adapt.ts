@@ -239,6 +239,13 @@ export function seatOf(
      */
     holdsInput: seat.holds_input ?? false,
     isDesktop: seat.viewer_id === null,
+    /**
+     * The host's answer, not ours. It builds a frame per recipient precisely so
+     * it can mark this row; a browser that instead matched the row's `address`
+     * against its own would be right until two tabs share a machine, which is
+     * the case the multi-viewer panel exists for.
+     */
+    isYou: seat.is_you === true,
     sinceLabel:
       serverTimeMs === null ? "" : agoLabel(serverTimeMs - seat.since_ms),
   };

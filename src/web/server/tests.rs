@@ -327,13 +327,14 @@ fn seat_frames_are_personalised_per_viewer() {
     registry.request_seat(&viewer("v1"), SeatRequest::Observe);
 
     let holder = Writer::Viewer(viewer("v0"));
-    let frames = registry.seat_frames(NOW_MS, Some(&holder));
+    let frames = registry.seat_frames(NOW_MS, Some(&holder), None);
     assert_eq!(frames.len(), 2);
     for (id, msg) in frames {
         let ServerMsg::Delta(Delta::Seats {
             you,
             seats,
             server_time_ms,
+            you_were_preempted,
         }) = msg
         else {
             panic!("a seat change is a Delta::Seats, never a Shutdown");
@@ -361,7 +362,70 @@ fn seat_frames_are_personalised_per_viewer() {
                 .collect::<Vec<_>>(),
             vec![Some(viewer("v0"))]
         );
+        // Nobody was interrupted here — `v0` claimed a free lock by typing,
+        // which is the ordinary movement and the overwhelmingly common one.
+        assert!(
+            !you_were_preempted,
+            "an ordinary hand-off must not put 2f's evicted panel in front of {id}"
+        );
     }
+}
+
+/// The flag that separates *someone confirmed an override* from *the lock moved
+/// the way it moves all day*, which is the difference between a notice and an
+/// obstruction.
+///
+/// The browser cannot make this distinction from the rows: "the lock left me" is
+/// true of both, and the lock leaves a writer every time their colleague starts
+/// a sentence. Intent exists only at the host, at the moment of the act, so the
+/// host carries it — per recipient, because one preemption interrupts exactly
+/// one writer and only that writer has anything to be told.
+#[test]
+fn only_the_interrupted_writers_frame_says_it_was_deliberate() {
+    let (mut registry, _rx) = registry_with(3);
+    for id in ["v0", "v1", "v2"] {
+        registry.request_seat(&viewer(id), SeatRequest::Write);
+    }
+
+    // `v2` confirmed `Take over` while `v0` was mid-burst.
+    let holder = Writer::Viewer(viewer("v2"));
+    let interrupted = Writer::Viewer(viewer("v0"));
+    let flagged = |frames: Vec<(ViewerId, ServerMsg)>| -> Vec<ViewerId> {
+        frames
+            .into_iter()
+            .filter(|(_, msg)| {
+                matches!(
+                    msg,
+                    ServerMsg::Delta(Delta::Seats {
+                        you_were_preempted: true,
+                        ..
+                    })
+                )
+            })
+            .map(|(id, _)| id)
+            .collect()
+    };
+
+    assert_eq!(
+        flagged(registry.seat_frames(NOW_MS, Some(&holder), Some(&interrupted))),
+        vec![viewer("v0")],
+        "the writer that was cut into, and nobody else — least of all the one \
+         that pressed the button"
+    );
+    assert_eq!(
+        flagged(registry.seat_frames(NOW_MS, Some(&holder), None)),
+        Vec::<ViewerId>::new(),
+        "the same roster with the same holder, announced for any other reason, \
+         is silent"
+    );
+    // An interrupted *desktop* reaches no browser panel: 2f gives the person at
+    // the machine a transient strip, because their keyboard was never revoked
+    // and they have no decision to make.
+    assert_eq!(
+        flagged(registry.seat_frames(NOW_MS, Some(&holder), Some(&Writer::Desktop))),
+        Vec::<ViewerId>::new(),
+        "the desktop's interruption is the desktop's business"
+    );
 }
 
 /// A viewer that stops draining is dropped rather than allowed to grow the

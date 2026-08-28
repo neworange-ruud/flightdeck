@@ -208,6 +208,149 @@ describe("wire/socket: a seat delta dates its own rows", () => {
 });
 
 /**
+ * `remote-control-eek.3`: 2f's *evicted* panel finally has a dispatcher, and the
+ * whole of the work is which seat deltas may open it.
+ *
+ * It was modelled, styled and tested from turn 2 and never fired — under
+ * protocol v1 for want of anything to fire it on, and under the revision for a
+ * sharper reason: **the input lock moves on every ordinary hand-off.** One
+ * writer stops typing, another starts, several times a minute, and every one of
+ * those is a `Delta::Seats` in which the lock left somebody. Opening a modal on
+ * that would put a dialog in front of a reader every time their colleague began
+ * a sentence.
+ *
+ * The distinguishing fact is *intent*, which exists only at the host at the
+ * moment of the act, so the host carries it per recipient
+ * (`Delta::Seats::you_were_preempted`). These are the two halves.
+ */
+describe("wire/socket: the evicted panel opens on preemption only", () => {
+  const holder = {
+    viewer_id: "v9",
+    label: "192.168.2.11 · Chrome on macOS",
+    address: "192.168.2.11",
+    user_agent_label: "Chrome on macOS",
+    seat: "writing",
+    holds_input: true,
+    since_ms: 1_700_000_000_000,
+    is_you: false,
+  };
+
+  function session(): {
+    store: ReturnType<typeof createStore>;
+    ws: FakeSocket;
+    tick: () => void;
+  } {
+    let clock = 1_700_000_000_000;
+    const store = createStore(createInitialState());
+    const ws = fakeSocket();
+    openSession({
+      store,
+      url: "ws://test/ws",
+      socketFactory: () => ws as unknown as WebSocket,
+      now: () => clock,
+    });
+    return {
+      store,
+      ws,
+      /** Eight seconds, not 2f's literal three: `agoLabel` floors anything
+       * under five at `just now`, which is the app's own vocabulary for a gap
+       * too short to put a number on. */
+      tick: () => {
+        clock += 8_000;
+      },
+    };
+  }
+
+  function deliverSeats(ws: FakeSocket, preempted: boolean): void {
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "seats",
+        you: "writing",
+        seats: [holder],
+        server_time_ms: 1_700_000_012_000,
+        you_were_preempted: preempted,
+      }),
+    });
+  }
+
+  it("stays shut when the lock simply moved", () => {
+    /** The common case by a wide margin, and the reason this cannot be driven
+     * off the rows: the reader lost the turn here too. */
+    const { store, ws } = session();
+    deliverSeats(ws, false);
+    expect(store.getState().seats).toHaveLength(1);
+    expect(store.getState().takeover).toBeNull();
+  });
+
+  it("stays shut for a host that says nothing at all", () => {
+    /** Absent is `false` on the wire, and the honest reading of it is "this
+     * host reports no preemptions" — which leaves the browser where it was
+     * before the field existed, not guessing. */
+    const { store, ws } = session();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "seats",
+        you: "writing",
+        seats: [holder],
+        server_time_ms: 1_700_000_012_000,
+      }),
+    });
+    expect(store.getState().takeover).toBeNull();
+  });
+
+  it("opens naming the writer that took it, when the host says it was deliberate", () => {
+    const { store, ws, tick } = session();
+    /** A keystroke that actually landed, some seconds before the interruption
+     * — 2f's "the last one that landed was 3s ago". */
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "ack", seq: 1, outcome: "applied" }),
+    });
+    tick();
+    deliverSeats(ws, true);
+
+    expect(store.getState().takeover).toEqual({
+      kind: "evicted",
+      /** The host-observed address, never the merged label split on its
+       * separator — the browser half of that label is untrusted free text. */
+      byAddress: "192.168.2.11",
+      lastInputAgo: "8s ago",
+    });
+    /** Losing the turn is a `Delta::Seats`, never a `Shutdown`: the socket and
+     * the seat both stay, which is what makes waiting a real option. */
+    expect(store.getState().shutdown).toBeNull();
+    expect(store.getState().seat).toBe("writing");
+  });
+
+  it("dates the panel from a keystroke that landed, never from one refused", () => {
+    /**
+     * A `rejected` ack is a keystroke the host declined — it never reached the
+     * PTY. Dating "the last one that landed" from it would tell the reader
+     * their typing was arriving when it was not, so the clause is left out
+     * entirely instead.
+     */
+    const { store, ws, tick } = session();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "ack",
+        seq: 1,
+        outcome: "rejected",
+        detail: "someone else is typing",
+      }),
+    });
+    tick();
+    deliverSeats(ws, true);
+
+    expect(store.getState().takeover).toEqual({
+      kind: "evicted",
+      byAddress: "192.168.2.11",
+      lastInputAgo: "",
+    });
+  });
+});
+
+/**
  * `remote-control-ll5.7`: split view is shared instance state (D3), so the
  * toggle round-trips through `sendCommand("toggle_split_view")` and the
  * layout only ever moves from what the host says next — never from the

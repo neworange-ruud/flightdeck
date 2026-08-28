@@ -45,11 +45,31 @@ export function observers(seats: readonly SeatInfo[]): readonly SeatInfo[] {
 }
 
 /**
+ * How one seat is named to the reader: `this tab` for their own, and the host's
+ * label verbatim for everybody else.
+ *
+ * **`isYou` is the host's word, and the only thing that may decide this.** The
+ * host builds one frame per recipient precisely so it can mark that row; a
+ * browser that instead matched a row's address, or its label, against its own
+ * would be right until two tabs share a machine — at which point it names
+ * *both* of them `this tab`, or neither, and the chip stops being able to
+ * answer the one question it exists for. That is not a rare case: it is a
+ * second tab on the same laptop.
+ *
+ * D14 as revised states the outcome directly — "the browser's viewer chip
+ * reads `desktop + this tab ✎`" — and the seat panel's rows mark the reader
+ * from the same field. Two surfaces, one fact, no derivation in either.
+ */
+function seatChipName(seat: SeatInfo): string {
+  return seat.isYou ? "this tab" : seat.label;
+}
+
+/**
  * The chip's text: the seats that can type, named, with the one that is typing
  * marked.
  *
  * 2f is specific about the form — **named seats, not a counter that implies a
- * crowd** — so this joins labels and never totals them. What the revision adds
+ * crowd** — so this joins names and never totals them. What the revision adds
  * is the second fact: `desktop ✎ + this tab` says who is typing *now*, which is
  * the only honest answer to "why did my keys stop working" and is exactly what
  * v1's `desktop + this tab` could not say.
@@ -69,13 +89,37 @@ export function viewerChipText(
     return `${fallbackCount} viewer${fallbackCount === 1 ? "" : "s"}`;
   }
   const named = writers(seats)
-    .map((seat) => (seat.holdsInput ? `${seat.label} ✎` : seat.label))
+    .map((seat) => {
+      const name = seatChipName(seat);
+      return seat.holdsInput ? `${name} ✎` : name;
+    })
     .join(" + ");
   const watching = observers(seats).length;
   if (watching === 0) {
     return named;
   }
   return `${named} + ${watching} watching`;
+}
+
+/**
+ * What one row is allowed to do and whether it is doing it, in three words.
+ *
+ * **The two facts collapse into one phrase here and nowhere else.** `seat` and
+ * `holdsInput` stay separate everywhere they are reasoned about — that
+ * separation is the whole of D14's revision — but a reader needs one phrase per
+ * row, and having two surfaces invent that phrase independently is how the chip
+ * and the panel come to describe the same seat differently. So the chip's
+ * tooltip and the seat panel's rows both call this.
+ *
+ * The three phrases are the ones the chip already used; none of them is new
+ * copy. `can type` is deliberately not "waiting": a writer without the turn is
+ * not queued behind anything, it takes the lock the moment the holder pauses.
+ */
+export function seatRoleLabel(seat: SeatInfo): string {
+  if (seat.seat === "observing") {
+    return "read-only";
+  }
+  return seat.holdsInput ? "typing now" : "can type";
 }
 
 /**
@@ -89,14 +133,13 @@ export function viewerChipTitle(seats: readonly SeatInfo[]): string {
   }
   return seats
     .map((seat) => {
-      const role =
-        seat.seat === "observing"
-          ? "read-only"
-          : seat.holdsInput
-            ? "typing now"
-            : "can type";
+      /** The tooltip is where the identifying detail belongs, so the reader's
+       * own row keeps its full label *and* gains the marker — the compact chip
+       * above has room for one or the other, this has room for both. Same
+       * order as the seat panel's row: name, `this tab`, role, connected. */
+      const you = seat.isYou ? " · this tab" : "";
       const since = seat.sinceLabel === "" ? "" : ` · ${seat.sinceLabel}`;
-      return `${seat.label} — ${role}${since}`;
+      return `${seat.label}${you} — ${seatRoleLabel(seat)}${since}`;
     })
     .join("\n");
 }

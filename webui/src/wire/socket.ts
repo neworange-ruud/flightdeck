@@ -22,7 +22,13 @@
 
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
-import { dialogOf, seatOf, snapshotFromWire, statusFromLabel } from "./adapt";
+import {
+  agoLabel,
+  dialogOf,
+  seatOf,
+  snapshotFromWire,
+  statusFromLabel,
+} from "./adapt";
 import {
   decodeBase64,
   encodeBase64,
@@ -142,6 +148,20 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
    * below it — this set is what tells the two apart.
    */
   const pendingCommands = new Set<number>();
+  /**
+   * When this tab's most recent keystroke was **applied** — 2f's "the last one
+   * that landed was 3s ago".
+   *
+   * Deliberately the ack and not the send: a keystroke that was queued, or
+   * refused with `seat_held`, never landed, and dating the panel from it would
+   * tell the reader their typing was arriving when it was not. `null` until one
+   * does, and the panel then leaves the clause out rather than inventing a time.
+   *
+   * Both ends of the subtraction are this machine's clock, which is what makes
+   * it honest without a host timestamp: it measures the gap between two local
+   * events, never a host instant against a local clock.
+   */
+  let lastAppliedInputAtMs: number | null = null;
   let seq = 0;
   let viewerId: string | null = null;
   let socket: WebSocket | null = null;
@@ -266,13 +286,47 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
           typeof frame.server_time_ms === "number" && frame.server_time_ms > 0
             ? frame.server_time_ms
             : null;
+        /** The same mapping the snapshot path uses, deliberately: 2f draws
+         * the same three facts however the seat news arrived. */
+        const rows = seats.map((s) => seatOf(s, serverTimeMs));
         store.dispatch({
           type: "seats/changed",
           seat: (frame.you as "writing" | "observing") ?? "observing",
-          /** The same mapping the snapshot path uses, deliberately: 2f draws
-           * the same three facts however the seat news arrived. */
-          seats: seats.map((s) => seatOf(s, serverTimeMs)),
+          seats: rows,
         });
+        /**
+         * 2f's *evicted* panel, and the one condition it may open on.
+         *
+         * **Not "the lock left me".** Under D14 as revised the lock leaves a
+         * writer every time the other person starts a sentence and comes back
+         * `INPUT_LOCK_IDLE_MS` after they stop; opening a modal on that would
+         * put a dialog in front of somebody several times a minute for an event
+         * they were about to stop noticing. The panel is for the one movement a
+         * human *confirmed*, and the host is the only place that knows which
+         * one that was — hence the per-recipient
+         * `Delta::Seats::you_were_preempted` rather than a comparison against
+         * the previous rows.
+         *
+         * A host that never sends the field never opens the panel, which is
+         * where this browser already was: `evicted` was modelled, styled and
+         * tested from turn 2 and had no dispatcher at all until the host could
+         * say *deliberately*.
+         */
+        if (frame.you_were_preempted === true) {
+          const holder = rows.find((row) => row.holdsInput) ?? null;
+          store.dispatch({
+            type: "takeover/evicted",
+            /** The same three-way fallback the `seat_held` path uses: the
+             * host-observed address, else the merged label (which starts with
+             * it), else a phrase that claims nothing. The label is never split
+             * to recover the address — see `WireSeatInfo`. */
+            byAddress: holder?.address ?? holder?.label ?? "another writer",
+            lastInputAgo:
+              lastAppliedInputAtMs === null
+                ? ""
+                : agoLabel(now() - lastAppliedInputAtMs),
+          });
+        }
         return;
       }
       case "geometry": {
@@ -480,6 +534,7 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     }
     if (frame.outcome === "applied") {
       held = held.filter((item) => item.seq > frame.seq);
+      lastAppliedInputAtMs = now();
       store.dispatch({ type: "input/acked", throughSeq: frame.seq });
       return;
     }

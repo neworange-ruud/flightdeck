@@ -264,6 +264,7 @@ fn all_deltas() -> Vec<Delta> {
             you: Seat::Observing,
             seats: vec![seat_info()],
             server_time_ms: 1_700_000_012_000,
+            you_were_preempted: false,
         },
     ]
 }
@@ -729,6 +730,9 @@ fn losing_the_input_lock_is_a_seat_delta_not_a_shutdown() {
             is_you: false,
         }],
         server_time_ms: 1_700_000_112_000,
+        // The ordinary case: the turn moved, but not because anybody confirmed
+        // an override. See the dedicated test below.
+        you_were_preempted: false,
     };
     let value = serde_json::to_value(&delta).unwrap();
     assert_eq!(value["change"], "seats");
@@ -804,6 +808,7 @@ fn a_seat_delta_carries_the_clock_its_rows_are_dated_against() {
         you: Seat::Observing,
         seats: vec![seat_info()],
         server_time_ms: 1_700_000_012_000,
+        you_were_preempted: false,
     };
     let value = serde_json::to_value(&delta).unwrap();
     assert_eq!(value["server_time_ms"], 1_700_000_012_000i64);
@@ -831,6 +836,46 @@ fn a_seat_delta_carries_the_clock_its_rows_are_dated_against() {
     assert_eq!(
         *server_time_ms, 0,
         "absent is not a time, and never a guess"
+    );
+    assert_eq!(seats.len(), 1, "the rows themselves survive intact");
+}
+
+#[test]
+fn a_seat_delta_says_whether_the_recipient_was_preempted_on_purpose() {
+    // The lock moves on every ordinary hand-off, so "it left me" cannot be what
+    // opens 2f's evicted panel — that would be a modal every time the other
+    // person starts a sentence. The distinguishing fact is intent, which exists
+    // only here, at the moment of the act, so the frame carries it.
+    let delta = Delta::Seats {
+        you: Seat::Writing,
+        seats: vec![seat_info()],
+        server_time_ms: 1_700_000_012_000,
+        you_were_preempted: true,
+    };
+    let value = serde_json::to_value(&delta).unwrap();
+    assert_eq!(value["you_were_preempted"], true);
+    assert_eq!(round_trip(&delta), delta);
+
+    // Additive and defaulted, which is precisely why this field is *not* a
+    // `PROTOCOL_VERSION` bump: it is neither a required field nor a closed
+    // vocabulary growing a member. `false` is the honest reading for a host that
+    // never sends it — "this host reports no preemptions" — which leaves the
+    // browser exactly where it was before the field existed rather than
+    // guessing from the rows.
+    let mut older = serde_json::to_value(&delta).unwrap();
+    older.as_object_mut().unwrap().remove("you_were_preempted");
+    let without: Delta = serde_json::from_value(older).unwrap();
+    let Delta::Seats {
+        you_were_preempted,
+        seats,
+        ..
+    } = &without
+    else {
+        panic!("still a seat delta");
+    };
+    assert!(
+        !you_were_preempted,
+        "absent is 'nobody said this was deliberate', never 'it was'"
     );
     assert_eq!(seats.len(), 1, "the rows themselves survive intact");
 }

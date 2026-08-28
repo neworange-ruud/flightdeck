@@ -1446,7 +1446,101 @@ tested but still **not dispatched by `socket.ts`** — it was not wired under v1
 either, and firing it on every ordinary hand-off would be a modal every time the
 other person starts typing. Wiring it to explicit preemption only needs the host
 to say *which* movements were deliberate, which is a per-recipient field on
-`Delta::Seats` that this task did not add.
+`Delta::Seats` that this task did not add. *(Added by R15 below.)*
+
+### R15 — the panel is the roster, and the host says which movements were meant
+
+`remote-control-eek.3`. R14 left the multi-viewer list and one loose end; both
+are the same panel, which is why they are one entry.
+
+**The list is 2f's panel with rows, not a new screen.** D14's caption says so
+literally, and the implementation takes it literally: `webui/src/ui/takeover.ts`
+replaces the single incumbent's `address / browser / connected` fact list with
+one row per seat, on both of the panel's directions. The rows are read from
+`AppState.seats` rather than from `TakeoverState`, which is the whole of what
+makes them **live** — a `Delta::Seats` arriving while the panel is open repaints
+it, so a reader watching the lock move sees it move.
+
+Each row carries the two facts R14 insisted on keeping apart, as two marks: the
+role (`can type` / `read-only`, from `seatRoleLabel`, shared with the chip's
+tooltip so the two cannot drift) and the turn (`typing now`, plus the chip's `✎`
+glyph, on at most one row). *Three writers, one of them mid-burst* renders as
+three rows. The reader's own row is marked `this tab` from `SeatInfo::is_you`,
+which the browser had been dropping on the floor: two tabs on one machine are
+two rows with the same address and the same browser, so matching on either marks
+both, and the host is the only party that knows. The fact list survives as the
+fallback for the one case that genuinely has no roster — `WireError::seat_held`
+naming a holder before any dated seat list has arrived on a fresh socket.
+
+**The evicted panel now fires, and only on a confirmed override.** The reason it
+could not simply be fired on every seat delta is R14's: under the revision the
+lock moves on every ordinary hand-off, so "the lock left me" is true several
+times a minute and a modal on it is an obstruction rather than a notice. The
+distinguishing fact is *intent*, and intent exists only at the host at the
+moment of the act — so the host carries it, as
+**`Delta::Seats::you_were_preempted`**, per recipient beside `you`. One
+preemption interrupts exactly one writer; a list-shaped `preempted:
+Option<ViewerId>` would broadcast the same fact to everybody and invite each
+browser to compare it against its own id, and a browser that gets that
+comparison wrong shows a modal to the wrong person. It names no interrupter,
+because the rows already do (`holds_input`) and a second field naming the same
+surface is a second thing that can disagree.
+
+`SeatRegistry::seat_frames` takes the interrupted writer alongside the holder,
+and `Shared::announce_seats` takes it as a parameter rather than deriving it from
+`announced_holder`: that field records *what* moved, and only the caller knows
+*why*. `Some` at exactly three sites — a browser's `Attach { seat: TakeOver }`,
+a browser's `take_input_lock`, and `preempt_input_for_desktop` — all of which go
+through `preempt_for_viewer`, which reads the holder *before* the preemption and
+returns `None` when the claimant already held it, so confirming `Take over`
+twice does not show the panel to the person who pressed the button. An
+interrupted *desktop* flags nobody: 2f gives the person at the machine a
+transient strip, because their keyboard was never revoked.
+
+**Not a version bump, and the reasoning is the policy's own.** §3's
+forward-compatibility rules make a bump necessary when a field's meaning
+changes, a required field appears, or a **closed vocabulary grows a member**.
+This is an additive `#[serde(default)]` `bool`, and `false` is the honest reading
+on a host that never sends it — *this host reports no preemptions*, which leaves
+the browser exactly where it was before the field existed rather than guessing.
+So `PROTOCOL_VERSION` stays at 2, and `webui/e2e/chain.spec.ts` needs nothing
+(it takes the number from `wire/frames`, and the number did not move).
+
+**One copy change, and it is 2f's own sentence.** The evicted panel's *"the last
+one that landed was 3s ago"* clause is now dropped entirely when this tab has no
+keystroke that landed — `socket.ts` dates it from the most recent **applied**
+ack, never from a send or a refusal, so a tab preempted before it ever typed
+gets the sentence without the clause rather than a time invented for an event
+that did not happen. The panel's remaining two-seat wording needed nothing: it
+describes *the other writer*, which is still exactly one surface however many
+rows the roster has.
+
+**The chip and the panel agree by construction.** D14 as revised says outright
+that "the browser's viewer chip reads `desktop + this tab ✎`", and the chip did
+not: `is_you` had never been mapped into the browser's model at all, so
+`viewerChipText` rendered the reader's own row by the host's label and a real
+session read `desktop + 192.168.2.20 · Chrome on macOS ✎`. It only *looked*
+right because `fixtureSeats` set that row's label to the literal string
+`this tab` — a fixture that had pre-baked the answer.
+
+Both surfaces now read the one field: `seatChipName` in `state/seats.ts` for the
+chip's line, `SeatInfo.isYou` for the panel's row, and neither derives it from
+anything else. **Matching on the address or the label is not a shortcut, it is a
+wrong answer**, and it is wrong in the ordinary case rather than an exotic one:
+two tabs on one laptop send the same `User-Agent` from the same address, so
+their rows are identical in every field a browser could match on, and a label
+match names *both* of them `this tab`. Only the host can tell them apart,
+because it is the one building a frame per recipient. The fixture now carries
+the host's real label so that a chip which stopped deriving the name cannot keep
+passing — `npx vitest run` fails eight tests if `seatChipName` is reverted to
+returning the label, four of them the pre-existing artboard tests for 2c and 1a.
+
+The chip's compact line has room for one of the two, so it shows `this tab` in
+place of the label; its **tooltip** has room for both and shows
+`192.168.2.20 · Chrome on macOS · this tab — can type · 14 minutes`, in the seat
+panel's own column order. Nothing is invented when the host marks nobody: every
+row is then named by its label, which is what a host that does not send `is_you`
+is actually saying.
 
 ---
 

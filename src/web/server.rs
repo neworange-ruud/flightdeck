@@ -488,7 +488,10 @@ impl WebServerHandle {
             moved
         };
         if moved {
-            self.shared.announce_seats();
+            // The lock moved because time passed, not because anybody decided
+            // anything: `None`, so no browser is shown 2f's evicted panel for
+            // the most ordinary movement there is.
+            self.shared.announce_seats(None);
         }
     }
 
@@ -499,17 +502,28 @@ impl WebServerHandle {
     /// same way — only from an affordance a human chose (`Take Input Lock` in
     /// the palette). Returns whom it interrupted, so the caller can say so.
     pub fn preempt_input_for_desktop(&self, now_ms: i64) -> Option<String> {
+        // Read before the preempt, because after it the holder is us: whom we
+        // interrupted is a fact that exists for exactly one statement.
         let interrupted = {
             let mut lock = self.shared.input_lock();
+            // Preempting a free lock, or our own, interrupts nobody — and must
+            // not, or the palette command would announce an eviction to a
+            // browser that never held anything.
             let interrupted = match lock.holder() {
                 Some(Writer::Desktop) | None => None,
-                Some(Writer::Viewer(_)) => lock.holder_label().map(str::to_string),
+                Some(who @ Writer::Viewer(_)) => {
+                    Some((who.clone(), lock.holder_label().map(str::to_string)))
+                }
             };
             lock.preempt(&Writer::Desktop, DESKTOP_SEAT_LABEL, now_ms);
             interrupted
         };
-        self.shared.announce_seats();
-        interrupted
+        let (who, label) = match interrupted {
+            Some((who, label)) => (Some(who), label),
+            None => (None, None),
+        };
+        self.shared.announce_seats(who.as_ref());
+        label
     }
 
     /// Who holds the input lock, as a label the desktop can render, or `None`
@@ -848,13 +862,23 @@ impl Shared {
 
     /// Fan out a [`Delta::Seats`] to everyone (each recipient's `you` differs)
     /// and tell the TUI, after any seat change.
-    fn announce_seats(&self) {
+    ///
+    /// `interrupted` names the writer a human just took the lock from, and is
+    /// `Some` at exactly the three sites that can do that — a browser's
+    /// `Attach { seat: TakeOver }`, a browser's `take_input_lock`, and the
+    /// desktop's palette command. Every other caller passes `None`, which is
+    /// what keeps the browser's evicted panel off the screen during the
+    /// ordinary hand-offs that make up almost all of this frame's traffic. It is
+    /// a parameter rather than something read back out of
+    /// [`Shared::announced_holder`] because that only records *what* moved; the
+    /// caller is the only one that knows *why*.
+    fn announce_seats(&self, interrupted: Option<&Writer>) {
         let now_ms = self.now_ms();
         let holder = self.holder();
         let (frames, rows) = {
             let registry = self.registry();
             (
-                registry.seat_frames(now_ms, holder.as_ref()),
+                registry.seat_frames(now_ms, holder.as_ref(), interrupted),
                 registry.seat_rows(None, holder.as_ref()),
             )
         };
@@ -1121,12 +1145,31 @@ impl SeatRegistry {
         rows
     }
 
-    /// One `Delta::Seats` per viewer, each with that viewer's own `you`.
+    /// One `Delta::Seats` per viewer, each with that viewer's own `you` — and,
+    /// when a preemption caused this fan-out, its own `you_were_preempted`.
+    ///
+    /// `interrupted` is the writer that a human *deliberately* took the lock
+    /// from, and it is `None` for every other reason a seat list is sent: a tab
+    /// arriving or leaving, a seat released, and — the one that matters — the
+    /// ordinary idle hand-off that [`WebServerHandle::sync_input_lock`]
+    /// announces. Only the first of those is worth a panel, so only the first
+    /// sets the flag.
     fn seat_frames(
         &self,
         server_time_ms: i64,
         holder: Option<&Writer>,
+        interrupted: Option<&Writer>,
     ) -> Vec<(ViewerId, ServerMsg)> {
+        // An interrupted *desktop* reaches no browser's panel, and that is not
+        // an oversight: 2f gives the desktop a transient strip in D13's origin
+        // vocabulary, because the person at the machine has no decision to make
+        // — their keyboard was never revoked, only their turn. Matched
+        // exhaustively so that a third kind of writer cannot be silently
+        // dropped into the `None` arm.
+        let interrupted = match interrupted {
+            Some(Writer::Viewer(id)) => Some(id),
+            Some(Writer::Desktop) | None => None,
+        };
         self.viewers
             .iter()
             .map(|v| {
@@ -1140,6 +1183,7 @@ impl SeatRegistry {
                         // cannot date, which is how 2f's `connected` row came
                         // to be silently dropped on this path.
                         server_time_ms,
+                        you_were_preempted: interrupted == Some(&v.id),
                     }),
                 )
             })
@@ -1777,7 +1821,9 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
             viewer_id: viewer_id.clone(),
         });
         // Someone leaving is a seat change: the seat they held is free now.
-        shared.announce_seats();
+        // Nobody was interrupted — a socket that closed took its own turn with
+        // it, and the writer that types next is claiming a free lock.
+        shared.announce_seats(None);
     }
     // Dropped last: the shutdown path waits on this, so it must outlive the
     // `Shutdown` frame write above (Q5's ordering).
@@ -2042,24 +2088,22 @@ async fn handle_attach(
     // (D14 as revised). It is a *separate* frame from `Write` precisely because
     // 2f gates it behind a confirmation: seating yourself as a writer must not
     // silently interrupt somebody mid-word.
-    match attach.seat {
-        SeatRequest::TakeOver => {
-            shared
-                .input_lock()
-                .preempt(&Writer::Viewer(viewer_id.clone()), &label, now);
-        }
+    let interrupted = match attach.seat {
+        SeatRequest::TakeOver => preempt_for_viewer(shared, viewer_id, &label, now),
         // A viewer that stops competing must not keep the turn it holds, or the
         // terminal would sit locked to a tab that has promised never to type
-        // into it again.
+        // into it again. Nobody is interrupted by it either: giving a turn up is
+        // not taking one away.
         SeatRequest::Observe => {
             shared
                 .input_lock()
                 .release(&Writer::Viewer(viewer_id.clone()));
+            None
         }
         // Seating yourself as a writer buys the right to contend, and nothing
         // more: the lock is still claimed by typing.
-        SeatRequest::Write => {}
-    }
+        SeatRequest::Write => None,
+    };
 
     *attached = true;
     let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
@@ -2082,9 +2126,40 @@ async fn handle_attach(
     // re-attach may have just moved the input lock. Both travel as this
     // `Delta::Seats`, never as a `Shutdown`: nobody is disconnected by a
     // takeover under D14 as revised, and an interrupted writer keeps its seat
-    // (2f).
-    shared.announce_seats();
+    // (2f). `interrupted` is `Some` only for the `TakeOver` arm above, so the
+    // writer that was cut into is the one — the only one — whose frame says so.
+    shared.announce_seats(interrupted.as_ref());
     Flow::Continue
+}
+
+/// Take the input lock for one browser and report **whom that interrupted**, so
+/// the fan-out behind it can tell that writer, and only that writer, that this
+/// was deliberate (`Delta::Seats::you_were_preempted`).
+///
+/// Two details that are load-bearing rather than defensive:
+///
+/// * The holder is read **before** the preemption, because a moment later it is
+///   the claimant and the fact is gone.
+/// * A claimant that already holds the lock interrupts **nobody**. Confirming
+///   `Take over` twice, or re-attaching as `TakeOver` while already mid-burst,
+///   is a no-op on the lock and must be a no-op on the panel too — otherwise
+///   the browser that pressed the button is shown 2f's evicted panel about
+///   itself.
+fn preempt_for_viewer(
+    shared: &Arc<Shared>,
+    viewer_id: &ViewerId,
+    label: &str,
+    now_ms: i64,
+) -> Option<Writer> {
+    let me = Writer::Viewer(viewer_id.clone());
+    let mut lock = shared.input_lock();
+    let interrupted = match lock.holder() {
+        Some(held) if held != &me => Some(held.clone()),
+        // Ours already, or free: an override that overrode nothing.
+        Some(_) | None => None,
+    };
+    lock.preempt(&me, label, now_ms);
+    interrupted
 }
 
 /// Keep a browser-supplied label renderable: printable characters only, no
@@ -2184,11 +2259,9 @@ async fn handle_command(
                 .registry()
                 .label_of(viewer_id)
                 .unwrap_or_else(|| viewer_id.to_string());
-            shared
-                .input_lock()
-                .preempt(&Writer::Viewer(viewer_id.clone()), &label, now);
+            let interrupted = preempt_for_viewer(shared, viewer_id, &label, now);
             let _ = send_msg(sink, &applied(command.seq)).await;
-            shared.announce_seats();
+            shared.announce_seats(interrupted.as_ref());
         }
         // Seat bookkeeping is this module's job (D14), so it never travels to
         // the TUI and back.
@@ -2199,7 +2272,9 @@ async fn handle_command(
                 .input_lock()
                 .release(&Writer::Viewer(viewer_id.clone()));
             let _ = send_msg(sink, &applied(command.seq)).await;
-            shared.announce_seats();
+            // Giving a turn up interrupts nobody: the next writer to type is
+            // claiming a lock that is free, not one taken from anyone.
+            shared.announce_seats(None);
         }
         // D16: the host knows the command and will not run it for a browser.
         // Acked, not ignored — a `host only` action that silently did nothing

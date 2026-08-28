@@ -1422,6 +1422,45 @@ pub enum Delta {
         /// fabricated or negative duration.
         #[serde(default)]
         server_time_ms: i64,
+        /// Whether **the recipient of this frame** is the writer that was just
+        /// interrupted by a *confirmed* preemption.
+        ///
+        /// ## Why the frame has to say it, and cannot be re-derived
+        ///
+        /// The input lock moves on every ordinary hand-off — one writer stops
+        /// typing, another starts, several times a minute — and every one of
+        /// those movements is a `Delta::Seats` too. A browser watching only the
+        /// rows therefore cannot tell the two apart: "the lock left me" is true
+        /// of both, and 2f's *evicted* panel in front of somebody every time
+        /// their colleague starts a sentence is not a notice, it is an
+        /// obstruction. The distinguishing fact is **intent**, and intent is
+        /// known only at the host, at the moment the act happens
+        /// ([`SeatRequest::TakeOver`], or `Take Input Lock` from either
+        /// surface's palette). So it is carried, not inferred.
+        ///
+        /// ## Per-recipient, like `you`
+        ///
+        /// One preemption interrupts exactly one writer, and only that writer
+        /// has anything to be told. This sits beside `you` for that reason: the
+        /// registry already builds one frame per viewer so each can be told what
+        /// *it* holds, and this is the second thing that differs between them.
+        /// A list-shaped `preempted: Option<ViewerId>` would be the same fact
+        /// broadcast to everybody, which invites a browser to compare it against
+        /// its own id — and a browser that gets that comparison wrong shows a
+        /// modal to the wrong person.
+        ///
+        /// It names no interrupter. The rows already do: the one with
+        /// [`SeatInfo::holds_input`] is the surface that took it, and a second
+        /// field naming the same surface is a second thing that can disagree.
+        ///
+        /// **`false` is the honest default**, and the reason this field is not a
+        /// [`PROTOCOL_VERSION`] bump: it is additive and optional under the
+        /// forward-compatibility policy, and a host that never sends it is a
+        /// host that reports no preemptions — which leaves the browser exactly
+        /// where it was before the field existed, with the lock moving silently.
+        /// That is a lesser panel, not a wrong one.
+        #[serde(default)]
+        you_were_preempted: bool,
     },
     /// A change this build does not know. Ignored by the receiver; see the
     /// forward-compatibility policy in the module docs.

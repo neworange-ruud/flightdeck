@@ -388,16 +388,28 @@ export function fixtureSeats(): readonly SeatInfo[] {
       /** It may type; right now somebody else is. */
       holdsInput: false,
       isDesktop: true,
+      /** The desktop is never the recipient of a frame — it is not a viewer. */
+      isYou: false,
       sinceLabel: "since launch",
     },
     {
-      label: "this tab",
+      /**
+       * The label the **host** sends for a browser: address plus the browser's
+       * own claim. It is deliberately *not* the string `this tab` — that is
+       * what the chip and the seat panel each derive from `isYou` below, and a
+       * fixture that pre-baked the answer would let a chip which had stopped
+       * deriving it keep passing.
+       */
+      label: "192.168.2.20 · Chrome on macOS",
       /** 2f's three facts, each in its own field. */
       address: "192.168.2.20",
       browser: "Chrome on macOS",
       seat: "writing",
       holdsInput: true,
       isDesktop: false,
+      /** The host marks the row it built this frame for; the panel says
+       * `this tab` on it rather than repeating the reader's own address back. */
+      isYou: true,
       sinceLabel: "14 minutes, active 20s ago",
     },
   ];

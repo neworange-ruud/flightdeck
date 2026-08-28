@@ -613,6 +613,67 @@
   margin: 0;
   color: var(--fd-text-soft);
 }
+/* ── 2f, widened for M3: the same panel, with one row per seat ──────────────
+ * The fact list above describes one writer; this describes everyone. Same
+ * inset rule, same magenta, same meta size — it is not a second component,
+ * which is what "M3's multi-viewer list is the same panel with rows" means.
+ *
+ * The grid is fixed at five columns so the marks line up down the list: a turn
+ * column that is empty on every row but one, the name, the reader's own marker,
+ * the role, and the joined-at pushed to the right. `max-content` on the name
+ * lets a long label take the room it needs before `connected` gives way. */
+.fd-takeover__seats {
+  margin: 0 12px;
+  padding: 8px 12px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__seat {
+  display: grid;
+  grid-template-columns: 1ch max-content max-content 1fr max-content;
+  align-items: baseline;
+  gap: 0 8px;
+}
+/* Every cell is placed by name rather than by source order, so a row missing
+ * its `this tab` marker or its `connected` line keeps the same columns as the
+ * rows around it. Auto-placement would slide the rest of that row left, and the
+ * list would stop lining up in exactly the place it is being compared. */
+.fd-takeover__seat-mark {
+  grid-column: 1;
+  color: var(--fd-elsewhere);
+}
+.fd-takeover__seat-label {
+  grid-column: 2;
+  color: var(--fd-text-soft);
+}
+/* The reader's own row, in the app's interactive hue rather than the panel's
+ * magenta: `this tab` is not another actor, it is the one reading. */
+.fd-takeover__seat-you {
+  grid-column: 3;
+  color: var(--fd-accent);
+}
+.fd-takeover__seat-role {
+  grid-column: 4;
+  color: var(--fd-text-quiet);
+}
+/* The turn is a fact somebody may act on — it is the answer to "why did my keys
+ * stop working" — so the row holding it reads in the panel's own hue while the
+ * rest stay at 2g's lifted floor for facts. */
+.fd-takeover__seat[data-holds-input="true"] .fd-takeover__seat-role {
+  color: var(--fd-elsewhere);
+}
+/* How long a seat has been there is identifying detail, which 2g puts at the
+ * lifted floor and not at the decor tier: deleting it would lose a fact. */
+.fd-takeover__seat-since {
+  grid-column: 5;
+  justify-self: end;
+  color: var(--fd-text-quiet);
+}
 .fd-takeover__action--primary {
   background: var(--fd-elsewhere);
   color: color-mix(in srgb, var(--fd-elsewhere) 12%, var(--fd-canvas));

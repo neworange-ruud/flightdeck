@@ -649,13 +649,21 @@ describe("2f — takeover", () => {
     });
   }
 
-  it("arriving: names the incumbent and offers all three ways out", () => {
-    const h = render();
+  it("arriving: with no seat list yet, names the incumbent from the refusal", () => {
+    /**
+     * `WireError::seat_held` arrives before any dated seat list on a fresh
+     * socket, so the panel really can open knowing one writer and nothing else.
+     * `attach: false` is that situation: no snapshot, so no rows.
+     */
+    const h = render({ attach: false });
     arriving(h);
     expect(h.text(".fd-takeover__title")).toBe("Someone else is typing");
     expect(h.text(".fd-takeover__facts")).toContain("192.168.2.20");
     expect(h.text(".fd-takeover__facts")).toContain("Safari · iOS 18");
     expect(h.text(".fd-takeover__facts")).toContain("14 minutes, active 20s ago");
+    /** One writer described is not a roster, and must not be drawn as one: a
+     * one-row list would claim the reader is alone with that writer. */
+    expect(h.maybe(".fd-takeover__seats")).toBeNull();
     /** The panel says what actually happened: refused rather than mixed in, and
      * waiting is a real option because the lock frees itself. */
     expect(h.text(".fd-takeover__body")).toContain("one cursor");
@@ -689,6 +697,7 @@ describe("2f — takeover", () => {
           seat: "writing",
           holdsInput: false,
           isDesktop: true,
+          isYou: false,
           sinceLabel: "since launch",
         },
         {
@@ -700,6 +709,7 @@ describe("2f — takeover", () => {
           seat: "writing",
           holdsInput: true,
           isDesktop: false,
+          isYou: false,
           sinceLabel: "14 minutes",
         },
       ],
@@ -729,6 +739,7 @@ describe("2f — takeover", () => {
           seat: "writing",
           holdsInput: true,
           isDesktop: false,
+          isYou: false,
           sinceLabel: "14 minutes",
         },
       ],
@@ -742,7 +753,7 @@ describe("2f — takeover", () => {
   });
 
   it("arriving: a fact the host did not send is a row that is not drawn", () => {
-    const h = render();
+    const h = render({ attach: false });
     h.app.store.dispatch({
       type: "takeover/held",
       incumbent: { address: "192.168.2.20", browser: "", connected: "" },
@@ -847,6 +858,206 @@ describe("2f — takeover", () => {
     /** There is no takeover frame: the caller re-sends `Attach { seat }`,
      * which is why this is reported rather than sent from the component. */
     expect(h.dispatched.map((a) => a.type)).toContain("takeover/claim");
+  });
+});
+
+/* ══ 2f, widened for M3 — the seat panel as rows ═════════════════════════ */
+
+/**
+ * `remote-control-eek.3`. D14's second revision ends "M3's multi-viewer list is
+ * the same panel with rows", and these are the properties that make the rows
+ * worth having rather than a longer way of saying what the chip already says.
+ *
+ * The panel is opened here with `takeover/held` because that is what puts it on
+ * screen; what is being asserted is the roster, which comes from `state.seats`
+ * and not from the takeover state — which is exactly why it is live.
+ */
+describe("2f/M3 — the seat panel, N rows", () => {
+  function seat(
+    over: Partial<AppState["seats"][number]> = {},
+  ): AppState["seats"][number] {
+    return {
+      label: "192.168.2.20 · Chrome on macOS",
+      address: "192.168.2.20",
+      browser: "Chrome on macOS",
+      seat: "writing",
+      holdsInput: false,
+      isDesktop: false,
+      isYou: false,
+      sinceLabel: "4m ago",
+      ...over,
+    };
+  }
+
+  const desktop = seat({
+    label: "desktop",
+    address: null,
+    browser: null,
+    isDesktop: true,
+    sinceLabel: "2h ago",
+  });
+
+  function panelWith(seats: readonly AppState["seats"][number][]): Harness {
+    const h = render();
+    h.app.store.dispatch({ type: "seats/changed", seat: "writing", seats });
+    h.app.store.dispatch({
+      type: "takeover/held",
+      incumbent: { address: "192.168.2.11", browser: "", connected: "" },
+    });
+    return h;
+  }
+
+  function rowText(h: Harness): readonly string[] {
+    return h.all(".fd-takeover__seat-label").map((el) => el.textContent ?? "");
+  }
+
+  it("draws one row per seat, in the host's order, and totals nothing", () => {
+    /** Four surfaces is not an exotic case — it is one desktop and three tabs.
+     * 2f names seats rather than counting them, and that reasoning gets
+     * stronger with more rows, not weaker. */
+    const h = panelWith([
+      desktop,
+      seat({ label: "192.168.2.11", isYou: true }),
+      seat({ label: "192.168.2.12" }),
+      seat({ label: "192.168.2.13", seat: "observing" }),
+    ]);
+    expect(rowText(h)).toEqual([
+      "desktop",
+      "192.168.2.11",
+      "192.168.2.12",
+      "192.168.2.13",
+    ]);
+    /** The fact list is what the roster replaced; both at once would say who is
+     * typing twice, from two sources that can disagree. */
+    expect(h.maybe(".fd-takeover__facts")).toBeNull();
+  });
+
+  it("marks the reader's own row, and only from the host's word", () => {
+    /** Two tabs on one machine are two rows with the same address and the same
+     * browser. Matching on either would mark both. */
+    const mine = seat({ label: "192.168.2.11 · Chrome on macOS", isYou: true });
+    const theirs = seat({ label: "192.168.2.11 · Chrome on macOS" });
+    const h = panelWith([desktop, mine, theirs]);
+    const marked = h.all(".fd-takeover__seat[data-you='true']");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]?.textContent).toContain("this tab");
+    /** `this tab` is the chip's own word for it — the same seat, described the
+     * same way, wherever the reader meets it. */
+    expect(h.all(".fd-takeover__seat-you").map((el) => el.textContent)).toEqual([
+      "this tab",
+    ]);
+  });
+
+  it("tells a writer apart from an observer, and neither is the turn", () => {
+    const h = panelWith([
+      desktop,
+      seat({ label: "writer" }),
+      seat({ label: "watcher", seat: "observing" }),
+    ]);
+    const roles = h
+      .all(".fd-takeover__seat-role")
+      .map((el) => el.textContent ?? "");
+    expect(roles).toEqual(["can type", "can type", "read-only"]);
+    /** An observer never contends, so it can never be the one holding it. */
+    expect(h.all(".fd-takeover__seat[data-holds-input='true']")).toHaveLength(0);
+  });
+
+  it("says who is typing now, beside the writers who merely may", () => {
+    /**
+     * The renderable case D14's revision exists for, and the one protocol v1's
+     * merged `controlling` flag could not express: **three writers, one of them
+     * mid-burst.** The role and the turn are two marks because they are two
+     * facts.
+     */
+    const h = panelWith([
+      desktop,
+      seat({ label: "192.168.2.11", holdsInput: true }),
+      seat({ label: "192.168.2.12" }),
+    ]);
+    expect(
+      h
+        .all(".fd-takeover__seat-role")
+        .map((el) => el.textContent ?? ""),
+    ).toEqual(["can type", "typing now", "can type"]);
+    const marks = h
+      .all(".fd-takeover__seat-mark")
+      .map((el) => el.textContent ?? "");
+    expect(marks).toEqual(["", "✎", ""]);
+  });
+
+  it("follows a live Delta::Seats, holder and roster alike", () => {
+    /** The rows are read from `state.seats` on every render, so a seat delta
+     * repaints them. A reader watching the lock move sees it move — which is
+     * the whole answer to "why did my keys stop working". */
+    const h = panelWith([
+      desktop,
+      seat({ label: "192.168.2.11", holdsInput: true, isYou: true }),
+    ]);
+    expect(rowText(h)).toEqual(["desktop", "192.168.2.11"]);
+
+    h.app.store.dispatch({
+      type: "seats/changed",
+      seat: "writing",
+      seats: [
+        { ...desktop, holdsInput: true },
+        seat({ label: "192.168.2.11", isYou: true }),
+        seat({ label: "192.168.2.12", seat: "observing" }),
+      ],
+    });
+
+    expect(rowText(h)).toEqual(["desktop", "192.168.2.11", "192.168.2.12"]);
+    /** The turn moved to the desktop — which is a legal answer, because the
+     * desktop is one of the writers and has no precedence over any of them. */
+    expect(
+      h
+        .all(".fd-takeover__seat[data-holds-input='true'] .fd-takeover__seat-label")
+        .map((el) => el.textContent),
+    ).toEqual(["desktop"]);
+  });
+
+  it("draws the joined-at, and drops it rather than fabricating one", () => {
+    const h = panelWith([
+      desktop,
+      seat({ label: "dated", sinceLabel: "40s ago" }),
+      /** A host that sent no clock to date its rows against. Empty is "we
+       * cannot say", never "just now". */
+      seat({ label: "undated", sinceLabel: "" }),
+    ]);
+    expect(
+      h.all(".fd-takeover__seat-since").map((el) => el.textContent),
+    ).toEqual(["connected 2h ago", "connected 40s ago"]);
+  });
+
+  it("puts the same rows on the evicted panel, which is the same panel", () => {
+    const h = render();
+    h.app.store.dispatch({
+      type: "seats/changed",
+      seat: "writing",
+      seats: [desktop, seat({ label: "192.168.2.11", holdsInput: true })],
+    });
+    h.app.store.dispatch({
+      type: "takeover/evicted",
+      byAddress: "192.168.2.11",
+      lastInputAgo: "3s ago",
+    });
+    expect(rowText(h)).toEqual(["desktop", "192.168.2.11"]);
+    /** Losing the turn is exactly when "who else is here" becomes worth
+     * knowing, and 2f's caption makes it one panel, not two. */
+    expect(h.text(".fd-takeover__body")).toContain("3s ago");
+  });
+
+  it("leaves the clause out when no keystroke of ours ever landed", () => {
+    /** A tab preempted before it typed has no "last one that landed" to date
+     * the sentence from, and `just now` would be a time invented for an event
+     * that did not happen. */
+    const h = render();
+    h.app.store.dispatch({
+      type: "takeover/evicted",
+      byAddress: "192.168.2.11",
+      lastInputAgo: "",
+    });
+    expect(h.text(".fd-takeover__body")).not.toContain("the last one that landed");
+    expect(h.text(".fd-takeover__body")).toContain("192.168.2.11");
   });
 });
 

@@ -988,24 +988,34 @@ fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
         let after = await_snapshot(&mut second).await;
         assert_eq!(after.seat, Seat::Writing);
 
-        let (you, seats, server_time_ms) = frame_matching(&mut first, |frame| match frame {
-            ServerMsg::Delta(Delta::Seats {
-                you,
-                seats,
-                server_time_ms,
-            }) if seats
-                .iter()
-                .any(|row| row.holds_input && row.viewer_id.as_ref() == Some(&after.viewer_id)) =>
-            {
-                Some((you, seats, server_time_ms))
-            }
-            _ => None,
-        })
-        .await;
+        let (you, seats, server_time_ms, preempted) =
+            frame_matching(&mut first, |frame| match frame {
+                ServerMsg::Delta(Delta::Seats {
+                    you,
+                    seats,
+                    server_time_ms,
+                    you_were_preempted,
+                }) if seats.iter().any(|row| {
+                    row.holds_input && row.viewer_id.as_ref() == Some(&after.viewer_id)
+                }) =>
+                {
+                    Some((you, seats, server_time_ms, you_were_preempted))
+                }
+                _ => None,
+            })
+            .await;
         assert_eq!(
             you,
             Seat::Writing,
             "the interrupted writer keeps its seat — only the turn moved"
+        );
+        // The one fact the rows cannot carry: this movement was *deliberate*.
+        // Without it the browser cannot tell a confirmed override from the
+        // ordinary hand-off that happens every time the other person starts a
+        // sentence, and 2f's evicted panel would be a modal on every hand-off.
+        assert!(
+            preempted,
+            "the writer that was cut into is told the interruption was confirmed"
         );
         // The frame carries its own reference clock, so the rows it delivers are
         // as datable as the ones inside a snapshot. Artboard 2f's `connected`
@@ -1025,6 +1035,31 @@ fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
             seats.iter().filter(|row| row.holds_input).count(),
             1,
             "exactly one surface has the turn: {seats:?}"
+        );
+
+        // The other half of the flag: the surface that *did* the interrupting
+        // gets the same roster and is told nothing was done to it. A browser
+        // shown 2f's evicted panel about its own confirmed `Take over` would be
+        // the panel accusing the reader of what the reader just chose.
+        let (holder_view, holder_preempted) = frame_matching(&mut second, |frame| match frame {
+            ServerMsg::Delta(Delta::Seats {
+                seats,
+                you_were_preempted,
+                you: _,
+                server_time_ms: _,
+            }) => Some((seats, you_were_preempted)),
+            _ => None,
+        })
+        .await;
+        assert!(
+            holder_view
+                .iter()
+                .any(|row| row.holds_input && row.viewer_id.as_ref() == Some(&after.viewer_id)),
+            "the interrupter's own frame shows it holding the turn: {holder_view:?}"
+        );
+        assert!(
+            !holder_preempted,
+            "the writer that pressed the button was interrupted by nobody"
         );
 
         // And now the roles are exactly reversed, on the same symmetric rule.
@@ -1215,16 +1250,20 @@ fn releasing_the_seat_frees_it_for_the_next_browser() {
         .await;
         // Skip the `Delta::Seats` that the attach itself produced (`you:
         // controlling`) and wait for the one the release produced.
-        let (you, _, _) = frame_matching(&mut first, |frame| match frame {
+        let (you, _, _, preempted) = frame_matching(&mut first, |frame| match frame {
             ServerMsg::Delta(Delta::Seats {
                 you,
                 seats,
                 server_time_ms,
-            }) if you == Seat::Observing => Some((you, seats, server_time_ms)),
+                you_were_preempted,
+            }) if you == Seat::Observing => Some((you, seats, server_time_ms, you_were_preempted)),
             _ => None,
         })
         .await;
         assert_eq!(you, Seat::Observing);
+        // Giving a turn up is not having one taken away: nothing here is worth
+        // 2f's evicted panel.
+        assert!(!preempted, "release_seat interrupted nobody");
 
         // The seat is free, so the next browser gets it without a takeover.
         let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");

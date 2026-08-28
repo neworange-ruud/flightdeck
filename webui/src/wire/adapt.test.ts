@@ -257,6 +257,7 @@ describe("snapshot", () => {
       seat: "writing",
       holdsInput: true,
       isDesktop: false,
+      isYou: false,
       sinceLabel: "12s ago",
     });
   });
