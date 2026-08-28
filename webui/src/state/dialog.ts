@@ -35,14 +35,24 @@ import type { AppState, DialogOutcome, DialogState } from "./types";
  * its key. A browser cannot reach an action the person at the desktop cannot
  * see, because the host refuses a key that is not on the open dialog.
  * `confirmable: false` is the host saying "you may cancel this one but not
- * confirm it" — today the destructive family alone
- * (`remote-control-ll5.4`) — with `refusal` carrying the sentence to show.
- *
- * The git confirmations (push / merge / rebase) were in that set until
- * `remote-control-ll5.5` and no longer are: those dialogs *are* SPECS §5's
- * confirmation, so a surface that could raise the question but not answer it
- * would leave it stranded. Nothing here changed to allow it — the host sends
+ * confirm it", with `refusal` carrying the sentence to show. The destructive
+ * family was that set until `remote-control-ll5.4`, and the git confirmations
+ * until `.5`; today it is only a gate the host cannot resolve (the session it
+ * asked about is gone). Nothing here changed to allow either — the host sends
  * `confirmable: true` now, and this module has never had a list of its own.
+ *
+ * ## Artboard 1g's second step, and why it is not a browser-side rule
+ *
+ * A destructive answer from a browser takes two steps: the consequences and the
+ * keyed buttons, then a field where the session's — or the project's — own name
+ * is typed back (`gate`, `ConfirmGate`). Every part of that comes off the wire:
+ * which button is gated, what must be typed, and the sentence saying why. The
+ * browser contributes the local `draft.step` and `draft.confirmName`, which are
+ * a reading position and a keystroke buffer — never a claim.
+ *
+ * The host checks the same name against the same expectation before it feeds a
+ * single key into its prompt, so `gateSatisfied` is an affordance, not the
+ * enforcement. See `specs/WEB_INTERFACE.md` §6.5 R13.
  */
 
 /** The wire name for confirming the open dialog (`command::DIALOG_CONFIRM`). */
@@ -84,6 +94,61 @@ export interface DialogDraft {
   readonly index: number | null;
   /** 1e's `Tab` — run from the base branch, no worktree. */
   readonly toggled: boolean;
+  /** 1g step 2's field: the name typed back. Empty until the user types, and
+   * never pre-filled from `gate.expected` — a gate that fills itself in is a
+   * button with extra steps. */
+  readonly confirmName: string;
+  /** Which of 1g's two panels is showing. `1` is the consequences and the keyed
+   * buttons; `2` is the name field, reached only by pressing the gated button
+   * on a gated dialog. Local, because it is a reading position rather than a
+   * decision: the host is told nothing until the confirm carries the name. */
+  readonly step: 1 | 2;
+}
+
+/**
+ * Artboard 1g's step 2, exactly as the host published it (`protocol::
+ * ConfirmGate`).
+ *
+ * `key` is the button it guards — every *other* button on the same dialog, and
+ * cancelling, stays one press away. `expected` is what must be typed back, and
+ * it is host-sent because 1g draws it as the field's own hint: the gate buys
+ * deliberateness, not secrecy.
+ */
+export interface ConfirmGate {
+  readonly key: string;
+  readonly expected: string;
+  readonly instruction: string;
+}
+
+/**
+ * Whether pressing `key` on this dialog is the answer 1g's second step guards.
+ *
+ * The browser asks the host's own field rather than its own opinion about which
+ * commands are dangerous (R7 as amended by ll5.12: nothing about a row is
+ * authored here). A dialog with no gate answers `false` for every key.
+ */
+export function gatedKey(dialog: DialogState, key: string): boolean {
+  return dialog.gate !== null && dialog.gate.key === key;
+}
+
+/** Whether the name field is showing — 1g's second panel. */
+export function atNameStep(dialog: DialogState): boolean {
+  return dialog.gate !== null && dialog.draft.step === 2;
+}
+
+/**
+ * Whether what has been typed is the name the host will accept.
+ *
+ * **Exact**, and deliberately so: no trim, no case fold, no normalisation. The
+ * host compares the same two strings the same way (`apply_web_dialog` in
+ * `src/lib.rs`), so a browser that accepted `Task ` would be enabling a button
+ * the host is about to refuse — which is worse than a disabled one, because it
+ * looks like the answer was given.
+ */
+export function gateSatisfied(dialog: DialogState): boolean {
+  return (
+    dialog.gate !== null && dialog.draft.confirmName === dialog.gate.expected
+  );
 }
 
 /**
@@ -155,6 +220,14 @@ export function confirmArgs(
   choice: string | null,
 ): Record<string, unknown> {
   const args: Record<string, unknown> = { dialog_id: dialog.id };
+  /** 1g's second step rides on the deciding frame, which is what makes "the
+   * seat that typed the name is the seat that confirms" structural: there is no
+   * armed state on the host for a takeover to inherit. Sent only for the button
+   * the host said it guards — spraying it at every confirm would teach the host
+   * to expect it where it means nothing. */
+  if (choice !== null && gatedKey(dialog, choice)) {
+    args["confirm_name"] = dialog.draft.confirmName;
+  }
   if (choice !== null && choice !== primaryKey(dialog)?.key) {
     args["choice"] = choice;
   }

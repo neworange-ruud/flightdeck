@@ -1002,7 +1002,16 @@ impl AppState {
                 let label = if self.split_view { "on" } else { "off" };
                 Ok(Effect::Message(format!("Split view {label}.")))
             }
-            Command::Quit => Ok(Effect::Quit),
+            // SPECS §23 gives the desktop's quit no second question, so a
+            // confirmed value quits outright. An unconfirmed one asks — the
+            // shape §5.1's rebase and §5/§15's abandon already have, reused so
+            // D16's "a badge is not enough for quit" needs no browser-only flow
+            // (`specs/WEB_INTERFACE.md` §6.5 R13).
+            Command::Quit { confirm } => Ok(if confirm {
+                Effect::Quit
+            } else {
+                Effect::QuitConfirm
+            }),
         }
     }
 

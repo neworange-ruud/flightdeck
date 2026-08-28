@@ -35,20 +35,37 @@
 //! stated per row rather than hidden:
 //!
 //! * [`Route::Rejected`] — the host knows the command and refuses it, with the
-//!   reason. D16's two desktop-only actions land here (their effect is a window
-//!   on the host's screen, so a fake `Applied` would be a lie), and so does
-//!   `quit`: a bare frame naming it **cannot** kill the process, it is refused
-//!   pending artboard 1g's two-step confirmation (`remote-control-ll5.4`).
+//!   reason. D16's two desktop-only actions land here: their effect is a window
+//!   on the host's screen, so a fake `Applied` would be a lie.
 //! * [`Route::Dialog`] — D13's shared dialog. The dialog is app state, published
 //!   to both surfaces with the origin that opened it, and either surface can
 //!   confirm or cancel; these two rows are how a browser does it.
 //! * [`Route::NotSupported`] — this build has no browser-side surface for it, and
-//!   the refusal names the task that owns one. What is left after D13 and the
-//!   git family landed is the destructive confirmation (`remote-control-ll5.4`),
-//!   the configuration manager (`.6`), help/about (`.8`), `show_git_status` —
-//!   which is not a dialog at all, nothing is being asked, so there is nothing
-//!   to answer — and `pull_base`, which is a boundary decision rather than a
-//!   missing surface (see [`PULL_BASE_REFUSAL`]).
+//!   the refusal names the task that owns one. What is left after D13, the git
+//!   family and the destructive confirmation landed is the configuration manager
+//!   (`remote-control-ll5.6`), help/about (`.8`), `show_git_status` — which is
+//!   not a dialog at all, nothing is being asked, so there is nothing to answer
+//!   — and `pull_base`, which is a boundary decision rather than a missing
+//!   surface (see [`PULL_BASE_REFUSAL`]).
+//!
+//! ## Destroying work from a browser takes two steps (artboard 1g)
+//!
+//! `abandon_worktree` and `quit` are palette rows here like any other, and both
+//! carry their **unconfirmed** value, so choosing either can only raise D13's
+//! shared question. What is new in `remote-control-ll5.4` is the second step
+//! behind that question: a browser answering the destroying button must also
+//! type the session's — or the project's — own name, exactly.
+//!
+//! The trigger is **the surface being remote**, not the command being
+//! destructive, which is what artboard 1g's step 2 says in as many words
+//! ("This browser is remote. Type the session name to run the rebase on the
+//! host."). So the desktop's dialogs are untouched — nothing reaches step 2
+//! there — and from a browser the gate covers the three answers that destroy
+//! work or rewrite history: **Abandon Worktree**, **Rebase Worktree** (SPECS
+//! §5.1's sanctioned rewrite) and **Quit** (D16). Push and Finish / Local Merge
+//! stay one-step: neither rewrites history nor discards anything, so 1g's
+//! friction would be ceremony. See [`BrowserConfirm`] for the mechanism and
+//! `specs/WEB_INTERFACE.md` §6.5 R13 for the ruling.
 //!
 //! ## The git-ownership boundary holds by construction (SPECS §5)
 //!
@@ -167,31 +184,120 @@ pub struct CommandSpec {
     pub route: Route,
 }
 
-/// The reason `quit` is refused. Named because both the refusal and the test
-/// that proves a bare frame cannot kill the process read it.
-pub const QUIT_REFUSAL: &str = "Quit stops FlightDeck and every agent running in it. \
-     From a browser that needs the two-step confirmation, which this build does \
-     not have yet — quit from the desktop.";
-
 /// Why a desktop-only action cannot be run from a browser (D16). One sentence,
 /// so `Open Worktree in File Manager` and `edit in $EDITOR` refuse identically.
 pub const HOST_ONLY_REFUSAL: &str =
     "This opens a window on the machine running FlightDeck, which is not the \
      machine this browser is on. Run it from the desktop.";
 
-/// Why the *destructive* dialogs still refuse a browser
-/// (`remote-control-ll5.4`, artboard 1g).
+// ===========================================================================
+// Artboard 1g: the second step a remote surface takes (`remote-control-ll5.4`)
+// ===========================================================================
+
+/// What a **browser** must do to confirm one open dialog.
 ///
-/// D13 made dialogs shared, so the abandon confirmation now appears in the
-/// browser like any other — this refusal is about **opening** it from a browser
-/// row and about **confirming** it, which artboard 1g gates behind a two-step
-/// typed-name confirmation this build does not have. Cancelling is always
-/// allowed: it is the one dialog decision that cannot destroy anything.
-pub const DESTRUCTIVE_DIALOG_REFUSAL: &str =
-    "Abandoning a worktree discards work, and from a browser that needs artboard \
-     1g's two-step confirmation, which this build does not have yet. The dialog \
-     is shared once the desktop opens it (D13) and you can cancel it from here — \
-     but confirm it from the desktop.";
+/// The desktop is not described here at all, and that is the ruling: 1g's step 2
+/// exists because *"this browser is remote"*, so it is a property of the surface
+/// answering, never of the prompt itself. `src/lib.rs`'s `browser_confirm_gate`
+/// is the exhaustive classification over the prompt family; this type is the
+/// vocabulary it answers in, and lives here because every sentence a browser
+/// reads is worded in this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserConfirm {
+    /// The dialog's own buttons are the whole confirmation, exactly as on the
+    /// desktop. Every dialog that neither destroys work nor rewrites history.
+    OneStep,
+    /// One of the dialog's buttons is behind artboard 1g's typed-name step.
+    /// Every *other* button on the same dialog — and cancelling, always — is
+    /// still one press away.
+    TypedName(TypedNameGate),
+}
+
+/// Artboard 1g's step 2, as the host states it before a browser can pass it.
+///
+/// It guards **one button**, not the dialog. Every gated dialog in this build is
+/// a `y`/`n` confirmation, so the distinction looks free — but it is what states
+/// the rule: the gate stands in front of the *answer that destroys work*, never
+/// in front of the question. A gate on a button that merely opens the next
+/// dialog would cost a typed name for nothing, and a name typed for nothing is a
+/// name typed without reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedNameGate {
+    /// The [`crate::web::protocol::DialogKey::key`] this stands in front of.
+    pub key: &'static str,
+    /// Whose name must be typed. Resolved against the live workspace, so what
+    /// the browser is shown and what the host checks come from one place.
+    pub subject: GateSubject,
+    /// 1g step 2's sentence, rendered verbatim by the browser.
+    pub instruction: &'static str,
+}
+
+/// What a [`TypedNameGate`] asks the user to name.
+///
+/// Always something the browser is *already looking at* — 1g draws the expected
+/// name as the field's own hint, so a gate whose subject the user cannot see
+/// would be a riddle rather than a confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateSubject {
+    /// The Agent Session Tab the dialog is about: the one that is selected.
+    /// Every session-scoped guarded command acts on the selection, including
+    /// the sidebar's close menu, which switches to the row it names first.
+    SelectedSession,
+    /// The active project. Quit does not belong to one session; it stops the
+    /// whole deck, and the project name is what the browser has on screen.
+    ActiveProject,
+}
+
+/// 1g's own sentence, for the rebase it draws (SPECS §5.1).
+pub const GATE_REBASE_INSTRUCTION: &str =
+    "This browser is remote. Type the session name to run the rebase on the host.";
+
+/// The same sentence for the two abandon answers (SPECS §5/§15).
+pub const GATE_ABANDON_INSTRUCTION: &str =
+    "This browser is remote. Type the session name to abandon the worktree on \
+     the host.";
+
+/// And for quit, which is not about one session (D16).
+pub const GATE_QUIT_INSTRUCTION: &str =
+    "This browser is remote. Type the project name to stop FlightDeck and every \
+     agent running on the host.";
+
+/// The refusal for a confirm that never took step 2 — the browser pressed the
+/// destroying button and sent no name at all.
+///
+/// It repeats the instruction rather than saying "denied", because the frame is
+/// not an attack: it is what an older browser, or a reconnecting one, sends. The
+/// last clause is the part that matters most, and it is a statement of fact —
+/// the gate is checked before a single key reaches the prompt.
+pub fn gate_step_refusal(gate: &TypedNameGate, expected: &str) -> String {
+    format!(
+        "{} Send it as `confirm_name`, spelled exactly `{expected}`. Nothing has \
+         happened.",
+        gate.instruction
+    )
+}
+
+/// The refusal for a name that does not match, character for character.
+///
+/// The comparison is exact — no trimming, no case folding, no normalisation —
+/// because a name that needs correcting before it matches is a name that was not
+/// read. Git branch names are case-sensitive, and a fold would accept a name the
+/// host does not have.
+pub fn gate_mismatch_refusal(typed: &str, expected: &str) -> String {
+    format!(
+        "`{typed}` is not `{expected}`. The name must match exactly, character \
+         for character — nothing has happened."
+    )
+}
+
+/// The refusal for a gate whose subject the host cannot name right now: the tab
+/// it was about is gone, or the dialog outlived what it asked about.
+///
+/// Refusing is the only safe answer. A gate with no name to check is not a gate,
+/// and confirming past it would destroy something nobody named.
+pub const GATE_UNRESOLVED_REFUSAL: &str =
+    "The host can no longer name what this would destroy — the session it asked \
+     about is gone. Cancel this dialog and start again.";
 
 /// Why `Show Git Status` is still refused: it is not a dialog, and it has no
 /// browser design yet.
@@ -362,13 +468,19 @@ pub static INVENTORY: &[CommandSpec] = &[
             confirm: false,
         })),
     },
+    // SPECS §5/§15: abandoning always asks first, even for a clean worktree, so
+    // the row carries the unconfirmed value and the first dispatch can only open
+    // D13's shared question. A browser's *answer* to that question is where
+    // artboard 1g's second step stands (see [`BrowserConfirm`]).
     CommandSpec {
         name: names::ABANDON_WORKTREE,
         label: "Abandon Worktree",
         group: "Worktree",
         host_only: false,
         annotation: Some("destructive"),
-        route: Route::NotSupported(DESTRUCTIVE_DIALOG_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::AbandonWorktree {
+            confirm: false,
+        })),
     },
     CommandSpec {
         name: names::OPEN_WORKTREE_IN_FILE_MANAGER,
@@ -540,10 +652,13 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Remote",
         host_only: false,
         annotation: None,
+        // Not 1g's family, and deliberately not given 1g's gate: this destroys
+        // no work and rewrites nothing — it takes the surface away from the
+        // browser asking, which is the one refusal a remote surface cannot read
+        // the answer to. Refused outright, which is stricter than a gate.
         route: Route::Rejected(
             "Stopping the web interface would disconnect every browser, including \
-             this one. Like quit, that needs the two-step confirmation this build \
-             does not have yet — stop it from the desktop.",
+             this one — you would not see how it went. Stop it from the desktop.",
         ),
     },
     // -- view --------------------------------------------------------------
@@ -578,13 +693,18 @@ pub static INVENTORY: &[CommandSpec] = &[
         ),
     },
     // -- global ------------------------------------------------------------
+    // D16: a `host only` badge is not enough for quit, so it is not badged and
+    // not refused — it dispatches the value that can only ask. The desktop's own
+    // row carries `Quit { confirm: true }` and still quits on the spot (SPECS
+    // §23); this one raises the shared dialog, and a browser's `y` on it has to
+    // pass 1g's typed-name step.
     CommandSpec {
         name: names::QUIT,
         label: "Quit",
         group: "Global",
         host_only: false,
         annotation: Some("destructive"),
-        route: Route::Rejected(QUIT_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::Quit { confirm: false })),
     },
     // -- the browser's own plumbing ----------------------------------------
     CommandSpec {
@@ -779,7 +899,7 @@ fn exposure_of_command(cmd: &Command) -> Exposure {
         Command::ToggleSplitView => Exposure::Wire(names::TOGGLE_SPLIT_VIEW),
         Command::ShowHelp => Exposure::Wire(names::SHOW_HELP),
         Command::ShowAbout => Exposure::Wire(names::ABOUT_FLIGHTDECK),
-        Command::Quit => Exposure::Wire(names::QUIT),
+        Command::Quit { .. } => Exposure::Wire(names::QUIT),
 
         // Not palette rows, so not wire names of their own.
         Command::NewAgentTab { .. } => Exposure::NotExposed(
@@ -885,8 +1005,12 @@ pub fn confirmation_of(cmd: &Command) -> Confirmation {
         | Command::ShowHelp
         | Command::ShowAbout
         | Command::ToggleSplitView
-        | Command::OpenWorktreeInFileManager
-        | Command::Quit => Confirmation::None,
+        | Command::OpenWorktreeInFileManager => Confirmation::None,
+        // D16: quit needs more than a badge from a remote surface, and it gets
+        // the shape every other guarded command already has — the first
+        // dispatch asks (`specs/WEB_INTERFACE.md` §6.5 R13). The desktop's own
+        // `Ctrl-q` dispatches the confirmed value and is unchanged.
+        Command::Quit { confirm } => pending(!confirm),
     }
 }
 
@@ -925,7 +1049,7 @@ pub fn rewrites_history(cmd: &Command) -> bool {
         | Command::ShowAbout
         | Command::ToggleSplitView
         | Command::OpenWorktreeInFileManager
-        | Command::Quit => false,
+        | Command::Quit { .. } => false,
     }
 }
 
@@ -961,7 +1085,7 @@ pub fn creates_pull_request(cmd: &Command) -> bool {
         | Command::ShowAbout
         | Command::ToggleSplitView
         | Command::OpenWorktreeInFileManager
-        | Command::Quit => false,
+        | Command::Quit { .. } => false,
     }
 }
 

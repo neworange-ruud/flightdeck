@@ -655,8 +655,10 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: "destructive",
       target: null,
-      refusal:
-        "Abandoning a worktree discards work, and from a browser that needs artboard 1g's two-step confirmation, which this build does not have yet. The dialog is shared once the desktop opens it (D13) and you can cancel it from here — but confirm it from the desktop.",
+      /** It runs from a browser since `remote-control-ll5.4`: the row opens
+       * SPECS §5/§15's shared question, and artboard 1g's typed-name step
+       * stands in front of the answer rather than in front of the row. */
+      refusal: null,
     },
     {
       id: "open_worktree_in_file_manager",
@@ -908,8 +910,10 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: "destructive",
       target: null,
-      refusal:
-        "Quit stops FlightDeck and every agent running in it. From a browser that needs the two-step confirmation, which this build does not have yet — quit from the desktop.",
+      /** D16 said a `host only` badge is not enough for quit, and since
+       * `remote-control-ll5.4` it is not a refusal either: the row opens the
+       * shared confirmation, and artboard 1g's typed name guards the answer. */
+      refusal: null,
     },
     {
       id: "request_snapshot",

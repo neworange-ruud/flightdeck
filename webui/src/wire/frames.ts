@@ -175,6 +175,24 @@ export interface WireDialogBody {
   /** `false` means the host will refuse a `dialog_confirm` for this dialog. */
   readonly confirmable?: boolean;
   readonly refusal?: string;
+  /** Artboard 1g's second step, when one of this dialog's buttons has one
+   * (`protocol::ConfirmGate`, `specs/WEB_INTERFACE.md` §6.5 R13). */
+  readonly confirm_gate?: WireConfirmGate | null;
+}
+
+/**
+ * The host's description of artboard 1g's step 2 (`protocol::ConfirmGate`).
+ *
+ * Every field is the host's: the button it guards, the exact name to type, and
+ * the sentence saying why a second step exists. The browser words none of it —
+ * a locally-authored "are you sure?" would be the browser claiming something the
+ * host did not say, and the host is the only thing that knows what it is about
+ * to destroy.
+ */
+export interface WireConfirmGate {
+  readonly key: string;
+  readonly expected: string;
+  readonly instruction: string;
 }
 
 /** The one open dialog (D13). `kind` is open on purpose: an unknown one renders

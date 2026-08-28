@@ -9,12 +9,15 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  atNameStep,
   branchFieldVisible,
   cancelArgs,
   confirmArgs,
   decidingKeys,
   dialogOriginLabel,
   dialogStatus,
+  gateSatisfied,
+  gatedKey,
   hasToggle,
   primaryKey,
   selectedChoice,
@@ -72,6 +75,33 @@ function unpairWire(): WireDialogView {
   };
 }
 
+/**
+ * Artboard 1g's destructive confirmation, as the host really sends it: one
+ * gated button (`y`), one that is not (`n` — cancel), and the whole of step 2
+ * in `confirm_gate`.
+ */
+function abandonWire(): WireDialogView {
+  return {
+    dialog_id: "dialog-9",
+    kind: "confirm_abandon",
+    title: "The worktree has uncommitted changes. Discard them and abandon it?",
+    origin: { origin: "desktop" },
+    body: {
+      buttons: [
+        { key: "y", label: "Abandon (force)" },
+        { key: "n", label: "Cancel" },
+      ],
+      confirmable: true,
+      confirm_gate: {
+        key: "y",
+        expected: "fix-login-redirect",
+        instruction:
+          "This browser is remote. Type the session name to abandon the worktree on the host.",
+      },
+    },
+  };
+}
+
 function opened(wire: WireDialogView, state?: AppState): AppState {
   return reduce(state ?? createInitialState(), {
     type: "dialog/opened",
@@ -118,7 +148,15 @@ describe("the wire → model mapping", () => {
 
   it("starts with an empty draft and no local selection", () => {
     const dialog = dialogOf(newAgentWire());
-    expect(dialog.draft).toEqual({ text: "", index: null, toggled: false });
+    expect(dialog.draft).toEqual({
+      text: "",
+      index: null,
+      toggled: false,
+      /** 1g's field starts empty and at step 1: a gate that pre-filled itself
+       * would be a button with extra steps. */
+      confirmName: "",
+      step: 1,
+    });
     /** `index: null` means the host's own highlight stands, which for 1e is the
      * configured default agent — not a guess the browser made. */
     expect(selectedChoice(dialog)).toBe(0);
@@ -388,5 +426,146 @@ describe("what the panel says about the answer it sent", () => {
       outcome: "applied",
     });
     expect(dialogOf_(state).lastOutcome).toBeNull();
+  });
+});
+
+describe("artboard 1g's second step (ll5.4, §6.5 R13)", () => {
+  it("reads the whole gate off the wire and invents none of it", () => {
+    const dialog = dialogOf(abandonWire());
+    expect(dialog.confirmable).toBe(true);
+    expect(dialog.refusal).toBeNull();
+    expect(dialog.gate).toEqual({
+      key: "y",
+      expected: "fix-login-redirect",
+      instruction:
+        "This browser is remote. Type the session name to abandon the worktree on the host.",
+    });
+    /** Which button is gated is the host's answer, not a local list of
+     * dangerous-sounding kinds (R7 as amended by ll5.12). */
+    expect(gatedKey(dialog, "y")).toBe(true);
+    expect(gatedKey(dialog, "n")).toBe(false);
+  });
+
+  it("leaves an ordinary dialog ungated, so nothing grows a second step", () => {
+    const dialog = dialogOf(unpairWire());
+    expect(dialog.gate).toBeNull();
+    expect(gatedKey(dialog, "y")).toBe(false);
+    expect(atNameStep(dialog)).toBe(false);
+  });
+
+  it("matches the name exactly — no trim, no case fold", () => {
+    let state = opened(abandonWire());
+    state = reduce(state, { type: "dialog/advance" });
+    const type = (text: string) => {
+      for (const char of text) {
+        state = reduce(state, { type: "dialog/gateType", char });
+      }
+    };
+
+    /** Each of these is a name the host does not have, and the host compares
+     * the same two strings the same way — so accepting one here would enable a
+     * button the host is about to refuse. */
+    for (const wrong of [
+      "fix-login-redi",
+      "Fix-Login-Redirect",
+      "FIX-LOGIN-REDIRECT",
+      "fix-login-redirect ",
+      " fix-login-redirect",
+      "flightdeck/fix-login-redirect",
+    ]) {
+      let attempt = state;
+      for (const char of wrong) {
+        attempt = reduce(attempt, { type: "dialog/gateType", char });
+      }
+      expect(gateSatisfied(dialogOf_(attempt))).toBe(false);
+    }
+
+    type("fix-login-redirect");
+    expect(gateSatisfied(dialogOf_(state))).toBe(true);
+
+    /** And a backspace takes it straight back out of the satisfied state. */
+    state = reduce(state, { type: "dialog/gateBackspace" });
+    expect(gateSatisfied(dialogOf_(state))).toBe(false);
+  });
+
+  it("advances locally: step 1 commits to nothing", () => {
+    let state = opened(abandonWire());
+    expect(dialogOf_(state).draft.step).toBe(1);
+    expect(atNameStep(dialogOf_(state))).toBe(false);
+
+    state = reduce(state, { type: "dialog/advance" });
+    expect(dialogOf_(state).draft.step).toBe(2);
+    expect(atNameStep(dialogOf_(state))).toBe(true);
+    /** Nothing was sent: `pending` is what a frame would have added, and only
+     * `dialog/dispatched` adds to it. */
+    expect(dialogOf_(state).pending).toEqual([]);
+  });
+
+  it("never advances a dialog the host did not gate", () => {
+    let state = opened(unpairWire());
+    state = reduce(state, { type: "dialog/advance" });
+    expect(dialogOf_(state).draft.step).toBe(1);
+    state = reduce(state, { type: "dialog/gateType", char: "x" });
+    expect(dialogOf_(state).draft.confirmName).toBe("");
+  });
+
+  it("puts the typed name on the gated confirm, and on nothing else", () => {
+    let state = opened(abandonWire());
+    state = reduce(state, { type: "dialog/advance" });
+    for (const char of "fix-login-redirect") {
+      state = reduce(state, { type: "dialog/gateType", char });
+    }
+    const dialog = dialogOf_(state);
+
+    expect(confirmArgs(dialog, "y")).toEqual({
+      dialog_id: "dialog-9",
+      confirm_name: "fix-login-redirect",
+    });
+    /** The ungated button carries no name: sending one where the host does not
+     * check it would teach the wire to expect it everywhere. */
+    expect(confirmArgs(dialog, "n")).toEqual({
+      dialog_id: "dialog-9",
+      choice: "n",
+    });
+    /** Cancelling is never gated — R8: a shared dialog a remote surface can see
+     * but not dismiss would be worse than not sharing it. */
+    expect(cancelArgs(dialog)).toEqual({ dialog_id: "dialog-9" });
+  });
+
+  it("sends the name it has, wrong or empty, rather than a name it invented", () => {
+    /** The browser does not correct, pad or substitute: if a frame goes out at
+     * all it carries exactly what was typed, and the host refuses it. */
+    let state = opened(abandonWire());
+    state = reduce(state, { type: "dialog/advance" });
+    expect(confirmArgs(dialogOf_(state), "y")).toEqual({
+      dialog_id: "dialog-9",
+      confirm_name: "",
+    });
+  });
+
+  it("keeps the typed name across a re-announcement of the same dialog", () => {
+    /** A coalesced resync must not empty 1g's field mid-typing, for the same
+     * reason it must not empty 1e's branch field. */
+    let state = opened(abandonWire());
+    state = reduce(state, { type: "dialog/advance" });
+    for (const char of "fix-login") {
+      state = reduce(state, { type: "dialog/gateType", char });
+    }
+    state = opened(abandonWire(), state);
+    expect(dialogOf_(state).draft.confirmName).toBe("fix-login");
+    expect(dialogOf_(state).draft.step).toBe(2);
+  });
+
+  it("drops the typed name when a different dialog replaces it", () => {
+    /** A different question is a different answer: carrying a half-typed name
+     * across would put it in front of something nobody read. */
+    let state = opened(abandonWire());
+    state = reduce(state, { type: "dialog/advance" });
+    for (const char of "fix-login") {
+      state = reduce(state, { type: "dialog/gateType", char });
+    }
+    state = opened(unpairWire(), state);
+    expect(dialogOf_(state).draft.confirmName).toBe("");
+    expect(dialogOf_(state).draft.step).toBe(1);
   });
 });

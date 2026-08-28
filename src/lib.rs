@@ -1158,6 +1158,16 @@ enum Prompt {
     /// Confirm unpairing the phone (FlightDeck Remote). On confirm the event
     /// loop forgets the pairing and reverts to the passthrough sealer.
     UnpairConfirm,
+    /// Confirm quitting FlightDeck: every agent it is running is stopped.
+    ///
+    /// Only an **unconfirmed** `Command::Quit` opens this, and the only row that
+    /// carries one is the browser's (D16 — a `host only` badge is not enough for
+    /// quit). The desktop's `Ctrl-q` and its palette row dispatch the confirmed
+    /// value and never see it, which is why SPECS §23's "quit just quits" is
+    /// unchanged for the person at the keyboard. It is a D13 dialog like any
+    /// other once open: shared, origin-tagged, cancellable from either surface —
+    /// and from a browser its `y` is behind artboard 1g's typed-name step.
+    QuitConfirm,
 }
 
 /// State for the project-folder browser prompt ([`Prompt::OpenProject`]): the
@@ -2175,7 +2185,11 @@ fn event_loop(
             workspace,
             &web_surface.streams,
             activity,
-            web_dialog_view(&ui),
+            web_dialog_view(
+                &ui,
+                &workspace.active_project().name,
+                &workspace.active_project().state,
+            ),
             now0,
         );
         match web_surface.start(&config, initial) {
@@ -2535,7 +2549,11 @@ fn event_loop(
                 workspace,
                 &web_surface.streams,
                 activity,
-                web_dialog_view(&ui),
+                web_dialog_view(
+                    &ui,
+                    &workspace.active_project().name,
+                    &workspace.active_project().state,
+                ),
                 now_ms,
             );
             let decided = std::mem::take(&mut ui.dialog_decisions);
@@ -2576,7 +2594,11 @@ fn event_loop(
                 workspace,
                 &web_surface.streams,
                 activity,
-                web_dialog_view(&ui),
+                web_dialog_view(
+                    &ui,
+                    &workspace.active_project().name,
+                    &workspace.active_project().state,
+                ),
                 now_ms,
             );
             match web_surface.start(&config, initial) {
@@ -4777,17 +4799,18 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         // newly-opened dialog and acks `DIALOG_OPENED_DETAIL`; nothing has
         // merged, pushed or been rewritten yet, and the browser is told that by
         // being shown the question rather than a success.
-        Effect::PushWarning(_) | Effect::MergeConfirm { .. } | Effect::RebaseConfirm { .. } => {
-            WebDispatch::Applied(None)
-        }
-        // The one family whose *confirmation* is still someone else's task:
-        // artboard 1g's two-step destructive step (`remote-control-ll5.4`). It is
-        // unreachable from a browser row — the table refuses that name — so this
-        // is the second line of defence, refusing in the same words
-        // `browser_may_confirm` uses.
-        Effect::AbandonWarning { .. } => {
-            WebDispatch::Refused(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL.to_string())
-        }
+        //
+        // The destructive pair joined them in `remote-control-ll5.4`, for the
+        // same reason and with one more step behind the question: opening
+        // §5/§15's abandon warning, or D16's quit confirmation, is what the row
+        // is *for*. Nothing has been discarded and nothing has stopped — the
+        // browser is told that by being shown the question, and its answer to it
+        // has to pass artboard 1g's typed-name gate (`browser_confirm_gate`).
+        Effect::PushWarning(_)
+        | Effect::MergeConfirm { .. }
+        | Effect::RebaseConfirm { .. }
+        | Effect::AbandonWarning { .. }
+        | Effect::QuitConfirm => WebDispatch::Applied(None),
         // Not dialogs: read-only overlays with nothing to answer, and no browser
         // design yet (`remote-control-ll5.8`, design turn 3).
         Effect::GitStatus { .. } | Effect::ShowHelp | Effect::ShowAbout => WebDispatch::Refused(
@@ -4818,6 +4841,9 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         }
         Effect::AbandonWarning { dirty } => {
             start_prompt(ui, Prompt::AbandonConfirm { dirty });
+        }
+        Effect::QuitConfirm => {
+            start_prompt(ui, Prompt::QuitConfirm);
         }
         Effect::MergeConfirm {
             agent_branch,
@@ -5552,6 +5578,13 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 DialogButton::new(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
+        Prompt::QuitConfirm => Dialog::confirm(
+            "Quit FlightDeck? Every agent it is running is stopped.",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Quit"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
         Prompt::PushConfirm => Dialog::confirm(
             "The worktree has uncommitted changes. Push the committed changes only?",
             vec![
@@ -5798,6 +5831,17 @@ fn handle_prompt_key_inner(
             if key.code == KeyCode::Char('y') {
                 // Deferred to the event loop, which owns the relay channels.
                 ui.pending_unpair = true;
+            }
+            return Ok(());
+        }
+        // Quit belongs to no project, so it is answered here beside unpair.
+        // `y` is the same key the desktop's own dialog prints, which is what
+        // lets a browser's confirm reach it as a synthetic keypress rather
+        // than through an arm of its own (D13, R8).
+        Some(Prompt::QuitConfirm) => {
+            ui.prompt = None;
+            if key.code == KeyCode::Char('y') {
+                ui.should_quit = true;
             }
             return Ok(());
         }
@@ -6185,7 +6229,8 @@ fn handle_prompt_key_project(
         Prompt::OpenProject { .. }
         | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
-        | Prompt::UnpairConfirm => {
+        | Prompt::UnpairConfirm
+        | Prompt::QuitConfirm => {
             ui.prompt = Some(pstate);
         }
     }
@@ -6224,6 +6269,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
         }
         Effect::PushWarning(_) => start_prompt(ui, Prompt::PushConfirm),
         Effect::AbandonWarning { dirty } => start_prompt(ui, Prompt::AbandonConfirm { dirty }),
+        Effect::QuitConfirm => start_prompt(ui, Prompt::QuitConfirm),
         Effect::MergeConfirm {
             agent_branch,
             base_branch,
@@ -6558,11 +6604,36 @@ fn run_web_command(
 /// already carries it structurally, and the browser words it itself. Only the
 /// desktop needs the sentence, which is why the sentence lives on the desktop's
 /// render model.
-fn web_dialog_view(ui: &Ui) -> Option<crate::web::protocol::DialogView> {
+fn web_dialog_view(
+    ui: &Ui,
+    project_name: &str,
+    project: &AppState,
+) -> Option<crate::web::protocol::DialogView> {
+    use crate::web::commands::BrowserConfirm;
     use crate::web::protocol as wire;
 
     let open = ui.prompt.as_ref()?;
-    let refusal = browser_may_confirm(&open.prompt).err();
+    // Artboard 1g's second step, if this dialog has one for a browser. The
+    // expected name is *published*, because 1g draws it as the field's own hint:
+    // the gate buys deliberateness, not secrecy. A gate whose subject the host
+    // can no longer name is the one case that turns into an outright refusal —
+    // see `GATE_UNRESOLVED_REFUSAL`.
+    let (confirm_gate, refusal) = match browser_confirm_gate(&open.prompt) {
+        BrowserConfirm::OneStep => (None, None),
+        BrowserConfirm::TypedName(gate) => {
+            match gate_expectation(gate.subject, project_name, project) {
+                Some(expected) => (
+                    Some(wire::ConfirmGate {
+                        key: gate.key.to_string(),
+                        expected,
+                        instruction: gate.instruction.to_string(),
+                    }),
+                    None,
+                ),
+                None => (None, Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)),
+            }
+        }
+    };
     let body = wire::DialogBody {
         input: open.dialog.input.clone(),
         list: open
@@ -6585,6 +6656,7 @@ fn web_dialog_view(ui: &Ui) -> Option<crate::web::protocol::DialogView> {
             .collect(),
         confirmable: refusal.is_none(),
         refusal: refusal.map(str::to_string),
+        confirm_gate,
     };
     Some(wire::DialogView {
         dialog_id: open.id.clone(),
@@ -6617,39 +6689,76 @@ fn dialog_kind(prompt: &Prompt) -> &'static str {
         Prompt::OpenProject { .. } => "open_project",
         Prompt::CloseProjectConfirm { .. } => "close_project",
         Prompt::UnpairConfirm => "unpair_phone",
+        Prompt::QuitConfirm => "confirm_quit",
     }
 }
 
-/// Whether a browser may **confirm** this dialog, or the sentence saying why not.
+/// What a **browser** must do to confirm this dialog: press the button, or press
+/// it *and* type a name back (artboard 1g, `specs/WEB_INTERFACE.md` §6.5 R13).
 ///
-/// D13 gives either surface both decisions; two later tasks take one of them
-/// back for a named set of dialogs, and this is where that boundary is stated
-/// once. Exhaustive on purpose: a prompt added later must decide.
+/// **The trigger is the surface, not the command.** 1g's step 2 says so itself —
+/// *"This browser is remote. Type the session name to run the rebase on the
+/// host."* — so this function describes browsers only. The desktop's dialogs are
+/// untouched: nothing reaches step 2 there, because the person answering is at
+/// the machine the effect lands on. That is also why 1g's caption can enumerate
+/// only two dialogs while the artboard draws a third: the caption is counting
+/// the desktop's world, and this is the remote one.
 ///
-/// Cancelling is never gated here, and deliberately: dismissing a confirmation
-/// cannot destroy anything, and a shared dialog a remote surface can see but not
-/// dismiss would be worse than not sharing it.
-fn browser_may_confirm(prompt: &Prompt) -> std::result::Result<(), &'static str> {
-    use crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL;
+/// From a browser the gate covers the three answers that destroy work or rewrite
+/// history — §5/§15's abandon, §5.1's rebase, and D16's quit. `Push Branch` and `Finish / Local Merge`
+/// deliberately stay one-step: neither rewrites history nor discards anything, a
+/// push is undone by a force-push the user still owns, and a merge-back is a
+/// commit on the base branch — so 1g's friction would be ceremony rather than
+/// protection, and ceremony teaches people to type the name without reading it.
+///
+/// Exhaustive on purpose: a prompt added later must say where it stands.
+///
+/// **Cancelling is never gated**, here or anywhere below: dismissing a
+/// confirmation cannot destroy anything, and a shared dialog a remote surface
+/// can see but not dismiss would be worse than not sharing it (R8).
+fn browser_confirm_gate(prompt: &Prompt) -> crate::web::commands::BrowserConfirm {
+    use crate::web::commands::{
+        BrowserConfirm, GateSubject, TypedNameGate, GATE_ABANDON_INSTRUCTION,
+        GATE_QUIT_INSTRUCTION, GATE_REBASE_INSTRUCTION,
+    };
     match prompt {
-        // `remote-control-ll5.4`, artboard 1g: discarding work needs the
-        // two-step typed-name confirmation this build has not got. The sidebar's
-        // close menu is here too — its primary button *is* Abandon.
-        Prompt::AbandonConfirm { .. } | Prompt::CloseAgentChoice { .. } => {
-            Err(DESTRUCTIVE_DIALOG_REFUSAL)
-        }
-        // The git family (`remote-control-ll5.5`, SPECS §5) used to refuse here.
-        // It no longer does, and the reason is the point: these three dialogs
-        // **are** SPECS §5's confirmation. §5.1 requires the rebase to be "user-
-        // initiated and explicitly confirmed"; a browser is a user surface, the
-        // dialog is D13-shared so it is read before it is answered, and the
-        // unconfirmed value that opened it came from `web::commands::INVENTORY`
-        // rather than from the frame. Refusing the confirm while offering the
-        // row would leave a question on screen that only one of the two surfaces
-        // could answer. See `specs/WEB_INTERFACE.md` §6.5 R11.
-        Prompt::PushConfirm
+        // SPECS §5/§15: the worktree and everything uncommitted in it goes.
+        // `y` is the button `prompt_dialog` prints for both spellings of the
+        // question ("Abandon" / "Abandon (force)").
+        Prompt::AbandonConfirm { .. } => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::SelectedSession,
+            instruction: GATE_ABANDON_INSTRUCTION,
+        }),
+        // SPECS §5.1's sanctioned history rewrite, and the one artboard 1g
+        // actually draws its two steps around.
+        Prompt::RebaseConfirm { .. } => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::SelectedSession,
+            instruction: GATE_REBASE_INSTRUCTION,
+        }),
+        // D16: quit stops FlightDeck and every agent in it. Not one session's
+        // work, so not one session's name — the project the browser is looking
+        // at is what it names.
+        Prompt::QuitConfirm => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::ActiveProject,
+            instruction: GATE_QUIT_INSTRUCTION,
+        }),
+        // The rest are one step, exactly as they are on the desktop. The two git
+        // confirmations that are not a rewrite (`remote-control-ll5.5`, SPECS
+        // §14/§15) are here deliberately: these dialogs **are** §5's
+        // confirmation, a browser is a user surface, and the unconfirmed value
+        // that opened them came from `web::commands::INVENTORY` rather than from
+        // the frame. See `specs/WEB_INTERFACE.md` §6.5 R11.
+        // The sidebar's close menu (`a` Abandon / `c` Close / `n` Cancel) is
+        // **not** gated, and that is precision rather than a hole: `a` discards
+        // nothing, it dispatches `AbandonWorktree { confirm: false }`, which
+        // always asks — so the browser lands on `AbandonConfirm` above and takes
+        // step 2 there, once, in front of the button that really does it.
+        Prompt::CloseAgentChoice { .. }
+        | Prompt::PushConfirm
         | Prompt::MergeConfirm { .. }
-        | Prompt::RebaseConfirm { .. }
         | Prompt::NewAgentForm { .. }
         | Prompt::SelectChildAgent { .. }
         | Prompt::RenameTab { .. }
@@ -6658,7 +6767,37 @@ fn browser_may_confirm(prompt: &Prompt) -> std::result::Result<(), &'static str>
         | Prompt::CloseChildConfirm { .. }
         | Prompt::OpenProject { .. }
         | Prompt::CloseProjectConfirm { .. }
-        | Prompt::UnpairConfirm => Ok(()),
+        | Prompt::UnpairConfirm => BrowserConfirm::OneStep,
+    }
+}
+
+/// The exact name a [`crate::web::commands::TypedNameGate`] expects, read off
+/// the live workspace.
+///
+/// One function, called from **two places that must not disagree**: the dialog
+/// the browser is shown (`web_dialog_view`) and the check the confirm passes
+/// (`apply_web_dialog`). A second spelling of "which name is that" is how a gate
+/// becomes unpassable or, worse, passable with the wrong name.
+///
+/// `None` means the host cannot name the subject any more — the tab was closed
+/// while its question was on screen. The confirm is refused; see
+/// [`crate::web::commands::GATE_UNRESOLVED_REFUSAL`].
+fn gate_expectation(
+    subject: crate::web::commands::GateSubject,
+    project_name: &str,
+    project: &AppState,
+) -> Option<String> {
+    use crate::web::commands::GateSubject;
+    match subject {
+        // The session name, not the branch: 1g's field hints
+        // `fix-login-redirect` while the dialog above it names
+        // `flightdeck/fix-login-redirect`, and the name is what the sidebar
+        // shows the person typing it.
+        GateSubject::SelectedSession => {
+            let index = project.selected_tab?;
+            Some(project.tabs.get(index)?.meta.name.clone())
+        }
+        GateSubject::ActiveProject => Some(project_name.to_string()),
     }
 }
 
@@ -6735,8 +6874,7 @@ fn apply_web_dialog(
         return Ok(Some("Cancelled the dialog.".to_string()));
     }
 
-    browser_may_confirm(&open.prompt).map_err(str::to_string)?;
-
+    let gate = browser_confirm_gate(&open.prompt);
     let dialog = open.dialog.clone();
     let choice = args.and_then(|a| a.get("choice")).and_then(|c| c.as_str());
     let text = args.and_then(|a| a.get("text")).and_then(|t| t.as_str());
@@ -6775,6 +6913,40 @@ fn apply_web_dialog(
              is told the dialog was dismissed rather than confirmed."
                 .to_string(),
         );
+    }
+
+    // **Artboard 1g's second step, before a single key is fed.** Everything
+    // below this point synthesises keypresses into the live prompt, so the gate
+    // is checked here and nowhere later: a refusal returns with the dialog
+    // untouched, which is what makes "the effect provably does not occur" a
+    // property of the control flow rather than of a rollback.
+    //
+    // Only the button the gate names is behind it — every other answer this
+    // dialog offers is one press away — and cancelling never reaches here at
+    // all, because `DialogAct::Cancel` returned above.
+    if let crate::web::commands::BrowserConfirm::TypedName(gate) = gate {
+        if dialog_accel_key(deciding) == gate.key {
+            let active = workspace.active_project();
+            let expected = gate_expectation(gate.subject, &active.name, &active.state)
+                .ok_or_else(|| crate::web::commands::GATE_UNRESOLVED_REFUSAL.to_string())?;
+            match args
+                .and_then(|a| a.get("confirm_name"))
+                .and_then(|n| n.as_str())
+            {
+                // Step 1 only: the browser pressed the button and sent no name.
+                None => {
+                    return Err(crate::web::commands::gate_step_refusal(&gate, &expected));
+                }
+                // Byte-for-byte. No trim, no case fold, no normalisation — see
+                // `gate_mismatch_refusal` for why each of those was rejected.
+                Some(typed) if typed == expected => {}
+                Some(typed) => {
+                    return Err(crate::web::commands::gate_mismatch_refusal(
+                        typed, &expected,
+                    ));
+                }
+            }
+        }
     }
 
     // 1. The `Tab` option (1e's "run from base branch"), if asked for.
@@ -10728,6 +10900,52 @@ mod tests {
             }
         }
 
+        /// A workspace whose one project has a real Agent Session Tab named
+        /// `Task`.
+        ///
+        /// Built by dispatching `NewAgentTab` against a [`FakeGit`], so the tab
+        /// is the real thing rather than a hand-assembled record — its name is
+        /// what artboard 1g's gate expects to be typed back, and a test that
+        /// invented the name would prove nothing about where the gate reads it
+        /// from. The project keeps `one_project_workspace`'s scaffolding, so the
+        /// name a browser must type for the *project* gate is still `proj`.
+        fn workspace_with_a_tab(dir: &TempDir, git: &FakeGit, pty: &FakePty) -> Workspace {
+            let agent = make_real_agent(dir, "opencode");
+            let mut config = config_with_agent(agent);
+            config.ui.default_agent = "opencode".to_string();
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &runner,
+            };
+            pty.queue_session();
+            let mut state = AppState::new(
+                config,
+                default_state("main"),
+                "/repo",
+                "/repo/.flightdeck/state.json",
+            );
+            state
+                .dispatch(
+                    Command::NewAgentTab {
+                        name: "Task".to_string(),
+                        agent_key: None,
+                    },
+                    &services,
+                )
+                .expect("the tab is created");
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state = state;
+            ws
+        }
+
         /// Run one wire frame against `workspace`, returning the ack the browser
         /// would receive. Builds the fake services fresh, as the event loop
         /// builds the real ones per tick.
@@ -10837,22 +11055,124 @@ mod tests {
             assert_eq!(ack.detail.as_deref(), Some(ISOLATED_REFUSAL));
         }
 
-        /// D16, defence in depth: even if a frame naming `quit` reached the host
-        /// applier, there is no arm that dispatches it — it is refused with the
-        /// same sentence the socket would have used, and nothing quits.
+        /// **D16 + artboard 1g, end to end: quitting from a browser takes two
+        /// steps, and every way of taking only one provably does not quit.**
+        ///
+        /// `ui.should_quit` is what makes this the clearest of the destructive
+        /// tests: the effect is a boolean on the host, so "the effect did not
+        /// occur" is asserted directly rather than inferred from an absence.
         #[test]
-        fn a_quit_frame_that_reaches_the_applier_still_cannot_quit() {
+        fn quitting_from_a_browser_takes_the_typed_project_name() {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
 
+            // Step 1. The row asks; it does not quit. D16's `host only` badge
+            // would have been the alternative, and the spec says it is not
+            // enough — so the row dispatches, and what it dispatches can only
+            // open the question.
             let ack = run(&mut ws, &mut ui, &frame(6, names::QUIT, None));
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(!ui.should_quit, "the row asked, it did not quit");
+            let opened = ui.dialog_id().expect("the question is open");
 
-            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let view = view(&ui, &ws);
+            assert_eq!(view.kind, "confirm_quit");
+            let body = body(&view);
+            assert!(body.confirmable, "a browser may answer — through step 2");
+            assert_eq!(body.refusal, None);
+            let gate = body.confirm_gate.clone().expect("1g's step 2 is published");
+            assert_eq!(gate.key, "y", "the gate stands in front of the Quit button");
             assert_eq!(
-                ack.detail.as_deref(),
-                Some(crate::web::commands::QUIT_REFUSAL)
+                gate.expected, "proj",
+                "quit is not one session's work, so it names the project"
             );
-            assert!(!ui.should_quit, "no browser frame may set the quit flag");
+            assert!(
+                gate.instruction.contains("This browser is remote"),
+                "1g's step 2 says why there is one: {}",
+                gate.instruction
+            );
+
+            // Step 1 alone: the button, no name. This is what an older browser —
+            // and a replayed frame — sends.
+            let confirm = answer(7, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(
+                ack.detail
+                    .expect("a refusal states its reason")
+                    .contains("proj"),
+                "the refusal repeats what to type"
+            );
+            assert!(!ui.should_quit, "step 1 alone must not quit");
+            assert!(
+                ui.prompt.is_some(),
+                "the question is still on both surfaces"
+            );
+
+            // Every near miss. The comparison is exact — no trimming, no case
+            // folding — so each of these is a name the host does not have.
+            for wrong in ["Proj", "PROJ", "proj ", " proj", "pro", "", "projx"] {
+                let confirm = answer(
+                    8,
+                    names::DIALOG_CONFIRM,
+                    &ui,
+                    json!({ "confirm_name": wrong }),
+                );
+                let ack = run(&mut ws, &mut ui, &confirm);
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{wrong}`");
+                assert!(!ui.should_quit, "`{wrong}` must not quit FlightDeck");
+                assert!(ui.prompt.is_some(), "`{wrong}` left the question open");
+                assert!(
+                    ui.dialog_decisions.is_empty(),
+                    "`{wrong}` was refused before any key reached the prompt"
+                );
+            }
+
+            // And the name itself, exactly. Only now is a key fed into the
+            // prompt — the same `y` the desktop's own button sends.
+            let confirm = answer(
+                9,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "proj" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.should_quit, "both steps taken: FlightDeck stops");
+            assert!(ui.prompt.is_none());
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(opened, crate::web::protocol::DialogOutcome::Confirmed)],
+                "the other surface is told it was confirmed, not superseded"
+            );
+        }
+
+        /// The desktop's half of the same dialog, which is the ruling in one
+        /// assertion: **nothing reaches step 2 there.** The person at this
+        /// keyboard is at the machine that stops, so `y` is the whole answer —
+        /// and SPECS §23's `Ctrl-q` never opens this dialog in the first place,
+        /// because the desktop's row carries `Quit { confirm: true }`.
+        #[test]
+        fn the_desktop_answers_the_quit_dialog_with_one_key() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::QUIT, None));
+            let id = ui.dialog_id().expect("open");
+
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            assert!(ui.should_quit, "one key, no name, from the desktop");
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(id, crate::web::protocol::DialogOutcome::Confirmed)]
+            );
         }
 
         /// The same for a desktop-only action: refused with D16's sentence, and
@@ -10896,8 +11216,17 @@ mod tests {
         // ===============================================================
 
         /// The one dialog open on the host, as the browser would receive it.
-        fn view(ui: &Ui) -> crate::web::protocol::DialogView {
-            web_dialog_view(ui).expect("a dialog is open")
+        ///
+        /// The workspace is not decoration: artboard 1g's gate names a live
+        /// session or project, so the view a browser gets is a function of both
+        /// the prompt and the state it is about (§6.5 R13).
+        fn maybe_view(ui: &Ui, ws: &Workspace) -> Option<crate::web::protocol::DialogView> {
+            web_dialog_view(ui, &ws.active_project().name, &ws.active_project().state)
+        }
+
+        fn view(ui: &Ui, ws: &Workspace) -> crate::web::protocol::DialogView {
+            web_dialog_view(ui, &ws.active_project().name, &ws.active_project().state)
+                .expect("a dialog is open")
         }
 
         /// The body the host serialised into `DialogView::body`.
@@ -10935,7 +11264,7 @@ mod tests {
 
             assert_eq!(ack.outcome, AckOutcome::Applied);
             assert_eq!(ack.detail.as_deref(), Some(DIALOG_OPENED_DETAIL));
-            let view = view(&ui);
+            let view = view(&ui, &ws);
             assert_eq!(view.kind, "new_agent");
             assert_eq!(view.origin, browser_origin(), "D13: tagged with who asked");
             // And the desktop is rendering the origin sentence, not just holding
@@ -10956,7 +11285,7 @@ mod tests {
 
             start_new_tab_flow(&ws.projects[0].state, &mut ui);
 
-            let view = view(&ui);
+            let view = view(&ui, &ws);
             assert_eq!(view.origin, crate::web::protocol::DialogOrigin::Desktop);
             assert!(ui
                 .prompt
@@ -10978,7 +11307,7 @@ mod tests {
                 &frame(1, names::NEW_AGENT_SESSION_TAB, None),
             );
 
-            let view = view(&ui);
+            let view = view(&ui, &ws);
             let body = body(&view);
             assert_eq!(body.input.as_deref(), Some(""), "1e's branch field");
             assert_eq!(body.list.len(), 1, "one registered agent, one radio row");
@@ -11001,7 +11330,7 @@ mod tests {
                 &mut ui,
                 &frame(1, names::NEW_AGENT_SESSION_TAB, None),
             );
-            assert!(body(&view(&ui)).input.is_some());
+            assert!(body(&view(&ui, &ws)).input.is_some());
 
             // A `Tab` with no decision key is not a thing the wire offers, so
             // the toggle rides on the confirm — and the form is gone by then.
@@ -11016,7 +11345,7 @@ mod tests {
             let e = env(&fs, &pty, &clock, &container, &runner);
             handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
 
-            let body = body(&view(&ui));
+            let body = body(&view(&ui, &ws));
             assert_eq!(body.input, None, "1e: branch field hidden on run-from-base");
             assert!(body
                 .buttons
@@ -11033,7 +11362,7 @@ mod tests {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
             run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
-            assert_eq!(view(&ui).kind, "unpair_phone");
+            assert_eq!(view(&ui, &ws).kind, "unpair_phone");
             let id = ui.dialog_id().expect("open");
 
             let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({}));
@@ -11177,88 +11506,335 @@ mod tests {
             assert!(ui.prompt.is_some());
         }
 
-        /// The destructive family (`remote-control-ll5.4`, artboard 1g): the
-        /// dialog is shared and **cancellable** from a browser, and confirming it
-        /// is refused with the sentence naming the task that owns the two-step
-        /// confirmation. Both halves matter — a shared dialog a remote surface
-        /// cannot dismiss would be worse than not sharing it.
-        #[test]
-        fn a_destructive_dialog_can_be_cancelled_but_not_confirmed_from_a_browser() {
-            let mut ws = one_project_workspace(false);
-            let mut ui = Ui::default();
-            // The desktop opens it — the browser row for it is refused by the
-            // table, which is the first line of defence.
-            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: true });
-
-            let view = view(&ui);
-            let body = body(&view);
-            assert_eq!(view.kind, "confirm_abandon");
-            assert!(!body.confirmable, "the browser may not confirm this one");
-            assert_eq!(
-                body.refusal.as_deref(),
-                Some(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL)
-            );
-
-            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
-            let ack = run(&mut ws, &mut ui, &confirm);
-            assert_eq!(ack.outcome, AckOutcome::Rejected);
-            assert_eq!(
-                ack.detail.as_deref(),
-                Some(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL)
-            );
-            assert!(ui.prompt.is_some(), "nothing was abandoned");
-
-            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
-            let ack = run(&mut ws, &mut ui, &cancel);
-            assert_eq!(ack.outcome, AckOutcome::Applied);
-            assert!(ui.prompt.is_none(), "cancelling is always allowed");
-        }
-
-        /// **The git confirmations are answerable from a browser**
-        /// (`remote-control-ll5.5`, SPECS §5.1/§14/§15). Before this task all
-        /// three refused a browser's confirm with `GIT_DIALOG_REFUSAL`; the gate
-        /// is lifted, because these dialogs *are* §5's confirmation and D13
-        /// already shares them — the browser reads the same words the desktop
-        /// does, including §12's drift, before it answers.
+        /// **The 1g ruling, as a table.** Three answers are behind step 2 from a
+        /// browser, and they are the ones that destroy work or rewrite history.
         ///
-        /// The refusal the browser gets here is the **dispatch's** own (this
-        /// workspace has no tab to rebase), which is the whole point: the
-        /// confirm was accepted and reached the real command, and the sentence
-        /// came back from the guard rather than from a gate standing in front of
-        /// it. Nothing was rewritten, because nothing could be.
+        /// The artboard's caption says *"Abandon and Quit are the only two that
+        /// reach step 2"* while the artboard itself **draws Rebase Worktree** as
+        /// its two-step example, and step 2's own copy reads *"This browser is
+        /// remote…"*. The drawn artboard wins, and the copy says why: the
+        /// trigger is the surface being remote, not the command being
+        /// destructive. So the caption is counting the desktop's world — where
+        /// nothing reaches step 2 at all — and this is the remote one, covering
+        /// the superset the pixels demonstrate. See `specs/WEB_INTERFACE.md`
+        /// §6.5 R13.
         #[test]
-        fn a_git_dialog_is_confirmable_from_a_browser_and_acks_the_dispatch() {
-            let mut ws = one_project_workspace(false);
-            let mut ui = Ui::default();
-            start_prompt(
-                &mut ui,
+        fn exactly_three_answers_are_behind_step_two_from_a_browser() {
+            use crate::web::commands::BrowserConfirm;
+            let gated = |prompt: &Prompt| match browser_confirm_gate(prompt) {
+                BrowserConfirm::TypedName(gate) => {
+                    // The key it guards must be a button the dialog is really
+                    // showing, or the gate would stand in front of nothing.
+                    let dialog = prompt_dialog(prompt);
+                    assert!(
+                        dialog
+                            .buttons
+                            .iter()
+                            .any(|b| dialog_accel_key(b.accel) == gate.key),
+                        "the gate guards `{}`, which this dialog does not show: {:?}",
+                        gate.key,
+                        dialog.buttons
+                    );
+                    true
+                }
+                BrowserConfirm::OneStep => false,
+            };
+
+            for prompt in [
+                Prompt::AbandonConfirm { dirty: true },
+                Prompt::AbandonConfirm { dirty: false },
                 Prompt::RebaseConfirm {
                     agent_branch: "flightdeck/x".to_string(),
                     base_branch: "main".to_string(),
                     drift: 2,
+                    primary_running: true,
+                },
+                Prompt::QuitConfirm,
+            ] {
+                assert!(
+                    gated(&prompt),
+                    "{:?} destroys work or rewrites history",
+                    dialog_kind(&prompt)
+                );
+            }
+
+            for prompt in [
+                // SPECS §14/§15: neither rewrites history nor discards work — a
+                // push is undone by a push, a merge-back is a commit on base.
+                Prompt::PushConfirm,
+                Prompt::MergeConfirm {
+                    agent_branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
                     primary_running: false,
                 },
+                // The sidebar's close menu: `a` only dispatches the unconfirmed
+                // abandon, which asks. The gate belongs on the question it
+                // opens, and it is there.
+                Prompt::CloseAgentChoice { index: 0 },
+                Prompt::CloseTab {
+                    actions: vec![CloseAction::CtrlCPrimary],
+                },
+                Prompt::CloseChildConfirm {
+                    label: "shell 2".to_string(),
+                },
+                Prompt::RenameTab {
+                    buffer: String::new(),
+                },
+                Prompt::SetManualStatus,
+                Prompt::SelectChildAgent { agents: vec![] },
+                Prompt::CloseProjectConfirm { index: 0 },
+                Prompt::UnpairConfirm,
+            ] {
+                assert!(
+                    !gated(&prompt),
+                    "{:?} is one step, exactly as on the desktop",
+                    dialog_kind(&prompt)
+                );
+            }
+        }
+
+        /// **The destructive family (`remote-control-ll5.4`, artboard 1g): a
+        /// wrong name refuses and the worktree provably survives; cancelling is
+        /// never gated.**
+        ///
+        /// The gate is checked before a single key is fed into the prompt, so
+        /// "nothing was abandoned" is asserted three ways: the question is still
+        /// open, the tab is still in the workspace, and no decision was
+        /// witnessed for the other surface to be told about.
+        #[test]
+        fn a_destructive_confirmation_needs_the_exact_session_name() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            // The desktop opens it; D13 shares it either way.
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: true });
+
+            let view = view(&ui, &ws);
+            let body = body(&view);
+            assert_eq!(view.kind, "confirm_abandon");
+            assert!(
+                body.confirmable,
+                "ll5.4 lifts the flat refusal: a browser confirms through step 2"
+            );
+            assert_eq!(body.refusal, None);
+            let gate = body.confirm_gate.clone().expect("1g's step 2 is published");
+            assert_eq!(gate.key, "y");
+            assert_eq!(
+                gate.expected, "Task",
+                "1g hints the *session* name, not the branch it lives on"
             );
 
-            // The browser is told it may confirm, and the dialog it reads names
-            // the branches and §12's drift — so nobody answers a question they
-            // could not see.
-            let view = view(&ui);
+            for wrong in [
+                "",
+                "task",
+                "TASK",
+                "Task ",
+                " Task",
+                "Tas",
+                "flightdeck/Task",
+            ] {
+                let confirm = answer(
+                    1,
+                    names::DIALOG_CONFIRM,
+                    &ui,
+                    json!({ "confirm_name": wrong }),
+                );
+                let ack = run(&mut ws, &mut ui, &confirm);
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{wrong}`");
+                assert!(ui.prompt.is_some(), "`{wrong}` left the question open");
+                assert_eq!(
+                    ws.projects[0].state.tabs.len(),
+                    1,
+                    "`{wrong}` must not have abandoned anything"
+                );
+                assert!(
+                    ui.dialog_decisions.is_empty(),
+                    "`{wrong}` never reached the prompt, so nothing was decided"
+                );
+            }
+
+            // Step 1 alone: pressing the button and sending no name at all.
+            let confirm = answer(2, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("confirm_name"));
+            assert!(ui.prompt.is_some());
+            assert_eq!(ws.projects[0].state.tabs.len(), 1);
+
+            // And the half R8 insists on: cancelling is never gated. A shared
+            // dialog a remote surface can see but not dismiss would be worse
+            // than not sharing it — so no name, and it closes.
+            let cancel = answer(3, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none(), "cancelling is always allowed");
+            assert_eq!(
+                ws.projects[0].state.tabs.len(),
+                1,
+                "cancelling destroyed nothing"
+            );
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(
+                    view.dialog_id.clone(),
+                    crate::web::protocol::DialogOutcome::Cancelled
+                )]
+            );
+        }
+
+        /// 1g's own drawing is the rebase, and SPECS §5.1 is why: it is the one
+        /// sanctioned history rewrite, so from a browser it takes both steps.
+        /// The two git confirmations that rewrite nothing (§14 push, §15 merge)
+        /// stay one step — a gate there would be ceremony, and ceremony teaches
+        /// people to type the name without reading it.
+        #[test]
+        fn the_rewrite_is_gated_and_the_other_git_confirmations_are_not() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            start_prompt(
+                &mut ui,
+                Prompt::RebaseConfirm {
+                    agent_branch: "flightdeck/Task".to_string(),
+                    base_branch: "main".to_string(),
+                    drift: 4,
+                    primary_running: true,
+                },
+            );
+            // The browser reads the same question the desktop does — the
+            // branches and §12's drift — before it answers (R11).
+            let question = view(&ui, &ws);
+            assert!(
+                question.title.contains("base moved 4 commits"),
+                "{}",
+                question.title
+            );
+            let gate = body(&question)
+                .confirm_gate
+                .expect("§5.1's rewrite takes both steps from a browser");
+            assert_eq!(gate.expected, "Task");
+            assert_eq!(
+                gate.instruction,
+                crate::web::commands::GATE_REBASE_INSTRUCTION,
+                "artboard 1g's step 2 copy, verbatim"
+            );
+
+            // A confirm with no name gets nowhere near `GitExecutor::rebase_onto`.
+            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ui.prompt.is_some(), "the question is still open");
+            assert!(
+                git.rebases().is_empty(),
+                "SPECS §5.1: nothing was rewritten"
+            );
+
+            for prompt in [
+                Prompt::PushConfirm,
+                Prompt::MergeConfirm {
+                    agent_branch: "flightdeck/Task".to_string(),
+                    base_branch: "main".to_string(),
+                    primary_running: false,
+                },
+            ] {
+                start_prompt(&mut ui, prompt);
+                let one_step = view(&ui, &ws);
+                let body = body(&one_step);
+                assert!(body.confirmable);
+                assert!(
+                    body.confirm_gate.is_none(),
+                    "§14/§15 are one step: {:?}",
+                    body.confirm_gate
+                );
+            }
+        }
+
+        /// A gate the host cannot resolve is a refusal, not a shortcut. The tab
+        /// the question was about is gone, so there is no name to check — and
+        /// confirming past that would destroy something nobody named.
+        #[test]
+        fn a_gate_with_nothing_to_name_refuses_but_still_cancels() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: false });
+
+            let body = body(&view(&ui, &ws));
+            assert!(!body.confirmable, "there is nothing to type back");
+            assert_eq!(
+                body.refusal.as_deref(),
+                Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)
+            );
+            assert!(body.confirm_gate.is_none());
+
+            let confirm = answer(
+                1,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "Task" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)
+            );
+            assert!(ui.prompt.is_some());
+
+            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+            assert_eq!(
+                ack.outcome,
+                AckOutcome::Applied,
+                "cancelling is never gated"
+            );
+            assert!(ui.prompt.is_none());
+        }
+
+        /// **The git confirmations are answerable from a browser**
+        /// (`remote-control-ll5.5`, SPECS §5.1/§14/§15). Before that task all
+        /// three refused a browser's confirm outright; that gate is gone,
+        /// because these dialogs *are* §5's confirmation and D13 already shares
+        /// them — the browser reads the same words the desktop does before it
+        /// answers.
+        ///
+        /// `remote-control-ll5.4` tightened one of the three: §5.1's rebase now
+        /// takes artboard 1g's typed name as well, and that half is pinned in
+        /// `the_rewrite_is_gated_and_the_other_git_confirmations_are_not`. This
+        /// test keeps the *un*gated half honest, on §14's push.
+        ///
+        /// The refusal the browser gets here is the **dispatch's** own (this
+        /// workspace has no tab to push), which is the whole point: the confirm
+        /// was accepted and reached the real command, and the sentence came back
+        /// from the guard rather than from a gate standing in front of it.
+        #[test]
+        fn a_git_dialog_is_confirmable_from_a_browser_and_acks_the_dispatch() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::PushConfirm);
+
+            let view = view(&ui, &ws);
             let body = body(&view);
-            assert_eq!(view.kind, "confirm_rebase");
+            assert_eq!(view.kind, "confirm_push");
             assert!(body.confirmable, "the git gate is lifted (ll5.5)");
             assert_eq!(body.refusal, None);
             assert!(
-                view.title.contains("base moved 2 commits"),
-                "{}",
-                view.title
+                body.confirm_gate.is_none(),
+                "§14 rewrites nothing, so it stays one step (ll5.4)"
             );
 
             let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
             let ack = run(&mut ws, &mut ui, &confirm);
 
             // Accepted, dispatched, and refused by the command's own guard —
-            // never by `browser_may_confirm`, which no longer has an arm for it.
+            // never by a gate in front of it.
             assert_eq!(ack.outcome, AckOutcome::Rejected);
             let detail = ack.detail.expect("a refusal states its reason");
             assert!(
@@ -11404,13 +11980,13 @@ mod tests {
             run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
             let first = ui.dialog_id().expect("open");
             let published = crate::web::server::HostState {
-                dialog: web_dialog_view(&ui),
+                dialog: maybe_view(&ui, &ws),
                 ..crate::web::server::HostState::default()
             };
 
             start_prompt(&mut ui, Prompt::SetManualStatus);
             let next = crate::web::server::HostState {
-                dialog: web_dialog_view(&ui),
+                dialog: maybe_view(&ui, &ws),
                 ..crate::web::server::HostState::default()
             };
             let second = ui.dialog_id().expect("open");
@@ -11449,14 +12025,14 @@ mod tests {
             run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
             let id = ui.dialog_id().expect("open");
             let published = crate::web::server::HostState {
-                dialog: web_dialog_view(&ui),
+                dialog: maybe_view(&ui, &ws),
                 ..crate::web::server::HostState::default()
             };
 
             let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
             run(&mut ws, &mut ui, &cancel);
             let next = crate::web::server::HostState {
-                dialog: web_dialog_view(&ui),
+                dialog: maybe_view(&ui, &ws),
                 ..crate::web::server::HostState::default()
             };
 
@@ -11691,7 +12267,7 @@ mod tests {
 
             // The question is on both surfaces, answerable from either, and it
             // names what it will do — including the drift it will pull in.
-            let view = web_dialog_view(&ui).expect("the dialog is published");
+            let view = web_dialog_view(&ui, "proj", &state).expect("the dialog is published");
             let body: crate::web::protocol::DialogBody =
                 serde_json::from_value(view.body.clone().expect("a body")).expect("a DialogBody");
             assert_eq!(view.kind, "confirm_rebase");
@@ -11847,7 +12423,7 @@ mod tests {
                 matches!(outcome, Some(WebDispatch::Applied(None))),
                 "a question opened, and nothing else is claimed: {outcome:?}"
             );
-            let view = web_dialog_view(&ui).expect("the warning is published");
+            let view = web_dialog_view(&ui, "proj", &state).expect("the warning is published");
             assert_eq!(view.kind, "confirm_push");
             assert!(
                 view.title.contains("committed changes only"),

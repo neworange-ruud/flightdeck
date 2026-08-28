@@ -392,7 +392,18 @@ export function dialogOf(wire: WireDialogView): DialogState {
      * host refuses, which is a worse experience than a disabled button. */
     confirmable: body.confirmable ?? false,
     refusal: body.refusal ?? null,
-    draft: { text: "", index: null, toggled: false },
+    /** Absent means the host named no second step, which is the common case and
+     * the honest reading of silence: a gate the browser invented would ask for a
+     * name the host is not going to check. */
+    gate:
+      body.confirm_gate === undefined || body.confirm_gate === null
+        ? null
+        : {
+            key: body.confirm_gate.key,
+            expected: body.confirm_gate.expected,
+            instruction: body.confirm_gate.instruction,
+          },
+    draft: { text: "", index: null, toggled: false, confirmName: "", step: 1 },
     pending: [],
     lastOutcome: null,
   };

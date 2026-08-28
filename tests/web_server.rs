@@ -2832,9 +2832,7 @@ use flightdeck::app::commands::{Command as AppCommand, Effect};
 use flightdeck::app::state::{AppState, Services};
 use flightdeck::contracts::domain::{Config, ProjectState, STATE_VERSION};
 use flightdeck::testing::{FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeGit};
-use flightdeck::web::commands::{
-    self, Confirmation, Route, HOST_ONLY_REFUSAL, PULL_BASE_REFUSAL, QUIT_REFUSAL,
-};
+use flightdeck::web::commands::{self, Confirmation, Route, HOST_ONLY_REFUSAL, PULL_BASE_REFUSAL};
 use flightdeck::web::protocol::{command as names, CommandTarget};
 
 /// Send one command frame from a controlling browser, and hand back the socket
@@ -3041,9 +3039,15 @@ fn a_desktop_only_command_is_acked_with_its_host_only_outcome() {
     assert_nothing_forwarded(&harness);
 }
 
-/// D16: `quit` stops FlightDeck and every agent in it. A bare frame naming it is
-/// refused pending the two-step confirmation, and — the part that matters — it
-/// never reaches the host, so no path exists that could have run it.
+/// **D16: `quit` stops FlightDeck and every agent in it, and a bare frame naming
+/// it cannot do that.**
+///
+/// The mechanism changed in `remote-control-ll5.4` and the property did not.
+/// Until then the socket refused the name outright; now the frame is forwarded,
+/// and what stops it is the *payload* — `INVENTORY` carries `Quit { confirm:
+/// false }` and a forwarding row never reads the frame's `args`, so the value
+/// reaching `AppState::dispatch` can only ask. The dispatch below is the real
+/// one, so this test cannot pass by describing a table that lies.
 #[test]
 fn a_bare_quit_frame_cannot_kill_flightdeck() {
     let harness = Harness::start();
@@ -3051,16 +3055,123 @@ fn a_bare_quit_frame_cannot_kill_flightdeck() {
     let cookie = on_runtime(harness.authenticate());
     let mut ws = on_runtime(control(&addr, &cookie));
 
-    on_runtime(command(&mut ws, 51, names::QUIT));
-    let ack = on_runtime(next_ack(&mut ws));
-    assert_eq!(ack.seq, 51);
-    assert_eq!(ack.outcome, AckOutcome::Rejected);
-    assert_eq!(ack.detail.as_deref(), Some(QUIT_REFUSAL));
-    assert_nothing_forwarded(&harness);
+    // Even a frame that spells out `confirm: true` — the smuggling attempt.
+    on_runtime(async {
+        send(
+            &mut ws,
+            &ClientMsg::Command(WireCommand {
+                seq: 51,
+                name: names::QUIT.to_string(),
+                args: Some(serde_json::json!({ "confirm": true })),
+            }),
+        )
+        .await;
+    });
+    let (_, _, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::QUIT);
 
-    // The refusal is not fatal to the socket either: the tab keeps working.
+    let spec = commands::lookup(&forwarded.name).expect("a forwarded name is a known name");
+    let cmd = match &spec.route {
+        Route::Palette(flightdeck::tui::palette::PaletteAction::Dispatch(cmd)) => cmd.clone(),
+        other => panic!("expected a direct dispatch, got {other:?}"),
+    };
+    assert_eq!(
+        cmd,
+        AppCommand::Quit { confirm: false },
+        "the args the frame carried are not read: the table's value is what runs"
+    );
+    assert_eq!(commands::confirmation_of(&cmd), Confirmation::Pending);
+
+    let mut app = app_state();
+    let git = FakeGit::new();
+    let fs = FakeFs::new();
+    let pty = FakePty::new();
+    let clock = FakeClock::new("2026-08-28T10:00:00Z");
+    let container = FakeContainerRuntime::new();
+    let runner = FakeCommandRunner::new();
+    let services = Services {
+        git: &git,
+        fs: &fs,
+        pty: &pty,
+        clock: &clock,
+        container: &container,
+        command: &runner,
+    };
+    let effect = app.dispatch(cmd, &services).expect("the dispatch succeeds");
+    assert_eq!(
+        effect,
+        Effect::QuitConfirm,
+        "the frame opened D13's shared question; it did not quit"
+    );
+
+    // And the socket keeps working, as it did when this was a flat refusal.
     on_runtime(command(&mut ws, 52, names::REQUEST_SNAPSHOT));
     on_runtime(await_snapshot(&mut ws));
+}
+
+/// **A confirmation raced by a takeover does not slip through** (D14 + artboard
+/// 1g, `remote-control-ll5.4`).
+///
+/// The seat that typed the name must be the seat that confirms, and here that is
+/// true *by construction rather than by comparison*: 1g's typed name rides on
+/// the deciding frame itself, so the host keeps no "this viewer is armed" state
+/// for a second browser to inherit or race. What is left is the ordinary seat
+/// check — which runs before a command's own route is even considered — so the
+/// evicted browser's confirm, correct name and all, is answered `read_only` and
+/// never reaches the host at all.
+#[test]
+fn a_confirm_from_a_browser_that_lost_the_seat_never_reaches_the_host() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut first = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut first, SeatRequest::Control).await;
+        await_snapshot(&mut first).await;
+
+        // The race: a second browser takes the seat while the first is typing
+        // the session name into artboard 1g's step 2.
+        let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut second, SeatRequest::TakeOver).await;
+        await_snapshot(&mut second).await;
+
+        // The first finishes typing and answers. The name is right; the seat is
+        // not its any more.
+        send(
+            &mut first,
+            &ClientMsg::Command(WireCommand {
+                seq: 71,
+                name: names::DIALOG_CONFIRM.to_string(),
+                args: Some(serde_json::json!({
+                    "dialog_id": "dialog-1",
+                    "confirm_name": "Task",
+                })),
+            }),
+        )
+        .await;
+        let error = next_error(&mut first).await;
+        assert_eq!(error.code, ErrorCode::ReadOnly);
+        assert_eq!(error.seq, Some(71));
+
+        // Cancelling is refused for the same reason, and that is not a
+        // contradiction of "cancelling is never gated": the gate is about the
+        // *name*, the seat is about D14. An observer answering a question that
+        // is not theirs is input by another name, in either direction.
+        send(
+            &mut first,
+            &ClientMsg::Command(WireCommand {
+                seq: 72,
+                name: names::DIALOG_CANCEL.to_string(),
+                args: Some(serde_json::json!({ "dialog_id": "dialog-1" })),
+            }),
+        )
+        .await;
+        let error = next_error(&mut first).await;
+        assert_eq!(error.code, ErrorCode::ReadOnly);
+    });
+
+    assert_nothing_forwarded(&harness);
 }
 
 /// D14: read-only means read-only, for the whole surface and not just for the
@@ -3229,30 +3340,44 @@ fn publish_dialog(
     *published = next;
 }
 
-/// D13 shared the dialog family, but two rows still refuse, each naming the task
-/// that owns it: `abandon_worktree` needs artboard 1g's two-step confirmation
-/// (`remote-control-ll5.4`) and `show_git_status` has no browser design at all
-/// (design turn 3). Refused at the socket, so no code path exists that could
-/// half-open either.
+/// D13 shared the dialog family, and one row still refuses at the socket:
+/// `show_git_status` is **not** one of D13's dialogs — nothing is being asked,
+/// so there is nothing to answer — and has no browser design at all (design turn
+/// 3). Refused at the socket, so no code path exists that could half-open it.
+///
+/// `abandon_worktree` left this test in `remote-control-ll5.4`: it is a palette
+/// row now, forwarding `AbandonWorktree { confirm: false }`, which can only open
+/// SPECS §5/§15's question. What stops a browser *answering* that question with
+/// one press is artboard 1g's typed name, which lives on the confirm rather than
+/// on the row — so it is checked where the effect is, not at the door.
 #[test]
-fn the_two_dialog_rows_that_still_refuse_say_which_task_owns_them() {
+fn the_dialog_row_that_still_refuses_says_which_task_owns_it() {
     let harness = Harness::start();
     let addr = harness.addr();
     let cookie = on_runtime(harness.authenticate());
     let mut ws = on_runtime(control(&addr, &cookie));
 
-    for (seq, name) in [(71, names::ABANDON_WORKTREE), (72, names::SHOW_GIT_STATUS)] {
-        on_runtime(command(&mut ws, seq, name));
-        let error = on_runtime(next_error(&mut ws));
-        assert_eq!(error.code, ErrorCode::NotSupported, "for `{name}`");
-        assert_eq!(error.seq, Some(seq));
-        assert!(
-            error.message.len() > 30,
-            "`{name}` must say why: {}",
-            error.message
-        );
-    }
+    on_runtime(command(&mut ws, 72, names::SHOW_GIT_STATUS));
+    let error = on_runtime(next_error(&mut ws));
+    assert_eq!(error.code, ErrorCode::NotSupported);
+    assert_eq!(error.seq, Some(72));
+    assert!(
+        error.message.len() > 30,
+        "it must say why: {}",
+        error.message
+    );
     assert_nothing_forwarded(&harness);
+
+    // The destructive row is forwarded now — and carries the value that asks.
+    on_runtime(command(&mut ws, 73, names::ABANDON_WORKTREE));
+    let (_, _, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::ABANDON_WORKTREE);
+    let spec = commands::lookup(&forwarded.name).expect("a forwarded name is a known name");
+    assert_eq!(
+        commands::dispatched_command(&spec.route),
+        Some(&AppCommand::AbandonWorktree { confirm: false }),
+        "the first dispatch asks; 1g's second step guards the answer"
+    );
 
     // Still alive, like any other refusal.
     on_runtime(command(&mut ws, 74, names::REQUEST_SNAPSHOT));

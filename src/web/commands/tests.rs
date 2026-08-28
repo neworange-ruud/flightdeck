@@ -129,7 +129,7 @@ fn the_commands_with_no_wire_name_say_why() {
 }
 
 // ---------------------------------------------------------------------------
-// D16 and the two-step confirmation
+// D16 and artboard 1g's two-step confirmation
 // ---------------------------------------------------------------------------
 
 /// D16: desktop-only actions stay visible and are honest about where their
@@ -155,23 +155,69 @@ fn the_two_desktop_only_actions_are_badged_and_refuse() {
     }
 }
 
-/// D16: `quit` kills FlightDeck and every agent, so a bare frame naming it must
-/// not reach a dispatch at all. It is refused here, in the table, which is why
-/// no code path exists that could run it.
+/// **D16 + artboard 1g: a frame naming `quit` can only ever ask.**
+///
+/// `quit` stops FlightDeck and every agent in it, so the row carries the
+/// *unconfirmed* value and nothing else — the first dispatch returns
+/// `Effect::QuitConfirm`, which is D13's shared dialog, and a browser's answer
+/// to that dialog has to pass the typed-name gate (`browser_confirm_gate` in
+/// `src/lib.rs`). The property this pins is the one R7 stated for the refusal it
+/// replaces: no row anywhere may hand `Command::Quit { confirm: true }` to a
+/// dispatch, so no frame can reach the value that quits.
 #[test]
-fn quit_is_refused_by_the_table_not_by_a_check() {
+fn no_row_can_dispatch_a_confirmed_quit() {
     let spec = lookup(names::QUIT).expect("quit is a name the host knows");
-    assert_eq!(spec.route, Route::Rejected(QUIT_REFUSAL));
-    assert!(
-        dispatched_command(&spec.route).is_none(),
-        "quit must not be on a dispatching route"
+    assert_eq!(
+        dispatched_command(&spec.route),
+        Some(&Command::Quit { confirm: false }),
+        "the row must carry the value that can only ask (D16)"
+    );
+    assert_eq!(
+        confirmation_of(&Command::Quit { confirm: false }),
+        Confirmation::Pending
     );
     assert!(
         INVENTORY
             .iter()
-            .all(|s| dispatched_command(&s.route) != Some(&Command::Quit)),
-        "no row may dispatch Command::Quit"
+            .all(|s| dispatched_command(&s.route) != Some(&Command::Quit { confirm: true })),
+        "no row may dispatch a confirmed Command::Quit"
     );
+    // And the row still says what it is, so nobody meets it by accident.
+    assert_eq!(spec.view().annotation.as_deref(), Some("destructive"));
+    assert!(
+        !spec.view().host_only,
+        "D16: quit is not a `host only` badge — a badge is not enough for it"
+    );
+}
+
+/// **The destructive pair carry their unconfirmed values, and only those.**
+///
+/// `abandon_worktree` joined `rebase_worktree` on a dispatching route in
+/// `remote-control-ll5.4`. What makes that safe is unchanged from R7/R11: the
+/// forwarding row's payload comes from this table, so the first dispatch can
+/// only raise SPECS §5/§15's question, and 1g's typed-name step stands in front
+/// of a browser's answer to it.
+#[test]
+fn the_destructive_rows_can_only_ask() {
+    for (name, cmd) in [
+        (
+            names::ABANDON_WORKTREE,
+            Command::AbandonWorktree { confirm: false },
+        ),
+        (names::QUIT, Command::Quit { confirm: false }),
+    ] {
+        let spec = lookup(name).expect("the row is offered");
+        assert_eq!(dispatched_command(&spec.route), Some(&cmd));
+        assert_eq!(confirmation_of(&cmd), Confirmation::Pending);
+        assert!(
+            spec.refusal().is_none(),
+            "`{name}` runs now — it must not also claim it will be refused"
+        );
+        assert!(
+            spec.view().run.args.is_none(),
+            "`{name}` hands the browser no args to echo back"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

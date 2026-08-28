@@ -19,6 +19,7 @@ import type {
 import { shouldRetry } from "./model";
 import type { ConfigEdit, ConfigScope } from "./config";
 import type {
+  ConfirmGate,
   DialogChoice,
   DialogDraft,
   DialogKey,
@@ -369,12 +370,15 @@ export interface DialogState {
   readonly input: string | null;
   readonly list: readonly DialogChoice[];
   readonly buttons: readonly DialogKey[];
-  /** `false` when the host will refuse a confirm from a browser — the
-   * destructive family (`remote-control-ll5.4`) and the git family (`.5`).
-   * Cancelling stays available, which is why this is not "read-only". */
+  /** `false` when the host will refuse a confirm from a browser. Cancelling
+   * stays available, which is why this is not "read-only". */
   readonly confirmable: boolean;
   /** The sentence to show when `confirmable` is false. */
   readonly refusal: string | null;
+  /** Artboard 1g's second step, when the host put one in front of one of this
+   * dialog's buttons (`remote-control-ll5.4`, §6.5 R13). `null` — the common
+   * case — means every button is one press away. */
+  readonly gate: ConfirmGate | null;
   readonly draft: DialogDraft;
   readonly pending: readonly PendingDialogAnswer[];
   readonly lastOutcome: DialogOutcome | null;
@@ -723,6 +727,16 @@ export type AppAction =
   | { readonly type: "dialog/choose"; readonly index: number }
   /** `Tab`: 1e's `run from base branch`. Local until the confirm carries it. */
   | { readonly type: "dialog/toggle" }
+  /**
+   * Artboard 1g's step 1 → step 2: the gated button was pressed, so the name
+   * field opens. Deliberately **not** a frame — the host is told nothing until
+   * the name is typed and the confirm carries it, so pressing `y` on a
+   * destructive dialog from a browser commits to nothing at all.
+   */
+  | { readonly type: "dialog/advance" }
+  /** A printable character landed in 1g's name field. */
+  | { readonly type: "dialog/gateType"; readonly char: string }
+  | { readonly type: "dialog/gateBackspace" }
   /** A `dialog_confirm` / `dialog_cancel` was sent and the transport assigned
    * it `seq` — mirrors `palette/dispatched` and `config/dispatched`. */
   | {

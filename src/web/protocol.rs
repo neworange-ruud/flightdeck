@@ -996,9 +996,11 @@ pub enum DialogOrigin {
 /// destructive confirmation without a version bump; an unknown kind renders the
 /// generic form instead of failing to parse.
 ///
-/// M2 will add: a typed `body` (fields, options, the typed-session-name
-/// confirmation of artboard 1g), a `dangerous` flag, and the `host only` badges
-/// of D16.
+/// M2 added the typed [`DialogBody`] — fields, options, buttons, and artboard
+/// 1g's typed-session-name confirmation as [`ConfirmGate`] — inside the same
+/// free-form slot, with no version bump. No `dangerous` flag was needed: what a
+/// browser must do about a dangerous answer is the gate on the button that takes
+/// it, which is a fact rather than an adjective.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialogView {
     /// Stable dialog id.
@@ -1053,13 +1055,45 @@ pub struct DialogBody {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<DialogKey>,
     /// Whether this build accepts [`command::DIALOG_CONFIRM`] for this dialog.
-    /// `false` with a `refusal` is how a dialog whose confirmation belongs to a
-    /// later task (the two-step destructive confirmation, the git family) is
-    /// shown honestly instead of hidden — cancelling stays available either way.
+    /// `false` with a `refusal` is how a dialog a browser may see but not answer
+    /// is shown honestly instead of hidden — cancelling stays available either
+    /// way. Note that a dialog behind [`ConfirmGate`] is `true`: a browser *can*
+    /// confirm it, through the gate's second step.
     pub confirmable: bool,
     /// Why a browser may not confirm it, when `confirmable` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Artboard 1g's second step, when one of this dialog's buttons has one
+    /// (`specs/WEB_INTERFACE.md` §6.5 R13). Absent — the common case — means
+    /// every button this dialog shows is one press away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_gate: Option<ConfirmGate>,
+}
+
+/// Artboard 1g's **step 2**: the typed-name gate a remote surface must pass
+/// before one particular button lands (`specs/WEB_INTERFACE.md` §6.5 R13).
+///
+/// It is published rather than kept secret, because it is not a password: the
+/// artboard draws the expected name as the field's own hint. What it buys is
+/// deliberateness — the browser is not the machine the effect lands on, so the
+/// person answering has to name the thing they are about to destroy.
+///
+/// Only [`ConfirmGate::key`]'s button is gated. Every other button on the same
+/// dialog is one press away, because the gate stands in front of the *answer*
+/// that destroys work, not in front of the question.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmGate {
+    /// The [`DialogKey::key`] this gate guards (`y`, `a`). Any other button of
+    /// the same dialog — and cancelling, always — is unaffected.
+    pub key: String,
+    /// The name that must be typed back **exactly**: no trimming, no case
+    /// folding. The host compares against this same string, so what the browser
+    /// shows and what the host checks cannot drift.
+    pub expected: String,
+    /// 1g step 2's sentence, worded by the host and rendered verbatim — it says
+    /// *why* there is a second step ("this browser is remote") rather than
+    /// leaving the browser to invent a reason.
+    pub instruction: String,
 }
 
 /// One choice row of a [`DialogBody`].
@@ -1726,11 +1760,16 @@ pub mod command {
     /// Confirm the open dialog, whichever surface opened it (D13).
     ///
     /// `args` names the dialog and, when it has one, what the browser filled in:
-    /// `{ dialog_id, choice?, text?, toggle? }`. `choice` is the *key label* of a
-    /// button the dialog is currently showing (`y`, `1`, `i`, `Enter`) and `text`
-    /// is the input field's content, so a browser can only ever press a key the
-    /// dialog is offering — the same power the desktop's keyboard has and no
-    /// more.
+    /// `{ dialog_id, choice?, text?, toggle?, confirm_name? }`. `choice` is the
+    /// *key label* of a button the dialog is currently showing (`y`, `1`, `i`,
+    /// `Enter`) and `text` is the input field's content, so a browser can only
+    /// ever press a key the dialog is offering — the same power the desktop's
+    /// keyboard has and no more.
+    ///
+    /// `confirm_name` is artboard 1g's second step (see [`ConfirmGate`]): a
+    /// frame answering a gated button without it — or with a name that is not
+    /// exactly [`ConfirmGate::expected`] — is refused before a single key is
+    /// fed into the prompt, so the effect provably does not happen.
     pub const DIALOG_CONFIRM: &str = "dialog_confirm";
     /// Cancel the open dialog, whichever surface opened it (D13). `args` is
     /// `{ dialog_id }`; cancelling is the one dialog decision that is never

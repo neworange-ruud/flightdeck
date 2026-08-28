@@ -901,7 +901,10 @@ never read".
   with `GIT_DIALOG_REFUSAL` and remain cancellable (`remote-control-ll5.5`).
   *(The git half is superseded by R11: those three dialogs **are** SPECS §5's
   confirmation, so `remote-control-ll5.5` lifted the gate and
-  `GIT_DIALOG_REFUSAL` is gone. `abandon_worktree` is unchanged.)*
+  `GIT_DIALOG_REFUSAL` is gone. The abandon half is superseded by R13:
+  `remote-control-ll5.4` built 1g's two steps, so `abandon_worktree` is a
+  dispatching row and `DESTRUCTIVE_DIALOG_REFUSAL` is gone too — the refusal
+  became a gate on the confirm, and R11's rebase was pulled behind it.)*
   Cancelling is never gated: dismissing a confirmation cannot destroy anything,
   and a shared dialog a remote surface can see but not dismiss would be worse
   than not sharing it.
@@ -1182,6 +1185,120 @@ wrong, which on a security screen would print a confident wrong duration. Either
 value missing — an older host, or a tombstone with no time — renders *"withdrew
 this browser's access."* and stops. A zero is never sent, because zero is not a
 missing time, it is 1970.
+
+### R13 — 1g's second step is a remote-surface gate, and it is checked before a key is fed
+
+`remote-control-ll5.4`. Artboard 1g draws a destructive confirmation twice —
+`step 1 of 2` with the consequences and the keyed buttons, then `step 2 of 2 —
+confirm` with a field where the session's own name is typed back. Everything
+below follows from reading step 2's own copy.
+
+**The contradiction in 1g, and the ruling.** The caption says *"Abandon and Quit
+are the only two that reach step 2."* The artboard **draws Rebase Worktree** as
+its two-step example, and step 2's copy reads *"This browser is remote. Type the
+session name to run the rebase on the host."* The drawn artboard wins, and the
+copy says why: **the trigger is the surface being remote, not the command being
+destructive.** Read that way the caption is not wrong, it is counting a different
+world — the desktop's, where *nothing* reaches step 2, because the person
+answering is at the machine the effect lands on. That is what lets an enumeration
+of two stand beside a picture of a third.
+
+So the ruling is: **step 2 is a browser-only gate, and from a browser it covers
+the answers that destroy work or rewrite history** — §5/§15's **Abandon
+Worktree**, §5.1's **Rebase Worktree** (the one 1g actually draws) and D16's
+**Quit**. `Push Branch` and `Finish / Local Merge` stay one-step, explicitly:
+neither rewrites history nor discards anything — a push is undone by a push, a
+merge-back is a commit on the base branch — so 1g's friction there would be
+ceremony, and ceremony is what teaches people to type the name without reading
+it. The desktop's dialogs are untouched in every case.
+
+**This tightens R11 rather than extending it.** `remote-control-ll5.5` made the
+git confirmations answerable from a browser with one press; rebase's browser
+confirm now has to pass step 2 as well. Nothing about R11's boundary invariant
+moved: the row still carries `RebaseWorktree { confirm: false }`, the exception
+clause still names exactly one history-rewriting row, and
+`a_frame_cannot_smuggle_a_confirmed_rebase` still holds. The gate is strictly
+additional, and it is on the *answer*, not on the row.
+
+**The mechanism, and what is enforced by construction versus by check.**
+
+1. **Both destructive rows dispatch their unconfirmed value** —
+   `abandon_worktree` joins `rebase_worktree` on a palette route, and `quit`
+   joins them by gaining `Command::Quit { confirm }`. *By construction:* R7's
+   forwarding rule means the payload comes from `INVENTORY`, never from the
+   frame, so the first dispatch can only open D13's shared question.
+   `Confirmation::Given` remains unreachable from any row.
+2. **The desktop's quit is unchanged.** SPECS §23 asks the person at the keyboard
+   nothing, and this did not add a question: the desktop's palette row and
+   `Ctrl-q` carry `Quit { confirm: true }`. The confirmation is not a
+   browser-only flow either — it is a D13 dialog, shared, origin-tagged, and
+   answerable with one `y` from the desktop. Only an unconfirmed dispatch opens
+   it, and only the browser's row carries one.
+3. **The gate is host state, published with the dialog.** `DialogBody` gained
+   `confirm_gate: Option<ConfirmGate>` — the button key it guards, the exact
+   name to type, and the sentence saying why. All three are host-worded, so the
+   browser authors nothing about which dialogs are dangerous (R7 as amended by
+   ll5.12). `expected` is published rather than kept secret because 1g draws it
+   as the field's own hint: the gate buys deliberateness, not secrecy.
+4. **One function resolves the name, for both readers.** `gate_expectation`
+   answers what the browser is shown *and* what the confirm is checked against.
+   A second spelling of "which name is that" is how a gate becomes unpassable
+   or, worse, passable with the wrong name.
+5. **The gate guards one button, not the dialog.** The sidebar's close menu
+   (`a` Abandon / `c` Close) is deliberately **not** gated: `a` dispatches the
+   *unconfirmed* abandon, which asks — so the browser lands on the abandon
+   confirmation and takes step 2 there, once, in front of the button that
+   really does it.
+6. **The check runs before a single key is fed.** *By check, in exactly one
+   place:* `apply_web_dialog` compares `confirm_name` against `expected` and
+   returns before the synthetic keypresses begin. So "the effect provably does
+   not occur" is a property of the control flow — there is no rollback, because
+   nothing started. A frame with no name at all (an older browser, a replay) is
+   refused the same way, and cancelling never reaches the check at all.
+7. **The comparison is exact: no trimming, no case folding, no normalisation.**
+   A name that needs correcting before it matches is a name that was not read,
+   and git branch names are case-sensitive — a fold would accept a name the host
+   does not have. Both surfaces compare the same two strings the same way, so
+   the browser never enables a button the host is about to refuse.
+8. **A gate the host cannot resolve refuses.** If the session the question was
+   about is gone there is no name to check, so `confirmable: false` and
+   `GATE_UNRESOLVED_REFUSAL` — confirming past an unresolvable gate would
+   destroy something nobody named. Cancelling still works.
+
+**A confirmation raced by a takeover cannot slip through, and does not need a
+comparison to prove it.** The typed name rides on the deciding frame itself, so
+the host keeps no "this viewer is armed" state for a second browser to inherit —
+the seat that typed the name *is* the seat that confirms, structurally. What is
+left is D14's ordinary seat check, which runs before a command's route is even
+considered, so an evicted browser's confirm — correct name and all — is answered
+`read_only` and never reaches the host
+(`a_confirm_from_a_browser_that_lost_the_seat_never_reaches_the_host`).
+
+**Cancelling is never gated**, at either step, on either surface. R8's reason
+stands unchanged: a shared dialog a remote surface can see but not dismiss would
+be worse than not sharing it. The browser's step-2 panel keeps `Esc Cancel`
+enabled with a half-typed name in the field, and the host's `dialog_cancel` path
+returns before the gate is ever consulted.
+
+**What the browser contributes is a reading position, never a claim.**
+`draft.step` and `draft.confirmName` are local — 1g's step 1 sends nothing at
+all, so pressing `y` on a destructive dialog from a browser commits to nothing.
+`gateSatisfied` disables the confirm until the name matches, which is an
+affordance in front of the host's own check, not a substitute for it.
+
+**Tested on both sides, on the refusal paths first** (SPECS §26). Rust:
+`quitting_from_a_browser_takes_the_typed_project_name` (`ui.should_quit` is a
+boolean, so "it did not happen" is asserted directly),
+`a_destructive_confirmation_needs_the_exact_session_name` (wrong name, wrong
+case, trailing space, step 1 alone — the tab survives all of them and no decision
+is witnessed), `the_rewrite_is_gated_and_the_other_git_confirmations_are_not`
+(nothing reaches `GitExecutor::rebase_onto`),
+`a_gate_with_nothing_to_name_refuses_but_still_cancels`,
+`exactly_three_answers_are_behind_step_two_from_a_browser` (the ruling as a
+table, plus the check that a gate's key is a button the dialog really shows),
+and `the_desktop_answers_the_quit_dialog_with_one_key` (the ruling's other half).
+webui: the gate's exactness, the local advance that sends nothing, and every way
+of pressing `Enter` on a wrong name producing no frame at all.
 
 ---
 

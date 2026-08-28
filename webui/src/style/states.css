@@ -1286,9 +1286,33 @@
 }
 .fd-dialog__refusal[hidden],
 .fd-dialog__list[hidden],
+.fd-dialog__gate[hidden],
 .fd-dialog__field[hidden],
 .fd-dialog__status[hidden] {
   display: none;
+}
+/* Artboard 1g's step 2. The frame stays the dialog's own accent rather than
+ * turning red on its own: the *host* wrote the sentence above the field, and a
+ * colour this file chose would be the browser adding a claim of its own. */
+.fd-dialog__gate {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fd-dialog__gate-instruction {
+  color: var(--fd-text-soft);
+  line-height: 1.65;
+}
+/* Pushes 1g's hint to the right-hand edge of the field, where the artboard
+ * draws it. */
+.fd-dialog__gate-spacer {
+  flex: 1;
+}
+/* The name the host is waiting for, shown verbatim — 1g draws it as the
+ * field's own hint, because the gate buys deliberateness rather than secrecy. */
+.fd-dialog__gate-hint {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
 }
 .fd-dialog__list {
   display: flex;

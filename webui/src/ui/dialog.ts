@@ -1,8 +1,11 @@
 import {
+  atNameStep,
   branchFieldVisible,
   decidingKeys,
   dialogOriginLabel,
   dialogStatus,
+  gateSatisfied,
+  gatedKey,
   hasToggle,
   selectedChoice,
 } from "../state/dialog";
@@ -45,6 +48,24 @@ import type { Region } from "./dom";
  * `data-toggled` on the panel — one panel, not two components, because it is
  * one dialog in two states and the artboard draws them side by side only to
  * show both at once.
+ *
+ * ## Artboard 1g's two steps are the same panel again
+ *
+ * 1g draws a destructive confirmation twice: `step 1 of 2` with the
+ * consequences and the keyed buttons, then `step 2 of 2 — confirm` with a field
+ * where the session's own name is typed back. That is `draft.step` here, and it
+ * moves only when the button the *host* marked as gated is pressed
+ * (`dialog.gate.key`) — pressing it sends nothing, which is what makes step 1
+ * free of consequences.
+ *
+ * Two properties this component must not lose:
+ *
+ * 1. **`Esc Cancel` is never disabled, at either step.** R8: a shared dialog a
+ *    remote surface can see but not dismiss is worse than not sharing it.
+ * 2. **Nothing here decides what is dangerous.** The gate, its key, its expected
+ *    name and its sentence are all the host's (`protocol::ConfirmGate`); this
+ *    file draws them. A browser-authored list of destructive dialogs is exactly
+ *    what R7 removed from the palette.
  */
 
 export interface DialogOptions {
@@ -64,12 +85,14 @@ export function createDialog(
   options: DialogOptions = {},
   onChoose?: (index: number) => void,
   onToggle?: () => void,
+  onAdvance?: () => void,
 ): Region {
   const titleEl = el("span", { class: "fd-dialog__title" });
   const kindEl = el("span", { class: "fd-dialog__kind" });
   const originEl = el("div", { class: "fd-dialog__origin" });
   const refusalEl = el("div", { class: "fd-dialog__refusal" });
   const listEl = el("div", { class: "fd-dialog__list" });
+  const gateEl = el("div", { class: "fd-dialog__gate" });
   const fieldEl = el("div", { class: "fd-dialog__field" });
   const statusEl = el("div", { class: "fd-dialog__status" });
   const actionsEl = el("div", { class: "fd-dialog__actions" });
@@ -80,6 +103,7 @@ export function createDialog(
       originEl,
       refusalEl,
       listEl,
+      gateEl,
       fieldEl,
       statusEl,
       actionsEl,
@@ -105,6 +129,12 @@ export function createDialog(
     panel.setAttribute("data-kind", dialog.kind);
     panel.setAttribute("data-toggled", String(dialog.draft.toggled));
     panel.setAttribute("data-confirmable", String(dialog.confirmable));
+    /** 1g's `step 1 of 2` / `step 2 of 2`, as an attribute so the panel can be
+     * styled — and read by a test — without parsing the header's words. */
+    panel.setAttribute(
+      "data-step",
+      dialog.gate === null ? "" : String(dialog.draft.step),
+    );
 
     titleEl.textContent = dialog.title;
     /** 1e's right-hand header reads `no worktree` when run-from-base is on;
@@ -119,6 +149,7 @@ export function createDialog(
 
     renderRefusal(dialog);
     renderList(dialog);
+    renderGate(dialog);
     renderField(dialog);
     renderStatus(dialog);
     renderActions(dialog);
@@ -133,10 +164,56 @@ export function createDialog(
     refusalEl.textContent = refusal ?? "";
   }
 
+  /**
+   * 1g's step 2: the host's sentence, then the field, then the name it is
+   * waiting for — drawn to the right of the caret exactly as the artboard hints
+   * it. The hint is not a shortcut: it is `gate.expected` verbatim, which is the
+   * same string the host will compare against, so what the reader copies and
+   * what the host checks cannot drift.
+   */
+  function renderGate(dialog: DialogState): void {
+    clear(gateEl);
+    gateEl.hidden = !atNameStep(dialog);
+    if (!atNameStep(dialog) || dialog.gate === null) {
+      return;
+    }
+    const satisfied = gateSatisfied(dialog);
+    gateEl.append(
+      el("div", {
+        class: "fd-dialog__gate-instruction",
+        text: dialog.gate.instruction,
+      }),
+      el(
+        "div",
+        {
+          class: "fd-dialog__input",
+          attrs: { "data-satisfied": String(satisfied) },
+        },
+        [
+          el("span", {
+            class: "fd-dialog__typed",
+            text: dialog.draft.confirmName,
+          }),
+          el("span", {
+            class: "fd-dialog__caret",
+            text: " ",
+            attrs: { "aria-hidden": "true" },
+          }),
+          el("span", { class: "fd-dialog__gate-spacer" }),
+          el("span", {
+            class: "fd-dialog__gate-hint",
+            text: dialog.gate.expected,
+          }),
+        ],
+      ),
+    );
+  }
+
   function renderList(dialog: DialogState): void {
     clear(listEl);
-    listEl.hidden = dialog.list.length === 0;
-    if (dialog.list.length === 0) {
+    /** At step 2 the question has been read; the panel is about the name. */
+    listEl.hidden = dialog.list.length === 0 || atNameStep(dialog);
+    if (listEl.hidden) {
       return;
     }
     const selected = selectedChoice(dialog);
@@ -173,7 +250,7 @@ export function createDialog(
    */
   function renderField(dialog: DialogState): void {
     clear(fieldEl);
-    if (dialog.input === null) {
+    if (dialog.input === null || atNameStep(dialog)) {
       fieldEl.hidden = true;
       return;
     }
@@ -215,13 +292,30 @@ export function createDialog(
 
   function renderActions(dialog: DialogState): void {
     clear(actionsEl);
-    for (const button of decidingKeys(dialog)) {
+    if (atNameStep(dialog) && dialog.gate !== null) {
+      /** Step 2 offers one verb and a cancel, as 1g draws it. The verb keeps
+       * the label the host printed on the button at step 1 — `Abandon
+       * (force)`, `Quit`, `Rebase` — rather than a word this file invented. */
+      const gated = dialog.buttons.find((b) => b.key === dialog.gate?.key);
+      const label = gated?.label ?? "Confirm";
       actionsEl.append(
         action(
           "primary",
-          button,
-          dialog.confirmable,
-          () => options.onConfirm?.(button.key),
+          { key: "Enter", label },
+          dialog.confirmable && gateSatisfied(dialog),
+          () => options.onConfirm?.(dialog.gate?.key ?? "Enter"),
+        ),
+      );
+      actionsEl.append(cancelAction());
+      return;
+    }
+    for (const button of decidingKeys(dialog)) {
+      /** The gated button does not decide anything at step 1: it opens step 2,
+       * locally, and the host hears nothing until a name is typed. */
+      const gated = gatedKey(dialog, button.key);
+      actionsEl.append(
+        action("primary", button, dialog.confirmable, () =>
+          gated ? onAdvance?.() : options.onConfirm?.(button.key),
         ),
       );
     }
@@ -233,13 +327,18 @@ export function createDialog(
         actionsEl.append(row);
       }
     }
-    /** `Esc Cancel` is added by this component rather than read off the host's
-     * buttons: not every dialog lists one (the y/n confirmations use `n`), and
-     * D13 gives every dialog a cancel from either surface. */
-    actionsEl.append(
-      action("tertiary", { key: "Esc", label: "Cancel" }, true, () =>
-        options.onCancel?.(),
-      ),
+    actionsEl.append(cancelAction());
+  }
+
+  /** `Esc Cancel` is added by this component rather than read off the host's
+   * buttons: not every dialog lists one (the y/n confirmations use `n`), and
+   * D13 gives every dialog a cancel from either surface. **Always enabled, at
+   * both of 1g's steps** — dismissing a confirmation cannot destroy anything,
+   * and a shared dialog a remote surface can see but not dismiss would be worse
+   * than not sharing it (R8). */
+  function cancelAction(): HTMLElement {
+    return action("tertiary", { key: "Esc", label: "Cancel" }, true, () =>
+      options.onCancel?.(),
     );
   }
 
@@ -275,6 +374,11 @@ function action(
 /** The header's right-hand hint: the keys this dialog is waiting for, in 1e's
  * own words where it has them. */
 function keyHintFor(dialog: DialogState): string {
+  /** 1g prints the step count where every other dialog prints its keys — it is
+   * the one thing worth knowing about a dialog that has two panels. */
+  if (dialog.gate !== null) {
+    return dialog.draft.step === 2 ? "step 2 of 2 — confirm" : "step 1 of 2";
+  }
   const parts: string[] = [];
   if (dialog.list.length > 1) {
     parts.push("↑/↓ choose");

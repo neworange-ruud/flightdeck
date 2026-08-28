@@ -99,7 +99,10 @@ function newAgentFromDesktop(): WireDialogView {
   return { ...newAgentFromBrowser(), origin: { origin: "desktop" } };
 }
 
-/** A destructive confirmation: shared, cancellable, not confirmable from here. */
+/**
+ * Artboard 1g's destructive confirmation: shared, cancellable, and confirmable
+ * only through the typed-name step the host published with it.
+ */
 function abandonFromDesktop(): WireDialogView {
   return {
     dialog_id: "dialog-9",
@@ -112,9 +115,50 @@ function abandonFromDesktop(): WireDialogView {
         { key: "y", label: "Abandon (force)" },
         { key: "n", label: "Cancel" },
       ],
+      confirmable: true,
+      confirm_gate: {
+        key: "y",
+        expected: "fix-login-redirect",
+        instruction:
+          "This browser is remote. Type the session name to abandon the worktree on the host.",
+      },
+    },
+  };
+}
+
+/** A plain y/n confirmation with no second step — SPECS §19's close-shell. */
+function closeTerminalFromDesktop(): WireDialogView {
+  return {
+    dialog_id: "dialog-4",
+    kind: "close_terminal",
+    title: "Close shell 2?",
+    origin: { origin: "desktop" },
+    body: {
+      buttons: [
+        { key: "y", label: "Close" },
+        { key: "n", label: "Cancel" },
+      ],
+      confirmable: true,
+    },
+  };
+}
+
+/**
+ * The one dialog this build still refuses to confirm from a browser: a gate
+ * whose subject the host can no longer name, because the session it asked about
+ * is gone. Cancelling stays available, as it does everywhere.
+ */
+function unresolvedGateFromDesktop(): WireDialogView {
+  return {
+    ...abandonFromDesktop(),
+    body: {
+      buttons: [
+        { key: "y", label: "Abandon (force)" },
+        { key: "n", label: "Cancel" },
+      ],
       confirmable: false,
       refusal:
-        "Abandoning a worktree discards work, and from a browser that needs artboard 1g's two-step confirmation.",
+        "The host can no longer name what this would destroy — the session it asked about is gone. Cancel this dialog and start again.",
     },
   };
 }
@@ -255,20 +299,14 @@ describe("answering, and who is allowed to", () => {
 
   it("a keyed button fires that button, on a dialog with no text field", () => {
     const h = render();
-    h.open({
-      ...abandonFromDesktop(),
-      body: { ...abandonFromDesktop().body, confirmable: true },
-    });
+    h.open(closeTerminalFromDesktop());
     h.key("y");
     expect(h.answers).toEqual(["y"]);
   });
 
   it("a key the dialog is not showing does nothing", () => {
     const h = render();
-    h.open({
-      ...abandonFromDesktop(),
-      body: { ...abandonFromDesktop().body, confirmable: true },
-    });
+    h.open(closeTerminalFromDesktop());
     h.key("q");
     expect(h.answers).toEqual([]);
   });
@@ -284,10 +322,10 @@ describe("answering, and who is allowed to", () => {
 describe("a dialog this build will not confirm from a browser", () => {
   it("shows the host's refusal and disables the confirm", () => {
     const h = render();
-    h.open(abandonFromDesktop());
+    h.open(unresolvedGateFromDesktop());
 
     expect(h.q(".fd-dialog__refusal").hidden).toBe(false);
-    expect(h.text(".fd-dialog__refusal")).toContain("two-step confirmation");
+    expect(h.text(".fd-dialog__refusal")).toContain("no longer name");
     const abandon = h
       .all(".fd-dialog__action")
       .find((b) => b.getAttribute("data-key") === "y");
@@ -298,13 +336,161 @@ describe("a dialog this build will not confirm from a browser", () => {
 
   it("still offers Cancel — dismissing cannot destroy anything", () => {
     const h = render();
-    h.open(abandonFromDesktop());
+    h.open(unresolvedGateFromDesktop());
     const cancel = h
       .all(".fd-dialog__action")
       .find((b) => b.getAttribute("data-key") === "Esc");
     expect(cancel?.hasAttribute("disabled")).toBe(false);
     cancel?.click();
     expect(h.answers).toEqual([null]);
+  });
+});
+
+/**
+ * **Artboard 1g, end to end in the browser** (`remote-control-ll5.4`, §6.5 R13).
+ *
+ * Every test here is a refusal path: the ones that matter are the ones proving
+ * no `dialog_confirm` frame left this tab. `h.answers` is that proof — it
+ * records what `main.ts` would have sent, so an empty array is "nothing was
+ * answered", not "we did not look".
+ */
+describe("the two-step destructive confirmation (1g)", () => {
+  it("opens at step 1, with the consequences and the keyed buttons", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    expect(h.q(".fd-dialog__panel").getAttribute("data-step")).toBe("1");
+    expect(h.text(".fd-dialog__kind")).toBe("step 1 of 2");
+    expect(h.q(".fd-dialog__gate").hidden).toBe(true);
+    /** The question is the host's own words, read before anything is decided. */
+    expect(h.text(".fd-dialog__title")).toContain("abandon it?");
+  });
+
+  it("pressing the gated button opens step 2 and sends nothing", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+    expect(h.answers).toEqual([]);
+    expect(h.q(".fd-dialog__panel").getAttribute("data-step")).toBe("2");
+    expect(h.text(".fd-dialog__kind")).toBe("step 2 of 2 — confirm");
+    expect(h.q(".fd-dialog__gate").hidden).toBe(false);
+    /** The host's sentence, and the name it is waiting for, both verbatim. */
+    expect(h.text(".fd-dialog__gate-instruction")).toContain(
+      "This browser is remote",
+    );
+    expect(h.text(".fd-dialog__gate-hint")).toBe("fix-login-redirect");
+  });
+
+  it("clicking the gated button does the same thing the key does", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.all(".fd-dialog__action")
+      .find((b) => b.getAttribute("data-key") === "y")
+      ?.click();
+    expect(h.answers).toEqual([]);
+    expect(h.q(".fd-dialog__panel").getAttribute("data-step")).toBe("2");
+  });
+
+  it("refuses to send a wrong or partial name", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+
+    for (const char of "fix-login-redi") {
+      h.key(char);
+    }
+    expect(h.text(".fd-dialog__typed")).toBe("fix-login-redi");
+    const confirm = () =>
+      h.all(".fd-dialog__action").find((b) => b.getAttribute("data-key") === "Enter");
+    expect(confirm()?.hasAttribute("disabled")).toBe(true);
+
+    /** Neither the key nor the click gets a frame out. */
+    h.key("Enter");
+    confirm()?.click();
+    expect(h.answers).toEqual([]);
+
+    /** And the panel has not moved on: the question is still on screen. */
+    expect(h.q(".fd-dialog").hidden).toBe(false);
+    expect(h.q(".fd-dialog__panel").getAttribute("data-step")).toBe("2");
+  });
+
+  it("refuses a name that differs only in case or whitespace", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+    for (const char of "Fix-Login-Redirect") {
+      h.key(char);
+    }
+    h.key("Enter");
+    expect(h.answers).toEqual([]);
+
+    /** Same for a trailing space, once the letters are right. */
+    const h2 = render();
+    h2.open(abandonFromDesktop());
+    h2.key("y");
+    for (const char of "fix-login-redirect ") {
+      h2.key(char);
+    }
+    h2.key("Enter");
+    expect(h2.answers).toEqual([]);
+  });
+
+  it("sends the gated key once the name matches exactly", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+    for (const char of "fix-login-redirect") {
+      h.key(char);
+    }
+    const confirm = h
+      .all(".fd-dialog__action")
+      .find((b) => b.getAttribute("data-key") === "Enter");
+    expect(confirm?.hasAttribute("disabled")).toBe(false);
+    /** 1g prints the host's own verb on step 2's button. */
+    expect(confirm?.textContent).toContain("Abandon (force)");
+
+    h.key("Enter");
+    expect(h.answers).toEqual(["y"]);
+    /** Still the host's to close: an answer is not an outcome. */
+    expect(h.q(".fd-dialog").hidden).toBe(false);
+  });
+
+  it("a backspace takes the confirm away again", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+    for (const char of "fix-login-redirect") {
+      h.key(char);
+    }
+    h.key("Backspace");
+    h.key("Enter");
+    expect(h.answers).toEqual([]);
+  });
+
+  it("cancels from step 2 with no name typed at all", () => {
+    /** R8's property, at the step where it is easiest to lose: dismissing a
+     * confirmation cannot destroy anything, so it is never gated. */
+    const h = render();
+    h.open(abandonFromDesktop());
+    h.key("y");
+    h.key("f");
+    const cancel = h
+      .all(".fd-dialog__action")
+      .find((b) => b.getAttribute("data-key") === "Esc");
+    expect(cancel?.hasAttribute("disabled")).toBe(false);
+    h.key("Escape");
+    expect(h.answers).toEqual([null]);
+  });
+
+  it("leaves an ungated dialog answering on the first press", () => {
+    /** The gate is the host's per-button answer, not a browser-side rule about
+     * dialogs that look dangerous: a `y`/`n` confirmation with no gate still
+     * decides on `y`. */
+    const h = render();
+    h.open(closeTerminalFromDesktop());
+    expect(h.q(".fd-dialog__panel").getAttribute("data-step")).toBe("");
+    h.key("y");
+    expect(h.answers).toEqual(["y"]);
+    expect(h.q(".fd-dialog__gate").hidden).toBe(true);
   });
 });
 

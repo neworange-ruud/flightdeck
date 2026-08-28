@@ -241,12 +241,23 @@ describe("the palette is the host's inventory", () => {
   it("shows the host's own refusal sentence on the row, word for word", () => {
     const h = render();
     h.key("g", { ctrlKey: true });
-    const host = fixtureCommands().find((c) => c.id === "abandon_worktree");
+    const host = fixtureCommands().find(
+      (c) => c.id === "open_worktree_in_file_manager",
+    );
     expect(host?.refusal).toBeTruthy();
-    const row = rowLabelled(h, "Abandon Worktree");
+    const row = rowLabelled(h, "Open Worktree in File Manager");
     expect(row?.title).toBe(host?.refusal);
-    /** The tag beside it is the host's word too — not a local "refused". */
+  });
+
+  it("marks a destructive row the host runs without claiming it is refused", () => {
+    /** `abandon_worktree` dispatches since `remote-control-ll5.4`, so the tag
+     * beside it is the host's word (`destructive`) and there is no refusal to
+     * show — the second step lives on the dialog it opens, not on the row. */
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    const row = rowLabelled(h, "Abandon Worktree");
     expect(row?.textContent).toContain("destructive");
+    expect(row?.title).toBe("");
   });
 
   it("leaves no title on a row the host runs", () => {

@@ -233,7 +233,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
         group: "Global",
         label: "Quit",
-        action: PaletteAction::Dispatch(Command::Quit),
+        action: PaletteAction::Dispatch(Command::Quit { confirm: true }),
     },
 ];
 
@@ -671,7 +671,14 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.set_filter("quit");
         let action = palette.selected_action().expect("should match Quit");
-        assert_eq!(action, &PaletteAction::Dispatch(Command::Quit));
+        // The desktop's row carries the *confirmed* value: SPECS §23 asks the
+        // person at this keyboard nothing further. The browser's row carries
+        // `confirm: false` and lands on the shared dialog instead (D16,
+        // `specs/WEB_INTERFACE.md` §6.5 R13).
+        assert_eq!(
+            action,
+            &PaletteAction::Dispatch(Command::Quit { confirm: true })
+        );
     }
 
     #[test]

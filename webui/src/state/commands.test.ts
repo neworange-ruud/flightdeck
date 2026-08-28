@@ -275,11 +275,24 @@ describe("D16 and refusals come from the host, never from here", () => {
 
   it("carries the host's refusal sentence verbatim", () => {
     const commands = paletteInventory(stateWithSnapshot());
-    const abandon = commands.find((c) => c.run.name === "abandon_worktree");
-    expect(abandon?.refusal).toBe(hostRow("abandon_worktree").refusal);
-    expect(abandon?.refusal).toContain("two-step confirmation");
-    /** …and the tag beside it is the host's word too, not "refused". */
-    expect(abandon?.annotation).toBe("destructive");
+    const badged = commands.find(
+      (c) => c.run.name === "open_worktree_in_file_manager",
+    );
+    expect(badged?.refusal).toBe(hostRow("open_worktree_in_file_manager").refusal);
+    expect(badged?.refusal).toContain("machine this browser is on");
+  });
+
+  it("carries the host's annotation on a destructive row it does run", () => {
+    /** `abandon_worktree` and `quit` stopped being refusals in
+     * `remote-control-ll5.4` — the second step moved onto the dialog they open
+     * (§6.5 R13). The tag beside them is still the host's word, and the browser
+     * did not invent a refusal to replace the one that went away. */
+    const commands = paletteInventory(stateWithSnapshot());
+    for (const name of ["abandon_worktree", "quit"]) {
+      const row = commands.find((c) => c.run.name === name);
+      expect(row?.annotation).toBe("destructive");
+      expect(row?.refusal).toBeNull();
+    }
   });
 
   it("a row the host runs carries no refusal", () => {
@@ -289,7 +302,7 @@ describe("D16 and refusals come from the host, never from here", () => {
 
   it("a refused row is still offered — visible and honest beats hidden", () => {
     const commands = paletteInventory(stateWithSnapshot());
-    for (const name of ["quit", "pull_base", "show_git_status", "pair_phone"]) {
+    for (const name of ["pull_base", "show_git_status", "pair_phone"]) {
       const row = commands.find((c) => c.run.name === name);
       expect(row).toBeDefined();
       expect(row?.refusal).not.toBeNull();

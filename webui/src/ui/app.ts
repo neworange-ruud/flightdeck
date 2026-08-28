@@ -1,5 +1,12 @@
 import { accessCopy, canSubmit } from "../state/access";
-import { decidingKeys, hasToggle, primaryKey } from "../state/dialog";
+import {
+  atNameStep,
+  decidingKeys,
+  gateSatisfied,
+  gatedKey,
+  hasToggle,
+  primaryKey,
+} from "../state/dialog";
 import { highlightedCommand } from "../state/commands";
 import type { PaletteCommand } from "../state/commands";
 import type { ConfigSaveRequest } from "../state/config";
@@ -176,6 +183,9 @@ export function createApp(options: AppOptions): App {
     },
     (index) => store.dispatch({ type: "dialog/choose", index }),
     () => store.dispatch({ type: "dialog/toggle" }),
+    /** 1g step 1 → step 2. Local, and sends nothing: pressing the destructive
+     * button from a browser opens the name field, it does not answer. */
+    () => store.dispatch({ type: "dialog/advance" }),
   );
 
   const statusBar = createStatusBar({
@@ -622,6 +632,30 @@ export function createApp(options: AppOptions): App {
       options.onAnswerDialog?.(null);
       return true;
     }
+    /** Artboard 1g's step 2 takes the keyboard whole: the panel is one field
+     * and two keys. `Esc` above it is deliberately *first*, so cancelling out
+     * of a half-typed name never needs the name (R8). */
+    if (atNameStep(dialog)) {
+      event.preventDefault();
+      if (event.key === "Enter") {
+        /** A confirm the host would refuse is not sent: the browser does not
+         * spend a round trip to be told what it can already see. The host
+         * checks the same name anyway — this is the affordance, not the
+         * enforcement. */
+        if (gateSatisfied(dialog) && dialog.gate !== null) {
+          options.onAnswerDialog?.(dialog.gate.key);
+        }
+        return true;
+      }
+      if (event.key === "Backspace") {
+        store.dispatch({ type: "dialog/gateBackspace" });
+        return true;
+      }
+      if (event.key.length === 1) {
+        store.dispatch({ type: "dialog/gateType", char: event.key });
+      }
+      return true;
+    }
     if (event.key === "Tab") {
       /** Only claimed by a dialog that has the option; otherwise `Tab` stays
        * the browser's, so a keyboard-only user can still reach the buttons. */
@@ -643,7 +677,12 @@ export function createApp(options: AppOptions): App {
     if (event.key === "Enter") {
       event.preventDefault();
       const primary = primaryKey(dialog);
-      options.onAnswerDialog?.(primary === null ? "Enter" : primary.key);
+      const key = primary === null ? "Enter" : primary.key;
+      if (gatedKey(dialog, key)) {
+        store.dispatch({ type: "dialog/advance" });
+        return true;
+      }
+      options.onAnswerDialog?.(key);
       return true;
     }
     if (event.key === "Backspace") {
@@ -667,7 +706,14 @@ export function createApp(options: AppOptions): App {
         (button) => button.key === event.key,
       );
       if (pressed !== undefined) {
-        options.onAnswerDialog?.(pressed.key);
+        /** The gated key (1g's `y`) opens step 2 instead of answering — the
+         * same thing clicking the button does, because they are the same
+         * press. */
+        if (gatedKey(dialog, pressed.key)) {
+          store.dispatch({ type: "dialog/advance" });
+        } else {
+          options.onAnswerDialog?.(pressed.key);
+        }
       }
       return true;
     }

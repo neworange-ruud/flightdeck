@@ -714,6 +714,55 @@ export function reduce(state: AppState, action: AppAction): AppState {
       };
     }
 
+    /* --- artboard 1g's second step (ll5.4, §6.5 R13) -------------------- */
+
+    case "dialog/advance": {
+      /** Only a gated dialog has a second panel to advance to. Everything else
+       * decides on the first press, exactly as it does on the desktop. */
+      const dialog = state.dialog;
+      if (dialog === null || dialog.gate === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: { ...dialog, draft: { ...dialog.draft, step: 2 } },
+      };
+    }
+
+    case "dialog/gateType": {
+      const dialog = state.dialog;
+      if (dialog === null || dialog.gate === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          draft: {
+            ...dialog.draft,
+            confirmName: dialog.draft.confirmName + action.char,
+          },
+        },
+      };
+    }
+
+    case "dialog/gateBackspace": {
+      const dialog = state.dialog;
+      if (dialog === null || dialog.gate === null) {
+        return state;
+      }
+      return {
+        ...state,
+        dialog: {
+          ...dialog,
+          draft: {
+            ...dialog.draft,
+            confirmName: dialog.draft.confirmName.slice(0, -1),
+          },
+        },
+      };
+    }
+
     case "dialog/dispatched": {
       const dialog = state.dialog;
       if (dialog === null) {
