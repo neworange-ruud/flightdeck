@@ -75,6 +75,43 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   involved: reaching it from outside your network is deliberately your own choice
   of Tailscale, `ssh -L` or a tunnel.
 
+- **FlightDeck Web can now drive FlightDeck, not just watch it.** The browser
+  gets the command palette, the dialog family, the configuration manager and
+  split view — every one of them driving the same code the desktop drives, so
+  there is no second implementation to drift. The palette is the host's own
+  command list sent over the wire rather than a copy maintained in the browser:
+  if the desktop cannot run a command, the browser does not offer it, and when a
+  command is offered but would be refused, the row carries the host's own
+  sentence explaining why instead of failing on click. Actions whose effect
+  lands on the machine FlightDeck is running on — opening a worktree in the file
+  manager, `$EDITOR` — stay visible with a `host only` badge rather than being
+  hidden, because a missing command is more confusing than an honest one.
+  Dialogs are shared state: one opens on both surfaces at once, tagged with who
+  opened it, and either surface can answer it.
+
+  **Git commands work from the browser** — push, finish / local merge and rebase
+  worktree — and they refuse in the same words the desktop would use, so a dirty
+  base or a missing upstream reads as itself rather than as a generic failure.
+  What FlightDeck will not do to your history is unchanged and is enforced by
+  construction rather than by a check: no browser-reachable path can rewrite
+  history except the one rebase the specification sanctions, and none can open a
+  pull request. Pull Base deliberately stays desktop-only, and says so.
+
+  **Anything destructive asks twice from a browser and makes you type the name.**
+  Abandon Worktree, Rebase Worktree and Quit all take a second step in which you
+  type the session's name exactly — no trimming, no case folding — because a
+  browser is not the machine the damage lands on. Getting it wrong refuses and
+  changes nothing; cancelling is never gated, at either step. The desktop's own
+  dialogs are unchanged: it is the remoteness that earns the second step, not
+  the command.
+
+  Smaller things you will notice: a finished session's activity row now says how
+  many files it touched, counted by asking git at the moment it finished rather
+  than reusing a cached number that would be stale or missing; and when a viewer
+  takes a seat, its address, browser and how long it has been connected are three
+  separate facts rather than one string, with every time it prints dated against
+  the host's clock instead of the browser's.
+
 ### Improvements
 
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
