@@ -48,6 +48,8 @@ burden.
 
 > **Cost accepted:** "control it from the train" requires third-party setup.
 > A relay-tunnelled transport is not ruled out later, but is out of scope here.
+> **D17 settles what this left open:** not pursued for the current architecture,
+> which makes this cost permanent rather than provisional.
 
 ### D2 — Terminal model: raw PTY bytes, xterm.js parses
 
@@ -174,15 +176,40 @@ toggling from the browser, destructive operations.
   "FlightDeck Remote" row in the configuration manager.
 - The token persists, so bookmarks keep working across restarts.
 
-### D11 — Notifications: in-app activity feed only in M1
+### D11 — Notifications: in-app activity feed only, and no Web Push
 
 A visible list of status transitions inside the app. No permission prompt, no
 service worker, no push infrastructure — works identically in every browser on
 every platform.
 
-Web Push is not merely deferred but **structurally blocked** under D1: Web Push
-requires a publicly reachable sender, and a loopback-bound server with no relay
-has none. It realistically waits for a relay-tunnelled transport.
+Web Push is not merely deferred but **structurally blocked** under D1, and D17
+makes that **permanent for the current architecture** rather than an M1
+limitation. There is no milestone in which it arrives.
+
+The blocking mechanism is the secure-context rule. A service worker — the thing
+that receives a push when no tab is open — registers only in a secure context.
+`http://127.0.0.1` qualifies, but loopback is the one place push is pointless:
+the desktop is on that machine and already notifies natively. The address a
+*remote* browser actually uses is the LAN one from D5/Q1
+(`http://192.168.2.20:<port>`), which is **not** a secure context, so no service
+worker registers and no subscription is ever created. Serving that address over
+HTTPS would need a certificate for a private IP, which no public CA issues.
+
+**What would have to change first, in order: reachability, then browser key
+custody, then push.** A relay transport is the only thing that supplies a public
+HTTPS origin without third-party setup, and D17 declines to build one — for
+reasons about key custody and PTY volume, not about notifications. So the
+activity feed (§5.1) is the whole notification story, and a browser with no
+FlightDeck tab open is silent by design.
+
+> **One honest exception, recorded so nobody finds it and concludes the spec was
+> wrong.** A user who has already paid D1's cost with an **HTTPS-terminating**
+> tunnel (Cloudflare, Tailscale Funnel) is in a secure context and could
+> subscribe. That does not make Web Push a FlightDeck feature: it would need
+> VAPID keys and a push sender in the binary, and it would work for that subset
+> of users while doing nothing at all for everyone else. Whether that narrow
+> version earns its keep is a separate and much smaller question. D17 does not
+> decide it and no milestone carries it.
 
 ### D12 — Wire protocol: a new web-only protocol in its own module
 
@@ -265,6 +292,92 @@ effect lands rather than being hidden.
 than a badge from a remote surface; it inherits the two-step confirmation
 treatment from artboard 1g.
 
+### D17 — Relay-tunnelled transport: not pursued · **provisional**
+
+D1 left one thread hanging — *"a relay-tunnelled transport is not ruled out
+later"* — and §4 carried it into M3 as "if pursued", which is not a plan. This
+settles it. **FlightDeck Web does not get a relay-tunnelled transport in the
+current architecture.** Reaching the embedded server from outside the network
+stays exactly what D1 made it: the user's own Tailscale, `ssh -L`, or Cloudflare
+tunnel. Those work today, on every platform, and cost us no code.
+
+Three reasons, heaviest first.
+
+**1. The browser cannot hold the key the phone holds.** A relay transport
+re-introduces precisely what D1 removed — relay involvement *and* E2E crypto in
+the browser — and the phone's model does not transfer. `REMOTE_PROTOCOL.md` §7.1
+derives the channel from a **static-static P-256 ECDH** between long-lived
+key-agreement keypairs with **no forward secrecy in v1**, which is only
+defensible because of where those keys live and who writes the code that uses
+them: on iOS the identity key is Secure-Enclave-resident and non-exportable, the
+software KA key sits in the app's Keychain behind the sandbox, and the code that
+applies it is App Store–delivered and OS-verified.
+
+A browser can hold *something*. WebCrypto generates a non-extractable
+`CryptoKey`, IndexedDB stores it, and the private scalar is then unreadable from
+JavaScript. That solves exfiltration, which is not the problem. The key is bound
+to an origin, and **whoever serves the origin writes the code that uses the
+key** — so a relay that both routes ciphertext and serves the SPA can ship one
+build of the JavaScript that seals to a key of its own, and no user can detect
+it. "Zero-knowledge relay" and "the relay serves the client" cannot both be true.
+Fixing that means the page must come from somewhere the relay does not control,
+which is the host you cannot reach, which is the problem we started with.
+WebAuthn does not rescue it — passkeys sign, they do not do ECDH. And
+non-extractable keys are erased by "clear site data", by private windows and by
+storage eviction, so pairing becomes something the user re-does at intervals
+nobody can predict.
+
+That is an unsolved security design question, not plumbing waiting on a sprint.
+It is why this decision is a "no" rather than a "later".
+
+**2. It puts raw PTY bytes through a relay built for curated envelopes.** D2
+requires the *actual* byte stream so xterm.js can parse it, which means the relay
+may not summarise, coalesce or drop. `remote/relay` is not shaped for that: it
+routes discrete `ciphertext` envelopes by `pairing_id`, sequences them, persists
+per-pairing queues, prunes on cumulative ack, and bounds each queue by **envelope
+count** with drop-oldest on overflow (`remote/relay/src/queue.rs`). Every one of
+those properties assumes a message that is individually meaningful and
+individually droppable. For a VT byte stream, drop-oldest is not a lost
+notification — it is a corrupted parser state.
+
+The volume differs in kind, not degree. What dominates it is bulk program
+output: `cargo build`, a test run scrolling, an agent streaming tokens, a
+full-screen TUI repainting, one stream per live terminal. The phone protocol
+never carries any of that, because `specs/MOBILE_REMOTE_BRIEFING.md` exists
+precisely to curate it away — the phone's traffic is bounded by how much a human
+reads, the browser's by how fast a compiler writes. And the relay is New
+Orange–operated infrastructure, so that egress is billed to us, per user, per
+unbounded session, with an authenticated pairing becoming a general-purpose byte
+pipe for anyone who wants one.
+
+**3. Nothing else in M3 needs it.** Multi-viewer and the narrow-viewport layout
+are local-transport features. Removing the transport question from M3 is what
+lets M3 ship.
+
+> **Cost accepted, and it is user-facing.** Three things are foreclosed, plainly:
+>
+> 1. **Web Push is permanently unavailable** for this architecture, not deferred
+>    — see D11. FlightDeck Web will never raise an OS notification or wake a
+>    phone; the in-app activity feed is the entire story, and it is silent when
+>    no tab is open.
+> 2. **"Control it from the train" keeps its third-party setup cost**, which D1
+>    already accepted — now permanently rather than for one milestone. A user
+>    with no Tailscale and no tunnel cannot reach FlightDeck from anywhere but
+>    their own network, and documentation carries that burden indefinitely.
+> 3. **The project keeps two reachability models on purpose** — relay for the
+>    phone, the user's own network for the browser. They will not converge, and
+>    anyone asking "how do I reach FlightDeck" must answer "from which surface"
+>    first.
+>
+> **Provisional, pending the repository owner's ratification** — marked in §6's
+> sense: build against it, do not wait on it. Two things reopen it: a concrete
+> demand for Web Push that the activity feed demonstrably cannot answer, or a
+> browser key-custody design that survives reason 1 — specifically one where the
+> code that uses the key is not delivered by the party the crypto defends
+> against. Either reopens this as a design question, not as an epic. **No
+> implementation epic is filed, deliberately**: filing one would assert the
+> "if pursued" branch this decision declines.
+
 ---
 
 ## 3. Architecture
@@ -299,7 +412,7 @@ treatment from artboard 1g.
 | **M0** | Port the relay client to tokio (D6/D7 step 1); fix `5qu`, `zv3`, `aew` in async code; reconcile with `2jy`. **Prerequisite for M1.** |
 | **M1** | Embedded axum server, token auth + access overlay, palette start/stop + config opt-in, web protocol v1, `webui/` SPA against artboards 1a–1c and 2a–2g, live state, raw terminal streaming, terminal input, takeover **plus read-only observers** (D14), activity feed, Rust integration tests + Playwright job. |
 | **M2** | Command palette, the dialog family with origin labels, git commands, destructive operations with two-step confirmation, configuration manager, split view (1c–1g). |
-| **M3** | Multi-viewer, narrow-viewport/slide-over layout, and — if pursued — a relay-tunnelled transport (which is what unblocks Web Push). |
+| **M3** | Multi-viewer (the viewer panel as rows, over D14's existing fan-out) and the narrow-viewport / slide-over layout, with the turn-3 designs those need (§5). **No relay transport, and therefore no Web Push** — see D17 and D11. |
 
 ---
 
@@ -1079,6 +1192,10 @@ missing time, it is 1970.
   connection and staleness states, takeover, activity feed, reference sheet.
 - `specs/REMOTE_PROTOCOL.md` §8–§9 — the phone protocol we are deliberately *not*
   extending (D12).
+- `specs/REMOTE_PROTOCOL.md` §7 — the phone's static-static P-256 ECDH and the key
+  custody it rests on; the model D17 finds does not transfer to a browser.
+- `remote/relay/src/queue.rs` — the per-pairing, envelope-counted, drop-oldest
+  queue behind D17's second reason.
 - `specs/SPECS.md` §19–§24 — terminal model, layout, git panel, interaction model,
   keyboard modes, status detection.
 - `src/lib.rs:5387-5405` — `sync_terminal_sizes` / `resize_if_changed`, the per-frame
