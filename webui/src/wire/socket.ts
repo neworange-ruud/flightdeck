@@ -77,6 +77,18 @@ export interface SessionSocket {
    * `command/result`.
    */
   sendCommand(name: string, args?: unknown): number;
+  /**
+   * Re-`Attach` asking for a different seat (D14, 2f).
+   *
+   * Takeover has no dedicated frame — `take_over` is an `Attach`, and it both
+   * seats this browser as a writer and takes the input lock from whoever holds
+   * it. `observe` gives up contending altogether; `write` asks only for the
+   * role, which is never refused.
+   *
+   * The host answers every one of them with a `Snapshot` and a `Delta::Seats`,
+   * so nothing here has to guess what it got.
+   */
+  requestSeat(seat: "write" | "take_over" | "observe"): void;
   close(): void;
 }
 
@@ -256,7 +268,7 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
             : null;
         store.dispatch({
           type: "seats/changed",
-          seat: (frame.you as "controlling" | "observing") ?? "observing",
+          seat: (frame.you as "writing" | "observing") ?? "observing",
           /** The same mapping the snapshot path uses, deliberately: 2f draws
            * the same three facts however the seat news arrived. */
           seats: seats.map((s) => seatOf(s, serverTimeMs)),
@@ -421,8 +433,18 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       return;
     }
     if (frame.code === "seat_held") {
-      /** D14: someone else is driving. Watch read-only and offer the takeover,
-       * rather than sitting on a socket with no seat. */
+      /**
+       * D14 as revised: another writer is mid-burst, so the keystroke this
+       * refers to was refused rather than mixed into theirs. 2f's panel opens
+       * naming them.
+       *
+       * **We do not re-attach as an observer.** v1 did, because `seat_held`
+       * then meant the seat itself was taken and sitting on a socket with no
+       * seat was the alternative. It now means only that the turn is somebody
+       * else's, for as long as they keep typing — dropping to read-only would
+       * give up a seat the host never took, and would leave the tab silently
+       * unable to type after the other person stopped.
+       */
       const incumbent = frame.incumbent;
       store.dispatch({
         type: "takeover/held",
@@ -435,12 +457,11 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
            * may contain another separator. An unknown browser leaves the row
            * empty and `factList` drops it.
            */
-          address: incumbent?.address ?? incumbent?.label ?? "another browser",
+          address: incumbent?.address ?? incumbent?.label ?? "another writer",
           browser: incumbent?.user_agent_label ?? "",
           connected: "",
         },
       });
-      sendAttach("observe");
       return;
     }
     console.warn(`[ws] ${frame.code}: ${frame.message}`);
@@ -513,7 +534,7 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     }
   }
 
-  function sendAttach(seat: "control" | "take_over" | "observe"): void {
+  function sendAttach(seat: "write" | "take_over" | "observe"): void {
     if (socket === null || socket.readyState !== WebSocket.OPEN) {
       return;
     }
@@ -556,7 +577,7 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     attached = false;
     ws.onopen = () => {
       attempt = 0;
-      sendAttach("control");
+      sendAttach("write");
     };
     ws.onmessage = (event: MessageEvent) => {
       if (typeof event.data !== "string") {
@@ -640,6 +661,9 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       });
     },
     sendCommand,
+    requestSeat(seat) {
+      sendAttach(seat);
+    },
     close() {
       closedForGood = true;
       if (retryTimer !== null) {

@@ -108,7 +108,8 @@ fn seat_info() -> SeatInfo {
         label: "192.168.2.20 · Chrome on macOS".into(),
         address: Some("192.168.2.20".into()),
         user_agent_label: Some("Chrome on macOS".into()),
-        seat: Seat::Controlling,
+        seat: Seat::Writing,
+        holds_input: true,
         since_ms: 1_700_000_000_000,
         is_you: true,
     }
@@ -171,14 +172,15 @@ fn snapshot() -> Snapshot {
         host_version: "0.9.1".into(),
         server_time_ms: 1_700_000_000_000,
         viewer_id: ViewerId::new("view_1"),
-        seat: Seat::Controlling,
+        seat: Seat::Writing,
         seats: vec![
             SeatInfo {
                 viewer_id: None,
                 label: "desktop".into(),
                 address: None,
                 user_agent_label: None,
-                seat: Seat::Controlling,
+                seat: Seat::Writing,
+                holds_input: false,
                 since_ms: 1_699_999_000_000,
                 is_you: false,
             },
@@ -398,10 +400,15 @@ fn ids_are_plain_json_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn protocol_version_is_one_and_the_whole_supported_range() {
-    assert_eq!(PROTOCOL_VERSION, 1);
-    assert_eq!(MIN_SUPPORTED_VERSION, 1);
-    assert_eq!(MAX_SUPPORTED_VERSION, 1);
+fn protocol_version_is_two_and_the_whole_supported_range() {
+    // v2 is D14 as revised: `Seat` and `SeatRequest` are closed vocabularies and
+    // both grew a member the peer must understand, which the module's
+    // forward-compatibility policy makes a bump by definition. There is still no
+    // range, because server and SPA ship in one binary (D9) and a stale tab is
+    // told to reload rather than served a half-spoken protocol.
+    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(MIN_SUPPORTED_VERSION, 2);
+    assert_eq!(MAX_SUPPORTED_VERSION, 2);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -413,37 +420,39 @@ fn matching_version_is_accepted() {
 
 #[test]
 fn mismatched_version_is_representable_and_detectable() {
-    // A stale tab after `flightdeck update`: the page speaks v2, we speak v1.
-    let err = check_version(2).expect_err("v2 must not be accepted by a v1 host");
+    // A stale tab left open across `flightdeck update`: the page still speaks
+    // v1's seat model, this host speaks v2's. Exactly the case D14's revision
+    // creates, and the reason it is a bump rather than an additive field.
+    let err = check_version(1).expect_err("v1 must not be accepted by a v2 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 1,
-            peer: 2,
-            min_supported: 1,
-            max_supported: 1,
+            local: 2,
+            peer: 1,
+            min_supported: 2,
+            max_supported: 2,
         }
     );
-    // Older than our floor is equally a mismatch — there is no downgrade path,
+    // Newer than our ceiling is equally a mismatch — there is no downgrade path,
     // because server and SPA ship together.
-    assert!(check_version(0).is_err());
+    assert!(check_version(3).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
     let value = serde_json::to_value(&frame).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
-    assert_eq!(value["version"]["peer"], 2);
-    assert_eq!(value["version"]["max_supported"], 1);
+    assert_eq!(value["version"]["peer"], 1);
+    assert_eq!(value["version"]["max_supported"], 2);
     assert_eq!(round_trip(&frame), frame);
 }
 
 #[test]
 fn snapshot_carries_the_version_for_the_browser_to_compare() {
     // The browser's own detection path: compare the snapshot against its
-    // baked-in constant. A v2 host talking to this v1 build is detectable.
+    // baked-in constant. A newer host talking to this build is detectable.
     let mut snap = snapshot();
-    snap.protocol_version = 2;
+    snap.protocol_version = PROTOCOL_VERSION + 1;
     let value = serde_json::to_value(ServerMsg::Snapshot(snap)).unwrap();
     let parsed: ServerMsg = serde_json::from_value(value).unwrap();
     let ServerMsg::Snapshot(parsed) = parsed else {
@@ -487,7 +496,7 @@ fn next_offset_is_the_cursor_the_viewer_sends_back() {
     assert_eq!(round_trip(&cursor), cursor);
     let attach = Attach {
         protocol_version: PROTOCOL_VERSION,
-        seat: SeatRequest::Control,
+        seat: SeatRequest::Write,
         cursors: vec![cursor],
         resume_viewer: Some(ViewerId::new("view_0")),
         viewport: None,
@@ -599,7 +608,7 @@ fn geometry_converts_from_the_desktops_pty_size() {
 #[test]
 fn the_three_attach_intents_are_distinct_on_the_wire() {
     let spellings: Vec<String> = [
-        SeatRequest::Control,
+        SeatRequest::Write,
         SeatRequest::TakeOver,
         SeatRequest::Observe,
     ]
@@ -612,19 +621,26 @@ fn the_three_attach_intents_are_distinct_on_the_wire() {
             .to_owned()
     })
     .collect();
-    assert_eq!(spellings, vec!["control", "take_over", "observe"]);
+    assert_eq!(spellings, vec!["write", "take_over", "observe"]);
 }
 
 #[test]
-fn a_held_seat_is_refused_without_evicting_and_names_the_incumbent() {
-    // `control` on a held seat must be answerable with a *question*, which is
-    // what makes the takeover prompt of artboard 2f possible.
+fn a_refused_keystroke_names_the_writer_that_is_typing() {
+    // A refusal that says only "that did not work" is indistinguishable from a
+    // broken host, and 2f exists precisely so that neither person has to wonder
+    // why the keys stopped working. So the refusal carries the holder, whole.
     let err = WireError::seat_held(seat_info());
     assert_eq!(err.code, ErrorCode::SeatHeld);
     assert!(err.message.contains("192.168.2.20"));
-    let incumbent = err.incumbent.clone().expect("incumbent must be described");
-    assert_eq!(incumbent.seat, Seat::Controlling);
-    assert!(incumbent.since_ms > 0, "how long it has been connected");
+    assert!(
+        err.message.contains("typing"),
+        "the sentence names the act, not the failure: {}",
+        err.message
+    );
+    let holder = err.incumbent.clone().expect("the holder must be described");
+    assert_eq!(holder.seat, Seat::Writing);
+    assert!(holder.holds_input, "and must be the one holding the turn");
+    assert!(holder.since_ms > 0, "how long it has been connected");
     assert_eq!(round_trip(&err), err);
 }
 
@@ -683,7 +699,8 @@ fn the_desktop_row_has_no_address_because_it_arrived_over_no_socket() {
         label: "desktop".into(),
         address: None,
         user_agent_label: None,
-        seat: Seat::Controlling,
+        seat: Seat::Writing,
+        holds_input: false,
         since_ms: 1_699_999_000_000,
         is_you: false,
     };
@@ -694,17 +711,20 @@ fn the_desktop_row_has_no_address_because_it_arrived_over_no_socket() {
 }
 
 #[test]
-fn eviction_is_a_seat_delta_not_a_shutdown() {
-    // An evicted controller keeps its socket and becomes an observer, which is
-    // what lets it watch read-only instead of fighting (D14 as revised).
+fn losing_the_input_lock_is_a_seat_delta_not_a_shutdown() {
+    // Nobody is disconnected and nobody is demoted by a takeover under D14 as
+    // revised: the interrupted writer keeps its seat and its socket, and learns
+    // that the *turn* moved from `holds_input`. That is what lets it either wait
+    // for the holder to go quiet or watch read-only instead of fighting.
     let delta = Delta::Seats {
-        you: Seat::Observing,
+        you: Seat::Writing,
         seats: vec![SeatInfo {
             viewer_id: Some(ViewerId::new("view_2")),
             label: "192.168.2.31 · Safari on iPadOS".into(),
             address: Some("192.168.2.31".into()),
             user_agent_label: Some("Safari on iPadOS".into()),
-            seat: Seat::Controlling,
+            seat: Seat::Writing,
+            holds_input: true,
             since_ms: 1_700_000_100_000,
             is_you: false,
         }],
@@ -712,8 +732,65 @@ fn eviction_is_a_seat_delta_not_a_shutdown() {
     };
     let value = serde_json::to_value(&delta).unwrap();
     assert_eq!(value["change"], "seats");
-    assert_eq!(value["you"], "observing");
+    assert_eq!(
+        value["you"], "writing",
+        "the recipient still holds a writer's seat — only the turn moved"
+    );
+    assert_eq!(value["seats"][0]["holds_input"], true);
     assert_eq!(round_trip(&delta), delta);
+}
+
+#[test]
+fn a_role_and_a_turn_are_two_fields_because_they_are_two_facts() {
+    // Protocol v1 merged them into one `controlling` flag, and that is exactly
+    // what D14's revision had to undo: the merged flag cannot express "three
+    // writers, one of them mid-burst". Several rows say `writing`; at most one
+    // says `holds_input`.
+    let seats = [
+        SeatInfo {
+            viewer_id: None,
+            label: "desktop".into(),
+            address: None,
+            user_agent_label: None,
+            seat: Seat::Writing,
+            holds_input: false,
+            since_ms: 1_699_999_000_000,
+            is_you: false,
+        },
+        SeatInfo {
+            seat: Seat::Writing,
+            holds_input: true,
+            ..seat_info()
+        },
+        SeatInfo {
+            viewer_id: Some(ViewerId::new("view_9")),
+            label: "192.168.2.31".into(),
+            address: Some("192.168.2.31".into()),
+            user_agent_label: None,
+            seat: Seat::Observing,
+            holds_input: false,
+            since_ms: 1_700_000_100_000,
+            is_you: false,
+        },
+    ];
+    assert_eq!(
+        seats.iter().filter(|s| s.seat == Seat::Writing).count(),
+        2,
+        "more than one writer is the normal case now"
+    );
+    assert_eq!(
+        seats.iter().filter(|s| s.holds_input).count(),
+        1,
+        "and exactly one of them has the turn"
+    );
+
+    // Additive and defaulted, in the idiom the rest of these types use. `false`
+    // from an older host is the honest reading: not "the lock is free" but
+    // "this row is not the one holding it", which is true of every row there.
+    let mut value = serde_json::to_value(&seats[1]).unwrap();
+    value.as_object_mut().unwrap().remove("holds_input");
+    let without: SeatInfo = serde_json::from_value(value).unwrap();
+    assert!(!without.holds_input);
 }
 
 #[test]

@@ -8,13 +8,15 @@ import {
   renderedTerminal,
   test,
 } from "./support/fixtures";
+import { PROTOCOL_VERSION } from "../src/wire/frames";
 
 /**
  * The whole chain, end to end (D15).
  *
  * A real FlightDeck is running on a real PTY with a real agent process (see
  * `e2e/support/host.ts`); a real Chromium loads the SPA out of the binary's own
- * asset route and talks protocol v1 over a real WebSocket. Every assertion below
+ * asset route and talks the current wire protocol over a real WebSocket. Every
+ * assertion below
  * is on something only that arrangement can produce:
  *
  *   PTY bytes → replay ring (D2) → `term_bytes` → WebSocket → xterm.js DOM
@@ -196,8 +198,17 @@ test.describe("FlightDeck Web, end to end", () => {
      * the expected grid comes from the host's authoritative frame, and the
      * assertions below check that the SPA both rendered and labelled that grid.
      */
-    const geometry = await page.evaluate<{ cols: number; rows: number }>(
-      () =>
+    /**
+     * The version is passed in from `wire/frames` rather than written as a
+     * literal here: the host refuses an `attach` it cannot speak, so a hardcoded
+     * number turns every protocol bump into this test timing out on a snapshot
+     * that was never coming, twenty seconds at a time.
+     */
+    const geometry = await page.evaluate<
+      { cols: number; rows: number },
+      number
+    >(
+      (protocolVersion) =>
         new Promise((resolve, reject) => {
           const ws = new WebSocket(`ws://${location.host}/ws`);
           const timer = setTimeout(() => {
@@ -208,7 +219,7 @@ test.describe("FlightDeck Web, end to end", () => {
             ws.send(
               JSON.stringify({
                 type: "attach",
-                protocol_version: 1,
+                protocol_version: protocolVersion,
                 seat: "observe",
               }),
             );
@@ -229,6 +240,7 @@ test.describe("FlightDeck Web, end to end", () => {
             reject(new Error("the observer socket failed to open"));
           };
         }),
+      PROTOCOL_VERSION,
     );
     expect(geometry.cols).toBeGreaterThan(0);
     expect(geometry.rows).toBeGreaterThan(0);

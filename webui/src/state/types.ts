@@ -587,11 +587,23 @@ export type AppAction =
    */
   | { readonly type: "takeover/claim" }
   /**
-   * 2f's `w Watch read-only`, and its `Esc Cancel`, which land in the same
-   * place: **a live read-only view**. D14 makes observation a real mode, so
-   * cancelling a takeover is not a dead end and eviction is not an ejection.
+   * 2f's `w Watch read-only`: give up contending for input altogether and take
+   * a seat that never will. D14 makes observation a real mode, so this is a
+   * destination rather than a dead end.
    */
   | { readonly type: "takeover/observe" }
+  /**
+   * 2f's `Esc Cancel`, which under D14 as revised is **not** the same act as
+   * `w`.
+   *
+   * v1 folded the two together, correctly: being refused meant the seat itself
+   * was gone, so the only thing `Cancel` could leave you was a read-only view.
+   * A refusal now costs the turn and not the seat, so cancelling means *fine,
+   * I will wait* — the panel closes, the seat stays, and the lock comes back
+   * the moment the other writer goes quiet. Dropping to read-only here would
+   * take away something the host never took.
+   */
+  | { readonly type: "takeover/dismiss" }
 
   /* --- Activity feed (2e, D11) ------------------------------------------- */
 

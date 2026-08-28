@@ -52,6 +52,8 @@ fn the_wire_surface_is_the_palette_plus_the_browsers_own_rows() {
     // browser needs for itself (snapshot, seat, read-marking), and D13's two
     // dialog answers (`dialog_confirm` / `dialog_cancel`) — which the desktop
     // answers with its keyboard, so they have no palette row on either side.
+    // `take_input_lock` is in both counts: it is a palette row *and* a wire row,
+    // because both surfaces need the same explicit override (D14 as revised).
     assert_eq!(all_entries().len(), REQUIRED_ACTION_COUNT);
     assert_eq!(INVENTORY.len(), REQUIRED_ACTION_COUNT + 9);
 }

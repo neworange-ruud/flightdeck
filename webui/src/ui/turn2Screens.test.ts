@@ -469,8 +469,11 @@ describe("2c — the connection strip", () => {
 
   it("names the seats instead of counting them (2f)", () => {
     const h = render();
-    expect(h.text(".fd-viewers")).toBe("desktop + this tab");
-    expect(h.q(".fd-viewers").title).toContain("controls input");
+    expect(h.text(".fd-viewers")).toBe("desktop + this tab ✎");
+    /** The second fact D14's revision made necessary: both surfaces may type,
+     * and the `✎` says which one is typing right now. */
+    expect(h.q(".fd-viewers").title).toContain("desktop — can type");
+    expect(h.q(".fd-viewers").title).toContain("this tab — typing now");
   });
 });
 
@@ -649,12 +652,16 @@ describe("2f — takeover", () => {
   it("arriving: names the incumbent and offers all three ways out", () => {
     const h = render();
     arriving(h);
-    expect(h.text(".fd-takeover__title")).toBe("Someone else is driving");
+    expect(h.text(".fd-takeover__title")).toBe("Someone else is typing");
     expect(h.text(".fd-takeover__facts")).toContain("192.168.2.20");
     expect(h.text(".fd-takeover__facts")).toContain("Safari · iOS 18");
     expect(h.text(".fd-takeover__facts")).toContain("14 minutes, active 20s ago");
-    /** D14: courtesy, not a permission check. */
-    expect(h.text(".fd-takeover__detail")).toContain("it is not a lock");
+    /** The panel says what actually happened: refused rather than mixed in, and
+     * waiting is a real option because the lock frees itself. */
+    expect(h.text(".fd-takeover__body")).toContain("one cursor");
+    expect(h.text(".fd-takeover__body")).toContain("frees itself");
+    /** D14: courtesy, not a permission check — and no surface has precedence. */
+    expect(h.text(".fd-takeover__detail")).toContain("the desktop plays by the same rule");
     expect(h.all(".fd-takeover__action").map((b) => b.getAttribute("data-key"))).toEqual([
       "Enter",
       "w",
@@ -673,13 +680,14 @@ describe("2f — takeover", () => {
     const h = render();
     h.app.store.dispatch({
       type: "seats/changed",
-      seat: "observing",
+      seat: "writing",
       seats: [
         {
           label: "desktop",
           address: null,
           browser: null,
-          seat: "controlling",
+          seat: "writing",
+          holdsInput: false,
           isDesktop: true,
           sinceLabel: "since launch",
         },
@@ -689,7 +697,8 @@ describe("2f — takeover", () => {
           /** A separator inside the browser's own claim: exactly the payload a
            * browser-side split of the label would get wrong. */
           browser: "Safari · iOS 18",
-          seat: "controlling",
+          seat: "writing",
+          holdsInput: true,
           isDesktop: false,
           sinceLabel: "14 minutes",
         },
@@ -711,13 +720,14 @@ describe("2f — takeover", () => {
     const h = render();
     h.app.store.dispatch({
       type: "seats/changed",
-      seat: "observing",
+      seat: "writing",
       seats: [
         {
           label: "192.168.2.20 · Safari on iOS",
           address: null,
           browser: null,
-          seat: "controlling",
+          seat: "writing",
+          holdsInput: true,
           isDesktop: false,
           sinceLabel: "14 minutes",
         },
@@ -742,30 +752,57 @@ describe("2f — takeover", () => {
     expect(h.text(".fd-takeover__facts")).toContain("192.168.2.20");
   });
 
-  it("arriving: taking over claims the seat", () => {
+  it("arriving: taking over asks for the writer's seat and the turn", () => {
     const h = render();
     arriving(h);
     h.key("Enter");
-    expect(h.state().seat).toBe("controlling");
+    expect(h.state().seat).toBe("writing");
     expect(h.q(".fd-takeover").hidden).toBe(true);
   });
 
-  it("arriving: cancelling leaves a live read-only view", () => {
+  it("arriving: being refused costs the turn, never the seat", () => {
+    /**
+     * D14 as revised. v1 answered `seat_held` by dropping to read-only, because
+     * the seat really had been taken. Now the seat is untouched — draining the
+     * mode chip here would tell a tab that is still a writer, and will be
+     * typing again in 400ms, that it has lost control.
+     */
+    const h = render();
+    arriving(h);
+    expect(h.state().seat).toBe("writing");
+    expect(h.text(".fd-mode")).toBe("MODE: TERMINAL");
+  });
+
+  it("arriving: cancelling leaves a live view, and the seat we still have", () => {
     const h = render();
     arriving(h);
     h.key("Escape");
-    /** 2f: "cancelling still leaves a live read-only view" — observation costs
-     * the host nothing and answers "is it done yet?" without evicting anyone. */
-    expect(h.state().seat).toBe("observing");
+    /**
+     * 2f: "cancelling still leaves a live view" — and under D14 as revised a
+     * live *writing* one. v1 folded `Esc` into `w` correctly, because a refusal
+     * then meant the seat was gone and read-only was all that was left. A
+     * refusal now costs the turn only, so cancelling means "I will wait": the
+     * lock comes back on its own once the other writer goes quiet, and taking
+     * the seat away here would remove something the host never took.
+     */
+    expect(h.state().seat).toBe("writing");
     expect(h.state().connection).toBe("connected");
     expect(h.q(".fd-pane").getAttribute("data-tone")).toBe("live");
+    expect(h.text(".fd-mode")).toBe("MODE: TERMINAL");
+  });
+
+  it("arriving: `w` is the way to stop competing, and it is a different act", () => {
+    const h = render();
+    arriving(h);
+    h.key("w");
+    expect(h.state().seat).toBe("observing");
     expect(h.text(".fd-mode")).toBe("MODE: —");
   });
 
   it("evicted: a prompt over a live connection, never a shutdown", () => {
     const h = render();
     evicted(h);
-    expect(h.text(".fd-takeover__title")).toBe("Another browser took over");
+    expect(h.text(".fd-takeover__title")).toBe("Someone took the input");
     expect(h.text(".fd-takeover__body")).toContain("192.168.2.11");
     expect(h.text(".fd-takeover__body")).toContain("3s");
     /** Eviction is a `Delta::Seats`; the socket stays open. */
@@ -791,7 +828,7 @@ describe("2f — takeover", () => {
     evicted(h);
     expect(h.text(".fd-takeover__action--primary")).toContain("Take it back");
     h.q(".fd-takeover__action--primary").click();
-    expect(h.state().seat).toBe("controlling");
+    expect(h.state().seat).toBe("writing");
   });
 
   it("evicted: offers no Cancel, because there is nothing to cancel", () => {
@@ -807,7 +844,7 @@ describe("2f — takeover", () => {
     const h = render();
     arriving(h);
     h.key("Enter");
-    /** There is no takeover frame in v1: the caller re-sends `Attach { seat }`,
+    /** There is no takeover frame: the caller re-sends `Attach { seat }`,
      * which is why this is reported rather than sent from the component. */
     expect(h.dispatched.map((a) => a.type)).toContain("takeover/claim");
   });

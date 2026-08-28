@@ -175,23 +175,24 @@ describe("session", () => {
 describe("snapshot", () => {
   const wire: WireSnapshot = {
     type: "snapshot",
-    protocol_version: 1,
+    protocol_version: 2,
     host_version: "1.16.0",
     server_time_ms: 1_000_000,
     viewer_id: "v1",
-    seat: "controlling",
+    seat: "writing",
     seats: [
       {
         viewer_id: null,
         label: "desktop",
-        seat: "controlling",
+        seat: "writing",
         since_ms: 940_000,
         is_you: false,
       },
       {
         viewer_id: "v1",
         label: "127.0.0.1 · Chrome",
-        seat: "controlling",
+        seat: "writing",
+        holds_input: true,
         since_ms: 999_000,
         is_you: true,
       },
@@ -239,7 +240,8 @@ describe("snapshot", () => {
       label: "192.168.2.20 · Safari on iOS",
       address: "192.168.2.20",
       user_agent_label: "Safari on iOS",
-      seat: "controlling",
+      seat: "writing",
+      holds_input: true,
       since_ms: 988_000,
       is_you: false,
     };
@@ -252,10 +254,29 @@ describe("snapshot", () => {
       label: "192.168.2.20 · Safari on iOS",
       address: "192.168.2.20",
       browser: "Safari on iOS",
-      seat: "controlling",
+      seat: "writing",
+      holdsInput: true,
       isDesktop: false,
       sinceLabel: "12s ago",
     });
+  });
+
+  it("reads an absent holds_input as `not this row`, never as `free`", () => {
+    /**
+     * The additive-field rule, applied to the one field where the wrong default
+     * would be a claim rather than a gap. `false` on every row of an older
+     * host's list is true of every row of an older host's list — it says
+     * nothing about whether a lock is held, which is exactly right, because
+     * such a host has no lock.
+     */
+    const row: WireSeatInfo = {
+      viewer_id: "v2",
+      label: "192.168.2.20",
+      seat: "writing",
+      since_ms: 988_000,
+      is_you: false,
+    };
+    expect(seatOf(row, wire.server_time_ms).holdsInput).toBe(false);
   });
 
   it("undates a seat the host sent no clock for, and nothing else", () => {
@@ -267,7 +288,7 @@ describe("snapshot", () => {
       label: "192.168.2.20 · Safari on iOS",
       address: "192.168.2.20",
       user_agent_label: "Safari on iOS",
-      seat: "controlling",
+      seat: "writing",
       since_ms: 988_000,
       is_you: false,
     };

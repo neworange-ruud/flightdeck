@@ -15,8 +15,17 @@
  * has never heard of, and the tab must not drop the socket over it".
  */
 
-/** The version this tab speaks. Must match `protocol::PROTOCOL_VERSION`. */
-export const PROTOCOL_VERSION = 1;
+/**
+ * The version this tab speaks. Must match `protocol::PROTOCOL_VERSION`.
+ *
+ * v2 is D14 as revised: a seat is a writer or an observer, several writers may
+ * be seated at once, and `holds_input` says which one has the turn. `Seat` and
+ * `SeatRequest` are closed vocabularies and both grew a member, which the wire
+ * protocol's forward-compatibility policy makes a bump by definition — a tab
+ * left open across a host update is told to reload rather than served a
+ * half-spoken protocol.
+ */
+export const PROTOCOL_VERSION = 2;
 
 /** `GET /ws` — protocol v1, JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -120,7 +129,21 @@ export interface WireSeatInfo {
    * drops the row rather than printing a guess.
    */
   readonly user_agent_label?: string | null;
-  readonly seat: "controlling" | "observing";
+  /**
+   * The **role**: may this surface type at all. Several rows can be `writing`
+   * at once — that is what lifting D14's single-controller restriction means.
+   */
+  readonly seat: "writing" | "observing";
+  /**
+   * The **turn**: is this surface typing *right now*. At most one row in a list
+   * has it, and none does when the lock is free (nobody has typed for
+   * `INPUT_LOCK_IDLE_MS`).
+   *
+   * Absent means the host did not say, which reads as `false` — not "the lock
+   * is free" but "this row is not the one holding it", which is true of every
+   * row on such a host.
+   */
+  readonly holds_input?: boolean;
   readonly since_ms: number;
   readonly is_you: boolean;
 }
@@ -238,7 +261,7 @@ export interface WireSnapshot {
   readonly host_version: string;
   readonly server_time_ms: number;
   readonly viewer_id: string;
-  readonly seat: "controlling" | "observing";
+  readonly seat: "writing" | "observing";
   readonly seats: readonly WireSeatInfo[];
   readonly last_input_seq: number;
   readonly projects: readonly WireProjectView[];
@@ -294,6 +317,11 @@ export interface WireError {
     readonly min_supported: number;
     readonly max_supported: number;
   };
+  /**
+   * Set with `code: "seat_held"`: the writer that holds the input lock and is
+   * mid-burst, so the keystroke `seq` names was refused rather than mixed into
+   * theirs. It does **not** cost us our seat.
+   */
   readonly incumbent?: WireSeatInfo;
   readonly retry_after_ms?: number;
 }
@@ -332,7 +360,12 @@ export type ServerFrame =
 export interface WireAttach {
   readonly type: "attach";
   readonly protocol_version: number;
-  readonly seat: "control" | "take_over" | "observe";
+  /**
+   * `write` seats us as a writer and is never refused; `take_over` does that
+   * *and* takes the input lock now, which is the one explicit override in the
+   * model; `observe` never contends at all.
+   */
+  readonly seat: "write" | "take_over" | "observe";
   readonly cursors: readonly { terminal_id: string; next_offset: number }[];
   readonly resume_viewer: string | null;
   readonly viewport: WireGeometry | null;

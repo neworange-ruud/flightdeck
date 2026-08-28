@@ -351,9 +351,9 @@ export function fixtureSnapshot(): Snapshot {
     viewers: 2,
     latencyMs: 18,
     update: { version: "v1.16.0" },
-    /** 1a is a browser that holds the keyboard, so the host granted it the
-     * controlling seat. An observer would see `MODE: —`, correctly. */
-    seat: "controlling",
+    /** 1a is a browser that types, so it asked for and got a writer's seat.
+     * An observer would see `MODE: —`, correctly. */
+    seat: "writing",
     seats: fixtureSeats(),
     activity: fixtureActivity(),
     /** D13: no dialog. 1a/1b/1c are the screen with nothing being asked; the
@@ -366,12 +366,16 @@ export function fixtureSnapshot(): Snapshot {
 }
 
 /**
- * 2c/2f's viewer chip: `desktop + this tab`.
+ * 2c/2f's viewer chip: `desktop + this tab ✎`.
  *
- * **Two named seats, not a counter that implies a crowd.** The desktop is
- * first because it is always there and is not a viewer at all (its
+ * **Named seats, not a counter that implies a crowd.** The desktop is first
+ * because it is always there and is not a viewer at all (its
  * `SeatInfo::viewer_id` is `null` on the wire); this tab is second because it
  * is the one the reader is looking at.
+ *
+ * Both are writers, which is the ordinary state under D14 as revised, and this
+ * tab holds the input lock — so the fixture exercises the two facts the chip
+ * has to keep apart rather than the one v1 could express.
  */
 export function fixtureSeats(): readonly SeatInfo[] {
   return [
@@ -380,7 +384,9 @@ export function fixtureSeats(): readonly SeatInfo[] {
       /** No socket, so no address the host observed and no browser to name. */
       address: null,
       browser: null,
-      seat: "controlling",
+      seat: "writing",
+      /** It may type; right now somebody else is. */
+      holdsInput: false,
       isDesktop: true,
       sinceLabel: "since launch",
     },
@@ -389,7 +395,8 @@ export function fixtureSeats(): readonly SeatInfo[] {
       /** 2f's three facts, each in its own field. */
       address: "192.168.2.20",
       browser: "Chrome on macOS",
-      seat: "controlling",
+      seat: "writing",
+      holdsInput: true,
       isDesktop: false,
       sinceLabel: "14 minutes, active 20s ago",
     },

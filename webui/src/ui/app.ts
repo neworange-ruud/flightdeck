@@ -71,6 +71,7 @@ import type { TerminalMount } from "./terminalStage";
  * | --- | --- |
  * | `takeover/claim` | re-`Attach { seat: SeatRequest::TakeOver }` (there is no takeover frame) |
  * | `takeover/observe` | re-`Attach { seat: SeatRequest::Observe }` |
+ * | `takeover/dismiss` | nothing — `Esc` closes the panel and keeps the seat |
  * | `selection/jump` | `ClientMsg::Command { select_session }` (D3) |
  * | a `retry`/`reload`/`code` strip action | reconnect, `location.reload()`, or the access screen |
  */
@@ -153,9 +154,11 @@ export function createApp(options: AppOptions): App {
   const takeover = createTakeover({
     onClaim: () => store.dispatch({ type: "takeover/claim" }),
     onObserve: () => store.dispatch({ type: "takeover/observe" }),
-    /** D14/2f: cancelling is not a dead end — it leaves a live read-only view,
-     * which is why it dispatches the same action `w` does. */
-    onCancel: () => store.dispatch({ type: "takeover/observe" }),
+    /** D14 as revised: cancelling is not a dead end, and it is no longer the
+     * same act as `w`. Being refused a keystroke costs the turn and not the
+     * seat, so `Esc` means *I will wait* — the panel closes and this tab is
+     * still a writer. See `takeover/dismiss`. */
+    onCancel: () => store.dispatch({ type: "takeover/dismiss" }),
   });
   const access = createAccessScreen({
     onSubmit: () => submitCode(),
@@ -475,9 +478,10 @@ export function createApp(options: AppOptions): App {
     }
     if (event.key === "Escape" && state.takeover.kind === "arriving") {
       event.preventDefault();
-      /** Cancel leaves a live read-only view (2f) — the same destination as
-       * `w`, which is why there is no third action to dispatch. */
-      store.dispatch({ type: "takeover/observe" });
+      /** Cancel leaves a live view (2f) — but under D14 as revised a live
+       * *writing* one: the refusal cost the turn, not the seat, so `Esc` means
+       * "I will wait" and is a different destination from `w`. */
+      store.dispatch({ type: "takeover/dismiss" });
       return true;
     }
     return true;

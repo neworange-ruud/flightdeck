@@ -318,11 +318,17 @@ describe("2b — the access keypad", () => {
 
 describe("2f — seats and takeover", () => {
   it("the host's snapshot decides our seat; we never assume it", () => {
-    expect(attached().seat).toBe("controlling");
+    expect(attached().seat).toBe("writing");
     expect(createInitialState().seat).toBe("observing");
   });
 
-  it("a held seat prompts, and does not pretend we have control", () => {
+  it("a refused keystroke prompts, and costs the turn but never the seat", () => {
+    /**
+     * D14 as revised. v1 dropped to `observing` here, because `seat_held` then
+     * meant the seat itself had been taken. It now means only that somebody
+     * else is mid-burst — so demoting ourselves would paint `MODE: —` over a
+     * tab that is still a writer and will be typing again in 400ms.
+     */
     const state = reduce(attached(), {
       type: "takeover/held",
       incumbent: {
@@ -332,23 +338,23 @@ describe("2f — seats and takeover", () => {
       },
     });
     expect(state.takeover?.kind).toBe("arriving");
-    expect(state.seat).toBe("observing");
+    expect(state.seat).toBe("writing");
   });
 
-  it("eviction leaves the socket open as an observer, never a shutdown", () => {
+  it("being interrupted leaves the seat and the socket alone", () => {
     const state = reduce(attached(), {
       type: "takeover/evicted",
       byAddress: "192.168.2.11",
       lastInputAgo: "3s",
     });
     expect(state.takeover?.kind).toBe("evicted");
-    expect(state.seat).toBe("observing");
+    expect(state.seat).toBe("writing");
     /** A `Delta::Seats`, not a `Shutdown`: the connection is untouched. */
     expect(state.connection).toBe("connected");
     expect(state.shutdown).toBeNull();
   });
 
-  it("claiming clears the prompt and takes the seat", () => {
+  it("claiming clears the prompt and asks for a writer's seat", () => {
     let state = reduce(attached(), {
       type: "takeover/evicted",
       byAddress: "192.168.2.11",
@@ -356,7 +362,7 @@ describe("2f — seats and takeover", () => {
     });
     state = reduce(state, { type: "takeover/claim" });
     expect(state.takeover).toBeNull();
-    expect(state.seat).toBe("controlling");
+    expect(state.seat).toBe("writing");
   });
 
   it("watching read-only is a destination, from both directions", () => {

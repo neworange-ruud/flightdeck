@@ -661,6 +661,19 @@ pub static INVENTORY: &[CommandSpec] = &[
              this one — you would not see how it went. Stop it from the desktop.",
         ),
     },
+    CommandSpec {
+        name: names::TAKE_INPUT_LOCK,
+        label: "Take Input Lock",
+        group: "Remote",
+        host_only: false,
+        annotation: Some("interrupts whoever is typing"),
+        // Answered by the server itself, like `release_seat`: the input lock is
+        // seat bookkeeping (D14 as revised), so it never travels to the TUI and
+        // back. Taking it for the *desktop* is what the palette row does; taking
+        // it for the asking browser is what this does, and the two are the same
+        // act from opposite ends rather than one surface's privilege.
+        route: Route::Server,
+    },
     // -- view --------------------------------------------------------------
     CommandSpec {
         name: names::TOGGLE_SPLIT_VIEW,
@@ -720,7 +733,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         label: "Release Seat",
         group: "Session",
         host_only: false,
-        annotation: Some("give up control"),
+        annotation: Some("stop competing for input"),
         route: Route::Server,
     },
     CommandSpec {
@@ -766,13 +779,28 @@ pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
 }
 
 impl CommandSpec {
-    /// Whether a frame naming this command must come from the controlling seat
-    /// (D14). Only the two rows the server answers from published state are
-    /// open to an observer; everything else — including a refusal — is a
-    /// controller's frame, so a read-only tab is told `read_only` rather than
-    /// being told *why* a command it may not send would have been refused.
+    /// Whether a frame naming this command must come from a **writer's** seat
+    /// (D14 as revised).
+    ///
+    /// Only the rows the server answers from published state are open to an
+    /// observer; everything else — including a refusal — is a writer's frame,
+    /// so a read-only tab is told `read_only` rather than being told *why* a
+    /// command it may not send would have been refused.
+    ///
+    /// `take_input_lock` is the one [`Route::Server`] row that is *not* open to
+    /// an observer, because it is not a question about published state: an
+    /// observer taking the input lock would stop everyone else typing in order
+    /// to type nothing.
     pub fn requires_control(&self) -> bool {
-        !matches!(self.route, Route::Server)
+        match self.route {
+            Route::Server => self.name == names::TAKE_INPUT_LOCK,
+            Route::Selection(_)
+            | Route::ActivityRead
+            | Route::Palette(_)
+            | Route::Dialog(_)
+            | Route::Rejected(_)
+            | Route::NotSupported(_) => true,
+        }
     }
 
     /// The reason this build refuses the command, if it does.
@@ -871,6 +899,7 @@ pub fn exposure_of(action: &PaletteAction) -> Exposure {
         PaletteAction::UnpairPhone => Exposure::Wire(names::UNPAIR_PHONE),
         PaletteAction::StartWebInterface => Exposure::Wire(names::START_WEB_INTERFACE),
         PaletteAction::StopWebInterface => Exposure::Wire(names::STOP_WEB_INTERFACE),
+        PaletteAction::TakeInputLock => Exposure::Wire(names::TAKE_INPUT_LOCK),
     }
 }
 

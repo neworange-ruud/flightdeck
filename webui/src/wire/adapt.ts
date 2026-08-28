@@ -230,6 +230,14 @@ export function seatOf(
     address: seat.address ?? null,
     browser: seat.user_agent_label ?? null,
     seat: seat.seat,
+    /**
+     * The turn, kept apart from the role for the same reason the host keeps
+     * them apart: several rows may be `writing`, and at most one of them is
+     * typing. Absent is `false` — not "the lock is free", but "this row is not
+     * the one holding it", which is true of every row a host that omits it
+     * sends.
+     */
+    holdsInput: seat.holds_input ?? false,
     isDesktop: seat.viewer_id === null,
     sinceLabel:
       serverTimeMs === null ? "" : agoLabel(serverTimeMs - seat.since_ms),

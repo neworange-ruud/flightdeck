@@ -24,7 +24,7 @@ function state(overrides: Partial<AppState> = {}): AppState {
 function connected(overrides: Partial<AppState> = {}): AppState {
   return state({
     connection: "connected",
-    seat: "controlling",
+    seat: "writing",
     latencyMs: 18,
     ...overrides,
   });

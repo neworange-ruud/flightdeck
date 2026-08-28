@@ -572,6 +572,7 @@ pub fn draw(
     state: &AppState,
     cache: &GitStatusCache,
     overlay: &UiOverlay,
+    input_holder: Option<&str>,
     now_ms: u64,
 ) {
     let area = frame.area();
@@ -638,11 +639,15 @@ pub fn draw(
     frame.render_widget(status_divider, ml.status_divider);
     if chrome == layout::Chrome::Collapsed {
         frame.render_widget(
-            Paragraph::new(compact_status_bar_text(state, ml.status_bar.width)),
+            Paragraph::new(compact_status_bar_text(
+                state,
+                input_holder,
+                ml.status_bar.width,
+            )),
             ml.status_bar,
         );
     } else {
-        draw_status_bar(frame, state, ml.status_bar);
+        draw_status_bar(frame, state, input_holder, ml.status_bar);
     }
 
     // Draw overlay on top if active.
@@ -1749,12 +1754,18 @@ pub const HELP_KEYS: &str = "F1 / Alt-h";
 /// Both help keys are listed, and identically on every OS: unlike the
 /// leave-focus key they are the same binding everywhere, so a platform-varying
 /// label would imply a difference that does not exist.
-pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
+pub fn draw_status_bar(
+    frame: &mut Frame,
+    state: &AppState,
+    input_holder: Option<&str>,
+    area: Rect,
+) {
     let text = status_bar_text(
         state.mode(),
         &state.config.ui,
         state.update_available.as_deref(),
         state.isolated,
+        input_holder,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
@@ -1763,7 +1774,11 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Compact terminal-mode status used when the git info row is reclaimed. Safety
 /// and mode indicators come first, followed by bounded base context; optional
 /// shortcut hints are the first content allowed to clip.
-fn compact_status_bar_text(state: &AppState, width: u16) -> Line<'static> {
+fn compact_status_bar_text(
+    state: &AppState,
+    input_holder: Option<&str>,
+    width: u16,
+) -> Line<'static> {
     let branch_limit = match width {
         0..=49 => 4,
         50..=79 => 8,
@@ -1795,6 +1810,16 @@ fn compact_status_bar_text(state: &AppState, width: u16) -> Line<'static> {
             ))
             .add_modifier(Modifier::BOLD),
     ));
+    if let Some(holder) = input_holder {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("INPUT: {holder}"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(version) = &state.update_available {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -1853,6 +1878,7 @@ pub fn status_bar_text(
     ui: &crate::contracts::UiConfig,
     update_available: Option<&str>,
     isolated: bool,
+    input_holder: Option<&str>,
 ) -> Line<'static> {
     let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
     let use_f2 = ui.use_f2_to_leave_terminal_focus;
@@ -1895,6 +1921,26 @@ pub fn status_bar_text(
             Span::raw(": help"),
         ],
     };
+
+    // The input lock (`specs/WEB_INTERFACE.md` D14 as revised). Drawn only when
+    // a browser is seated as a writer and somebody holds the turn, because with
+    // one writer there is no contest to report.
+    //
+    // **This is not decoration and it is not a warning.** It is the only reason
+    // a desktop user has for why the keys they just pressed did not appear:
+    // the model refuses a keystroke typed into another writer's live burst
+    // rather than interleaving it, and §5.1 does not allow that to happen
+    // silently. `Take Input Lock` in the palette is the way past it.
+    if let Some(holder) = input_holder {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("INPUT: {holder}"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Isolated run (SPECS §32): nothing persists and several actions are gone,
     // so say so permanently rather than once at launch.
@@ -3233,7 +3279,7 @@ mod tests {
         state.focus_terminal();
 
         let mut term = test_terminal(w, h);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let all: String = (0..h)
@@ -3261,7 +3307,7 @@ mod tests {
         state.focus_app();
 
         let mut term = test_terminal(w, h);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let all: String = (0..h)
@@ -3288,7 +3334,7 @@ mod tests {
             let chrome = layout::chrome_for(area, state.mode());
             let ml = layout::compute(area, chrome, mode_style::border_enabled(&state.config.ui));
             draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
-            draw(frame, state, &empty_cache(), &UiOverlay::None, 0);
+            draw(frame, state, &empty_cache(), &UiOverlay::None, None, 0);
         })
         .unwrap();
     }
@@ -3409,7 +3455,7 @@ mod tests {
             .process_output(b"HELLO_FLIGHTDECK");
 
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -3628,7 +3674,7 @@ mod tests {
         session.child_mut(0).unwrap().process_output(b"SHELL_PANE");
 
         let mut term = test_terminal(120, 30);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -3741,7 +3787,7 @@ mod tests {
     fn header_and_divider_render_on_top_rows() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(120, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let row0: String = (0..120)
@@ -3820,7 +3866,7 @@ mod tests {
     fn collapsed_status_keeps_default_and_target_visible_first() {
         let mut state = state_with_tabs(1);
         state.base_branch = "develop".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, 100));
+        let flat = flatten(&compact_status_bar_text(&state, None, 100));
         assert!(flat.contains("default: develop"), "got: {flat:?}");
         assert!(flat.contains("target: main"), "got: {flat:?}");
     }
@@ -3830,7 +3876,7 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.isolated = true;
         state.update_available = Some("2.0.0".to_string());
-        let flat = flatten(&compact_status_bar_text(&state, 100));
+        let flat = flatten(&compact_status_bar_text(&state, None, 100));
         assert!(flat.contains("ISOLATED"), "got: {flat:?}");
         assert!(flat.contains("v2.0.0 update"), "got: {flat:?}");
     }
@@ -3856,7 +3902,7 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.base_branch = "feature/a-very-long-project-default-branch".to_string();
         state.tabs[0].meta.base_branch = "release/a-very-long-pinned-target-branch".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, 80));
+        let flat = flatten(&compact_status_bar_text(&state, None, 80));
         assert!(flat.contains("default: featur...-branch"), "got: {flat:?}");
         assert!(flat.contains("target: releas...-branch"), "got: {flat:?}");
         assert!(flat.contains("MODE: TERMINAL"), "got: {flat:?}");
@@ -3942,7 +3988,7 @@ mod tests {
             },
         );
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         // Layout bottom rows: info_bar (y = 21), status_divider (y = 22),
@@ -3969,7 +4015,7 @@ mod tests {
     #[test]
     fn status_bar_terminal_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(
@@ -3992,7 +4038,7 @@ mod tests {
         // difference in the binding that does not exist.
         for mode in [InputMode::Terminal, InputMode::App] {
             let ui = crate::contracts::UiConfig::default();
-            let line = status_bar_text(mode, &ui, None, false);
+            let line = status_bar_text(mode, &ui, None, false, None);
             let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(flat.contains("F1 / Alt-h"), "{mode:?} must show both keys");
         }
@@ -4009,7 +4055,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -4026,7 +4072,7 @@ mod tests {
             use_f2_to_leave_terminal_focus: true,
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("F2"));
     }
@@ -4034,7 +4080,7 @@ mod tests {
     #[test]
     fn status_bar_app_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, false);
+        let line = status_bar_text(InputMode::App, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -4052,7 +4098,7 @@ mod tests {
     #[test]
     fn status_bar_shows_update_hint_when_available() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"), false);
+        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"), false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -4063,15 +4109,48 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, &ui, None, false);
+        let none = status_bar_text(InputMode::App, &ui, None, false, None);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
+    }
+
+    /// `specs/WEB_INTERFACE.md` D14 as revised: the desktop is one of the
+    /// writers, so it needs the same answer to "who can type" the browser gets.
+    ///
+    /// This chip is the desktop's whole trace for a refused keystroke. Without
+    /// it, typing into another writer's live burst would look exactly like a
+    /// broken keyboard.
+    #[test]
+    fn status_bar_names_whoever_holds_the_input_lock() {
+        let ui = crate::contracts::UiConfig::default();
+        let held = status_bar_text(
+            InputMode::Terminal,
+            &ui,
+            None,
+            false,
+            Some("192.168.2.20 · Chrome on macOS"),
+        );
+        let flat: String = held.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            flat.contains("INPUT: 192.168.2.20 · Chrome on macOS"),
+            "the holder must be named, not merely reported as `busy`: {flat}"
+        );
+
+        // Nothing to contend with — the web interface is stopped, or no browser
+        // is seated as a writer — and the bar says nothing rather than
+        // reporting a contest that cannot happen.
+        let free = status_bar_text(InputMode::Terminal, &ui, None, false, None);
+        let free_flat: String = free.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !free_flat.contains("INPUT:"),
+            "one writer means no chip: {free_flat}"
+        );
     }
 
     #[test]
     fn status_bar_shows_the_isolated_badge() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, true);
+        let line = status_bar_text(InputMode::App, &ui, None, true, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("ISOLATED"),
@@ -4082,7 +4161,7 @@ mod tests {
     #[test]
     fn status_bar_has_no_badge_in_a_normal_run() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, false);
+        let line = status_bar_text(InputMode::App, &ui, None, false, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("ISOLATED"), "no badge normally: {text}");
     }
@@ -4091,7 +4170,7 @@ mod tests {
     fn status_bar_shows_both_the_badge_and_the_update_hint() {
         // The two trailing spans must coexist, not overwrite each other.
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, Some("9.9.9"), true);
+        let line = status_bar_text(InputMode::App, &ui, Some("9.9.9"), true, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("ISOLATED") && text.contains("9.9.9"),
@@ -4105,7 +4184,7 @@ mod tests {
             terminal_mode_color: "magenta".to_string(),
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let chip = line
             .spans
             .iter()
@@ -4122,7 +4201,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
     }
@@ -4147,7 +4226,7 @@ mod tests {
         state.config.ui.mode_border = "normal".to_string();
         let mut term = test_terminal(120, 40);
         let cache = GitStatusCache::new();
-        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -4191,7 +4270,7 @@ mod tests {
 
         let mut term = test_terminal(120, 40);
         let cache = GitStatusCache::new();
-        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buf = term.backend().buffer().clone();
 
@@ -4298,6 +4377,7 @@ mod tests {
                 &state,
                 &cache,
                 &UiOverlay::Dialog(Dialog::notification("Test message")),
+                None,
                 0,
             );
         })
@@ -4463,7 +4543,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Help, 0);
+            draw(frame, &state, &cache, &UiOverlay::Help, None, 0);
         })
         .unwrap();
     }
@@ -4580,7 +4660,7 @@ mod tests {
         let cache = empty_cache();
         let palette = CommandPalette::new();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Palette(palette), 0);
+            draw(frame, &state, &cache, &UiOverlay::Palette(palette), None, 0);
         })
         .unwrap();
     }
@@ -4599,7 +4679,7 @@ mod tests {
             vec!["opencode".to_string(), "claude".to_string()],
         );
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), None, 0);
         })
         .unwrap();
 
@@ -4626,7 +4706,7 @@ mod tests {
             vec!["opencode".to_string()],
         );
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), None, 0);
         })
         .unwrap();
         let buffer = term.backend().buffer();
@@ -4647,7 +4727,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::About, 0);
+            draw(frame, &state, &cache, &UiOverlay::About, None, 0);
         })
         .unwrap();
         let buffer = term.backend().buffer();
@@ -4691,6 +4771,7 @@ mod tests {
                     status: ws,
                     pr_url: Some("https://github.com/owner/repo/compare/main...test".to_string()),
                 },
+                None,
                 0,
             );
         })
@@ -4703,7 +4784,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
 
@@ -4745,6 +4826,7 @@ mod tests {
                     status: ws,
                     pr_url: None,
                 },
+                None,
                 0,
             );
         })
@@ -4769,7 +4851,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
 
@@ -4828,7 +4910,7 @@ mod tests {
     fn sidebar_shows_bracketed_status_without_proc_prefix() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();

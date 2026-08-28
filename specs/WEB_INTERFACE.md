@@ -25,7 +25,8 @@ almost nothing but vocabulary, by deliberate decision (see D12).
 
 - Replacing the TUI. The desktop remains primary; the browser mirrors it.
 - Reachability from anywhere without user setup (see D1).
-- Multi-user collaboration. One operator, several surfaces (see D14).
+- Multi-user collaboration. One operator, several surfaces (see D14) — several
+  of which may now type, arbitrated rather than merged.
 - A light theme. The design argues dark-only and we accept it: the main pane is a
   VT100 surface rendering ANSI colors the agent chose against a dark ground.
 
@@ -247,26 +248,109 @@ or cancel. No new state.
 TUI's own prompt state, what happens when a second dialog arrives while one is
 open, and the two rows that still refuse.
 
-### D14 — One *controlling* browser, plus read-only observers
+### D14 — N writers and N observers, arbitrated by a soft input lock
 
-The server accepts **one controlling browser at a time**. A second attach is
-offered a takeover, and — per turn 2 — **may instead watch read-only**.
+Any number of browsers may seat themselves as **writers**; any number may watch
+read-only. Among the writers — the desktop is always one of them — exactly one
+holds the **input lock** at a time, and only that one's keystrokes reach the PTY.
 
-This is a revision. D14 originally said "one viewer, full stop"; turn 2's
+**This has now been revised twice, in the same direction: towards saying what is
+actually scarce.**
+
+*First revision (turn 2).* D14 originally said "one viewer, full stop"; the
 takeover artboard (2f) makes read-only observation a first-class affordance in
-two places: cancelling a takeover leaves a live read-only view, and an evicted
-browser can watch rather than fight. Adopted, because **it preserves D14's actual
-rationale exactly**. The reason for the restriction was to defer the
-interleaved-input problem — and read-only viewers have no input, so they do not
-reintroduce it. What it adds is read-only fan-out, which is strictly simpler than
-multi-writer arbitration.
+two places — cancelling a takeover leaves a live read-only view, and a browser
+that has lost the seat can watch rather than fight. Adopted, because it preserved
+D14's actual rationale exactly: the reason for the restriction was to defer the
+interleaved-input problem, and read-only viewers have no input. What it added was
+read-only fan-out, strictly simpler than multi-writer arbitration.
 
-So M1 supports: the desktop, one controlling browser, and N observers. The
-viewer chip reads `desktop + this tab` — two named seats rather than a counter
-implying a crowd (2f). M3's multi-viewer list is the same panel with rows.
+*Second revision (`remote-control-eek.2`).* The deferred problem itself, now
+solved, so the single-controller restriction is lifted. **The read-only fan-out
+above is untouched** — an observer still costs nothing in arbitration, and every
+sentence of the first revision still holds.
 
-> **Cost accepted:** fan-out to N sockets lands in M1 rather than M3. Modest, and
-> the alternative was shipping an approved design minus a feature.
+#### Why a lock, and not the alternatives
+
+A terminal has one cursor. Deliver two keystroke streams and the agent reads
+`helwolrold`, which looks like a bug in the agent rather than in FlightDeck. The
+three candidates:
+
+| Model | Why not / why |
+| --- | --- |
+| Per-keystroke last-writer-wins | This *is* the corruption. Rejected outright. |
+| Line-level batching | Not available to us: D2 requires the raw PTY byte stream and agents read raw keys, so there is no line to batch. |
+| **A soft lock with a visible holder** | Adopted. |
+
+#### The rule, in full
+
+- A seat is a **writer** or an **observer** (`Seat::Writing` / `Seat::Observing`).
+  `SeatRequest::Write` is never refused: several writers at once is the normal
+  case, and that is what "lift the restriction" means.
+- Among writers, exactly one holds the input lock. It is **claimed implicitly by
+  typing**: a writer that types while the lock is free, or while its holder has
+  been idle for `INPUT_LOCK_IDLE_MS`, takes it. Nobody presses a button to start
+  typing, and nobody has to remember to let go.
+- A writer that types **into another holder's live burst is refused** — never
+  interleaved, and never silently dropped (§5.1). The refusal is an
+  `Ack { rejected }` for the queue's bookkeeping plus an
+  `Error { seat_held, incumbent }` that **names the holder**, because "that did
+  not work" is indistinguishable from a broken host, and 2f exists precisely so
+  that neither person wonders why the keys stopped working.
+- **Explicit preemption reuses the vocabulary that already exists.**
+  `SeatRequest::TakeOver` already meant "evict the incumbent and take the seat"
+  and was already gated behind a confirmation in 2f; it now means *take the input
+  lock now*. The desktop reaches the same act through `Take Input Lock` in the
+  palette. There is **no hard-coded precedence for any surface** — a surface that
+  could always cut in is exactly the corruption this removes, and an asymmetric
+  rule is one more thing for a reader to get wrong. Symmetric rule, explicit
+  override.
+- Preemption demotes nobody. The interrupted writer keeps its seat and gets the
+  lock back the moment the interrupter goes quiet, which is what lets 2f offer
+  `Watch read-only` as a choice rather than as a consolation.
+- **The holder is host state, published to both surfaces.** `SeatInfo` carries
+  `seat` (the role) and `holds_input` (the turn) as two fields, because one
+  merged `controlling` flag cannot express "three writers, one of them
+  mid-burst". The browser's viewer chip reads `desktop + this tab ✎`; the
+  desktop's status bar carries an `INPUT: <holder>` chip built from the same
+  rows. Neither surface derives it, so the two cannot disagree.
+
+#### `INPUT_LOCK_IDLE_MS = 400`
+
+The number is the floor on how fast two people can alternate, so it wants to be
+short — a few hundred milliseconds, not conversational. 400 ms is the smallest
+value that satisfies all three constraints:
+
+1. **Longer than a typist's gap between keystrokes**, or an ordinary burst would
+   be broken mid-word and the other surface would splice into it — the exact
+   corruption this exists to prevent. Fast typing runs 50–150 ms between keys and
+   held-key autorepeat is 30–50 ms.
+2. **Longer than the host's own drain latency.** A browser's keystrokes cross a
+   channel and are written on the TUI's next render tick (`POLL_TIMEOUT`, 50 ms).
+   If the lock could move while the previous holder's bytes were still queued,
+   the queue itself would interleave them. 400 ms is eight ticks.
+3. **Short enough that a hand-off is not a negotiation** — about one relaxed
+   inter-word pause.
+
+> **Cost accepted, and it is a real one:** during genuine simultaneous typing one
+> side's keystrokes are **refused, not delivered**. They are not queued for later
+> either, because a keystroke replayed once the other writer stopped would land
+> in the middle of what they had typed — which is the thing being prevented. The
+> loss is visible (an ack, a named holder, a panel) rather than silent, and that
+> is the whole of the mitigation. Two people alternating faster than 400 ms hit
+> the floor and are refused until it elapses.
+>
+> **Also accepted:** protocol v1 → **v2**. `Seat` and `SeatRequest` are closed
+> vocabularies and both grew a member the peer must understand, which the wire
+> protocol's own forward-compatibility policy makes a bump by definition. A tab
+> left open across a host update is told to reload (D9), which is the failure
+> mode that policy was written for.
+>
+> **Out of scope, and named so it is not mistaken for an oversight:** FlightDeck
+> Remote's phone reply path (`write_primary_pty`) does not claim the lock. It
+> delivers one complete message as a single atomic write rather than a keystroke
+> stream, and it is not a FlightDeck Web surface; bringing it under the same
+> arbiter is a `area:relay` question, not this one.
 
 ### D15 — Testing: Rust integration + SPA unit + Playwright E2E
 
@@ -410,9 +494,9 @@ lets M3 ship.
 | Milestone | Contents |
 | --- | --- |
 | **M0** | Port the relay client to tokio (D6/D7 step 1); fix `5qu`, `zv3`, `aew` in async code; reconcile with `2jy`. **Prerequisite for M1.** |
-| **M1** | Embedded axum server, token auth + access overlay, palette start/stop + config opt-in, web protocol v1, `webui/` SPA against artboards 1a–1c and 2a–2g, live state, raw terminal streaming, terminal input, takeover **plus read-only observers** (D14), activity feed, Rust integration tests + Playwright job. |
+| **M1** | Embedded axum server, token auth + access overlay, palette start/stop + config opt-in, web protocol v1, `webui/` SPA against artboards 1a–1c and 2a–2g, live state, raw terminal streaming, terminal input, takeover **plus read-only observers** (D14 as first revised), activity feed, Rust integration tests + Playwright job. |
 | **M2** | Command palette, the dialog family with origin labels, git commands, destructive operations with two-step confirmation, configuration manager, split view (1c–1g). |
-| **M3** | Multi-viewer (the viewer panel as rows, over D14's existing fan-out) and the narrow-viewport / slide-over layout, with the turn-3 designs those need (§5). **No relay transport, and therefore no Web Push** — see D17 and D11. |
+| **M3** | Multi-viewer (the viewer panel as rows, over D14's existing fan-out) and the narrow-viewport / slide-over layout, with the turn-3 designs those need (§5). Also D14's second revision: the input lock, protocol v2, and the seat vocabulary the panel's rows render. **No relay transport, and therefore no Web Push** — see D17 and D11. |
 
 ---
 
@@ -755,7 +839,7 @@ Implemented exactly as Q6 fixed it, and recorded here because the dates matter:
 
 - `retries: 2` in CI, `retries: 0` locally (`webui/playwright.config.ts`, from
   `$CI`). `workers: 1` and `fullyParallel: false` are a *correctness*
-  requirement, not tuning: D14 gives out one controlling seat, and two workers
+  requirement, not tuning: D14 gives out one input lock at a time, and two workers
   would fight over it.
 - Quarantine is `test.fixme` naming a filed `bd` issue and an owner, within the
   same working day as the second consecutive failure on `main`. The exact form
@@ -1270,9 +1354,12 @@ comparison to prove it.** The typed name rides on the deciding frame itself, so
 the host keeps no "this viewer is armed" state for a second browser to inherit —
 the seat that typed the name *is* the seat that confirms, structurally. What is
 left is D14's ordinary seat check, which runs before a command's route is even
-considered, so an evicted browser's confirm — correct name and all — is answered
+considered, so a read-only browser's confirm — correct name and all — is answered
 `read_only` and never reaches the host
-(`a_confirm_from_a_browser_that_lost_the_seat_never_reaches_the_host`).
+(`a_confirm_from_a_browser_watching_read_only_never_reaches_the_host`).
+*(D14's second revision narrows what puts a browser on the wrong side of that
+check: a takeover no longer demotes anyone, so it is 2f's `Watch read-only` —
+which a browser chooses — rather than eviction. The check itself is unchanged.)*
 
 **Cancelling is never gated**, at either step, on either surface. R8's reason
 stands unchanged: a shared dialog a remote surface can see but not dismiss would
@@ -1300,6 +1387,67 @@ and `the_desktop_answers_the_quit_dialog_with_one_key` (the ruling's other half)
 webui: the gate's exactness, the local advance that sends nothing, and every way
 of pressing `Enter` on a wrong name producing no frame at all.
 
+### R14 — the input lock is a third thing, beside the seat and the watermark
+
+`remote-control-eek.2`. D14's second revision names the model; this records where
+it lives and the three seams that shaped it.
+
+**One arbiter, one mutex, and it is not the seat registry.**
+`src/web/arbiter.rs` owns `InputArbiter`, shared as an `Arc<Mutex<_>>` by the
+tokio task that owns a browser's socket and the TUI thread that owns `AppState`.
+The two were kept apart deliberately: the seat roster changes when a tab opens or
+closes, the lock changes several times a minute, and one mutex for both would put
+every keystroke behind the same lock as every fan-out. They meet in exactly one
+place — `SeatRegistry::seat_rows`, which is handed the current holder and marks
+the row that has it — so `holds_input` has a single source.
+
+**The claim happens before the channel, not at the PTY.** A browser's `Input` is
+arbitrated in `handle_client_msg` and only then forwarded as
+`WebInbound::Input`; the desktop's claims in `desktop_may_type` before
+`write_active_pty`. That ordering is what makes the drain safe: everything queued
+for the TUI is from one holder until the lock moves, so applying it in order
+cannot splice two writers together. Arbitrating at the write instead would put
+both writers' bytes in the same queue and lose the property entirely.
+
+**Nobody causes an expiry, so the tick announces it.** Every other movement of
+the lock is announced by whoever caused it. Idleness is the passage of time, so
+`WebServerHandle::sync_input_lock` runs once per render tick, retires a holder
+that has gone quiet, and fans out a `Delta::Seats` only when the holder actually
+changed — otherwise a per-tick call would be a per-tick fan-out. It is also why
+both surfaces can show *free* rather than naming somebody who stopped typing a
+minute ago.
+
+**A refused keystroke leaves the browser's queue.** §5.1's held-queue releases a
+frame on any ack, `rejected` included, which is correct here and deliberate: the
+alternative is retrying it once the lock frees, which delivers it into the middle
+of what the other writer typed. The queue's other invariants are untouched — a
+refused `seq` is **not** recorded as forwarded, so `Snapshot::last_input_seq`
+never claims a keystroke the host declined.
+
+**What the tests pin.** `two_writers_typing_at_once_never_interleave_at_the_pty`
+(`tests/web_server.rs`) is the criterion: two real sockets, both seated as
+writers, each typing a five-byte token one frame per byte at 40 ms intervals so
+the bursts genuinely overlap in time, with a 20 ms stagger deciding the round's
+winner and alternating so both reach the terminal. The assertion is on the fake
+PTY's transcript — every five-byte chunk must be one writer's whole token.
+Removing the claim makes it read `12121212..21212121..`, which is the failure it
+exists to catch. `two_threads_typing_at_once_never_split_a_burst`
+(`src/web/arbiter/tests.rs`) asserts the same property on two real threads
+without a socket in the way, and
+`the_desktop_has_no_precedence_over_a_browser` pins the symmetry in both
+directions so a future "the desktop is special" cannot pass.
+
+**What this leaves for `remote-control-eek.3`.** The multi-viewer panel renders
+rows, and it now has two fields per row to render rather than one: `seat` (may
+this surface type) and `holds_input` (is it typing now), with `writers()`,
+`observers()` and `inputHolder()` in `webui/src/state/seats.ts` as the only
+correct questions. `TakeoverState`'s `evicted` direction is modelled, styled and
+tested but still **not dispatched by `socket.ts`** — it was not wired under v1
+either, and firing it on every ordinary hand-off would be a modal every time the
+other person starts typing. Wiring it to explicit preemption only needs the host
+to say *which* movements were deliberate, which is a per-recipient field on
+`Delta::Seats` that this task did not add.
+
 ---
 
 ## 7. Reference
@@ -1321,4 +1469,6 @@ of pressing `Enter` on a wrong name producing no frame at all.
   generalise.
 - `src/web/commands.rs` — the one table behind the browser's command surface
   (R7): wire name to palette action, `host only` badges, refusals.
+- `src/web/arbiter.rs` — the input lock behind D14's second revision (R14): who
+  may type, why 400 ms, and why no surface has precedence.
 - `src/remote/client.rs` — the blocking relay client retired by D6/D7.

@@ -207,103 +207,85 @@ fn listen_address_brackets_a_bare_ipv6_literal() {
 fn a_registered_viewer_starts_as_an_observer() {
     let (registry, _rx) = registry_with(1);
     assert_eq!(registry.seat_of(&viewer("v0")), Some(Seat::Observing));
-    assert_eq!(registry.controller(), None);
+    assert!(registry.writers().is_empty());
 }
 
+/// D14's revision in one assertion: a writer's seat is a *role*, and asking for
+/// it can no longer be refused. What is scarce is the turn, and that lives in
+/// [`crate::web::arbiter`] rather than here.
 #[test]
-fn control_is_granted_when_the_seat_is_free() {
-    let (mut registry, _rx) = registry_with(1);
-    assert_eq!(
-        registry.request_seat(&viewer("v0"), SeatRequest::Control),
-        SeatOutcome::Granted(Seat::Controlling)
-    );
-    assert_eq!(registry.controller(), Some(&viewer("v0")));
+fn several_viewers_can_be_writers_at_once() {
+    let (mut registry, _rx) = registry_with(3);
+    for id in ["v0", "v1", "v2"] {
+        assert_eq!(
+            registry.request_seat(&viewer(id), SeatRequest::Write),
+            Seat::Writing,
+            "no writer request is refused any more"
+        );
+    }
+    assert_eq!(registry.writers().len(), 3);
 }
 
-/// The refusal that makes the takeover prompt possible: the incumbent is named
-/// and **left alone** (D14, artboard 2f).
+/// Takeover has no dedicated frame — the client re-sends
+/// `Attach { seat: TakeOver }` — and under the revision it demotes **nobody**.
+/// The interrupted writer keeps its seat and gets the turn back the moment the
+/// interrupter goes quiet, which is what makes 2f's `Watch read-only` a choice
+/// rather than a consolation.
 #[test]
-fn a_second_control_request_is_refused_and_the_incumbent_is_untouched() {
+fn takeover_demotes_nobody_because_nothing_is_being_taken_from_them() {
     let (mut registry, _rx) = registry_with(2);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
-
-    let outcome = registry.request_seat(&viewer("v1"), SeatRequest::Control);
-    let SeatOutcome::Refused(incumbent) = outcome else {
-        panic!("a held seat must refuse Control, not grant it: {outcome:?}");
-    };
-    assert_eq!(incumbent.viewer_id, Some(viewer("v0")));
-    assert_eq!(incumbent.seat, Seat::Controlling);
-    assert!(!incumbent.is_you, "the incumbent is not the recipient");
-
-    // Untouched: still controlling, and the challenger is still an observer.
-    assert_eq!(registry.controller(), Some(&viewer("v0")));
-    assert_eq!(registry.seat_of(&viewer("v1")), Some(Seat::Observing));
-}
-
-/// Takeover has no dedicated frame in protocol v1 — the client re-sends
-/// `Attach { seat: TakeOver }` — and eviction demotes rather than disconnects,
-/// because the evicted socket stays open as an observer (2f).
-#[test]
-fn takeover_demotes_the_incumbent_to_an_observer_without_evicting_it() {
-    let (mut registry, _rx) = registry_with(2);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
 
     assert_eq!(
         registry.request_seat(&viewer("v1"), SeatRequest::TakeOver),
-        SeatOutcome::Granted(Seat::Controlling)
+        Seat::Writing
     );
-    assert_eq!(registry.controller(), Some(&viewer("v1")));
     assert_eq!(
         registry.seat_of(&viewer("v0")),
-        Some(Seat::Observing),
-        "the evicted viewer keeps its socket and watches read-only"
+        Some(Seat::Writing),
+        "the interrupted writer keeps its seat"
     );
     assert_eq!(registry.viewers.len(), 2, "nobody was disconnected");
+    assert_eq!(registry.writers().len(), 2);
 }
 
 #[test]
 fn observe_never_contends_so_n_observers_cost_nothing() {
     let (mut registry, _rx) = registry_with(4);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
     for id in ["v1", "v2", "v3"] {
         assert_eq!(
             registry.request_seat(&viewer(id), SeatRequest::Observe),
-            SeatOutcome::Granted(Seat::Observing)
+            Seat::Observing
         );
     }
-    assert_eq!(registry.controller(), Some(&viewer("v0")));
-}
-
-#[test]
-fn releasing_and_leaving_both_free_the_seat() {
-    let (mut registry, _rx) = registry_with(2);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
-    registry.release(&viewer("v0"));
-    assert_eq!(registry.controller(), None);
-
-    registry.request_seat(&viewer("v1"), SeatRequest::Control);
-    registry.remove(&viewer("v1"));
-    assert_eq!(registry.controller(), None);
-    assert_eq!(registry.seat_of(&viewer("v1")), None);
-}
-
-/// A re-attach on a socket that already holds the seat must not refuse itself.
-#[test]
-fn the_incumbent_can_re_request_its_own_seat() {
-    let (mut registry, _rx) = registry_with(1);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
     assert_eq!(
-        registry.request_seat(&viewer("v0"), SeatRequest::Control),
-        SeatOutcome::Granted(Seat::Controlling)
+        registry.writers(),
+        vec![viewer("v0")],
+        "D14's read-only fan-out is untouched by the revision"
     );
+}
+
+#[test]
+fn releasing_and_leaving_both_give_up_the_writer_role() {
+    let (mut registry, _rx) = registry_with(2);
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
+    registry.release(&viewer("v0"));
+    assert!(registry.writers().is_empty());
+
+    registry.request_seat(&viewer("v1"), SeatRequest::Write);
+    registry.remove(&viewer("v1"));
+    assert!(registry.writers().is_empty());
+    assert_eq!(registry.seat_of(&viewer("v1")), None);
 }
 
 #[test]
 fn seat_rows_put_the_desktop_first_and_mark_only_the_recipient() {
     let (mut registry, _rx) = registry_with(2);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
 
-    let rows = registry.seat_rows(Some(&viewer("v1")));
+    let holder = Writer::Viewer(viewer("v0"));
+    let rows = registry.seat_rows(Some(&viewer("v1")), Some(&holder));
     assert_eq!(rows.len(), 3, "desktop + two tabs");
 
     let desktop = &rows[0];
@@ -311,23 +293,29 @@ fn seat_rows_put_the_desktop_first_and_mark_only_the_recipient() {
     assert_eq!(desktop.label, DESKTOP_SEAT_LABEL);
     assert_eq!(
         desktop.seat,
-        Seat::Controlling,
-        "the desktop's keyboard is never revoked by a browser taking over"
+        Seat::Writing,
+        "the desktop's keyboard is never revoked — it is always a writer"
+    );
+    assert!(
+        !desktop.holds_input,
+        "but the *turn* is somebody else's, and the desktop is told so"
     );
     assert!(!desktop.is_you);
 
-    // Exactly one *web* controller: the row with a viewer id and Controlling.
-    let web_controllers: Vec<_> = rows
-        .iter()
-        .filter(|r| r.viewer_id.is_some() && r.seat == Seat::Controlling)
-        .collect();
-    assert_eq!(web_controllers.len(), 1);
-    assert_eq!(web_controllers[0].viewer_id, Some(viewer("v0")));
+    // Exactly one row holds input, and it is the one the arbiter named.
+    let holding: Vec<_> = rows.iter().filter(|r| r.holds_input).collect();
+    assert_eq!(holding.len(), 1);
+    assert_eq!(holding[0].viewer_id, Some(viewer("v0")));
 
     assert_eq!(rows.iter().filter(|r| r.is_you).count(), 1);
     assert!(rows
         .iter()
         .any(|r| r.is_you && r.viewer_id == Some(viewer("v1"))));
+
+    // A free lock marks nobody. Saying "the desktop has it" would be the
+    // asymmetry the model exists to refuse.
+    let free = registry.seat_rows(None, None);
+    assert!(free.iter().all(|r| !r.holds_input));
 }
 
 /// Each viewer's `Delta::Seats` carries *its own* `you`, which is why the
@@ -335,10 +323,11 @@ fn seat_rows_put_the_desktop_first_and_mark_only_the_recipient() {
 #[test]
 fn seat_frames_are_personalised_per_viewer() {
     let (mut registry, _rx) = registry_with(2);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
     registry.request_seat(&viewer("v1"), SeatRequest::Observe);
 
-    let frames = registry.seat_frames(NOW_MS);
+    let holder = Writer::Viewer(viewer("v0"));
+    let frames = registry.seat_frames(NOW_MS, Some(&holder));
     assert_eq!(frames.len(), 2);
     for (id, msg) in frames {
         let ServerMsg::Delta(Delta::Seats {
@@ -354,7 +343,7 @@ fn seat_frames_are_personalised_per_viewer() {
         // disappears on this path while surviving on the snapshot path.
         assert_eq!(server_time_ms, NOW_MS);
         let expected = if id == viewer("v0") {
-            Seat::Controlling
+            Seat::Writing
         } else {
             Seat::Observing
         };
@@ -362,6 +351,16 @@ fn seat_frames_are_personalised_per_viewer() {
         assert!(seats
             .iter()
             .any(|r| r.is_you && r.viewer_id.as_ref() == Some(&id)));
+        // Every recipient sees the same holder — there is one lock, and the
+        // whole point of publishing it is that no two surfaces disagree.
+        assert_eq!(
+            seats
+                .iter()
+                .filter(|r| r.holds_input)
+                .map(|r| r.viewer_id.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(viewer("v0"))]
+        );
     }
 }
 
@@ -637,8 +636,8 @@ fn a_client_claim_replaces_the_browser_fact_and_never_the_address() {
 #[test]
 fn seat_rows_split_the_address_from_the_browsers_own_claim() {
     let (mut registry, _rx) = registry_with(1);
-    registry.request_seat(&viewer("v0"), SeatRequest::Control);
-    let rows = registry.seat_rows(Some(&viewer("v0")));
+    registry.request_seat(&viewer("v0"), SeatRequest::Write);
+    let rows = registry.seat_rows(Some(&viewer("v0")), None);
 
     let desktop = &rows[0];
     assert_eq!(desktop.address, None, "never a fabricated `localhost`");
@@ -746,6 +745,8 @@ fn test_shared() -> Arc<Shared> {
         state: state_tx,
         state_rx,
         registry: Mutex::new(SeatRegistry::new(1_699_999_000_000)),
+        input_lock: InputArbiter::shared(),
+        announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
         drain: Arc::new(Drain::default()),
     })
@@ -766,9 +767,9 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
     );
     shared
         .registry()
-        .request_seat(&viewer("v0"), SeatRequest::Control);
+        .request_seat(&viewer("v0"), SeatRequest::Write);
 
-    let snapshot = shared.snapshot_for(&viewer("v0"), Seat::Controlling, 12);
+    let snapshot = shared.snapshot_for(&viewer("v0"), Seat::Writing, 12);
     assert_eq!(
         snapshot.protocol_version,
         crate::web::protocol::PROTOCOL_VERSION
@@ -776,7 +777,7 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
     assert_eq!(snapshot.host_version, "9.9.9");
     assert_eq!(snapshot.server_time_ms, 1_700_000_000_000);
     assert_eq!(snapshot.viewer_id, viewer("v0"));
-    assert_eq!(snapshot.seat, Seat::Controlling);
+    assert_eq!(snapshot.seat, Seat::Writing);
     assert_eq!(snapshot.last_input_seq, 12);
     assert_eq!(snapshot.replay_capacity_bytes, 262_144);
     assert_eq!(

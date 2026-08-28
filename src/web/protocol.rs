@@ -36,11 +36,6 @@
 //!      │                                    version check ─┬─ mismatch
 //!      │  Error { code: version_mismatch }                 │
 //!      ◄───────────────────────────────────────────────────┘
-//!      │                                    seat check ────┬─ held (D14)
-//!      │  Error { code: seat_held, incumbent }             │
-//!      ◄───────────────────────────────────────────────────┘
-//!      │      … user picks `Take over` → Attach { seat: take_over }
-//!      │      … or `Watch read-only`   → Attach { seat: observe }
 //!      │
 //!      │  Snapshot { protocol_version, seat, projects, geometry, activity, … }
 //!      ◄────────────────────────────────────────────────────────────
@@ -53,6 +48,12 @@
 //!      ├────────────────────────────────────────────────────────────►
 //!      │  Ack { seq, outcome }
 //!      ◄────────────────────────────────────────────────────────────
+//!      │                              input lock ──┬─ another writer is
+//!      │  Ack { seq, rejected }                    │  mid-burst (D14)
+//!      │  Error { code: seat_held, incumbent }     │
+//!      ◄───────────────────────────────────────────┘
+//!      │      … user picks `Take over` → Attach { seat: take_over }
+//!      │      … or waits: the lock frees itself once they go quiet
 //!      │
 //!      ╳  link drops. The browser keeps typing into a local queue (§5.1);
 //!      │  it remembers per-terminal `next_offset` and its own `ViewerId`.
@@ -76,7 +77,7 @@
 //! | [`TermBytes`] with `offset` + `truncated`, [`Attach::cursors`] | D2 raw PTY bytes, Q2 bounded ring, Q3 resume-from-cursor |
 //! | [`Snapshot::geometry`], [`Delta::Geometry`] | D4 as revised by turn 2 — the browser letterboxes the host's grid, so it must be told the grid |
 //! | [`Resize`] (viewport only, no target) | D4 — the desktop owns PTY geometry, unconditionally |
-//! | [`SeatRequest`], [`Seat`], [`SeatInfo`], [`Delta::Seats`] | D14 — one controller + N observers, takeover, read-only watch |
+//! | [`SeatRequest`], [`Seat`], [`SeatInfo`], [`Delta::Seats`] | D14 as revised — N writers + N observers, the input lock, takeover, read-only watch |
 //! | [`ShutdownReason`], `self_initiated` | Q5 — deliberate quit vs network failure, and "I asked for this" |
 //! | [`Input::seq`], [`Ack`], [`Snapshot::last_input_seq`] | turn 2 §5.1 — input is queued, never dropped, never reordered, never doubled |
 //! | [`Delta::Status`], [`Delta::Git`], [`Delta::Activity`] | D11 activity feed, and the live sidebar/git bar |
@@ -123,10 +124,18 @@ mod tests;
 
 /// The protocol version this build speaks.
 ///
-/// v1 is the M1 wire format: attach/snapshot/delta/term-bytes/input plus the
-/// seat model and the byte cursor. It is deliberately the whole range — there is
-/// no older web protocol to interoperate with, because the browser SPA ships
-/// inside the same binary as the server (D9).
+/// v1 was the M1 wire format: attach/snapshot/delta/term-bytes/input plus the
+/// seat model and the byte cursor. **v2 is D14 as revised for multi-writer
+/// input**: a seat is a writer or an observer rather than a controller or an
+/// observer, several writers may be seated at once, and [`SeatInfo::holds_input`]
+/// says which one holds the input lock right now. That is a closed vocabulary
+/// growing a member the peer must understand ([`Seat`], [`SeatRequest`]), which
+/// the forward-compatibility policy below makes a version bump by definition.
+///
+/// It is deliberately the whole range — there is no older web protocol to
+/// interoperate with, because the browser SPA ships inside the same binary as
+/// the server (D9), and a stale tab is answered with "reload to update" rather
+/// than with a half-spoken v1.
 ///
 /// That co-shipping is exactly why the constant matters. The SPA is baked in, so
 /// `flightdeck update` on the host while a tab is open leaves that tab running
@@ -139,13 +148,14 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`] in v1.
-pub const MIN_SUPPORTED_VERSION: u16 = 1;
+/// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
+/// and SPA ship in the same binary (D9), so there is no older peer to keep.
+pub const MIN_SUPPORTED_VERSION: u16 = 2;
 
-/// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`] in v1.
-pub const MAX_SUPPORTED_VERSION: u16 = 1;
+/// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
+pub const MAX_SUPPORTED_VERSION: u16 = 2;
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -483,45 +493,72 @@ pub struct Viewport {
 /// What an attaching browser is asking for.
 ///
 /// The three intents are distinct frames rather than one boolean because the
-/// middle one is a *question*: turn 2's takeover artboard (2f) requires that an
-/// arriving browser is told who holds the seat and offered a choice, so
-/// [`SeatRequest::Control`] must be refusable without evicting anyone.
+/// last one is a *deliberate interruption*: artboard 2f requires that taking
+/// input away from somebody who is mid-burst is something a human confirmed, so
+/// it cannot be the same frame as "seat me, I would like to type".
 ///
-/// This is courtesy, not authorisation: anyone holding the credential can evict
-/// anyone else. The protocol must not imply an authority it does not have.
+/// This is courtesy, not authorisation: anyone holding the credential can
+/// interrupt anyone else. The protocol must not imply an authority it does not
+/// have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeatRequest {
-    /// Take the controlling seat **if it is free**. If it is held, the host
-    /// answers [`ErrorCode::SeatHeld`] with the incumbent's [`SeatInfo`] and
-    /// leaves the incumbent alone; the browser then renders the takeover prompt.
-    Control,
-    /// Evict the incumbent and take the seat. Sent only after the user confirmed
-    /// `Take over`. Also how an evicted browser reclaims its seat — one click, no
-    /// round trip to the desktop.
+    /// Seat me as a **writer**: I intend to type.
+    ///
+    /// Always granted — D14 as revised allows several writers at once. It does
+    /// not hand over the input lock, which is claimed by typing (see
+    /// [`SeatInfo::holds_input`] and [`crate::web::arbiter`]). A writer that
+    /// types while another writer's burst is live is refused *that keystroke*,
+    /// with [`ErrorCode::SeatHeld`] naming the holder; it keeps its seat.
+    Write,
+    /// Seat me as a writer **and take the input lock now**, interrupting
+    /// whoever holds it.
+    ///
+    /// Sent only after the user confirmed `Take over` (2f). This is the one
+    /// explicit override in the model, and it is deliberately the vocabulary
+    /// that already existed rather than a new privilege: no surface, the
+    /// desktop included, can cut into a live burst any other way.
     TakeOver,
-    /// Watch read-only. Never contends for the seat, so N observers cost nothing
-    /// in arbitration. Reachable from both the arriving browser (`Cancel` leaves
-    /// a live read-only view) and the evicted one (2f).
+    /// Watch read-only. Never contends for input, so N observers cost nothing in
+    /// arbitration — D14's read-only fan-out is untouched by the revision.
+    /// Reachable from both the arriving browser (`Cancel` leaves a live
+    /// read-only view) and a writer that would rather stop competing (2f).
     Observe,
 }
 
 /// What a viewer currently holds.
+///
+/// **A seat is a role, not a turn.** Several viewers may be [`Seat::Writing`] at
+/// once; which one may type *at this instant* is [`SeatInfo::holds_input`], and
+/// it moves between writers as they type and go quiet. Splitting the two is what
+/// lets the seat list stay stable while the lock moves several times a minute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Seat {
-    /// This viewer's [`Input`] is delivered to the PTY.
-    Controlling,
+    /// This viewer may contend for the input lock. Its [`Input`] is delivered to
+    /// the PTY when it holds the lock, and answered
+    /// [`AckOutcome::Rejected`] + [`ErrorCode::SeatHeld`] when another writer is
+    /// mid-burst — never interleaved into theirs.
+    Writing,
     /// This viewer receives everything and sends no input. Its [`Input`] frames,
     /// if any, are answered [`AckOutcome::Ignored`] — never silently dropped,
     /// because §5.1 forbids a keystroke vanishing without a trace.
     Observing,
 }
 
-/// One occupant of the viewer chip (`desktop + this tab`, 2f).
+/// One occupant of the viewer chip (2f).
 ///
-/// The identifying detail is what turn 2 asks for: enough for the two humans to
-/// work out who is who, and no more.
+/// The identifying detail is what turn 2 asks for: enough for the humans to work
+/// out who is who, and no more.
+///
+/// ## Two facts, not one
+///
+/// [`SeatInfo::seat`] is the **role** — may this surface type at all — and
+/// [`SeatInfo::holds_input`] is the **turn** — is it typing right now. Exactly
+/// one row across the whole list can hold input, and it may be free, in which
+/// case no row does. Merging them into a single "controlling" flag is what
+/// protocol v1 did, and it is the thing D14's revision had to undo: it could not
+/// express "three writers, one of them mid-burst".
 ///
 /// ## Why the facts are separate fields as well as one label
 ///
@@ -562,8 +599,21 @@ pub struct SeatInfo {
     /// then drops the `browser` row rather than printing a guess.
     #[serde(default)]
     pub user_agent_label: Option<String>,
-    /// Whether this seat controls input.
+    /// Whether this seat may type at all — a writer or an observer.
     pub seat: Seat,
+    /// Whether this seat holds the **input lock** right now: the one surface
+    /// whose keystrokes are reaching the PTY this instant.
+    ///
+    /// At most one row in a list is `true`, and none is when the lock is free
+    /// (nobody has typed for [`crate::web::arbiter::INPUT_LOCK_IDLE_MS`]). Both
+    /// surfaces render it, because both surfaces are writers and both deserve
+    /// the same answer to "why did my keys stop working".
+    ///
+    /// `false` is the [`serde`] default and is the honest reading for a host
+    /// that does not send it: it does not claim the lock is free, it claims this
+    /// row is not the one holding it, which is true of every row on such a host.
+    #[serde(default)]
+    pub holds_input: bool,
     /// Wall-clock (unix ms) the seat was taken — "how long it has been
     /// connected", which turn 2 names as fair identifying detail.
     pub since_ms: i64,
@@ -1344,10 +1394,14 @@ pub enum Delta {
         /// How it closed.
         outcome: DialogOutcome,
     },
-    /// The seat map changed: someone attached, left, took over, or was evicted
-    /// (D14). An evicted controller learns it here — it keeps its socket and
-    /// becomes an observer, which is what makes "watch read-only instead of
-    /// fighting" possible (2f).
+    /// The seat map changed: someone attached, left, changed role, or the
+    /// **input lock moved** (D14 as revised).
+    ///
+    /// The lock moves far more often than the roster does — every time one
+    /// writer stops typing and another starts — so this frame is the one that
+    /// keeps both surfaces' "who can type" honest, and it carries
+    /// [`SeatInfo::holds_input`] on every row rather than a separate holder
+    /// field: one list, one truth, and no way for the two to disagree.
     Seats {
         /// What the recipient now holds.
         you: Seat,
@@ -1381,7 +1435,15 @@ pub enum Delta {
 pub enum AckOutcome {
     /// Applied. The browser may release it from its queue.
     Applied,
-    /// Refused for a stated reason; see [`Ack::detail`].
+    /// Refused for a stated reason; see [`Ack::detail`]. **This frame was not
+    /// applied and will not be**: the browser releases it from its queue.
+    ///
+    /// The input lock's refusal is one of these, paired with an
+    /// [`ErrorCode::SeatHeld`] error naming the holder. Refusing rather than
+    /// holding it back is deliberate: a keystroke replayed once the other writer
+    /// stopped would arrive in the middle of whatever they had typed, which is
+    /// the corruption the lock exists to prevent. The cost — the keystroke is
+    /// gone — is paid visibly, which is what §5.1 requires.
     Rejected,
     /// Received but deliberately not applied — most often input from an
     /// [`Seat::Observing`] viewer. Acked rather than dropped so a keystroke never
@@ -1420,9 +1482,16 @@ pub enum ErrorCode {
     /// Too many bootstrap-code attempts from this address (Q1's per-address
     /// rate limit). See [`WireError::retry_after_ms`].
     RateLimited,
-    /// Another browser holds the controlling seat (D14). Accompanied by
-    /// [`WireError::incumbent`]; the browser renders the takeover prompt and may
-    /// re-attach with [`SeatRequest::TakeOver`] or [`SeatRequest::Observe`].
+    /// Another writer holds the **input lock** and is mid-burst, so this
+    /// keystroke was refused rather than mixed into theirs (D14 as revised).
+    /// Accompanied by [`WireError::incumbent`] — who is typing — and by an
+    /// [`Ack`] with [`AckOutcome::Rejected`] for the same `seq`, so §5.1's
+    /// held-keystroke queue can release it.
+    ///
+    /// **It does not cost the recipient its seat.** The browser stays a writer,
+    /// renders 2f's panel, and may either wait (the lock frees itself once the
+    /// holder goes quiet) or re-attach with [`SeatRequest::TakeOver`] to
+    /// interrupt.
     SeatHeld,
     /// This viewer is read-only, so the frame was refused rather than applied.
     ReadOnly,
@@ -1505,7 +1574,7 @@ pub struct WireError {
     /// Set with [`ErrorCode::VersionMismatch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<VersionMismatch>,
-    /// Set with [`ErrorCode::SeatHeld`]: who holds the seat (D14, 2f).
+    /// Set with [`ErrorCode::SeatHeld`]: who holds the input lock (D14, 2f).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incumbent: Option<SeatInfo>,
     /// Set with [`ErrorCode::RateLimited`]: how long to wait.
@@ -1541,10 +1610,15 @@ impl WireError {
         }
     }
 
-    /// The seat-is-taken refusal, carrying the incumbent so the arriving browser
-    /// can offer `Take over` / `Watch read-only` (D14).
+    /// The input-lock refusal, carrying the holder so the refused browser can
+    /// say *who* is typing and offer `Take over` / `Watch read-only` (2f).
+    ///
+    /// The sentence names the holder rather than the failure, because "your
+    /// keystroke was refused" on its own is indistinguishable from a broken
+    /// host, and 2f's whole reason to exist is that neither person should have
+    /// to wonder why the keys stopped working.
     pub fn seat_held(incumbent: SeatInfo) -> Self {
-        let message = format!("{} is controlling this instance.", incumbent.label);
+        let message = format!("{} is typing right now.", incumbent.label);
         WireError {
             incumbent: Some(incumbent),
             ..WireError::new(ErrorCode::SeatHeld, message)
@@ -1712,6 +1786,12 @@ pub struct Input {
     pub terminal_id: TerminalId,
     /// The bytes to write. Base64 on the wire, for the same reason as
     /// [`TermBytes::data`]: a keystroke is not necessarily a character.
+    ///
+    /// Delivered only while this viewer holds the input lock. A writer that is
+    /// not holding it is answered [`AckOutcome::Rejected`] plus
+    /// [`ErrorCode::SeatHeld`], and an observer [`AckOutcome::Ignored`]; in
+    /// neither case do these bytes reach a PTY, and in neither case do they
+    /// vanish unremarked.
     #[serde(with = "b64")]
     pub data: Vec<u8>,
 }
@@ -1752,8 +1832,16 @@ pub mod command {
     /// Ask for a fresh [`super::Snapshot`] — the browser's recovery path when it
     /// believes it has drifted.
     pub const REQUEST_SNAPSHOT: &str = "request_snapshot";
-    /// Give up the controlling seat voluntarily and become an observer (D14).
+    /// Stop competing for input voluntarily and become an observer (D14).
     pub const RELEASE_SEAT: &str = "release_seat";
+    /// Take the input lock now, interrupting whoever holds it (D14 as revised).
+    ///
+    /// The explicit override, and the *only* way past another writer's live
+    /// burst. Named as a command as well as a [`super::SeatRequest`] so a
+    /// surface that is already seated as a writer — the desktop's palette, or a
+    /// browser that does not want to re-attach — has the same door rather than a
+    /// privilege of its own.
+    pub const TAKE_INPUT_LOCK: &str = "take_input_lock";
 
     // -- the shared dialog (D13) -------------------------------------------
 

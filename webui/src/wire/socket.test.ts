@@ -109,7 +109,8 @@ describe("wire/socket: a seat delta dates its own rows", () => {
     label: "192.168.2.20 · Safari on iOS",
     address: "192.168.2.20",
     user_agent_label: "Safari on iOS",
-    seat: "controlling",
+    seat: "writing",
+    holds_input: true,
     since_ms: 1_700_000_000_000,
     is_you: false,
   };
@@ -119,7 +120,7 @@ describe("wire/socket: a seat delta dates its own rows", () => {
       data: JSON.stringify({
         type: "delta",
         change: "seats",
-        you: "observing",
+        you: "writing",
         seats: [seat],
         ...(serverTimeMs === null ? {} : { server_time_ms: serverTimeMs }),
       }),
@@ -171,17 +172,17 @@ describe("wire/socket: a seat delta dates its own rows", () => {
 
   it("completes an arriving takeover panel that opened without a time", () => {
     /**
-     * `WireError::seat_held` names the incumbent but is not a seat list, so the
-     * panel opens with `connected` blank. The dated list that follows finishes
-     * it — which is what makes the panel show the same three facts however the
-     * seat news arrived.
+     * `WireError::seat_held` names the writer that is typing but is not a seat
+     * list, so the panel opens with `connected` blank. The dated list that
+     * follows finishes it — which is what makes the panel show the same three
+     * facts however the news arrived.
      */
     const { store, ws } = session();
     ws.onmessage?.({
       data: JSON.stringify({
         type: "error",
         code: "seat_held",
-        message: "192.168.2.20 · Safari on iOS is controlling this instance.",
+        message: "192.168.2.20 · Safari on iOS is typing right now.",
         incumbent: seat,
       }),
     });

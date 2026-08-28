@@ -51,10 +51,12 @@ auth routes.
 3. **The connection strip never moves.** The mechanism is structural:
    `.fd-spacer` is always the element immediately before `.fd-conn`. Do not add
    a second spacer after it, and do not give the connection group a margin.
-4. **The desktop's seat row is always `Seat::Controlling`.** A "find the
-   controller" that only looks at `seat` finds two rows and names the desktop as
-   the browser that evicted you. Ask `webController()` — a viewer *and*
-   controlling — and nothing else.
+4. **A seat is a role; the input lock is a turn** (D14 as revised). Several
+   rows say `Seat::Writing` on an ordinary connection — the desktop's always
+   does, because its keyboard is never revoked — so "find the writer" finds
+   several and answers nothing. Who may type is `writers()`; who is typing is
+   `inputHolder()`, which reads `holdsInput` and is true of at most one row in
+   the list, the desktop included.
 5. **The feed is never a modal.** `role="complementary"`, no `aria-modal`, no
    focus trap, no click-swallowing scrim. D11 makes it the only notification
    channel there is, so a version that blocked the screen would interrupt the
@@ -175,7 +177,8 @@ npx playwright test
 `$HOME`, a temp git fixture whose only agent is `scripts/e2e/fake-agent.sh`, and
 `flightdeck --isolated` under a PTY (`e2e/support/pty-spawn.py` — FlightDeck is a
 TUI and cannot run headless). One host for the whole run, `workers: 1`, because
-D14 gives out exactly one controlling seat.
+D14 as revised gives out one input lock at a time: two browsers typing at once
+would refuse each other's keystrokes.
 
 | Env | Effect |
 | --- | --- |

@@ -356,14 +356,20 @@ export function reduce(state: AppState, action: AppAction): AppState {
       };
 
     case "takeover/held":
+      /**
+       * D14 as revised: a refused keystroke costs the **turn**, never the seat.
+       * Dropping to `observing` here — which is what v1 did, because a refusal
+       * meant the seat itself was taken — would paint `MODE: —` over a tab that
+       * is still a writer and will be typing again the moment the other one
+       * pauses. The seat only ever changes when the host says so.
+       */
       return {
         ...state,
         takeover: { kind: "arriving", incumbent: action.incumbent },
-        /** We asked for control and were refused, so we do not have it. */
-        seat: "observing",
       };
 
     case "takeover/evicted":
+      /** Same rule from the other side: we lost the lock, not the seat. */
       return {
         ...state,
         takeover: {
@@ -371,7 +377,6 @@ export function reduce(state: AppState, action: AppAction): AppState {
           byAddress: action.byAddress,
           lastInputAgo: action.lastInputAgo,
         },
-        seat: "observing",
       };
 
     case "takeover/claim":
@@ -379,13 +384,19 @@ export function reduce(state: AppState, action: AppAction): AppState {
        * `Delta::Seats` either way: if the claim fails, `seats/changed` will say
        * so, and there is no frame to wait for in between (takeover is a
        * re-`Attach`, not a request/response of its own). */
-      return { ...state, takeover: null, seat: "controlling" };
+      return { ...state, takeover: null, seat: "writing" };
 
     case "takeover/observe":
-      /** D14: `w Watch read-only` and `Esc Cancel` land in the same place, a
-       * live read-only view. Clearing the prompt is what makes the terminal
-       * behind it trustworthy again — 2d's rule that colour means "live". */
+      /** D14: `w Watch read-only` is a real destination. Clearing the prompt is
+       * what makes the terminal behind it trustworthy again — 2d's rule that
+       * colour means "live". */
       return { ...state, takeover: null, seat: "observing" };
+
+    case "takeover/dismiss":
+      /** `Esc Cancel`, which is no longer the same act as `w` — see the action's
+       * own note. The seat is untouched: we were refused a keystroke, not a
+       * seat, and waiting is a real answer now that the lock frees itself. */
+      return { ...state, takeover: null };
 
     case "activity/received":
       return { ...state, activity: [...state.activity, ...action.events] };
@@ -920,10 +931,12 @@ function firstSelectionIn(project: Project): Selection {
  * the host's clock beside it, and naming the same seat from the more complete
  * frame is what stops 2f drawing two rows on one path and three on another.
  *
- * Only the `arriving` panel, and only when the list still names a web
- * controller: a list with nobody in the seat is not a reason to blank out the
- * name of the browser we were just refused by. The panel is closed by the user's
- * own answer (`takeover/claim`, `takeover/observe`), never by a seat list.
+ * Only the `arriving` panel, and only when the list still names a lock holder:
+ * a list with the lock free is not a reason to blank out the name of the writer
+ * we were just refused by — the lock frees itself the moment they go quiet, and
+ * the panel would then be a dialog about nobody. The panel is closed by the
+ * user's own answer (`takeover/claim`, `takeover/observe`), never by a seat
+ * list.
  */
 function refreshArrivingIncumbent(
   takeover: AppState["takeover"],

@@ -70,6 +70,7 @@ use crate::contracts::domain::WebConfig;
 use crate::contracts::traits::Clock;
 use crate::remote::debuglog;
 use crate::remote::runtime;
+use crate::web::arbiter::{Claim, InputArbiter, SharedInputLock, Writer};
 use crate::web::assets::{self, Lookup};
 use crate::web::credentials::{
     AccessScreen, AuthFailure, CredentialStore, TokenId, BOOTSTRAP_CODE_TTL_MS,
@@ -136,8 +137,9 @@ const DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// can be told what already landed ([`Snapshot::last_input_seq`]).
 const REMEMBERED_INPUT_CURSORS: usize = 64;
 
-/// The label the desktop's own seat row carries (2f's `desktop + this tab`).
-const DESKTOP_SEAT_LABEL: &str = "desktop";
+/// The label the desktop's own seat row carries, and the name it is refused
+/// under when another writer holds the input lock (2f).
+pub const DESKTOP_SEAT_LABEL: &str = "desktop";
 
 // ===========================================================================
 // The state the TUI publishes
@@ -208,8 +210,14 @@ pub enum WebOutbound {
         /// What to send.
         msg: ServerMsg,
     },
-    /// To whichever viewer currently holds the controlling seat, if any.
-    Controller(ServerMsg),
+    /// To every viewer seated as a **writer**, and to no observer.
+    ///
+    /// Several writers is the normal case under D14 as revised, so this is a
+    /// fan-out rather than a single recipient. It deliberately does *not* mean
+    /// "whoever holds the input lock": the lock moves on every hand-off, and a
+    /// frame addressed to a moving target would land on whoever happened to be
+    /// typing when it was built.
+    Writers(ServerMsg),
 }
 
 /// Viewers → host. The TUI drains these non-blockingly each render tick, the
@@ -245,15 +253,22 @@ pub enum WebInbound {
         /// The viewer that went away.
         viewer_id: ViewerId,
     },
-    /// The seat map changed — someone attached, left, took over, was evicted,
-    /// or released the seat. Carries the same rows the viewers were just told
-    /// about, so the desktop's viewer chip can render without asking.
+    /// The seat map changed — someone attached, left, changed role, or the
+    /// input lock moved. Carries the same rows the viewers were just told about,
+    /// so the desktop's viewer chip renders the same facts as the browser's
+    /// without asking a second source.
     SeatsChanged {
         /// Everyone attached, desktop row first.
         seats: Vec<SeatInfo>,
     },
-    /// Keystrokes from the **controlling** viewer. An observer's input never
-    /// reaches here: it is answered [`AckOutcome::Ignored`] by the server.
+    /// Keystrokes from a writer **that held the input lock when they arrived**.
+    ///
+    /// Two kinds of input never reach here, and neither vanishes unremarked: an
+    /// observer's is answered [`AckOutcome::Ignored`], and a writer's typed into
+    /// somebody else's live burst is answered [`AckOutcome::Rejected`] plus
+    /// [`ErrorCode::SeatHeld`]. Arbitrating *before* the channel is what makes
+    /// this queue safe: everything in it is from one holder until the lock
+    /// moves, so draining it in order cannot splice two writers together.
     ///
     /// The other half of the `stream.rs` seam. Whoever applies these owns the
     /// [`Ack`]: this module has forwarded a frame, which is not the same claim
@@ -264,7 +279,7 @@ pub enum WebInbound {
         /// What they typed.
         input: crate::web::protocol::Input,
     },
-    /// A named command from the controlling viewer (the M2 door, D13). The
+    /// A named command from a seated writer (the M2 door, D13). The
     /// server answers `release_seat` and `request_snapshot` itself and refuses
     /// unknown names with [`ErrorCode::NotSupported`], so only M1's remaining
     /// commands arrive here.
@@ -437,7 +452,84 @@ impl WebServerHandle {
     /// renders. `is_you` is false on every row, because the desktop is not a
     /// viewer.
     pub fn seats(&self) -> Vec<SeatInfo> {
-        self.shared.registry().seat_rows(None)
+        let holder = self.shared.holder();
+        self.shared.registry().seat_rows(None, holder.as_ref())
+    }
+
+    /// The input lock, so the **desktop** can claim a turn before it writes to a
+    /// PTY (D14 as revised).
+    ///
+    /// Handed out rather than wrapped in a `claim_for_desktop` helper because
+    /// the desktop is one writer among several and gets no separate door: it
+    /// calls [`crate::web::arbiter::InputArbiter::claim`], with the same
+    /// arguments and the same possible refusal as a browser's socket does.
+    pub fn input_lock(&self) -> SharedInputLock {
+        Arc::clone(&self.shared.input_lock)
+    }
+
+    /// Expire a holder that has gone quiet and announce the lock if it moved.
+    ///
+    /// Called once per render tick. Every other lock movement is announced by
+    /// whoever caused it, but *nobody* causes an expiry — it is the passage of
+    /// time — so without this the chip would keep naming somebody who stopped
+    /// typing a minute ago. Comparing against
+    /// [`Shared::announced_holder`] is what keeps a per-tick call from
+    /// producing a per-tick fan-out.
+    pub fn sync_input_lock(&self, now_ms: i64) {
+        let moved = {
+            let mut lock = self.shared.input_lock();
+            lock.expire(now_ms);
+            let holder = lock.holder().cloned();
+            let mut announced = self.shared.announced_holder.unwrap_or_recover();
+            let moved = *announced != holder;
+            if moved {
+                *announced = holder;
+            }
+            moved
+        };
+        if moved {
+            self.shared.announce_seats();
+        }
+    }
+
+    /// The desktop's explicit override: take the input lock now, interrupting
+    /// whoever holds it.
+    ///
+    /// The mirror of a browser's `Attach { seat: TakeOver }`, and reachable the
+    /// same way — only from an affordance a human chose (`Take Input Lock` in
+    /// the palette). Returns whom it interrupted, so the caller can say so.
+    pub fn preempt_input_for_desktop(&self, now_ms: i64) -> Option<String> {
+        let interrupted = {
+            let mut lock = self.shared.input_lock();
+            let interrupted = match lock.holder() {
+                Some(Writer::Desktop) | None => None,
+                Some(Writer::Viewer(_)) => lock.holder_label().map(str::to_string),
+            };
+            lock.preempt(&Writer::Desktop, DESKTOP_SEAT_LABEL, now_ms);
+            interrupted
+        };
+        self.shared.announce_seats();
+        interrupted
+    }
+
+    /// Who holds the input lock, as a label the desktop can render, or `None`
+    /// when it is free.
+    ///
+    /// Reading, never claiming: the status bar asks this every frame, and a
+    /// draw that took the lock would hand it to whoever repainted last.
+    pub fn input_holder_label(&self) -> Option<String> {
+        self.shared.input_lock().holder_label().map(str::to_string)
+    }
+
+    /// Whether any *browser* is seated as a writer — i.e. whether the desktop
+    /// has anybody to contend with at all.
+    ///
+    /// The desktop's own row is always a writer, so it is deliberately not
+    /// counted here: with no browser writing, naming a lock holder on the
+    /// desktop's status bar would be permanent chrome about a contest that
+    /// cannot happen.
+    pub fn has_browser_writer(&self) -> bool {
+        !self.shared.registry().writers().is_empty()
     }
 
     /// How many browsers are attached (observers included).
@@ -535,6 +627,8 @@ pub fn start(
         state: state_tx,
         state_rx,
         registry: Mutex::new(SeatRegistry::new(started_ms)),
+        input_lock: InputArbiter::shared(),
+        announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
         drain: Arc::new(Drain::default()),
     });
@@ -669,6 +763,13 @@ struct Shared {
     state: watch::Sender<Arc<HostState>>,
     state_rx: watch::Receiver<Arc<HostState>>,
     registry: Mutex<SeatRegistry>,
+    /// Who may type right now (D14 as revised). Shared with the TUI thread,
+    /// which is one of the writers — see [`crate::web::arbiter`].
+    input_lock: SharedInputLock,
+    /// The holder the viewers were last told about, so a move is announced
+    /// exactly once. Compared against [`Shared::input_lock`] on every
+    /// [`WebServerHandle::sync_input_lock`].
+    announced_holder: Mutex<Option<Writer>>,
     shutdown: watch::Receiver<Option<ShutdownNotice>>,
     drain: Arc<Drain>,
 }
@@ -685,6 +786,18 @@ impl Shared {
         self.clock.now_millis() as i64
     }
 
+    /// The input lock, recovered rather than propagated if a writer panicked
+    /// mid-claim — the same reasoning as [`Shared::registry`]: one panicking
+    /// surface must not take the terminal away from everyone else.
+    fn input_lock(&self) -> std::sync::MutexGuard<'_, InputArbiter> {
+        self.input_lock.unwrap_or_recover()
+    }
+
+    /// Who the seat rows should mark with [`SeatInfo::holds_input`].
+    fn holder(&self) -> Option<Writer> {
+        self.input_lock().holder().cloned()
+    }
+
     /// Tell the TUI something. Dropped silently once the TUI has gone away.
     fn notify(&self, msg: WebInbound) {
         if let Ok(tx) = self.inbound.lock() {
@@ -698,9 +811,9 @@ impl Shared {
         match out {
             WebOutbound::All(msg) => registry.send_all(&msg),
             WebOutbound::Viewer { viewer_id, msg } => registry.send_to(&viewer_id, msg),
-            WebOutbound::Controller(msg) => {
-                if let Some(id) = registry.controller().cloned() {
-                    registry.send_to(&id, msg);
+            WebOutbound::Writers(msg) => {
+                for id in registry.writers() {
+                    registry.send_to(&id, msg.clone());
                 }
             }
         }
@@ -709,7 +822,8 @@ impl Shared {
     /// Build the snapshot a viewer gets on attach.
     fn snapshot_for(&self, viewer_id: &ViewerId, seat: Seat, last_input_seq: u64) -> Snapshot {
         let state = self.state_rx.borrow().clone();
-        let seats = self.registry().seat_rows(Some(viewer_id));
+        let holder = self.holder();
+        let seats = self.registry().seat_rows(Some(viewer_id), holder.as_ref());
         Snapshot {
             protocol_version: crate::web::protocol::PROTOCOL_VERSION,
             host_version: state.host_version.clone(),
@@ -736,9 +850,13 @@ impl Shared {
     /// and tell the TUI, after any seat change.
     fn announce_seats(&self) {
         let now_ms = self.now_ms();
+        let holder = self.holder();
         let (frames, rows) = {
             let registry = self.registry();
-            (registry.seat_frames(now_ms), registry.seat_rows(None))
+            (
+                registry.seat_frames(now_ms, holder.as_ref()),
+                registry.seat_rows(None, holder.as_ref()),
+            )
         };
         {
             let mut registry = self.registry();
@@ -746,6 +864,10 @@ impl Shared {
                 registry.send_to(&id, msg);
             }
         }
+        // Whatever we just said is now what everyone has been told, including
+        // about the lock — so a `sync_input_lock` right behind an attach does
+        // not repeat it.
+        *self.announced_holder.unwrap_or_recover() = holder;
         self.notify(WebInbound::SeatsChanged { seats: rows });
     }
 }
@@ -835,7 +957,7 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn info(&self, you: Option<&ViewerId>) -> SeatInfo {
+    fn info(&self, you: Option<&ViewerId>, holder: Option<&Writer>) -> SeatInfo {
         SeatInfo {
             viewer_id: Some(self.id.clone()),
             label: self.identity.label(),
@@ -846,13 +968,23 @@ impl Viewer {
             // `browser` row rather than printing a guess.
             user_agent_label: self.identity.user_agent_label.clone(),
             seat: self.seat,
+            // The role and the turn are separate facts: an observer can never
+            // hold the lock, and a writer only holds it while it is typing.
+            holds_input: holder == Some(&Writer::Viewer(self.id.clone())),
             since_ms: self.since_ms,
             is_you: you == Some(&self.id),
         }
     }
 }
 
-/// One controlling browser plus N observers (D14), and the takeover path.
+/// N writers plus N observers (D14 as revised), and the preemption path.
+///
+/// **The registry owns roles, not turns.** Which writer may type at this instant
+/// is [`crate::web::arbiter::InputArbiter`], deliberately kept out of here: the
+/// roster changes when a tab opens or closes, the lock changes several times a
+/// minute, and one mutex for both would put every keystroke behind the same lock
+/// as every fan-out. The two meet only in [`SeatRegistry::seat_rows`], which is
+/// handed the current holder and marks the row that has it.
 ///
 /// Insertion order is display order, so the viewer chip's rows are stable while
 /// a tab is attached.
@@ -867,16 +999,6 @@ struct SeatRegistry {
     started_ms: i64,
 }
 
-/// What happened when a viewer asked for a seat.
-#[derive(Debug, PartialEq, Eq)]
-enum SeatOutcome {
-    /// The seat (or observer status) was granted.
-    Granted(Seat),
-    /// [`SeatRequest::Control`] was refused because someone holds it. The
-    /// incumbent is left alone; the browser renders the takeover prompt (2f).
-    Refused(SeatInfo),
-}
-
 impl SeatRegistry {
     fn new(started_ms: i64) -> Self {
         SeatRegistry {
@@ -887,7 +1009,8 @@ impl SeatRegistry {
     }
 
     /// Add a viewer, or return the existing one's slot. New viewers start as
-    /// observers: a seat is something you then ask for.
+    /// observers: a writer's seat is something you then ask for, and asking is
+    /// what makes a browser that only ever watches cost nothing in arbitration.
     fn register(
         &mut self,
         id: ViewerId,
@@ -911,11 +1034,13 @@ impl SeatRegistry {
         self.viewers.retain(|v| &v.id != id);
     }
 
-    fn controller(&self) -> Option<&ViewerId> {
+    /// Every seated writer, in display order. Several is now the normal case.
+    fn writers(&self) -> Vec<ViewerId> {
         self.viewers
             .iter()
-            .find(|v| v.seat == Seat::Controlling)
-            .map(|v| &v.id)
+            .filter(|v| v.seat == Seat::Writing)
+            .map(|v| v.id.clone())
+            .collect()
     }
 
     fn seat_of(&self, id: &ViewerId) -> Option<Seat> {
@@ -932,47 +1057,31 @@ impl SeatRegistry {
             .map(|v| v.identity.label())
     }
 
-    /// Arbitrate one [`SeatRequest`]. The viewer must already be registered.
+    /// Grant one [`SeatRequest`]. The viewer must already be registered.
     ///
-    /// Takeover has **no dedicated frame** in protocol v1 — the client re-sends
-    /// `Attach { seat: TakeOver }` — and eviction is a [`Delta::Seats`], never a
-    /// [`ServerMsg::Shutdown`], because the evicted socket stays open as an
-    /// observer (2f).
-    fn request_seat(&mut self, id: &ViewerId, request: SeatRequest) -> SeatOutcome {
-        match request {
-            SeatRequest::Observe => {
-                self.set_seat(id, Seat::Observing);
-                SeatOutcome::Granted(Seat::Observing)
-            }
-            SeatRequest::Control => match self.controller().cloned() {
-                Some(incumbent) if &incumbent != id => {
-                    let info = self
-                        .viewers
-                        .iter()
-                        .find(|v| v.id == incumbent)
-                        .map(|v| v.info(None))
-                        .expect("the controller is in the viewer list");
-                    SeatOutcome::Refused(info)
-                }
-                _ => {
-                    self.set_seat(id, Seat::Controlling);
-                    SeatOutcome::Granted(Seat::Controlling)
-                }
-            },
-            SeatRequest::TakeOver => {
-                for viewer in self.viewers.iter_mut() {
-                    if &viewer.id != id && viewer.seat == Seat::Controlling {
-                        // Demoted, not disconnected.
-                        viewer.seat = Seat::Observing;
-                    }
-                }
-                self.set_seat(id, Seat::Controlling);
-                SeatOutcome::Granted(Seat::Controlling)
-            }
-        }
+    /// **No request is refused any more.** D14's revision is exactly this: a
+    /// seat is a role, several viewers may be writers at once, and the scarce
+    /// thing — the turn to type — is the input lock, which lives in
+    /// [`crate::web::arbiter`] and is not granted here.
+    ///
+    /// Takeover has **no dedicated frame** — the client re-sends
+    /// `Attach { seat: TakeOver }` — and it now means *seat me as a writer and
+    /// take the lock now*. Nobody is demoted by it: the writer that was
+    /// interrupted keeps its seat and gets the lock back the moment the
+    /// interrupter goes quiet, which is why 2f can honestly offer `Watch
+    /// read-only` as a choice rather than as a consolation.
+    fn request_seat(&mut self, id: &ViewerId, request: SeatRequest) -> Seat {
+        let seat = match request {
+            SeatRequest::Observe => Seat::Observing,
+            SeatRequest::Write | SeatRequest::TakeOver => Seat::Writing,
+        };
+        self.set_seat(id, seat);
+        seat
     }
 
-    /// Give up the controlling seat voluntarily (`release_seat`).
+    /// Stop competing for input voluntarily (`release_seat`): become an
+    /// observer. Whether this viewer also held the input lock is the arbiter's
+    /// business, and the caller releases it there.
     fn release(&mut self, id: &ViewerId) {
         self.set_seat(id, Seat::Observing);
     }
@@ -985,12 +1094,15 @@ impl SeatRegistry {
 
     /// The rows for the viewer chip, desktop first (2f).
     ///
-    /// The desktop is [`Seat::Controlling`] unconditionally, because its
-    /// keyboard is never revoked — a browser taking over does not stop the
-    /// person at the machine from typing. The single *web* controller is the row
-    /// with `viewer_id: Some(_)` and [`Seat::Controlling`], of which there is at
-    /// most one.
-    fn seat_rows(&self, you: Option<&ViewerId>) -> Vec<SeatInfo> {
+    /// **The desktop is always a writer**, because its keyboard is never
+    /// revoked: nothing a browser does takes the role away from the person at
+    /// the machine. What it does *not* always have is the turn — the desktop
+    /// contends for the input lock on exactly the same terms as every browser,
+    /// and this is the row that says so when it does not hold it.
+    ///
+    /// `holder` is passed in rather than read here because the lock lives in
+    /// [`crate::web::arbiter`]; see the type's doc for why the two are apart.
+    fn seat_rows(&self, you: Option<&ViewerId>, holder: Option<&Writer>) -> Vec<SeatInfo> {
         let mut rows = Vec::with_capacity(self.viewers.len() + 1);
         rows.push(SeatInfo {
             viewer_id: None,
@@ -1000,16 +1112,21 @@ impl SeatRegistry {
             // placeholder like `localhost` would be an invention.
             address: None,
             user_agent_label: None,
-            seat: Seat::Controlling,
+            seat: Seat::Writing,
+            holds_input: holder == Some(&Writer::Desktop),
             since_ms: self.started_ms,
             is_you: false,
         });
-        rows.extend(self.viewers.iter().map(|v| v.info(you)));
+        rows.extend(self.viewers.iter().map(|v| v.info(you, holder)));
         rows
     }
 
     /// One `Delta::Seats` per viewer, each with that viewer's own `you`.
-    fn seat_frames(&self, server_time_ms: i64) -> Vec<(ViewerId, ServerMsg)> {
+    fn seat_frames(
+        &self,
+        server_time_ms: i64,
+        holder: Option<&Writer>,
+    ) -> Vec<(ViewerId, ServerMsg)> {
         self.viewers
             .iter()
             .map(|v| {
@@ -1017,7 +1134,7 @@ impl SeatRegistry {
                     v.id.clone(),
                     ServerMsg::Delta(Delta::Seats {
                         you: v.seat,
-                        seats: self.seat_rows(Some(&v.id)),
+                        seats: self.seat_rows(Some(&v.id), holder),
                         // The reference clock for every row's `since_ms`. A
                         // seat list without one is a seat list the browser
                         // cannot date, which is how 2f's `connected` row came
@@ -1650,6 +1767,11 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
         let mut registry = shared.registry();
         registry.remove(&viewer_id);
     }
+    // A closed socket must not hold the terminal for the rest of the idle
+    // window: nobody is coming back to finish that burst.
+    shared
+        .input_lock()
+        .release(&Writer::Viewer(viewer_id.clone()));
     if was_attached {
         shared.notify(WebInbound::ViewerDetached {
             viewer_id: viewer_id.clone(),
@@ -1731,19 +1853,11 @@ async fn handle_client_msg(
         ClientMsg::Input(input) => {
             let seat = shared.registry().seat_of(viewer_id);
             match seat {
-                Some(Seat::Controlling) => {
-                    shared.registry().record_input(viewer_id, input.seq);
-                    // The applier owns the ack: forwarding is not the same claim
-                    // as "the PTY took it". `src/web/stream.rs` answers with
-                    // `WebOutbound::Viewer { ServerMsg::Ack }`.
-                    shared.notify(WebInbound::Input {
-                        viewer_id: viewer_id.clone(),
-                        input,
-                    });
-                    Flow::Continue
-                }
-                _ => {
-                    // Acked, never silently dropped (§5.1).
+                Some(Seat::Writing) => forward_or_refuse(shared, viewer_id, input, sink).await,
+                // An observer never contends, so it is never *refused* by the
+                // lock — it simply has no input to arbitrate. Acked all the
+                // same, never silently dropped (§5.1).
+                Some(Seat::Observing) | None => {
                     let _ = send_msg(
                         sink,
                         &ServerMsg::Ack(Ack {
@@ -1784,6 +1898,100 @@ async fn handle_client_msg(
     }
 }
 
+/// One writer's keystrokes: arbitrate, then forward or refuse.
+///
+/// **The claim happens here, before the bytes enter the channel**, which is what
+/// makes the drain on the other side safe: everything queued is from one holder
+/// until the lock moves, so applying it in order cannot splice two writers'
+/// bytes together. Forwarding a frame and letting the applier decide would put
+/// both writers' bytes in the same queue and lose the property entirely.
+///
+/// A refusal is two frames, deliberately:
+///
+/// * an [`Ack`] with [`AckOutcome::Rejected`], because §5.1's held-keystroke
+///   queue is keyed by `seq` and would replay this one for ever otherwise; and
+/// * an [`ErrorCode::SeatHeld`] carrying the holder's [`SeatInfo`], because 2f's
+///   panel names three facts about them and an ack's free-text `detail` is not
+///   a place to encode three facts.
+///
+/// The `seq` is **not** recorded: nothing was forwarded, so
+/// [`Snapshot::last_input_seq`] must not claim it was.
+async fn forward_or_refuse(
+    shared: &Arc<Shared>,
+    viewer_id: &ViewerId,
+    input: crate::web::protocol::Input,
+    sink: &mut Sink,
+) -> Flow {
+    let now = shared.now_ms();
+    let who = Writer::Viewer(viewer_id.clone());
+    let label = shared
+        .registry()
+        .label_of(viewer_id)
+        .unwrap_or_else(|| viewer_id.to_string());
+    let claim = shared.input_lock().claim(&who, &label, now);
+    match claim {
+        Claim::Granted => {
+            shared.registry().record_input(viewer_id, input.seq);
+            // The applier owns the ack: forwarding is not the same claim as
+            // "the PTY took it". `src/web/stream.rs` answers with
+            // `WebOutbound::Viewer { ServerMsg::Ack }`.
+            shared.notify(WebInbound::Input {
+                viewer_id: viewer_id.clone(),
+                input,
+            });
+            Flow::Continue
+        }
+        Claim::Refused { by, label } => {
+            let holder = shared
+                .registry()
+                .seat_rows(Some(viewer_id), Some(&by))
+                .into_iter()
+                .find(|row| row.holds_input)
+                .unwrap_or_else(|| lost_holder(&by, &label));
+            let _ = send_msg(
+                sink,
+                &ServerMsg::Ack(Ack {
+                    seq: input.seq,
+                    outcome: AckOutcome::Rejected,
+                    detail: Some(format!(
+                        "{label} is typing — this keystroke was refused rather than \
+                         mixed into theirs"
+                    )),
+                }),
+            )
+            .await;
+            let _ = send_msg(sink, &ServerMsg::Error(WireError::seat_held(holder))).await;
+            Flow::Continue
+        }
+    }
+}
+
+/// The holder's row when the seat list no longer has one — the holder's socket
+/// closed in the moment between the claim and the lookup.
+///
+/// Only what the arbiter still knows is filled in: who, and their label. The
+/// facts that came off a socket are `None`, which is the honest shape — 2f drops
+/// a row it was told nothing about rather than printing a placeholder, and
+/// `since_ms: 0` is never read here, because `WireError::seat_held` is not a
+/// seat list and the panel it opens leaves `connected` blank until one arrives.
+fn lost_holder(who: &Writer, label: &str) -> SeatInfo {
+    SeatInfo {
+        // `None` is the desktop's spelling and would be a lie about a browser,
+        // so the viewer's own id travels when there is one.
+        viewer_id: match who {
+            Writer::Desktop => None,
+            Writer::Viewer(id) => Some(id.clone()),
+        },
+        label: label.to_string(),
+        address: None,
+        user_agent_label: None,
+        seat: Seat::Writing,
+        holds_input: true,
+        since_ms: 0,
+        is_you: false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     shared: &Arc<Shared>,
@@ -1817,7 +2025,7 @@ async fn handle_attach(
     let label = identity.label();
 
     let now = shared.now_ms();
-    let (outcome, last_input_seq) = {
+    let (seat, last_input_seq) = {
         let mut registry = shared.registry();
         registry.register(viewer_id.clone(), identity.clone(), now, tx.clone());
         let last_input_seq = match attach.resume_viewer.as_ref() {
@@ -1830,20 +2038,28 @@ async fn handle_attach(
         )
     };
 
-    let seat = match outcome {
-        SeatOutcome::Granted(seat) => seat,
-        SeatOutcome::Refused(incumbent) => {
-            // The incumbent is left alone (D14); the browser renders the
-            // takeover prompt and may come back with `TakeOver` or `Observe` on
-            // this same socket.
-            let _ = send_msg(sink, &ServerMsg::Error(WireError::seat_held(incumbent))).await;
-            if !*attached {
-                let mut registry = shared.registry();
-                registry.remove(viewer_id);
-            }
-            return Flow::Continue;
+    // The one explicit override in the model, and the only way past a live burst
+    // (D14 as revised). It is a *separate* frame from `Write` precisely because
+    // 2f gates it behind a confirmation: seating yourself as a writer must not
+    // silently interrupt somebody mid-word.
+    match attach.seat {
+        SeatRequest::TakeOver => {
+            shared
+                .input_lock()
+                .preempt(&Writer::Viewer(viewer_id.clone()), &label, now);
         }
-    };
+        // A viewer that stops competing must not keep the turn it holds, or the
+        // terminal would sit locked to a tab that has promised never to type
+        // into it again.
+        SeatRequest::Observe => {
+            shared
+                .input_lock()
+                .release(&Writer::Viewer(viewer_id.clone()));
+        }
+        // Seating yourself as a writer buys the right to contend, and nothing
+        // more: the lock is still claimed by typing.
+        SeatRequest::Write => {}
+    }
 
     *attached = true;
     let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
@@ -1863,9 +2079,10 @@ async fn handle_attach(
         resume_viewer: attach.resume_viewer,
     });
     // Any attach can change the seat map — a first attach adds a row, a
-    // re-attach may have just evicted the incumbent. Eviction is exactly this
-    // `Delta::Seats`, never a `Shutdown`: the evicted socket stays open as an
-    // observer (2f).
+    // re-attach may have just moved the input lock. Both travel as this
+    // `Delta::Seats`, never as a `Shutdown`: nobody is disconnected by a
+    // takeover under D14 as revised, and an interrupted writer keeps its seat
+    // (2f).
     shared.announce_seats();
     Flow::Continue
 }
@@ -1929,7 +2146,7 @@ async fn handle_command(
         return;
     };
 
-    if spec.requires_control() && seat != Seat::Controlling {
+    if spec.requires_control() && seat != Seat::Writing {
         // Read-only means read-only. D3 makes the selection shared with the
         // desktop, so letting an observer move it would be input by another
         // name — and the same holds for every command that changes anything.
@@ -1958,9 +2175,29 @@ async fn handle_command(
         }
         // Seat bookkeeping is this module's job (D14), so it never travels to
         // the TUI and back.
+        Route::Server if spec.name == names::TAKE_INPUT_LOCK => {
+            // The browser's own explicit override, for a surface that is already
+            // a writer and does not want to re-attach to interrupt. Same act as
+            // `Attach { seat: TakeOver }`, same confirmation behind it (2f).
+            let now = shared.now_ms();
+            let label = shared
+                .registry()
+                .label_of(viewer_id)
+                .unwrap_or_else(|| viewer_id.to_string());
+            shared
+                .input_lock()
+                .preempt(&Writer::Viewer(viewer_id.clone()), &label, now);
+            let _ = send_msg(sink, &applied(command.seq)).await;
+            shared.announce_seats();
+        }
+        // Seat bookkeeping is this module's job (D14), so it never travels to
+        // the TUI and back.
         Route::Server => {
             debug_assert_eq!(spec.name, names::RELEASE_SEAT);
             shared.registry().release(viewer_id);
+            shared
+                .input_lock()
+                .release(&Writer::Viewer(viewer_id.clone()));
             let _ = send_msg(sink, &applied(command.seq)).await;
             shared.announce_seats();
         }

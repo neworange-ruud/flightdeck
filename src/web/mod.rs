@@ -13,6 +13,7 @@
 //! | Module | Decision | What it owns |
 //! | --- | --- | --- |
 //! | [`protocol`] | D12, Q3, Q5 | versioned JSON wire types, byte cursors |
+//! | [`arbiter`] | D14 | the input lock: which writer may type right now |
 //! | [`replay`] | D2, Q2 | per-terminal byte ring buffer + resume |
 //! | [`credentials`] | D5, D10, Q4 | bootstrap code → persistent token |
 //! | [`interfaces`] | Q1 | network interfaces for the address picker |
@@ -23,6 +24,7 @@
 //! | [`commands`] | D3, D13, D16 | wire name to palette action, one table |
 
 pub mod activity;
+pub mod arbiter;
 pub mod assets;
 pub mod commands;
 pub mod credentials;

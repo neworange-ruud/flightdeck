@@ -195,11 +195,18 @@ function glyph(kind: StatusGlyph, tone: string): HTMLElement {
 }
 
 /**
- * 2f's viewer chip: `desktop + this tab`.
+ * 2f's viewer chip: `desktop + this tab ✎`.
  *
- * Two named seats, not a counter that implies a crowd — and the naming is not
+ * Named seats, not a counter that implies a crowd — and the naming is not
  * decoration: the reason a second seat is not alarming is that you can see it
  * is your own desktop.
+ *
+ * The `✎` is the second fact D14's revision made necessary, and it is the whole
+ * reason `desktop + this tab` was not good enough any more. Several surfaces can
+ * type; one of them is typing *now*, and the others are being refused. That is
+ * the only honest answer to "why did my keystroke not appear", so the chip says
+ * it rather than leaving the user to guess — and the desktop's own status bar
+ * carries the same fact, from the same seat rows.
  */
 function viewerChip(state: AppState): HTMLElement {
   return el("span", {

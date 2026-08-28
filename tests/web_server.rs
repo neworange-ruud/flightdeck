@@ -782,12 +782,12 @@ fn an_authenticated_attach_is_answered_with_a_snapshot() {
         let mut ws = ws_connect(&addr, Some(&cookie))
             .await
             .expect("an authenticated upgrade succeeds");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
 
         let snapshot = await_snapshot(&mut ws).await;
         assert_eq!(snapshot.protocol_version, PROTOCOL_VERSION);
         assert_eq!(snapshot.host_version, "test-host");
-        assert_eq!(snapshot.seat, Seat::Controlling);
+        assert_eq!(snapshot.seat, Seat::Writing);
         assert_eq!(snapshot.replay_capacity_bytes, 262_144);
         assert_eq!(snapshot.last_input_seq, 0, "a fresh tab has typed nothing");
         assert!(snapshot.server_time_ms > 0);
@@ -843,7 +843,7 @@ fn an_authenticated_attach_is_answered_with_a_snapshot() {
             _ => None,
         })
         .expect("the TUI is told a viewer attached");
-    assert_eq!(attached.0, Seat::Controlling);
+    assert_eq!(attached.0, Seat::Writing);
     assert!(attached.1.is_loopback());
     assert!(
         events
@@ -867,7 +867,7 @@ fn an_unsupported_protocol_version_is_refused_with_the_numbers() {
             &mut ws,
             &ClientMsg::Attach(Attach {
                 protocol_version: PROTOCOL_VERSION + 7,
-                seat: SeatRequest::Control,
+                seat: SeatRequest::Write,
                 cursors: Vec::new(),
                 resume_viewer: None,
                 viewport: None,
@@ -897,53 +897,116 @@ fn an_unsupported_protocol_version_is_refused_with_the_numbers() {
 // Seats and takeover (D14)
 // ===========================================================================
 
+/// D14 as revised, end to end over two real sockets: **both browsers are
+/// seated**, the one that is mid-burst holds the turn, the other is refused by
+/// name, and `TakeOver` is the one thing that cuts in.
 #[test]
-fn a_second_controller_is_refused_then_takes_over_and_the_first_becomes_an_observer() {
+fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
     let harness = Harness::start();
     let addr = harness.addr();
     let cookie = on_runtime(harness.authenticate());
 
     on_runtime(async {
         let mut first = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut first, SeatRequest::Control).await;
+        attach(&mut first, SeatRequest::Write).await;
         let first_snapshot = await_snapshot(&mut first).await;
-        assert_eq!(first_snapshot.seat, Seat::Controlling);
+        assert_eq!(first_snapshot.seat, Seat::Writing);
 
         let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut second, SeatRequest::Control).await;
+        attach(&mut second, SeatRequest::Write).await;
+        let second_snapshot = await_snapshot(&mut second).await;
+        assert_eq!(
+            second_snapshot.seat,
+            Seat::Writing,
+            "a writer's seat is a role now, and asking for it is never refused"
+        );
+        assert_ne!(second_snapshot.viewer_id, first_snapshot.viewer_id);
+        assert_eq!(
+            second_snapshot
+                .seats
+                .iter()
+                .filter(|row| row.viewer_id.is_some() && row.seat == Seat::Writing)
+                .count(),
+            2,
+            "two browsers seated as writers: {:?}",
+            second_snapshot.seats
+        );
+        assert!(
+            second_snapshot.seats.iter().all(|row| !row.holds_input),
+            "and nobody has typed yet, so the turn is free: {:?}",
+            second_snapshot.seats
+        );
 
-        // Refused, with the incumbent named so the takeover prompt can render.
+        // The first one types, which is how the lock is claimed.
+        send(
+            &mut first,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: "t1".into(),
+                data: b"hel".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+
+        // The second one types into that live burst and is refused — by name,
+        // and without losing its seat.
+        send(
+            &mut second,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: "t1".into(),
+                data: b"wor".to_vec(),
+            }),
+        )
+        .await;
+        let ack = next_ack(&mut second).await;
+        assert_eq!(ack.seq, 1);
+        assert_eq!(
+            ack.outcome,
+            flightdeck::web::protocol::AckOutcome::Rejected,
+            "refused, never interleaved and never silently dropped (§5.1)"
+        );
         let refusal = frame_matching(&mut second, |frame| match frame {
             ServerMsg::Error(error) => Some(error),
             _ => None,
         })
         .await;
         assert_eq!(refusal.code, ErrorCode::SeatHeld);
-        let incumbent = refusal.incumbent.expect("who holds the seat");
-        assert_eq!(
-            incumbent.viewer_id.as_ref(),
-            Some(&first_snapshot.viewer_id)
+        let holder = refusal.incumbent.expect("who is typing");
+        assert_eq!(holder.viewer_id.as_ref(), Some(&first_snapshot.viewer_id));
+        assert!(holder.holds_input);
+        assert!(
+            refusal.message.contains("typing"),
+            "the refusal says who is typing, not merely that something failed: {}",
+            refusal.message
         );
-        assert_eq!(incumbent.seat, Seat::Controlling);
 
-        // Takeover has no dedicated frame: the client re-sends `Attach`.
+        // Takeover has no dedicated frame: the client re-sends `Attach`. It
+        // takes the *turn*, and demotes nobody.
         attach(&mut second, SeatRequest::TakeOver).await;
-        let second_snapshot = await_snapshot(&mut second).await;
-        assert_eq!(second_snapshot.seat, Seat::Controlling);
-        assert_ne!(second_snapshot.viewer_id, first_snapshot.viewer_id);
+        let after = await_snapshot(&mut second).await;
+        assert_eq!(after.seat, Seat::Writing);
 
-        // Eviction is a `Delta::Seats`, never a `Shutdown`: the evicted socket
-        // stays open, watching read-only (2f).
         let (you, seats, server_time_ms) = frame_matching(&mut first, |frame| match frame {
             ServerMsg::Delta(Delta::Seats {
                 you,
                 seats,
                 server_time_ms,
-            }) if you == Seat::Observing => Some((you, seats, server_time_ms)),
+            }) if seats
+                .iter()
+                .any(|row| row.holds_input && row.viewer_id.as_ref() == Some(&after.viewer_id)) =>
+            {
+                Some((you, seats, server_time_ms))
+            }
             _ => None,
         })
         .await;
-        assert_eq!(you, Seat::Observing);
+        assert_eq!(
+            you,
+            Seat::Writing,
+            "the interrupted writer keeps its seat — only the turn moved"
+        );
         // The frame carries its own reference clock, so the rows it delivers are
         // as datable as the ones inside a snapshot. Artboard 2f's `connected`
         // fact must not depend on which frame the seat news arrived in.
@@ -958,46 +1021,45 @@ fn a_second_controller_is_refused_then_takes_over_and_the_first_becomes_an_obser
             );
         }
         assert_eq!(seats.len(), 3, "desktop + two tabs: {seats:?}");
-        let web_controllers: Vec<_> = seats
-            .iter()
-            .filter(|row| row.viewer_id.is_some() && row.seat == Seat::Controlling)
-            .collect();
-        assert_eq!(web_controllers.len(), 1, "exactly one browser drives");
         assert_eq!(
-            web_controllers[0].viewer_id.as_ref(),
-            Some(&second_snapshot.viewer_id)
+            seats.iter().filter(|row| row.holds_input).count(),
+            1,
+            "exactly one surface has the turn: {seats:?}"
         );
 
-        // The evicted socket is still usable — it just cannot type.
+        // And now the roles are exactly reversed, on the same symmetric rule.
         send(
             &mut first,
             &ClientMsg::Input(Input {
-                seq: 1,
+                seq: 2,
                 terminal_id: "t1".into(),
-                data: b"ls\r".to_vec(),
+                data: b"lo".to_vec(),
             }),
         )
         .await;
-        let ack = frame_matching(&mut first, |frame| match frame {
-            ServerMsg::Ack(ack) => Some(ack),
-            _ => None,
-        })
-        .await;
-        assert_eq!(ack.seq, 1);
+        let ack = next_ack(&mut first).await;
         assert_eq!(
             ack.outcome,
-            flightdeck::web::protocol::AckOutcome::Ignored,
-            "a keystroke is acked, never silently dropped (§5.1)"
+            flightdeck::web::protocol::AckOutcome::Rejected,
+            "the writer that was interrupted is refused on the same terms"
         );
     });
 
-    // No observer input ever reached the host's input seam.
-    assert!(
-        !harness
-            .inbound()
-            .iter()
-            .any(|event| matches!(event, WebInbound::Input { .. })),
-        "an observer's keystrokes must not reach the PTY seam"
+    // Only the holder's bytes ever reached the host's input seam. The refused
+    // ones were never forwarded at all — arbitration happens before the channel,
+    // which is what makes draining it in order safe.
+    let typed: Vec<Vec<u8>> = harness
+        .inbound()
+        .iter()
+        .filter_map(|event| match event {
+            WebInbound::Input { input, .. } => Some(input.data.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        typed,
+        vec![b"hel".to_vec()],
+        "a refused keystroke must not reach the PTY seam"
     );
 }
 
@@ -1009,7 +1071,7 @@ fn an_observer_never_contends_for_the_seat() {
 
     on_runtime(async {
         let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut driver, SeatRequest::Control).await;
+        attach(&mut driver, SeatRequest::Write).await;
         let driving = await_snapshot(&mut driver).await;
 
         let mut watchers = Vec::new();
@@ -1032,7 +1094,7 @@ fn an_observer_never_contends_for_the_seat() {
         )
         .await;
         let again = await_snapshot(&mut driver).await;
-        assert_eq!(again.seat, Seat::Controlling);
+        assert_eq!(again.seat, Seat::Writing);
         assert_eq!(again.viewer_id, driving.viewer_id);
         assert_eq!(
             again.seats.len(),
@@ -1097,7 +1159,7 @@ fn an_unknown_command_is_not_supported_rather_than_fatal() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
 
         send(
@@ -1139,7 +1201,7 @@ fn releasing_the_seat_frees_it_for_the_next_browser() {
 
     on_runtime(async {
         let mut first = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut first, SeatRequest::Control).await;
+        attach(&mut first, SeatRequest::Write).await;
         await_snapshot(&mut first).await;
 
         send(
@@ -1166,8 +1228,8 @@ fn releasing_the_seat_frees_it_for_the_next_browser() {
 
         // The seat is free, so the next browser gets it without a takeover.
         let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut second, SeatRequest::Control).await;
-        assert_eq!(await_snapshot(&mut second).await.seat, Seat::Controlling);
+        attach(&mut second, SeatRequest::Write).await;
+        assert_eq!(await_snapshot(&mut second).await.seat, Seat::Writing);
     });
 }
 
@@ -1182,7 +1244,7 @@ fn the_controllers_input_reaches_the_host_seam() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         send(
             &mut ws,
@@ -1238,7 +1300,7 @@ fn the_host_can_push_frames_to_all_viewers_and_to_one() {
 
     on_runtime(async {
         let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut driver, SeatRequest::Control).await;
+        attach(&mut driver, SeatRequest::Write).await;
         let driving = await_snapshot(&mut driver).await;
         let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
         attach(&mut watcher, SeatRequest::Observe).await;
@@ -1277,11 +1339,11 @@ fn the_host_can_push_frames_to_all_viewers_and_to_one() {
         .await;
         assert_eq!(ack.seq, 42);
 
-        // And `Controller` finds whoever holds the seat, which is not the
+        // And `Writers` reaches everyone seated as a writer, which is not the
         // observer.
         harness
             .handle
-            .send(server::WebOutbound::Controller(ServerMsg::Delta(
+            .send(server::WebOutbound::Writers(ServerMsg::Delta(
                 Delta::Geometry {
                     terminal_id: "t1".into(),
                     geometry: flightdeck::web::protocol::Geometry {
@@ -1318,7 +1380,7 @@ fn published_state_is_what_the_next_attach_sees() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let snapshot = await_snapshot(&mut ws).await;
         assert_eq!(snapshot.host_version, "9.9.9-published");
         assert_eq!(snapshot.geometry.cols, 120);
@@ -1343,7 +1405,7 @@ fn a_graceful_stop_sends_shutdown_before_the_socket_closes() {
     let (frames_tx, frames_rx) = std::sync::mpsc::channel::<Option<ServerMsg>>();
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         tokio::spawn(async move {
             loop {
@@ -1412,7 +1474,7 @@ fn the_viewer_that_asked_for_the_quit_is_told_it_was_its_own_doing() {
     let (id_tx, id_rx) = std::sync::mpsc::channel::<flightdeck::web::protocol::ViewerId>();
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let snapshot = await_snapshot(&mut ws).await;
         id_tx.send(snapshot.viewer_id).expect("the id is reported");
         tokio::spawn(async move {
@@ -1498,7 +1560,7 @@ fn every_attached_viewer_is_told_about_the_shutdown() {
         for index in 0..3 {
             let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
             let seat = if index == 0 {
-                SeatRequest::Control
+                SeatRequest::Write
             } else {
                 SeatRequest::Observe
             };
@@ -1734,7 +1796,7 @@ fn pty_bytes_reach_an_attached_viewer_with_monotonic_offsets() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -1782,7 +1844,7 @@ fn a_controller_and_an_observer_both_see_bytes_but_only_one_types() {
 
     on_runtime(async {
         let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut driver, SeatRequest::Control).await;
+        attach(&mut driver, SeatRequest::Write).await;
         await_snapshot(&mut driver).await;
         let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
         attach(&mut watcher, SeatRequest::Observe).await;
@@ -1861,7 +1923,7 @@ fn a_reconnecting_viewer_resumes_from_its_byte_cursor() {
     on_runtime(async {
         // First connection: sees the first chunk, then the link dies.
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -1934,7 +1996,7 @@ fn a_reconnecting_viewer_whose_cursor_aged_out_is_told_it_missed_output() {
             &mut ws,
             &ClientMsg::Attach(Attach {
                 protocol_version: PROTOCOL_VERSION,
-                seat: SeatRequest::Control,
+                seat: SeatRequest::Write,
                 cursors: vec![TermCursor {
                     terminal_id: terminal.clone(),
                     next_offset: 2,
@@ -1981,7 +2043,7 @@ fn input_reaches_the_terminal_it_names_and_no_other() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -2009,6 +2071,159 @@ fn input_reaches_the_terminal_it_names_and_no_other() {
     });
 }
 
+/// Type one writer's whole token at human speed, one `Input` frame per byte,
+/// after an optional stagger.
+///
+/// **One frame per byte, spaced out in time, on purpose.** A token sent as a
+/// single frame would be written atomically by `write_into_session` whatever the
+/// lock did, and a burst fired in microseconds would finish before the other
+/// writer's first byte arrived — either way the test would pass without the lock
+/// and prove nothing. A `KEY_GAP_MS` gap makes the two bursts genuinely overlap
+/// in time, so an unarbitrated host really does splice them, while staying well
+/// inside `INPUT_LOCK_IDLE_MS` so an arbitrated one never breaks a burst.
+async fn type_token(
+    ws: &mut Ws,
+    terminal: &flightdeck::web::protocol::TerminalId,
+    seq_base: u64,
+    token: &[u8],
+    stagger_ms: u64,
+    key_gap_ms: u64,
+) {
+    if stagger_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+    }
+    for (offset, byte) in token.iter().enumerate() {
+        if offset > 0 {
+            tokio::time::sleep(Duration::from_millis(key_gap_ms)).await;
+        }
+        send(
+            ws,
+            &ClientMsg::Input(Input {
+                seq: seq_base + offset as u64,
+                terminal_id: terminal.clone(),
+                data: vec![*byte],
+            }),
+        )
+        .await;
+    }
+}
+
+/// **The criterion D14's revision exists for: two writers typing at the same
+/// time never produce interleaved-and-corrupted bytes at the PTY.**
+///
+/// Two real sockets, both seated as writers, both typing a five-byte token one
+/// frame per byte at human speed, *concurrently* — the two bursts genuinely
+/// overlap: one writer's keys fall in the gaps between the other's, which is
+/// precisely the arrangement that produces `1212121212…` on a host that does not
+/// arbitrate. The 20 ms stagger is half a keystroke gap, so it decides the
+/// round's winner without ever separating the bursts in time; which side gets it
+/// alternates, so both writers really reach the terminal and the result is not
+/// an artifact of one of them never having tried.
+///
+/// The assertion is on the bytes the fake PTY actually received. Every five-byte
+/// token must be whole and belong to one writer. **Half the tokens never arrive
+/// at all**, and that is the cost the decision log states rather than a defect:
+/// a keystroke typed into somebody else's live burst is refused, not queued for
+/// later delivery, because delivering it later would splice it into the middle
+/// of whatever they had typed.
+#[test]
+fn two_writers_typing_at_once_never_interleave_at_the_pty() {
+    const ROUNDS: u64 = 4;
+    const TOKEN_A: &[u8] = b"1111.";
+    const TOKEN_B: &[u8] = b"2222.";
+    /// A relaxed typing speed. Five of these span 160 ms — comfortably inside
+    /// `INPUT_LOCK_IDLE_MS`, so an arbitrated host never breaks a burst.
+    const KEY_GAP_MS: u64 = 40;
+    /// Half a keystroke gap: enough to decide who asked first (the host answers
+    /// a frame in microseconds over loopback), far too little to stop the bursts
+    /// overlapping.
+    const STAGGER_MS: u64 = 20;
+    /// Long enough after the winner's last byte that the lock has idled out
+    /// before the next round, so each round starts from a free lock.
+    const SETTLE_MS: u64 = 450;
+
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+    let mut fleet = Fleet::new(65_536);
+    let agent = fleet.tab("tab-1");
+    let terminal = primary_terminal_id("tab-1");
+
+    on_runtime(async {
+        let mut alice = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        let mut bob = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut alice, SeatRequest::Write).await;
+        let alice_snapshot = await_snapshot(&mut alice).await;
+        attach(&mut bob, SeatRequest::Write).await;
+        let bob_snapshot = await_snapshot(&mut bob).await;
+        assert_eq!(alice_snapshot.seat, Seat::Writing);
+        assert_eq!(
+            bob_snapshot.seat,
+            Seat::Writing,
+            "both are writers — that is what lifting the single-controller \
+             restriction means"
+        );
+        settle().await;
+        fleet.drain(harness.inbound(), &harness.handle);
+
+        for round in 0..ROUNDS {
+            let seq = 1 + round * TOKEN_A.len() as u64;
+            // Alternate who asks first, so the transcript has to contain both
+            // writers' tokens for the test to pass.
+            let (alice_stagger, bob_stagger) = if round % 2 == 0 {
+                (0, STAGGER_MS)
+            } else {
+                (STAGGER_MS, 0)
+            };
+            // Both bursts are genuinely in flight together: two tasks on two
+            // sockets, joined rather than sequenced, and interleaved in time.
+            tokio::join!(
+                type_token(
+                    &mut alice,
+                    &terminal,
+                    seq,
+                    TOKEN_A,
+                    alice_stagger,
+                    KEY_GAP_MS
+                ),
+                type_token(&mut bob, &terminal, seq, TOKEN_B, bob_stagger, KEY_GAP_MS),
+            );
+            tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
+            settle().await;
+            fleet.drain(harness.inbound(), &harness.handle);
+        }
+    });
+
+    let typed = agent.input();
+    let transcript = String::from_utf8_lossy(&typed).into_owned();
+    let tokens: Vec<&[u8]> = typed.chunks(TOKEN_A.len()).collect();
+
+    // The criterion. An unarbitrated host writes `12121212..21212121..`, and
+    // every chunk of it is a token neither writer typed.
+    for (chunk, token) in tokens.iter().enumerate() {
+        assert!(
+            *token == TOKEN_A || *token == TOKEN_B,
+            "the PTY was written `{}` at chunk {chunk}, which is neither \
+             writer's token — the two bursts were spliced together, which is \
+             exactly the corruption the input lock exists to prevent. Whole \
+             transcript: `{transcript}`",
+            String::from_utf8_lossy(token)
+        );
+    }
+    assert!(
+        tokens.contains(&TOKEN_A) && tokens.contains(&TOKEN_B),
+        "both writers must actually reach the PTY, or this proves only that one \
+         of them never typed: `{transcript}`"
+    );
+    assert_eq!(
+        typed.len(),
+        (ROUNDS as usize) * TOKEN_A.len(),
+        "exactly one writer's token landed per round — the other was refused, \
+         which is the cost D14's revision states rather than a defect: \
+         `{transcript}`"
+    );
+}
+
 /// §5.1 end to end: keystrokes typed while the link is down are queued by the
 /// browser, replayed **in order** when it returns, and the ones the host
 /// already applied are not applied a second time.
@@ -2027,7 +2242,7 @@ fn input_held_across_a_reconnect_arrives_in_order_exactly_once() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let first = await_snapshot(&mut ws).await;
         assert_eq!(
             first.last_input_seq, 0,
@@ -2145,7 +2360,7 @@ fn input_for_a_terminal_the_host_does_not_have_is_refused_out_loud() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -2204,7 +2419,7 @@ fn input_for_an_exited_terminal_is_refused_with_the_accurate_reason() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -2267,7 +2482,7 @@ fn a_resize_frame_never_resizes_a_pty() {
 
     let saw_resize = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         settle().await;
         fleet.drain(harness.inbound(), &harness.handle);
@@ -2468,7 +2683,7 @@ fn an_attached_viewer_learns_a_new_transition_without_reloading() {
 
     let mut ws = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let snapshot = await_snapshot(&mut ws).await;
         assert!(
             snapshot.activity.is_empty(),
@@ -2524,7 +2739,7 @@ fn republishing_the_same_feed_sends_no_further_activity_deltas() {
 
     let mut ws = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         ws
     });
@@ -2592,7 +2807,7 @@ fn a_freshly_attached_viewer_backfills_the_retained_feed() {
 
     on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let snapshot = await_snapshot(&mut ws).await;
         assert_eq!(
             snapshot.activity.len(),
@@ -2647,7 +2862,7 @@ fn marking_the_feed_read_is_host_state_a_second_tab_sees() {
 
     let (mut ws, ids) = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         let snapshot = await_snapshot(&mut ws).await;
         let ids: Vec<String> = snapshot
             .activity
@@ -2720,7 +2935,7 @@ fn a_malformed_mark_activity_read_is_rejected_and_changes_nothing() {
 
     let mut ws = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await;
         ws
     });
@@ -2780,7 +2995,7 @@ fn an_observer_cannot_mark_the_feed_read() {
     on_runtime(async {
         // A controller first, so the second socket really is an observer.
         let mut driver = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut driver, SeatRequest::Control).await;
+        attach(&mut driver, SeatRequest::Write).await;
         await_snapshot(&mut driver).await;
 
         let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
@@ -2839,7 +3054,7 @@ use flightdeck::web::protocol::{command as names, CommandTarget};
 /// so the answer can be read off it.
 async fn control(addr: &str, cookie: &str) -> Ws {
     let mut ws = ws_connect(addr, Some(cookie)).await.expect("upgrade");
-    attach(&mut ws, SeatRequest::Control).await;
+    attach(&mut ws, SeatRequest::Write).await;
     await_snapshot(&mut ws).await;
     ws
 }
@@ -2888,7 +3103,7 @@ fn the_snapshot_carries_the_hosts_command_inventory() {
 
     let snapshot = on_runtime(async {
         let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut ws, SeatRequest::Control).await;
+        attach(&mut ws, SeatRequest::Write).await;
         await_snapshot(&mut ws).await
     });
 
@@ -3109,35 +3324,44 @@ fn a_bare_quit_frame_cannot_kill_flightdeck() {
     on_runtime(await_snapshot(&mut ws));
 }
 
-/// **A confirmation raced by a takeover does not slip through** (D14 + artboard
-/// 1g, `remote-control-ll5.4`).
+/// **A confirmation from a browser that has gone read-only does not slip
+/// through** (D14 + artboard 1g, `remote-control-ll5.4`).
 ///
 /// The seat that typed the name must be the seat that confirms, and here that is
 /// true *by construction rather than by comparison*: 1g's typed name rides on
 /// the deciding frame itself, so the host keeps no "this viewer is armed" state
 /// for a second browser to inherit or race. What is left is the ordinary seat
-/// check — which runs before a command's own route is even considered — so the
-/// evicted browser's confirm, correct name and all, is answered `read_only` and
-/// never reaches the host at all.
+/// check — which runs before a command's own route is even considered.
+///
+/// **D14's revision changes what puts a browser on the wrong side of that
+/// check.** A takeover no longer demotes anyone: it takes the input *lock*, and
+/// the interrupted browser keeps its writer's seat and may still answer a
+/// dialog. What still refuses is the seat itself, and 2f's `Watch read-only` is
+/// how a browser chooses it — which is exactly the flow here, mid-dialog.
 #[test]
-fn a_confirm_from_a_browser_that_lost_the_seat_never_reaches_the_host() {
+fn a_confirm_from_a_browser_watching_read_only_never_reaches_the_host() {
     let harness = Harness::start();
     let addr = harness.addr();
     let cookie = on_runtime(harness.authenticate());
 
     on_runtime(async {
         let mut first = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
-        attach(&mut first, SeatRequest::Control).await;
+        attach(&mut first, SeatRequest::Write).await;
         await_snapshot(&mut first).await;
 
-        // The race: a second browser takes the seat while the first is typing
-        // the session name into artboard 1g's step 2.
+        // A second browser takes the turn while the first is typing the session
+        // name into artboard 1g's step 2 — which, under the revision, leaves the
+        // first browser still seated and still able to answer.
         let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
         attach(&mut second, SeatRequest::TakeOver).await;
         await_snapshot(&mut second).await;
 
-        // The first finishes typing and answers. The name is right; the seat is
-        // not its any more.
+        // So the first browser takes 2f's other offer instead of fighting.
+        attach(&mut first, SeatRequest::Observe).await;
+        await_snapshot(&mut first).await;
+
+        // It finishes typing and answers anyway. The name is right; the seat is
+        // not one that may decide anything.
         send(
             &mut first,
             &ClientMsg::Command(WireCommand {
@@ -3172,6 +3396,108 @@ fn a_confirm_from_a_browser_that_lost_the_seat_never_reaches_the_host() {
     });
 
     assert_nothing_forwarded(&harness);
+}
+
+/// D14 as revised: `take_input_lock` is the browser's explicit override, and it
+/// is the *same* act as `Attach { seat: take_over }` — the palette door for a
+/// tab that is already a writer and does not want to re-attach to interrupt.
+///
+/// The desktop reaches the same act through its own palette row, which is what
+/// keeps the rule symmetric: neither surface can cut into a live burst any other
+/// way, and both can.
+#[test]
+fn a_writer_can_take_the_input_lock_by_name() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut first = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut first, SeatRequest::Write).await;
+        let first_snapshot = await_snapshot(&mut first).await;
+        let mut second = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut second, SeatRequest::Write).await;
+        let second_snapshot = await_snapshot(&mut second).await;
+
+        // The first claims the lock by typing.
+        send(
+            &mut first,
+            &ClientMsg::Input(Input {
+                seq: 1,
+                terminal_id: "t1".into(),
+                data: b"a".to_vec(),
+            }),
+        )
+        .await;
+        settle().await;
+
+        command(&mut second, 90, names::TAKE_INPUT_LOCK).await;
+        let ack = next_ack(&mut second).await;
+        assert_eq!(ack.seq, 90);
+        assert_eq!(ack.outcome, AckOutcome::Applied);
+
+        // The turn moved, and the seat map says so to everyone.
+        let seats = frame_matching(&mut first, |frame| match frame {
+            ServerMsg::Delta(Delta::Seats { seats, .. })
+                if seats.iter().any(|row| {
+                    row.holds_input && row.viewer_id.as_ref() == Some(&second_snapshot.viewer_id)
+                }) =>
+            {
+                Some(seats)
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(seats.iter().filter(|row| row.holds_input).count(), 1);
+
+        // And the first is now the one being refused, mid-burst, on the same rule.
+        send(
+            &mut first,
+            &ClientMsg::Input(Input {
+                seq: 2,
+                terminal_id: "t1".into(),
+                data: b"b".to_vec(),
+            }),
+        )
+        .await;
+        let refusal = frame_matching(&mut first, |frame| match frame {
+            ServerMsg::Error(error) => Some(error),
+            _ => None,
+        })
+        .await;
+        assert_eq!(refusal.code, ErrorCode::SeatHeld);
+        assert_eq!(
+            refusal.incumbent.and_then(|row| row.viewer_id).as_ref(),
+            Some(&second_snapshot.viewer_id)
+        );
+        assert_ne!(first_snapshot.viewer_id, second_snapshot.viewer_id);
+    });
+}
+
+/// An observer taking the input lock would stop everyone else typing in order to
+/// type nothing, so it is the one server-answered row that is not open to a
+/// read-only tab.
+#[test]
+fn an_observer_cannot_take_the_input_lock() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut watcher = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut watcher, SeatRequest::Observe).await;
+        await_snapshot(&mut watcher).await;
+
+        command(&mut watcher, 91, names::TAKE_INPUT_LOCK).await;
+        let error = next_error(&mut watcher).await;
+        assert_eq!(error.code, ErrorCode::ReadOnly);
+        assert_eq!(error.seq, Some(91));
+
+        // The two rows that *are* open to an observer still are: this is one
+        // row's exception, not a new rule about `Route::Server`.
+        command(&mut watcher, 92, names::REQUEST_SNAPSHOT).await;
+        await_snapshot(&mut watcher).await;
+    });
 }
 
 /// D14: read-only means read-only, for the whole surface and not just for the

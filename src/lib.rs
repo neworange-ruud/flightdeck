@@ -1242,6 +1242,27 @@ struct Ui {
     /// Set by "Stop Web Interface"; the event loop drains the viewers and
     /// releases the listener (Q5).
     pending_web_stop: bool,
+    /// Set by "Take Input Lock"; the event loop interrupts whichever surface is
+    /// mid-burst and takes the input lock for this desktop (D14 as revised).
+    ///
+    /// Deferred rather than done in the palette handler for the same reason as
+    /// the two lifecycle flags above: the lock lives behind
+    /// [`crate::web::server::WebServerHandle`], which only the event loop holds.
+    pending_input_preempt: bool,
+    /// The input lock, while the web server is running (D14 as revised).
+    ///
+    /// **This is the desktop's own arbitration seam, and it is deliberately not
+    /// a privilege.** Every desktop keystroke bound for a PTY claims through it
+    /// exactly the way a browser's does, is refused by name while another writer
+    /// is mid-burst, and takes the lock back the moment they go quiet. `None`
+    /// while the server is stopped, which is the honest reading of "there is one
+    /// writer and nothing to arbitrate".
+    input_lock: Option<crate::web::arbiter::SharedInputLock>,
+    /// Who holds the input lock, as the status bar renders it, or `None` when it
+    /// is free or when there is nobody to contend with. Refreshed once per tick
+    /// from the same seat rows the browser is sent, so the two surfaces cannot
+    /// disagree about who can type.
+    input_holder: Option<String>,
     /// Whether the embedded web server is currently listening. Refreshed each
     /// tick and read when opening the palette, so exactly one of the two
     /// lifecycle commands is ever offered — the same gating idiom as
@@ -2619,10 +2640,54 @@ fn event_loop(
         }
         ui.web_running = web_surface.running();
 
+        // --- The input lock (D14 as revised). ---------------------------------
+        //
+        // The desktop is one of the writers, so it holds the same lock every
+        // browser does and reads it from the same place. Three things happen
+        // here, all once per tick:
+        //
+        //   1. The handle is picked up (or dropped) as the server starts and
+        //      stops, so `write_active_pty` has something to claim through —
+        //      and, when the server is stopped, deliberately does not.
+        //   2. `sync_input_lock` retires a holder that has gone quiet. Nobody
+        //      *causes* an expiry, so without a tick nothing would announce it
+        //      and both surfaces would keep naming somebody who stopped typing.
+        //   3. The palette's explicit override is applied, and only here: it is
+        //      the one act that may cut into a live burst.
+        match web_surface.handle.as_ref() {
+            Some(handle) => {
+                if ui.input_lock.is_none() {
+                    ui.input_lock = Some(handle.input_lock());
+                }
+                if std::mem::take(&mut ui.pending_input_preempt) {
+                    let message = match handle.preempt_input_for_desktop(now_ms as i64) {
+                        Some(interrupted) => {
+                            format!("Input lock taken from {interrupted}.")
+                        }
+                        // Nobody was mid-burst. Say what happened rather than
+                        // implying somebody was interrupted.
+                        None => "Input lock held by this desktop.".to_string(),
+                    };
+                    ui.message(message);
+                }
+                handle.sync_input_lock(now_ms as i64);
+                // Named only while somebody else could be typing: with no
+                // browser seated as a writer the chip would be permanent noise
+                // about a contest that cannot happen.
+                ui.input_holder = web_input_holder(handle);
+            }
+            None => {
+                ui.pending_input_preempt = false;
+                ui.input_lock = None;
+                ui.input_holder = None;
+            }
+        }
+
         // --- Render: the project tab row (workspace-level) plus the active
         //     project's full UI. The project row is painted first so any
         //     centered overlay drawn by `draw` still wins on tiny screens. ---
         let overlay = ui.render_overlay();
+        let input_holder = ui.input_holder.as_deref();
         let infos = workspace.tab_infos(now_ms);
         let active_idx = workspace.active;
         let p = &workspace.projects[active_idx];
@@ -2636,7 +2701,7 @@ fn event_loop(
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
-                draw(frame, &p.state, &p.cache, &overlay, now_ms);
+                draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
             })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
@@ -4564,12 +4629,21 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             switch_project(workspace, env, sel, ui);
             Ok(false)
         }
+        // D14 as revised: every byte the desktop aims at a PTY claims the input
+        // lock first, on exactly the terms a browser's does. Refused means the
+        // bytes are dropped — never queued for later, which would splice them
+        // into the middle of whatever the other writer typed — and the status
+        // bar names the holder, so nothing disappears without a trace (§5.1).
         KeyAction::Passthrough(bytes) => {
-            write_active_pty(&mut workspace.active_project_mut().state, &bytes);
+            if desktop_may_type(ui, env.clock.now_millis() as i64) {
+                write_active_pty(&mut workspace.active_project_mut().state, &bytes);
+            }
             Ok(false)
         }
         KeyAction::Paste => {
-            paste_into_active_pty(&mut workspace.active_project_mut().state);
+            if desktop_may_type(ui, env.clock.now_millis() as i64) {
+                paste_into_active_pty(&mut workspace.active_project_mut().state);
+            }
             Ok(false)
         }
         KeyAction::OpenPalette => {
@@ -4641,9 +4715,14 @@ fn handle_paste(data: String, workspace: &mut Workspace, env: &Env, ui: &mut Ui)
     }
 
     // Only a focused terminal receives pasted text; in App mode it is a no-op.
-    let state = &mut workspace.active_project_mut().state;
-    if state.mode() == InputMode::Terminal {
-        paste_text_into_active_pty(state, &data);
+    // A paste is one atomic write, but it is still this desktop's turn or
+    // somebody else's (D14 as revised) — dropping a bracketed paste into the
+    // middle of another writer's line would be the same corruption a keystroke
+    // causes, only larger.
+    if workspace.active_project().state.mode() == InputMode::Terminal
+        && desktop_may_type(ui, env.clock.now_millis() as i64)
+    {
+        paste_text_into_active_pty(&mut workspace.active_project_mut().state, &data);
     }
     Ok(())
 }
@@ -6409,6 +6488,13 @@ fn run_palette_action(
             ui.pending_web_stop = true;
             return Ok(());
         }
+        // D14 as revised: the desktop's half of the one explicit override in
+        // the input-arbitration model. Deferred like the two above, because the
+        // lock lives on the running server's side of the seam.
+        PaletteAction::TakeInputLock => {
+            ui.pending_input_preempt = true;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -6467,7 +6553,8 @@ fn run_palette_action(
         | PaletteAction::PairPhone
         | PaletteAction::UnpairPhone
         | PaletteAction::StartWebInterface
-        | PaletteAction::StopWebInterface => Ok(()),
+        | PaletteAction::StopWebInterface
+        | PaletteAction::TakeInputLock => Ok(()),
     }
 }
 
@@ -7529,7 +7616,64 @@ fn drain_pty_output(
     }
 }
 
+/// Who holds the input lock, as the desktop's status bar should name it, or
+/// `None` when there is nothing to say (`specs/WEB_INTERFACE.md` D14 as
+/// revised).
+///
+/// `None` in two different situations that both mean *do not draw a chip*: the
+/// lock is free, or no browser is seated as a writer, so the desktop is the only
+/// surface that can type and a "who can type" chip would be permanent noise
+/// about a contest that cannot happen. Read off the same seat rows the browser
+/// is sent, so neither surface can be told a different holder.
+fn web_input_holder(handle: &crate::web::server::WebServerHandle) -> Option<String> {
+    let holder = handle.input_holder_label()?;
+    handle.has_browser_writer().then_some(holder)
+}
+
+/// Whether this desktop may type into a PTY right now, claiming the input lock
+/// if it is free (D14 as revised).
+///
+/// **This is the desktop obeying the same rule as every browser, and it is the
+/// point of the whole model.** A surface that could always cut in would splice
+/// its bytes into somebody else's half-typed word, which reads as a bug in the
+/// agent rather than in FlightDeck. So the desktop claims, and while another
+/// writer's burst is live it is refused — the bytes are dropped, and the status
+/// bar names the holder so the refusal is never silent.
+///
+/// `true` with no server running: there is exactly one writer, and nothing to
+/// arbitrate.
+fn desktop_may_type(ui: &mut Ui, now_ms: i64) -> bool {
+    let Some(lock) = ui.input_lock.as_ref() else {
+        return true;
+    };
+    let mut lock = match lock.lock() {
+        Ok(lock) => lock,
+        // A writer panicked mid-claim. Recovering beats taking the terminal
+        // away from the person at the machine — the same reasoning the server
+        // applies to its own registry.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match lock.claim(
+        &crate::web::arbiter::Writer::Desktop,
+        crate::web::server::DESKTOP_SEAT_LABEL,
+        now_ms,
+    ) {
+        crate::web::arbiter::Claim::Granted => true,
+        crate::web::arbiter::Claim::Refused { label, .. } => {
+            // The trace §5.1 requires. The status bar is already naming the
+            // holder every frame; this makes the *next* frame name them even if
+            // the lock frees itself in between.
+            ui.input_holder = Some(label);
+            false
+        }
+    }
+}
+
 /// Write key bytes to the active terminal's PTY (Terminal-mode passthrough).
+///
+/// Callers that can be reached from a keystroke must have claimed the input lock
+/// first ([`desktop_may_type`]); this function is the write itself and does not
+/// arbitrate, because it is also the path a dialog's synthesised keypress takes.
 fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     let Some(tab) = state.selected_mut() else {
         return;

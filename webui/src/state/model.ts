@@ -218,11 +218,13 @@ export interface Snapshot {
   /** D14/2f: the named occupants of the viewer chip. */
   readonly seats: readonly SeatInfo[];
   /**
-   * D14: which seat *this* browser got. The host answers this on attach —
-   * `Attach { seat: SeatRequest::Control }` can be granted or answered
-   * `SeatHeld`, and `SeatRequest::Observe` is granted read-only — so the
-   * browser is told rather than assuming, and never paints a mode it does not
-   * have.
+   * D14: which seat *this* browser got. `Attach { seat: "write" }` is always
+   * granted now — several writers may be seated at once — and
+   * `SeatRequest::Observe` is granted read-only, so the browser is told rather
+   * than assuming, and never paints a mode it does not have.
+   *
+   * Being refused a keystroke (`ErrorCode::SeatHeld`) does **not** change this:
+   * a refusal costs the turn, never the seat.
    */
   readonly seat: Seat;
   /**
@@ -469,15 +471,25 @@ export interface ReplayProgress {
   readonly truncated: boolean;
 }
 
-/** Mirrors `protocol::Seat`: one controller, N observers (D14). */
-export type Seat = "controlling" | "observing";
+/**
+ * Mirrors `protocol::Seat`: N writers, N observers (D14 as revised).
+ *
+ * **A seat is a role, not a turn.** Several surfaces can be `writing` at once;
+ * which one may type at this instant is `SeatInfo.holdsInput`, and it moves
+ * between writers as they type and go quiet. Protocol v1 merged the two into
+ * one `controlling` flag, and that merged flag could not express "three
+ * writers, one of them mid-burst".
+ */
+export type Seat = "writing" | "observing";
 
 /**
  * One occupant of the viewer chip — mirrors `protocol::SeatInfo`.
  *
- * 2f: the chip reads `desktop + this tab`, **two named seats, not a counter
- * that implies a crowd.** So this carries a label to render verbatim, never a
- * number to total up.
+ * 2f: the chip names its seats, **never a counter that implies a crowd.** So
+ * this carries a label to render verbatim, never a number to total up. Under
+ * D14's revision the chip has a second thing to say — which of the named seats
+ * is typing — and it says it about the same rows rather than from a second
+ * source.
  */
 export interface SeatInfo {
   /** The compact chip's one line, rendered verbatim. */
@@ -497,7 +509,16 @@ export interface SeatInfo {
    * A claim the host relays, not a fact it checked. Displayed and nothing else.
    */
   readonly browser: string | null;
+  /** The role: may this surface type at all. */
   readonly seat: Seat;
+  /**
+   * The turn: is this surface typing *right now* (D14 as revised).
+   *
+   * At most one seat in a list has it, and none does when the lock is free.
+   * `false` for a host that did not say — which is not "the lock is free", it
+   * is "this row is not the one holding it".
+   */
+  readonly holdsInput: boolean;
   /** The desktop is not a viewer (`SeatInfo::viewer_id == null`). */
   readonly isDesktop: boolean;
   /** `14 minutes, active 20s ago` — a label; see `Staleness` for why. */
@@ -505,9 +526,9 @@ export interface SeatInfo {
 }
 
 /**
- * The browser that currently holds the controlling seat, as 2f's arriving
- * panel names it. Exactly the identifying detail turn 2 calls fair: where it
- * is, what it is, and how long it has been there.
+ * The writer that currently holds the input lock, as 2f's panel names it.
+ * Exactly the identifying detail turn 2 calls fair: where it is, what it is,
+ * and how long it has been there.
  */
 export interface Incumbent {
   readonly address: string;
@@ -518,24 +539,31 @@ export interface Incumbent {
 /**
  * The takeover prompt (2f), in its two directions.
  *
- * Two protocol facts shape this:
+ * Three protocol facts shape this:
  *   - **Takeover has no dedicated frame.** The client re-sends `Attach { seat:
  *     SeatRequest::TakeOver }`; there is no `ClientMsg::TakeOver` to model.
- *   - **Eviction is a `Delta::Seats`, never a `Shutdown`.** The evicted socket
- *     stays open as an observer, which is why `evicted` is a prompt over a live
- *     connection rather than a terminal state.
+ *   - **Nobody is disconnected and nobody is demoted.** Under D14 as revised a
+ *     takeover moves the *input lock*, not the seat, so both directions are
+ *     prompts over a live connection and `Watch read-only` is a choice rather
+ *     than a consolation.
+ *   - **Losing the turn is a `Delta::Seats`, never a `Shutdown`**, for the same
+ *     reason: the socket, and the seat, stay.
  *
  * Neither direction is a permission check. D14: anyone holding the credential
- * can evict anyone; this is courtesy, so that neither person wonders why the
- * keys stopped working.
+ * can interrupt anyone; this is courtesy, so that neither person wonders why
+ * the keys stopped working.
  */
 export type TakeoverState =
-  /** We asked for control and the seat is held (`ErrorCode::SeatHeld`). */
+  /**
+   * We typed into somebody else's live burst and were refused
+   * (`ErrorCode::SeatHeld`). We are still a writer: waiting is a real option,
+   * because the lock frees itself once they go quiet.
+   */
   | { readonly kind: "arriving"; readonly incumbent: Incumbent }
-  /** We *had* control and a `Delta::Seats` took it away. */
+  /** We held the input lock and a `Delta::Seats` moved it to somebody else. */
   | {
       readonly kind: "evicted";
-      /** The browser that took it, e.g. `192.168.2.11`. */
+      /** The writer that took it, e.g. `192.168.2.11`. */
       readonly byAddress: string;
       /** 2f: `the last one that landed was 3s ago`. */
       readonly lastInputAgo: string;

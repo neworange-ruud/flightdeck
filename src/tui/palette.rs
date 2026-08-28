@@ -66,6 +66,19 @@ pub enum PaletteAction {
     /// Stop the embedded web interface: tell every attached browser why, then
     /// release the listener (Q5).
     StopWebInterface,
+    /// Take the input lock now (`specs/WEB_INTERFACE.md` D14 as revised),
+    /// interrupting whichever surface is mid-burst.
+    ///
+    /// The desktop's half of the one explicit override in the arbitration
+    /// model. The browser's half is artboard 2f's confirmed `Take over`
+    /// (`SeatRequest::TakeOver`); this row exists so the rule stays symmetric —
+    /// a desktop that could always cut in would be exactly the privilege the
+    /// model refuses, and a desktop with no way to cut in at all would be the
+    /// same asymmetry pointed the other way.
+    ///
+    /// Offered only while the web interface is running, because with no browser
+    /// attached there is one writer and nothing to interrupt.
+    TakeInputLock,
 }
 
 /// All §22 command-palette entries, in display order.
@@ -216,6 +229,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::StopWebInterface,
     },
     PaletteEntry {
+        group: "Remote",
+        label: "Take Input Lock",
+        action: PaletteAction::TakeInputLock,
+    },
+    PaletteEntry {
         group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
@@ -246,8 +264,10 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// Phone") bring the total to 28, plus "About FlightDeck" makes 29, plus "Open
 /// Worktree in File Manager" makes 30, plus "Change Project Default Base"
 /// makes 31, plus the two FlightDeck Web lifecycle actions ("Start Web
-/// Interface" / "Stop Web Interface", D10) makes 33.
-pub const REQUIRED_ACTION_COUNT: usize = 33;
+/// Interface" / "Stop Web Interface", D10) makes 33, plus
+/// "Take Input Lock" (D14 as revised — the desktop's half of the one explicit
+/// override in the input-arbitration model) makes 34.
+pub const REQUIRED_ACTION_COUNT: usize = 34;
 
 /// Every §22 palette row, in display order, unfiltered and ungated.
 ///
@@ -329,6 +349,8 @@ impl CommandPalette {
             // Exactly one of the two web lifecycle actions is ever offered.
             PaletteAction::StartWebInterface => !self.web_running,
             PaletteAction::StopWebInterface => self.web_running,
+            // Nothing to interrupt while nothing else can type.
+            PaletteAction::TakeInputLock => self.web_running,
             // An isolated run has one session in one project (SPECS §32).
             PaletteAction::OpenProject
             | PaletteAction::CloseProject
@@ -483,6 +505,7 @@ mod tests {
             "Unpair Phone",
             "Start Web Interface",
             "Stop Web Interface",
+            "Take Input Lock",
             "Toggle Split View",
             "Show Help",
             "About FlightDeck",
@@ -542,11 +565,12 @@ mod tests {
 
     #[test]
     fn filter_empty_shows_all() {
-        // A fresh palette shows every action except the two hidden halves of
-        // the gated pairs: "Unpair Phone" (nothing is paired) and "Stop Web
-        // Interface" (nothing is listening).
+        // A fresh palette shows every action except the three the current state
+        // has nothing to say about: "Unpair Phone" (nothing is paired), "Stop
+        // Web Interface" and "Take Input Lock" (nothing is listening, so there
+        // is one writer and nothing to interrupt).
         let palette = CommandPalette::new();
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
     }
 
     #[test]
@@ -570,8 +594,9 @@ mod tests {
             "cannot pair when already paired"
         );
         assert!(labels.contains(&"Unpair Phone"), "unpair must be offered");
-        // Exactly one of each gated pair is visible in either state.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+        // Exactly one of each gated pair is visible in either state; the web
+        // interface is still stopped, so its two running-only rows are hidden.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
     }
 
     /// D10: exactly one of the two FlightDeck Web lifecycle actions is offered
@@ -710,9 +735,9 @@ mod tests {
 
         palette.clear_filter();
         assert_eq!(palette.filter(), "");
-        // Unpaired and not listening: all actions except the hidden half of
-        // each gated pair.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+        // Unpaired and not listening: all actions except "Unpair Phone" and the
+        // two rows that only mean something while the web interface is running.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
     }
 
     #[test]

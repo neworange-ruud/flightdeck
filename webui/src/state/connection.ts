@@ -414,9 +414,16 @@ function isStale(state: AppState): boolean {
  * Whether this state costs the user control — i.e. whether the mode chip is a
  * lie (§5.1). Exported so the rule is asserted once, over every state, rather
  * than re-derived per component.
+ *
+ * **The seat, not the input lock.** A writer that is momentarily refused
+ * because somebody else is mid-burst has not lost control: the lock frees
+ * itself once they go quiet, and draining the mode chip on every hand-off would
+ * make it flicker several times a minute. What the chip reports is whether this
+ * tab may type *at all*, which is exactly what `seat` says. Who is typing right
+ * now is the viewer chip's business (`state/seats.ts`).
  */
 export function hasControl(state: AppState): boolean {
-  return state.connection === "connected" && state.seat === "controlling";
+  return state.connection === "connected" && state.seat === "writing";
 }
 
 /** The coarse buckets, for tests that want to iterate every one of them. */

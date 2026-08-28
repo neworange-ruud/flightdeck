@@ -103,8 +103,20 @@ const app = createApp({
       case "activity/read":
         session.sendCommand("mark_activity_read", { event_ids: action.ids });
         return;
-      /** Takeover has no frame of its own: the browser re-sends `Attach`. The
-       * socket does that itself when the host refuses the seat. */
+      /**
+       * Takeover has no frame of its own: the browser re-sends `Attach` (2f).
+       *
+       * Both answers travel now. Under D14 as revised a refused keystroke costs
+       * the *turn* and not the seat, so the host does not move this browser
+       * anywhere on its own — `Take over` has to say so, and so does `Watch
+       * read-only`, or the panel would close over a seat nothing changed.
+       */
+      case "takeover/claim":
+        session?.requestSeat("take_over");
+        return;
+      case "takeover/observe":
+        session?.requestSeat("observe");
+        return;
       default:
         return;
     }
