@@ -609,6 +609,13 @@ impl CommandSpec {
         }
     }
 
+    /// D13: whether this row answers the open dialog instead of being a palette
+    /// row. Derived from the route rather than stored, so a new
+    /// [`Route::Dialog`] row cannot forget to say so.
+    pub fn answers_dialog(&self) -> bool {
+        matches!(self.route, Route::Dialog(_))
+    }
+
     /// What the browser must expand this row over, filling `run.args`.
     pub fn target(&self) -> Option<CommandTarget> {
         match self.route {
@@ -635,6 +642,7 @@ impl CommandSpec {
                 args: None,
             },
             host_only: self.host_only,
+            answers_dialog: self.answers_dialog(),
             annotation: self.annotation.map(str::to_string),
             target: self.target(),
             refusal: self.refusal().map(str::to_string),

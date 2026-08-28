@@ -6,7 +6,7 @@
  * no snapshot files.
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { fixtureSnapshot } from "../state/fixture";
+import { fixtureCommands, fixtureSnapshot } from "../state/fixture";
 import { createApp } from "./app";
 import type { App } from "./app";
 import type { PaletteCommand } from "../state/commands";
@@ -72,6 +72,15 @@ function type(h: Harness, text: string): void {
   for (const char of text) {
     h.key(char);
   }
+}
+
+/** The rendered row whose label is exactly `label` — the row text also
+ * carries the right-hand tag, so a `textContent` match would confuse
+ * `New Agent` with `New Agent Session Tab`. */
+function rowLabelled(h: Harness, label: string): HTMLElement | undefined {
+  return h
+    .all(".fd-palette__row")
+    .find((r) => r.querySelector(".fd-palette__label")?.textContent === label);
 }
 
 beforeEach(() => {
@@ -151,11 +160,16 @@ describe("filtering", () => {
   });
 });
 
+/**
+ * D16, now with the badge coming off the wire (`remote-control-ll5.12`): the
+ * host sets `host_only`, and these two rows are the ones it sets it on. The
+ * selected row always shows `Enter` instead of its tag (1d), so these read the
+ * unfiltered palette, where neither row is the highlighted one.
+ */
 describe("D16: host-only commands", () => {
   it("render the host-only badge and are never hidden", () => {
     const h = render();
     h.key("g", { ctrlKey: true });
-    type(h, "editor");
 
     const rows = h.all(".fd-palette__row");
     const editorRow = rows.find((r) => r.textContent?.includes("Edit in $EDITOR"));
@@ -167,14 +181,141 @@ describe("D16: host-only commands", () => {
   it("Open Worktree in File Manager is present with the badge too", () => {
     const h = render();
     h.key("g", { ctrlKey: true });
-    type(h, "file manager");
     const rows = h.all(".fd-palette__row");
     const row = rows.find((r) =>
       r.textContent?.includes("Open Worktree in File Manager"),
     );
     expect(row?.querySelector(".fd-badge-host")).not.toBeNull();
   });
+
+  it("survives a filter that narrows to it — never hidden, only unmatched", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    type(h, "editor");
+    const rows = h.all(".fd-palette__row");
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("Edit in $EDITOR"),
+    ]);
+    expect(rows[0]?.hidden).toBe(false);
+  });
 });
+
+/**
+ * `remote-control-ll5.12`. Every row, tag, badge and refusal below is the
+ * host's — `Snapshot::commands` — and the browser has no list of its own to
+ * fall back on.
+ */
+describe("the palette is the host's inventory", () => {
+  it("a row the host stops sending disappears, with no code change here", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    type(h, "toggle split");
+    expect(h.all(".fd-palette__row")).toHaveLength(1);
+
+    h.key("Escape");
+    const full = fixtureSnapshot();
+    h.app.store.dispatch({
+      type: "snapshot/received",
+      snapshot: {
+        ...full,
+        commands: full.commands.filter((c) => c.id !== "toggle_split_view"),
+      },
+    });
+    h.key("g", { ctrlKey: true });
+    type(h, "toggle split");
+    expect(h.all(".fd-palette__row")).toHaveLength(0);
+    expect(h.text(".fd-palette__count")).toContain("0 of ");
+  });
+
+  it("offers nothing at all before a host has said what it implements", () => {
+    const h = render();
+    h.app.store.dispatch({
+      type: "snapshot/received",
+      snapshot: { ...fixtureSnapshot(), commands: [] },
+    });
+    h.key("g", { ctrlKey: true });
+    expect(h.all(".fd-palette__row")).toHaveLength(0);
+    expect(h.text(".fd-palette__count")).toBe("0 of 0 commands");
+  });
+
+  it("shows the host's own refusal sentence on the row, word for word", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    const host = fixtureCommands().find((c) => c.id === "abandon_worktree");
+    expect(host?.refusal).toBeTruthy();
+    const row = rowLabelled(h, "Abandon Worktree");
+    expect(row?.title).toBe(host?.refusal);
+    /** The tag beside it is the host's word too — not a local "refused". */
+    expect(row?.textContent).toContain("destructive");
+  });
+
+  it("leaves no title on a row the host runs", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    type(h, "open shell");
+    expect(h.q(".fd-palette__row").title).toBe("");
+  });
+
+  it("D13: the two dialog answers are not palette rows", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    type(h, "dialog");
+    const labels = h.all(".fd-palette__row").map((r) => r.textContent ?? "");
+    expect(labels.some((l) => l.includes("Confirm Dialog"))).toBe(false);
+    expect(labels.some((l) => l.includes("Cancel Dialog"))).toBe(false);
+  });
+});
+
+/**
+ * The bug this task fixes: ten commands open D13's shared dialog on the host,
+ * and until now no browser row sent any of them — so a browser could answer a
+ * dialog but never start one.
+ */
+describe("a browser can open every dialog the host offers", () => {
+  /** The ten `Route::Palette` rows that open a D13 dialog on the host. Named
+   * by id, with the label read off the host's own row — this file words
+   * neither. */
+  const OPENERS = [
+    "open_project",
+    "close_project",
+    "new_agent_session_tab",
+    "rename_agent_session_tab",
+    "close_agent_session_tab",
+    "close_child_terminal",
+    "new_agent",
+    "close_agent",
+    "set_manual_status",
+    "unpair_phone",
+  ];
+
+  for (const id of OPENERS) {
+    it(`runs ${id} from a palette row`, () => {
+      const h = render();
+      const label = fixtureCommands().find((c) => c.id === id)?.label ?? "";
+      expect(label, `'${id}' is not in the host inventory`).not.toBe("");
+
+      h.key("g", { ctrlKey: true });
+      type(h, label);
+      const row = rowLabelled(h, label);
+      expect(row, `no palette row is labelled '${label}'`).toBeDefined();
+      /** No refusal: the host dispatches these through its own palette path,
+       * which is what opens the dialog on both surfaces. */
+      expect(row?.title).toBe("");
+
+      row?.click();
+      expect(h.runCommands.map((c) => c.run.name)).toEqual([id]);
+    });
+  }
+
+  it("sends them as bare frames — the dialog collects what it needs", () => {
+    const h = render();
+    h.key("g", { ctrlKey: true });
+    type(h, "new agent session tab");
+    h.q(".fd-palette__row").click();
+    expect(h.runCommands[0]?.run).toEqual({ name: "new_agent_session_tab" });
+  });
+});
+
 
 describe("outcomes follow the host's Ack, never optimism", () => {
   it("shows nothing until the Ack lands, then the real outcome", () => {

@@ -1142,6 +1142,16 @@ pub struct CommandView {
     /// badge and never hidden.
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_only: bool,
+    /// D13: this row **answers** the open dialog rather than opening anything.
+    ///
+    /// The desktop answers a dialog with its keyboard and the browser answers it
+    /// with the dialog panel's own buttons, so neither surface lists these as
+    /// palette rows. They are in the inventory because everything the browser may
+    /// send is in the inventory — which is what makes the server's "refuse any
+    /// name not in the table" a complete check — and this flag is how a browser
+    /// tells the two kinds apart without a list of its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub answers_dialog: bool,
     /// Artboard 1d's right-hand tag (`current`, `3 unread`, …), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotation: Option<String>,

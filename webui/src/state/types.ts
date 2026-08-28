@@ -2,6 +2,7 @@ import type {
   AccessScreen,
   AccessState,
   ActivityEvent,
+  HostCommand,
   Incumbent,
   Project,
   ReplayProgress,
@@ -78,7 +79,9 @@ export type ConnectionStatus =
    * Version mismatch is deliberately **not** here. 2c draws it as
    * `● connected 21ms` with the mode chip intact, because nothing about the
    * connection or about control is wrong — the tab is merely old. It lives in
-   * `AppState.versionMismatch` instead.
+   * `AppState.versionMismatch` instead. That is also why the reload chip's
+   * `Enter` stays scoped to the chip's own focus rather than becoming a
+   * global binding: see `specs/WEB_INTERFACE.md` §6.5 R9.
    */
   | "revoked"
   | "stopped";
@@ -288,6 +291,16 @@ export interface AppState {
    * "no new state" rules out.
    */
   readonly dialog: DialogState | null;
+
+  /**
+   * The host's command inventory (`remote-control-ll5.12`), empty until the
+   * first snapshot.
+   *
+   * The palette has no list of its own: `state/commands.ts` renders these rows
+   * and nothing else, so a name this host does not implement cannot be offered,
+   * and a row the host stops sending stops appearing with no browser change.
+   */
+  readonly commands: readonly HostCommand[];
 }
 
 /** A `save_config` command this browser sent and has not heard back about. */
@@ -408,6 +421,7 @@ export function createInitialState(): AppState {
     palette: null,
     config: null,
     dialog: null,
+    commands: [],
   };
 }
 

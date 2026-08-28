@@ -171,6 +171,33 @@ export interface WireDialogView {
   readonly body?: WireDialogBody | null;
 }
 
+/**
+ * One row of the host's command inventory (`protocol::CommandView`).
+ *
+ * The whole palette is built from these (`remote-control-ll5.12`): the host is
+ * the only thing that knows which names this build accepts, so a name it does
+ * not send cannot appear in the palette at all. Every field except the first
+ * four is `skip_serializing_if` on the host, so every one of them is optional
+ * here.
+ */
+export interface WireCommandView {
+  readonly id: string;
+  readonly label: string;
+  readonly group: string;
+  readonly run: { readonly name: string; readonly args?: unknown };
+  /** D16: the effect lands on the host's machine. */
+  readonly host_only?: boolean;
+  /** D13: answers the open dialog rather than being a palette row. */
+  readonly answers_dialog?: boolean;
+  /** 1d's right-hand tag (`destructive`, `next`, …). */
+  readonly annotation?: string | null;
+  /** `project` / `session` / `terminal` / `unread_activity`: the row is a
+   * template the browser expands into one row per target. */
+  readonly target?: string | null;
+  /** The sentence the host answers with if this row is sent. */
+  readonly refusal?: string | null;
+}
+
 export interface WireSnapshot {
   readonly type: "snapshot";
   readonly protocol_version: number;
@@ -192,6 +219,16 @@ export interface WireSnapshot {
    * paint it, and it never saw the `Delta::DialogOpened`.
    */
   readonly dialog?: WireDialogView | null;
+  /**
+   * The command inventory the palette renders (`remote-control-ll5.12`). It
+   * rides on the snapshot rather than on a delta because it is static for the
+   * life of the host build — there is no change for a `Delta` to describe.
+   *
+   * Absent from a host that predates it, which means an empty palette rather
+   * than a locally-authored stand-in: a row this host cannot execute is exactly
+   * what the host-sent inventory exists to prevent.
+   */
+  readonly commands?: readonly WireCommandView[];
 }
 
 export interface WireTermBytes {

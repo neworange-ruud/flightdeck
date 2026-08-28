@@ -1,5 +1,5 @@
 import { decideEscape } from "../input/escape";
-import { buildCommandInventory, clampIndex, paletteColumns } from "./commands";
+import { clampIndex, paletteColumns, paletteInventory } from "./commands";
 import { CONFIG_FIELDS, selectableConfigFields } from "./config";
 import { selectedChoice } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
@@ -121,6 +121,13 @@ export function reduce(state: AppState, action: AppAction): AppState {
          * empty the branch field.
          */
         dialog: mergeDialog(state.dialog, snapshot.dialog),
+        /**
+         * `remote-control-ll5.12`: the palette's whole inventory, replaced
+         * wholesale like every other fact on the snapshot. A host that lists
+         * fewer rows than last time offers fewer rows — that is the point of
+         * reading the palette off the wire instead of compiling it in.
+         */
+        commands: snapshot.commands,
       };
     }
 
@@ -472,7 +479,7 @@ export function reduce(state: AppState, action: AppAction): AppState {
       if (palette === null) {
         return state;
       }
-      const { flat } = paletteColumns(buildCommandInventory(state), palette.filter);
+      const { flat } = paletteColumns(paletteInventory(state), palette.filter);
       const index = clampIndex(
         palette.index + action.delta,
         flat[palette.column].length,
@@ -488,7 +495,7 @@ export function reduce(state: AppState, action: AppAction): AppState {
         return state;
       }
       const other: 0 | 1 = palette.column === 0 ? 1 : 0;
-      const { flat } = paletteColumns(buildCommandInventory(state), palette.filter);
+      const { flat } = paletteColumns(paletteInventory(state), palette.filter);
       /** A `Tab` to an empty column would strand the highlight nowhere for
        * `Enter` to run — stay put instead. */
       if (flat[other].length === 0) {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { gitOf, sessionOf, snapshotFromWire, statusOf } from "./adapt";
 import { decodeBase64, encodeBase64 } from "./frames";
 import type {
+  WireCommandView,
   WireGitBar,
   WireSessionView,
   WireSnapshot,
@@ -265,6 +266,79 @@ describe("snapshot", () => {
     it("defaults to false rather than guessing when the host omits it", () => {
       const mapped = snapshotFromWire({ ...wire, selection: {} });
       expect(mapped.splitView).toBe(false);
+    });
+  });
+
+  /**
+   * `remote-control-ll5.12`: the palette's whole inventory rides on the
+   * snapshot, so the rename below is the only thing standing between
+   * `src/web/commands.rs`'s table and what the user reads.
+   */
+  describe("commands", () => {
+    const row: WireCommandView = {
+      id: "abandon_worktree",
+      label: "Abandon Worktree",
+      group: "Worktree",
+      run: { name: "abandon_worktree" },
+      annotation: "destructive",
+      refusal: "Abandoning a worktree discards work. Confirm it from the desktop.",
+    };
+
+    it("renames every field and defaults nothing into existence", () => {
+      const mapped = snapshotFromWire({ ...wire, commands: [row] });
+      expect(mapped.commands).toEqual([
+        {
+          id: "abandon_worktree",
+          label: "Abandon Worktree",
+          group: "Worktree",
+          run: { name: "abandon_worktree" },
+          hostOnly: false,
+          answersDialog: false,
+          annotation: "destructive",
+          target: null,
+          refusal:
+            "Abandoning a worktree discards work. Confirm it from the desktop.",
+        },
+      ]);
+    });
+
+    it("carries the host's flags through (D16, D13)", () => {
+      const mapped = snapshotFromWire({
+        ...wire,
+        commands: [
+          { ...row, host_only: true },
+          { ...row, id: "dialog_confirm", answers_dialog: true },
+        ],
+      });
+      expect(mapped.commands[0]?.hostOnly).toBe(true);
+      expect(mapped.commands[1]?.answersDialog).toBe(true);
+    });
+
+    it("maps the four target kinds by name", () => {
+      const targets = ["project", "session", "terminal", "unread_activity"];
+      const mapped = snapshotFromWire({
+        ...wire,
+        commands: targets.map((target) => ({ ...row, target })),
+      });
+      expect(mapped.commands.map((c) => c.target)).toEqual(targets);
+    });
+
+    /** The host's own `#[serde(other)]` arm reaching the browser. Kept as
+     * `unrecognized` rather than flattened to `null`, because the difference
+     * decides whether the row is skipped or sent with no argument. */
+    it("keeps a target kind it does not know as unrecognized, not null", () => {
+      const mapped = snapshotFromWire({
+        ...wire,
+        commands: [{ ...row, target: "pod" }],
+      });
+      expect(mapped.commands[0]?.target).toBe("unrecognized");
+    });
+
+    /** No local fallback, by design: a browser cannot know what a host that
+     * says nothing is able to run. */
+    it("is empty when the host sends no inventory", () => {
+      expect(snapshotFromWire(wire).commands).toEqual([]);
+      expect(snapshotFromWire({ ...wire, commands: [] }).commands).toEqual([]);
     });
   });
 });

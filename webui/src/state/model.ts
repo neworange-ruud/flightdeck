@@ -130,6 +130,55 @@ export interface Selection {
   readonly terminalId: string;
 }
 
+/**
+ * What a template [`HostCommand`] expands over, and which `run.args` key the
+ * browser fills with the chosen target's id — `protocol::CommandTarget`.
+ *
+ * `unrecognized` is the host's own `#[serde(other)]` arm arriving here: a
+ * target kind this build does not know how to fill in. Such a row is **skipped**
+ * rather than rendered without its argument, which is what the Rust side says
+ * too — a row that cannot carry its id is a row that cannot be run.
+ */
+export type CommandTarget =
+  | "project"
+  | "session"
+  | "terminal"
+  | "unread_activity"
+  | "unrecognized";
+
+/**
+ * One row of the host's command inventory (`protocol::CommandView`), as the
+ * browser receives it.
+ *
+ * **The palette has no list of its own** (`remote-control-ll5.12`). The host is
+ * the only thing that knows what this build implements, so every row the
+ * palette draws is one of these, and a name the host stopped sending stops
+ * being offered with no browser change. `hostOnly`, `annotation` and `refusal`
+ * are the host's own words — the browser never guesses any of the three.
+ */
+export interface HostCommand {
+  /** Stable id for keyed rendering; equal to `run.name` for a plain row. */
+  readonly id: string;
+  readonly label: string;
+  /** The palette group heading (`Worktree`, `Git`, `Terminals`, …). */
+  readonly group: string;
+  /** The `Command` frame to send when the row is chosen. */
+  readonly run: { readonly name: string; readonly args?: unknown };
+  /** D16: the effect lands on the host's machine — `host only`, never hidden. */
+  readonly hostOnly: boolean;
+  /** D13: this row answers the open dialog (the dialog panel sends it), so it
+   * is not a palette row on either surface. */
+  readonly answersDialog: boolean;
+  /** 1d's right-hand tag, or `null` when the host worded none. */
+  readonly annotation: string | null;
+  /** Non-null makes this a *template*: one row per target, with the target's id
+   * filled into `run.args`. */
+  readonly target: CommandTarget | null;
+  /** The sentence this build answers with if the row is sent, or `null` when it
+   * runs it. Shown as-is; never reworded, never invented. */
+  readonly refusal: string | null;
+}
+
 /** An available update (1a's status-bar chip). */
 export interface UpdateInfo {
   readonly version: string;
@@ -191,6 +240,15 @@ export interface Snapshot {
    * none — never a guess.
    */
   readonly dialog: DialogState | null;
+  /**
+   * The palette's whole inventory (`remote-control-ll5.12`), in the host's own
+   * display order.
+   *
+   * On the snapshot because it is static for the life of the host build. Empty
+   * from a host that sends none, which is an empty palette — the browser has no
+   * list of its own to fall back to, by design.
+   */
+  readonly commands: readonly HostCommand[];
 }
 
 /** Look-ups used by both the reducer and the components. */

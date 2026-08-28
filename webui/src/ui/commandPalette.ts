@@ -1,6 +1,6 @@
 import {
-  buildCommandInventory,
   paletteColumns,
+  paletteInventory,
   type LabelSpan,
   type MatchedCommand,
   type PaletteCommand,
@@ -18,13 +18,14 @@ import type { Region } from "./dom";
  * of the keyboard (typing, `↑↓`, `Tab`, `Enter`, `Esc`); this module only
  * renders `state.palette` and reports which command a click or `Enter` means.
  *
- * ## What is deliberately not here
+ * ## Every row is the host's row
  *
- * `D13`'s dialog family, git commands, the configuration manager and
- * split-view toggling are each a separate M2 task (`remote-control-ll5.3`
- * through `.7`) — this only ever runs a command the host can already execute
- * or D16 says must stay visible anyway (`src/state/commands.ts` has the full
- * accounting of why the inventory is short).
+ * `remote-control-ll5.12`: the rows, their labels, their groups, their tags,
+ * the `host only` badge and the refusal a row would come back with are all
+ * `Snapshot::commands` (`src/state/commands.ts`). This component words none of
+ * them. A row the host refuses today still renders — visible and honest beats
+ * hidden — carrying the host's own sentence as its tooltip, which is the same
+ * sentence the status line shows when the row is actually run.
  *
  * ## Results follow the `Ack`, never optimism
  *
@@ -111,7 +112,7 @@ export function createCommandPalette(
 
     textEl.textContent = palette.filter;
 
-    const inventory = buildCommandInventory(state);
+    const inventory = paletteInventory(state);
     const { columns, matchedCount, totalCount } = paletteColumns(
       inventory,
       palette.filter,
@@ -193,6 +194,10 @@ function row(
     "button",
     {
       class: "fd-palette__row",
+      /** The host's own words for why it would refuse this row, readable
+       * before running it as well as after. Never reworded here, and absent
+       * (not empty) for a row the host runs. */
+      ...(command.refusal === null ? {} : { title: command.refusal }),
       attrs: { type: "button", "data-selected": String(selected) },
     },
     [label, tag],
@@ -213,10 +218,10 @@ function rowTag(command: PaletteCommand, selected: boolean): HTMLElement | null 
   if (selected) {
     return el("span", { class: "fd-palette__key", text: "Enter" });
   }
-  if (command.hostOnly === true) {
+  if (command.hostOnly) {
     return hostOnlyBadge();
   }
-  if (command.annotation !== undefined) {
+  if (command.annotation !== null) {
     return el("span", { class: "fd-palette__annotation", text: command.annotation });
   }
   return null;

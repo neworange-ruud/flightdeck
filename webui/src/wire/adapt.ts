@@ -24,7 +24,9 @@
 
 import type {
   ActivityEvent,
+  CommandTarget,
   GitBarInfo,
+  HostCommand,
   Project,
   Seat,
   SeatInfo,
@@ -38,6 +40,7 @@ import type { DialogState } from "../state/types";
 import type {
   WireActivityEvent,
   WireBucket,
+  WireCommandView,
   WireDialogView,
   WireGitBar,
   WireProjectView,
@@ -240,6 +243,45 @@ function activityOf(
   };
 }
 
+/** The four target kinds this build knows how to fill an id into. Anything
+ * else is the host's `#[serde(other)]` arm reaching us — kept as
+ * `unrecognized` rather than dropped to `null`, because a template row with a
+ * target we cannot fill is skipped, not sent with no argument. */
+const COMMAND_TARGETS: readonly CommandTarget[] = [
+  "project",
+  "session",
+  "terminal",
+  "unread_activity",
+];
+
+function targetOf(target: string | null | undefined): CommandTarget | null {
+  if (target === null || target === undefined) {
+    return null;
+  }
+  return COMMAND_TARGETS.find((known) => known === target) ?? "unrecognized";
+}
+
+/**
+ * One inventory row → the palette's model (`remote-control-ll5.12`).
+ *
+ * Pure rename plus the absent-is-`null` convention every other adapter here
+ * uses. Nothing is defaulted into existence: a row the host sent without an
+ * annotation has none, and a row it sent without a refusal is one it runs.
+ */
+export function commandOf(wire: WireCommandView): HostCommand {
+  return {
+    id: wire.id,
+    label: wire.label,
+    group: wire.group,
+    run: wire.run,
+    hostOnly: wire.host_only ?? false,
+    answersDialog: wire.answers_dialog ?? false,
+    annotation: wire.annotation ?? null,
+    target: targetOf(wire.target),
+    refusal: wire.refusal ?? null,
+  };
+}
+
 /**
  * A host snapshot as the store's `snapshot/received` wants it.
  *
@@ -283,6 +325,10 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
       wire.dialog === undefined || wire.dialog === null
         ? null
         : dialogOf(wire.dialog),
+    /** `remote-control-ll5.12`: the palette is exactly what the host lists
+     * here. A host that sends none offers none — there is deliberately no
+     * locally-authored inventory to fall back to. */
+    commands: (wire.commands ?? []).map(commandOf),
   };
 }
 

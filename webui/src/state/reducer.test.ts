@@ -46,6 +46,10 @@ describe("createInitialState", () => {
       /** D13: nothing is being asked. The dialog is app state the host
        * publishes, so a tab that has not attached yet cannot have one. */
       dialog: null,
+      /** `remote-control-ll5.12`: the palette is the host's inventory, and no
+       * host has spoken yet — so there is nothing to offer, not a local list
+       * of guesses to offer instead. */
+      commands: [],
     });
   });
 });

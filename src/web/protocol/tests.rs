@@ -208,6 +208,7 @@ fn command_view() -> CommandView {
             args: None,
         },
         host_only: true,
+        answers_dialog: true,
         annotation: Some("host only".into()),
         target: None,
         refusal: Some("Run it from the desktop.".into()),

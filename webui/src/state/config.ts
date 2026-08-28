@@ -13,14 +13,13 @@
  * There is no wire source for config today. `src/web/protocol.rs`'s
  * `Snapshot` carries projects/selection/activity/seats — nothing about
  * `config.toml` — and no `Command` exists yet that reads or writes it
- * (`remote-control-ll5.1` is building host-side command dispatch concurrently
- * with this task). So `CONFIG_FIELDS` below is built the same way
- * `buildCommandInventory` was built from the six protocol commands that
- * genuinely exist: real field names, real layering semantics, sample layered
- * values chosen to reproduce every origin tag 1f draws — not a live read. See
- * the ll5.6 task report for exactly what `ll5.1` needs to add so this module
- * can read (and `save_config`/`SAVE_CONFIG_COMMAND` below can actually write)
- * a real inventory instead.
+ * (`remote-control-ll5.1` built host-side command dispatch concurrently with
+ * this task). So `CONFIG_FIELDS` below is a curated constant: real field
+ * names, real layering semantics, sample layered values chosen to reproduce
+ * every origin tag 1f draws — not a live read. The palette no longer has a
+ * curated list of its own — `remote-control-ll5.12` moved it onto
+ * `Snapshot::commands` — and this one goes the same way once the host sends a
+ * config inventory and accepts `save_config`/`SAVE_CONFIG_COMMAND`.
  *
  * ## Origin attribution
  *

@@ -534,6 +534,12 @@ export function createApp(options: AppOptions): App {
      * browser — same as `Ctrl-g` opening *this* palette, it is a local UI
      * toggle, not a `Command` frame. The palette closes as it hands off, so
      * only one full-screen overlay is ever up at once.
+     *
+     * The *row* is still the host's, like every other row
+     * (`remote-control-ll5.12`): a host that stops offering the name stops
+     * offering the manager. This is only about where the answer comes from —
+     * and the host's own refusal for the name says the same thing, that the
+     * configuration manager is a browser surface of its own.
      */
     if (command.id === "open_configuration") {
       store.dispatch({ type: "palette/close" });

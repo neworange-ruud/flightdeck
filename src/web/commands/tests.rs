@@ -306,3 +306,20 @@ fn refusals_are_sentences() {
         }
     }
 }
+
+/// D13: exactly the two dialog answers say so on the wire, so the browser's
+/// palette can leave them out without a hardcoded list of its own — and every
+/// other row is a palette row.
+#[test]
+fn only_the_dialog_answers_are_flagged_as_answering_a_dialog() {
+    let answering: Vec<&str> = INVENTORY
+        .iter()
+        .filter(|spec| spec.view().answers_dialog)
+        .map(|spec| spec.name)
+        .collect();
+    assert_eq!(
+        answering,
+        vec![names::DIALOG_CONFIRM, names::DIALOG_CANCEL],
+        "the palette on either surface is INVENTORY minus these two"
+    );
+}
