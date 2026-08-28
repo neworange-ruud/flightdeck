@@ -53,7 +53,9 @@ export type ModeChipTone = "terminal" | "app" | "drained" | "stopped";
  *     sent` next to it, so the drained chip is explained rather than mysterious.
  *
  * Version mismatch is deliberately *not* here: 2c keeps the mode chip intact,
- * because a stale tab has lost nothing but its version.
+ * because a stale tab has lost nothing but its version. That position is also
+ * why the reload chip's `Enter` is not bound globally — see `actionButton`
+ * below and `specs/WEB_INTERFACE.md` §6.5 R9.
  */
 export function modeChip(state: AppState): {
   readonly text: string;
@@ -207,19 +209,52 @@ function viewerChip(state: AppState): HTMLElement {
   });
 }
 
+/**
+ * `r Retry now` and `Enter Enter a code` are bound globally in `app.ts`,
+ * because `disconnected` and `revoked` deliver input nowhere and the key is
+ * therefore free. `reload`'s `Enter` is the one exception: 2c draws a version
+ * mismatch as `● connected 21ms` with the mode chip intact (see
+ * `ConnectionStatus`'s doc comment in `state/types.ts`), so `Enter` still
+ * means "newline" or "focus the terminal" everywhere else and cannot be
+ * claimed globally without contradicting that. Ruling recorded in
+ * `specs/WEB_INTERFACE.md` §6.5 R9.
+ */
 function actionButton(
   action: StripAction,
   onAction: ((action: StripAction) => void) | undefined,
 ): HTMLElement {
+  const scopedToFocus = action.kind === "reload";
   const button = el(
     "button",
     {
       class: "fd-stripaction",
       attrs: { type: "button", "data-tone": action.tone, "data-kind": action.kind },
+      /** The visible text stays exactly `Enter` + the label (2c's own words);
+       * the title carries the one fact the artboard has no room to print.
+       * Omitted rather than set to `undefined` — `exactOptionalPropertyTypes`
+       * treats those as different things, and `el` only checks presence. */
+      ...(scopedToFocus
+        ? { title: "Enter reloads only while this button is focused" }
+        : {}),
     },
     [el("span", { class: "fd-stripaction__key", text: action.key }), action.label],
   );
   button.addEventListener("click", () => onAction?.(action));
+  /**
+   * A real `<button>` already activates on Enter/Space once focused, in every
+   * browser — this handler is what makes that a fact a test can check rather
+   * than an assumption about the platform (jsdom does not run the browser's
+   * own keydown-activates-button default action). It is attached to the
+   * button itself, so nothing fires unless the button is the event's target:
+   * an `Enter` that bubbles up from anywhere else in the frame never reaches
+   * it, which is the whole of what "focus-scoped" means in code.
+   */
+  button.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      onAction?.(action);
+    }
+  });
   return button;
 }
 

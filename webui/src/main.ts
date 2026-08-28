@@ -175,7 +175,10 @@ const app = createApp({
   onStripAction: (action) => {
     if (action.kind === "reload") {
       /** Turn 2 §4: a version mismatch is a stale tab, not a negotiation, and
-       * the SPA ships inside the binary (D9) — so the fix really is a reload. */
+       * the SPA ships inside the binary (D9) — so the fix really is a reload.
+       * This only ever runs from a click or from `Enter` while the chip
+       * itself has focus (`ui/statusBar.ts`'s `actionButton`) — never from a
+       * global binding. See `specs/WEB_INTERFACE.md` §6.5 R9. */
       window.location.reload();
       return;
     }

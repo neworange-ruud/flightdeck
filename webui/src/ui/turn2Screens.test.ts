@@ -318,6 +318,31 @@ describe("2c — the connection strip", () => {
     expect(h.q(".fd-statusbar").getAttribute("data-frame")).toBe("info");
   });
 
+  it("reload: Enter is scoped to the chip, not global (ll5.10, §6.5 R9)", () => {
+    const h = render();
+    h.app.store.dispatch({
+      type: "version/mismatch",
+      mismatch: { tabVersion: "v1.16.0", hostVersion: "v1.17.0" },
+    });
+    /** The mode is still `terminal` (2c keeps the chip intact), and an
+     * `Enter` typed there — or anywhere else that is not the chip itself —
+     * must stay a newline/focus keystroke, never a reload. `h.key` dispatches
+     * at the frame, which is exactly what a keystroke *not* aimed at the chip
+     * looks like: it reaches every global branch and none of them is this
+     * one. */
+    expect(h.state().mode).toBe("terminal");
+    h.key("Enter");
+    expect(h.actions).toEqual([]);
+
+    /** Pressed at the chip itself — the shape a real focused `Enter` takes —
+     * it does fire, and the chip says in its title that this is the only way
+     * it works. */
+    const button = h.q(".fd-stripaction");
+    expect(button.title).toBe("Enter reloads only while this button is focused");
+    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(h.actions.map((a) => a.kind)).toEqual(["reload"]);
+  });
+
   it("never moves the connection strip's position", () => {
     /**
      * 2c's first rule. The mechanism is structural: the flexible spacer is

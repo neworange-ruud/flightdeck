@@ -126,8 +126,8 @@ export function accessCopy(access: AccessState): AccessCopy {
     /**
      * Not drawn as a panel by 2b — it draws the rate limit as the footer line
      * of the rejected screen — so the copy below is written to 2b's rules
-     * rather than copied from it, and is listed in the task report as the one
-     * place a design turn would have something to say.
+     * rather than copied from it. Confirmed as a ruling rather than a guess in
+     * `remote-control-ll5.10`; see `specs/WEB_INTERFACE.md` §6.5 R9.
      *
      * Amber rather than red, by the same logic 2b applies to `revoked`: a
      * limiter doing its job is not a failure. And no primary button at all,
