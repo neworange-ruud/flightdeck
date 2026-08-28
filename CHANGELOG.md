@@ -176,6 +176,18 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **FlightDeck Web could not be opened at all.** Starting the web interface
+  printed a URL and stopped there: no access code was ever created, and nothing
+  on the desktop showed one, so there was no way to get a browser in. Starting it
+  now opens an access panel. On the default loopback binding it offers **Open in
+  browser**, which launches your browser already signed in, and a URL that copies
+  with a one-time code attached for a second browser. Turning on network access
+  shows a QR to scan from a phone, the code in large type with its countdown, and
+  a list of your network addresses to choose which one to publish — with the
+  consequence spelled out, because anyone on that network holding the code can
+  drive your agents. `r` hides the code and QR at any time, and `Show Web Access`
+  in the palette brings the panel back.
+
 - **FlightDeck Web: keyboard shortcuts did nothing on a freshly opened tab.**
   The global key handler was attached below the element the browser actually
   focuses, so `Ctrl-g`, `Esc Esc`, and the activity-feed and help keys all did
