@@ -1002,7 +1002,75 @@ impl AppState {
         let prefix = self.config.git.branch_prefix.clone();
         let branch = branch_name(&prefix, &slug);
 
-        // Refuse a second placeholder for the same branch/slug: the tab `id`
+        // (d) decide create vs attach (surface attach, never silent, SPECS §11).
+        let decision = decide_branch(services.git, &branch)?;
+        let attached = matches!(decision, BranchDecision::AttachExisting);
+
+        self.begin_worktree_agent_tab(name, key, branch, slug, attached, services)
+    }
+
+    /// Begin a new Agent Tab on a caller-selected local branch. Unlike the
+    /// normal name-based flow, `branch` is used verbatim and is never prefixed
+    /// or created. The same worktree reuse/refusal rules apply.
+    pub fn begin_new_agent_tab_for_existing_branch(
+        &mut self,
+        branch: &str,
+        agent_key: Option<&str>,
+        services: &Services,
+    ) -> Result<WorktreeJob> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err(FlightDeckError::Config(
+                "an existing branch must be selected".to_string(),
+            ));
+        }
+
+        let key = agent_key
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| self.registry.default_key.clone());
+        let agent = self
+            .registry
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{key}'")))?;
+        validate_launchable(
+            &agent,
+            &self.config.containers,
+            services.container,
+            &self.repo_root,
+        )?;
+
+        if !services.git.branch_exists(branch)? {
+            return Err(FlightDeckError::Refused(format!(
+                "local branch '{branch}' does not exist"
+            )));
+        }
+
+        // Keep managed paths concise for the usual configured-prefix case,
+        // while still making arbitrary branch names filesystem-safe.
+        let slug_source = branch
+            .strip_prefix(&self.config.git.branch_prefix)
+            .unwrap_or(branch);
+        let slug = slugify(slug_source);
+        if slug.is_empty() {
+            return Err(FlightDeckError::Config(
+                "branch name produced an empty worktree slug".to_string(),
+            ));
+        }
+
+        self.begin_worktree_agent_tab(branch, key, branch.to_string(), slug, true, services)
+    }
+
+    fn begin_worktree_agent_tab(
+        &mut self,
+        name: &str,
+        key: String,
+        branch: String,
+        slug: String,
+        attached: bool,
+        services: &Services,
+    ) -> Result<WorktreeJob> {
+        // Refuse a second placeholder for the same branch: the tab `id`
         // is only unique to the second (`{slug}-{created_at}`), so two rapid
         // creates for the same name could otherwise collide and let
         // `finalize_new_tab`/`fail_new_tab` target the wrong tab.
@@ -1011,10 +1079,6 @@ impl AppState {
                 "an Agent Tab for branch '{branch}' already exists"
             )));
         }
-
-        // (d) decide create vs attach (surface attach, never silent, SPECS §11).
-        let decision = decide_branch(services.git, &branch)?;
-        let attached = matches!(decision, BranchDecision::AttachExisting);
 
         // (e) plan the worktree.
         let worktrees_root_rel = self.config.worktrees.root.clone();
@@ -1026,7 +1090,7 @@ impl AppState {
         //     The slow `git worktree add` is deferred to `materialize_worktree`.
         let (worktree_abs, needs_create, create_branch) = match plan {
             // Create the branch from base only when it does not already exist.
-            WorktreePlan::Create => (target, true, matches!(decision, BranchDecision::Create)),
+            WorktreePlan::Create => (target, true, !attached),
             WorktreePlan::ReuseManaged { path } => (path, false, false),
             WorktreePlan::RefuseCheckedOutElsewhere { path } => {
                 return Err(FlightDeckError::Refused(format!(
@@ -3421,6 +3485,108 @@ mod tests {
         // No branch created (it already existed); worktree still materialized.
         assert!(git.created_branches().is_empty());
         assert_eq!(git.added_worktrees().len(), 1);
+    }
+
+    #[test]
+    fn selected_existing_branch_is_used_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main", "feature/auth-refresh"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let job = app
+            .begin_new_agent_tab_for_existing_branch("feature/auth-refresh", None, &svc)
+            .unwrap();
+
+        assert_eq!(job.branch, "feature/auth-refresh");
+        assert_eq!(
+            job.worktree_abs,
+            PathBuf::from("/repo/.flightdeck/worktrees/feature-auth-refresh")
+        );
+        assert!(!job.create_branch);
+        assert!(app.tabs[0].meta.attached_existing_branch);
+        assert_eq!(app.tabs[0].meta.name, "feature/auth-refresh");
+
+        materialize_worktree(svc.git, svc.command, &job).unwrap();
+        let effect = app.finalize_new_tab(&job.tab_id, &svc).unwrap();
+        assert_eq!(
+            effect,
+            Effect::AttachedExisting {
+                branch: "feature/auth-refresh".to_string()
+            }
+        );
+        assert!(git.created_branches().is_empty());
+        assert_eq!(
+            git.added_worktrees(),
+            vec![(
+                PathBuf::from("/repo/.flightdeck/worktrees/feature-auth-refresh"),
+                "feature/auth-refresh".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn selected_existing_branch_must_still_exist() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let err = app
+            .begin_new_agent_tab_for_existing_branch("feature/deleted", None, &svc)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, FlightDeckError::Refused(message) if message.contains("does not exist"))
+        );
+        assert!(app.tabs.is_empty());
+        assert!(git.added_worktrees().is_empty());
+    }
+
+    #[test]
+    fn selected_existing_branch_checked_out_elsewhere_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main", "feature/in-use"]);
+        git.add_existing_worktree(crate::contracts::WorktreeInfo {
+            path: PathBuf::from("/other/checkout"),
+            branch: Some("feature/in-use".to_string()),
+            head: None,
+        });
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let err = app
+            .begin_new_agent_tab_for_existing_branch("feature/in-use", None, &svc)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            FlightDeckError::Refused(message)
+                if message.contains("/other/checkout") && message.contains("already checked out")
+        ));
+        assert!(app.tabs.is_empty());
+        assert!(git.added_worktrees().is_empty());
     }
 
     // --- §26: rename tab -------------------------------------------------

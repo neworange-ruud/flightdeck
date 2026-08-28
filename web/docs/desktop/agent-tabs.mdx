@@ -15,10 +15,13 @@ creating, switching, renaming, and closing them.
 Press **`Ctrl-n`** (or command palette → *New Agent Session Tab*). FlightDeck
 walks you through a short flow:
 
-1. **Choose an agent** — pick from your configured agents (the menu is skipped
-   when only one is configured).
-2. **Name the task** — the name becomes a branch slug, e.g. `fix-login` →
-   `flightdeck/fix-login`.
+1. **Choose an agent** — pick from your configured agents.
+2. **Choose a target** — press **`Tab`** to cycle between a new branch, an
+   existing local branch, and the project base branch.
+3. **Name or select the branch** — a new task name becomes a branch slug, e.g.
+   `fix-login` → `flightdeck/fix-login`; existing-branch mode provides a
+   searchable local branch picker and creates a managed worktree for that
+   branch.
 
 ![Creating a tab: FlightDeck asks which configured agent to launch.](/screenshots/desktop/new-tab-agent-menu.png)
 
@@ -39,9 +42,10 @@ FlightDeck then:
   is left behind.
 </Callout>
 
-If the branch already exists, FlightDeck attaches to it and tells you (it never
-silently reuses a branch). A branch already checked out in another worktree is
-refused, with the path that holds it.
+If the generated branch already exists, or you select one explicitly,
+FlightDeck attaches to it and tells you (it never silently reuses a branch).
+Existing branches do not need the configured `flightdeck/` prefix. A branch
+already checked out in another worktree is refused, with the path that holds it.
 
 <Callout type="info">
   New worktrees automatically symlink `.env` and `.env.local` from your base

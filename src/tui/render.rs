@@ -112,9 +112,8 @@ pub enum DialogAccel {
     Enter,
     /// The Esc key (cancel/dismiss).
     Esc,
-    /// The Tab key (toggle a checkbox-style option, e.g. "run from base branch"
-    /// in the New Agent form — chosen because it never collides with the text
-    /// being typed into an adjacent input field).
+    /// The Tab key (cycle a form option, e.g. the target mode in the New Agent
+    /// form — chosen because it never collides with text typed into an input).
     Tab,
 }
 

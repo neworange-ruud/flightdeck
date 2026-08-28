@@ -90,8 +90,9 @@ Child terminals are not modeled as agents, even if the user manually launches an
 5. FlightDeck prompts for:
    - Tab/task name
    - Agent selection, defaulting to OpenCode
-6. FlightDeck generates a branch name using `flightdeck/<task-slug>`.
-7. FlightDeck creates or attaches to the branch.
+   - Target: a generated branch, an existing local branch, or the project base
+6. For a new target, FlightDeck generates a branch name using `flightdeck/<task-slug>`.
+7. FlightDeck creates the generated branch or attaches to the selected/existing branch.
 8. FlightDeck creates or attaches to the worktree.
 9. FlightDeck immediately starts the selected agent.
 10. User interacts with the agent in the primary terminal.
@@ -501,6 +502,13 @@ If the generated branch already exists:
 
 FlightDeck must not silently attach to existing branches.
 
+The New Agent form also offers a searchable picker of existing local branches
+other than the project base. A selected branch is used verbatim, including
+branches outside the configured `flightdeck/` prefix; FlightDeck never creates
+or renames it. The tab is marked as attached to an existing branch and follows
+the same worktree create/reuse/refusal rules below. The project base remains a
+separate no-worktree target mode.
+
 If the branch is already checked out:
 
 - If checked out in `.flightdeck/worktrees/`, reuse that worktree.
@@ -508,8 +516,6 @@ If the branch is already checked out:
 - Do not force checkout in MVP.
 
 Generated branches must use `flightdeck/`.
-
-Manual attach to non-prefixed branches is not part of the core MVP. If later added, such branches should be marked as external.
 
 ---
 

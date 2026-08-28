@@ -1082,10 +1082,9 @@ fn restore_terminal_title() -> std::io::Result<()> {
 /// New/Rename, single-key choice menus for Set Status / Close / Push.
 enum Prompt {
     /// The combined New Agent Session Tab form (SPECS §4, §22): pick the agent
-    /// (radio, ↑/↓), type a branch name, and optionally toggle "run from base
-    /// branch" (Tab), which disables the branch field and runs the agent — and
-    /// any child shells — directly in the project root on the base branch (no
-    /// worktree). Confirming (Enter) dispatches the async new-tab flow.
+    /// (radio, ↑/↓), type a new branch name, select an existing local branch,
+    /// or run directly from the base branch. Tab cycles those target modes.
+    /// Confirming (Enter) dispatches the async new-tab flow.
     NewAgentForm {
         /// `(key, display_name)` of each registered agent, in registry order.
         agents: Vec<(String, String)>,
@@ -1093,6 +1092,13 @@ enum Prompt {
         selected: usize,
         /// The branch/tab name being typed. Ignored when `run_on_base`.
         branch: String,
+        /// Local branches available to the existing-branch target mode.
+        existing_branches: Vec<String>,
+        /// Index into the filtered `existing_branches` list.
+        branch_selected: usize,
+        /// When true, the input filters `existing_branches` instead of naming a
+        /// newly-created branch.
+        use_existing_branch: bool,
         /// When true, run on the base branch in the project root (no worktree);
         /// the branch field is disabled.
         run_on_base: bool,
@@ -3780,7 +3786,7 @@ fn dispatch_command(
     // Intercept commands that need interactive input before dispatch.
     match &cmd {
         Command::NewAgentTab { name, .. } if name.is_empty() => {
-            start_new_tab_flow(state, ui);
+            start_new_tab_flow(state, services, ui);
             return Ok(());
         }
         Command::RenameAgentTab { new_name } if new_name.is_empty() => {
@@ -3942,9 +3948,9 @@ const ISOLATED_REFUSAL: &str =
      directory and opens nothing else.";
 
 /// Begin the New Agent Tab flow (SPECS §4, §22): open the combined form —
-/// agent radio, branch name, and the "run from base branch" toggle — with the
-/// configured default agent preselected.
-fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
+/// agent radio and new/existing/base target modes — with the configured default
+/// agent preselected.
+fn start_new_tab_flow(state: &AppState, services: &Services, ui: &mut Ui) {
     if state.isolated {
         ui.message(ISOLATED_REFUSAL);
         return;
@@ -3960,12 +3966,27 @@ fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
         .iter()
         .position(|(k, _)| k == &state.registry.default_key)
         .unwrap_or(0);
+    let existing_branches = match services.git.list_local_branches() {
+        Ok(branches) => branches
+            .into_iter()
+            // The base branch already has the project-root worktree; its
+            // dedicated no-worktree mode is the next Tab target instead.
+            .filter(|branch| branch != &state.base_branch)
+            .collect(),
+        Err(e) => {
+            ui.message(format!("Error listing local branches: {e}"));
+            return;
+        }
+    };
     start_prompt(
         ui,
         Prompt::NewAgentForm {
             agents,
             selected,
             branch: String::new(),
+            existing_branches,
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: false,
             base_branch: state.base_branch.clone(),
         },
@@ -3979,7 +4000,7 @@ fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
 fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mut Ui) {
     if state.selected().is_none() {
         state.focus_app();
-        start_new_tab_flow(state, ui);
+        start_new_tab_flow(state, services, ui);
         return;
     }
     let agents: Vec<(String, String)> = state
@@ -4422,39 +4443,79 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             agents,
             selected,
             branch,
+            existing_branches,
+            branch_selected,
+            use_existing_branch,
             run_on_base,
             base_branch,
         } => {
-            // Agents as a radio list: the highlighted row is both selected and
-            // marked, so ↑/↓ moves the choice.
-            let list: Vec<DialogListItem> = agents
-                .iter()
-                .enumerate()
-                .map(|(i, (_key, display))| {
-                    let marker = if i == *selected { "(•)" } else { "( )" };
-                    DialogListItem {
-                        label: format!("{marker} {display}"),
-                        selected: i == *selected,
-                    }
-                })
-                .collect();
+            let list: Vec<DialogListItem> = if *use_existing_branch {
+                let matches = matching_branches(existing_branches, branch);
+                if matches.is_empty() {
+                    vec![DialogListItem {
+                        label: "(no matching local branches)".to_string(),
+                        selected: false,
+                    }]
+                } else {
+                    matches
+                        .iter()
+                        .enumerate()
+                        .map(|(i, branch)| DialogListItem {
+                            label: (*branch).clone(),
+                            selected: i == *branch_selected,
+                        })
+                        .collect()
+                }
+            } else {
+                // Agents as a radio list: the highlighted row is both selected
+                // and marked, so ↑/↓ moves the choice in new/base modes.
+                agents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_key, display))| {
+                        let marker = if i == *selected { "(•)" } else { "( )" };
+                        DialogListItem {
+                            label: format!("{marker} {display}"),
+                            selected: i == *selected,
+                        }
+                    })
+                    .collect()
+            };
             let title = if *run_on_base {
                 format!(
-                    "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\n\
+                    "New Agent Session Tab   (↑/↓ agent · Tab changes target)\n\
                      Runs on base branch '{base_branch}' in the project root — no worktree."
                 )
+            } else if *use_existing_branch {
+                let agent = agents
+                    .get(*selected)
+                    .map(|(_, display)| display.as_str())
+                    .unwrap_or("default agent");
+                format!(
+                    "New Agent Session Tab — existing branch   \
+                     (type to filter · ↑/↓ select · Tab changes target)\n\
+                     Agent: {agent}"
+                )
             } else {
-                "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)"
+                "New Agent Session Tab — new branch   \
+                 (↑/↓ agent · type task name · Tab changes target)"
                     .to_string()
             };
-            let base_label = if *run_on_base {
-                format!("Run from base: {base_branch}")
+            let target_label = if *run_on_base {
+                format!("Target: base ({base_branch})")
+            } else if *use_existing_branch {
+                "Target: existing branch".to_string()
             } else {
-                "Run from base: off".to_string()
+                "Target: new branch".to_string()
+            };
+            let confirm_label = if *use_existing_branch {
+                "Use branch"
+            } else {
+                "Create"
             };
             let buttons = vec![
-                DialogButton::new(DialogAccel::Enter, "Create"),
-                DialogButton::new(DialogAccel::Tab, base_label),
+                DialogButton::new(DialogAccel::Enter, confirm_label),
+                DialogButton::new(DialogAccel::Tab, target_label),
                 cancel,
             ];
             // Hide the branch textbox entirely when running on base.
@@ -4746,45 +4807,98 @@ fn handle_prompt_key_project(
             match key.code {
                 // ↑/↓ move the agent radio selection.
                 KeyCode::Up => {
-                    if let Prompt::NewAgentForm { selected, .. } = &mut pstate.prompt {
-                        *selected = selected.saturating_sub(1);
+                    if let Prompt::NewAgentForm {
+                        selected,
+                        branch_selected,
+                        use_existing_branch,
+                        ..
+                    } = &mut pstate.prompt
+                    {
+                        if *use_existing_branch {
+                            *branch_selected = branch_selected.saturating_sub(1);
+                        } else {
+                            *selected = selected.saturating_sub(1);
+                        }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 KeyCode::Down => {
                     if let Prompt::NewAgentForm {
-                        selected, agents, ..
+                        selected,
+                        agents,
+                        branch,
+                        existing_branches,
+                        branch_selected,
+                        use_existing_branch,
+                        ..
                     } = &mut pstate.prompt
                     {
-                        if *selected + 1 < agents.len() {
+                        let branch_count = matching_branches(existing_branches, branch).len();
+                        if *use_existing_branch && *branch_selected + 1 < branch_count {
+                            *branch_selected += 1;
+                        } else if !*use_existing_branch && *selected + 1 < agents.len() {
                             *selected += 1;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
-                // Tab toggles "run from base branch" (disables the branch field).
+                // Tab cycles new branch → existing branch → base branch. Skip
+                // the existing mode when there are no non-base local branches.
                 KeyCode::Tab => {
-                    if let Prompt::NewAgentForm { run_on_base, .. } = &mut pstate.prompt {
-                        *run_on_base = !*run_on_base;
+                    if let Prompt::NewAgentForm {
+                        branch,
+                        existing_branches,
+                        branch_selected,
+                        use_existing_branch,
+                        run_on_base,
+                        ..
+                    } = &mut pstate.prompt
+                    {
+                        if *run_on_base {
+                            *run_on_base = false;
+                        } else if *use_existing_branch {
+                            *use_existing_branch = false;
+                            *run_on_base = true;
+                        } else if existing_branches.is_empty() {
+                            *run_on_base = true;
+                        } else {
+                            *use_existing_branch = true;
+                        }
+                        branch.clear();
+                        *branch_selected = 0;
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 KeyCode::Enter => {
-                    let (agent_key, name, run_on_base) = match &pstate.prompt {
+                    let (agent_key, name, use_existing_branch, run_on_base) = match &pstate.prompt {
                         Prompt::NewAgentForm {
                             agents,
                             selected,
                             branch,
+                            existing_branches,
+                            branch_selected,
+                            use_existing_branch,
                             run_on_base,
                             ..
-                        } => (
-                            agents.get(*selected).map(|(k, _)| k.clone()),
-                            branch.trim().to_string(),
-                            *run_on_base,
-                        ),
+                        } => {
+                            let name = if *use_existing_branch {
+                                matching_branches(existing_branches, branch)
+                                    .get(*branch_selected)
+                                    .map(|branch| (*branch).clone())
+                                    .unwrap_or_default()
+                            } else {
+                                branch.trim().to_string()
+                            };
+                            (
+                                agents.get(*selected).map(|(k, _)| k.clone()),
+                                name,
+                                *use_existing_branch,
+                                *run_on_base,
+                            )
+                        }
                         _ => unreachable!(),
                     };
                     // A worktree tab needs a name; a base-branch tab does not
@@ -4799,16 +4913,27 @@ fn handle_prompt_key_project(
                     // a background worker so the UI never blocks (SPECS §16/§17).
                     // A base-branch tab has nothing to materialize.
                     ui.prompt = None;
-                    match state.begin_new_agent_tab_ex(
-                        &name,
-                        agent_key.as_deref(),
-                        run_on_base,
-                        services,
-                    ) {
+                    let result = if use_existing_branch {
+                        state.begin_new_agent_tab_for_existing_branch(
+                            &name,
+                            agent_key.as_deref(),
+                            services,
+                        )
+                    } else {
+                        state.begin_new_agent_tab_ex(
+                            &name,
+                            agent_key.as_deref(),
+                            run_on_base,
+                            services,
+                        )
+                    };
+                    match result {
                         Ok(job) => {
                             let branch = job.branch.clone();
                             let msg = if run_on_base {
                                 format!("Starting agent on base branch {branch}…")
+                            } else if use_existing_branch {
+                                format!("Creating worktree for existing branch {branch}…")
                             } else {
                                 format!("Creating worktree for {branch}…")
                             };
@@ -4824,12 +4949,14 @@ fn handle_prompt_key_project(
                 KeyCode::Backspace => {
                     if let Prompt::NewAgentForm {
                         branch,
+                        branch_selected,
                         run_on_base,
                         ..
                     } = &mut pstate.prompt
                     {
                         if !*run_on_base {
                             branch.pop();
+                            *branch_selected = 0;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
@@ -4838,12 +4965,14 @@ fn handle_prompt_key_project(
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Prompt::NewAgentForm {
                         branch,
+                        branch_selected,
                         run_on_base,
                         ..
                     } = &mut pstate.prompt
                     {
                         if !*run_on_base {
                             branch.push(c);
+                            *branch_selected = 0;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
@@ -5206,7 +5335,7 @@ fn run_palette_action(
     match action {
         PaletteAction::Dispatch(cmd) => dispatch_command(cmd, state, &services, ui),
         PaletteAction::NewAgentTab => {
-            start_new_tab_flow(state, ui);
+            start_new_tab_flow(state, &services, ui);
             Ok(())
         }
         PaletteAction::NewAgentChild => {
@@ -6004,6 +6133,9 @@ mod tests {
             ],
             selected: 1,
             branch: "fix bug".to_string(),
+            existing_branches: vec!["feature/existing".to_string()],
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: false,
             base_branch: "main".to_string(),
         };
@@ -6014,7 +6146,7 @@ mod tests {
         assert_eq!(dialog.list.len(), 2);
         assert!(dialog.list[1].selected);
         assert!(dialog.list[1].label.contains("OpenCode"));
-        // Create (Enter), the base toggle (Tab), and Cancel (Esc).
+        // Create (Enter), the target toggle (Tab), and Cancel (Esc).
         assert!(dialog
             .buttons
             .iter()
@@ -6022,7 +6154,7 @@ mod tests {
         assert!(dialog
             .buttons
             .iter()
-            .any(|b| b.accel == DialogAccel::Tab && b.label.contains("off")));
+            .any(|b| b.accel == DialogAccel::Tab && b.label.contains("new branch")));
         assert!(dialog.buttons.iter().any(|b| b.accel == DialogAccel::Esc));
     }
 
@@ -6032,6 +6164,9 @@ mod tests {
             agents: vec![("claude".to_string(), "Claude Code".to_string())],
             selected: 0,
             branch: "ignored".to_string(),
+            existing_branches: Vec::new(),
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: true,
             base_branch: "main".to_string(),
         };
@@ -6043,6 +6178,93 @@ mod tests {
             .buttons
             .iter()
             .any(|b| b.accel == DialogAccel::Tab && b.label.contains("main")));
+    }
+
+    #[test]
+    fn new_agent_form_existing_mode_filters_local_branches() {
+        let p = Prompt::NewAgentForm {
+            agents: vec![("claude".to_string(), "Claude Code".to_string())],
+            selected: 0,
+            branch: "AUTH".to_string(),
+            existing_branches: vec!["bug/cache".to_string(), "feature/auth-refresh".to_string()],
+            branch_selected: 0,
+            use_existing_branch: true,
+            run_on_base: false,
+            base_branch: "main".to_string(),
+        };
+
+        let dialog = prompt_dialog(&p);
+        assert_eq!(dialog.input.as_deref(), Some("AUTH"));
+        assert_eq!(dialog.list.len(), 1);
+        assert_eq!(dialog.list[0].label, "feature/auth-refresh");
+        assert!(dialog.list[0].selected);
+        assert!(dialog
+            .buttons
+            .iter()
+            .any(|b| b.accel == DialogAccel::Enter && b.label == "Use branch"));
+    }
+
+    #[test]
+    fn new_agent_form_queues_selected_existing_branch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let mut state = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
+        let git = FakeGit::new().with_root("/repo").with_branches([
+            "main",
+            "bug/cache",
+            "feature/auth-refresh",
+        ]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+        let mut ui = Ui::default();
+
+        start_new_tab_flow(&state, &services, &mut ui);
+        handle_prompt_key_project(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &services,
+            &mut ui,
+            0,
+        )
+        .unwrap();
+        for c in "auth".chars() {
+            handle_prompt_key_project(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &services,
+                &mut ui,
+                0,
+            )
+            .unwrap();
+        }
+        handle_prompt_key_project(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &services,
+            &mut ui,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(ui.pending_jobs.len(), 1);
+        assert_eq!(ui.pending_jobs[0].job.branch, "feature/auth-refresh");
+        assert!(!ui.pending_jobs[0].job.create_branch);
+        assert_eq!(state.tabs[0].meta.name, "feature/auth-refresh");
+        assert!(state.tabs[0].meta.attached_existing_branch);
     }
 
     #[test]
@@ -6080,20 +6302,6 @@ mod tests {
         let mut state = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
         let mut ui = Ui::default();
 
-        // Starting the flow opens the combined form with the default preselected.
-        start_new_tab_flow(&state, &mut ui);
-        // BTreeMap key order: "claude" (idx 0) before "opencode" (idx 1).
-        match &ui.prompt.as_ref().expect("prompt active").prompt {
-            Prompt::NewAgentForm {
-                agents, selected, ..
-            } => {
-                assert_eq!(agents[0].0, "claude");
-                assert_eq!(agents[1].0, "opencode");
-                assert_eq!(*selected, 1, "default agent preselected");
-            }
-            _ => panic!("expected NewAgentForm prompt"),
-        }
-
         let git = FakeGit::new();
         let fs = FakeFs::new();
         let pty = FakePty::new();
@@ -6109,6 +6317,20 @@ mod tests {
             command: &command,
         };
 
+        // Starting the flow opens the combined form with the default preselected.
+        start_new_tab_flow(&state, &services, &mut ui);
+        // BTreeMap key order: "claude" (idx 0) before "opencode" (idx 1).
+        match &ui.prompt.as_ref().expect("prompt active").prompt {
+            Prompt::NewAgentForm {
+                agents, selected, ..
+            } => {
+                assert_eq!(agents[0].0, "claude");
+                assert_eq!(agents[1].0, "opencode");
+                assert_eq!(*selected, 1, "default agent preselected");
+            }
+            _ => panic!("expected NewAgentForm prompt"),
+        }
+
         // ↑ moves the radio selection to the first agent (claude).
         handle_prompt_key_project(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
@@ -6118,7 +6340,8 @@ mod tests {
             0,
         )
         .unwrap();
-        // Tab toggles "run from base branch" on.
+        // With no non-base branches available, Tab skips the existing-branch
+        // target and moves directly to "run from base branch".
         handle_prompt_key_project(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             &mut state,
@@ -8442,8 +8665,22 @@ mod tests {
         fn isolated_refuses_the_new_tab_flow() {
             let ws = one_project_workspace(true);
             let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
 
-            start_new_tab_flow(&ws.active_project().state, &mut ui);
+            start_new_tab_flow(&ws.active_project().state, &services, &mut ui);
 
             let msg = overlay_message(&ui).expect("a refusal is surfaced");
             assert!(
@@ -8457,8 +8694,22 @@ mod tests {
         fn a_normal_run_still_opens_the_new_tab_prompt() {
             let ws = one_project_workspace(false);
             let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
 
-            start_new_tab_flow(&ws.active_project().state, &mut ui);
+            start_new_tab_flow(&ws.active_project().state, &services, &mut ui);
 
             assert!(ui.prompt.is_some(), "the normal flow is untouched");
         }
