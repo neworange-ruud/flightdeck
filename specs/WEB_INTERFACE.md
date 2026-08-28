@@ -801,6 +801,90 @@ it is never rendered as accepted state: the confirm is settled by the host's own
 `Delta::DialogClosed` does, which is what makes "either surface can confirm or
 cancel and the other reflects it" one mechanism rather than two.
 
+### R9 — the reload chip's `Enter` is focus-scoped, and the rate-limited screen is written to 2b's rules
+
+`remote-control-l7ya` reported two open questions from artboard `2c —
+CONNECTION STATES` and `2b — BROWSER-SIDE ACCESS SCREENS`. `remote-control-ll5.10`
+settles both.
+
+**1. Enter on the version-mismatch reload chip is scoped to the chip's own
+focus — it is not bound globally.** 2c deliberately draws a version mismatch
+as `● connected 21ms` with the mode chip *intact*: nothing about the
+connection or about control is wrong, the tab is merely old (`ConnectionStatus`'s
+doc comment in `state/types.ts`, and `modeChip` in `ui/statusBar.ts`, both say
+so). Suppressing terminal input the way `disconnected` does — which is the
+only way to make `Enter` genuinely free — would contradict that position by
+turning "nothing is wrong" into "input is not arriving," so it was rejected.
+`Enter` therefore keeps its ordinary jobs (a newline in Terminal mode,
+focus-the-terminal in App mode — `app.ts`'s keydown handler), and the chip's
+printed `Enter` means "Enter while this chip has focus," exactly as a real
+`<button>` behaves. Contrast: `r Retry now` (`disconnected`) and `Enter Enter a
+code` (`revoked`) *are* bound globally — both in `app.ts`'s keydown handler —
+because those two states deliver input nowhere else and the key is genuinely
+free.
+
+The chip (`actionButton` in `ui/statusBar.ts`) carries this two ways: a
+`keydown` listener on the button itself fires only when the button is the
+event's target, so an `Enter` that bubbles up from anywhere else in the frame
+never reaches it; and its `title` says "Enter reloads only while this button
+is focused" for anyone who tabs to it without already knowing. The visible
+text is unchanged — still `Enter` plus 2c's own label — because the artboard
+does not license new copy; the scoping lives in the accessible name instead.
+Enforced by `reload: Enter is scoped to the chip, not global (ll5.10, §6.5
+R9)` in `ui/turn2Screens.test.ts`, which asserts an `Enter` dispatched at the
+frame (i.e. not aimed at the chip) fires nothing, and the same key dispatched
+at the chip does.
+
+**2. The rate-limited screen's amber tone and missing primary button are
+confirmed, not a guess.** 2b draws no rate-limited *panel* — it puts the limit
+in the rejected screen's footer instead — so `state/access.ts`'s `rate_limited`
+case was always written to 2b's *rules* rather than copied from an artboard:
+**amber** (`tone: "stale"`), by the same reasoning 2b gives `revoked` — a
+limiter doing its job is not a failure, so red would misreport it as one — and
+**no primary button** (`primary: null`), because the host would refuse a
+retry it knows cannot succeed, and offering one anyway is exactly the false
+claim Q7 rules out elsewhere. Enforced by `rate-limited: amber, no button, and
+the host's countdown` in `ui/turn2Screens.test.ts`, already in place before
+this task; ll5.10 confirms the ruling rather than changing the code.
+
+### R10 — `finished, N files touched` is bought at the finish edge, not from the cache
+
+R1 above records that the reason string is never padded with a guess, and until
+`remote-control-ll5.11` that left artboard 2e's `finished, 18 files touched`
+rendering with no clause at all. The count was not knowable at the call site:
+the git-status file count lives in `GitStatusCache`, refreshed every
+`GIT_REFRESH_EVERY` ticks **for the active project only**, so a number read at
+transition time would be stale for the project on screen and simply absent for a
+background one.
+
+**The fix is a scoped, one-shot refresh on the finish edge, not a wider periodic
+one.** Widening the cache to every open project would run git for every project
+every N ticks, forever, to serve a row that appears when a session finishes.
+Instead `record_web_transitions` (`src/lib.rs`) — which the event loop already
+calls for *every* open project in the same pass that drains PTYs and fires
+notifications — returns one `FinishCountRequest` per finished session, and
+`spawn_finish_count` runs a single `git status --porcelain` on that one tab's
+worktree, off the UI thread (SPECS §21). Nothing periodic changed: the
+`GIT_REFRESH_EVERY` block still refreshes `workspace.projects[active]` alone, and
+a project whose sessions are not moving asks git nothing.
+
+**Which edges earn a count** is `activity::wants_file_count`: a `finished`-tier
+move — derived through the same `StatusBucket`/`ActivityTier` pair the recorded
+event's own tier comes from — whose reason is still empty. A manual override, an
+exit code and a no-lifecycle agent all already have a better explanation and keep
+it.
+
+**The row waits, and is never lost or padded.** `activity::PendingFinishes` holds
+the whole transition while git is asked, rather than amending an event already in
+the store: `stream::deltas` matches feed entries by id and emits one only for an
+id the browser has not seen, so a row published empty and corrected later would
+reach an open tab as nothing at all. The row therefore enters the store exactly
+once, complete — stamped with the *edge's* `at_ms` (`ActivityStore::record_at`),
+not with the moment git answered. Git that fails, and git that has not answered
+within `FINISH_COUNT_DEADLINE_MS` (2s), both record the row with the **empty**
+reason it had before this existed: slow and broken degrade to the identical
+honest row, which is what lets the deadline be short.
+
 ---
 
 ## 7. Reference
