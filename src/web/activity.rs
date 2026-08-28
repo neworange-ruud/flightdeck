@@ -93,12 +93,47 @@
 //! | `set by hand on the desktop` | The manual override moved — a fact, supplied. |
 //! | `Codex CLI reports no lifecycle` | [`crate::agents::setup::status_backend`] says so — supplied. |
 //! | `asked a question` | **Not knowable.** The status hook writes `waiting`; *why* it is waiting never reaches the host. |
-//! | `finished, 18 files touched` | **Not knowable here.** The file count lives in the git-status cache, refreshed on its own schedule for the active project only, so any number at transition time would be stale or absent. |
+//! | `finished, 18 files touched` | **Not knowable by [`observe`].** The count comes from git, one tab at a time, at the finish edge — see the next section. |
 //!
-//! The two unknowable rows get an **empty** reason. §5.1's "unknown stays
-//! unknown" applies to the reason exactly as it applies to the statuses, and a
-//! plausible number is worse than no number: a user who trusts "18 files
+//! `asked a question` gets an **empty** reason, permanently. §5.1's "unknown
+//! stays unknown" applies to the reason exactly as it applies to the statuses,
+//! and a plausible number is worse than no number: a user who trusts "18 files
 //! touched" and acts on it has been misled by us, not by their agent.
+//!
+//! ## The finish edge asks git itself
+//!
+//! The file count is the one unknowable row that *can* be made knowable, and
+//! the reason it took a second mechanism is worth stating: the git-status cache
+//! ([`crate::tui::render::GitStatusCache`]) is refreshed every
+//! `GIT_REFRESH_EVERY` ticks **for the active project only**, so a number read
+//! out of it at transition time would be stale for the project on screen and
+//! simply absent for a project nobody is looking at. Widening that periodic
+//! refresh to every open project would buy the count by running git for every
+//! project every N ticks forever — a permanent cost for a row that appears
+//! when a session finishes, which is rare.
+//!
+//! So the refresh is **scoped and one-shot**: exactly one
+//! `git status --porcelain`, for exactly the tab whose row is being written, at
+//! exactly the moment its agent finished. [`wants_file_count`] decides which
+//! edges earn one (a `finished`-tier move whose reason is still empty — a
+//! manual override or an exit code already outranks it, see [`observe`]);
+//! [`file_count`] is the single git call, behind [`crate::contracts::GitExecutor`]
+//! like every other side effect here; and [`PendingFinishes`] holds the row
+//! while the call runs off the event loop (SPECS §21 — git status never blocks
+//! the UI thread).
+//!
+//! **A parked row is never lost, and never padded.**
+//! [`PendingFinishes::resolve`] records it with the count git reported;
+//! `resolve` with `None` — git failed, the worktree is gone, the repo is locked
+//! — and [`PendingFinishes::expire`] past [`FINISH_COUNT_DEADLINE_MS`] both
+//! record it with the **empty** reason it would have had before any of this
+//! existed. Slow and broken degrade to exactly the same honest row, which is
+//! why the deadline can be short.
+//!
+//! Because the row is recorded when the count lands rather than when the edge
+//! was seen, [`PendingFinishes`] carries the edge's own `at_ms` into
+//! [`ActivityStore::record_at`]. The timestamp a user reads is when the agent
+//! finished, not when git got round to answering.
 //!
 //! ## A second record, not the only one
 //!
@@ -126,9 +161,11 @@
 //! from.
 
 use std::collections::VecDeque;
+use std::path::Path;
 
 use crate::agents::status::DisplayStatus;
-use crate::contracts::{Clock, InterpretedStatus, ManualStatus, ProcessState, TabId};
+use crate::contracts::{Clock, GitExecutor, InterpretedStatus, ManualStatus, ProcessState, TabId};
+use crate::git::status::parse_porcelain_changes;
 
 use super::protocol::{
     Ack, AckOutcome, ActivityEvent, ActivityTier, Command, EventId, ProjectId, StatusBucket,
@@ -262,6 +299,21 @@ impl ActivityStore {
     /// happened is what keeps arrival order meaningful; see `tests.rs` for a
     /// test that pins this behaviour down explicitly.
     pub fn record(&mut self, clock: &dyn Clock, transition: Transition) -> EventId {
+        self.record_at(clock, clock.now_millis() as i64, transition)
+    }
+
+    /// [`ActivityStore::record`] for a transition that was **observed earlier
+    /// than it is being recorded**: `at_ms` is the moment the status actually
+    /// moved, `clock` is still the current time and is used only to enforce
+    /// retention.
+    ///
+    /// The one caller that needs the two to differ is [`PendingFinishes`]: a
+    /// finished row waits for git to count its files, so it arrives a moment
+    /// late. Stamping it with the edge's own time keeps `at_ms` telling the
+    /// truth about when the agent finished, and leaves the small arrival-order
+    /// wrinkle where this store already documents it (see
+    /// [`ActivityStore::record`]'s doc).
+    pub fn record_at(&mut self, clock: &dyn Clock, at_ms: i64, transition: Transition) -> EventId {
         self.next_seq += 1;
         let event_id = EventId::new(format!("evt-{}", self.next_seq));
 
@@ -270,7 +322,7 @@ impl ActivityStore {
 
         let event = ActivityEvent {
             event_id: event_id.clone(),
-            at_ms: clock.now_millis() as i64,
+            at_ms,
             project_id: transition.project_id,
             project_name: transition.project_name,
             session_id: transition.session_id,
@@ -448,6 +500,163 @@ pub fn observe(
         to,
         manual: now.manual,
         reason,
+    }
+}
+
+// ===========================================================================
+// `finished, N files touched`: the one-shot git refresh at the finish edge
+// ===========================================================================
+
+/// How long a finished row waits for its file count before it is recorded
+/// without the clause (see the module doc's "the finish edge asks git itself").
+///
+/// Short on purpose. The call it waits for is a single `git status --porcelain`
+/// on one worktree, so anything past this is a repo that is locked, huge, or on
+/// a network filesystem — and in every one of those cases the row a user wants
+/// is the one that arrives, without a number, rather than the one that never
+/// arrives at all.
+pub const FINISH_COUNT_DEADLINE_MS: i64 = 2_000;
+
+/// The design's `finished, 18 files touched` (artboard 2e), for the count git
+/// actually reported. `0` is a real answer and is said plainly: an agent that
+/// finished a turn without changing anything is a fact worth reading.
+fn reason_finished(files: u32) -> String {
+    match files {
+        1 => "finished, 1 file touched".to_string(),
+        n => format!("finished, {n} files touched"),
+    }
+}
+
+/// Whether this observed change is the finish edge whose row wants a file
+/// count.
+///
+/// Two conditions, both load-bearing. The tier must be
+/// [`ActivityTier::Finished`] — derived through the same
+/// [`StatusBucket::from_interpreted`]/[`ActivityTier::for_bucket`] pair the
+/// recorded event's own tier comes from, so "the row that says finished" and
+/// "the row that gets a count" cannot drift apart. And the reason must still be
+/// empty: [`observe`]'s precedence already gave a better explanation to a
+/// manual override, an exit code, and a no-lifecycle agent, and none of those
+/// should be replaced by a file count.
+pub fn wants_file_count(observed: &Observed) -> bool {
+    observed.reason.is_empty()
+        && ActivityTier::for_bucket(StatusBucket::from_interpreted(observed.to))
+            == ActivityTier::Finished
+}
+
+/// Ask git how many files one worktree has touched, **right now**.
+///
+/// One `git status --porcelain` through the [`GitExecutor`] seam, counted by
+/// [`parse_porcelain_changes`] — the same parse the git bar's own counts come
+/// from, so a feed row and the status panel can never disagree about the same
+/// worktree.
+///
+/// `None`, never a zero and never a guess, when git could not answer: the
+/// worktree is gone, the repo is locked, git is not on `PATH`. The caller
+/// records the row without the clause.
+pub fn file_count(git: &dyn GitExecutor, worktree: &Path) -> Option<u32> {
+    let porcelain = git.status_porcelain(worktree).ok()?;
+    Some(parse_porcelain_changes(&porcelain).total())
+}
+
+/// Identifies one outstanding file-count request, so the answer that comes back
+/// off a worker thread lands on the row that asked for it. Never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FinishCountId(u64);
+
+/// One feed row held back while git counts its files.
+#[derive(Debug)]
+struct PendingFinish {
+    id: FinishCountId,
+    /// When the status actually moved — carried into
+    /// [`ActivityStore::record_at`] so the row is stamped with the finish, not
+    /// with git's reply.
+    at_ms: i64,
+    transition: Transition,
+}
+
+/// The finished rows waiting on their one-shot git refresh (see the module
+/// doc's "the finish edge asks git itself").
+///
+/// Deliberately holds the *whole* [`Transition`] rather than amending an
+/// already-recorded event: `crate::web::stream::deltas` matches feed entries by
+/// id and emits one only for an id the browser has not seen, so a row published
+/// empty and corrected later would reach an open tab as nothing at all. A row
+/// therefore enters the store exactly once, complete.
+#[derive(Debug, Default)]
+pub struct PendingFinishes {
+    pending: Vec<PendingFinish>,
+    next_seq: u64,
+}
+
+impl PendingFinishes {
+    /// Nothing waiting.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many rows are currently held.
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True when nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Hold `transition` — observed at `at_ms` — until its count arrives.
+    /// Returns the id the answer must carry back.
+    pub fn park(&mut self, at_ms: i64, transition: Transition) -> FinishCountId {
+        self.next_seq += 1;
+        let id = FinishCountId(self.next_seq);
+        self.pending.push(PendingFinish {
+            id,
+            at_ms,
+            transition,
+        });
+        id
+    }
+
+    /// Record the row `id` was holding, with `files` if git answered and
+    /// without the clause if it did not.
+    ///
+    /// `None` for an id that is no longer held — it already expired, or the
+    /// answer arrived twice — which is a no-op rather than an error.
+    pub fn resolve(
+        &mut self,
+        store: &mut ActivityStore,
+        clock: &dyn Clock,
+        id: FinishCountId,
+        files: Option<u32>,
+    ) -> Option<EventId> {
+        let index = self.pending.iter().position(|p| p.id == id)?;
+        let mut held = self.pending.remove(index);
+        if let Some(files) = files {
+            held.transition.reason = reason_finished(files);
+        }
+        Some(store.record_at(clock, held.at_ms, held.transition))
+    }
+
+    /// Give up on every row that has waited [`FINISH_COUNT_DEADLINE_MS`] or
+    /// longer, recording each without the clause. Returns how many were let go.
+    ///
+    /// This is what makes the wait safe: a worker that never reports back —
+    /// killed, panicking, blocked on a repo lock nobody releases — costs a
+    /// missing clause, never a missing row.
+    pub fn expire(&mut self, store: &mut ActivityStore, clock: &dyn Clock, now_ms: i64) -> usize {
+        let deadline = now_ms - FINISH_COUNT_DEADLINE_MS;
+        // Drained in park order, so the rows that waited longest are recorded
+        // first — the same arrival order the event loop would have produced.
+        let (expired, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|p| p.at_ms <= deadline);
+        self.pending = held;
+        let count = expired.len();
+        for p in expired {
+            store.record_at(clock, p.at_ms, p.transition);
+        }
+        count
     }
 }
 

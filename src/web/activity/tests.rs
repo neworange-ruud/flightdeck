@@ -710,9 +710,12 @@ fn a_waiting_agent_gets_no_reason_because_why_it_waits_never_reaches_the_host() 
     );
 }
 
-/// The other unknowable row: `finished, 18 files touched`. The count lives in
-/// the git-status cache, on its own refresh schedule for the active project
-/// only, so no honest number exists at transition time.
+/// The other row the status pair cannot explain: `finished, 18 files touched`.
+/// [`observe`] still refuses to invent one — the count is not in the statuses
+/// and never will be. It arrives separately, from the finish-edge git refresh
+/// exercised further down (see [`wants_file_count`] and [`PendingFinishes`]),
+/// which is exactly why `observe` leaving this empty is the correct handoff
+/// rather than a gap.
 #[test]
 fn a_finished_agent_gets_no_reason_rather_than_an_invented_file_count() {
     let observed = observe(
@@ -1078,4 +1081,412 @@ fn marking_read_survives_into_the_events_a_later_reader_sees() {
         store.events().all(|event| event.read),
         "a second tab attaching now must not be shown a wall of unread"
     );
+}
+
+// ===========================================================================
+// `finished, N files touched`: the one-shot git refresh at the finish edge
+// ===========================================================================
+
+use crate::testing::FakeGit;
+use std::path::PathBuf;
+
+/// The worktree every git assertion below asks about.
+fn worktree() -> PathBuf {
+    PathBuf::from("/repo/worktrees/add-tests-api")
+}
+
+/// A finished transition with the empty reason `observe` hands over.
+fn finished() -> Observed {
+    observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Running, InterpretedStatus::Idle, None),
+        "Claude Code",
+        true,
+    )
+}
+
+/// The row the store writes for a parked transition, once.
+fn only_event(store: &ActivityStore) -> &ActivityEvent {
+    let mut events = store.events();
+    let event = events.next().expect("exactly one event");
+    assert!(events.next().is_none(), "exactly one event");
+    event
+}
+
+/// The acceptance criterion in one line: the number on the row is the number
+/// git reported for *that* worktree at *that* moment — 18 changed paths, the
+/// design's own example, spread across all three porcelain categories so the
+/// count is a real parse rather than a line tally that happens to agree.
+#[test]
+fn the_file_count_is_whatever_git_reports_for_that_worktree() {
+    let git = FakeGit::new();
+    let mut lines: Vec<String> = (0..10).map(|i| format!(" M src/mod-{i}.rs")).collect();
+    lines.extend((0..5).map(|i| format!("?? src/new-{i}.rs")));
+    lines.extend((0..3).map(|i| format!(" D src/gone-{i}.rs")));
+    git.set_porcelain_at(worktree(), lines);
+
+    assert_eq!(file_count(&git, &worktree()), Some(18));
+}
+
+/// A different worktree is a different question. The finish edge asks about the
+/// tab that finished, so the count must be keyed by path and not by repo.
+#[test]
+fn the_file_count_is_per_worktree_not_per_repo() {
+    let git = FakeGit::new();
+    git.set_porcelain_at("/repo/worktrees/a", [" M one.rs", " M two.rs"]);
+    git.set_porcelain_at("/repo/worktrees/b", [" M only.rs"]);
+
+    assert_eq!(file_count(&git, Path::new("/repo/worktrees/a")), Some(2));
+    assert_eq!(file_count(&git, Path::new("/repo/worktrees/b")), Some(1));
+}
+
+/// A clean worktree is a real answer, not a missing one. `Some(0)` and `None`
+/// are different facts and the row says different things about them.
+#[test]
+fn a_clean_worktree_counts_zero_rather_than_refusing_to_answer() {
+    let git = FakeGit::new();
+    git.set_porcelain_at(worktree(), Vec::<String>::new());
+
+    assert_eq!(file_count(&git, &worktree()), Some(0));
+}
+
+/// **The honest-empty source.** Git that cannot answer — a locked index, a
+/// worktree that has been removed, no `git` on `PATH` — yields no number at
+/// all, never a zero standing in for one.
+#[test]
+fn git_that_cannot_answer_yields_no_count_rather_than_zero() {
+    let git = FakeGit::new();
+    git.set_porcelain_at(worktree(), [" M src/lib.rs"]);
+    git.set_porcelain_error("fatal: unable to read index");
+
+    assert_eq!(file_count(&git, &worktree()), None);
+}
+
+#[test]
+fn a_finished_edge_with_an_empty_reason_wants_a_count() {
+    assert!(wants_file_count(&finished()));
+}
+
+/// Every reason `observe` already found is a better explanation than a file
+/// count, so none of them is overwritten by one.
+#[test]
+fn an_edge_that_already_has_a_reason_does_not_want_a_count() {
+    let manual = observe(
+        display(ProcessState::Running, InterpretedStatus::Idle, None),
+        display(
+            ProcessState::Running,
+            InterpretedStatus::Idle,
+            Some(ManualStatus::Done),
+        ),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(manual.reason, "set by hand on the desktop");
+    assert!(!wants_file_count(&manual));
+
+    let exited = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Exited(0), InterpretedStatus::Completed, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(exited.reason, "agent exited (code 0)");
+    assert!(!wants_file_count(&exited));
+
+    let no_lifecycle = observe(
+        display(ProcessState::Running, InterpretedStatus::Unknown, None),
+        display(ProcessState::Exited(0), InterpretedStatus::Completed, None),
+        "Codex CLI",
+        false,
+    );
+    assert_eq!(no_lifecycle.reason, "Codex CLI reports no lifecycle");
+    assert!(!wants_file_count(&no_lifecycle));
+}
+
+/// Only the `finished` tier earns the clause. An agent that stopped to ask a
+/// question has an empty reason too, and `finished, 3 files touched` on that
+/// row would be a flat lie about what just happened.
+#[test]
+fn only_a_finished_tier_edge_wants_a_count() {
+    let waiting = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(
+            ProcessState::Running,
+            InterpretedStatus::WaitingForInput,
+            None,
+        ),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(waiting.reason, "");
+    assert!(!wants_file_count(&waiting));
+
+    let lost = observe(
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        display(ProcessState::Lost, InterpretedStatus::SessionLost, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(lost.reason, "");
+    assert!(!wants_file_count(&lost));
+
+    let started = observe(
+        display(ProcessState::Running, InterpretedStatus::Idle, None),
+        display(ProcessState::Running, InterpretedStatus::Working, None),
+        "Claude Code",
+        true,
+    );
+    assert_eq!(started.reason, "");
+    assert!(!wants_file_count(&started));
+}
+
+/// End to end through the seam: park the row the finish edge produced, ask the
+/// fake git, resolve with what it said, and read the design's sentence off the
+/// recorded event.
+#[test]
+fn a_resolved_row_carries_the_count_git_reported() {
+    let clock = FakeClock::default();
+    let git = FakeGit::new();
+    git.set_porcelain_at(
+        worktree(),
+        (0..18)
+            .map(|i| format!(" M src/file-{i}.rs"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_700,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    assert_eq!(store.len(), 0, "nothing is published while git is asked");
+    assert_eq!(pending.len(), 1);
+
+    let files = file_count(&git, &worktree());
+    assert!(pending.resolve(&mut store, &clock, id, files).is_some());
+
+    let event = only_event(&store);
+    assert_eq!(event.reason, "finished, 18 files touched");
+    assert_eq!(event.tier, ActivityTier::Finished);
+    assert!(pending.is_empty());
+}
+
+/// One file is one file. The design's plural is a plural, not a template.
+#[test]
+fn a_single_touched_file_is_not_reported_as_1_files() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_700,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    pending.resolve(&mut store, &clock, id, Some(1));
+
+    assert_eq!(only_event(&store).reason, "finished, 1 file touched");
+}
+
+/// A clean finish says so. `Some(0)` is a fact git supplied, and the row is
+/// allowed to state it — this is the one place a number may be zero without
+/// being a stand-in for "we don't know".
+#[test]
+fn a_finish_that_touched_nothing_says_zero_rather_than_going_silent() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_700,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    pending.resolve(&mut store, &clock, id, Some(0));
+
+    assert_eq!(only_event(&store).reason, "finished, 0 files touched");
+}
+
+/// **The honest-empty path, preserved.** Git said nothing usable, so the row
+/// renders exactly as it did before this mechanism existed: present, correctly
+/// tiered, and silent about a number nobody can vouch for.
+#[test]
+fn a_row_git_could_not_count_is_recorded_without_the_clause() {
+    let clock = FakeClock::default();
+    let git = FakeGit::new();
+    git.set_porcelain_error("fatal: not a git repository");
+
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_700,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    let files = file_count(&git, &worktree());
+    assert_eq!(files, None);
+    pending.resolve(&mut store, &clock, id, files);
+
+    let event = only_event(&store);
+    assert_eq!(
+        event.reason, "",
+        "no number is obtainable, and §5.1 forbids padding the reason with a \
+         plausible one"
+    );
+    assert_eq!(event.tier, ActivityTier::Finished);
+    assert_eq!(event.to, InterpretedStatus::Idle);
+}
+
+/// A worker that never reports back must cost a clause, not a row. Nothing in
+/// the wait is allowed to swallow the event D11 exists to deliver.
+#[test]
+fn a_row_nobody_ever_answers_for_is_published_after_the_deadline() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    pending.park(
+        1_000,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+
+    // One millisecond short of the deadline: still waiting, still unpublished.
+    assert_eq!(
+        pending.expire(&mut store, &clock, 1_000 + FINISH_COUNT_DEADLINE_MS - 1),
+        0
+    );
+    assert_eq!(store.len(), 0);
+    assert_eq!(pending.len(), 1);
+
+    assert_eq!(
+        pending.expire(&mut store, &clock, 1_000 + FINISH_COUNT_DEADLINE_MS),
+        1
+    );
+    let event = only_event(&store);
+    assert_eq!(event.reason, "");
+    assert!(pending.is_empty());
+}
+
+/// The row is stamped with the finish, not with git's reply. A user reading
+/// `2 minutes ago` is being told when their agent stopped working, and the
+/// wait for a file count must not creep into that number.
+#[test]
+fn a_parked_row_keeps_the_timestamp_of_the_edge_not_of_the_answer() {
+    let clock = FakeClock::default();
+    clock.set_millis(9_000);
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_700,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    pending.resolve(&mut store, &clock, id, Some(4));
+
+    assert_eq!(
+        only_event(&store).at_ms,
+        1_700,
+        "the clock has moved on since the edge; the row must not claim the \
+         agent finished when git answered"
+    );
+}
+
+/// A late answer for a row that already gave up must not record it twice — the
+/// feed would then show one finish as two, which is worse than a missing count.
+#[test]
+fn an_answer_that_arrives_after_the_deadline_does_not_duplicate_the_row() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let id = pending.park(
+        1_000,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    assert_eq!(
+        pending.expire(&mut store, &clock, 1_000 + FINISH_COUNT_DEADLINE_MS),
+        1
+    );
+
+    assert!(
+        pending.resolve(&mut store, &clock, id, Some(7)).is_none(),
+        "the id is no longer held, so there is nothing to record"
+    );
+    assert_eq!(store.len(), 1);
+    assert_eq!(only_event(&store).reason, "");
+}
+
+/// Two sessions finishing on the same tick each get their own count, and the
+/// answers may come back in either order.
+#[test]
+fn two_finished_sessions_do_not_take_each_other_s_counts() {
+    let clock = FakeClock::default();
+    let mut store = ActivityStore::new();
+    let mut pending = PendingFinishes::new();
+    let first = pending.park(
+        1_000,
+        transition(
+            "flightdeck",
+            "add-tests-api",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+    let second = pending.park(
+        1_000,
+        transition(
+            "api-gateway",
+            "migrate-schema-v4",
+            InterpretedStatus::Working,
+            InterpretedStatus::Idle,
+            "",
+        ),
+    );
+
+    // Answered out of order, as two worker threads will.
+    pending.resolve(&mut store, &clock, second, Some(3));
+    pending.resolve(&mut store, &clock, first, Some(18));
+
+    let events: Vec<&ActivityEvent> = store.events().collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].session_name, "migrate-schema-v4");
+    assert_eq!(events[0].reason, "finished, 3 files touched");
+    assert_eq!(events[1].session_name, "add-tests-api");
+    assert_eq!(events[1].reason, "finished, 18 files touched");
 }

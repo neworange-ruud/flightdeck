@@ -1456,10 +1456,22 @@ struct WebSurface {
     /// it is why the feed survives a `Stop` / `Start` cycle for the same reason
     /// the rings do.
     activity: crate::web::activity::ActivityStore,
+    /// Finished feed rows held back while a one-shot `git status` counts the
+    /// files their session touched (`crate::web::activity`'s "the finish edge
+    /// asks git itself"). Drained by [`WebSurface::drain_finish_counts`], which
+    /// also lets go of anything that waited too long — a held row always ends
+    /// up in `activity`, with the clause or without it.
+    pending_finishes: crate::web::activity::PendingFinishes,
     /// Handed to `server::start`; kept so a restart reuses the same channel.
     inbound_tx: Sender<crate::web::server::WebInbound>,
     /// Drained every tick.
     inbound_rx: Receiver<crate::web::server::WebInbound>,
+    /// Where the finish-edge git workers report back. Kept on the surface
+    /// rather than per project because the request id, not the channel, says
+    /// which row an answer belongs to — so a background project's worker needs
+    /// no plumbing of its own.
+    count_tx: Sender<FinishCount>,
+    count_rx: Receiver<FinishCount>,
     /// `Some` while the server is running.
     handle: Option<crate::web::server::WebServerHandle>,
     /// The last state published, so `publish_state` is paired with the deltas
@@ -1481,12 +1493,16 @@ impl WebSurface {
             path,
         );
         let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        let (count_tx, count_rx) = std::sync::mpsc::channel();
         WebSurface {
             credentials: Arc::new(Mutex::new(store)),
             streams: crate::web::stream::TerminalStreams::new(config.replay_bytes),
             activity: crate::web::activity::ActivityStore::new(),
+            pending_finishes: crate::web::activity::PendingFinishes::new(),
             inbound_tx,
             inbound_rx,
+            count_tx,
+            count_rx,
             handle: None,
             published: crate::web::server::HostState::default(),
         }
@@ -1567,14 +1583,22 @@ impl WebSurface {
     /// [`crate::web::stream::lifecycle_reporting`] — the same helper
     /// `build_web_host_state` uses for the sidebar, so a feed row and a session
     /// row can never disagree about whether an agent reports a lifecycle.
+    ///
+    /// A *finished* row is the one case that cannot be completed here: artboard
+    /// 2e's `finished, 18 files touched` needs a number only git has, so the row
+    /// is parked (`pending_finishes`) and a [`FinishCountRequest`] is returned
+    /// for the caller to run off the event loop. Everything else — including a
+    /// finish edge whose `worktree_abs` is unknown, which is the honest-empty
+    /// path — is recorded here and now.
     fn record_transition(
         &mut self,
         clock: &dyn Clock,
         project_id: crate::web::protocol::ProjectId,
         project_name: &str,
         agent: Option<&AgentDef>,
+        worktree_abs: Option<PathBuf>,
         change: crate::app::state::TabStatusChange,
-    ) {
+    ) -> Option<FinishCountRequest> {
         let observed = crate::web::activity::observe(
             change.was,
             change.now,
@@ -1583,19 +1607,47 @@ impl WebSurface {
                 .unwrap_or(&change.agent_key),
             crate::web::stream::lifecycle_reporting(agent),
         );
-        self.activity.record(
-            clock,
-            crate::web::activity::Transition {
-                project_id,
-                project_name: project_name.to_string(),
-                session_id: change.tab_id,
-                session_name: change.tab_name,
-                from: observed.from,
-                to: observed.to,
-                manual: observed.manual,
-                reason: observed.reason,
-            },
-        );
+        let wants_count = crate::web::activity::wants_file_count(&observed);
+        let transition = crate::web::activity::Transition {
+            project_id,
+            project_name: project_name.to_string(),
+            session_id: change.tab_id,
+            session_name: change.tab_name,
+            from: observed.from,
+            to: observed.to,
+            manual: observed.manual,
+            reason: observed.reason,
+        };
+        match worktree_abs {
+            Some(worktree_abs) if wants_count => {
+                let request = self
+                    .pending_finishes
+                    .park(clock.now_millis() as i64, transition);
+                Some(FinishCountRequest {
+                    request,
+                    worktree_abs,
+                })
+            }
+            _ => {
+                self.activity.record(clock, transition);
+                None
+            }
+        }
+    }
+
+    /// Record the parked finished rows whose git refresh has answered, then let
+    /// go of any that has waited past
+    /// [`crate::web::activity::FINISH_COUNT_DEADLINE_MS`].
+    ///
+    /// Called every tick, before anything reads the feed, so a row is at most
+    /// one tick behind the answer it was waiting for.
+    fn drain_finish_counts(&mut self, clock: &dyn Clock, now_ms: u64) {
+        while let Ok(count) = self.count_rx.try_recv() {
+            self.pending_finishes
+                .resolve(&mut self.activity, clock, count.request, count.files);
+        }
+        self.pending_finishes
+            .expire(&mut self.activity, clock, now_ms as i64);
     }
 
     /// The retained feed for a `HostState`, both §5.1 bounds enforced against
@@ -1625,6 +1677,102 @@ impl WebSurface {
             ));
         }
     }
+}
+
+/// A per-tab, one-shot git refresh the event loop still has to run: a finished
+/// session's feed row is parked until it answers (D11 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinishCountRequest {
+    /// The parked row this answer belongs to.
+    request: crate::web::activity::FinishCountId,
+    /// The worktree to ask about — that tab's, not the repository root.
+    worktree_abs: PathBuf,
+}
+
+/// One completed finish-edge count, from its worker thread.
+struct FinishCount {
+    request: crate::web::activity::FinishCountId,
+    /// `None` when git could not answer. The row is then recorded without the
+    /// clause, exactly as it was before any of this existed.
+    files: Option<u32>,
+}
+
+/// Tee one project's status transitions into D11's feed, returning the one-shot
+/// git refreshes its finished rows are waiting on.
+///
+/// **This runs for every open project, on screen or not** — the event loop
+/// calls it inside the same per-project pass that drains PTYs and fires
+/// notifications, so a session that finished in a project nobody is looking at
+/// gets its file count on exactly the same terms as the active one. That is the
+/// whole reason the count is fetched *here*, at the edge, rather than read out
+/// of the periodic git-status cache, which only ever refreshes
+/// `workspace.projects[active]` (see `GIT_REFRESH_EVERY`) and is left untouched
+/// by this: no project gains any periodic git work it did not already have.
+///
+/// The refreshes are returned rather than spawned so the whole decision — which
+/// edges want a count, and which worktree to ask about — is a pure function of
+/// the project's state, testable against a fake git with no threads in it.
+fn record_web_transitions(
+    web: &mut WebSurface,
+    project: &mut Project,
+    clock: &dyn Clock,
+    now_ms: u64,
+) -> Vec<FinishCountRequest> {
+    let changes = project.state.take_status_transitions(now_ms);
+    if changes.is_empty() {
+        // Built only when there is something to attribute, so a quiet tick
+        // costs no allocation on a loop that runs at frame rate.
+        return Vec::new();
+    }
+    let project_id = crate::web::protocol::ProjectId::new(project.git.root().display().to_string());
+    let mut requests = Vec::new();
+    for change in changes {
+        let agent = project.state.registry.get(&change.agent_key);
+        // Only a `Ready` tab has a worktree on disk to count; anything else
+        // takes the honest-empty path rather than asking git about a directory
+        // that is not there yet.
+        let worktree_abs = project
+            .state
+            .tabs
+            .iter()
+            .find(|t| t.meta.id == change.tab_id.0 && t.phase == TabPhase::Ready)
+            .map(|t| {
+                to_absolute(
+                    &project.state.repo_root,
+                    Path::new(&t.meta.worktree_path_relative),
+                )
+            });
+        if let Some(request) = web.record_transition(
+            clock,
+            project_id.clone(),
+            &project.name,
+            agent,
+            worktree_abs,
+            change,
+        ) {
+            requests.push(request);
+        }
+    }
+    requests
+}
+
+/// Run one finish-edge count off the UI thread and post the answer back.
+///
+/// A whole thread for a single `git status --porcelain` is the same trade
+/// `spawn_status_refresh` makes and for the same reason (SPECS §21): a repo
+/// another instance is holding a lock on must never freeze the loop. It costs
+/// one thread per finished session, which is rare — this is not the periodic
+/// refresh and deliberately does not become one.
+fn spawn_finish_count(git: &GitCli, tx: &Sender<FinishCount>, req: FinishCountRequest) {
+    let git = git.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let files = crate::web::activity::file_count(&git, &req.worktree_abs);
+        let _ = tx.send(FinishCount {
+            request: req.request,
+            files,
+        });
+    });
 }
 
 /// The [`TerminalHost`] the web interface writes keystrokes through: every open
@@ -2113,24 +2261,23 @@ fn event_loop(
             // separate per-tab edge memory — and this record happens whether or
             // not the server is up, so a browser opened later lands on history
             // rather than silence (`WebSurface::activity`).
-            let changes = p.state.take_status_transitions(now_ms);
-            if !changes.is_empty() {
-                // Built only when there is something to attribute, so a quiet
-                // tick costs no allocation on a loop that runs at frame rate.
-                let project_id =
-                    crate::web::protocol::ProjectId::new(p.git.root().display().to_string());
-                for change in changes {
-                    let agent = p.state.registry.get(&change.agent_key);
-                    web_surface.record_transition(
-                        env.clock,
-                        project_id.clone(),
-                        &p.name,
-                        agent,
-                        change,
-                    );
-                }
+            //
+            // A finished session's row also wants the count artboard 2e shows
+            // (`finished, 18 files touched`), which only git knows: each
+            // returned request is one `git status --porcelain` on that tab's
+            // worktree, spawned here and answered into `count_tx`. This is the
+            // *only* git work the feed adds, it is per finished session rather
+            // than per tick, and the periodic cache above still refreshes the
+            // active project alone.
+            for request in record_web_transitions(&mut web_surface, p, env.clock, now_ms) {
+                spawn_finish_count(&p.git, &web_surface.count_tx, request);
             }
         }
+
+        // Land the finish-edge counts that came back, and let go of any row
+        // that has waited too long for one — before anything reads the feed
+        // this tick.
+        web_surface.drain_finish_counts(env.clock, now_ms);
 
         // --- Apply a completed background update check (SPECS §30). ---
         while let Ok(latest) = update_rx.try_recv() {
@@ -11248,6 +11395,374 @@ mod tests {
             let spec = crate::web::commands::lookup(names::MARK_ACTIVITY_READ)
                 .expect("the feed command is in the inventory");
             assert_eq!(spec.route, crate::web::commands::Route::ActivityRead);
+        }
+    }
+
+    /// D11 §5.1's `finished, 18 files touched`: the per-tab, one-shot git
+    /// refresh that makes the clause literal, and the honest-empty paths that
+    /// keep it from ever becoming a guess.
+    ///
+    /// Everything here runs the real `record_web_transitions` /
+    /// `WebSurface::record_transition` / `PendingFinishes` path. The only piece
+    /// standing in for production is the worker thread: `spawn_finish_count`
+    /// does nothing but call `activity::file_count` and post the answer back,
+    /// so `answer_with` below does exactly that, synchronously, against a
+    /// `FakeGit`.
+    mod web_finish_counts {
+        use super::*;
+        use crate::contracts::{
+            AgentDef, InterpretedStatus, ProjectState as CoreProjectState, StatusPatterns,
+            TabState, STATE_VERSION,
+        };
+        use crate::testing::FakeGit;
+
+        /// An agent whose command basename `status_backend` recognises, so
+        /// `lifecycle_reporting` is true and `observe` may report a real
+        /// `working → idle` pair rather than §5.1's `unknown → unknown`.
+        fn claude() -> AgentDef {
+            AgentDef {
+                key: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                command: "claude".to_string(),
+                args: vec![],
+                status_patterns: StatusPatterns::default(),
+            }
+        }
+
+        fn tab_state(id: &str, slug: &str) -> TabState {
+            TabState {
+                id: id.to_string(),
+                name: slug.to_string(),
+                slug: slug.to_string(),
+                agent: "claude".to_string(),
+                branch: format!("{slug}-branch"),
+                worktree_path_relative: format!("worktrees/{slug}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: false,
+                resume_args: Vec::new(),
+            }
+        }
+
+        /// A project with one `Ready` tab whose primary is running, so its
+        /// display status is driven by the cached lifecycle signal alone and a
+        /// test can move it by hand.
+        fn project(name: &str, root: &str, slug: &str, pty: &FakePty) -> Project {
+            let mut config = Config::default();
+            config.ui.default_agent = "claude".to_string();
+            config.agents.insert("claude".to_string(), claude());
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs: vec![tab_state(&format!("{name}-t1"), slug)],
+            };
+            let mut app = AppState::new(
+                config,
+                state,
+                root,
+                format!("{root}/.flightdeck/state.json"),
+            );
+            pty.queue_session();
+            app.tabs[0]
+                .session
+                .spawn_primary(pty, "agent", &[], Path::new(root), PtySize::default())
+                .unwrap();
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            Project {
+                name: name.to_string(),
+                git: GitCli::new(PathBuf::from(root)),
+                state: app,
+                cache: GitStatusCache::new(),
+                create_tx,
+                create_rx,
+                status_tx,
+                status_rx,
+                status_in_flight: false,
+                git_lock: Arc::new(Mutex::new(())),
+            }
+        }
+
+        /// A surface with no server and no real credential file behind it —
+        /// only the feed and the pending-finish queue are under test.
+        fn web_surface() -> WebSurface {
+            let store = crate::web::credentials::CredentialStore::open(
+                Arc::new(FakeFs::new()),
+                Arc::new(FakeClock::default()),
+                PathBuf::from("/web.json"),
+            );
+            let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+            let (count_tx, count_rx) = std::sync::mpsc::channel();
+            WebSurface {
+                credentials: Arc::new(Mutex::new(store)),
+                streams: crate::web::stream::TerminalStreams::new(1024),
+                activity: crate::web::activity::ActivityStore::new(),
+                pending_finishes: crate::web::activity::PendingFinishes::new(),
+                inbound_tx,
+                inbound_rx,
+                count_tx,
+                count_rx,
+                handle: None,
+                published: crate::web::server::HostState::default(),
+            }
+        }
+
+        /// Move a tab's lifecycle signal, the way `poll_status_files` does when
+        /// an agent's status hook writes to its status file.
+        fn set_interpreted(project: &mut Project, status: InterpretedStatus) {
+            project.state.tabs[0].interpreted = Some(status);
+        }
+
+        /// What `spawn_finish_count` does, minus the thread: ask `git`, post the
+        /// answer back, and let the surface drain it.
+        fn answer_with(
+            web: &mut WebSurface,
+            git: &FakeGit,
+            clock: &FakeClock,
+            now_ms: u64,
+            requests: Vec<FinishCountRequest>,
+        ) {
+            for req in requests {
+                let files = crate::web::activity::file_count(git, &req.worktree_abs);
+                web.count_tx
+                    .send(FinishCount {
+                        request: req.request,
+                        files,
+                    })
+                    .unwrap();
+            }
+            web.drain_finish_counts(clock, now_ms);
+        }
+
+        /// Drive one project from `working` to `idle`, returning the refreshes
+        /// the finish edge asked for. The first pass only arms the edge memory —
+        /// `take_status_transitions` never reports a first sighting.
+        fn finish(
+            web: &mut WebSurface,
+            project: &mut Project,
+            clock: &FakeClock,
+        ) -> Vec<FinishCountRequest> {
+            set_interpreted(project, InterpretedStatus::Working);
+            assert!(
+                record_web_transitions(web, project, clock, 1_000).is_empty(),
+                "first sighting is not a transition"
+            );
+            set_interpreted(project, InterpretedStatus::Idle);
+            record_web_transitions(web, project, clock, 1_100)
+        }
+
+        fn reasons(web: &WebSurface) -> Vec<String> {
+            web.activity.events().map(|e| e.reason.clone()).collect()
+        }
+
+        /// The row on screen: the count is what git reports for *that* tab's
+        /// worktree at the finish edge, not what some cache last happened to see.
+        #[test]
+        fn the_active_project_s_finished_row_carries_the_count_git_reports() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_at(
+                "/repo0/worktrees/add-tests-api",
+                (0..18)
+                    .map(|i| format!(" M src/file-{i}.rs"))
+                    .collect::<Vec<_>>(),
+            );
+            let mut web = web_surface();
+            let mut active = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut active, &clock);
+            assert_eq!(requests.len(), 1, "the finish edge asked git once");
+            assert_eq!(
+                requests[0].worktree_abs,
+                PathBuf::from("/repo0/worktrees/add-tests-api"),
+                "the tab's own worktree, not the repository root"
+            );
+            assert!(
+                web.activity.is_empty(),
+                "nothing is published while the count is outstanding"
+            );
+
+            answer_with(&mut web, &git, &clock, 1_100, requests);
+            assert_eq!(reasons(&web), vec!["finished, 18 files touched"]);
+        }
+
+        /// **The acceptance criterion.** `record_web_transitions` runs inside the
+        /// loop's per-project pass, which visits every open project — so a
+        /// session that finished in a project nobody is looking at gets the same
+        /// literal count, from its own repo and its own worktree. The active
+        /// project finishes in the same test with a *different* number, so a
+        /// count leaking between projects fails here rather than passing by
+        /// coincidence.
+        #[test]
+        fn a_background_project_s_finished_row_carries_the_count_too() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let active_git = FakeGit::new();
+            active_git.set_porcelain_at("/repo0/worktrees/on-screen", [" M a.rs", " M b.rs"]);
+            let background_git = FakeGit::new();
+            background_git.set_porcelain_at(
+                "/repo1/worktrees/off-screen",
+                (0..18)
+                    .map(|i| format!(" M src/file-{i}.rs"))
+                    .collect::<Vec<_>>(),
+            );
+
+            let mut web = web_surface();
+            let mut active = project("proj0", "/repo0", "on-screen", &pty);
+            let mut background = project("proj1", "/repo1", "off-screen", &pty);
+
+            let active_requests = finish(&mut web, &mut active, &clock);
+            let background_requests = finish(&mut web, &mut background, &clock);
+            assert_eq!(background_requests.len(), 1);
+            assert_eq!(
+                background_requests[0].worktree_abs,
+                PathBuf::from("/repo1/worktrees/off-screen"),
+            );
+
+            answer_with(&mut web, &active_git, &clock, 1_100, active_requests);
+            answer_with(
+                &mut web,
+                &background_git,
+                &clock,
+                1_100,
+                background_requests,
+            );
+
+            let rows: Vec<(String, String)> = web
+                .activity
+                .events()
+                .map(|e| (e.project_name.clone(), e.reason.clone()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("proj0".to_string(), "finished, 2 files touched".to_string()),
+                    (
+                        "proj1".to_string(),
+                        "finished, 18 files touched".to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// **No new periodic git work.** The count is bought at the edge, so a
+        /// project whose sessions are not moving — the normal state of every
+        /// background project — asks git nothing at all, however many ticks go
+        /// by. The `GIT_REFRESH_EVERY` cache is untouched and still refreshes
+        /// `workspace.projects[active]` alone.
+        #[test]
+        fn a_project_nobody_is_looking_at_asks_git_nothing_per_tick() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_at("/repo1/worktrees/off-screen", [" M src/lib.rs"]);
+            let mut web = web_surface();
+            let mut background = project("proj1", "/repo1", "off-screen", &pty);
+            set_interpreted(&mut background, InterpretedStatus::Working);
+
+            for t in 0..(GIT_REFRESH_EVERY * 3) {
+                let requests = record_web_transitions(&mut web, &mut background, &clock, 1_000 + t);
+                assert!(
+                    requests.is_empty(),
+                    "a session that has not moved is not a finish edge"
+                );
+                answer_with(&mut web, &git, &clock, 1_000 + t, requests);
+            }
+
+            assert_eq!(
+                git.porcelain_calls(),
+                0,
+                "the feed must not turn every open project into periodic git work"
+            );
+            assert!(web.activity.is_empty(), "and nothing happened to report");
+        }
+
+        /// Only the finish edge pays for a refresh. A session that stopped to
+        /// ask a question, or one the user set by hand, is a row the host can
+        /// already explain — git is never asked about either.
+        #[test]
+        fn only_the_finish_edge_asks_git_anything() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            set_interpreted(&mut p, InterpretedStatus::Working);
+            assert!(record_web_transitions(&mut web, &mut p, &clock, 1_000).is_empty());
+
+            set_interpreted(&mut p, InterpretedStatus::WaitingForInput);
+            assert!(
+                record_web_transitions(&mut web, &mut p, &clock, 1_100).is_empty(),
+                "a question is not a finish"
+            );
+
+            p.state.tabs[0].meta.manual_status = Some(ManualStatus::Done.as_str().to_string());
+            assert!(
+                record_web_transitions(&mut web, &mut p, &clock, 1_200).is_empty(),
+                "the user's own words outrank a file count"
+            );
+
+            assert_eq!(git.porcelain_calls(), 0);
+            assert_eq!(
+                reasons(&web),
+                vec!["".to_string(), "set by hand on the desktop".to_string()],
+                "both rows are recorded straight away; neither waits on git"
+            );
+        }
+
+        /// **The honest-empty path.** Git could not answer — a locked index, a
+        /// worktree that has been removed — so the row arrives without the
+        /// clause, exactly as it did before this mechanism existed.
+        #[test]
+        fn a_finish_git_cannot_count_still_produces_its_row() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_error("fatal: unable to read index");
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut p, &clock);
+            assert_eq!(requests.len(), 1);
+            answer_with(&mut web, &git, &clock, 1_100, requests);
+
+            let event = web.activity.events().next().expect("the row still lands");
+            assert_eq!(event.reason, "");
+            assert_eq!(event.tier, crate::web::protocol::ActivityTier::Finished);
+            assert_eq!(event.to, InterpretedStatus::Idle);
+        }
+
+        /// A worker that never comes back — killed, or blocked on a repo lock
+        /// nobody releases — costs the clause, never the row. The deadline is
+        /// enforced by the same per-tick drain the answers arrive on.
+        #[test]
+        fn a_finish_nobody_ever_answers_for_lands_after_the_deadline() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut p, &clock);
+            assert_eq!(requests.len(), 1);
+            // The answer is simply dropped, as a panicking worker's would be.
+            drop(requests);
+
+            web.drain_finish_counts(&clock, 1_100);
+            assert!(web.activity.is_empty(), "still waiting, still unpublished");
+
+            let deadline = 1_100 + crate::web::activity::FINISH_COUNT_DEADLINE_MS as u64;
+            web.drain_finish_counts(&clock, deadline);
+            assert_eq!(reasons(&web), vec!["".to_string()]);
         }
     }
 }
