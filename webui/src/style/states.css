@@ -11,6 +11,12 @@
  *      means; a hex value says nothing and drifts silently when 2g moves.
  *   2. Four type sizes only, from `--fd-t-meta | -body | -title | -code`.
  *
+ * Every layer below is toggled with the `hidden` property by its component,
+ * and every one of them sets `display: flex`. That combination used to need a
+ * `.fd-x[hidden] { display: none }` beside each — nine of them, five elements
+ * that never got one, and one live bug (`remote-control-eek.4`). It is now a
+ * single document-level rule in `app.css`; do not add per-layer ones back.
+ *
  * Turn 2 named exactly one new colour, `--fd-stale`, and left the *surfaces*
  * built from it unnamed — every dimmed chip fill, every 8%-wash panel ground,
  * every dark frame border. Those are expressed below as mixes with the token
@@ -310,14 +316,6 @@
    * photograph" is a statement the user can verify by looking. */
   background: color-mix(in srgb, var(--fd-canvas) 74%, transparent);
 }
-/* The layer is toggled with the `hidden` property (`accessScreen.ts`), and
- * `display: flex` above beats the UA stylesheet's `[hidden] { display: none }`
- * — so without this rule a granted tab keeps a full-frame scrim over the app
- * that dims everything and swallows every click, the terminal included. Caught
- * by the Playwright suite (D15) trying to click into the terminal. */
-.fd-access[hidden] {
-  display: none;
-}
 .fd-frame {
   position: relative;
 }
@@ -536,11 +534,6 @@
   z-index: 2;
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 76%, transparent);
-}
-/* Same trap as `.fd-access[hidden]` above: `takeover.ts` toggles `hidden`, and
- * `display: flex` would otherwise leave this scrim over the app for ever. */
-.fd-takeover[hidden] {
-  display: none;
 }
 .fd-takeover__panel {
   width: min(600px, calc(100% - 36px));
@@ -870,12 +863,6 @@
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
 }
-/* Same trap as `.fd-access[hidden]`/`.fd-takeover[hidden]` above: the
- * component toggles `hidden`, and `display: flex` would otherwise leave this
- * scrim over the app forever. */
-.fd-palette[hidden] {
-  display: none;
-}
 .fd-palette__panel {
   width: min(900px, calc(100% - 80px));
   height: min(620px, calc(100% - 108px));
@@ -1051,9 +1038,6 @@
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
 }
-.fd-config[hidden] {
-  display: none;
-}
 .fd-config__panel {
   width: min(1040px, calc(100% - 80px));
   height: min(640px, calc(100% - 108px));
@@ -1114,9 +1098,6 @@
 }
 .fd-config__unsaved {
   color: var(--fd-focus);
-}
-.fd-config__unsaved[hidden] {
-  display: none;
 }
 .fd-config__status {
   flex: none;
@@ -1275,9 +1256,6 @@
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
 }
-.fd-dialog[hidden] {
-  display: none;
-}
 .fd-dialog__panel {
   width: min(720px, calc(100% - 80px));
   margin: auto;
@@ -1344,13 +1322,6 @@
   box-shadow: inset 2px 0 0 var(--fd-stale);
   color: color-mix(in srgb, var(--fd-stale) 30%, var(--fd-text-soft));
   font-size: var(--fd-t-meta);
-}
-.fd-dialog__refusal[hidden],
-.fd-dialog__list[hidden],
-.fd-dialog__gate[hidden],
-.fd-dialog__field[hidden],
-.fd-dialog__status[hidden] {
-  display: none;
 }
 /* Artboard 1g's step 2. The frame stays the dialog's own accent rather than
  * turning red on its own: the *host* wrote the sentence above the field, and a
@@ -1550,12 +1521,6 @@
   z-index: 4;
   display: flex;
   background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
-}
-/* Same trap as `.fd-palette[hidden]` / `.fd-config[hidden]`: the component
- * toggles `hidden`, and `display: flex` would beat the UA stylesheet and leave
- * a scrim over the app for ever (R5's Playwright finding). */
-.fd-info[hidden] {
-  display: none;
 }
 .fd-info__panel {
   width: min(760px, calc(100% - 80px));

@@ -217,6 +217,25 @@ export function createApp(options: AppOptions): App {
     [tabs.el, pane.el, feed.el],
   );
   const body = el("div", { class: "fd-body" }, [sidebar.el, main]);
+  /**
+   * 1h: *"below 900px … the git bar folds into the status bar."*
+   *
+   * The fold is this wrapper and nothing else. At wide it is
+   * `display: contents`, so the two strips are laid out by `.fd-frame`
+   * exactly as they were before it existed — the wide layout is unchanged to
+   * the pixel. At narrow it becomes a `column-reverse` flex box, which puts
+   * the status line on top of the git line inside one box with one border:
+   * two strips become one bar, which is what "folds into" describes.
+   *
+   * `column-reverse` rather than reordering the DOM, for three reasons worth
+   * keeping: the status bar's `border-top` is 2c's frame colour and stays the
+   * *top* edge of the combined bar, so rule 3 ("the whole bar takes the
+   * state's colour") survives untouched; the DOM order is still git-then-
+   * status, so a screen reader hears the same order at both widths; and the
+   * git bar has no focusable content, so nothing's tab order is inverted by
+   * the visual flip.
+   */
+  const footer = el("div", { class: "fd-footer" }, [gitBar.el, statusBar.el]);
   const frame = el(
     "div",
     {
@@ -227,8 +246,7 @@ export function createApp(options: AppOptions): App {
       logo.el,
       projects.el,
       body,
-      gitBar.el,
-      statusBar.el,
+      footer,
       takeover.el,
       access.el,
       palette.el,
@@ -274,6 +292,18 @@ export function createApp(options: AppOptions): App {
     frame.setAttribute("data-dialog", String(state.dialog !== null));
     /** `remote-control-ll5.8`: whichever read-only panel is up, or `none`. */
     frame.setAttribute("data-readonly", state.readOnly?.kind ?? "none");
+    /**
+     * 1h's breakpoint, and 1h's slide-over (`remote-control-eek.4`, §6.5 R17).
+     *
+     * The eighth and ninth attributes on this element, and they are here for
+     * the reason the other seven are: a layout the app can *reason about* is a
+     * layout a test can assert. The 900px decision itself is `widthClass`, a
+     * pure function of the pixel width `main.ts` measures — `src/style/
+     * narrow.css` reads only the answer, so there is no width media query
+     * anywhere in the app and jsdom can drive the whole narrow layout.
+     */
+    frame.setAttribute("data-width", state.width);
+    frame.setAttribute("data-sidebar", String(state.sidebarOpen));
 
     if (state.layout === "split") {
       if (split === null) {
@@ -319,8 +349,39 @@ export function createApp(options: AppOptions): App {
    * xterm's `onData`, and the `Esc` branch below must move to
    * `attachCustomKeyEventHandler` so it stays the single authority — otherwise
    * an `Esc` would be both queued here and sent there.
+   *
+   * ## Why this listens on the document and not on the frame
+   *
+   * `remote-control-eek.4` (§6.5 R17). It was on `frame`, and a keydown only
+   * reaches a listener on an element if that element is an **ancestor of the
+   * focused one**. `document.body` is an ancestor of `.fd-frame`, not a
+   * descendant — so with focus on the body, every key below was delivered
+   * nowhere.
+   *
+   * That is not an edge case, it is the default: `activeElement` is `BODY` on a
+   * fresh load, and it returns to `BODY` whenever a focused control is removed
+   * from the DOM — which every control here is, because each region rebuilds
+   * its children on every render. Measured in a real browser: on a freshly
+   * loaded tab **no app-level key worked at all** — not `Ctrl-g`, the one chord
+   * §5 gives the app, not `Esc Esc`, not 2e's `a`, not R16's `?` — until the
+   * user happened to click the terminal. Clicking any chrome control then
+   * silently took them away again.
+   *
+   * Keys have no position. Their target is wherever focus happens to be, which
+   * is not this component's business, so the keyboard belongs to the document.
+   * The **pointer** handler below stays on the frame, because a click does have
+   * a position and its target is a real element inside it.
+   *
+   * `isConnected` is the whole of the tidying that costs: a frame taken out of
+   * the page must not answer for keys any more. In production nothing removes
+   * it; in `vitest` a file renders a dozen apps into one jsdom document, and
+   * without this each one's listener would outlive its DOM and keep reducing
+   * into a store nobody is reading.
    */
-  frame.addEventListener("keydown", (event: KeyboardEvent) => {
+  document.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (!frame.isConnected) {
+      return;
+    }
     const state = store.getState();
 
     if (event.key === "g" && event.ctrlKey) {
@@ -380,12 +441,44 @@ export function createApp(options: AppOptions): App {
     if (state.feedOpen && feedKey(event)) {
       return;
     }
+    if (state.sidebarOpen && sidebarKey(event)) {
+      return;
+    }
 
     /** 2e: `a` opens the feed in App mode. Not in Terminal mode, where `a` is
      * a letter the agent is waiting for. */
     if (isPlain(event) && event.key === "a" && state.mode === "app") {
       event.preventDefault();
       toggleFeed();
+      return;
+    }
+
+    /**
+     * 1h's slide-over, on `s` in App mode and only below 900px
+     * (`remote-control-eek.4`, §6.5 R17).
+     *
+     * The gating is 2e's, twice over. *App mode only*, because in Terminal
+     * mode `s` is a letter the agent is waiting for — 2e's own words for `a`.
+     * *Narrow only*, because at wide the sidebar is 1a's column and is already
+     * on screen: a key that toggled nothing would be a key that lies.
+     *
+     * §5 gives the app one **chord** (`Ctrl-g`) and this is not one; a plain
+     * key in App mode is the affordance 2e licenses and R16 already took a
+     * second helping of for `?`. `s` is free there, and it is the first letter
+     * of the thing it opens.
+     *
+     * The chip in the project row is the pointer door and needs no key at all,
+     * which is the whole of §5's palette-primary position — see
+     * `ui/projectTabs.ts`.
+     */
+    if (
+      isPlain(event) &&
+      event.key === "s" &&
+      state.mode === "app" &&
+      state.width === "narrow"
+    ) {
+      event.preventDefault();
+      store.dispatch({ type: "sidebar/set", open: !state.sidebarOpen });
       return;
     }
 
@@ -876,6 +969,30 @@ export function createApp(options: AppOptions): App {
   }
 
   /**
+   * 1h's slide-over closes on `s` — the key that opened it, exactly as 2e's
+   * `a` toggles the feed — and on `Esc`, because every slide-over in every app
+   * closes on `Esc`.
+   *
+   * It **swallows nothing else**, which is the difference between this and the
+   * palette's keyboard. The sidebar is 1a's column temporarily overlaid, not a
+   * question: `↑↓` still move the session selection and `Enter` still focuses
+   * the terminal while it is up, which is the same posture `feedKey` takes
+   * directly above and for 2e's reason — no scrim, no focus trap, nothing
+   * behind it stopped being live.
+   */
+  function sidebarKey(event: KeyboardEvent): boolean {
+    if (!isPlain(event)) {
+      return false;
+    }
+    if (event.key === "s" || event.key === "Escape") {
+      event.preventDefault();
+      store.dispatch({ type: "sidebar/set", open: false });
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Opening the feed marks what it shows as read, which is what makes the
    * unread chip drain when you look at it. The host owns the authoritative
    * record (`Delta::Activity` carries `read`), so this is the local half and
@@ -975,6 +1092,28 @@ export function createApp(options: AppOptions): App {
       }
       store.dispatch({ type: "readOnly/close" });
       return;
+    }
+    /**
+     * 1h's slide-over: the pointer half of `Esc`, and the one gesture a phone
+     * has for "put that away". Unlike the read-only panels above it does
+     * **not** `return` — the click keeps travelling to the mode rule below, so
+     * tapping the terminal to dismiss the sidebar also focuses the terminal.
+     * On a touch screen, needing two taps for one intention is the bug.
+     *
+     * The project row is exempt, and for two reasons rather than one. It holds
+     * the chip that *opens* the panel (1h), so a click there is the sidebar's
+     * own control and not a click outside it — without this the chip would
+     * open the panel and then this handler, running as the same click bubbled
+     * up, would close it again. And a click on a project *tab* with the list
+     * open is somebody switching project in order to see that project's
+     * sessions, so the list stays up and repopulates.
+     */
+    if (
+      store.getState().sidebarOpen &&
+      !path.includes(sidebar.el) &&
+      !path.includes(projects.el)
+    ) {
+      store.dispatch({ type: "sidebar/set", open: false });
     }
     const inTerminal =
       pane.el.contains(target) || (split?.el.contains(target) ?? false);

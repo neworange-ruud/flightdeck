@@ -466,6 +466,27 @@
  *   - no `transform: scale()` on the stage, the letterbox or the mount;
  *   - no `width/height: 100%` on `.fd-mount`;
  *   - no `FitAddon` anywhere in the app (see src/term/terminal.ts).
+ *
+ * ── And the other half of D4, which had never been written down
+ *    (`remote-control-eek.4`, specs/WEB_INTERFACE.md §6.5 R17) ──
+ *
+ * D4 says what happens when the viewport is *bigger* than the grid. It says
+ * nothing about smaller, and until this task the stage answered
+ * `overflow: hidden` + centring — which clips the host's grid at BOTH edges,
+ * silently, with nothing on screen admitting that columns 0–8 and 112–120
+ * exist. That is the one thing the letterbox is not allowed to be: dishonest.
+ * It is also not a narrow-viewport problem — a 200-column host grid does it on
+ * a 27" monitor — so the fix is here and not in `narrow.css`.
+ *
+ * **The stage scrolls.** Nothing is squeezed, nothing is scaled, nothing is
+ * refitted; the grid keeps its natural size and the viewport moves over it.
+ *
+ * `margin: auto` on the letterbox, not `align-items/justify-content: center`
+ * on the stage, and that swap is the whole trick: a *centred* flex item that
+ * overflows its scroll container overflows past the scroll origin, so the top
+ * and left of it can never be reached. Auto margins centre exactly as well
+ * while it fits, and collapse to zero when it does not, leaving both edges
+ * scrollable. Do not put the centring back.
  */
 .fd-pane {
   flex: 1;
@@ -477,14 +498,20 @@
   flex: 1;
   min-height: 0;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
+  overflow: auto;
   background: var(--fd-ground);
+  /* Ask for a scrollbar that is always drawn rather than an overlay one that
+   * fades out, because here the scrollbar is not chrome — it is the statement
+   * that there is more grid than viewport. Honoured by Firefox and by Chromium
+   * on Windows/Linux; macOS overlay scrollbars ignore it, which is why the
+   * geometry chip carries the same fact in words. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--fd-rule) transparent;
 }
 .fd-letterbox {
   /* Natural size only — the host's grid decides how big this is. */
   flex: none;
+  margin: auto;
   padding: 10px 14px;
   color: var(--fd-text-soft);
 }

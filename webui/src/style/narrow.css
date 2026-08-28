@@ -1,0 +1,417 @@
+/*
+ * FlightDeck Web — the layout below 900px (`remote-control-eek.4`,
+ * specs/WEB_INTERFACE.md §6.5 **R17**).
+ *
+ * ## What this file is derived from, since no artboard draws it
+ *
+ * Artboard 1h states the position and stops there: *"Below 900px the sidebar
+ * becomes a slide-over invoked from a session chip in the project row, and the
+ * git bar folds into the status bar."* Design turn 3 (`remote-control-v4s`)
+ * was to draw it and **was not run, by the repository owner's decision**, with
+ * the instruction to derive these screens from the rules turns 1 and 2 already
+ * establish. So every rule below traces to one of:
+ *
+ *   - **1h**, for the breakpoint, the slide-over, the chip and the fold;
+ *   - **2e**, for how a slide-over behaves in this app — right at the frame's
+ *     edge, `hidden`-toggled, no `aria-modal`, no focus trap, no scrim, and
+ *     `width: min(<something>, 100%)` so the narrowest viewport gets the whole
+ *     width. The sidebar is the same mechanism mirrored to the left edge;
+ *   - **2c rule 1**, for why the status bar's hints move to a line of their
+ *     own rather than being allowed to wrap anywhere: the connection strip
+ *     never moves;
+ *   - **D4**, for the terminal, which still letterboxes and never scales. The
+ *     scroll behaviour lives in `main.css` beside the rest of D4, because a
+ *     grid wider than its viewport is not a narrow-viewport problem;
+ *   - **2g**, for every colour and all four type sizes. This file introduces
+ *     no token and no fifth size.
+ *
+ * Where a rule had to be invented outright it is listed in R17 §4 and a later
+ * design turn may overrule it row by row.
+ *
+ * ## Why `[data-width="narrow"]` and not `@media (max-width: 899px)`
+ *
+ * `vitest` runs in jsdom, which parses media queries and never evaluates them,
+ * so a media-query layout would be asserted by nothing until the Playwright
+ * job ran — and R6 registered that job non-blocking until 2026-09-10. The
+ * decision is therefore `widthClass` in `src/state/viewport.ts`, a pure
+ * function of a measured pixel width, and it reaches CSS as the eighth
+ * `data-*` attribute on `.fd-frame` beside `data-mode`, `data-layout`,
+ * `data-access`, `data-takeover`, `data-feed`, `data-dialog` and
+ * `data-readonly`. `tokens.guard.test.ts` rule 5 keeps it that way.
+ *
+ * Under the same two rules as `main.css` and `states.css`: no colour literal,
+ * four type sizes only.
+ */
+
+/* ══ Things that exist at both widths ══════════════════════════════════════
+ * The fold's wrapper and the two narrow-only controls are in the DOM at every
+ * width — `display: contents` and `display: none` are what make the wide
+ * layout byte-identical to what 1a draws, with no conditional rendering and no
+ * DOM churn on a resize. A `display: none` button is also not focusable, so a
+ * wide keyboard user never tabs into a control for a panel that is not there.
+ *
+ * The closed slide-over needs nothing here: `app.css`'s one `[hidden]` rule
+ * makes "closed" mean gone — not laid out, not painted, not hit-testable —
+ * for every element in the app, which is the only way that stays true for the
+ * next one somebody adds. */
+
+/* 1h's fold. At wide this box is not a box: its two children are laid out by
+ * `.fd-frame` exactly as they were before it existed. */
+.fd-footer {
+  display: contents;
+}
+
+/* The status bar's hints, likewise: a real element at narrow, nothing at wide. */
+.fd-statusbar__hints {
+  display: contents;
+}
+
+.fd-sessionchip,
+.fd-sidebar__close {
+  display: none;
+}
+
+/* ══ Below 900px ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 1h's slide-over.
+ *
+ * 2e's mechanism, mirrored: absolutely positioned over the body, the frame's
+ * accent as a one-pixel inner rule on the *inner* edge, and 2e's own bloom
+ * thrown the other way. The edge is the left because that is where 1a's column
+ * is, and because 2e already owns the right — two panels arriving at the same
+ * edge would fight over it, and both can be open at once.
+ *
+ * `min(300px, 86%)`: 300px is 1a's own sidebar width, kept rather than
+ * redesigned, and the 14% of viewport left uncovered is what tells the reader
+ * at a glance that the terminal is still there behind it — 2e makes the same
+ * trade with `min(470px, 100%)` on a panel that has more to say.
+ */
+.fd-frame[data-width="narrow"] .fd-body {
+  /* The slide-over's containing block. `.fd-main` already has this for 2e. */
+  position: relative;
+}
+.fd-frame[data-width="narrow"] .fd-sidebar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(300px, 86%);
+  z-index: 2;
+  margin: 0;
+  opacity: 1;
+  border-right: 0;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow:
+    inset -1px 0 0 var(--fd-accent),
+    18px 0 44px -12px color-mix(in srgb, var(--fd-canvas) 70%, transparent);
+}
+/* 1b moves the glow to the sidebar at wide. Over a terminal it would read as a
+ * second focus ring on a panel that is temporary, so the slide-over keeps the
+ * accent edge above in both modes and the App-mode glow stays a wide-layout
+ * treatment. */
+.fd-frame[data-width="narrow"][data-mode="app"] .fd-sidebar {
+  box-shadow:
+    inset -1px 0 0 var(--fd-elsewhere),
+    18px 0 44px -12px color-mix(in srgb, var(--fd-canvas) 70%, transparent);
+}
+/* 1a centres this title; the close button takes the right edge without a
+ * flexible gap, so the heading stays exactly where 1a puts it. */
+.fd-frame[data-width="narrow"] .fd-sidebar__close {
+  display: block;
+  margin-left: auto;
+  font: inherit;
+  font-size: var(--fd-t-meta);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--fd-text-quiet);
+}
+.fd-frame[data-width="narrow"] .fd-sidebar__title {
+  padding: 0 10px;
+}
+.fd-frame[data-width="narrow"] .fd-sidebar__close:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: 1px;
+}
+
+/*
+ * 1h's session chip, the pointer door into the slide-over.
+ *
+ * `position: sticky` because the project row itself has to start scrolling at
+ * this width — three project tabs plus `+ project` plus its `host only` badge
+ * do not fit on a phone — and the one control that must never scroll out of
+ * reach is the one that opens the sidebar. It keeps the row's own chrome
+ * ground so the tabs pass underneath it rather than through it.
+ */
+.fd-frame[data-width="narrow"] .fd-projects {
+  overflow-x: auto;
+  /* The row is a fixed 30px at wide. A horizontal scrollbar inside a fixed
+   * 30px would eat a third of the tabs it is there to reach. */
+  height: auto;
+  min-height: 30px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--fd-rule) transparent;
+}
+/* 1b draws this border as the seam between the sidebar column and the pane.
+ * There is no column here — the sidebar is over the pane, not beside it — so
+ * the seam would be a line separating the pane from nothing. */
+.fd-frame[data-width="narrow"][data-mode="app"] .fd-main {
+  border-left: 0;
+}
+.fd-frame[data-width="narrow"] .fd-sessionchip {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 46%;
+  padding: 0 10px;
+  margin-right: 8px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  /* 2g: `--fd-accent` is "interactive". The chip is the only thing in this row
+   * that opens something, so it is the row's one interactive fill — the same
+   * recipe 1d's palette rows and the config manager's scope tabs use. */
+  background: color-mix(in srgb, var(--fd-accent) 12%, var(--fd-chrome));
+  color: var(--fd-text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+}
+.fd-frame[data-width="narrow"] .fd-sessionchip[aria-expanded="true"] {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+}
+.fd-frame[data-width="narrow"] .fd-sessionchip[aria-expanded="true"] .fd-key {
+  color: var(--fd-ground);
+}
+/* A long session name gives way before the glyph or the key hint do: the
+ * glyph is the status and the key is the instruction, and both are one
+ * character. */
+.fd-sessionchip__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-frame[data-width="narrow"] .fd-sessionchip:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+
+/*
+ * 1h's fold: *"the git bar folds into the status bar"*.
+ *
+ * `column-reverse`, so the status line is on top and the git line hangs below
+ * it inside one box. Three reasons, in order of how much they would cost to
+ * get wrong:
+ *
+ *   1. `.fd-statusbar`'s `border-top` is 2c's frame colour — the only chrome
+ *      in the app that changes hue — and this keeps it the top edge of the
+ *      whole folded bar. Stacking the other way would leave the state's colour
+ *      as a hairline *inside* the fold, saying "two bars" in the one place the
+ *      design has just said "one".
+ *   2. The DOM order is untouched, so a screen reader hears git-then-status at
+ *      both widths, and the git bar holds nothing focusable, so no tab order
+ *      is inverted by the visual flip.
+ *   3. The bottom line of a phone screen is the one under the browser's own
+ *      chrome and the home indicator. Git facts are the right thing to put
+ *      there; "nothing you type is arriving" is not.
+ */
+.fd-frame[data-width="narrow"] .fd-footer {
+  display: flex;
+  flex-direction: column-reverse;
+  flex: none;
+}
+/* One bar: the git line drops its own rule and takes the status bar's ground,
+ * so the fold reads as a single block with a single border. */
+.fd-frame[data-width="narrow"] .fd-gitbar {
+  height: auto;
+  min-height: 26px;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  padding: 4px 12px;
+  border-top: 0;
+  background: var(--fd-canvas);
+}
+/* The geometry chip keeps its `margin-left: auto` and so keeps the right edge
+ * of whichever line it lands on — D4's explanation stays findable rather than
+ * drifting into the middle of a wrapped row. */
+
+/*
+ * The status line itself. Wrapping is unavoidable at this width, so the
+ * question is only *what* wraps — and 2c rule 1 answers it: not the connection
+ * strip. The hints are given their own full-width line at the end, which
+ * leaves the mode chip, the spacer, `.fd-conn` and the trailing chips alone on
+ * the first line in every one of 2c's nine states.
+ *
+ * Nothing is dropped. 1h locks the hints in as hard as 2c locks the strip —
+ * *"the status bar states both routes permanently — no discovery required"* —
+ * so they move and they stay.
+ */
+.fd-frame[data-width="narrow"] .fd-statusbar {
+  height: auto;
+  min-height: 32px;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 4px;
+}
+.fd-frame[data-width="narrow"] .fd-statusbar__hints {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  /* Last, and on a line of its own. */
+  order: 1;
+  flex: 1 0 100%;
+  padding: 0 12px;
+}
+.fd-frame[data-width="narrow"] .fd-mode {
+  /* The chip is `align-self: stretch` at wide, against a fixed 32px bar. In a
+   * wrapping bar that would stretch it over both lines. */
+  align-self: center;
+  padding: 3px 10px;
+}
+.fd-frame[data-width="narrow"] .fd-update {
+  align-self: center;
+}
+
+/*
+ * 1c's split, stacked. Three side-by-side terminals on a phone are three
+ * unreadable slivers, and a column each is the same restack 1d's palette gets
+ * below. Every column still letterboxes its own grid and still scrolls it —
+ * the `.fd-stage` rule in `main.css` is per-stage and applies here unchanged.
+ */
+.fd-frame[data-width="narrow"] .fd-split {
+  flex-direction: column;
+}
+
+/*
+ * The overlays. All five already size themselves as `min(<design width>,
+ * calc(100% - 80px))`, so they never overflow — but 80px of gutter is a fifth
+ * of a phone screen spent on nothing. 2e's slide-over is the precedent for
+ * what a panel does when the viewport runs out (`min(470px, 100%)`: it takes
+ * the width), so the gutter shrinks to 24px rather than the panels shrinking.
+ */
+/* Each keeps its own designed width and only the gutter moves — a panel that
+ * grew past the size its artboard drew would be this file redesigning it. */
+.fd-frame[data-width="narrow"] .fd-palette__panel {
+  width: min(900px, calc(100% - 24px));
+  height: min(620px, calc(100% - 48px));
+}
+.fd-frame[data-width="narrow"] .fd-config__panel {
+  width: min(1040px, calc(100% - 24px));
+  height: min(640px, calc(100% - 48px));
+}
+.fd-frame[data-width="narrow"] .fd-dialog__panel {
+  width: min(720px, calc(100% - 24px));
+}
+.fd-frame[data-width="narrow"] .fd-info__panel {
+  width: min(760px, calc(100% - 24px));
+  max-height: min(620px, calc(100% - 48px));
+}
+.fd-frame[data-width="narrow"] .fd-info__panel[data-kind="help"] {
+  width: min(900px, calc(100% - 24px));
+  height: min(620px, calc(100% - 48px));
+}
+.fd-frame[data-width="narrow"] .fd-access__panel {
+  width: min(560px, calc(100% - 24px));
+}
+.fd-frame[data-width="narrow"] .fd-takeover__panel {
+  width: min(600px, calc(100% - 24px));
+}
+
+/*
+ * 1d's two columns, stacked. Two 150px columns are not two columns, they are
+ * two truncated lists; one under the other keeps every row readable and costs
+ * only scrolling, which the body already does. `Tab next column` still means
+ * what it says — the columns are still two, they are simply above each other —
+ * and `.fd-palette__body`'s 1px gap becomes the hairline between them.
+ */
+.fd-frame[data-width="narrow"] .fd-palette__body {
+  flex-direction: column;
+}
+.fd-frame[data-width="narrow"] .fd-palette__column {
+  flex: none;
+}
+
+/*
+ * 1f's four columns, restacked into two lines per row: the setting's name on
+ * top, its value and its origin under it. `22px 124px 1fr 150px` needs ~360px
+ * before the label gets a pixel, which is most of a phone.
+ *
+ * The column *header* goes with them. It is `aria-hidden` decoration that
+ * names four columns, and leaving it over a two-line list would be a caption
+ * for a layout that is not there.
+ */
+.fd-frame[data-width="narrow"] .fd-config__columns {
+  display: none;
+}
+.fd-frame[data-width="narrow"] .fd-config__row {
+  grid-template-columns: 18px minmax(0, 1fr) max-content;
+  grid-template-areas:
+    "cursor label  label"
+    ".      value  origin";
+  gap: 0 10px;
+  row-gap: 1px;
+  padding: 6px 12px;
+}
+.fd-frame[data-width="narrow"] .fd-config__cursor {
+  grid-area: cursor;
+}
+.fd-frame[data-width="narrow"] .fd-config__label {
+  grid-area: label;
+}
+.fd-frame[data-width="narrow"] .fd-config__value {
+  grid-area: value;
+}
+.fd-frame[data-width="narrow"] .fd-config__origin {
+  grid-area: origin;
+  justify-self: end;
+}
+/* The per-field warning indented under a 158px label column has nothing to
+ * line up with any more. */
+.fd-frame[data-width="narrow"] .fd-config__note--inline {
+  padding: 4px 12px 8px 28px;
+}
+
+/*
+ * The read-only panels' two fact grids (R16): `190px 1fr` for a help row and
+ * `130px 1fr` for a git fact. Both leave the *description* — the half that
+ * carries the meaning — with a hundred pixels at this width, so both stack:
+ * the key above what it does, the label above its value.
+ */
+.fd-frame[data-width="narrow"] .fd-info__key-row,
+.fd-frame[data-width="narrow"] .fd-info__fact {
+  grid-template-columns: minmax(0, 1fr);
+  row-gap: 1px;
+}
+.fd-frame[data-width="narrow"] .fd-info__body,
+.fd-frame[data-width="narrow"] .fd-info__foot,
+.fd-frame[data-width="narrow"] .fd-info__head {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+/*
+ * 2f's seat list, whose five `max-content` columns are sized by their content
+ * and therefore cannot be squeezed — they would simply overflow the panel.
+ * The joined-at column drops to a line of its own under the seat it belongs
+ * to, which keeps every fact and keeps the marks above it still lining up.
+ */
+.fd-frame[data-width="narrow"] .fd-takeover__seat {
+  grid-template-columns: 1ch max-content max-content minmax(0, 1fr);
+}
+.fd-frame[data-width="narrow"] .fd-takeover__seat-since {
+  grid-column: 2 / -1;
+  justify-self: start;
+}
+
+/*
+ * 2e's feed already handles this width by design — `min(470px, 100%)` — and
+ * needs nothing here. Recorded rather than omitted, because "we checked" and
+ * "we forgot" look identical in a stylesheet.
+ */

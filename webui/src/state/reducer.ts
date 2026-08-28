@@ -5,6 +5,7 @@ import { selectedChoice } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, SeatInfo, Selection } from "./model";
 import { incumbentFromSeats } from "./seats";
+import { widthClass } from "./viewport";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
 import type {
@@ -430,6 +431,38 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return state.feedOpen === action.open
         ? state
         : { ...state, feedOpen: action.open };
+
+    /**
+     * 1h's breakpoint, decided here rather than in CSS (`state/viewport.ts`
+     * says why) and **only** here.
+     *
+     * Crossing in either direction closes the slide-over. Going wide, the
+     * sidebar becomes 1a's column again and an "open" flag would be a
+     * remembered state nothing renders; coming back narrow, reopening a panel
+     * the reader dismissed three resizes ago would be the app deciding for
+     * them. Closing on every crossing is the same rule stated once.
+     */
+    case "viewport/measured": {
+      const width = widthClass(action.pixels);
+      if (width === state.width) {
+        return state;
+      }
+      return { ...state, width, sidebarOpen: false };
+    }
+
+    /**
+     * The slide-over exists only below 900px, and this refusal is what makes
+     * that structural instead of a convention: at wide there is no panel to
+     * open, so a stray `sidebar/set` from a resize race or a future caller
+     * cannot leave a flag set that the next crossing would honour.
+     */
+    case "sidebar/set":
+      if (state.width !== "narrow") {
+        return state.sidebarOpen ? { ...state, sidebarOpen: false } : state;
+      }
+      return state.sidebarOpen === action.open
+        ? state
+        : { ...state, sidebarOpen: action.open };
 
     case "host/set":
       return { ...state, host: action.host };

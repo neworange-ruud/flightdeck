@@ -4,7 +4,7 @@ import { unreadChip } from "../state/activity";
 import { viewerChipText, viewerChipTitle } from "../state/seats";
 import type { StatusGlyph } from "../state/model";
 import type { AppState } from "../state/types";
-import { clear, el, separator, spinnerGlyph } from "./dom";
+import { append, clear, el, separator, spinnerGlyph } from "./dom";
 import type { Child, Region } from "./dom";
 
 /**
@@ -104,17 +104,31 @@ export function createStatusBar(options: StatusBarOptions = {}): Region {
      * 2c replaces the key hints with a sentence in every state that has
      * something to say about the user's keystrokes, and keeps them in the two
      * states that do not (`connected`, `connecting`).
+     *
+     * They go in a container of their own for the narrow layout's sake
+     * (`remote-control-eek.4`, §6.5 R17), and it is `display: contents` at
+     * wide, so the bar is laid out exactly as it was before this box existed.
+     * Below 900px the bar's contents cannot fit on one line and something has
+     * to give — but not rule 1, and not a fact. This is the part that gives:
+     * the hints take a line of their own beneath the chips, which keeps
+     * `.fd-conn` pinned to the right edge of the bar's *first* line in every
+     * state, rather than letting a plain `flex-wrap` decide which line the
+     * connection strip lands on today. 1h locks the hints in too — *"the
+     * status bar states both routes permanently — no discovery required"* —
+     * so they may move, and may not be dropped.
      */
+    const hints = el("div", { class: "fd-statusbar__hints" });
     if (strip.message === null) {
       for (const hint of hintsFor(state)) {
-        parts.push(separator(), hint);
+        append(hints, [separator(), hint]);
       }
     } else {
-      parts.push(
+      append(hints, [
         separator(),
         el("span", { class: "fd-statusbar__message", text: strip.message }),
-      );
+      ]);
     }
+    parts.push(hints);
 
     parts.push(
       /** Rule 1. This spacer is load-bearing: it is what keeps `.fd-conn` in

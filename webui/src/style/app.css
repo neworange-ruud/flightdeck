@@ -8,6 +8,37 @@
   box-sizing: border-box;
 }
 
+/*
+ * `hidden` MEANS HIDDEN — and it means it by construction, not by nine
+ * components each remembering to say so (`remote-control-eek.4`,
+ * specs/WEB_INTERFACE.md §6.5 R17).
+ *
+ * The UA stylesheet's `[hidden] { display: none }` is a *rule of the lowest
+ * possible specificity*, and every overlay in this app sets `display: flex` on
+ * a class selector, which beats it. So an element the component "closed" by
+ * setting `.hidden = true` stays laid out, stays painted, and — since the
+ * overlays are `position: absolute` over the terminal — **stays hit-testable**.
+ * A closed panel that eats the clicks aimed at what is behind it is the worst
+ * shape a bug can take, because nothing about the screen shows it is there.
+ *
+ * That was defended nine times, one selector at a time, in comments that said
+ * "same trap as the one above" — and five elements never got the rule at all:
+ * `.fd-feed`, `.fd-tabs`, `.fd-pane`, `.fd-split` and `.fd-pane__banner`. The
+ * feed one was live: at 768px the closed activity feed covered the right 470px
+ * of the terminal and a tablet user could not click into the terminal at all.
+ *
+ * One rule, at the document level, and the whole class of bug is gone for
+ * every element that exists today and every one added later. `!important` is
+ * not a hammer here, it is the point: `hidden` is the platform's own "this is
+ * not relevant", and no component-level `display` may be allowed to outrank
+ * it. `tokens.guard.test.ts` rule 6 asserts this rule exists, that nothing
+ * re-enables display on a `[hidden]` selector, and that `!important` appears
+ * nowhere else in `src/style/` where it could shadow this.
+ */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;

@@ -1,5 +1,6 @@
 import { findSession } from "../state/model";
 import type { GitBarInfo } from "../state/model";
+import type { ViewportWidth } from "../state/viewport";
 import type { AppState, TerminalGeometry } from "../state/types";
 import { clear, el, separator } from "./dom";
 import type { Child, Region } from "./dom";
@@ -52,7 +53,7 @@ export function createGitBar(): Region {
         bar.append(part);
       }
     }
-    bar.append(geometryChip(state.geometry));
+    bar.append(geometryChip(state.geometry, state.width));
   }
 
   return { el: bar, update: render };
@@ -93,12 +94,34 @@ function gitParts(git: GitBarInfo): Child[] {
   ];
 }
 
-function geometryChip(geometry: TerminalGeometry | null): HTMLElement {
+/**
+ * D4's chip, and below 900px D4's *other* half.
+ *
+ * At wide the chip answers "why does my 4K window have dark margins?". At
+ * narrow the interesting question inverts — "why is my terminal wider than my
+ * screen?" — and the answer is the same decision read the other way round:
+ * the host owns the grid, so a viewport smaller than it **scrolls, and is
+ * never scaled to fit**. So the chip gains that clause below 900px, where the
+ * question is live (`remote-control-eek.4`, §6.5 R17).
+ *
+ * It is a *statement of policy*, true whether or not this particular grid
+ * happens to overflow this particular viewport — deliberately, because the
+ * alternative is for the browser to measure itself, and D4's whole position is
+ * that the browser never negotiates or requests a size, it only receives one.
+ * Measuring the stage to decide what to print would be the first step back
+ * towards a `FitAddon`, so this file does not do it and the *scrollbar* is
+ * what says the grid is actually over the edge right now.
+ */
+function geometryChip(
+  geometry: TerminalGeometry | null,
+  width: ViewportWidth,
+): HTMLElement {
   const grid = geometry === null ? "—×—" : `${geometry.cols}×${geometry.rows}`;
+  const scrolls = width === "narrow";
   return el("span", {
     class: "fd-geometry",
-    text: `${grid} · host owns geometry`,
+    text: `${grid} · host owns geometry${scrolls ? " · scroll, never scale" : ""}`,
     title:
-      "the desktop owns the PTY grid (D4); the browser letterboxes it rather than scaling it, which is why a large window has dark margins",
+      "the desktop owns the PTY grid (D4); the browser letterboxes it rather than scaling it, which is why a large window has dark margins — and why a window narrower than the grid scrolls instead of shrinking it",
   });
 }

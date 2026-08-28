@@ -219,6 +219,34 @@ const app = createApp({
 
 root.append(app.el);
 
+/**
+ * 1h's breakpoint, measured here and decided in the reducer
+ * (`remote-control-eek.4`, `specs/WEB_INTERFACE.md` §6.5 R17).
+ *
+ * This is the **only** place in the app that asks how wide anything is, and it
+ * is this file for the same reason `window.location`, the cookie exchange and
+ * the socket are: `main.ts` owns the impure edges, and `state/` and `ui/` stay
+ * testable without a browser. What goes on the action is the pixel width, not
+ * the layout — `widthClass` turns one into the other, so the 900px boundary is
+ * a unit test rather than a media query jsdom will never evaluate.
+ * `tokens.guard.test.ts` rule 5 fails the build if a second place starts
+ * measuring, or if a width media query appears in `src/style/`.
+ *
+ * Dispatched once before anything is painted, then on every `resize`. There is
+ * no debounce: `reduce` returns the *same state object* when the class has not
+ * changed (the overwhelming majority of resize events), so the store's identity
+ * check means a drag across a window edge re-renders exactly twice — once at
+ * each crossing.
+ */
+function measureViewport(): void {
+  app.store.dispatch({
+    type: "viewport/measured",
+    pixels: window.innerWidth,
+  });
+}
+measureViewport();
+window.addEventListener("resize", measureViewport);
+
 /** 2b's footer prints the address the user actually reached, never a guess. */
 app.store.dispatch({ type: "host/set", host: window.location.host });
 

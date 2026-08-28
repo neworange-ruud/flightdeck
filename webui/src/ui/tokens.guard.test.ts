@@ -40,6 +40,37 @@ import { describe, expect, it } from "vitest";
  * until 2026-09-10**. This is a file read and a regex, and it fails in
  * `npm run test`.
  *
+ * **Rule 5 — the width decision is one pure function, and nothing measures
+ * itself** (`remote-control-eek.4`, §6.5 R17). 1h's 900px boundary reaches CSS
+ * as `data-width` on `.fd-frame`, from `widthClass`, from a pixel width
+ * `main.ts` measures. Two things would quietly undo that:
+ *
+ *   - **a width media query.** `vitest` runs in jsdom, which parses `@media`
+ *     and never evaluates it, so a layout that moved into one would be checked
+ *     by nothing in `npm run test` — the same hole rule 4 was written for, and
+ *     `webui/e2e/narrow.spec.ts` is the same non-blocking Playwright job. Only
+ *     `prefers-reduced-motion` and other non-dimensional queries are allowed.
+ *   - **a second measurement.** D4's position is that the browser *never*
+ *     negotiates or requests a size, it only receives one; a component that
+ *     asked how wide it was would be one refactor away from asking the host to
+ *     match. `main.ts` is the single exempt file and it is not under `state/`
+ *     or `ui/`, so the rule needs no exemption list at all.
+ *
+ * **Rule 6 — `hidden` means hidden, and one rule says so** (`eek.4`, R17).
+ * Every overlay in this app is closed by setting `.hidden = true` and every one
+ * of them sets `display: flex`, which outranks the UA stylesheet's
+ * `[hidden] { display: none }`. A "closed" overlay therefore stayed laid out,
+ * painted and — being `position: absolute` over the terminal — **hit-testable**,
+ * eating clicks aimed at what was behind it with nothing on screen to show for
+ * it. That was defended nine times by hand and missed five times; the fifth
+ * miss cost a tablet user the ability to click the terminal at all.
+ *
+ * `app.css` now carries one document-level `[hidden] { display: none
+ * !important }`, and this rule keeps it load-bearing: the rule exists, nothing
+ * re-enables display on a `[hidden]` selector, and `!important` appears
+ * nowhere else in `src/style/` where it could outrank it. Playwright found the
+ * live instance; this is what finds the next one in `npm run test`.
+ *
  * It also guards D4's `FitAddon` invariant, for the same reason: it is a rule
  * that a single well-meaning import would silently undo.
  */
@@ -247,6 +278,116 @@ describe("the wire version mirror", () => {
   });
 });
 
+describe("the narrow layout is decided once, in one pure place", () => {
+  /**
+   * Everything below 900px is selected by `[data-width="narrow"]`, which jsdom
+   * cannot evaluate either — but the *attribute* is set by `ui/app.ts` from
+   * `AppState.width`, so `narrowScreen.test.ts` drives the whole layout by
+   * dispatching a number. A `@media (max-width: …)` would put the same rules
+   * somewhere no unit test can reach.
+   */
+  it("uses no width media query anywhere in the stylesheets", () => {
+    const dimensional = /@media[^{]*\b(?:min|max)-(?:width|inline-size)\b/g;
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => f.endsWith(".css"))) {
+      /** Comments stripped first, so a stylesheet is free to *say* why it
+       * does not use one — the same courtesy the `FitAddon` check extends. */
+      for (const match of readCode(file).matchAll(dimensional)) {
+        offenders.push(`${file}: ${match[0].trim()}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  /** The narrow stylesheet has to actually be doing the work, or the rule
+   * above passes by being vacuous. */
+  it("keeps the narrow layout in a stylesheet that keys off the attribute", () => {
+    const narrow = read("style/narrow.css");
+    expect(narrow).toContain('[data-width="narrow"]');
+    expect(files).toContain("style/narrow.css");
+  });
+
+  /**
+   * D4 in the other direction: the browser receives a size, it never takes
+   * one. `main.ts` reads `window.innerWidth` once and is neither `state/` nor
+   * `ui/`, so this needs no exemption — which is the point of putting it
+   * there.
+   */
+  it("measures nothing from the state or view layers", () => {
+    const measure =
+      /\b(?:innerWidth|innerHeight|outerWidth|matchMedia|getBoundingClientRect|ResizeObserver|offsetWidth|clientWidth)\b/g;
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (
+        file === SELF ||
+        file.endsWith(".test.ts") ||
+        !(file.startsWith("state/") || file.startsWith("ui/"))
+      ) {
+        continue;
+      }
+      for (const match of readCode(file).matchAll(measure)) {
+        offenders.push(`${file}: ${match[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("a closed overlay is closed", () => {
+  /**
+   * jsdom does no hit-testing, so `narrowScreen.test.ts` cannot see this class
+   * of bug at all — a `hidden` overlay it queries is `hidden` as far as it is
+   * concerned, while in a browser it is still swallowing every click behind
+   * it. These three assertions are the unit-testable shadow of that.
+   */
+  it("declares the one document-level rule that makes it true", () => {
+    /** Comments stripped, so the block comment explaining the rule does not
+     * sit between it and the `}` this anchors on. */
+    const base = readCode("style/app.css");
+    /** A bare attribute selector: it has to apply to every element that is
+     * ever given the attribute, not to a list somebody maintains. */
+    const rule = /(^|\})\s*\[hidden\]\s*\{([^}]*)\}/.exec(base);
+    expect(rule, "app.css must declare a bare [hidden] rule").not.toBeNull();
+    expect(rule?.[2]).toMatch(/display\s*:\s*none\s*!important/);
+  });
+
+  it("never re-enables display on something that is hidden", () => {
+    /** `.fd-feed[hidden] { display: flex }` would be the exact regression, and
+     * it would look perfectly reasonable in a diff. */
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => f.endsWith(".css"))) {
+      for (const match of readCode(file).matchAll(
+        /([^{}]*\[hidden\][^{}]*)\{([^{}]*)\}/g,
+      )) {
+        const display = /(?:^|;)\s*display\s*:\s*([^;!]+)/.exec(match[2] ?? "");
+        if (display !== undefined && display !== null) {
+          const value = display[1]?.trim();
+          if (value !== "none") {
+            offenders.push(`${file}: ${match[1]?.trim()} { display: ${value} }`);
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("keeps `!important` for that rule and nothing else", () => {
+    /**
+     * The rule only works because nothing can outrank it, and the only thing
+     * that can is another `!important`. There is exactly one in the whole of
+     * `src/style/`, and this is the assertion that keeps it that way — which
+     * is also why `!important` is not a smell here: it is the mechanism.
+     */
+    const found: string[] = [];
+    for (const file of files.filter((f) => f.endsWith(".css"))) {
+      for (const _ of readCode(file).matchAll(/!important/g)) {
+        found.push(file);
+      }
+    }
+    expect(found).toEqual(["style/app.css"]);
+  });
+});
+
 describe("D4 letterbox invariant", () => {
   it("never imports xterm's FitAddon", () => {
     /** An import, a require, or a `loadAddon` of it — not a mention of it. */
@@ -266,6 +407,29 @@ describe("D4 letterbox invariant", () => {
 
   it("never scales the terminal with a CSS transform", () => {
     expect(readCode("style/main.css")).not.toMatch(/transform\s*:\s*scale/);
+    /** Including from the one stylesheet whose whole subject is "the viewport
+     * is too small", which is exactly where somebody would reach for it. */
+    expect(readCode("style/narrow.css")).not.toMatch(/transform\s*:\s*scale/);
+  });
+
+  /**
+   * `remote-control-eek.4`: a grid wider than its stage used to be clipped at
+   * both edges by `overflow: hidden` + centring, silently. The stage scrolls
+   * instead, and the centring is `margin: auto` on the letterbox rather than
+   * `justify-content` on the stage — a centred flex item that overflows its
+   * scroll container overflows past the scroll origin, so its leading edge can
+   * never be reached. Both halves are asserted, because putting either back
+   * restores the clipping.
+   */
+  it("scrolls an oversized grid instead of clipping it", () => {
+    const main = readCode("style/main.css");
+    const stage = /\.fd-stage\s*\{([^}]*)\}/.exec(main)?.[1] ?? "";
+    const letterbox = /\.fd-letterbox\s*\{([^}]*)\}/.exec(main)?.[1] ?? "";
+    expect(stage, ".fd-stage must exist in main.css").not.toBe("");
+    expect(stage).toMatch(/overflow\s*:\s*auto/);
+    expect(stage).not.toMatch(/overflow\s*:\s*hidden/);
+    expect(stage).not.toMatch(/justify-content|align-items/);
+    expect(letterbox).toMatch(/margin\s*:\s*auto/);
   });
 
   it("is not allowed to depend on @xterm/addon-fit", () => {

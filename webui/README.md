@@ -243,7 +243,8 @@ webui/
 │   ├── ui/              the seven regions + three overlay layers, one file each
 │   ├── term/            xterm.js construction (terminal.ts) — no FitAddon
 │   └── style/           tokens.css (palette + type scale), main.css,
-│                         states.css (2b–2f), fonts.css
+│                         states.css (2b–2f), narrow.css (below 900px,
+│                         1h + §6.5 R17), fonts.css
 ├── dist/.gitkeep         tracked placeholder; dist/* itself is gitignored
 ├── vite.config.ts        also the vitest config (env: node; DOM per-file)
 └── tsconfig.json         strict

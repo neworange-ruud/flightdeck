@@ -36,6 +36,12 @@ describe("createInitialState", () => {
       replay: null,
       activity: [],
       feedOpen: false,
+      /** `remote-control-eek.4`: the layout every artboard actually draws.
+       * `main.ts` replaces it with the measured one before the first paint,
+       * so `wide` is what the state says only until something has been
+       * measured — never a claim about a viewport nobody looked at. */
+      width: "wide",
+      sidebarOpen: false,
       /** Empty rather than a guessed address — 2b prints this on a security
        * screen, so it is set from `location.host` or not at all. */
       host: "",

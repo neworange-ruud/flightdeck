@@ -33,16 +33,59 @@ import type { Store } from "./store";
  * operable — whose tooltip says the selection moves the desktop too. The `✕` is
  * a sibling rather than a nested button (nested interactives are invalid and
  * unreachable by keyboard), positioned over the row's first line.
+ *
+ * ## Below 900px it is the same component, slid over (1h, §6.5 R17)
+ *
+ * 1h: *"Below 900px the sidebar becomes a slide-over invoked from a session
+ * chip in the project row."* Turn 3 never drew it, so the mechanism is 2e's,
+ * reused rather than re-invented: the element is toggled with the `hidden`
+ * property, it is absolutely positioned over the body, and it keeps 2e's
+ * posture — **no `aria-modal`, no focus trap, no scrim that swallows clicks**,
+ * and the terminal behind it stays live. The one difference is the edge: 2e
+ * arrives from the right, this arrives from the **left**, because that is
+ * where 1a's column is and two panels sharing an edge would fight over it.
+ *
+ * Nothing below branches on the width except the `hidden` toggle and the close
+ * button, which is the point: at narrow this is not a different sidebar, it is
+ * the same sidebar somewhere else.
  */
 export function createSidebar(store: Store): Region {
   const list = el("ul", { class: "fd-sessions" });
   const footer = el("footer", { class: "fd-sidebar__foot" });
 
+  /**
+   * 2e's `a close`, in the sidebar's own key. Always in the DOM and hidden by
+   * CSS at wide rather than rendered conditionally: a column that is always on
+   * screen has nothing to close, and a `display: none` button is not focusable,
+   * so a wide keyboard user never meets it.
+   */
+  const close = el(
+    "button",
+    {
+      class: "fd-sidebar__close",
+      title: "close the agents list",
+      attrs: { type: "button" },
+    },
+    [el("span", { class: "fd-key", text: "s" }), " close"],
+  );
+  close.addEventListener("click", () => {
+    store.dispatch({ type: "sidebar/set", open: false });
+  });
+
   const aside = el(
     "aside",
     { class: "fd-sidebar", attrs: { "aria-label": "Agents" } },
     [
-      el("div", { class: "fd-sidebar__title", text: "Agents" }),
+      /**
+       * No `.fd-spacer` here on purpose: 1a centres this title, and a flexible
+       * gap would fill the row and push "Agents" to the left at *both* widths.
+       * The close button takes `margin-left: auto` in the narrow stylesheet
+       * instead, so the wide title is untouched.
+       */
+      el("div", { class: "fd-sidebar__title" }, [
+        el("span", { class: "fd-sidebar__heading", text: "Agents" }),
+        close,
+      ]),
       list,
       footer,
     ],
@@ -51,6 +94,13 @@ export function createSidebar(store: Store): Region {
   function render(state: AppState): void {
     clear(list);
     clear(footer);
+
+    /**
+     * The whole of the narrow layout's effect on this component. At wide the
+     * sidebar is 1a's column and is never hidden; at narrow it is on screen
+     * only while the reader asked for it.
+     */
+    aside.hidden = state.width === "narrow" && !state.sidebarOpen;
 
     const selection = state.selection;
     const project =
@@ -125,6 +175,13 @@ function sessionRow(
   );
   select.addEventListener("click", () => {
     store.dispatch({ type: "selection/session", sessionId: session.id });
+    /**
+     * Picking a session is the errand the slide-over was opened for, so it
+     * closes behind you — 2e's own rule (`jumpTo` closes the feed on a jump)
+     * applied to the same shape. A no-op at wide, where the reducer refuses a
+     * `sidebar/set` outright, so this costs the column nothing.
+     */
+    store.dispatch({ type: "sidebar/set", open: false });
   });
 
   const close = el("button", {

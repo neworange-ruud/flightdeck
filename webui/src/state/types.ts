@@ -21,6 +21,7 @@ import type {
 } from "./model";
 import { shouldRetry } from "./model";
 import type { ConfigEdit, ConfigScope } from "./config";
+import type { ViewportWidth } from "./viewport";
 import type {
   ConfirmGate,
   DialogChoice,
@@ -268,6 +269,27 @@ export interface AppState {
   readonly feedOpen: boolean;
 
   /**
+   * Which of 1h's two layouts this viewport gets (`remote-control-eek.4`,
+   * §6.5 R17). Derived from a measured pixel width by `widthClass`, so the
+   * 900px boundary is a pure function and not a media query nothing in
+   * `npm run test` can evaluate.
+   */
+  readonly width: ViewportWidth;
+  /**
+   * Whether 1h's slide-over sidebar is showing. Meaningful only while
+   * `width === "narrow"`: at wide the sidebar is 1a's column and is always on
+   * screen, so this is forced `false` the moment the viewport crosses back.
+   *
+   * It reuses 2e's slide-over mechanism rather than inventing a second one —
+   * same `hidden` toggle, same "no scrim, no focus trap, no aria-modal"
+   * posture, same `Esc`-closes rule. The one difference is the edge: 2e comes
+   * from the right, and the sidebar comes from the **left**, because that is
+   * where 1a's column is and because two panels arriving at the same edge
+   * would fight for it.
+   */
+  readonly sidebarOpen: boolean;
+
+  /**
    * When the last unpaired `Esc` was seen, for the 400 ms `Esc Esc` window
    * (§5). Stored rather than kept in a component so the decision is a pure
    * reduction; the timestamp always arrives on the action, never from a clock
@@ -467,6 +489,15 @@ export function createInitialState(): AppState {
     replay: null,
     activity: [],
     feedOpen: false,
+    /**
+     * `wide` before anything has been measured, and momentarily so: `main.ts`
+     * dispatches `viewport/measured` from the real `window.innerWidth` before
+     * the first paint. It is the honest default of the two — wide is the
+     * layout every artboard actually draws, so a viewport nobody managed to
+     * measure gets the drawn one rather than the derived one.
+     */
+    width: "wide",
+    sidebarOpen: false,
     host: "",
     retry: null,
     escArmedAt: null,
@@ -669,6 +700,25 @@ export type AppAction =
   /** Read-marking. The host owns the record; this is the local half. */
   | { readonly type: "activity/read"; readonly ids: readonly string[] }
   | { readonly type: "feed/set"; readonly open: boolean }
+
+  /* --- The narrow layout (1h, remote-control-eek.4, §6.5 R17) ------------- */
+
+  /**
+   * The viewport's **pixel** width, not the layout it implies.
+   *
+   * The measurement is the caller's impurity (`src/main.ts` reads
+   * `window.innerWidth` and listens for `resize`); which layout that means is
+   * `widthClass`, a pure function the reducer calls — the same split
+   * `input/esc` makes when it carries `at` rather than a decision about the
+   * 400 ms window. It is what lets the 900px boundary be a unit test.
+   */
+  | { readonly type: "viewport/measured"; readonly pixels: number }
+  /**
+   * 1h's slide-over, open or closed. Only meaningful below 900px: at wide the
+   * sidebar is a column that is always there, so the reducer refuses this
+   * outright rather than storing a flag nothing reads.
+   */
+  | { readonly type: "sidebar/set"; readonly open: boolean }
   | { readonly type: "host/set"; readonly host: string }
   | { readonly type: "retry/set"; readonly retry: RetryInfo | null }
 

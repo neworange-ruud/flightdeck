@@ -95,6 +95,10 @@ Implementation notes:
   `FitAddon` — the viewport is letterboxed, not fitted, and never scaled.
 - The geometry chip is not decoration. It is the honest explanation for why a
   large browser window has dark margins.
+- **And when the viewport is smaller than the grid, the stage scrolls** — see
+  §6.5 **R17**, which closes the direction this decision was never written for.
+  Not clipped, not scaled, not refitted: the grid keeps its natural size, both
+  edges stay reachable, and the browser still never measures itself.
 
 > **Cost accepted:** a large browser window under-uses its space.
 > **Precedent that does not apply:** `src/lib.rs:2637` sizes a shell the *phone*
@@ -560,17 +564,29 @@ required for M1.
   `--fd-text-decor` (2.9:1) is decoration only, under a rule worth quoting into
   code review: *if deleting it would lose a fact, it cannot be this colour.*
 
-**Not yet designed — needed before the milestone that uses them.**
+**Nothing is undesigned any more, and that table is gone.** What replaced it is
+the list below: the two screen families turn 3 would have drawn, both **built
+without a turn**, each with its derivation recorded in full and individually
+overrulable.
 
-| Gap | Needed by | Status |
+| Screen family | Built by | Derivation |
 | --- | --- | --- |
-| Narrow viewport main screen — the below-900px slide-over 1h asserts but does not draw | M3 | **still undesigned.** Turn 3 (`remote-control-v4s`, brief §11.9) was to draw it and was not run; nothing has been built against it. |
-| Help overlay, git-status overlay, About | M2 | **built without a turn** (`remote-control-ll5.8`). The repository owner decided not to run turn 3 and asked for these to be derived from the rules turns 1 and 2 established. Every token, size, frame colour and sentence is traceable; every call the artboards did not cover is listed in §6.5 **R16**, which a later turn may overrule row by row. |
+| Help overlay, git-status overlay, About | `remote-control-ll5.8` (M2) | §6.5 **R16** |
+| The below-900px layout — the slide-over sidebar, the session chip, the git bar folded into the status bar, and what D4 does when the host's grid does not fit | `remote-control-eek.4` (M3) | §6.5 **R17** |
 
-**Turn 3 was not run.** It remains the right way to close the narrow-viewport
-gap, and R16 is not a substitute for it — it is a record of one screen family
-derived under the standard a turn would have been held to, so that a later turn
-inherits reasoning rather than a fait accompli.
+**Turn 3 was not run**, by the repository owner's decision, recorded on
+`remote-control-v4s`'s close: the instruction was to design and build these
+screens directly from the rules turns 1 and 2 already establish rather than to
+wait for a human-gated design session. That lifted the block; it did not lower
+the bar.
+
+**R16 and R17 are not substitutes for a turn.** Each is a record of one screen
+family derived under the standard a turn would have been held to, written so
+that a later turn inherits reasoning rather than a fait accompli — every call
+the artboards did not cover is enumerated, and a turn may overrule any single
+row of either without reconstructing why the row is there. A future turn 3 is
+still the right way to *draw* these screens; what it is no longer is a
+prerequisite for having them.
 
 **Nothing M1 needs is undesigned.** Every gap the turn-2 brief raised was
 delivered: the access screens, the connection states, the stale treatment, the
@@ -1798,6 +1814,341 @@ overrule any of them.
 
 ---
 
+### R17 — the below-900px layout was derived, not designed, and here is the derivation
+
+`remote-control-eek.4`. The narrow viewport was the last of §5's gaps and the
+last of the epic. Artboard **1h** asserts it in one sentence and draws nothing:
+
+> *"Below 900px the sidebar becomes a slide-over invoked from a session chip in
+> the project row, and the git bar folds into the status bar."*
+
+Design turn 3 (`remote-control-v4s`) was to draw it and **was not run, by the
+repository owner's decision** — the same decision R16 records, applied to the
+same instruction: derive these screens from the rules turns 1 and 2 already
+establish rather than wait for a human-gated session. This entry is the
+derivation, in the form a turn's hand-off would have taken, and like R16 it is
+written so a later turn can overrule any single row without reconstructing why
+the row is there.
+
+**1h gave more than it looks like.** Its sentence names four things — a
+breakpoint, a slide-over, where the slide-over is invoked from, and a fold —
+and each of those had a precedent in the existing artboards to be built out of.
+What it does not name is what happens to the *terminal*, and that is the part
+the issue called the interesting constraint.
+
+#### 1. D4, in the direction it was never written for
+
+D4 says what a browser does when its viewport is **bigger** than the host's
+grid: it letterboxes, it does not scale, and the `120×34 · host owns geometry`
+chip is the honest explanation for the dark margins. It says nothing about
+smaller, and until this task the stage answered smaller with `overflow: hidden`
+plus `justify-content: center` — which **clips the host's grid at both edges,
+silently**. On a 768px tablet against a 120-column grid, roughly the first ten
+and last ten columns of the terminal did not exist, with nothing anywhere
+admitting it. That is the one thing the letterbox is not allowed to be.
+
+**The ruling: the stage scrolls.** Nothing is scaled, refitted or squeezed; the
+grid keeps its natural pixel size and the viewport moves over it. Three things
+follow, and all three are load-bearing:
+
+* **The centring moved from the stage to the letterbox.** `margin: auto` on the
+  flex item, not `align-items`/`justify-content` on the container. A *centred*
+  flex item that overflows its scroll container overflows past the scroll
+  origin, so its leading edge can never be scrolled to — the fix would have
+  swapped clipping on both edges for clipping on one. Auto margins centre
+  exactly as well while it fits and collapse to zero when it does not.
+* **It is not a narrow-viewport rule.** A 200-column host grid overflows a 27"
+  monitor, so the change lives in `main.css` beside the rest of D4 and applies
+  at every width. `narrow.css` says nothing about the terminal at all.
+* **The browser still does not measure itself.** No `ResizeObserver`, no
+  `getBoundingClientRect`, no conditional "it does not fit" state. D4's position
+  is that the browser never negotiates or requests a size, it only receives one,
+  and a component that measured its own overflow would be one refactor from
+  asking the host to match it. `tokens.guard.test.ts` rule 5 now forbids the
+  measurement outright in `state/` and `ui/`.
+
+**So how is the overflow *stated*?** By the scrollbar, and by the chip. The
+stage asks for a non-overlay scrollbar (`scrollbar-width: thin`,
+`scrollbar-color`), which Firefox and Chromium on Windows/Linux honour — but
+macOS overlay scrollbars do not, and that is a real hole. It is closed in words
+rather than by measurement: below 900px the geometry chip reads
+`120×34 · host owns geometry · scroll, never scale`, and the chip's `title`
+carries the full sentence at both widths. The clause is a statement of *policy*,
+true whether or not this particular grid overflows this particular viewport,
+which is exactly why it can be rendered without asking the DOM anything.
+
+R4 is untouched: `sync_terminal_sizes` still calls `resize_if_changed` every
+frame, the host still owns cols/rows, and `narrowScreen.test.ts` asserts that
+crossing the breakpoint three times mounts the terminal **once**, at the host's
+numbers.
+
+#### 2. The breakpoint is a pure function, not a media query
+
+Every other width-dependent thing in this app would have been a
+`@media (max-width: 899px)`. It is not, and the reason is the same one rule 4 of
+`tokens.guard.test.ts` was written for: **`vitest` runs in jsdom, which parses
+media queries and never evaluates them.** A layout inside one would be checked
+by nothing in `npm run test`, leaving it to `webui/e2e/narrow.spec.ts` — the
+Playwright job R6 registered **non-blocking until 2026-09-10**. A rule nothing
+checks is a rule that drifts, and this whole entry is a derivation nobody drew.
+
+So: `main.ts` reads `window.innerWidth`, dispatches the **pixels**,
+`state/viewport.ts`'s `widthClass` turns pixels into `wide | narrow`, and
+`ui/app.ts` writes the answer to `data-width` on `.fd-frame`. That is the
+existing idiom, not a new one — the frame already carries `data-mode`,
+`data-layout`, `data-access`, `data-takeover`, `data-feed`, `data-dialog` and
+`data-readonly`, and the narrow layout is the eighth member of the family. The
+impurity arriving on the action and the decision living in the reducer is
+`input/esc`'s split exactly (`at: number`, not "this was a double-tap").
+
+`900` is 1h's number and **900 itself is wide**: "below" excludes the boundary,
+and 900px still fits 1a's 300px column beside a terminal.
+
+#### 3. What each piece was derived from
+
+| Element | Derived from |
+| --- | --- |
+| The 900px breakpoint | 1h, verbatim |
+| The sidebar as a slide-over, `hidden`-toggled, absolutely positioned, no `aria-modal`, no focus trap, no scrim | 2e, whose mechanism this reuses rather than inventing a second one. The sidebar is already an `<aside aria-label="Agents">`, which is 2e's `role="complementary"` by another route |
+| `Esc` closes it; clicking outside closes it | 2e's feed (`Esc`) and 1a's advertised `click outside release keys` |
+| Selecting a session closes it | 2e's own `jumpTo`, which closes the feed on a jump: the errand it was opened for is done |
+| A chip in the project row opens it | 1h, verbatim |
+| The chip shows the selected session's status glyph and name | 1a's sidebar rows, whose glyph and tone functions it shares — at this width the row is the only place the current session is named |
+| `s` in App mode, and only there | 2e's rule for `a`, quoted in full: *"not in Terminal mode, where `a` is a letter the agent is waiting for"*. R16 took the same licence for `?` |
+| The git bar and status bar as one bar | 1h, verbatim |
+| The status line above the git line | 2c rule 3: the status bar's `border-top` **is** the state's frame colour, so it has to remain the top edge of the fold |
+| The hints on a line of their own | 2c rule 1 (the connection strip never moves) plus 1h's own *"the status bar states both routes permanently — no discovery required"*: something must wrap, it may not be the strip, and it may not be dropped |
+| Panels keep their designed widths; only the gutter shrinks, 80px → 24px | 2e's `min(470px, 100%)` — when the viewport runs out, the panel takes the width rather than the gutter keeping it |
+| 1d's two palette columns stacked | the columns are still two in the DOM, so `Tab next column` still means what 1d's footer says |
+| 1f's four cells restacked to two lines | 1f's own grid needs ~360px before the label gets a pixel |
+| Tokens, four type sizes, no new colour | 2g, enforced by `tokens.guard.test.ts` |
+
+#### 4. The calls the artboards do not cover
+
+Each of these is a decision this task had to make. A later design turn may
+overrule any of them.
+
+1. **The slide-over comes from the left.** 2e is a right-edge slide-over, and
+   the sidebar could have copied that literally. It does not, for two reasons:
+   the left is where 1a's column is, so the panel arrives from where the thing
+   it replaces used to be; and both panels can be open at once, so sharing an
+   edge would mean one covering the other. **Not drawn by any artboard.** A turn
+   could reasonably put both on the right and make them exclusive.
+2. **`min(300px, 86%)` wide.** 300px is 1a's own sidebar width, kept rather than
+   redesigned. The 14% left uncovered is 2e's trade — you can see the terminal
+   is still behind it — at a width where 2e's own `100%` would have covered
+   everything.
+3. **`s` is the key, and it is bound only below 900px.** At wide the sidebar is
+   always on screen, so a key that toggled nothing would be a key that lies.
+   `s` is free in App mode and is the first letter of what it opens. **A turn is
+   free to pick a different letter, or none** — the chip is a real `<button>`
+   and is the only door a phone has anyway.
+4. **The status bar was not changed to advertise `s`.** Same call R16 made for
+   `?` and for the same reason: 1a/1b/2e draw that hint row, and adding a hint
+   is an artboard change. The chip carries the key instead, the way 2e's feed
+   header carries `a close`.
+5. **The fold is `column-reverse`, not a DOM reorder.** The DOM order stays
+   git-then-status at both widths, so a screen reader hears one order; the git
+   bar holds nothing focusable, so no tab order is inverted; and the phone's
+   bottom line — the one under the browser chrome and the home indicator — gets
+   the git facts rather than "nothing you type is arriving".
+6. **Nothing is dropped from either strip.** Every git fact and every hint the
+   wide layout carries is still carried; the fold saves a border, a background
+   and a rule, never a number. That is a deliberate refusal of the obvious
+   alternative (elide `base: main`, elide a hint) and it costs one line of
+   height at 768px. A turn could decide differently, and if it does the git
+   status panel (R16) is where the elided facts already live.
+7. **The project row scrolls horizontally, with the chip pinned.** Three project
+   tabs, their separators and a badged `+ project` do not fit on a phone. A
+   scrolling tab strip is the ordinary answer; `position: sticky` on the chip is
+   what keeps the one control that opens the sidebar from scrolling out of reach.
+8. **A click on the project row does not close the slide-over.** It holds the
+   chip that opens it, so a click there is the panel's own control and not a
+   click outside — and switching project with the list open is somebody asking
+   to see *that* project's sessions, so the list stays up and repopulates.
+9. **A click that dismisses the panel also focuses the terminal.** The read-only
+   panels swallow that click (R16 §4.4); this one does not. On a touch screen,
+   two taps for one intention is the bug.
+10. **1c's split stacks into a column.** Three side-by-side terminals on a phone
+    are three unreadable slivers. Each column still letterboxes and still
+    scrolls its own grid. **Not drawn**, and cheap for a turn to overrule.
+11. **2f's seat list wraps its `connected …` column onto a second line**, and
+    the read-only panels' two fact grids (`190px 1fr`, `130px 1fr`) stack label
+    over value. Both are the same judgement: the half carrying the meaning was
+    being left with a hundred pixels.
+12. **Only one breakpoint.** 1h names one and this task refused to invent a
+    second, so a 380px phone and an 880px window get the same layout. If that is
+    wrong it is a turn's to say, and the shape is ready for it: `widthClass`
+    returns a union, and adding a third value is one function and one stylesheet
+    section.
+
+#### 5. `hidden` did not mean hidden, and the pixel test is what found it
+
+This section is here because the first version of this work shipped a layout
+that Playwright rejected, and the rejection was correct.
+
+`e2e/narrow.spec.ts` could not click the terminal at 768px:
+
+> `locator.click on '.fd-mount' timed out` …
+> `<aside hidden class="fd-feed" data-open="false"> subtree intercepts pointer events`
+
+**The closed activity feed was covering the right 470px of the terminal.** On a
+tablet that is not a cosmetic defect: a user could not focus the terminal, could
+not dismiss the sidebar by tapping past it, could not do anything with the thing
+the app exists to show them — and nothing on screen said why, because the panel
+was invisible.
+
+**The cause was general and it was five bugs, not one.** `[hidden]` is a UA
+stylesheet rule of the lowest possible specificity, and every overlay in this
+app sets `display: flex` on a class selector, which beats it. So `.hidden =
+true` closed nothing: the element stayed laid out, stayed painted and stayed
+hit-testable. That had been defended **nine times**, one selector at a time, in
+comments that literally read *"same trap as the one above"* — and five elements
+never got the rule at all. An audit of every element any component toggles:
+
+| Element | Toggled by | Consequence of the miss |
+| --- | --- | --- |
+| `.fd-feed` | `activityFeed.ts` | the live bug: a closed feed over the right 470px of the terminal |
+| `.fd-pane__banner` | `terminalPane.ts` | an absolutely-positioned, 92%-opaque strip across the bottom of **every live terminal**, at every width |
+| `.fd-tabs` | `app.ts`, in split layout | 1c drew the single pane's tab strip above the split |
+| `.fd-pane` | `app.ts`, in split layout | 1c drew the single pane *and* the split, stacked |
+| `.fd-split` | `app.ts`, on the way back to single | 1a drew the split as well |
+
+Only the first was caused by this task; the other four are older, and three of
+them are visible at any width. They are listed because they are the same bug,
+and fixing them one at a time is what produced the situation in the first place.
+
+**The fix is one rule, at the document level**, in `webui/src/style/app.css`:
+
+```css
+[hidden] {
+  display: none !important;
+}
+```
+
+and the nine per-component guards are **deleted**, so nobody can believe those
+are what does the work and no future component has to remember. `!important` is
+the mechanism here rather than a smell: `hidden` is the platform's own "this is
+not relevant", and the whole failure was a component-level `display` outranking
+it. Nothing in `src/style/` may carry a second one.
+
+This is deliberately *not* a `pointer-events: none` patch. That would leave a
+closed panel laid out and painted, fixing the symptom the trace named while
+leaving the four rendering bugs above untouched — and it would have to be
+remembered per component, which is the property that failed.
+
+**What it changes about the entries above.** Nothing. No call in §4 is revised,
+no token, size or word moves, and the narrow layout is what it was. `narrow.css`
+lost its `.fd-sidebar[hidden]` rule to the general one, and `states.css` lost
+eight; the only new fact is that "closed" is now true by construction.
+
+#### 5b. And the keyboard was not reaching the app at all
+
+Writing the test above turned up a second defect of exactly the same shape:
+general, invisible to every unit test in the repository, and found only because
+something drove a real browser.
+
+The new test presses `a` to open the feed after clicking a chrome control, and
+it did nothing. Measured rather than guessed — a throwaway spec that printed
+`document.activeElement` at each step:
+
+```
+initial activeElement: BODY
+after clicking the session chip: BODY
+after Escape: sidebar still open
+after 'a': feed still closed
+after clicking .fd-mount: TEXTAREA.xterm-helper-textarea
+```
+
+**A keydown is delivered to listeners on the ancestors of the focused element.**
+`ui/app.ts` attached its handler to `frame`, and `document.body` is an
+*ancestor* of `.fd-frame`, not a descendant — so with focus on the body, every
+key the app claims went nowhere.
+
+That is the default state, not an edge case. `activeElement` is `BODY` on a
+fresh load, and it returns to `BODY` whenever the focused control is removed
+from the DOM — which every control in this app is, because each region rebuilds
+its children on every render. So: **on a freshly loaded tab, no app-level key
+worked at all** — not `Ctrl-g`, the one chord §5 gives the app; not `Esc Esc`;
+not 2e's `a`; not R16's `?`; not 1h's `s` — until the user happened to click the
+terminal, and clicking any chrome control silently took them away again. On a
+tablet, where 1h's whole story is that the sidebar is reachable from a chip and
+a key, that is the difference between a keyboard and no keyboard.
+
+Nothing caught it because every keyboard test in the repository dispatches its
+event on `app.el`, which is inside the frame by construction — the tests were
+pressing keys somewhere the browser never does.
+
+**The fix: the keyboard listens on the document; the pointer stays on the
+frame.** Keys have no position, and their target is wherever focus happens to
+be, which is not a component's business. Clicks do have a position and their
+target is a real element, so the click handler is unchanged. One guard comes
+with it — a frame that is no longer `isConnected` declines — so a torn-down app
+stops answering, which matters in `vitest` where one file renders a dozen apps
+into one document.
+
+This one **jsdom can prove**, as long as the event is dispatched where a browser
+would really put it, so `narrowScreen.test.ts` gained three tests that press
+keys on `document.body`: §5's chord, the three App-mode plain keys, and the
+`isConnected` guard. Verified to fail against the old handler.
+
+**And what it says about the two test layers.** `ui/narrowScreen.test.ts`
+asserted `.fd-feed` is `hidden` and passed — jsdom does no hit-testing, so to it
+`hidden` is simply an attribute, and the entire class of bug is invisible from
+`npm run test`. The keyboard one was worse: it was invisible because the tests
+were pressing keys in a place a browser never focuses. That is the honest limit recorded at the end of this entry,
+found the hard way rather than argued for. Both defences were added:
+`tokens.guard.test.ts` rule 6 makes the *rule's existence* checkable in unit
+tests, and `narrow.spec.ts`'s last test makes the *behaviour* checkable in a
+browser — walking every overlay open and closed, asserting after each close
+that no `[hidden]` element has a client rect, that `elementFromPoint` over a
+grid of nine points on the terminal never lands inside one, and that the
+terminal still takes a click.
+
+#### 6. What is enforced rather than asserted
+
+* `tokens.guard.test.ts` gained **rule 5 — the width decision is one pure
+  function, and nothing measures itself.** No `min-width`/`max-width` media
+  query anywhere in `src/style/` (comments stripped first, so a file may explain
+  why it has none), and no `innerWidth`, `matchMedia`, `getBoundingClientRect`,
+  `ResizeObserver`, `offsetWidth` or `clientWidth` under `state/` or `ui/`.
+  `main.ts` is the one place that measures and it is under neither, so the rule
+  needs no exemption list — which is why the measurement was put there.
+* The **D4 letterbox block gained a positive assertion**, not just the existing
+  negative ones: `.fd-stage` must be `overflow: auto` with no `justify-content`
+  or `align-items`, and `.fd-letterbox` must be `margin: auto`. Putting either
+  half back restores the silent clipping, and each half looks harmless on its
+  own in a diff. `transform: scale` is now forbidden in `narrow.css` too — the
+  one stylesheet whose entire subject is "the viewport is too small" is exactly
+  where somebody would reach for it.
+* `tokens.guard.test.ts` gained **rule 6 — a closed overlay is closed.** Three
+  assertions, each verified to fail against the regression it names: `app.css`
+  declares a bare `[hidden]` rule with `display: none !important`; no selector
+  anywhere re-enables display on a `[hidden]` selector; and `!important` appears
+  in exactly one file, so nothing can outrank it.
+* `ui/narrowScreen.test.ts` presses three of the app's keys on
+  `document.body` — the place a real browser leaves focus, and the place no
+  other keyboard test in this repository has ever pressed one.
+* `state/viewport.test.ts` pins 1h's boundary in both directions, including that
+  900 is wide, and that crossing it in *either* direction closes the slide-over.
+* `ui/narrowScreen.test.ts` (jsdom) drives the whole layout by dispatching a
+  number, which is the payoff for not using a media query: the breakpoint, the
+  slide-over's whole lifecycle, the fold's structure, every git fact and every
+  hint surviving, and every overlay still opening and operating at 768px.
+
+**What the unit tests do not prove, stated because it matters.** jsdom computes
+no boxes. Nothing under `src/` can tell a `column-reverse` from a `column`,
+notice that a panel overflows, or see that the sidebar is *over* the terminal
+rather than beside it. `webui/e2e/narrow.spec.ts` does, at 768×1024, in a real
+browser — including the assertion this task turns on: **the terminal is the same
+number of pixels wide at 768 as it is at 1600**, with the same row count, and
+the stage scrolls to both edges. A `FitAddon`, a `transform: scale` or a
+`width: 100%` on the mount each fail that and none of them fails a jsdom test.
+That job is still R6's non-blocking one until 2026-09-10, which is the honest
+status of the pixel-level verification.
+
+---
+
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.
@@ -1820,6 +2171,10 @@ overrule any of them.
 - `src/tui/help.rs` — SPECS §23's help and the About screen as data, rendered by
   the desktop and sent to the browser (R16), so neither surface documents a
   keyboard the other does not have.
+- `webui/src/state/viewport.ts` — 1h's 900px boundary as a pure function of a
+  measured pixel width, and why it is not a media query (R17).
+- `webui/src/style/narrow.css` — everything below 900px, keyed off `data-width`
+  on `.fd-frame`: the slide-over sidebar, the fold, and the restacked panels.
 - `src/web/arbiter.rs` — the input lock behind D14's second revision (R14): who
   may type, why 400 ms, and why no surface has precedence.
 - `src/remote/client.rs` — the blocking relay client retired by D6/D7.
