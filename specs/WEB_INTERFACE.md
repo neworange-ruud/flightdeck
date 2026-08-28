@@ -709,6 +709,9 @@ performs a command's effect a second time.
    inside it come from the table — so no frame can smuggle a confirmed
    destructive operation, and the two history-rewriting commands
    (`rebase_worktree`, `pull_base`) are not on a forwarding route at all.
+   *(The second clause is superseded by R11: `rebase_worktree` now forwards its
+   **unconfirmed** value, which is what SPECS §5.1 sanctions. The first clause is
+   what makes that safe, and it is unchanged.)*
 3. *Refusals are typed, and the type says who owns the follow-up.* A command
    whose effect lands on the host's machine (D16's two) or must not land
    unconfirmed (`quit`, `stop_web_interface`) is answered `Ack{Rejected}` with the
@@ -717,7 +720,7 @@ performs a command's effect a second time.
    Everything whose browser-side surface belongs to another M2 task — destructive
    confirmations (ll5.4), git (ll5.5), the configuration manager (ll5.6),
    help/about/git-status (ll5.8); the dialog family (ll5.3) has since landed,
-   see R8 — is answered
+   see R8, and the git family (ll5.5) has since landed, see R11 — is answered
    `ErrorCode::NotSupported` with a reason naming what is missing, rather than
    dispatched into a modal on a screen the browser cannot see. Each of those
    tasks flips its rows' route; nothing else has to move.
@@ -783,6 +786,9 @@ never read".
   artboard 1g's two-step typed-name confirmation. Same shape for the git
   confirmations (`push` / `merge` / `rebase`), which refuse a browser's confirm
   with `GIT_DIALOG_REFUSAL` and remain cancellable (`remote-control-ll5.5`).
+  *(The git half is superseded by R11: those three dialogs **are** SPECS §5's
+  confirmation, so `remote-control-ll5.5` lifted the gate and
+  `GIT_DIALOG_REFUSAL` is gone. `abandon_worktree` is unchanged.)*
   Cancelling is never gated: dismissing a confirmation cannot destroy anything,
   and a shared dialog a remote surface can see but not dismiss would be worse
   than not sharing it.
@@ -884,6 +890,185 @@ not with the moment git answered. Git that fails, and git that has not answered
 within `FINISH_COUNT_DEADLINE_MS` (2s), both record the row with the **empty**
 reason it had before this existed: slow and broken degrade to the identical
 honest row, which is what lets the deadline be short.
+
+### R11 — git runs from the browser, and §5's boundary is restated rather than relaxed
+
+`remote-control-ll5.5`. R7 left four rows on `Route::NotSupported(GIT_REFUSAL)`
+— `rebase_worktree`, `push_branch`, `finish_local_merge`, `pull_base` — and R8
+left the three git confirmations refusing a browser's confirm with
+`GIT_DIALOG_REFUSAL`. Three of the four rows now dispatch, both refusals are
+gone, and the fourth is a decision rather than a placeholder.
+
+**What the browser can now do.** `Push Branch` (SPECS §14), `Finish / Local
+Merge` (§15) and `Rebase Worktree` (§5.1) are palette rows a browser runs, and
+they run through the same `run_palette_action` → `AppState::dispatch` path the
+desktop's own palette drives — there is still no arm anywhere that performs a git
+effect a second time. The confirmations those commands raise are D13 dialogs, so
+a browser now *confirms* as well as cancels them: `browser_may_confirm` has no
+git arm left, and `web_dialog_view` publishes `confirmable: true` with no
+`refusal`. Nothing on the browser side changed to allow that. `state/commands.ts`
+renders whatever the host sends, `state/dialog.ts` has never had a list of dialog
+kinds, and the git rows appeared the moment the Rust table flipped.
+
+**Why the confirm had to be lifted along with the row.** Refusing it would have
+left the worst of both: a browser able to raise a question — *Rebase
+flightdeck/x onto main (base moved 7 commits)? Rewrites history; aborts on
+conflict* — that only the other surface could answer. D13 exists so a dialog is
+one thing on two screens; a family where one surface can ask and not answer is
+that decision half-taken.
+
+**The boundary invariant, restated.** The old test asserted that *no*
+browser-reachable dispatching route rewrites history. That was true while every
+git row refused, and it would now be false — so it was restated rather than
+loosened into a rubber stamp:
+
+> No browser-reachable route may rewrite history **except** through a route
+> whose dispatched command is unconfirmed and therefore lands on §5.1's
+> confirmation prompt; and no browser-reachable route may create a pull request,
+> **ever, with no exception**.
+
+Both halves are enforced by construction, not by a check at the door:
+
+1. **`web::commands::confirmation_of` classifies a command *value*, not a
+   command kind** — `Pending` / `Given` / `None` — exhaustively and with no
+   wildcard arm, so a new confirmation flag has to say where it stands before
+   the crate compiles. `INVENTORY` carries `RebaseWorktree { confirm: false }`,
+   and R7's forwarding rule is what makes that unforgeable: a `Command` frame's
+   `args` are *never read* by a forwarding row, so the payload reaching
+   `AppState::dispatch` is the table's whatever the frame said. §5.1's "the first
+   dispatch always returns a confirmation prompt before anything is rewritten" is
+   therefore a property of the payload, and
+   `a_frame_cannot_smuggle_a_confirmed_rebase` pins it.
+2. **The exception cannot quietly grow.** The boundary test collects every
+   history-rewriting row it finds and asserts the set is exactly
+   `[rebase_worktree]`, so a second one is a spec argument rather than a test
+   update. `creates_pull_request` stays asserted absolutely, with no clause.
+   Both functions remain exhaustive with no wildcard arm.
+
+**`pull_base` is deliberately not exposed (SPECS §5.2).** It was the judgment
+call, and the reasoning is on the record because either answer is defensible and
+an unexamined one is not.
+
+*For exposing it:* §5.2 sanctions it as a palette command with a keybinding, it
+never touches an Agent Tab's worktree, and it is guarded — base branch must be
+checked out, conflicts abort, the folder is left exactly as it was.
+
+*Against, and decisive:* those preconditions bound the **damage**, not the
+**surprise**. What makes a browser-reachable rebase acceptable is not that it is
+safe but that nobody reaches it without reading a question, and §5.2 says in as
+many words that pull-base "is not confirmation-gated". So it has no unconfirmed
+variant for the table to carry — `confirmation_of(&PullBase)` is `None` — and it
+fails the invariant's exception clause *structurally* rather than by being named
+in it. The implementation also does more than §5.2's summary: a dirty base folder
+is stashed, pulled over and re-applied, so one frame would move the user's own
+uncommitted work through the stash with nothing shown to either surface first.
+Inventing a browser-only confirmation was rejected for the reason the command
+module exists at all: it would be a second flow the desktop does not have.
+
+The row is therefore **offered and refused**, carrying `PULL_BASE_REFUSAL` —
+which names the asymmetry rather than pleading not-implemented, because it is not
+a missing surface. If §5.2 ever grows a confirmation step, the decision is worth
+revisiting; the test says so where it asserts `Confirmation::None`.
+
+**Refusals reach the browser in the guard's own words, and the phase decides
+what "applied" means.** R7 already routes a dispatch's outcome through
+`Ui::web_outcome`, so §13's dirty base, §15's precondition refusals, §5.1's
+rebase preconditions and git's own errors arrive verbatim rather than as a
+generic failure — `web_git_guards` in `src/lib.rs` asserts each against a
+`FakeGit` (SPECS §26 asks for the refusal paths, not only the happy ones). One
+correction was needed: `Effect::Warning` is two different facts. From a
+*confirmed* dispatch it means the operation landed and the cleanup after it did
+not — applied-with-caveat. From an **unconfirmed** one it means a guard stopped
+the flow before it asked, which is how §13's dirty base arrives, and reporting
+that as `Applied` would be the browser claiming something the host did not say.
+`dispatch_command` separates the two by the command's phase, once for every
+two-phase command — the same line the phone's `dispatch_remote_merge_back`
+already drew ("no merge happened, so it is a rejection").
+
+**`show_git_status` still refuses**, unchanged and for R8's reason: it is not one
+of D13's dialogs, nothing is being asked, and design turn 3 owns what the browser
+shows instead (`remote-control-ll5.8`).
+
+### R12 — the seat's facts, and the two policy numbers, are split on the wire
+
+`remote-control-ll5.9`. Three defects with one shape: the browser was being made
+to reconstruct something the host already knew.
+
+**Artboard 2f's arriving-viewer panel lists three facts — address / browser /
+connected — and `SeatInfo` carried the first two merged into one free-text
+`label`.** The webui task rendered that merged label verbatim in the address slot
+and left the browser slot empty, which was **the right call**: the browser half
+of the label is a user-agent string, which is attacker-supplied free text and can
+contain the ` · ` separator, so a browser-side split is a parse the parsed string
+gets to steer. The fix therefore belongs on the wire, not in a parser.
+`SeatInfo` now carries `address` and `user_agent_label` as additive
+`#[serde(default)]` fields beside `label`, which stays because the compact viewer
+chip (`desktop + this tab`) genuinely wants one line. `ViewerIdentity` in
+`src/web/server.rs` is the single place the two are joined, and joining is the
+only direction that is safe.
+
+**The address stays host-observed.** `ClientInfo`'s rule — *the host owns the
+address it observed and must not trust a client-supplied one for anything but
+display* — survives the split unchanged and is now enforced where it is easiest
+to get wrong: `ViewerIdentity::with_claim` lets an `Attach` frame replace what we
+say the *browser* is and can never move the address, which came off the socket.
+A claim of `9.9.9.9 · Chrome on macOS` lands in `user_agent_label`, verbatim and
+unparsed, and the address row still reads the real peer.
+
+The desktop row has `address: null` and `user_agent_label: null`, because it
+arrived over no socket; 2f drops a row it was told nothing about rather than
+printing a placeholder. So does a host from before the split — the merged label
+is still a true answer for the address slot, which it starts with, and the
+browser row goes undrawn.
+
+**The third fact needed a clock, so `Delta::Seats` now carries one.** Splitting
+the first two facts was not enough: `since_ms` is an instant on the *host's*
+clock, and a `Delta::Seats` carried no reference to date it against. The browser
+could not use it honestly — `Date.now()` measures a host instant with a local
+clock that may be wrong — so it left the row undated, and 2f drew three facts
+when the seat list arrived in a `Snapshot` and two when the same list arrived in
+a delta. A viewer panel that silently drops *"connected 12s ago"* depending on
+which frame carried the news is exactly the inconsistency this refinement exists
+to remove, so `Delta::Seats` gained `server_time_ms` as a fourth additive
+`#[serde(default)]` field, the same pairing `Snapshot` has always had. The
+reducer stays clock-free: dating happens in `wire/adapt.ts`'s `seatOf`, which is
+now **exported and shared by both paths** — two mapping functions is how the
+inconsistency arose in the first place. A delta with no clock (`0` is serde's
+default and is not a time) still renders the row without its `connected` line,
+never with a fabricated or negative duration.
+
+`WireError::seat_held` is not a seat list and carries no clock either, so an
+arriving takeover panel still opens with `connected` blank. It is completed by
+the first dated seat list to arrive — the snapshot on the observe-attach, then
+the delta — through `refreshArrivingIncumbent` in `state/reducer.ts`. The panel
+is closed only by the user's own answer, never by a seat list, and a list with
+nobody in the seat does not blank out the name of the browser that just refused
+us.
+
+**`RATE_LIMIT_LOCKOUT_MS` and `BOOTSTRAP_CODE_TTL_MS` were mirrored in
+TypeScript, and are host-sent now.** 2b prints *"3 attempts left before this
+address is rate-limited for 60s"* while the address is still allowed to try, so
+the lockout length is needed **before** the limiter fires — which `retry_after_ms`
+cannot supply, because it only exists once it has. `refusal_body()` carries both
+as `lockout_seconds` and `code_ttl_seconds`. `GET /auth/session` was the other
+candidate carrier and turned out to be unnecessary rather than wrong: the SPA's
+first act is that call, a browser with no live cookie is *refused* by it, and
+that refusal is built by the same function — while the `authenticated: true` body
+is only ever followed by the app, which draws none of 2b's copy. One carrier, no
+field nobody reads. The precedent is `attempts_remaining`, which was already
+host-sent and never guessed, and it is followed exactly: absent means *we were
+not told*, and every sentence has an honest shape one clause shorter.
+
+**`revoked_at_ms` completes 2b's revoked sentence.** `AuthFailure::TokenRevoked`
+now carries the tombstone's `revoked_at_unix_secs`, the way `RateLimited` already
+carried `retry_after_ms`, so the refusal that reports the fact also reports when.
+It is sent **paired with the host's own `server_time_ms`**, exactly as `Snapshot`
+pairs `server_time_ms` with every `since_ms`: the browser subtracts two host
+timestamps rather than measuring a host instant against a local clock that may be
+wrong, which on a security screen would print a confident wrong duration. Either
+value missing — an older host, or a tombstone with no time — renders *"withdrew
+this browser's access."* and stops. A zero is never sent, because zero is not a
+missing time, it is 1970.
 
 ---
 
