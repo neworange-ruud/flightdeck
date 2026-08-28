@@ -642,7 +642,7 @@ pub struct ProjectState {
 }
 
 /// The current state-file schema version.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Git value types used by the `GitExecutor` trait.

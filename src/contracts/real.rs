@@ -36,11 +36,15 @@ impl FileSystem for RealFs {
 
     fn write(&self, p: &Path, contents: &str) -> Result<()> {
         // Atomic full-file write: stage into a sibling temp file, then rename it
-        // over the destination. `rename` is atomic on POSIX and Windows, so a
-        // crash/kill during the write leaves the destination either fully intact
-        // (old) or fully replaced (new) — never truncated. This protects
-        // `state.json` from corruption on an abrupt shutdown mid-write.
-        let tmp = atomic_temp_path(p);
+        // over the destination. Resolve a symlink first so editing config updates
+        // its target instead of replacing the link, and copy existing permissions
+        // to the staged file before replacement.
+        let destination = match fs::symlink_metadata(p) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(p)
+                .map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))?,
+            _ => p.to_path_buf(),
+        };
+        let tmp = atomic_temp_path(&destination);
         let staged = fs::write(&tmp, contents)
             .map_err(|e| FlightDeckError::Io(format!("{}: {e}", tmp.display())));
         if let Err(e) = staged {
@@ -48,9 +52,15 @@ impl FileSystem for RealFs {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
-        fs::rename(&tmp, p).map_err(|e| {
+        if let Ok(metadata) = fs::metadata(&destination) {
+            if let Err(e) = fs::set_permissions(&tmp, metadata.permissions()) {
+                let _ = fs::remove_file(&tmp);
+                return Err(FlightDeckError::Io(format!("{}: {e}", tmp.display())));
+            }
+        }
+        fs::rename(&tmp, &destination).map_err(|e| {
             let _ = fs::remove_file(&tmp);
-            FlightDeckError::Io(format!("{}: {e}", p.display()))
+            FlightDeckError::Io(format!("{}: {e}", destination.display()))
         })
     }
 
@@ -282,6 +292,31 @@ mod tests {
         assert!(
             !atomic_temp_path(&dest).exists(),
             "no temp file should remain after a successful write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_permissions_and_updates_a_symlink_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config-target.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        RealFs.write(&link, "new").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

@@ -20,7 +20,7 @@ use crate::contracts::{
     AgentDef, Clock, CommandRunner, Config, ContainerRuntime, ContainerState, ContainersConfig,
     FileSystem, FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
     NotificationSound, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize,
-    Result, TabId, TabState, STATE_VERSION,
+    Result, TabId, TabState,
 };
 use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
@@ -514,6 +514,10 @@ pub struct AppState {
     pub registry: AgentRegistry,
     /// The runtime Agent Tabs, in display order.
     pub tabs: Vec<RuntimeTab>,
+    /// State schema to emit. Normally the current schema, but an older version
+    /// is retained when its migration was deferred so shutdown cannot mark an
+    /// incomplete migration as finished.
+    pub state_version: u32,
     /// Index of the selected tab, if any.
     pub selected_tab: Option<usize>,
     /// The current input mode (SPECS §23).
@@ -521,8 +525,13 @@ pub struct AppState {
     /// Persistent warnings to keep on screen (e.g. dirty base → merge disabled,
     /// SPECS §13). Deduplicated.
     pub warnings: Vec<String>,
-    /// The base branch (SPECS §12).
+    /// The project default base branch for newly-created tabs (SPECS §12).
+    /// Existing tabs keep their own target in [`TabState::base_branch`].
     pub base_branch: String,
+    /// Invalid default read from project config while [`Self::base_branch`]
+    /// retains the last valid runtime value. `None` when the configured default
+    /// is valid. Runtime-only; used to keep the repair target visible.
+    pub invalid_base_branch: Option<String>,
     /// Absolute repository root.
     pub repo_root: PathBuf,
     /// Absolute path to `state.json`.
@@ -564,16 +573,20 @@ impl AppState {
         state_path: impl Into<PathBuf>,
     ) -> Self {
         let registry = AgentRegistry::from_config(&config);
+        let base_branch = config.project.default_base_branch.clone();
+        let state_version = state.version;
         let tabs: Vec<RuntimeTab> = state.tabs.into_iter().map(RuntimeTab::from_meta).collect();
         let selected_tab = if tabs.is_empty() { None } else { Some(0) };
         AppState {
             config,
             registry,
             tabs,
+            state_version,
             selected_tab,
             mode: InputMode::default(),
             warnings: Vec::new(),
-            base_branch: state.base_branch,
+            base_branch,
+            invalid_base_branch: None,
             repo_root: repo_root.into(),
             state_path: state_path.into(),
             pty_size: PtySize::default(),
@@ -598,6 +611,7 @@ impl AppState {
         if self.isolated {
             config.ui.auto_continue = false;
         }
+        self.base_branch = config.project.default_base_branch.clone();
         self.registry = AgentRegistry::from_config(&config);
         self.config = config;
     }
@@ -815,7 +829,7 @@ impl AppState {
             })
             .collect();
         ProjectState {
-            version: STATE_VERSION,
+            version: self.state_version,
             project_root_relative,
             base_branch: self.base_branch.clone(),
             tabs,
@@ -1107,20 +1121,20 @@ impl AppState {
             )));
         }
 
-        // The branch a base tab is *actually* on. `base` is the configured base
-        // branch, which is not necessarily what HEAD points at in the project
-        // root — and `meta.branch` is what Push Branch pushes, so recording the
-        // base here would push the wrong ref. Two cases fall back to the base:
-        // a genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
-        // unavailable), and a detached HEAD, which `git rev-parse --abbrev-ref
-        // HEAD` reports not as an error but as the literal string "HEAD" —
-        // recording that verbatim would name the tab "HEAD" and hand Push a
-        // refname git rejects.
-        let head = match services.git.current_branch(&self.repo_root) {
-            Ok(b) if b == "HEAD" => base.clone(),
-            Ok(b) => b,
-            Err(_) => base.clone(),
-        };
+        // A root-running agent must really be on the displayed default. Never
+        // check out a branch underneath the user, and never launch on another
+        // branch while recording `base` as its target.
+        let head = services.git.current_branch(&self.repo_root)?;
+        if head == "HEAD" {
+            return Err(FlightDeckError::Refused(format!(
+                "the project root is in detached HEAD state; check out '{base}' first"
+            )));
+        }
+        if head != base {
+            return Err(FlightDeckError::Refused(format!(
+                "the project root is on '{head}', not the default base '{base}'; check out '{base}' first"
+            )));
+        }
 
         // The tab name falls back to the checked-out branch when the field was
         // left blank (the branch textbox is disabled in base mode).
@@ -2538,6 +2552,26 @@ mod tests {
     }
 
     #[test]
+    fn config_default_base_wins_without_retargeting_existing_tabs() {
+        let config = crate::config::schema::default_config("p", "develop");
+        let mut state = default_state("main");
+        state.tabs.push(recovered_tab("existing"));
+
+        let mut app = AppState::new(config, state, REPO, STATE);
+        assert_eq!(app.base_branch, "develop");
+        assert_eq!(app.tabs[0].meta.base_branch, "main");
+
+        let next = crate::config::schema::default_config("p", "release");
+        app.reload_config(next);
+        assert_eq!(app.base_branch, "release");
+        assert_eq!(app.tabs[0].meta.base_branch, "main");
+
+        let persisted = app.to_project_state(0);
+        assert_eq!(persisted.base_branch, "release");
+        assert_eq!(persisted.tabs[0].base_branch, "main");
+    }
+
+    #[test]
     fn reload_config_on_an_isolated_state_keeps_auto_continue_forced_off() {
         // Startup forces auto_continue off for the whole isolated run (SPECS
         // §32) so even Restart Agent starts fresh. The config manager's save
@@ -2982,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn base_tab_records_the_checked_out_branch_not_the_base() {
+    fn base_tab_refuses_when_the_project_root_is_on_another_branch() {
         let dir = TempDir::new().unwrap();
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
@@ -2998,32 +3032,17 @@ mod tests {
         let clock = FakeClock::default();
 
         let mut app = fresh_state(config);
-        let job = app
+        let err = app
             .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
-            .unwrap();
+            .unwrap_err();
 
-        assert!(app.tabs[0].meta.runs_on_base);
-        assert_eq!(
-            app.tabs[0].meta.branch, "spike",
-            "the tab must name the branch it is actually on — push uses this field"
-        );
-        assert_eq!(
-            app.tabs[0].meta.base_branch, "main",
-            "the configured base is unchanged"
-        );
-        assert_eq!(
-            app.tabs[0].meta.name, "spike",
-            "the blank name falls back to the branch"
-        );
-        assert!(
-            !job.needs_create,
-            "a base tab still materializes no worktree"
-        );
+        assert!(err.to_string().contains("not the default base 'main'"));
+        assert!(app.tabs.is_empty());
         assert!(git.added_worktrees().is_empty(), "and runs no git mutation");
     }
 
     #[test]
-    fn base_tab_falls_back_to_base_when_head_is_detached() {
+    fn base_tab_refuses_detached_head() {
         let dir = TempDir::new().unwrap();
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
@@ -3041,20 +3060,21 @@ mod tests {
         let clock = FakeClock::default();
 
         let mut app = fresh_state(config);
-        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
-            .unwrap();
+        let err = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap_err();
 
-        assert_eq!(app.tabs[0].meta.branch, "main");
+        assert!(err.to_string().contains("detached HEAD"));
+        assert!(app.tabs.is_empty());
     }
 
     #[test]
-    fn base_tab_falls_back_to_base_when_current_branch_errors() {
+    fn base_tab_propagates_current_branch_errors() {
         let dir = TempDir::new().unwrap();
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
 
-        // A genuine git failure (e.g. an unborn HEAD in a fresh repo, or git
-        // being unavailable) also falls back to the base.
+        // A genuine git failure must not guess which branch is checked out.
         let git = FakeGit::new()
             .with_root(REPO)
             .with_branches(["main"])
@@ -3065,10 +3085,12 @@ mod tests {
         let clock = FakeClock::default();
 
         let mut app = fresh_state(config);
-        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
-            .unwrap();
+        let err = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap_err();
 
-        assert_eq!(app.tabs[0].meta.branch, "main");
+        assert!(err.to_string().contains("fatal: not a git repository"));
+        assert!(app.tabs.is_empty());
     }
 
     #[test]
@@ -4703,17 +4725,15 @@ mod tests {
     }
 
     #[test]
-    fn base_tab_push_pushes_the_checked_out_branch_not_the_base() {
+    fn base_tab_pushes_the_verified_checked_out_base() {
         let dir = TempDir::new().unwrap();
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
 
-        // Base is "main", but the repo root has "spike" checked out. This is
-        // the whole point of the fix: Push must push "spike", not "main".
         let git = FakeGit::new()
             .with_root(REPO)
             .with_branches(["main"])
-            .with_current_branch("spike");
+            .with_current_branch("main");
         let fs = FakeFs::new();
         let pty = FakePty::new();
         pty.queue_session();
@@ -4722,7 +4742,7 @@ mod tests {
 
         let mut app = fresh_state(config);
         let job = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
-        assert_eq!(app.tabs[0].meta.branch, "spike");
+        assert_eq!(app.tabs[0].meta.branch, "main");
         materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
         app.finalize_new_tab(&job.tab_id, &svc).unwrap();
 
@@ -4738,8 +4758,8 @@ mod tests {
         let pushes = git.pushes();
         assert_eq!(pushes.len(), 1);
         assert_eq!(
-            pushes[0].1, "spike",
-            "Push must push the branch actually checked out, not the configured base"
+            pushes[0].1, "main",
+            "Push must use the verified branch checked out in the project root"
         );
     }
 
