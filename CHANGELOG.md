@@ -133,6 +133,21 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   Note that a browser tab left open across a FlightDeck update will ask to be
   reloaded: the wire protocol changed to carry the new seat model.
 
+- **Help, About and git status in the browser, and a layout that works on a
+  tablet.** The browser gets the same help and keybindings the desktop shows —
+  from the desktop's own text, so the two cannot drift — plus About FlightDeck
+  and a read-only git status panel carrying the branch, base, drift, dirty state,
+  ahead/behind and the GitHub compare URL for the branch. The compare link says
+  plainly that FlightDeck does not open the pull request; it never has and still
+  does not. Where a fact is unknown it says so rather than showing a zero: no
+  upstream means no ahead/behind row at all, and no compare URL means no link
+  rather than one guessed from the branch name.
+
+  Below 900px the sidebar becomes a slide-over and the git bar folds into the
+  status bar, so FlightDeck Web is usable on a tablet. The terminal still
+  letterboxes and is never scaled — if the host's grid is wider than your
+  viewport the stage scrolls, and the geometry chip says so.
+
 ### Improvements
 
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
@@ -160,6 +175,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   released Windows binary stays free of a C toolchain.
 
 ### Bug fixes
+
+- **FlightDeck Web: keyboard shortcuts did nothing on a freshly opened tab.**
+  The global key handler was attached below the element the browser actually
+  focuses, so `Ctrl-g`, `Esc Esc`, and the activity-feed and help keys all did
+  nothing until you first clicked inside the terminal — and clicking anything
+  else took it away again. On a tablet, where there is no terminal click to
+  spare, that was the entire keyboard.
+- **FlightDeck Web: a closed panel could still cover the terminal.** The
+  activity feed kept intercepting clicks over the right-hand side of the
+  terminal while shut, an opaque strip sat across the bottom of every live
+  terminal, and split view drew its single pane and its split at the same time.
+  All four were one cause — a closed element being given a layout that outranked
+  its own hidden state — now fixed in one place rather than defended
+  component by component.
+- **FlightDeck Web: a terminal wider than your window was silently cropped.**
+  The stage clipped the host's grid at both edges instead of letting it scroll,
+  so roughly ten columns each side simply were not there on a narrow window,
+  with nothing to indicate it.
 
 - A base-branch Agent Session Tab now records the branch actually checked out
   rather than the configured base, so Push Branch pushes the right ref. A
