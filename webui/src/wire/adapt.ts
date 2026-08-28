@@ -1,5 +1,5 @@
 /**
- * Wire → model. The only place protocol v1's spelling becomes the app's.
+ * Wire → model. The only place the wire's spelling becomes the app's.
  *
  * `remote-control-hgqy` left one decision open: protocol v1's `SessionView` is
  * flatter than `src/state/model.ts`'s `Session` in two places, and the note on
@@ -23,9 +23,12 @@
  */
 
 import type {
+  AboutDoc,
   ActivityEvent,
   CommandTarget,
   GitBarInfo,
+  GitStatusPanel,
+  HelpDoc,
   HostCommand,
   Project,
   Seat,
@@ -38,11 +41,14 @@ import type {
 } from "../state/model";
 import type { DialogState } from "../state/types";
 import type {
+  WireAboutDoc,
   WireActivityEvent,
   WireBucket,
   WireCommandView,
   WireDialogView,
   WireGitBar,
+  WireGitStatus,
+  WireHelpDoc,
   WireProjectView,
   WireSeatInfo,
   WireSessionStatus,
@@ -371,6 +377,85 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
      * here. A host that sends none offers none — there is deliberately no
      * locally-authored inventory to fall back to. */
     commands: (wire.commands ?? []).map(commandOf),
+    /**
+     * SPECS §23's help and the About screen (`remote-control-ll5.8`). `null`
+     * from a host that sends neither, and nothing is substituted: a
+     * locally-authored keybinding list would document a FlightDeck this tab is
+     * not attached to. Same rule as `commands` being empty above.
+     */
+    help: helpOf(wire.help),
+    about: aboutOf(wire.about),
+  };
+}
+
+/** `HelpDoc` as the browser wants it. Structure only — every string is the
+ * host's, verbatim, and `notes` defaults to empty because an ordinary run has
+ * none rather than because we could not read it. */
+function helpOf(wire: WireHelpDoc | null | undefined): HelpDoc | null {
+  if (wire === null || wire === undefined) {
+    return null;
+  }
+  return {
+    title: wire.title,
+    notes: (wire.notes ?? []).map((note) => ({
+      title: note.title,
+      lines: [...note.lines],
+    })),
+    sections: wire.sections.map((section) => ({
+      title: section.title,
+      rows: section.rows.map((row) => ({
+        keys: row.keys,
+        description: row.description,
+      })),
+    })),
+  };
+}
+
+function aboutOf(wire: WireAboutDoc | null | undefined): AboutDoc | null {
+  if (wire === null || wire === undefined) {
+    return null;
+  }
+  return {
+    name: wire.name,
+    version: wire.version,
+    tagline: wire.tagline,
+    credits: wire.credits.map((c) => ({ role: c.role, name: c.name })),
+    url: wire.url,
+  };
+}
+
+/**
+ * SPECS §21's panel (`remote-control-ll5.8`, §6.5 R16).
+ *
+ * The two absent-or-present fields are the whole reason this is a mapper and
+ * not a cast. `upstream` missing means the branch has never been pushed, and
+ * the ahead/behind counts are inside it precisely so that this function cannot
+ * hand the panel a count without a remote to count against. `compare_url`
+ * missing means there is no GitHub compare URL for this branch — rendered as
+ * no row, never as an empty link and never as a URL assembled here from the
+ * branch name, which would invite the user to a page that does not exist.
+ */
+export function gitStatusOf(wire: WireGitStatus): GitStatusPanel {
+  const upstream = wire.upstream;
+  return {
+    seq: wire.seq,
+    sessionId: wire.session_id,
+    sessionName: wire.session_name,
+    branch: wire.branch,
+    baseBranch: wire.base_branch,
+    baseDrift: wire.base_drift,
+    dirty: wire.dirty,
+    changedFiles: wire.changed_files,
+    upstream:
+      upstream === null || upstream === undefined
+        ? null
+        : {
+            name: upstream.name,
+            ahead: upstream.ahead,
+            behind: upstream.behind,
+          },
+    worktreePath: wire.worktree_path,
+    compareUrl: wire.compare_url ?? null,
   };
 }
 

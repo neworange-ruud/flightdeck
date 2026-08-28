@@ -273,7 +273,7 @@ async fn next_frame(ws: &mut Ws) -> Option<ServerMsg> {
         match message {
             Ok(Message::Text(text)) => {
                 return Some(
-                    serde_json::from_str(text.as_str()).expect("the host speaks protocol v1"),
+                    serde_json::from_str(text.as_str()).expect("the host speaks the web protocol"),
                 )
             }
             Ok(Message::Close(_)) | Err(_) => return None,
@@ -314,7 +314,7 @@ async fn attach(ws: &mut Ws, seat: SeatRequest) -> ClientMsg {
 
 async fn await_snapshot(ws: &mut Ws) -> flightdeck::web::protocol::Snapshot {
     frame_matching(ws, |frame| match frame {
-        ServerMsg::Snapshot(snapshot) => Some(snapshot),
+        ServerMsg::Snapshot(snapshot) => Some(*snapshot),
         _ => None,
     })
     .await
@@ -3193,6 +3193,57 @@ fn the_snapshot_carries_the_hosts_command_inventory() {
         .any(|view| view.run.name == names::TOGGLE_SPLIT_VIEW));
 }
 
+/// SPECS §23's help and the About screen ride on the snapshot, in the host's
+/// own words (`remote-control-ll5.8`, `specs/WEB_INTERFACE.md` §6.5 R16).
+///
+/// This is the same argument the inventory test above makes, applied to the
+/// other thing both surfaces must agree about: a browser that authored its own
+/// keybinding list would be documenting a FlightDeck it is not attached to, and
+/// the drift would be invisible until somebody changed a binding. Asserting the
+/// content *matches `crate::tui::help`* is the whole point — it is what makes
+/// the desktop's overlay and the browser's one source rather than two.
+#[test]
+fn the_snapshot_carries_the_hosts_help_and_about() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    let snapshot = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Write).await;
+        await_snapshot(&mut ws).await
+    });
+
+    let help = snapshot.help.expect("this build sends its help screen");
+    assert_eq!(help, flightdeck::tui::help::help_doc(false, false));
+    assert!(
+        help.sections.iter().any(|s| s.title == "Global"),
+        "the browser must get the whole list, not a summary"
+    );
+    // Every row is both halves. A key with no description is nothing a reader
+    // can act on, and the browser renders these verbatim.
+    for section in &help.sections {
+        assert!(!section.rows.is_empty());
+        for row in &section.rows {
+            assert!(!row.keys.is_empty() && !row.description.is_empty());
+        }
+    }
+    // An ordinary run has no notes; SPECS §32's is the only one, and it is a
+    // fact about *this* run rather than a constant either surface holds.
+    assert!(help.notes.is_empty());
+
+    // One source, again: the panel the browser draws is the panel the desktop
+    // draws. (`snapshot.host_version` is deliberately *not* compared here —
+    // this harness fabricates a `HostState` with a stand-in version string,
+    // whereas a real one is built by `build_web_host_state` from the same
+    // `CARGO_PKG_VERSION` this is.)
+    let about = snapshot.about.expect("this build sends its About screen");
+    assert_eq!(about, flightdeck::tui::help::about_doc());
+    assert_eq!(about.version, env!("CARGO_PKG_VERSION"));
+    assert!(!about.credits.is_empty());
+    assert!(about.url.starts_with("https://"));
+}
+
 /// A real frame drives a real effect: `toggle_split_view` travels over the
 /// socket, is looked up in the inventory, and the action it carries — the very
 /// value the TUI's palette row holds — flips real `AppState`.
@@ -3705,10 +3756,17 @@ fn publish_dialog(
     *published = next;
 }
 
-/// D13 shared the dialog family, and one row still refuses at the socket:
-/// `show_git_status` is **not** one of D13's dialogs — nothing is being asked,
-/// so there is nothing to answer — and has no browser design at all (design turn
-/// 3). Refused at the socket, so no code path exists that could half-open it.
+/// The rows that still refuse at the socket refuse because of **where the panel
+/// would land**, not because nothing was built.
+///
+/// `show_git_status` left this test in `remote-control-ll5.8`: it is a palette
+/// row now, forwarding `ShowGitStatus`, and the host answers the asking browser
+/// with `ServerMsg::GitStatus` rather than opening a panel on the desktop
+/// (`specs/WEB_INTERFACE.md` §6.5 R16). What took its place here is
+/// `show_help`: the browser draws its own help from `Snapshot::help`, so
+/// forwarding the row would put a panel on the desktop that the person who
+/// asked cannot read. Refused at the socket, so no code path exists that could
+/// half-open it.
 ///
 /// `abandon_worktree` left this test in `remote-control-ll5.4`: it is a palette
 /// row now, forwarding `AbandonWorktree { confirm: false }`, which can only open
@@ -3722,7 +3780,7 @@ fn the_dialog_row_that_still_refuses_says_which_task_owns_it() {
     let cookie = on_runtime(harness.authenticate());
     let mut ws = on_runtime(control(&addr, &cookie));
 
-    on_runtime(command(&mut ws, 72, names::SHOW_GIT_STATUS));
+    on_runtime(command(&mut ws, 72, names::SHOW_HELP));
     let error = on_runtime(next_error(&mut ws));
     assert_eq!(error.code, ErrorCode::NotSupported);
     assert_eq!(error.seq, Some(72));
@@ -3732,6 +3790,17 @@ fn the_dialog_row_that_still_refuses_says_which_task_owns_it() {
         error.message
     );
     assert_nothing_forwarded(&harness);
+
+    // And the read-only overlay that *is* forwarded, because its facts are a
+    // fresh `git` read the snapshot cannot hold (SPECS §21).
+    on_runtime(command(&mut ws, 75, names::SHOW_GIT_STATUS));
+    let (_, _, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::SHOW_GIT_STATUS);
+    let spec = commands::lookup(&forwarded.name).expect("a forwarded name is a known name");
+    assert_eq!(
+        commands::dispatched_command(&spec.route),
+        Some(&AppCommand::ShowGitStatus)
+    );
 
     // The destructive row is forwarded now — and carries the value that asks.
     on_runtime(command(&mut ws, 73, names::ABANDON_WORKTREE));

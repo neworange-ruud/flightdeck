@@ -144,7 +144,7 @@ const app = createApp({
   },
   /**
    * 1f, `remote-control-ll5.6`. `SAVE_CONFIG_COMMAND` is a placeholder —
-   * protocol v1 has no `save_config` command yet (see `state/config.ts`'s
+   * the web protocol has no `save_config` command yet (see `state/config.ts`'s
    * module doc and the ll5.6 task report for the shape `remote-control-ll5.1`
    * needs to add). Sending it today gets whatever the host does with an
    * unrecognised command name, and `command/result` renders exactly that —

@@ -18,6 +18,28 @@ import { describe, expect, it } from "vitest";
  * The exemption list is asserted, not just applied, so that adding a second
  * exempt file is a visible change to this test rather than a quiet one-liner.
  *
+ * **Rule 3 — the state and view layers never read a clock**
+ * (`remote-control-ll5.8`). Three module docs already state this — `reduce` is
+ * pure ("no `Date.now()`/`Math.random()`"), `state/model.ts` says a component
+ * reading the clock "would be the same impurity one layer down", and
+ * `wire/adapt.ts` says a host instant dated against a local clock is "a
+ * confident guess". It was three prose rules and no check, which is the same
+ * shape rules 1 and 2 were in before this file existed. The transport owns the
+ * clock and injects it (`SessionSocket`'s `options.now`), and the access client
+ * reads the host's own `server_time_ms`; nothing under `state/` or `ui/` may
+ * ask this machine what time it is, because every time those layers render is
+ * the **host's**.
+ *
+ * **Rule 4 — the SPA's `PROTOCOL_VERSION` matches the host's**
+ * (`remote-control-ll5.8`). The two constants are a hand-maintained mirror
+ * across two languages, and the whole point of the number is to catch a tab
+ * that no longer matches its host — so the one thing it cannot survive is the
+ * *mirror itself* going stale, which makes every version check pass while the
+ * wires differ. Nothing caught that before this: `webui/e2e/chain.spec.ts`
+ * would, but it is the Playwright job, which R6 registered **non-blocking
+ * until 2026-09-10**. This is a file read and a regex, and it fails in
+ * `npm run test`.
+ *
  * It also guards D4's `FitAddon` invariant, for the same reason: it is a rule
  * that a single well-meaning import would silently undo.
  */
@@ -26,6 +48,13 @@ const SRC = new URL("..", import.meta.url).pathname;
 
 /** The palette's definitions live in exactly one file. */
 const COLOUR_VALUE_EXEMPT = ["style/tokens.css"];
+/**
+ * The two files allowed to read this machine's clock, and what each reads it
+ * for. Both are transport: `socket.ts` injects it as `options.now` so tests can
+ * drive it, and `client.ts` uses it only against the host's own
+ * `server_time_ms`. Neither is a place a rendered duration is computed.
+ */
+const CLOCK_EXEMPT = ["wire/socket.ts", "access/client.ts"];
 /** This file quotes the forbidden patterns in order to forbid them. */
 const SELF = "ui/tokens.guard.test.ts";
 
@@ -132,6 +161,37 @@ describe("palette and type-scale guard", () => {
     expect(offenders).toEqual([]);
   });
 
+  it("exempts only the transport from reading the clock", () => {
+    expect(CLOCK_EXEMPT).toEqual(["wire/socket.ts", "access/client.ts"]);
+  });
+
+  /**
+   * Every duration these layers render is a *host* instant — `since_ms`,
+   * `at_ms`, a seat's `connected 14 minutes` — and the host sends its own
+   * `server_time_ms` beside each of them precisely so the arithmetic never
+   * needs this machine's clock. A `Date.now()` here would silently substitute
+   * a clock with no relationship to the host's, and would be wrong by however
+   * far the two have drifted rather than failing outright.
+   */
+  it("reads no clock from the state or view layers", () => {
+    const clock = /\bDate\.now\s*\(|\bnew\s+Date\s*\(/g;
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (
+        file === SELF ||
+        file.endsWith(".test.ts") ||
+        CLOCK_EXEMPT.includes(file) ||
+        !(file.startsWith("state/") || file.startsWith("ui/"))
+      ) {
+        continue;
+      }
+      for (const match of readCode(file).matchAll(clock)) {
+        offenders.push(`${file}: ${match[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("sets no inline style from a component", () => {
     /** Inline styles are how the first hex literal always gets in. Layout and
      * colour belong in `main.css`; components set classes and data-attributes. */
@@ -146,6 +206,44 @@ describe("palette and type-scale guard", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("the wire version mirror", () => {
+  /**
+   * `webui/src/wire/frames.ts` restates `src/web/protocol.rs`'s
+   * `PROTOCOL_VERSION` because the SPA cannot import Rust. A mismatch is
+   * invisible in review and silently defeats the very check the constant
+   * exists for, so it is read out of both files and compared.
+   */
+  it("frames.ts declares the same PROTOCOL_VERSION as protocol.rs", () => {
+    const rust = readFileSync(
+      new URL("../../../src/web/protocol.rs", import.meta.url),
+      "utf8",
+    );
+    const host = /pub const PROTOCOL_VERSION: u16 = (\d+);/.exec(rust);
+    expect(host, "protocol.rs must declare PROTOCOL_VERSION").not.toBeNull();
+
+    const tab = /export const PROTOCOL_VERSION = (\d+);/.exec(
+      read("wire/frames.ts"),
+    );
+    expect(tab, "frames.ts must declare PROTOCOL_VERSION").not.toBeNull();
+
+    expect(tab?.[1]).toBe(host?.[1]);
+  });
+
+  /** The host serves exactly one version (D9: server and SPA ship together),
+   * so the floor and the ceiling move with it. A range that drifted open would
+   * let a stale tab attach and then fail on the first frame it cannot parse. */
+  it("the host advertises exactly its own version, with no range", () => {
+    const rust = readFileSync(
+      new URL("../../../src/web/protocol.rs", import.meta.url),
+      "utf8",
+    );
+    const of = (name: string): string | undefined =>
+      new RegExp(`pub const ${name}: u16 = (\\d+);`).exec(rust)?.[1];
+    expect(of("MIN_SUPPORTED_VERSION")).toBe(of("PROTOCOL_VERSION"));
+    expect(of("MAX_SUPPORTED_VERSION")).toBe(of("PROTOCOL_VERSION"));
   });
 });
 

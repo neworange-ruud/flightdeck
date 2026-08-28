@@ -93,6 +93,16 @@
 //! 1. **Frame and delta kinds** ([`ServerMsg`], [`ClientMsg`], [`Delta`]) carry a
 //!    `#[serde(other)]` catch-all. An unrecognised `type`/`change` parses to
 //!    `Unrecognized` and is dropped by the receiver.
+//!
+//!    **That is a crash guard, not a licence to add frames without bumping.**
+//!    These are closed vocabularies under rule 3, and dropping a frame is only
+//!    the *right* outcome when the frame carried news the peer can live
+//!    without. A frame that answers something the peer **asked for** is not
+//!    such a frame: dropping it is silence where an answer was expected, which
+//!    the user reads as a broken button. [`ServerMsg::GitStatus`] is exactly
+//!    that shape and took v2 → v3 for it; contrast [`Delta::Seats`]'s
+//!    `you_were_preempted`, an additive *field* under rule 4, where a host that
+//!    never sends it is honestly saying "this host reports no preemptions".
 //! 2. **Open vocabularies** ([`ErrorCode`], [`ShutdownReason`]) go through a
 //!    lossy string conversion, the same shape as
 //!    [`InterpretedStatus::from_str_lossy`]. An unknown code becomes `Unknown`
@@ -125,17 +135,39 @@ mod tests;
 /// The protocol version this build speaks.
 ///
 /// v1 was the M1 wire format: attach/snapshot/delta/term-bytes/input plus the
-/// seat model and the byte cursor. **v2 is D14 as revised for multi-writer
+/// seat model and the byte cursor. **v2 was D14 as revised for multi-writer
 /// input**: a seat is a writer or an observer rather than a controller or an
 /// observer, several writers may be seated at once, and [`SeatInfo::holds_input`]
 /// says which one holds the input lock right now. That is a closed vocabulary
 /// growing a member the peer must understand ([`Seat`], [`SeatRequest`]), which
 /// the forward-compatibility policy below makes a version bump by definition.
 ///
+/// **v3 is SPECS §21's read-only git panel** (`remote-control-ll5.8`,
+/// `specs/WEB_INTERFACE.md` §6.5 R16): [`ServerMsg`] grew
+/// [`ServerMsg::GitStatus`], and a frame kind is a closed vocabulary by the
+/// same rule that made `Seat` one.
+///
+/// It is a bump for a concrete failure, not for tidiness. The palette is
+/// **host-driven** (R7): the browser renders whatever [`Snapshot::commands`]
+/// lists, and this build lists `show_git_status` as a row that *runs*. So a
+/// stale v2 tab attached to a v3 host would pass the version check (both say
+/// 2), be handed the row, send it, have it accepted — and then receive a frame
+/// its `handle` switch drops on the floor. The user clicks **Show Git Status**
+/// and gets silence, with nothing anywhere reporting a fault. "Reload to
+/// update" is the honest outcome, and this constant is the only thing that can
+/// produce it.
+///
+/// Note what does *not* bump it, in the same change: [`Snapshot::help`] and
+/// [`Snapshot::about`] are additive `#[serde(default)]` `Option` fields, so a
+/// v3 browser talking to a host that sends neither reads `None` and renders
+/// the "this FlightDeck did not send its keybindings" path — a lesser panel,
+/// not a wrong one. That is rule 4, and it is why the bump is attributed to
+/// the frame kind alone.
+///
 /// It is deliberately the whole range — there is no older web protocol to
 /// interoperate with, because the browser SPA ships inside the same binary as
 /// the server (D9), and a stale tab is answered with "reload to update" rather
-/// than with a half-spoken v1.
+/// than with a half-spoken older version.
 ///
 /// That co-shipping is exactly why the constant matters. The SPA is baked in, so
 /// `flightdeck update` on the host while a tab is open leaves that tab running
@@ -148,14 +180,14 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
 /// and SPA ship in the same binary (D9), so there is no older peer to keep.
-pub const MIN_SUPPORTED_VERSION: u16 = 2;
+pub const MIN_SUPPORTED_VERSION: u16 = 3;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 2;
+pub const MAX_SUPPORTED_VERSION: u16 = 3;
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -1168,6 +1200,100 @@ pub struct DialogKey {
 }
 
 // ===========================================================================
+// The two read-only overlays (`remote-control-ll5.8`, §6.5 R16)
+// ===========================================================================
+
+/// The help screen's content, **as the host has it**.
+///
+/// Re-exported from [`crate::tui::help`] rather than restated here, for the
+/// reason this module's header gives for [`InterpretedStatus`]: the wire
+/// borrows the vocabulary by reusing the type rather than copying it. A
+/// second `HelpRow` would be a second place for the same sentence to live,
+/// and the whole point of R16's help work was to remove the copy — a browser
+/// that authored its own keybinding list would be documenting a FlightDeck it
+/// is not attached to.
+///
+/// It rides on [`Snapshot::help`] for exactly R7's reason: it changes only
+/// with the config and the run, both of which are settled before a browser
+/// attaches, so there is no change for a [`Delta`] to describe.
+pub use crate::tui::help::{AboutCredit, AboutDoc, HelpDoc, HelpNote, HelpRow, HelpSection};
+
+/// SPECS §21's git status panel, collected for one session at one moment.
+///
+/// **A read, not a state change.** Nothing here is published to every viewer
+/// and nothing here is diffed: the host collects it because a browser asked
+/// (`show_git_status`) and answers that browser alone, with
+/// [`ServerMsg::GitStatus`]. `specs/WEB_INTERFACE.md` §6.5 R8 is why it is not
+/// a [`DialogView`] — nothing is being asked, so there is nothing to confirm
+/// or cancel — and R16 is why it is not a [`Delta`] either: a fact one reader
+/// asked for is not news for everybody else.
+///
+/// Every field is something `collect_status` actually looked up. The panel's
+/// unknowns are modelled rather than zeroed:
+///
+/// * [`GitStatusView::upstream`] is `None` when the branch has never been
+///   pushed, and the ahead/behind numbers live *inside* it — so the impossible
+///   state R2 warned about (counts without an upstream to count against)
+///   cannot be built, let alone sent.
+/// * [`GitStatusView::compare_url`] is `None` unless the branch has an
+///   upstream **and** the remote is a GitHub remote. It is a URL for the user
+///   to open, never an action: SPECS §5 forbids FlightDeck from creating a
+///   pull request, and §14 gives the compare URL as the whole of what it does
+///   instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusView {
+    /// The `seq` of the [`Command`] this answers, so a browser can tell its own
+    /// request apart from a stale frame it no longer has an overlay for.
+    pub seq: u64,
+    /// The session the panel is about (SPECS §21: "for the active Agent Tab").
+    pub session_id: TabId,
+    /// That session's name, so the panel can title itself without the browser
+    /// looking the id up in a list that may have moved on.
+    pub session_name: String,
+    /// The worktree's branch.
+    pub branch: String,
+    /// The branch it was created from.
+    pub base_branch: String,
+    /// SPECS §12: commits the base branch has moved on by since creation.
+    pub base_drift: u32,
+    /// Whether the worktree has uncommitted changes.
+    pub dirty: bool,
+    /// How many paths are changed, so `dirty` can say how dirty. `0` exactly
+    /// when `dirty` is false — both come from one porcelain read.
+    pub changed_files: u32,
+    /// The upstream and the counts against it, or `None` when there is none.
+    #[serde(default)]
+    pub upstream: Option<GitUpstream>,
+    /// The absolute worktree path on the **host's** filesystem, which is not
+    /// this browser's filesystem — see [`GitStatusView::session_id`]'s
+    /// neighbours in the panel for how that is worded.
+    pub worktree_path: String,
+    /// SPECS §14's GitHub compare URL, once the branch has been pushed to a
+    /// GitHub remote. `None` is the ordinary case and renders as no row at
+    /// all — never as an empty link, and never as a URL guessed from the
+    /// branch name.
+    #[serde(default)]
+    pub compare_url: Option<String>,
+}
+
+/// The upstream half of [`GitStatusView`], present only when there is one.
+///
+/// The name and the two counts are one struct on purpose. `ahead`/`behind`
+/// beside an `Option<String>` would admit "three commits ahead of nothing",
+/// which is the same defect R2 records for the git bar's bool pair — except
+/// that here the wire is new, so it can be made unrepresentable instead of
+/// merely documented.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitUpstream {
+    /// e.g. `origin/flightdeck/fix-login-redirect`.
+    pub name: String,
+    /// Commits on the branch that the upstream does not have.
+    pub ahead: u32,
+    /// Commits on the upstream that the branch does not have.
+    pub behind: u32,
+}
+
+// ===========================================================================
 // Server -> browser
 // ===========================================================================
 
@@ -1231,6 +1357,25 @@ pub struct Snapshot {
     /// See [`CommandView`] for how a row becomes a frame.
     #[serde(default)]
     pub commands: Vec<CommandView>,
+    /// The host's help screen (SPECS §23), so the browser draws the same
+    /// keybindings the desktop does rather than a copy of them
+    /// (`remote-control-ll5.8`, §6.5 R16).
+    ///
+    /// `None` from a host that predates the field, and the browser then has
+    /// nothing to show — which is the honest answer: a locally-authored
+    /// keybinding list would be this tab documenting a FlightDeck it cannot
+    /// see. Same reasoning as [`Snapshot::commands`]'s "absent means an empty
+    /// palette, not a stand-in".
+    #[serde(default)]
+    pub help: Option<HelpDoc>,
+    /// The About screen (version, credits, home page), on the snapshot for the
+    /// same reason [`Snapshot::help`] is: static for the life of the build.
+    ///
+    /// The version here and [`Snapshot::host_version`] are the same string
+    /// from the same `CARGO_PKG_VERSION`; About renders this one so the panel
+    /// is complete on its own, and the reload chip renders that one.
+    #[serde(default)]
+    pub about: Option<AboutDoc>,
 }
 
 /// One row of the browser's command palette, as the host describes it.
@@ -1746,13 +1891,34 @@ impl<'de> Deserialize<'de> for ShutdownReason {
 pub enum ServerMsg {
     /// Everything the browser needs to paint, in one frame. Sent in reply to a
     /// successful [`Attach`].
-    Snapshot(Snapshot),
+    ///
+    /// Boxed, and the box is not an aesthetic choice: a [`Snapshot`] is two
+    /// orders of magnitude larger than the [`Ack`] beside it, and every frame
+    /// this enum carries — including one per keystroke — would otherwise be
+    /// sized for the largest one. It serialises identically; `Box` is
+    /// transparent to serde, so the wire format is unchanged.
+    Snapshot(Box<Snapshot>),
     /// One live state change.
     Delta(Delta),
     /// Raw PTY output with its byte offset (D2, Q3).
     TermBytes(TermBytes),
     /// Acknowledgement of an [`Input`] or [`Command`].
     Ack(Ack),
+    /// SPECS §21's git status panel, in answer to one viewer's
+    /// `show_git_status` (`remote-control-ll5.8`, §6.5 R16).
+    ///
+    /// Sent as [`crate::web::server::WebOutbound::Viewer`] — to the browser
+    /// that asked and to nobody else. It is not a [`Delta`] because nothing
+    /// changed: the host ran `git status` because one reader asked it to, and
+    /// broadcasting that reader's answer would put a panel on four other
+    /// screens for a question none of them posed.
+    ///
+    /// It arrives **beside** the [`Ack`] for the same `seq`, not instead of
+    /// it. The ack says the command was applied; this frame is what it
+    /// produced. A browser too old to know this variant drops it under the
+    /// forward-compatibility policy and is left with the ack, which is a
+    /// lesser answer rather than a wrong one.
+    GitStatus(GitStatusView),
     /// A refusal. Not fatal on its own — the socket stays open unless the host
     /// also sends [`ServerMsg::Shutdown`].
     Error(WireError),

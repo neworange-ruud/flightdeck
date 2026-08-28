@@ -129,6 +129,15 @@ export function reduce(state: AppState, action: AppAction): AppState {
          * reading the palette off the wire instead of compiling it in.
          */
         commands: snapshot.commands,
+        /**
+         * `remote-control-ll5.8`: SPECS §23's help and the About screen, from
+         * the host, replaced wholesale like everything else on the snapshot.
+         * `null` from a host that sends neither, and nothing is substituted —
+         * see `state/help.ts` for why a browser-authored keybinding list would
+         * be worse than none.
+         */
+        help: snapshot.help,
+        about: snapshot.about,
         /** A dated seat list completes an arriving takeover panel — see
          * `refreshArrivingIncumbent`. */
         takeover: refreshArrivingIncumbent(state.takeover, snapshot.seats),
@@ -879,6 +888,38 @@ export function reduce(state: AppState, action: AppAction): AppState {
       ];
       return { ...state, config: { ...config, pending } };
     }
+
+    /* --- The read-only overlays (remote-control-ll5.8, §6.5 R16) --------- */
+
+    /**
+     * Opening one closes the palette and replaces whatever other read-only
+     * panel was up — `readOnly` holds one overlay, so that is the type doing
+     * the work rather than a rule somebody has to remember.
+     *
+     * The palette closes because it is what opened this: 1d is the door, and
+     * leaving it standing behind the panel would mean two overlays and two
+     * `Esc`s to get back to the terminal. The same handoff `config/open`
+     * already makes from `ui/app.ts`'s `runCommand`.
+     */
+    case "help/open":
+      return { ...state, palette: null, readOnly: { kind: "help" } };
+
+    case "about/open":
+      return { ...state, palette: null, readOnly: { kind: "about" } };
+
+    /**
+     * SPECS §21's panel arrived from the host, so the overlay opens *with* its
+     * facts. There is no state in which this panel is open and empty.
+     */
+    case "gitStatus/received":
+      return {
+        ...state,
+        palette: null,
+        readOnly: { kind: "git_status", panel: action.panel },
+      };
+
+    case "readOnly/close":
+      return state.readOnly === null ? state : { ...state, readOnly: null };
 
     default: {
       // Exhaustiveness check: a new AppAction variant left unhandled above is

@@ -1531,3 +1531,258 @@
   outline: 1px solid var(--fd-accent);
   outline-offset: -1px;
 }
+
+/* ══ The read-only panels — help, About, git status ══════════════════════════
+ * `remote-control-ll5.8`, `specs/WEB_INTERFACE.md` §6.5 R16.
+ *
+ * Same posture as 1d and 1f: a layer on `.fd-frame`, over a dimmed frame, at
+ * the same z-index — `AppState.readOnly` holds one panel and the reducer closes
+ * the palette when one opens, so none of them can be up at the same time as
+ * another and there is nothing to order.
+ *
+ * The frame colour is the one difference, and it is 1g's legend rather than a
+ * new idea: *"Cyan frame = confirm/select, blue = notification, red =
+ * destructive."* These three ask nothing, so they take the blue nothing else
+ * has claimed (`--fd-info`). The panel's colour says what R8 says in prose. */
+.fd-info {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+/* Same trap as `.fd-palette[hidden]` / `.fd-config[hidden]`: the component
+ * toggles `hidden`, and `display: flex` would beat the UA stylesheet and leave
+ * a scrim over the app for ever (R5's Playwright finding). */
+.fd-info[hidden] {
+  display: none;
+}
+.fd-info__panel {
+  width: min(760px, calc(100% - 80px));
+  max-height: min(620px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-info);
+}
+/* Help is the long one — the host's whole §23 list — so it gets 1d's width and
+ * height. The other two are a dozen lines and would be a mostly-empty box at
+ * that size. */
+.fd-info__panel[data-kind="help"] {
+  width: min(900px, calc(100% - 80px));
+  height: min(620px, calc(100% - 108px));
+}
+.fd-info__head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 14px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-info) 7%, transparent);
+}
+.fd-info__title {
+  color: var(--fd-info);
+  font-weight: 700;
+}
+/* Which Agent Tab the git panel is about (SPECS §21). A fact, so it sits in
+ * the lifted tier and not with the key hints. */
+.fd-info__subtitle {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-info__close {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--fd-text-decor);
+  cursor: pointer;
+}
+.fd-info__close:focus-visible {
+  outline: 1px solid var(--fd-info);
+  outline-offset: 2px;
+}
+.fd-info__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: var(--fd-t-body);
+  color: var(--fd-text-soft);
+}
+.fd-info__foot {
+  flex: none;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid
+    color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+
+/* --- Help: two halves, one list shape ------------------------------------ */
+.fd-info__group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* 1d's group eyebrow, reused verbatim so the browser's keys and the host's
+ * read as the same kind of list. */
+.fd-info__group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 4px;
+}
+.fd-info__group-title {
+  color: var(--fd-focus);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: var(--fd-t-meta);
+}
+.fd-info__key-row {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  gap: 12px;
+  align-items: baseline;
+  padding: 2px 8px;
+}
+/* The description is the fact; the key is the instruction. Both are above the
+ * decoration tier, per 2g's rule — deleting either loses something. */
+.fd-info__key-desc {
+  color: var(--fd-text-muted);
+}
+/* The sentence between the two halves: prose, so `--fd-text-second`. */
+.fd-info__note {
+  margin: 0;
+  color: var(--fd-text-second);
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  max-width: 72ch;
+}
+/* The host's own title for its list. */
+.fd-info__host-title {
+  margin: 0;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+/* SPECS §32's isolated-run note, in the "another actor / another situation"
+ * hue 2f and the dialog origin already use, with 2e's left rule. */
+.fd-info__hostnote {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+  line-height: 1.6;
+}
+.fd-info__hostnote-title {
+  color: var(--fd-elsewhere);
+  font-weight: 700;
+}
+.fd-info__hostnote-line {
+  color: var(--fd-text-muted);
+}
+/* What the panel says when the host sent nothing. A fact about the host, so it
+ * sits in the lifted tier rather than being whispered. */
+.fd-info__absent {
+  margin: 0;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  max-width: 72ch;
+}
+
+/* --- About --------------------------------------------------------------- */
+.fd-info__about-name {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.fd-info__about-product {
+  color: var(--fd-text);
+  font-weight: 700;
+  font-size: var(--fd-t-title);
+}
+.fd-info__about-version {
+  color: var(--fd-text-quiet);
+}
+.fd-info__about-tagline {
+  margin: 0;
+  color: var(--fd-text-muted);
+  line-height: 1.7;
+  max-width: 64ch;
+}
+.fd-info__about-credits {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fd-info__about-credit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.fd-info__about-role {
+  color: var(--fd-text-second);
+}
+.fd-info__about-person {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-info__about-url,
+.fd-info__link {
+  /* 2g: `--fd-accent` is "interactive". A link is the most interactive thing
+   * on a panel that otherwise only states facts. */
+  color: var(--fd-accent);
+  overflow-wrap: anywhere;
+}
+.fd-info__about-url:focus-visible,
+.fd-info__link:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: 2px;
+}
+
+/* --- Git status (SPECS §21) ---------------------------------------------- */
+/* 2f's fact-list shape: a quiet label, the value at full contrast beside it. */
+.fd-info__fact {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 12px;
+  align-items: baseline;
+}
+.fd-info__fact-label {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fd-info__fact-value {
+  color: var(--fd-text-soft);
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.fd-info__strong {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+/* A path on the host's filesystem: a fact, and often long. */
+.fd-info__path {
+  color: var(--fd-text-muted);
+  overflow-wrap: anywhere;
+}

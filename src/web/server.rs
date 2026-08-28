@@ -109,7 +109,7 @@ pub const AUTH_EXCHANGE_PATH: &str = "/auth/exchange";
 /// be refused.
 pub const AUTH_SESSION_PATH: &str = "/auth/session";
 
-/// The WebSocket endpoint protocol v1 rides on (D12).
+/// The WebSocket endpoint the web protocol rides on (D12).
 pub const WS_PATH: &str = "/ws";
 
 // ===========================================================================
@@ -172,6 +172,20 @@ pub struct HostState {
     pub activity: Vec<ActivityEvent>,
     /// The open dialog, if any (D13).
     pub dialog: Option<DialogView>,
+    /// SPECS §23's help screen, as this build and this config have it
+    /// (`remote-control-ll5.8`, §6.5 R16).
+    ///
+    /// It lives here rather than being computed in [`Shared::snapshot_for`]
+    /// because two of its facts are the TUI's — `[ui]
+    /// use_f2_to_leave_terminal_focus` and SPECS §32's `--isolated` — and the
+    /// event loop is the only thread that holds them. Published rather than
+    /// pushed: it changes at most once per config save, so no [`Delta`]
+    /// describes it and a browser picks the current one up on its next
+    /// snapshot.
+    pub help: crate::tui::help::HelpDoc,
+    /// The About screen's content. Constant for the build; carried here so
+    /// [`Shared::snapshot_for`] has one place to read both overlays from.
+    pub about: crate::tui::help::AboutDoc,
 }
 
 impl Default for HostState {
@@ -184,6 +198,13 @@ impl Default for HostState {
             replay_capacity_bytes: 0,
             activity: Vec::new(),
             dialog: None,
+            // The defaults a server that has never heard from the event loop
+            // serves: a real help screen for a build with no config loaded is
+            // still this build's keybindings, which is better than an empty
+            // panel and is not a guess — `use_f2` and `isolated` both default
+            // to off.
+            help: crate::tui::help::help_doc(false, false),
+            about: crate::tui::help::about_doc(),
         }
     }
 }
@@ -857,6 +878,10 @@ impl Shared {
             // describe, and the browser needs it in the same frame it paints
             // the palette from.
             commands: crate::web::commands::inventory(),
+            // Both overlays are the host's own words, sent so the browser
+            // renders them rather than authoring a copy (§6.5 R16).
+            help: Some(state.help.clone()),
+            about: Some(state.about.clone()),
         }
     }
 
@@ -1570,7 +1595,7 @@ fn authenticate(
         .verify_token(&address, &presented)
 }
 
-/// `GET /ws` — the protocol v1 upgrade (D12).
+/// `GET /ws` — the web-protocol upgrade (D12).
 ///
 /// **The credential is checked before the upgrade.** An unauthenticated peer
 /// gets an HTTP refusal and no WebSocket, which is the property the tests pin:
@@ -1752,7 +1777,7 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
                         &mut sink,
                         &ServerMsg::Error(WireError::new(
                             ErrorCode::NotSupported,
-                            "frame was not valid protocol v1 JSON",
+                            "frame was not valid web-protocol JSON",
                         )),
                     )
                     .await
@@ -1850,7 +1875,7 @@ async fn send_msg(sink: &mut Sink, msg: &ServerMsg) -> Result<(), ()> {
     sink.send(Message::Text(json.into())).await.map_err(|_| ())
 }
 
-/// The text of a frame, or `None` for anything protocol v1 does not use.
+/// The text of a frame, or `None` for anything the web protocol does not use.
 ///
 /// v1 is JSON over text frames; binary frames are not part of it (terminal bytes
 /// are base64 inside the JSON, see `protocol::TermBytes`). Ping/pong are handled
@@ -1864,7 +1889,7 @@ fn message_text(message: Message) -> Option<String> {
 
 /// Parse a client frame. `None` means the bytes were not JSON at all; an unknown
 /// `type` parses fine and arrives as [`ClientMsg::Unrecognized`], which is the
-/// forward-compatibility policy protocol v1 documents.
+/// forward-compatibility policy `crate::web::protocol` documents.
 fn parse_client_msg(text: &str) -> Option<ClientMsg> {
     serde_json::from_str::<ClientMsg>(text).ok()
 }
@@ -2107,7 +2132,7 @@ async fn handle_attach(
 
     *attached = true;
     let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
-    if send_msg(sink, &ServerMsg::Snapshot(snapshot))
+    if send_msg(sink, &ServerMsg::Snapshot(Box::new(snapshot)))
         .await
         .is_err()
     {
@@ -2245,7 +2270,7 @@ async fn handle_command(
         Route::Server if spec.name == names::REQUEST_SNAPSHOT => {
             let last_input_seq = shared.registry().input_cursor(viewer_id);
             let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
-            let _ = send_msg(sink, &ServerMsg::Snapshot(snapshot)).await;
+            let _ = send_msg(sink, &ServerMsg::Snapshot(Box::new(snapshot))).await;
             let _ = send_msg(sink, &applied(command.seq)).await;
         }
         // Seat bookkeeping is this module's job (D14), so it never travels to

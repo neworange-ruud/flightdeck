@@ -1736,9 +1736,10 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 // ---------------------------------------------------------------------------
 
 /// The global help keys, as one label. Both status-bar modes render this
-/// constant; the help panel's own Global entry repeats it as a literal because
-/// `shortcut_line` needs a `'static` str, and a test asserts the two match so
-/// they cannot drift apart.
+/// constant, and so does the help screen's own Global row
+/// ([`crate::tui::help::help_doc`]) — one constant, three renderings, so the
+/// bar and the panel cannot claim different keys. A test still asserts the
+/// panel contains it, because the panel is now built elsewhere.
 pub const HELP_KEYS: &str = "F1 / Alt-h";
 
 /// Draw the mode status bar (SPECS §23).
@@ -2194,100 +2195,55 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 // ---------------------------------------------------------------------------
 
 /// Draw the help / keybindings overlay (SPECS §23).
+///
+/// The words are not here: [`crate::tui::help::help_doc`] owns them, and the
+/// browser's help overlay is drawn from the very same value
+/// (`specs/WEB_INTERFACE.md` §6.5 R16). This function is the ratatui half of
+/// that one source — it decides indentation, colour and where the hints sit,
+/// and nothing else.
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
     let overlay_area = layout::centered_overlay(area, 64, 40);
     frame.render_widget(Clear, overlay_area);
 
-    let leave_focus_key = if use_f2 {
-        "  F2"
-    } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
-        "  Shift+Esc"
-    } else {
-        "  Alt+Esc"
-    };
+    let doc = crate::tui::help::help_doc(use_f2, isolated);
 
-    let mut help_text = vec![
-        Line::from(Span::styled(
-            "FlightDeck Keyboard Shortcuts",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("Global", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Ctrl-g", "Command palette"),
-        shortcut_line("  Ctrl-q", "Quit / close app"),
-        shortcut_line("  Ctrl-n", "New Agent Session Tab"),
-        shortcut_line("  Ctrl-p", "Push current branch"),
-        shortcut_line("  Ctrl-u", "Pull base (git pull --rebase)"),
-        shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
-        shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
-        shortcut_line("  Alt-o", "Open worktree in file manager"),
-        shortcut_line("  F1 / Alt-h", "Help / keybindings"),
-        Line::raw(""),
-        Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
-        shortcut_line("  Mouse click", "Switch project (top tab row)"),
-        shortcut_line("  + project", "Open another project folder"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Agent Session Tab Navigation",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Up / Down (or Alt)", "Previous / Next Agent Session Tab"),
-        shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Session Tab by index"),
-        shortcut_line("  Mouse click", "Select Agent Session Tab"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Child Terminal Navigation",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Ctrl-t", "New child terminal"),
-        shortcut_line("  Ctrl-w", "Close active child terminal"),
-        shortcut_line(
-            "  Left / Right (or Alt)",
-            "Cycle terminal tabs (agent + shells)",
-        ),
-        shortcut_line("  Ctrl-b", "Toggle split view (terminals side by side)"),
-        shortcut_line("  Mouse click", "Select terminal tab"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Selection / Clipboard",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Drag", "Select terminal text (copies on release)"),
-        shortcut_line("  Drag past edge", "Auto-scrolls to reach offscreen text"),
-        shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
-        Line::raw(""),
-        Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
-        shortcut_line(leave_focus_key, "Leave terminal focus / focus app"),
-        shortcut_line("  Enter", "Focus active terminal"),
-        Line::raw(""),
-        Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Ctrl-s", "Set manual status"),
-        shortcut_line("  Ctrl-r", "Restart primary agent"),
-    ];
+    let mut help_text: Vec<Line> = Vec::new();
 
-    // Isolated run (SPECS §32): nothing persists and several actions are
-    // gone, so say so here first, not buried after the shortcut list. The
-    // overlay is a fixed 64x40 box with no scroll or pagination (a known,
-    // separate defect: the base 44-line shortcut list alone already clips
-    // its own tail there). Leading with the note guarantees it survives
-    // that clip regardless of terminal height, but every line it costs is a
-    // line of the existing shortcut list pushed further into the clipped
-    // tail — so it is kept to a header plus two lines, not the four the
-    // first attempt used.
-    if isolated {
-        let mut isolated_first = vec![
-            Line::from(Span::styled(
-                "Isolated run (--isolated)",
-                Style::default().fg(Color::Magenta),
-            )),
-            Line::raw("  Nothing is saved and nothing was continued."),
-            Line::raw("  One session here; no other projects, no new session tabs."),
-        ];
-        isolated_first.append(&mut help_text);
-        help_text = isolated_first;
+    // SPECS §32: an isolated run's note leads, not trails. The overlay is a
+    // fixed 64x40 box with no scroll or pagination (a known, separate defect:
+    // the base shortcut list alone already clips its own tail there), so
+    // leading with the note guarantees it survives that clip regardless of
+    // terminal height. `help_doc` puts it first for both surfaces; this loop
+    // only draws what it was given.
+    for note in &doc.notes {
+        help_text.push(Line::from(Span::styled(
+            note.title.clone(),
+            Style::default().fg(Color::Magenta),
+        )));
+        for line in &note.lines {
+            help_text.push(Line::raw(format!("  {line}")));
+        }
+    }
+
+    help_text.push(Line::from(Span::styled(
+        doc.title.clone(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    for section in &doc.sections {
+        help_text.push(Line::raw(""));
+        help_text.push(Line::from(Span::styled(
+            section.title.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+        for row in &section.rows {
+            help_text.push(shortcut_line(
+                format!("  {}", row.keys),
+                row.description.clone(),
+            ));
+        }
     }
 
     // The hints live on the bottom border, not in the shortcut list: the list is
@@ -2721,48 +2677,45 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
 /// Draw the About dialog: version, one-line description, and authorship credits.
 pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
     let accent = Color::Cyan;
-    let lines: Vec<Line> = vec![
+    let doc = crate::tui::help::about_doc();
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            format!("FlightDeck  v{}", env!("CARGO_PKG_VERSION")),
+            format!("{}  v{}", doc.name, doc.version),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "A terminal UI for orchestrating parallel AI coding agents.",
+            doc.tagline.clone(),
             Style::default().fg(Color::Gray),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("Built by ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Ruud van Falier",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("with collaboration from ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Sander Langhorst",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "https://flightdeckai.app",
-            Style::default().fg(accent),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Esc / q to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
+    for credit in &doc.credits {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", credit.role),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                credit.name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        doc.url.clone(),
+        Style::default().fg(accent),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc / q to close",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let overlay_area = layout::centered_overlay(area, 62, content_height.saturating_add(2));
@@ -2779,7 +2732,7 @@ pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
 }
 
 /// Build a shortcut description line for the help overlay.
-fn shortcut_line(keys: &'static str, desc: &'static str) -> Line<'static> {
+fn shortcut_line(keys: String, desc: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(keys, Style::default().fg(Color::Cyan)),
         Span::raw("  "),

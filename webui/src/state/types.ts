@@ -1,7 +1,10 @@
 import type {
+  AboutDoc,
   AccessScreen,
   AccessState,
   ActivityEvent,
+  GitStatusPanel,
+  HelpDoc,
   HostCommand,
   Incumbent,
   Project,
@@ -302,7 +305,52 @@ export interface AppState {
    * and a row the host stops sending stops appearing with no browser change.
    */
   readonly commands: readonly HostCommand[];
+
+  /* --- The read-only overlays (remote-control-ll5.8, §6.5 R16) ----------- */
+
+  /**
+   * Which read-only panel is open, or `null` when none is.
+   *
+   * **One field for three overlays, so "one at a time" is structural.** Help,
+   * About and git status are the same kind of thing — a titled panel that
+   * states facts and offers no answer — and two of them on screen at once
+   * would be two panels the reader has to dismiss in order. The palette and
+   * the configuration manager already work this way by convention
+   * (`ui/app.ts`'s `runCommand` closes one before opening the other); here it
+   * is a property of the type.
+   *
+   * They are *this browser's* overlays, unlike `dialog`: something local opens
+   * them, `Esc` closes them, and the host is not told either way. R8 is why —
+   * nothing is being asked, so there is nothing for a second surface to
+   * answer, and publishing a reader's read would put a panel in front of
+   * somebody who did not ask for one.
+   */
+  readonly readOnly: ReadOnlyOverlay | null;
+  /**
+   * SPECS §23's help as the host sent it, or `null` from a host that sent
+   * none. Held from the snapshot so the overlay opens instantly and from
+   * facts, rather than costing a round trip to say what the keys are.
+   */
+  readonly help: HelpDoc | null;
+  /** The About screen's version and credits, from the host's own build. */
+  readonly about: AboutDoc | null;
 }
+
+/**
+ * The three read-only panels, as a union so each carries exactly what it
+ * needs.
+ *
+ * Help and About carry nothing: their content is on `AppState.help` /
+ * `AppState.about`, sent with the snapshot, so opening them is a pure UI
+ * toggle. Git status carries its panel, because SPECS §21's facts are a fresh
+ * `git` read the snapshot cannot hold — the upstream's name, the worktree path
+ * and §14's compare URL — so it arrives with the frame that answered the
+ * request (`ServerMsg::GitStatus`) and lives here until the panel closes.
+ */
+export type ReadOnlyOverlay =
+  | { readonly kind: "help" }
+  | { readonly kind: "about" }
+  | { readonly kind: "git_status"; readonly panel: GitStatusPanel };
 
 /** A `save_config` command this browser sent and has not heard back about. */
 export interface PendingConfigSave {
@@ -426,6 +474,12 @@ export function createInitialState(): AppState {
     config: null,
     dialog: null,
     commands: [],
+    readOnly: null,
+    /** `null`, not a locally-authored keybinding list: what the host binds is
+     * the host's to say, and a stand-in would document a FlightDeck this tab
+     * is not attached to (`remote-control-ll5.8`). */
+    help: null,
+    about: null,
   };
 }
 
@@ -755,7 +809,34 @@ export type AppAction =
       readonly type: "dialog/dispatched";
       readonly seq: number;
       readonly act: "confirm" | "cancel";
-    };
+    }
+
+  /* --- The read-only overlays (1d's shell, remote-control-ll5.8) --------- */
+
+  /**
+   * `?` in App mode, or the palette's "Show Help" row.
+   *
+   * Local, and sends nothing: the keybindings are already on `state.help`
+   * from the snapshot, and the host's own row refuses to be forwarded for
+   * exactly that reason (`HELP_REFUSAL`) — dispatching it would open a panel
+   * on the desktop that the person who asked cannot read.
+   */
+  | { readonly type: "help/open" }
+  /** The palette's "About FlightDeck" row. Local, for `help/open`'s reason. */
+  | { readonly type: "about/open" }
+  /**
+   * `ServerMsg::GitStatus` arrived: the host ran SPECS §21's collection
+   * because this tab sent `show_git_status`, and this is what it found.
+   *
+   * There is deliberately no `gitStatus/open` a component could dispatch. The
+   * browser has none of these facts until the host sends them, so the only way
+   * this panel opens is with a panel in hand — which is what makes "never
+   * render a fact the host did not send" true of this overlay by construction
+   * rather than by discipline.
+   */
+  | { readonly type: "gitStatus/received"; readonly panel: GitStatusPanel }
+  /** `Esc`, the panel's own close button, or a click outside it. */
+  | { readonly type: "readOnly/close" };
 
 /**
  * Seq of `pendingInput[0]`, or the seq the *next* keystroke will get when the

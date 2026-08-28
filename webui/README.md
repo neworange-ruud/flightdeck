@@ -10,7 +10,7 @@ built: seven regions driven entirely through the reducer. So are the turn-2
 screens — the four access screens (2b), every connection state (2c), the five
 terminal treatments (2d), the activity feed (2e) and the takeover trio (2f).
 
-**The session is live.** `src/wire/` speaks protocol v1 over `GET /ws`: the
+**The session is live.** `src/wire/` speaks the web protocol over `GET /ws`: the
 host's snapshot paints the tree, `term_bytes` goes straight into xterm.js, and a
 keystroke goes back as an `input` frame. `src/state/fixture.ts` still exists, but
 only the unit tests read it now. See "The socket" below.
@@ -125,7 +125,7 @@ is decoration only (key-hint letters, counts, the `│` separator).
 
 | File | What it owns |
 | --- | --- |
-| `wire/frames.ts` | protocol v1 as TypeScript (`src/web/protocol.rs`), plus base64 both ways |
+| `wire/frames.ts` | the web protocol as TypeScript (`src/web/protocol.rs`), plus base64 both ways; `PROTOCOL_VERSION` is mirrored here and must match the Rust constant |
 | `wire/adapt.ts` | wire → `state/model.ts`; the **only** place `snake_case` becomes the app's shape |
 | `wire/socket.ts` | attach, snapshot, `term_bytes`, `input`, acks, seats, shutdown, reconnect |
 

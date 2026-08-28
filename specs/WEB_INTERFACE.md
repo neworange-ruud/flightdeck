@@ -344,7 +344,10 @@ value that satisfies all three constraints:
 > vocabularies and both grew a member the peer must understand, which the wire
 > protocol's own forward-compatibility policy makes a bump by definition. A tab
 > left open across a host update is told to reload (D9), which is the failure
-> mode that policy was written for.
+> mode that policy was written for. *(The wire is at **v3** as of R16, which
+> applied this same standard to `ServerMsg` growing `GitStatus`. `PROTOCOL_VERSION`
+> in `src/web/protocol.rs` is the live number; this paragraph records why v2
+> happened, not where the wire is.)*
 >
 > **Out of scope, and named so it is not mistaken for an oversight:** FlightDeck
 > Remote's phone reply path (`write_primary_pty`) does not claim the lock. It
@@ -557,13 +560,17 @@ required for M1.
   `--fd-text-decor` (2.9:1) is decoration only, under a rule worth quoting into
   code review: *if deleting it would lose a fact, it cannot be this colour.*
 
-**Not yet designed — needed before the milestone that uses them.** Turn 3 covers
-these (`remote-control-v4s`):
+**Not yet designed — needed before the milestone that uses them.**
 
-| Gap | Needed by | Brief item |
+| Gap | Needed by | Status |
 | --- | --- | --- |
-| Narrow viewport main screen — the below-900px slide-over 1h asserts but does not draw | M3 | §11.9 |
-| Help overlay, git-status overlay | M2 | §6.1 |
+| Narrow viewport main screen — the below-900px slide-over 1h asserts but does not draw | M3 | **still undesigned.** Turn 3 (`remote-control-v4s`, brief §11.9) was to draw it and was not run; nothing has been built against it. |
+| Help overlay, git-status overlay, About | M2 | **built without a turn** (`remote-control-ll5.8`). The repository owner decided not to run turn 3 and asked for these to be derived from the rules turns 1 and 2 established. Every token, size, frame colour and sentence is traceable; every call the artboards did not cover is listed in §6.5 **R16**, which a later turn may overrule row by row. |
+
+**Turn 3 was not run.** It remains the right way to close the narrow-viewport
+gap, and R16 is not a substitute for it — it is a record of one screen family
+derived under the standard a turn would have been held to, so that a later turn
+inherits reasoning rather than a fait accompli.
 
 **Nothing M1 needs is undesigned.** Every gap the turn-2 brief raised was
 delivered: the access screens, the connection states, the stale treatment, the
@@ -996,6 +1003,12 @@ never read".
   asked, so there is nothing to confirm or cancel; it opens a read-only overlay
   and design turn 3 owns what the browser shows instead. It was grouped with the
   dialog family before this task only because it opens a desktop overlay.
+  *(Superseded by R16: turn 3 was not run, `remote-control-ll5.8` derived the
+  browser's panel from turns 1 and 2, and the row now dispatches — the host
+  collects SPECS §21's facts and answers the asking browser with
+  `ServerMsg::GitStatus`. R8's classification is unchanged and is the reason it
+  is a per-viewer reply rather than a shared dialog or a broadcast delta;
+  `UNDESIGNED_OVERLAY_REFUSAL` is gone.)*
 
 **A dialog rides on the snapshot as well as on deltas**, because a dialog is
 state: a tab that attaches while one is open paints it from `Snapshot::dialog`
@@ -1187,7 +1200,10 @@ already drew ("no merge happened, so it is a rejection").
 
 **`show_git_status` still refuses**, unchanged and for R8's reason: it is not one
 of D13's dialogs, nothing is being asked, and design turn 3 owns what the browser
-shows instead (`remote-control-ll5.8`).
+shows instead (`remote-control-ll5.8`). *(Superseded by R16: it dispatches now,
+and its answer goes to the browser that asked rather than onto the desktop's
+screen. It is still not a dialog — that is exactly why the answer is a
+per-viewer frame.)*
 
 ### R12 — the seat's facts, and the two policy numbers, are split on the wire
 
@@ -1503,8 +1519,12 @@ changes, a required field appears, or a **closed vocabulary grows a member**.
 This is an additive `#[serde(default)]` `bool`, and `false` is the honest reading
 on a host that never sends it — *this host reports no preemptions*, which leaves
 the browser exactly where it was before the field existed rather than guessing.
-So `PROTOCOL_VERSION` stays at 2, and `webui/e2e/chain.spec.ts` needs nothing
-(it takes the number from `wire/frames`, and the number did not move).
+So `PROTOCOL_VERSION` stayed at 2 for *this* change, and
+`webui/e2e/chain.spec.ts` needed nothing (it takes the number from
+`wire/frames`, and the number did not move). *(It has since moved: R16 took the
+wire to v3 for a frame **kind**, which is a different clause of the same policy.
+The distinction this paragraph draws — an additive field is not a bump — is
+unchanged, and is exactly the distinction R16 turns on.)*
 
 **One copy change, and it is 2f's own sentence.** The evicted panel's *"the last
 one that landed was 3s ago"* clause is now dropped entirely when this tab has no
@@ -1542,6 +1562,240 @@ panel's own column order. Nothing is invented when the host marks nobody: every
 row is then named by its label, which is what a host that does not send `is_you`
 is actually saying.
 
+### R16 — the read-only overlays were derived, not designed, and here is the derivation
+
+`remote-control-ll5.8`. The help overlay, the git-status overlay and About were
+the last of §5's M2 gaps, and they were the one part of M2 that §5 listed as
+*"not yet designed"*. **Design turn 3 (`remote-control-v4s`) was not run, by the
+repository owner's decision**, with the instruction to design and build these
+three from the rules turns 1 and 2 already establish rather than to wait. That
+lifts the block; it does not lower the bar. This entry is the derivation, in the
+form a design turn's hand-off would have taken — and it is written so that a
+later turn can overrule any single row of it without having to reconstruct why
+the row is there.
+
+**The block was on the screens, not on the plumbing.** Two of the three needed
+no design input at all to be *correct*, only to be *drawn*: help and About are
+the host's own words, and the reason they had no browser surface was that
+nobody had said where the words come from. That question — R7's question — has
+one answer in this codebase, and answering it is most of the work below.
+
+#### 1. The host owns the words, for the third time
+
+R7 put the command inventory on the wire because *"the host is the only thing
+that knows what it implements"*. R2 put the git union host-side for the same
+reason. Help is the third instance and the most obvious one: a browser that
+compiled in its own keybinding list would be right until somebody changed a
+binding, and then it would be a browser confidently documenting a FlightDeck it
+is not attached to — with no test anywhere able to see it.
+
+So `src/tui/help.rs` now owns the help and About content as data, the desktop's
+`draw_help_overlay` / `draw_about_overlay` render it, and `Snapshot::help` /
+`Snapshot::about` carry the same values to the browser. The types are
+re-exported by `web::protocol` rather than restated, which is that module's own
+stated practice for `InterpretedStatus` and `TabId`. Two facts vary at runtime
+and both are read from the live `AppState` when the snapshot is built:
+`[ui] use_f2_to_leave_terminal_focus` (which of three keys leaves terminal
+focus) and SPECS §32's `--isolated`. `HELP_KEYS` is now one constant behind the
+status bar *and* the panel's own `F1 / Alt-h` row, so those cannot drift either.
+
+They ride on the snapshot for R7's reason exactly — static for the life of the
+build, so there is no change for a `Delta` to describe.
+
+#### 2. Git status dispatches; help and About do not
+
+The three overlays split, and the line is **whether the browser already has the
+facts**.
+
+* **Help and About** are on the snapshot, so their palette rows are intercepted
+  in the browser and never sent — precisely as `open_configuration` already is
+  (`remote-control-ll5.6`). The host's rows stay in `INVENTORY` and stay
+  refusing, with the refusal reworded from *"this task owns it"* to what is
+  actually true: **forwarding would open a panel on the desktop that the person
+  who asked cannot read** (`HELP_REFUSAL`, `ABOUT_REFUSAL`, and
+  `OPEN_CONFIGURATION_REFUSAL`, now a named constant so the three read as one
+  rule). The row is still the host's, so a host that stops offering the name
+  stops offering the panel.
+* **`show_git_status` dispatches.** SPECS §21 wants the upstream's *name*, the
+  worktree path and §14's compare URL; none is on the snapshot, and the compare
+  URL needs a `git remote` lookup nobody would want on the status poll. So the
+  row now carries `Route::Palette(Dispatch(ShowGitStatus))` — it reads, it
+  rewrites nothing, it creates no pull request, and R7's forwarding rule means
+  the frame's `args` are never read. `UNDESIGNED_OVERLAY_REFUSAL` is gone.
+
+**A browser's read does not open the desktop's overlay.** This is the ruling
+R8 implies and did not have to make: git status is *not* one of D13's dialogs,
+nothing is being asked, so there is nothing for the person at the machine to
+answer — and a read-only panel they never requested is an obstruction, which is
+the same judgement 2f makes when it gives an interrupted *desktop* a transient
+strip instead of a modal. `apply_effect` therefore routes one collected
+`Effect::GitStatus` two ways by origin: the desktop's own run opens the
+desktop's overlay unchanged, and a browser's run is answered to that browser
+alone with a new per-viewer `ServerMsg::GitStatus`. There is still exactly one
+`collect_status` call and one dispatch path; only the rendering differs, which
+is what §1 has always permitted.
+
+**Also accepted: protocol v2 → v3.** `ServerMsg` is a closed vocabulary and it
+grew a member the peer must understand, which the wire protocol's own
+forward-compatibility policy makes a bump by definition — the same standard D14
+applied when `Seat` and `SeatRequest` took v1 → v2. This entry originally
+claimed the opposite, reading `ServerMsg`'s `#[serde(other)]` catch-all as a
+licence to add frames freely; that is wrong, and the correction is worth keeping
+on the record because the reasoning is the interesting part.
+
+The catch-all is a **crash guard, not a compatibility guarantee**. Dropping an
+unrecognised frame is the right outcome only when the frame carried news the
+peer can live without — `Delta::Seats`'s `you_were_preempted` is that shape, and
+a host that never sends it is honestly saying "this host reports no
+preemptions". A frame that *answers something the peer asked for* is not that
+shape, and here the palette makes the failure concrete rather than theoretical:
+the inventory is host-driven (R7), so a stale **v2** tab attached to this build
+would pass the version check (both sides say 2), be handed a `show_git_status`
+row the host lists as runnable, send it, have it accepted — and then drop the
+answer on its `default` branch. The user clicks **Show Git Status** and gets
+silence, with nothing anywhere reporting a fault. That is precisely the failure
+"reload to update" exists for, and only the constant can produce it.
+
+`MIN_SUPPORTED_VERSION` and `MAX_SUPPORTED_VERSION` move with it, as always:
+server and SPA ship in one binary (D9), so a difference is a stale tab and not a
+negotiation. `webui/e2e/chain.spec.ts` needed nothing — it imports
+`PROTOCOL_VERSION` from `wire/frames` and passes it into its observer socket
+precisely so a bump is not a twenty-second timeout, which was checked rather
+than assumed.
+
+**What did *not* contribute to the bump**, stated because the two changes landed
+together: `Snapshot::help` and `Snapshot::about` are additive
+`#[serde(default)]` `Option` fields under rule 4. A v3 browser attached to a
+host that sends neither reads `None` and renders the "this FlightDeck did not
+send its keybindings" path — a lesser panel, not a wrong one — which is asserted
+by `help_and_about_are_additive_and_absent_parses_as_absent`. Nothing else this
+task added is a required field or changes an existing field's meaning.
+
+The bump is also now defended by tests rather than by this paragraph.
+`the_newest_frame_kind_is_covered_by_the_advertised_version` pins the newest
+frame kind against the version that was current when it arrived, so the next
+person to add one has to say where it stands before the crate's tests pass —
+verified to fail against an un-bumped constant, which is to say it would have
+caught this mistake. And the forward-compatibility policy's rule 1 now states
+the carve-out in the module doc itself, so the clause I misread cannot be
+misread the same way twice.
+
+(Separately: adding the two snapshot fields pushed `ServerMsg` past clippy's
+`large_enum_variant` threshold, so `ServerMsg::Snapshot` is now boxed. The wire
+format is unchanged — `Box` is transparent to serde — and every other frame,
+including one per keystroke, stops being sized for the snapshot.)
+
+#### 3. What each screen was derived from
+
+| Element | Derived from |
+| --- | --- |
+| The panel shell — titled 1px frame, head with the title, body, keyed footer | 1d/1f/1g: *"same shell for every dialog: titled 1px accent frame, keyed buttons"* |
+| **Blue** frame (`--fd-info`) on all three | 1g's own legend: *"Cyan frame = confirm/select, blue = notification, red = destructive."* Cyan is taken (1d, 1e, 1f — all of them ask you to choose), red is 1g's, magenta is 2f's. Blue is the one the legend named and nothing had claimed, and *notification* is exactly what these are |
+| Centred panel over a dimmed frame, not a slide-over | 1d and 1f, both of which are this. §5.1's *"never a modal"* is 2e's rule and is specific to it: the feed is D11's entire substitute for OS notifications, so blocking the screen would interrupt the terminal you are reading to tell you about one you are not. None of these three is a notification; each is on screen because the reader just named it in the palette |
+| `role="dialog"`, no `aria-modal`, no focus trap | every existing browser-owned overlay (`accessScreen`, `takeover`, `commandPalette`, `configManager`) |
+| Four type sizes, named tokens only | 2g, enforced by `tokens.guard.test.ts` |
+| Fact rows as `quiet label / full-contrast value` | 2f's `address / browser / connected` list |
+| Group eyebrows in `--fd-focus`, uppercase, `--fd-t-meta` | 1d's palette group headings |
+| `clean` in `--fd-ok`; drift in `--fd-elsewhere`; upstream name in `--fd-accent` | 2g names each of these meanings against those tokens (`--fd-elsewhere` = "drift"; `--fd-accent` = "interactive, **upstream**") |
+| `no-upstream` in `--fd-text-quiet` | 2g's own worked example of the lifted dim tier |
+| `host only` badge on the worktree path and on the host's key group | D16 |
+| Drift and dirty wording (`4 commits ahead since creation`, `clean`) | the desktop's own `draw_git_status_overlay`, word for word, so the two surfaces say the same sentence |
+| The compare URL as a link that says FlightDeck did not open a PR | SPECS §5 (*"must not: create GitHub PRs"*) and §14 (the compare URL is the whole of what it does) |
+| Ahead/behind absent with no upstream; no compare row with no URL | SPECS §21's *"if known"*, and §5.1's "unknown stays unknown". `WorktreeStatus` literally holds `0`/`0` when it never looked, so the wire's `GitUpstream` puts the counts **inside** the optional upstream and the impossible pair cannot be built |
+
+#### 4. The calls the artboards do not cover
+
+Each of these is a decision this task had to make. A later design turn may
+overrule any of them.
+
+1. **The help overlay has two halves.** Rendering the host's thirty chords
+   unqualified in a browser tab would be the app's first outright lie: `Ctrl-q`
+   typed here goes to the agent, because §5 gives the SPA one chord and it passes
+   the rest to the PTY. So the panel states *This browser* (authored in
+   `webui/src/state/help.ts`, every row implemented in `ui/app.ts`) and *On the
+   host* (from `Snapshot::help`), with D16's badge on the host's heading and one
+   sentence between them saying where those keys act and that the palette reaches
+   all of them. **Derived from** D16's "honest about where the effect lands" and
+   §5's palette-primary position; **not drawn by any artboard.** A turn could
+   reasonably reject the two-column framing, or badge rows instead of the group.
+2. **The badge is on the group heading, not on every row.** A badge exists to be
+   noticed and thirty of them are wallpaper; the fact is uniform across the
+   group. A turn could overrule this cheaply.
+3. **The browser binds `?` in App mode, and nothing else.** The desktop's `F1` /
+   `Alt-h` are deliberately not taken: `F1` is the browser's own help in Chrome
+   and Firefox and `Alt-h` opens a menu on Windows, and §5 gives the app exactly
+   one chord. A *plain key in App mode* is the affordance the artboards do
+   license — 2e claims `a` on exactly this reasoning ("not in Terminal mode,
+   where `a` is a letter the agent is waiting for") — and `?` is free there. The
+   palette row is the other door and needs no key at all. **A turn is free to
+   pick a different letter, or none.** The status bar was deliberately *not*
+   changed to advertise it, because 1a/1b/2e draw that bar and adding a hint is
+   an artboard change.
+4. **`Esc` closes, and the panel takes the keyboard while it is up** — the
+   posture the palette, the configuration manager and the access screens
+   already have. The panel sits over a scrim that covers the frame to the
+   pointer, so letting `a` open the activity feed *behind* it would be the app
+   doing something else while the reader is reading. Nothing is lost by
+   swallowing: since R5, terminal input comes from xterm's own `onData`, so a
+   key eaten here was only ever one of the frame's app-level shortcuts, and
+   §5.1's "queued, never dropped" is about keystrokes bound for the PTY.
+   `Tab` is the exception, exactly as it is on 2b: the panel has a link and a
+   close button, and a keyboard-only reader has to be able to reach them.
+   Clicking outside closes it, which is the pointer half of `Esc` and matches
+   1a's advertised `click outside release keys` gesture.
+5. **One overlay at a time, structurally.** `AppState.readOnly` is a union
+   holding one panel, and opening one closes the palette — the handoff
+   `config/open` already makes informally, made a property of the type.
+6. **Help is 900×620 (1d's size); About and git status are 760 wide and
+   content-height.** The artboards give no size for a short panel, and 1d's box
+   around twelve lines would be mostly empty.
+7. **The compare URL is `--fd-accent`, where the desktop's overlay uses green.**
+   2g assigns `--fd-accent` to "interactive", and a link is the most interactive
+   thing on a panel that otherwise only states facts. The desktop's green is
+   ratatui's palette, not 2g's.
+8. **`changed_files` is on the wire and rendered as `dirty · 6 files
+   uncommitted`.** SPECS §21 asks only for "dirty/clean"; the count is the one
+   number a reader immediately wants next to "dirty", and it is the host's, from
+   the same porcelain read that set the flag. A turn could drop it.
+9. **What is *not* shown.** SPECS §21 also lists "last push status, if known".
+   The host does not track it — `WorktreeStatus` has no such field and the
+   desktop's overlay does not show one either — so the browser shows nothing
+   rather than inferring one from `ahead`. The two surfaces agree, and the gap
+   is §21's to close on the host first.
+10. **About renders the host's version, never the tab's.** D9 bakes the SPA into
+    the binary, so a tab left open across an update is last version's JavaScript
+    against this version's server; `Snapshot::about.version` is the host's
+    `CARGO_PKG_VERSION`. A host that sends no About gets a sentence saying so.
+
+#### 5. What is enforced rather than asserted
+
+* `tokens.guard.test.ts` gained **rule 4 — the SPA's `PROTOCOL_VERSION` matches
+  the host's.** The two constants are a hand-maintained mirror across two
+  languages, and a stale mirror makes every version check pass while the wires
+  differ — defeating the one thing the number is for. `webui/e2e/chain.spec.ts`
+  would catch it, but that is the Playwright job, which R6 registered
+  **non-blocking until 2026-09-10**; this is a file read and a regex that fails
+  in `npm run test`. It also asserts `MIN`/`MAX` have not drifted open around
+  `PROTOCOL_VERSION`, since a range would let a stale tab attach and *then* fail
+  on the first frame it cannot parse. Verified to fail when the two are set
+  apart.
+* `tokens.guard.test.ts` gained **rule 3 — the state and view layers never read
+  a clock.** Three module docs already said this (`reduce` is pure,
+  `state/model.ts`'s "the same impurity one layer down", `wire/adapt.ts`'s "a
+  confident guess"), and it was three prose rules with no check — the same shape
+  rules 1 and 2 were in before that file existed. `wire/socket.ts` and
+  `access/client.ts` are the asserted exemptions, both transport, both dating
+  host instants against the host's own `server_time_ms`. Verified to fail when
+  violated, as were the absence tests for the ahead/behind row, the host's help
+  list and `?`'s App-mode gate.
+* The panel's absences are tests, not conventions: no upstream renders
+  `no-upstream` **and no ahead/behind row**; no compare URL renders **no compare
+  row and no link**; a host that sent no help renders a sentence saying so and
+  none of the host's rows; a refused `show_git_status` sends no panel at all.
+* `a_browsers_git_status_answers_the_browser_and_never_the_desktop`
+  (`src/lib.rs`) pins the routing decision in both directions in one test,
+  because it is one rule and a test per direction would let half of it rot.
+
 ---
 
 ## 7. Reference
@@ -1563,6 +1817,9 @@ is actually saying.
   generalise.
 - `src/web/commands.rs` — the one table behind the browser's command surface
   (R7): wire name to palette action, `host only` badges, refusals.
+- `src/tui/help.rs` — SPECS §23's help and the About screen as data, rendered by
+  the desktop and sent to the browser (R16), so neither surface documents a
+  keyboard the other does not have.
 - `src/web/arbiter.rs` — the input lock behind D14's second revision (R14): who
   may type, why 400 ms, and why no surface has precedence.
 - `src/remote/client.rs` — the blocking relay client retired by D6/D7.

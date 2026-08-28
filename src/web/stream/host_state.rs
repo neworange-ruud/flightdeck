@@ -1,4 +1,4 @@
-//! The desktop → wire adapter: `AppState` facts as protocol v1 views.
+//! The desktop → wire adapter: `AppState` facts as web-protocol views.
 //!
 //! Kept beside [`super::TerminalStreams`] because the two are called from the
 //! same place — the TUI's tick — and because the byte-stream facts

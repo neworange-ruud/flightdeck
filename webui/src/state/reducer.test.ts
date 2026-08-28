@@ -50,6 +50,12 @@ describe("createInitialState", () => {
        * host has spoken yet — so there is nothing to offer, not a local list
        * of guesses to offer instead. */
       commands: [],
+      /** `remote-control-ll5.8`: nothing is open, and neither read-only panel
+       * has content — the host has not sent its keybindings or its version, so
+       * there is nothing honest to show and nothing local to show instead. */
+      readOnly: null,
+      help: null,
+      about: null,
     });
   });
 });

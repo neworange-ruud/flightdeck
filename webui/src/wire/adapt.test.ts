@@ -175,7 +175,7 @@ describe("session", () => {
 describe("snapshot", () => {
   const wire: WireSnapshot = {
     type: "snapshot",
-    protocol_version: 2,
+    protocol_version: 3,
     host_version: "1.16.0",
     server_time_ms: 1_000_000,
     viewer_id: "v1",
@@ -219,6 +219,58 @@ describe("snapshot", () => {
 
   it("carries the host's geometry through untouched (D4)", () => {
     expect(snapshotFromWire(wire).geometry).toEqual({ cols: 120, rows: 34 });
+  });
+
+  /**
+   * `remote-control-ll5.8`: `help` and `about` are **additive** snapshot
+   * fields, and this fixture omits both — which is what a host that predates
+   * them sends. They must read as absent rather than being filled in, because
+   * a browser-authored keybinding list would document a FlightDeck this tab is
+   * not attached to.
+   *
+   * This is the wire half of the claim that the v2 → v3 bump is attributable
+   * to `ServerMsg::GitStatus` alone (§6.5 R16): if either of these needed the
+   * peer to understand it, this test could not pass.
+   */
+  it("reads a host that sent no help or About as having sent none", () => {
+    const snapshot = snapshotFromWire(wire);
+    expect(snapshot.help).toBeNull();
+    expect(snapshot.about).toBeNull();
+    /** And nothing else on the snapshot was disturbed by their absence. */
+    expect(snapshot.projects).toHaveLength(1);
+    expect(snapshot.geometry).toEqual({ cols: 120, rows: 34 });
+  });
+
+  it("reads an explicit null the same way as an omitted field", () => {
+    const snapshot = snapshotFromWire({ ...wire, help: null, about: null });
+    expect(snapshot.help).toBeNull();
+    expect(snapshot.about).toBeNull();
+  });
+
+  /** And a host that *does* send them hands the words through untouched. */
+  it("passes the host's help and About through verbatim", () => {
+    const snapshot = snapshotFromWire({
+      ...wire,
+      help: {
+        title: "FlightDeck Keyboard Shortcuts",
+        sections: [
+          { title: "Global", rows: [{ keys: "Ctrl-g", description: "Palette" }] },
+        ],
+      },
+      about: {
+        name: "FlightDeck",
+        version: "1.16.0",
+        tagline: "A terminal UI.",
+        credits: [{ role: "Built by", name: "Ruud van Falier" }],
+        url: "https://flightdeckai.app",
+      },
+    });
+    expect(snapshot.help?.sections[0]?.rows[0]?.keys).toBe("Ctrl-g");
+    /** `notes` is absent on the wire and empty here — an ordinary run has
+     * none, which is a fact rather than a failure to read one. */
+    expect(snapshot.help?.notes).toEqual([]);
+    expect(snapshot.about?.version).toBe("1.16.0");
+    expect(snapshot.about?.credits[0]?.name).toBe("Ruud van Falier");
   });
 
   it("marks the desktop seat by its absent viewer id", () => {
@@ -437,3 +489,4 @@ describe("base64", () => {
     expect([...first, ...second]).toEqual([0xc3, 0xa9]);
   });
 });
+

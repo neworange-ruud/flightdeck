@@ -302,11 +302,21 @@ describe("D16 and refusals come from the host, never from here", () => {
 
   it("a refused row is still offered — visible and honest beats hidden", () => {
     const commands = paletteInventory(stateWithSnapshot());
-    for (const name of ["pull_base", "show_git_status", "pair_phone"]) {
+    for (const name of ["pull_base", "show_help", "pair_phone"]) {
       const row = commands.find((c) => c.run.name === name);
       expect(row).toBeDefined();
       expect(row?.refusal).not.toBeNull();
     }
+  });
+
+  /** `show_git_status` stopped being a refusal in `remote-control-ll5.8`
+   * (§6.5 R16): the host runs SPECS §21's collection and answers this tab with
+   * the panel, so the row carries no refusal and keeps artboard 1d's own tag. */
+  it("show_git_status runs now, and keeps 1d's tag", () => {
+    const commands = paletteInventory(stateWithSnapshot());
+    const row = commands.find((c) => c.run.name === "show_git_status");
+    expect(row?.refusal).toBeNull();
+    expect(row?.annotation).toBe("worktree detail");
   });
 });
 

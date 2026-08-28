@@ -1,5 +1,5 @@
 /**
- * Protocol v1 on the wire, as TypeScript (`src/web/protocol.rs`).
+ * The web protocol on the wire, as TypeScript (`src/web/protocol.rs`).
  *
  * These are the shapes the host actually serializes, spelled `snake_case`
  * because that is what arrives — the translation into the app's own
@@ -8,26 +8,46 @@
  * render rather than the shape the host happens to send (the mapping decision
  * `remote-control-hgqy` left to whoever wired the socket).
  *
- * Only the frames M1's browser has to understand are typed here. The unions are
- * deliberately **open**: every `switch` on `type` (and on a delta's `change`)
- * ends in a branch that ignores what it does not know, because the host's
- * forward-compatibility policy is "a newer host may send frames an older tab
- * has never heard of, and the tab must not drop the socket over it".
+ * The unions are deliberately **open**: every `switch` on `type` (and on a
+ * delta's `change`) ends in a branch that ignores what it does not know,
+ * because the host's forward-compatibility policy is "a newer host may send
+ * frames an older tab has never heard of, and the tab must not drop the socket
+ * over it".
+ *
+ * That openness is a **crash guard, not a substitute for the version check**.
+ * Dropping an unknown frame is the right outcome only when the frame carried
+ * news the tab can live without; a frame that answers something the tab
+ * *asked for* becomes silence where the user expected an answer. So a new
+ * frame kind still bumps `PROTOCOL_VERSION` — see below.
  */
 
 /**
  * The version this tab speaks. Must match `protocol::PROTOCOL_VERSION`.
  *
- * v2 is D14 as revised: a seat is a writer or an observer, several writers may
+ * v2 was D14 as revised: a seat is a writer or an observer, several writers may
  * be seated at once, and `holds_input` says which one has the turn. `Seat` and
  * `SeatRequest` are closed vocabularies and both grew a member, which the wire
  * protocol's forward-compatibility policy makes a bump by definition — a tab
  * left open across a host update is told to reload rather than served a
  * half-spoken protocol.
+ *
+ * **v3 adds `git_status`** (`remote-control-ll5.8`), and the reason is the
+ * concrete one rather than the formal one. The palette is host-driven: this
+ * tab renders whatever `Snapshot::commands` lists, and a v3 host lists
+ * `show_git_status` as a row that runs. A stale v2 tab would therefore pass
+ * the version check, be handed the row, send it, have it accepted — and then
+ * hit `handle`'s `default` branch and drop the answer. The user clicks
+ * **Show Git Status** and nothing happens, with no error anywhere. Reloading
+ * is the honest outcome, and this constant is what produces it.
+ *
+ * `Snapshot.help` / `Snapshot.about` did *not* contribute to the bump: both
+ * are additive optional fields, and a host that sends neither leaves this tab
+ * rendering its "did not send its keybindings" path, which is a lesser panel
+ * rather than a wrong one.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
-/** `GET /ws` — protocol v1, JSON over **text** frames, no subprotocol. */
+/** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
 
 export interface WireGeometry {
@@ -255,6 +275,84 @@ export interface WireCommandView {
   readonly refusal?: string | null;
 }
 
+/**
+ * SPECS §23's help screen, as `src/tui/help.rs` has it. The desktop's overlay
+ * and this one are drawn from the same value: the host builds it once and
+ * sends it, so neither surface can document a keyboard the other does not have
+ * (`specs/WEB_INTERFACE.md` §6.5 R16).
+ */
+export interface WireHelpDoc {
+  readonly title: string;
+  /** Prose that must be read *before* the shortcuts — SPECS §32's isolated-run
+   * note is the only one this build sends. Absent on an ordinary run. */
+  readonly notes?: readonly WireHelpNote[];
+  readonly sections: readonly WireHelpSection[];
+}
+
+export interface WireHelpNote {
+  readonly title: string;
+  readonly lines: readonly string[];
+}
+
+export interface WireHelpSection {
+  readonly title: string;
+  readonly rows: readonly WireHelpRow[];
+}
+
+export interface WireHelpRow {
+  /** Not always a key: `Mouse click`, `Drag past edge` and `+ project` are
+   * rows too, because SPECS §22's interaction model is not only the keyboard. */
+  readonly keys: string;
+  readonly description: string;
+}
+
+/** The About screen's version and credits, from the host's own build. */
+export interface WireAboutDoc {
+  readonly name: string;
+  readonly version: string;
+  readonly tagline: string;
+  readonly credits: readonly WireAboutCredit[];
+  readonly url: string;
+}
+
+export interface WireAboutCredit {
+  readonly role: string;
+  readonly name: string;
+}
+
+/**
+ * SPECS §21's git status panel, in answer to one viewer's `show_git_status`
+ * (`remote-control-ll5.8`, §6.5 R16).
+ *
+ * A per-viewer reply, not a delta: nothing changed, the host ran `git status`
+ * because *this* tab asked. It arrives beside the `ack` for the same `seq` —
+ * the ack says the command was applied, this says what it produced.
+ *
+ * Two fields are optional and both mean **absent**, never zero:
+ * `upstream` is missing until the branch has been pushed (and the ahead/behind
+ * counts live inside it, so there is no way to receive commits ahead of a
+ * remote that does not exist), and `compare_url` is missing unless the remote
+ * is a GitHub remote that has the branch.
+ */
+export interface WireGitStatus {
+  readonly type: "git_status";
+  readonly seq: number;
+  readonly session_id: string;
+  readonly session_name: string;
+  readonly branch: string;
+  readonly base_branch: string;
+  readonly base_drift: number;
+  readonly dirty: boolean;
+  readonly changed_files: number;
+  readonly upstream?: {
+    readonly name: string;
+    readonly ahead: number;
+    readonly behind: number;
+  } | null;
+  readonly worktree_path: string;
+  readonly compare_url?: string | null;
+}
+
 export interface WireSnapshot {
   readonly type: "snapshot";
   readonly protocol_version: number;
@@ -286,6 +384,19 @@ export interface WireSnapshot {
    * what the host-sent inventory exists to prevent.
    */
   readonly commands?: readonly WireCommandView[];
+  /**
+   * SPECS §23's help screen (`remote-control-ll5.8`). It rides here for
+   * `commands`'s reason exactly: static for the life of the host build, so
+   * there is no change for a `Delta` to describe.
+   *
+   * Absent from a host that predates it, and the browser then has no help to
+   * show — which is the honest answer. A locally-authored keybinding list
+   * would be this tab documenting a FlightDeck it cannot see, which is the
+   * same failure the host-sent `commands` inventory exists to prevent.
+   */
+  readonly help?: WireHelpDoc | null;
+  /** The About screen, on the snapshot for `help`'s reason. */
+  readonly about?: WireAboutDoc | null;
 }
 
 export interface WireTermBytes {
@@ -353,6 +464,7 @@ export type ServerFrame =
   | WireAck
   | WireError
   | WireShutdown
+  | WireGitStatus
   | WireDeltaEnvelope
   | { readonly type: string };
 

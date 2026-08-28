@@ -199,6 +199,11 @@ fn snapshot() -> Snapshot {
         activity: vec![activity_event()],
         dialog: Some(dialog_view()),
         commands: vec![command_view()],
+        // Both overlays present, and the help one built for an isolated run
+        // with `use_f2` on, so the round trip carries the two fields that
+        // actually vary (`remote-control-ll5.8`, §6.5 R16).
+        help: Some(crate::tui::help::help_doc(true, true)),
+        about: Some(crate::tui::help::about_doc()),
     }
 }
 
@@ -269,11 +274,36 @@ fn all_deltas() -> Vec<Delta> {
     ]
 }
 
+/// SPECS §21's panel with every optional field populated, so the round trip
+/// cannot skip one (`remote-control-ll5.8`, §6.5 R16). The absent forms are
+/// exercised separately, below.
+fn git_status_view() -> GitStatusView {
+    GitStatusView {
+        seq: 41,
+        session_id: TabId("tab_1".into()),
+        session_name: "fix-login-redirect".into(),
+        branch: "flightdeck/fix-login-redirect".into(),
+        base_branch: "main".into(),
+        base_drift: 4,
+        dirty: true,
+        changed_files: 6,
+        upstream: Some(GitUpstream {
+            name: "origin/flightdeck/fix-login-redirect".into(),
+            ahead: 3,
+            behind: 1,
+        }),
+        worktree_path: "/repo/../worktrees/fix-login-redirect".into(),
+        compare_url: Some(
+            "https://github.com/o/r/compare/main...flightdeck/fix-login-redirect".into(),
+        ),
+    }
+}
+
 /// Every [`ServerMsg`] variant except the `Unrecognized` catch-all, which is
 /// deserialize-only by design and covered by the forward-compat tests.
 fn all_server_msgs() -> Vec<ServerMsg> {
     let mut msgs = vec![
-        ServerMsg::Snapshot(snapshot()),
+        ServerMsg::Snapshot(Box::new(snapshot())),
         ServerMsg::TermBytes(TermBytes {
             terminal_id: TerminalId::new("tab_1:primary"),
             offset: 512,
@@ -286,6 +316,7 @@ fn all_server_msgs() -> Vec<ServerMsg> {
             detail: Some("read-only viewer".into()),
         }),
         ServerMsg::Error(WireError::seat_held(seat_info())),
+        ServerMsg::GitStatus(git_status_view()),
         ServerMsg::Shutdown {
             reason: ShutdownReason::HostQuit,
             self_initiated: true,
@@ -401,17 +432,54 @@ fn ids_are_plain_json_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn protocol_version_is_two_and_the_whole_supported_range() {
-    // v2 is D14 as revised: `Seat` and `SeatRequest` are closed vocabularies and
-    // both grew a member the peer must understand, which the module's
-    // forward-compatibility policy makes a bump by definition. There is still no
-    // range, because server and SPA ship in one binary (D9) and a stale tab is
-    // told to reload rather than served a half-spoken protocol.
-    assert_eq!(PROTOCOL_VERSION, 2);
-    assert_eq!(MIN_SUPPORTED_VERSION, 2);
-    assert_eq!(MAX_SUPPORTED_VERSION, 2);
+fn protocol_version_is_three_and_the_whole_supported_range() {
+    // v2 was D14 as revised: `Seat` and `SeatRequest` are closed vocabularies
+    // and both grew a member the peer must understand. **v3 is
+    // `ServerMsg::GitStatus`** (`remote-control-ll5.8`), a frame kind growing a
+    // member — the same clause, applied to the same kind of vocabulary.
+    //
+    // The `#[serde(other)]` catch-all on `ServerMsg` is what makes a stale tab
+    // *survive* an unknown frame; it is not what makes the frame safe to add
+    // without a bump. Here it would be actively harmful: the palette is
+    // host-driven (R7), so a v2 tab would be handed the `show_git_status` row
+    // by a v3 host, send it, have it accepted, and then drop the answer — a
+    // button that does nothing, with no error anywhere.
+    //
+    // There is still no range, because server and SPA ship in one binary (D9)
+    // and a stale tab is told to reload rather than served a half-spoken
+    // protocol.
+    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(MIN_SUPPORTED_VERSION, 3);
+    assert_eq!(MAX_SUPPORTED_VERSION, 3);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
+}
+
+/// The bump's own reason, as a property rather than as a comment: **every
+/// `ServerMsg` this build can send is one a peer at `PROTOCOL_VERSION` knows**.
+///
+/// This is the check that would have caught `remote-control-ll5.8` shipping
+/// `GitStatus` at v2. It cannot enumerate a *future* variant, so what it pins
+/// instead is the pairing: the newest frame kind added, and the version that
+/// was current when it was added. A variant added without touching either
+/// leaves this test asserting a version that no longer covers the wire, and the
+/// next person to add one has to read this comment to update it.
+#[test]
+fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
+    // `GitStatus` arrived with v3. If you are adding a frame kind and this line
+    // still says 3, the answer is almost certainly a bump — see the module doc's
+    // forward-compatibility rule 1.
+    let newest_frame_kind_arrived_in = 3;
+    assert_eq!(
+        PROTOCOL_VERSION, newest_frame_kind_arrived_in,
+        "a frame kind was added without bumping PROTOCOL_VERSION: a peer at the \
+         advertised version would silently drop it"
+    );
+
+    // And it really is a frame this build sends, so the pairing above is about
+    // live code rather than a number kept in step with nothing.
+    let frame = ServerMsg::GitStatus(git_status_view());
+    assert_eq!(serde_json::to_value(&frame).unwrap()["type"], "git_status");
 }
 
 #[test]
@@ -421,31 +489,96 @@ fn matching_version_is_accepted() {
 
 #[test]
 fn mismatched_version_is_representable_and_detectable() {
-    // A stale tab left open across `flightdeck update`: the page still speaks
-    // v1's seat model, this host speaks v2's. Exactly the case D14's revision
-    // creates, and the reason it is a bump rather than an additive field.
-    let err = check_version(1).expect_err("v1 must not be accepted by a v2 host");
+    // A stale tab left open across `flightdeck update`. **v2 is the case that
+    // matters now** (`remote-control-ll5.8`): that tab speaks D14's seat model
+    // perfectly well, so nothing about it *looks* broken — but it does not know
+    // `git_status`, and the host's own palette inventory would hand it the row
+    // that produces one. Refusing the attach is what turns a dead button into
+    // "reload to update".
+    let err = check_version(2).expect_err("v2 must not be accepted by a v3 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 2,
-            peer: 1,
-            min_supported: 2,
-            max_supported: 2,
+            local: 3,
+            peer: 2,
+            min_supported: 3,
+            max_supported: 3,
         }
     );
+    // v1 is equally refused, and for D14's original reason.
+    assert!(check_version(1).is_err());
     // Newer than our ceiling is equally a mismatch — there is no downgrade path,
     // because server and SPA ship together.
-    assert!(check_version(3).is_err());
+    assert!(check_version(4).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
     let value = serde_json::to_value(&frame).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
-    assert_eq!(value["version"]["peer"], 1);
-    assert_eq!(value["version"]["max_supported"], 2);
+    assert_eq!(value["version"]["peer"], 2);
+    assert_eq!(value["version"]["max_supported"], 3);
     assert_eq!(round_trip(&frame), frame);
+}
+
+/// SPECS §21's two absences survive the wire as absences
+/// (`remote-control-ll5.8`, §6.5 R16).
+///
+/// Both are the same failure if they leak: `upstream: None` is a branch that
+/// was never pushed, and the ahead/behind counts live *inside* the upstream so
+/// that "three commits ahead of nothing" is not a value this type can hold —
+/// the defect R2 could only document for the git bar's bool pair is
+/// unrepresentable here. `compare_url: None` is a branch with no GitHub
+/// compare page; SPECS §5 forbids creating a pull request, so a fabricated URL
+/// would invite the user to a page that may not exist.
+#[test]
+fn a_git_panel_with_no_upstream_carries_no_counts_and_no_compare_url() {
+    let view = GitStatusView {
+        upstream: None,
+        compare_url: None,
+        ..git_status_view()
+    };
+    let value = serde_json::to_value(&view).unwrap();
+    assert_eq!(value["upstream"], serde_json::Value::Null);
+    assert_eq!(value["compare_url"], serde_json::Value::Null);
+    // There is nowhere on the frame for a count to hide.
+    assert!(value.get("ahead").is_none());
+    assert!(value.get("behind").is_none());
+    assert_eq!(round_trip(&view), view);
+
+    // And a host that omits the keys entirely reads the same way, rather than
+    // failing to parse — `#[serde(default)]` on both.
+    let mut older = serde_json::to_value(&view).unwrap();
+    let obj = older.as_object_mut().unwrap();
+    obj.remove("upstream");
+    obj.remove("compare_url");
+    let parsed: GitStatusView = serde_json::from_value(older).unwrap();
+    assert!(parsed.upstream.is_none());
+    assert!(parsed.compare_url.is_none());
+}
+
+/// The two snapshot fields `remote-control-ll5.8` added are **additive**, which
+/// is why the v2 → v3 bump is attributed to [`ServerMsg::GitStatus`] alone.
+///
+/// A host that sends neither is a host with nothing to say about its own
+/// keyboard or version, and the browser renders the "did not send its
+/// keybindings" path rather than a locally-authored stand-in. That is rule 4 of
+/// the forward-compatibility policy: a lesser panel, not a wrong one.
+#[test]
+fn help_and_about_are_additive_and_absent_parses_as_absent() {
+    let mut value = serde_json::to_value(snapshot()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    assert!(obj.contains_key("help") && obj.contains_key("about"));
+    obj.remove("help");
+    obj.remove("about");
+
+    let parsed: Snapshot = serde_json::from_value(value).expect("still parses");
+    assert!(parsed.help.is_none());
+    assert!(parsed.about.is_none());
+    // Nothing else about the snapshot moved, so neither field is load-bearing
+    // for anything but its own panel.
+    assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(parsed.projects.len(), snapshot().projects.len());
 }
 
 #[test]
@@ -454,7 +587,7 @@ fn snapshot_carries_the_version_for_the_browser_to_compare() {
     // baked-in constant. A newer host talking to this build is detectable.
     let mut snap = snapshot();
     snap.protocol_version = PROTOCOL_VERSION + 1;
-    let value = serde_json::to_value(ServerMsg::Snapshot(snap)).unwrap();
+    let value = serde_json::to_value(ServerMsg::Snapshot(Box::new(snap))).unwrap();
     let parsed: ServerMsg = serde_json::from_value(value).unwrap();
     let ServerMsg::Snapshot(parsed) = parsed else {
         panic!("expected a snapshot");
@@ -551,7 +684,7 @@ fn terminal_view_lets_a_viewer_detect_loss_before_any_bytes_arrive() {
 
 #[test]
 fn snapshot_carries_the_hosts_authoritative_geometry() {
-    let value = serde_json::to_value(ServerMsg::Snapshot(snapshot())).unwrap();
+    let value = serde_json::to_value(ServerMsg::Snapshot(Box::new(snapshot()))).unwrap();
     assert_eq!(value["geometry"]["cols"], 120);
     assert_eq!(value["geometry"]["rows"], 34);
     // And per terminal, so a non-selected terminal letterboxes correctly too.

@@ -1,5 +1,7 @@
 import type {
+  AboutDoc,
   ActivityEvent,
+  HelpDoc,
   HostCommand,
   Project,
   SeatInfo,
@@ -362,6 +364,66 @@ export function fixtureSnapshot(): Snapshot {
     dialog: null,
     /** `remote-control-ll5.12`: the palette renders this and nothing else. */
     commands: fixtureCommands(),
+    /** `remote-control-ll5.8`: SPECS §23's help and the About screen, as this
+     * host would send them. The fixture carries the *real* shape — sections
+     * with rows, and no notes, which is what an ordinary (non-isolated) run
+     * looks like — so a component that stopped rendering the host's half
+     * cannot keep passing. */
+    help: fixtureHelp(),
+    about: fixtureAbout(),
+  };
+}
+
+/**
+ * SPECS §23's help as the host sends it (`src/tui/help.rs`), trimmed to three
+ * sections.
+ *
+ * Trimmed rather than complete on purpose: the point of the fixture is that
+ * the browser renders *whatever the host sent*, so a shorter list is the
+ * stronger test — a component that had its own copy of the real list would
+ * render more rows than this and fail.
+ */
+export function fixtureHelp(): HelpDoc {
+  return {
+    title: "FlightDeck Keyboard Shortcuts",
+    notes: [],
+    sections: [
+      {
+        title: "Global",
+        rows: [
+          { keys: "Ctrl-g", description: "Command palette" },
+          { keys: "Ctrl-q", description: "Quit / close app" },
+          { keys: "F1 / Alt-h", description: "Help / keybindings" },
+        ],
+      },
+      {
+        title: "Projects",
+        rows: [
+          { keys: "Mouse click", description: "Switch project (top tab row)" },
+        ],
+      },
+      {
+        title: "Focus",
+        rows: [
+          { keys: "Alt+Esc", description: "Leave terminal focus / focus app" },
+          { keys: "Enter", description: "Focus active terminal" },
+        ],
+      },
+    ],
+  };
+}
+
+/** The About screen as the host sends it. */
+export function fixtureAbout(): AboutDoc {
+  return {
+    name: "FlightDeck",
+    version: "1.16.0",
+    tagline: "A terminal UI for orchestrating parallel AI coding agents.",
+    credits: [
+      { role: "Built by", name: "Ruud van Falier" },
+      { role: "with collaboration from", name: "Sander Langhorst" },
+    ],
+    url: "https://flightdeckai.app",
   };
 }
 
@@ -744,10 +806,12 @@ export function fixtureCommands(): readonly HostCommand[] {
       run: { name: "show_git_status" },
       hostOnly: false,
       answersDialog: false,
-      annotation: null,
+      /** Artboard 1d's own tag for this row. */
+      annotation: "worktree detail",
       target: null,
-      refusal:
-        "Git status opens a read-only overlay on the desktop, and the browser has no design for it yet (design turn 3). It is not one of D13's shared dialogs: nothing is being asked, so there is nothing to answer from here.",
+      /** `remote-control-ll5.8`: the host runs it and answers this tab with
+       * SPECS §21's panel (`ServerMsg::GitStatus`). */
+      refusal: null,
     },
     {
       id: "new_child_terminal",
@@ -906,7 +970,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       annotation: null,
       target: null,
       refusal:
-        "The help overlay is a browser surface of its own (remote-control-ll5.8); this build would only open it on the desktop.",
+        "Help is a browser surface of its own: this row opens the browser's help overlay, drawn from the keybindings this host sent with the snapshot. Forwarding it would open a panel on the desktop instead, where the person who asked cannot read it.",
     },
     {
       id: "about_flightdeck",
@@ -918,7 +982,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       annotation: null,
       target: null,
       refusal:
-        "The About dialog is a browser surface of its own (remote-control-ll5.8); this build would only open it on the desktop.",
+        "About is a browser surface of its own: this row opens the browser's About panel, drawn from the version and credits this host sent with the snapshot. Forwarding it would open a panel on the desktop instead.",
     },
     {
       id: "quit",

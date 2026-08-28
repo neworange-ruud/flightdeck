@@ -1,5 +1,5 @@
 /**
- * The live session: protocol v1 over `GET /ws` (D12).
+ * The live session: the web protocol over `GET /ws` (D12).
  *
  * This is the half of the app `src/main.ts` used to fake. Everything the screen
  * shows now comes from the host: the snapshot paints the tree, `term_bytes`
@@ -25,6 +25,7 @@ import type { Store } from "../ui/store";
 import {
   agoLabel,
   dialogOf,
+  gitStatusOf,
   seatOf,
   snapshotFromWire,
   statusFromLabel,
@@ -40,6 +41,7 @@ import {
   type WireDialogView,
   type WireError,
   type WireGeometry,
+  type WireGitStatus,
   type WireSeatInfo,
   type WireShutdown,
   type WireSnapshot,
@@ -547,6 +549,27 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     }
   }
 
+  /**
+   * SPECS §21's panel, in answer to this tab's `show_git_status`
+   * (`remote-control-ll5.8`, `specs/WEB_INTERFACE.md` §6.5 R16).
+   *
+   * Per-viewer, so it only ever arrives because *this* tab asked — the host
+   * does not broadcast one reader's read. It comes beside the `ack` for the
+   * same seq rather than instead of it: `onAck` above settles the palette row
+   * ("applied"), and this opens the panel with what the command produced.
+   *
+   * Nothing is filtered on the seq here. The frame is addressed to this
+   * viewer and carries the seq for the reader's benefit; dropping a panel
+   * because a seq did not match a queue this function does not own would lose
+   * an answer the host really sent.
+   */
+  function onGitStatus(frame: WireGitStatus): void {
+    store.dispatch({
+      type: "gitStatus/received",
+      panel: gitStatusOf(frame),
+    });
+  }
+
   function onShutdown(frame: WireShutdown): void {
     const reason = shutdownReason(frame.reason);
     /** Q5: a deliberate quit is a terminal state, not a network failure. Only
@@ -576,6 +599,9 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         return;
       case "ack":
         onAck(frame as WireAck);
+        return;
+      case "git_status":
+        onGitStatus(frame as WireGitStatus);
         return;
       case "error":
         onError(frame as WireError);

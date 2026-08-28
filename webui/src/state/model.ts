@@ -179,6 +179,103 @@ export interface HostCommand {
   readonly refusal: string | null;
 }
 
+/**
+ * SPECS §23's help screen, **as the host sent it** (`remote-control-ll5.8`,
+ * `specs/WEB_INTERFACE.md` §6.5 R16).
+ *
+ * The browser holds no keybinding list of its own for the *host's* keyboard,
+ * for `HostCommand`'s reason exactly: a copy would be right until somebody
+ * changed a binding, and then it would be a browser confidently documenting a
+ * FlightDeck it is not attached to. `src/tui/help.rs` is the one source; the
+ * desktop's overlay and this one are two renderings of it.
+ *
+ * What the browser *does* author is its own half — `Ctrl-g`, `Esc Esc`, `a`,
+ * `?` — because those are facts about a tab and the host does not run it. See
+ * `state/help.ts`.
+ */
+export interface HelpDoc {
+  readonly title: string;
+  /** Read before the shortcuts, not after: SPECS §32's isolated-run note is
+   * the only one this build sends, and it is empty on an ordinary run. */
+  readonly notes: readonly HelpNote[];
+  readonly sections: readonly HelpSection[];
+}
+
+export interface HelpNote {
+  readonly title: string;
+  readonly lines: readonly string[];
+}
+
+export interface HelpSection {
+  readonly title: string;
+  readonly rows: readonly HelpRow[];
+}
+
+export interface HelpRow {
+  /** Not always a key — `Mouse click` and `+ project` are rows too. */
+  readonly keys: string;
+  readonly description: string;
+}
+
+/** The About screen: this host's version, and who made it. */
+export interface AboutDoc {
+  readonly name: string;
+  readonly version: string;
+  readonly tagline: string;
+  readonly credits: readonly AboutCredit[];
+  readonly url: string;
+}
+
+export interface AboutCredit {
+  readonly role: string;
+  readonly name: string;
+}
+
+/**
+ * SPECS §21's git status panel for one session, as the host collected it.
+ *
+ * Every field is a fact the host looked up. The two that can be missing are
+ * modelled as missing rather than as zero, which is 2g's dim-tier rule applied
+ * to structure instead of to colour: `git: ?` and `no-upstream` exist because
+ * *absence of information is still information*, and a `↑0 ↓0` on a branch
+ * that was never pushed would be information that is false.
+ */
+export interface GitStatusPanel {
+  /** The `Command` seq this answers, so a stale frame can be told apart from
+   * the answer to the request this tab actually made. */
+  readonly seq: number;
+  readonly sessionId: string;
+  readonly sessionName: string;
+  readonly branch: string;
+  readonly baseBranch: string;
+  /** SPECS §12: commits the base has moved on by since the tab was created. */
+  readonly baseDrift: number;
+  readonly dirty: boolean;
+  /** How many paths are changed; `0` exactly when `dirty` is false. */
+  readonly changedFiles: number;
+  /** `null` until the branch has been pushed. The counts live inside it, so
+   * "three commits ahead of nothing" is not a state this type can hold. */
+  readonly upstream: GitUpstream | null;
+  /** On the **host's** filesystem, which is not this browser's. */
+  readonly worktreePath: string;
+  /**
+   * SPECS §14's GitHub compare URL, once the branch has been pushed to a
+   * GitHub remote. `null` renders as no row at all.
+   *
+   * It is a link for the user to open and nothing more. SPECS §5 forbids
+   * FlightDeck from creating a pull request, and §14 gives the compare URL as
+   * the whole of what it does instead — so the panel must never word this as
+   * an action FlightDeck took or will take.
+   */
+  readonly compareUrl: string | null;
+}
+
+export interface GitUpstream {
+  readonly name: string;
+  readonly ahead: number;
+  readonly behind: number;
+}
+
 /** An available update (1a's status-bar chip). */
 export interface UpdateInfo {
   readonly version: string;
@@ -251,6 +348,17 @@ export interface Snapshot {
    * list of its own to fall back to, by design.
    */
   readonly commands: readonly HostCommand[];
+  /**
+   * SPECS §23's help screen, or `null` from a host that sends none
+   * (`remote-control-ll5.8`).
+   *
+   * `null` means the browser shows the host's half of its help overlay as
+   * absent rather than filling it in locally — same posture as `commands`
+   * being empty. See `HelpDoc`.
+   */
+  readonly help: HelpDoc | null;
+  /** The About screen, or `null` from a host that sends none. */
+  readonly about: AboutDoc | null;
 }
 
 /** Look-ups used by both the reducer and the components. */

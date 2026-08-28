@@ -40,13 +40,18 @@
 //! * [`Route::Dialog`] — D13's shared dialog. The dialog is app state, published
 //!   to both surfaces with the origin that opened it, and either surface can
 //!   confirm or cancel; these two rows are how a browser does it.
-//! * [`Route::NotSupported`] — this build has no browser-side surface for it, and
-//!   the refusal names the task that owns one. What is left after D13, the git
-//!   family and the destructive confirmation landed is the configuration manager
-//!   (`remote-control-ll5.6`), help/about (`.8`), `show_git_status` — which is
-//!   not a dialog at all, nothing is being asked, so there is nothing to answer
-//!   — and `pull_base`, which is a boundary decision rather than a missing
-//!   surface (see [`PULL_BASE_REFUSAL`]).
+//! * [`Route::NotSupported`] — the host will not forward this name, and the
+//!   refusal says why. After D13, the git family, the destructive confirmation,
+//!   the configuration manager and the read-only overlays all landed, three
+//!   rows are left and **none of them is "not built yet"**:
+//!   `open_configuration`, `show_help` and `about_flightdeck` are each a
+//!   *browser* surface, drawn from state the host already sent, so forwarding
+//!   them would open a panel on the desktop that the asker cannot read
+//!   ([`OPEN_CONFIGURATION_REFUSAL`], [`HELP_REFUSAL`], [`ABOUT_REFUSAL`]); and
+//!   `pull_base` is a boundary decision (see [`PULL_BASE_REFUSAL`]).
+//!   `show_git_status` is the one read-only overlay that *does* dispatch,
+//!   because its facts are not on the snapshot — see
+//!   [`crate::web::protocol::GitStatusView`].
 //!
 //! ## Destroying work from a browser takes two steps (artboard 1g)
 //!
@@ -299,18 +304,40 @@ pub const GATE_UNRESOLVED_REFUSAL: &str =
     "The host can no longer name what this would destroy — the session it asked \
      about is gone. Cancel this dialog and start again.";
 
-/// Why `Show Git Status` is still refused: it is not a dialog, and it has no
-/// browser design yet.
+/// Why `Show Help` is offered but not forwarded (`remote-control-ll5.8`).
 ///
-/// It was grouped with the dialog family before this task because it opens a
-/// desktop overlay. It is not one of D13's dialogs — nothing is being asked, so
-/// there is nothing to confirm or cancel — and design turn 3 owns what the
-/// browser shows instead. Refused with that said out loud rather than dispatched
-/// into an overlay only the desktop can read.
-pub const UNDESIGNED_OVERLAY_REFUSAL: &str =
-    "Git status opens a read-only overlay on the desktop, and the browser has no \
-     design for it yet (design turn 3). It is not one of D13's shared dialogs: \
-     nothing is being asked, so there is nothing to answer from here.";
+/// The same shape as [`OPEN_CONFIGURATION_REFUSAL`] and for the same reason: a
+/// browser's help is a browser surface, and dispatching this row would open a
+/// panel on the desktop that the person who asked cannot read. The difference
+/// from the configuration manager is only in where the words come from — the
+/// browser draws [`Snapshot::help`](crate::web::protocol::Snapshot::help),
+/// which is this build's own help screen, so the two surfaces cannot document
+/// different keyboards (`specs/WEB_INTERFACE.md` §6.5 R16).
+///
+/// The row is still listed, still visible, and its refusal is still the
+/// sentence a frame naming it gets back — because a browser from a later build
+/// might send it, and "we do not forward this" is a fact worth stating rather
+/// than a silence to be discovered.
+pub const HELP_REFUSAL: &str =
+    "Help is a browser surface of its own: this row opens the browser's help \
+     overlay, drawn from the keybindings this host sent with the snapshot. \
+     Forwarding it would open a panel on the desktop instead, where the person \
+     who asked cannot read it.";
+
+/// Why `About FlightDeck` is offered but not forwarded, for
+/// [`HELP_REFUSAL`]'s reason exactly.
+pub const ABOUT_REFUSAL: &str =
+    "About is a browser surface of its own: this row opens the browser's About \
+     panel, drawn from the version and credits this host sent with the \
+     snapshot. Forwarding it would open a panel on the desktop instead.";
+
+/// Why `Open Configuration` is offered but not forwarded
+/// (`remote-control-ll5.6`), named so [`HELP_REFUSAL`] can point at the
+/// precedent it follows.
+pub const OPEN_CONFIGURATION_REFUSAL: &str =
+    "The configuration manager is a browser surface of its own \
+     (remote-control-ll5.6); opening the desktop's overlay from here \
+     would put a modal on a screen this browser cannot see.";
 
 /// Why `Pull Base` alone in the git family is refused (`remote-control-ll5.5`,
 /// SPECS §5.2).
@@ -537,13 +564,22 @@ pub static INVENTORY: &[CommandSpec] = &[
         annotation: None,
         route: Route::NotSupported(PULL_BASE_REFUSAL),
     },
+    // `remote-control-ll5.8`: this one really does dispatch. Unlike help and
+    // About, its facts are not in the snapshot and cannot be — SPECS §21 wants
+    // the upstream's name, the worktree path and §14's compare URL, and the
+    // last of those needs a remote lookup nobody would want on the status poll.
+    // So the host collects it on request and answers the asker alone with
+    // `ServerMsg::GitStatus`; `apply_effect` is where the desktop's own overlay
+    // is deliberately *not* opened for a browser's read (§6.5 R16).
     CommandSpec {
         name: names::SHOW_GIT_STATUS,
         label: "Show Git Status",
         group: "Git",
         host_only: false,
-        annotation: None,
-        route: Route::NotSupported(UNDESIGNED_OVERLAY_REFUSAL),
+        // Artboard 1d draws this row with this tag; it is the host's word for
+        // what the panel is, so it is stated here rather than in the SPA.
+        annotation: Some("worktree detail"),
+        route: Route::Palette(PaletteAction::Dispatch(Command::ShowGitStatus)),
     },
     // -- terminals ---------------------------------------------------------
     CommandSpec {
@@ -611,11 +647,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Configuration",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(
-            "The configuration manager is a browser surface of its own \
-             (remote-control-ll5.6); opening the desktop's overlay from here \
-             would put a modal on a screen this browser cannot see.",
-        ),
+        route: Route::NotSupported(OPEN_CONFIGURATION_REFUSAL),
     },
     CommandSpec {
         name: names::PAIR_PHONE,
@@ -689,10 +721,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "View",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(
-            "The help overlay is a browser surface of its own \
-             (remote-control-ll5.8); this build would only open it on the desktop.",
-        ),
+        route: Route::NotSupported(HELP_REFUSAL),
     },
     CommandSpec {
         name: names::ABOUT_FLIGHTDECK,
@@ -700,10 +729,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "View",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(
-            "The About dialog is a browser surface of its own \
-             (remote-control-ll5.8); this build would only open it on the desktop.",
-        ),
+        route: Route::NotSupported(ABOUT_REFUSAL),
     },
     // -- global ------------------------------------------------------------
     // D16: a `host only` badge is not enough for quit, so it is not badged and

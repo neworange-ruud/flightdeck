@@ -20,6 +20,7 @@ import { createCommandPalette } from "./commandPalette";
 import { createConfigManager } from "./configManager";
 import { createDialog } from "./dialog";
 import { createGitBar } from "./gitBar";
+import { createInfoOverlay } from "./infoOverlay";
 import { createLogoBand } from "./logoBand";
 import { createProjectTabs } from "./projectTabs";
 import { createSidebar } from "./sidebar";
@@ -175,6 +176,20 @@ export function createApp(options: AppOptions): App {
    * Configuration" row (see `runCommand` below), closed by `Esc`. */
   const config = createConfigManager(store);
   /**
+   * The three read-only panels (`remote-control-ll5.8`): help, About, and
+   * SPECS §21's git status. Opened by their palette rows below — and help also
+   * by `?` in App mode — closed by `Esc` or by clicking outside.
+   *
+   * Two of the three never leave the browser, exactly as "Open Configuration"
+   * does not: their content is already on the snapshot. The third *does* send
+   * a frame, because its facts are a fresh `git` read the snapshot cannot
+   * hold, and the panel opens when the host's answer arrives rather than when
+   * the request goes out — see `wire/socket.ts`'s `onGitStatus`.
+   */
+  const info = createInfoOverlay({
+    onClose: () => store.dispatch({ type: "readOnly/close" }),
+  });
+  /**
    * Artboards 1d/1e, `remote-control-ll5.3`. Unlike every other overlay here,
    * nothing local opens or closes it: it is on screen because the host
    * published a dialog (D13), and it goes away when the host closes it.
@@ -218,6 +233,7 @@ export function createApp(options: AppOptions): App {
       access.el,
       palette.el,
       config.el,
+      info.el,
       dialog.el,
     ],
   );
@@ -239,6 +255,7 @@ export function createApp(options: AppOptions): App {
     access,
     palette,
     config,
+    info,
     dialog,
   ];
 
@@ -255,6 +272,8 @@ export function createApp(options: AppOptions): App {
     frame.setAttribute("data-feed", String(state.feedOpen));
     /** D13: the dialog layer, like the access and takeover layers. */
     frame.setAttribute("data-dialog", String(state.dialog !== null));
+    /** `remote-control-ll5.8`: whichever read-only panel is up, or `none`. */
+    frame.setAttribute("data-readonly", state.readOnly?.kind ?? "none");
 
     if (state.layout === "split") {
       if (split === null) {
@@ -347,6 +366,17 @@ export function createApp(options: AppOptions): App {
     if (state.config !== null && configKey(event, state)) {
       return;
     }
+    /**
+     * The read-only panels sit below the palette and the configuration
+     * manager in this order for the same reason those two sit below a dialog:
+     * ranking is by *how much is at stake*, and a panel that states facts and
+     * asks nothing is the least urgent thing on screen. In practice the order
+     * never has to arbitrate — the reducer closes the palette when a panel
+     * opens, so only one of them is ever up.
+     */
+    if (state.readOnly !== null && readOnlyKey(event)) {
+      return;
+    }
     if (state.feedOpen && feedKey(event)) {
       return;
     }
@@ -356,6 +386,27 @@ export function createApp(options: AppOptions): App {
     if (isPlain(event) && event.key === "a" && state.mode === "app") {
       event.preventDefault();
       toggleFeed();
+      return;
+    }
+
+    /**
+     * `?` opens help, in App mode only — `remote-control-ll5.8`, derived from
+     * 2e's rule for `a` rather than invented beside it.
+     *
+     * §5 gives the app **one chord** (`Ctrl-g`) and nothing licenses a second,
+     * so the desktop's `F1` / `Alt-h` are deliberately not taken: `F1` is the
+     * browser's own help in Chrome and Firefox, and `Alt-h` opens a browser
+     * menu on Windows. A plain key in App mode is the affordance the artboards
+     * *do* license — 2e claims `a` exactly this way, on exactly this reasoning
+     * ("not in Terminal mode, where `a` is a letter the agent is waiting for")
+     * — and `?` is free there.
+     *
+     * The palette's "Show Help" row is the other door and needs no key at all,
+     * which is the whole of §5's palette-primary position.
+     */
+    if (isPlain(event) && event.key === "?" && state.mode === "app") {
+      event.preventDefault();
+      store.dispatch({ type: "help/open" });
       return;
     }
 
@@ -566,7 +617,70 @@ export function createApp(options: AppOptions): App {
       store.dispatch({ type: "config/open" });
       return;
     }
+    /**
+     * Help and About, for "Open Configuration"'s reason exactly
+     * (`remote-control-ll5.8`): their content is already on the snapshot
+     * (`Snapshot::help` / `Snapshot::about`), so the answer is in hand and a
+     * round trip would buy nothing — while *forwarding* the row would open a
+     * panel on the desktop that the person who asked cannot read. The host's
+     * own refusals (`HELP_REFUSAL`, `ABOUT_REFUSAL`) say the same thing, which
+     * is what keeps this local interception honest rather than a shortcut: a
+     * host that stops offering the name stops offering the panel, because the
+     * *row* is still the host's like every other (R7).
+     *
+     * `show_git_status` is deliberately **not** here. It is the one read-only
+     * panel whose facts the browser does not have, so it goes to the host like
+     * any other command and the panel opens when the answer arrives.
+     */
+    if (command.id === "show_help") {
+      store.dispatch({ type: "help/open" });
+      return;
+    }
+    if (command.id === "about_flightdeck") {
+      store.dispatch({ type: "about/open" });
+      return;
+    }
     options.onRunCommand?.(command);
+  }
+
+  /**
+   * The read-only panels' whole keyboard: `Esc`, and `?` to close the help
+   * panel the same key opened (2e's `a` toggles the feed exactly this way).
+   *
+   * Everything else is **swallowed**, the same posture the palette, the
+   * configuration manager and the access screens take. The panel sits over a
+   * scrim that already covers the frame to the pointer, so letting `a` open
+   * the activity feed *behind* it — or `Enter` move the mode underneath it —
+   * would leave the reader looking at a panel while the app quietly did
+   * something else.
+   *
+   * Nothing is lost by swallowing. §5.1's "queued, never dropped" is about
+   * keystrokes bound for the PTY, and those do not come through this handler
+   * at all: since `remote-control-hgqy` terminal input comes from xterm's own
+   * `onData` (R5), so a key eaten here was only ever going to be one of this
+   * frame's own app-level shortcuts.
+   *
+   * `Tab` is the one exception, as it is on 2b's access screens: both panels
+   * are operable by pointer *and* by keyboard, and swallowing `Tab` would
+   * leave a keyboard-only reader with a link and a close button they can see
+   * and cannot reach.
+   */
+  function readOnlyKey(event: KeyboardEvent): boolean {
+    if (!isPlain(event) || event.key === "Tab") {
+      return false;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      store.dispatch({ type: "readOnly/close" });
+      return true;
+    }
+    if (event.key === "?" && store.getState().readOnly?.kind === "help") {
+      event.preventDefault();
+      store.dispatch({ type: "readOnly/close" });
+      return true;
+    }
+    /** Swallow the rest — see the doc comment. */
+    return true;
   }
 
   /**
@@ -846,6 +960,20 @@ export function createApp(options: AppOptions): App {
       path.includes(config.el) ||
       path.includes(dialog.el)
     ) {
+      return;
+    }
+    /**
+     * A read-only panel is the one overlay where clicking *outside* it means
+     * something more than "not in the panel": it means the reader is done with
+     * it. Closing it here is the pointer half of `Esc`, and it happens before
+     * the mode rule below so the click that dismissed the panel does not also
+     * release the keys.
+     */
+    if (store.getState().readOnly !== null) {
+      if (path.includes(info.el)) {
+        return;
+      }
+      store.dispatch({ type: "readOnly/close" });
       return;
     }
     const inTerminal =

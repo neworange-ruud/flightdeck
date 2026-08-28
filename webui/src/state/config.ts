@@ -165,7 +165,7 @@ export function selectableConfigFields(): readonly ConfigField[] {
 
 /**
  * The command name `s` sends, kept in exactly one place so a future rename on
- * either side of the wire is a one-line change. **Placeholder**: protocol v1
+ * either side of the wire is a one-line change. **Placeholder**: the web protocol
  * defines no such command yet — see the ll5.6 task report for the shape this
  * build needs `remote-control-ll5.1` to add. Sending it today will get
  * whatever an unrecognised command name draws from the host (most likely

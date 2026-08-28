@@ -376,17 +376,26 @@ fn the_git_rows_dispatch_the_values_their_spec_sections_require() {
         );
     }
 
-    // The two rows the git family still does not run, each for its own stated
-    // reason: §5.2's boundary decision, and an overlay with no browser design
-    // (`remote-control-ll5.8`). Neither is a dialog, so neither is ll5.4's.
+    // The one git row that still does not run, for the one reason that is a
+    // boundary decision rather than a missing surface (SPECS §5.2, R11).
     assert_eq!(
         lookup(names::PULL_BASE).map(|s| &s.route),
         Some(&Route::NotSupported(PULL_BASE_REFUSAL))
     );
+
+    // `show_git_status` dispatches as of `remote-control-ll5.8` (§6.5 R16). It
+    // is pinned here beside the family it belongs to, with the two properties
+    // that make it safe to forward stated rather than assumed: it reads, and it
+    // carries no payload a frame could have influenced.
+    let status = lookup(names::SHOW_GIT_STATUS).expect("the row is offered");
     assert_eq!(
-        lookup(names::SHOW_GIT_STATUS).map(|s| &s.route),
-        Some(&Route::NotSupported(UNDESIGNED_OVERLAY_REFUSAL))
+        dispatched_command(&status.route),
+        Some(&Command::ShowGitStatus)
     );
+    assert!(status.refusal().is_none());
+    assert!(status.view().run.args.is_none());
+    assert!(!rewrites_history(&Command::ShowGitStatus));
+    assert!(!creates_pull_request(&Command::ShowGitStatus));
 }
 
 // ---------------------------------------------------------------------------

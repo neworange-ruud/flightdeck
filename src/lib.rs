@@ -1281,14 +1281,42 @@ struct Ui {
     /// Overwritten constantly by the desktop's own keypresses, which is fine:
     /// only the value written during one web dispatch is ever read.
     web_outcome: Option<WebDispatch>,
-    /// D13: the origin to stamp on the next dialog this build opens.
+    /// Which browser's frame is being applied right now, or `None` when the
+    /// dispatch came from this keyboard.
     ///
     /// `Some` only for the duration of one [`run_web_command`] dispatch, exactly
-    /// like [`Ui::web_outcome`] — a dialog opened while a browser's frame is
-    /// being applied was opened *by* that browser, and every other dialog was
-    /// opened at this keyboard. Set and cleared in one place, so no prompt-
-    /// opening site has to know a browser exists.
-    web_dialog_origin: Option<crate::web::protocol::DialogOrigin>,
+    /// like [`Ui::web_outcome`]. Two things read it, both for the same reason —
+    /// *who asked* changes what the right answer is:
+    ///
+    /// * **D13** stamps it on any dialog the dispatch opens, so the desktop can
+    ///   say `opened from browser · 192.168.2.20` about a modal nobody at this
+    ///   keyboard requested. `start_prompt` is the only place a dialog is
+    ///   opened, so a dialog cannot be published without an origin.
+    /// * **§6.5 R16** uses its mere presence to decide where a read-only
+    ///   overlay lands: `show_git_status` from the desktop opens the desktop's
+    ///   panel, and the same row from a browser answers *that browser* instead
+    ///   of putting a panel in front of somebody who did not ask for one.
+    ///
+    /// Set and cleared in one place, so neither of the two dozen prompt-opening
+    /// sites nor `apply_effect`'s other arms have to know a browser exists.
+    web_origin: Option<crate::web::protocol::DialogOrigin>,
+    /// SPECS §21's panel, collected by the dispatch a browser just made, for
+    /// the browser that made it (`remote-control-ll5.8`, §6.5 R16).
+    ///
+    /// The same one-dispatch-long idiom as [`Ui::web_outcome`] and
+    /// [`Ui::web_origin`]: [`run_web_command`] clears it, dispatches,
+    /// and takes whatever [`apply_effect`] left. It exists because
+    /// `show_git_status` is the one read-only overlay whose facts are not
+    /// already on the snapshot — the upstream's name, the worktree path and
+    /// §14's compare URL are a fresh `git` read — so the answer has to travel
+    /// back to the asker rather than being drawn from state they already hold.
+    ///
+    /// **A browser's read does not open the desktop's overlay.** Nothing is
+    /// being asked (R8), so there is nothing for the person at the machine to
+    /// answer, and a panel they did not request would be the interruption 2f
+    /// declines to inflict on them for the same reason. The desktop opens its
+    /// own overlay when the desktop runs the row; see [`apply_effect`].
+    web_git_status: Option<crate::web::protocol::GitStatusView>,
     /// Dialogs that reached a real decision this tick, oldest first.
     ///
     /// The published-state diff (`crate::web::stream::deltas`) can see that a
@@ -2538,7 +2566,7 @@ fn event_loop(
                         viewer_id: Some(viewer_id.clone()),
                         label: label.clone(),
                     };
-                    let ack = run_web_command(
+                    let reply = run_web_command(
                         command,
                         &origin,
                         workspace,
@@ -2549,8 +2577,18 @@ fn event_loop(
                     if let Some(handle) = web_surface.handle.as_ref() {
                         handle.send(crate::web::server::WebOutbound::Viewer {
                             viewer_id: viewer_id.clone(),
-                            msg: crate::web::protocol::ServerMsg::Ack(ack),
+                            msg: crate::web::protocol::ServerMsg::Ack(reply.ack),
                         });
+                        // SPECS §21's panel, to the viewer that asked and to no
+                        // other (§6.5 R16). After the ack, so a browser that
+                        // reads frames in order learns the command landed
+                        // before it is handed what the command produced.
+                        if let Some(view) = reply.git_status {
+                            handle.send(crate::web::server::WebOutbound::Viewer {
+                                viewer_id: viewer_id.clone(),
+                                msg: crate::web::protocol::ServerMsg::GitStatus(view),
+                            });
+                        }
                     }
                     continue;
                 }
@@ -2902,6 +2940,16 @@ fn build_web_host_state(
         replay_capacity_bytes: streams.capacity_bytes() as u64,
         activity,
         dialog,
+        // SPECS §23's help, built from the *active project's* config: the
+        // leave-focus binding is a `[ui]` setting and `--isolated` is a
+        // property of the run, and both are read here rather than remembered
+        // when the server started, so a config save changes what the next
+        // snapshot documents (`specs/WEB_INTERFACE.md` §6.5 R16).
+        help: crate::tui::help::help_doc(
+            active.state.config.ui.use_f2_to_leave_terminal_focus,
+            active.state.isolated,
+        ),
+        about: crate::tui::help::about_doc(),
     }
 }
 
@@ -4890,12 +4938,23 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         | Effect::RebaseConfirm { .. }
         | Effect::AbandonWarning { .. }
         | Effect::QuitConfirm => WebDispatch::Applied(None),
-        // Not dialogs: read-only overlays with nothing to answer, and no browser
-        // design yet (`remote-control-ll5.8`, design turn 3).
-        Effect::GitStatus { .. } | Effect::ShowHelp | Effect::ShowAbout => WebDispatch::Refused(
-            "This opens a read-only overlay on the desktop, which the browser has \
-             no design for yet. Nothing is being asked, so there is nothing to \
-             answer from here."
+        // SPECS §21's panel: a read, not a state change. From a browser it is
+        // `Applied` with no sentence — the *panel* is the answer, and it
+        // travels back as `ServerMsg::GitStatus` rather than as prose crammed
+        // into an ack's `detail` (`remote-control-ll5.8`, §6.5 R16). The
+        // desktop's own run is unchanged and this value is never read for it.
+        Effect::GitStatus { .. } => WebDispatch::Applied(None),
+        // Help and About never reach here from a browser: both rows are
+        // `Route::NotSupported`, because the browser draws them from
+        // `Snapshot::help` / `Snapshot::about` and forwarding would open a
+        // panel on the desktop instead (`HELP_REFUSAL`, `ABOUT_REFUSAL`). The
+        // classification is kept honest for the day one of them is forwarded
+        // anyway: it would open a desktop panel, and that is a refusal.
+        Effect::ShowHelp | Effect::ShowAbout => WebDispatch::Refused(
+            "This opens a read-only overlay on the desktop, which is not the \
+             screen this browser is on. The browser draws its own from the \
+             snapshot; nothing is being asked, so there is nothing to answer \
+             from here."
                 .to_string(),
         ),
     });
@@ -4962,27 +5021,89 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
                 },
             );
         }
+        // §6.5 R16: the panel goes to whoever asked for it, and only there.
+        //
+        // The desktop's run opens the desktop's overlay, exactly as before. A
+        // browser's run does *not*: R8 established that this is not one of
+        // D13's shared dialogs — nothing is being asked, so there is nothing
+        // for the person at the machine to answer — and a read-only panel they
+        // never requested is an obstruction rather than a notice, which is the
+        // same judgement 2f makes when it gives the interrupted desktop a
+        // transient strip instead of a modal. One collection, two renderings,
+        // and no arm anywhere that runs `collect_status` a second time.
         Effect::GitStatus { status, pr_url } => {
-            ui.overlay = UiOverlay::GitStatus {
-                status: *status,
-                pr_url,
-            };
+            match web_git_status_view(&status, pr_url.as_deref(), _state) {
+                Some(view) if ui.web_origin.is_some() => {
+                    ui.web_git_status = Some(view);
+                }
+                _ => {
+                    ui.overlay = UiOverlay::GitStatus {
+                        status: *status,
+                        pr_url,
+                    };
+                }
+            }
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,
         Effect::ShowAbout => ui.overlay = UiOverlay::About,
     }
 }
 
+/// SPECS §21's panel as the browser receives it, or `None` when the host cannot
+/// say which session it is about (`remote-control-ll5.8`, §6.5 R16).
+///
+/// `None` is not a degraded panel, it is a refusal to send one: the panel's
+/// first fact is *which* Agent Tab this is, and a panel that could not name its
+/// session would be a set of numbers about an unnamed thing. The dispatch that
+/// produced the status already required a selected tab (`cmd_show_git_status`
+/// errors without one), so this only fires if the selection moved underneath
+/// the dispatch — in which case the desktop's overlay is drawn instead and the
+/// browser's ack still tells it what happened.
+///
+/// Nothing here is computed: every field is copied from the
+/// [`crate::git::status::WorktreeStatus`] `collect_status` returned, and the
+/// upstream's counts live *inside* the optional upstream so the browser cannot
+/// be handed commits ahead of a remote that does not exist.
+fn web_git_status_view(
+    status: &crate::git::status::WorktreeStatus,
+    pr_url: Option<&str>,
+    state: &AppState,
+) -> Option<crate::web::protocol::GitStatusView> {
+    let tab = state.selected()?;
+    Some(crate::web::protocol::GitStatusView {
+        // Filled in by `run_web_command`, which is the only place that knows
+        // which frame this answers.
+        seq: 0,
+        session_id: tab.id(),
+        session_name: tab.meta.name.clone(),
+        branch: status.branch.clone(),
+        base_branch: status.base_branch.clone(),
+        base_drift: status.base_drift,
+        dirty: status.dirty,
+        changed_files: status.changes.total(),
+        upstream: status
+            .upstream
+            .as_ref()
+            .map(|name| crate::web::protocol::GitUpstream {
+                name: name.clone(),
+                ahead: status.ahead,
+                behind: status.behind,
+            }),
+        worktree_path: status.worktree_path.display().to_string(),
+        compare_url: pr_url.map(str::to_string),
+    })
+}
+
 /// Begin an interactive prompt, building its modal dialog.
 ///
 /// D13 lands here and nowhere else. The origin comes from
-/// [`Ui::web_dialog_origin`] — set for exactly as long as one browser frame is
+/// [`Ui::web_origin`] — set for exactly as long as one browser frame is
 /// being applied — so every one of the two dozen call sites keeps knowing
 /// nothing about browsers, and a dialog can never be published without an
 /// origin because there is no other way to open one.
 fn start_prompt(ui: &mut Ui, prompt: Prompt) {
     let origin = ui
-        .web_dialog_origin
+        .web_origin
         .clone()
         .unwrap_or(crate::web::protocol::DialogOrigin::Desktop);
     let mut dialog = prompt_dialog(&prompt);
@@ -6582,6 +6703,28 @@ fn run_palette_action(
 /// before a frame is ever forwarded — which is why a bare frame naming `quit`
 /// cannot reach a dispatch — so reaching them here would mean the table and the
 /// server had disagreed.
+/// What one browser `Command` frame produced: the [`Ack`] it always earns, and
+/// the extra per-viewer frame the one read-only overlay needs
+/// (`remote-control-ll5.8`, §6.5 R16).
+///
+/// Two fields rather than a widened [`crate::web::protocol::Ack`], because they
+/// are two different claims. The ack says *what happened to your frame*, in the
+/// vocabulary §5.1's held-keystroke queue needs; the panel is *what the command
+/// produced*, which is a fact about a worktree and has nothing to do with
+/// queueing. Folding SPECS §21's nine fields into an ack's `detail` string
+/// would make the browser parse prose to find its branch name, which is the
+/// failure R7 removed from the palette.
+///
+/// `git_status` is `None` for every other row, and for `show_git_status` itself
+/// when the dispatch was refused — a refusal produces no panel, so there is
+/// nothing to send and nothing to invent.
+struct WebCommandReply {
+    /// The answer §5.1 requires for every frame.
+    ack: crate::web::protocol::Ack,
+    /// SPECS §21's panel, for the viewer that asked and no other.
+    git_status: Option<crate::web::protocol::GitStatusView>,
+}
+
 fn run_web_command(
     command: &crate::web::protocol::Command,
     origin: &crate::web::protocol::DialogOrigin,
@@ -6589,14 +6732,17 @@ fn run_web_command(
     env: &Env,
     ui: &mut Ui,
     activity: &mut crate::web::activity::ActivityStore,
-) -> crate::web::protocol::Ack {
+) -> WebCommandReply {
     use crate::web::commands::Route;
     use crate::web::protocol::{Ack, AckOutcome};
 
-    let ack = |outcome, detail: Option<String>| Ack {
-        seq: command.seq,
-        outcome,
-        detail,
+    let ack = |outcome, detail: Option<String>| WebCommandReply {
+        ack: Ack {
+            seq: command.seq,
+            outcome,
+            detail,
+        },
+        git_status: None,
     };
 
     let Some(spec) = crate::web::commands::lookup(&command.name) else {
@@ -6612,7 +6758,10 @@ fn run_web_command(
     match &spec.route {
         // D11: read-marking is host state, so a second tab — or the same tab
         // tomorrow — backfills a feed that agrees about what has been seen.
-        Route::ActivityRead => crate::web::activity::apply_mark_read(activity, command),
+        Route::ActivityRead => WebCommandReply {
+            ack: crate::web::activity::apply_mark_read(activity, command),
+            git_status: None,
+        },
         // D3: the selection is shared, so this moves the desktop too.
         Route::Selection(target) => {
             match apply_web_selection(*target, command.args.as_ref(), workspace, env, ui) {
@@ -6622,15 +6771,25 @@ fn run_web_command(
         }
         Route::Palette(action) => {
             ui.web_outcome = None;
+            ui.web_git_status = None;
             // D13: for as long as this dispatch runs, a dialog it opens was
-            // opened *by this browser*. `start_prompt` reads it; nothing else
-            // has to know a browser exists.
+            // opened *by this browser*. `start_prompt` reads it, and so does
+            // `apply_effect`'s git-status arm (§6.5 R16); nothing else has to
+            // know a browser exists.
             let was_open = ui.dialog_id();
-            ui.web_dialog_origin = Some(origin.clone());
+            ui.web_origin = Some(origin.clone());
             let dispatched = run_palette_action(action.clone(), workspace, env, ui);
-            ui.web_dialog_origin = None;
+            ui.web_origin = None;
+            // SPECS §21's panel, if this dispatch produced one. The seq is
+            // stamped here because this is the only place that knows which
+            // frame is being answered — `apply_effect` sees an `Effect`, not a
+            // request.
+            let git_status = ui.web_git_status.take().map(|mut view| {
+                view.seq = command.seq;
+                view
+            });
             let opened = ui.dialog_id().filter(|id| Some(id) != was_open.as_ref());
-            match (dispatched, ui.web_outcome.take(), opened) {
+            let reply = match (dispatched, ui.web_outcome.take(), opened) {
                 (Err(e), _, _) => ack(AckOutcome::Rejected, Some(e.to_string())),
                 (Ok(()), Some(WebDispatch::Refused(reason)), _) => {
                     ack(AckOutcome::Rejected, Some(reason))
@@ -6653,6 +6812,10 @@ fn run_web_command(
                 // means it did its work quietly (a selection move, a split-view
                 // toggle). Applied with no sentence rather than an invented one.
                 (Ok(()), None, None) => ack(AckOutcome::Applied, None),
+            };
+            WebCommandReply {
+                git_status,
+                ..reply
             }
         }
         // D13: either surface can answer the dialog the other one opened.
@@ -11098,6 +11261,12 @@ mod tests {
             ui: &mut Ui,
             command: &WireCommand,
         ) -> crate::web::protocol::Ack {
+            reply(workspace, ui, command).ack
+        }
+
+        /// The same, keeping the whole reply — the ack *and* SPECS §21's panel,
+        /// which is the half `show_git_status` exists to deliver (§6.5 R16).
+        fn reply(workspace: &mut Workspace, ui: &mut Ui, command: &WireCommand) -> WebCommandReply {
             let fs = FakeFs::new();
             let pty = FakePty::new();
             let clock = FakeClock::default();
@@ -12237,6 +12406,219 @@ mod tests {
                 .expect("the feed command is in the inventory");
             assert_eq!(spec.route, crate::web::commands::Route::ActivityRead);
         }
+
+        // -------------------------------------------------------------------
+        // SPECS §21's panel (`remote-control-ll5.8`, §6.5 R16)
+        // -------------------------------------------------------------------
+
+        /// A worktree status with an upstream, a compare URL and dirt — the
+        /// fullest panel there is, so a test asserting a field is absent has
+        /// something to have removed it from.
+        fn full_status() -> crate::git::status::WorktreeStatus {
+            crate::git::status::WorktreeStatus {
+                branch: "flightdeck/fix-login-redirect".to_string(),
+                base_branch: "main".to_string(),
+                dirty: true,
+                changes: crate::git::status::WorktreeChanges {
+                    added: 3,
+                    modified: 2,
+                    deleted: 1,
+                },
+                ahead: 4,
+                behind: 1,
+                upstream: Some("origin/flightdeck/fix-login-redirect".to_string()),
+                base_drift: 7,
+                worktree_path: PathBuf::from("/repo/../worktrees/fix-login-redirect"),
+            }
+        }
+
+        /// Apply one `Effect::GitStatus` as if it came from `origin`, and hand
+        /// back what the desktop and the browser each ended up with.
+        fn apply_git_status(
+            ws: &Workspace,
+            ui: &mut Ui,
+            status: crate::git::status::WorktreeStatus,
+            pr_url: Option<&str>,
+            from_browser: bool,
+        ) {
+            ui.web_origin = from_browser.then(browser_origin);
+            apply_effect(
+                Effect::GitStatus {
+                    status: Box::new(status),
+                    pr_url: pr_url.map(str::to_string),
+                },
+                &ws.projects[0].state,
+                ui,
+            );
+            ui.web_origin = None;
+        }
+
+        /// The routing decision R16 makes, both ways round, in one test —
+        /// because it is one rule and a test per direction would let half of it
+        /// rot.
+        ///
+        /// A browser's read is answered *to that browser* and leaves the
+        /// desktop alone: R8 established this is not one of D13's shared
+        /// dialogs, so there is nothing for the person at the machine to
+        /// answer, and a panel they never asked for is an obstruction. The
+        /// desktop's own read is unchanged and opens the desktop's overlay.
+        #[test]
+        fn a_browsers_git_status_answers_the_browser_and_never_the_desktop() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+
+            let mut browser = Ui::default();
+            apply_git_status(&ws, &mut browser, full_status(), None, true);
+            assert!(
+                matches!(browser.overlay, UiOverlay::None),
+                "a browser's read must not put a panel on the desktop"
+            );
+            let view = browser.web_git_status.expect("the browser is answered");
+            assert_eq!(view.branch, "flightdeck/fix-login-redirect");
+            assert_eq!(view.session_name, "Task");
+
+            let mut desktop = Ui::default();
+            apply_git_status(&ws, &mut desktop, full_status(), None, false);
+            assert!(
+                matches!(desktop.overlay, UiOverlay::GitStatus { .. }),
+                "the desktop's own read still opens the desktop's overlay"
+            );
+            assert!(
+                desktop.web_git_status.is_none(),
+                "and sends nothing to a browser that did not ask"
+            );
+        }
+
+        /// Every field is the status's, and SPECS §21's facts all survive the
+        /// crossing. The counts live *inside* the upstream, so the panel cannot
+        /// carry commits ahead of a remote that does not exist.
+        #[test]
+        fn the_panel_carries_specs_21s_facts_verbatim() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            apply_git_status(
+                &ws,
+                &mut ui,
+                full_status(),
+                Some("https://github.com/o/r/compare/main...flightdeck/fix-login-redirect"),
+                true,
+            );
+            let view = ui.web_git_status.expect("the browser is answered");
+
+            assert_eq!(view.base_branch, "main");
+            assert_eq!(view.base_drift, 7);
+            assert!(view.dirty);
+            assert_eq!(view.changed_files, 6);
+            let upstream = view.upstream.expect("the branch has been pushed");
+            assert_eq!(upstream.name, "origin/flightdeck/fix-login-redirect");
+            assert_eq!((upstream.ahead, upstream.behind), (4, 1));
+            assert_eq!(
+                view.compare_url.as_deref(),
+                Some("https://github.com/o/r/compare/main...flightdeck/fix-login-redirect")
+            );
+        }
+
+        /// The unknowns, and the shape of "unknown" the wire uses for each.
+        ///
+        /// A branch with no upstream has no ahead/behind — not `0`/`0`, which
+        /// is what the underlying `WorktreeStatus` happens to hold and what a
+        /// less careful mapping would forward as a fact. And an unpushed branch
+        /// has no compare URL, which is absence rather than an empty string:
+        /// §5 forbids FlightDeck from creating a pull request, so a fabricated
+        /// compare link would be an invitation to one that does not exist.
+        #[test]
+        fn an_unpushed_branch_carries_no_upstream_and_no_compare_url() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            let mut status = full_status();
+            status.upstream = None;
+            // Exactly the numbers `collect_status` leaves behind when it never
+            // looked: they must not reach the browser.
+            status.ahead = 0;
+            status.behind = 0;
+            apply_git_status(&ws, &mut ui, status, None, true);
+
+            let view = ui.web_git_status.expect("the browser is answered");
+            assert!(view.upstream.is_none());
+            assert!(view.compare_url.is_none());
+        }
+
+        /// A refused dispatch produces no panel at all.
+        ///
+        /// `show_git_status` needs a selected tab; a project with none makes
+        /// the dispatch fail, and the browser is told so in the host's own
+        /// words. What it is *not* handed is an empty panel — nothing was
+        /// collected, so there is nothing to render, and a panel of blanks
+        /// would be the guess §5.1 rules out.
+        #[test]
+        fn a_refused_git_status_sends_no_panel() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply(&mut ws, &mut ui, &frame(9, names::SHOW_GIT_STATUS, None));
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            assert!(reply.git_status.is_none());
+            // Nor a panel on the desktop. (The desktop does get the refusal as
+            // its usual toast — that is `ui.message`'s job for every refused
+            // command and predates this task — but no git-status overlay.)
+            assert!(!matches!(ui.overlay, UiOverlay::GitStatus { .. }));
+        }
+
+        /// The row is forwarded now, and the frame it answers is named on the
+        /// panel — so a browser can tell its own request apart from one it no
+        /// longer has an overlay for.
+        #[test]
+        fn the_panel_names_the_frame_it_answers() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            apply_git_status(&ws, &mut ui, full_status(), None, true);
+            // `apply_effect` cannot know the seq; `run_web_command` stamps it.
+            assert_eq!(ui.web_git_status.expect("answered").seq, 0);
+
+            let spec =
+                crate::web::commands::lookup(names::SHOW_GIT_STATUS).expect("the row is offered");
+            assert!(
+                matches!(spec.route, crate::web::commands::Route::Palette(_)),
+                "the row dispatches as of ll5.8"
+            );
+        }
+
+        /// Help and About are **not** forwarded, and the refusal says why
+        /// rather than pleading not-implemented. Both are drawn by the browser
+        /// from `Snapshot::help` / `Snapshot::about`, so forwarding would open
+        /// a panel on the desktop that the asker cannot read.
+        #[test]
+        fn help_and_about_are_browser_surfaces_and_say_so() {
+            for (name, refusal) in [
+                (names::SHOW_HELP, crate::web::commands::HELP_REFUSAL),
+                (names::ABOUT_FLIGHTDECK, crate::web::commands::ABOUT_REFUSAL),
+            ] {
+                let spec = crate::web::commands::lookup(name).expect("the row is offered");
+                assert_eq!(
+                    spec.route,
+                    crate::web::commands::Route::NotSupported(refusal),
+                    "'{name}' must refuse with its own sentence"
+                );
+                assert!(
+                    !refusal.contains("not implemented") && !refusal.contains("no design"),
+                    "'{name}' refuses because of where the panel would land, not because it is missing"
+                );
+            }
+        }
     }
 
     /// **The git surface's refusal paths** (`remote-control-ll5.5`; SPECS §5,
@@ -12334,12 +12716,12 @@ mod tests {
                 command: &command,
             };
             ui.web_outcome = None;
-            ui.web_dialog_origin = Some(crate::web::protocol::DialogOrigin::Browser {
+            ui.web_origin = Some(crate::web::protocol::DialogOrigin::Browser {
                 viewer_id: Some(crate::web::protocol::ViewerId::new("viewer-1")),
                 label: "192.168.2.20".to_string(),
             });
             let result = dispatch_command(cmd, state, &services, ui);
-            ui.web_dialog_origin = None;
+            ui.web_origin = None;
             result.expect("a guard is a refusal, never an event-loop error");
             ui.web_outcome.take()
         }
