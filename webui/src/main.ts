@@ -186,8 +186,14 @@ const app = createApp({
       app.store.dispatch({
         type: "access/required",
         screen: "code_entry",
+        /** Nothing was refused, so there is nothing the host has told us. The
+         * screen renders its sentences without the clauses these numbers fill;
+         * the first refusal brings them, and they are never remembered from a
+         * constant of our own. */
         attemptsRemaining: null,
         lockoutSeconds: null,
+        lockoutLengthSeconds: null,
+        codeTtlSeconds: null,
       });
       return;
     }
@@ -277,16 +283,22 @@ function applyResult(
    * plain `access/required` would leave it claiming the link is fine.
    */
   if (result.screen === "revoked") {
-    /** An HTTP refusal does not say *when* access was withdrawn, so we do not
-     * claim to know: `null` prints the sentence without a time. */
-    store.dispatch({ type: "access/revoked", revokedAgo: null });
+    /** The refusal now carries `revoked_at_ms` beside the host's own
+     * `server_time_ms`, so 2b's "withdrew this browser's access **12s ago**"
+     * can render its time. A host that did not send them leaves `revokedAgo`
+     * `null`, and the sentence prints without the clause rather than with an
+     * invented or zero time. */
+    store.dispatch({ type: "access/revoked", revokedAgo: result.revokedAgo });
     return;
   }
   store.dispatch({
     type: after === "exchange" ? "access/refused" : "access/required",
     screen: result.screen,
+    /** Every number here is the host's, straight from the refusal body. */
     attemptsRemaining: result.attemptsRemaining,
     lockoutSeconds: result.lockoutSeconds,
+    lockoutLengthSeconds: result.lockoutLengthSeconds,
+    codeTtlSeconds: result.codeTtlSeconds,
   });
 }
 

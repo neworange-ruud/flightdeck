@@ -14,26 +14,30 @@ import { ACCESS_CODE_LENGTH } from "./model";
  * deliver.* So nothing here says "secure", nothing says "encrypted", and the
  * revoked screen is explicit that the agents kept running and the picture
  * underneath is a photograph — because that is what is true.
- */
-
-/**
- * Mirrors `credentials::RATE_LIMIT_LOCKOUT_MS` (60_000).
  *
- * 2b's exact sentence is "3 attempts left before this address is rate-limited
- * **for 60s**", so the browser has to know the lockout length before it has
- * ever been locked out — which means it cannot come from the refusal body,
- * which only carries `retry_after_ms` once the limiter has already fired.
- * Mirrored rather than derived, and listed in the task report as a value the
- * host could usefully publish (see also `RATE_LIMIT_MAX_FAILURES`, which the
- * browser deliberately does *not* mirror: the host sends
- * `attempts_remaining` on every refusal, so the budget itself is never guessed).
+ * ## The two policy numbers are the host's, and are no longer mirrored here
+ *
+ * This file used to carry `RATE_LIMIT_LOCKOUT_SECONDS = 60` and
+ * `BOOTSTRAP_CODE_TTL_SECONDS = 120`, copied from `RATE_LIMIT_LOCKOUT_MS` and
+ * `BOOTSTRAP_CODE_TTL_MS` in `src/web/credentials.rs`. They are host-sent now
+ * (`lockout_seconds`, `code_ttl_seconds` in every refusal body), because a copy
+ * of a constant in another language is a lie waiting for someone to tune the
+ * original.
+ *
+ * The lockout length in particular could never come from `retry_after_ms`:
+ * 2b prints "3 attempts left before this address is rate-limited **for 60s**"
+ * while the address is *still allowed to try*, and `retry_after_ms` only exists
+ * once it is not. That is why the numbers ride on the refusal body rather than
+ * on the rate-limited refusal alone — the SPA's first act is
+ * `GET /auth/session`, and an unauthenticated browser is refused by it long
+ * before it types a digit.
+ *
+ * `attempts_remaining` set the precedent and is followed exactly: host-sent,
+ * never guessed, and when it is absent the sentence loses the clause instead of
+ * gaining an invention.
  */
-export const RATE_LIMIT_LOCKOUT_SECONDS = 60;
 
-/** Mirrors `credentials::BOOTSTRAP_CODE_TTL_MS` (120_000) — 2b: "good for two
- * minutes", "Codes last 120 seconds and only work once". */
-export const BOOTSTRAP_CODE_TTL_SECONDS = 120;
-
+/** Everything one of 2b's four screens renders, chosen by `accessCopy`. */
 export interface AccessCopy {
   readonly title: string;
   /** 2b's revoked panel puts `from the desktop` opposite the title. */
@@ -64,9 +68,7 @@ export function accessCopy(access: AccessState): AccessCopy {
       return {
         title: "Enter your code",
         eyebrow: null,
-        body:
-          "On the machine running FlightDeck, press Ctrl-g and run Web Interface. " +
-          "The overlay shows a four-digit code, good for two minutes.",
+        body: codeEntrySentence(access.codeTtlSeconds),
         /**
          * 2b prints this on the *first* screen, which reads oddly until you
          * notice what it is doing: a user who reached the code screen from a
@@ -87,9 +89,7 @@ export function accessCopy(access: AccessState): AccessCopy {
       return {
         title: "That code did not work",
         eyebrow: null,
-        body:
-          `It expired, or it was mistyped. Codes last ${BOOTSTRAP_CODE_TTL_SECONDS} ` +
-          "seconds and only work once.",
+        body: rejectedSentence(access.codeTtlSeconds),
         detail: null,
         /** 2b's two numbered steps, verbatim — both of them are on the *other*
          * machine, which is the fact the user needs first. */
@@ -151,6 +151,33 @@ export function accessCopy(access: AccessState): AccessCopy {
   }
 }
 
+/**
+ * 2b: "The overlay shows a four-digit code, **good for two minutes**."
+ *
+ * The duration is the host's `BOOTSTRAP_CODE_TTL_MS`, so it is printed in the
+ * host's own number rather than in the artboard's prose spelling of it — 2b
+ * writes the same fact as "120 seconds" on its rejected panel, so both forms
+ * are its vocabulary, and only one of them stays true if the host is retuned.
+ * A host that did not tell us drops the clause rather than guessing.
+ */
+function codeEntrySentence(codeTtlSeconds: number | null): string {
+  const lead =
+    "On the machine running FlightDeck, press Ctrl-g and run Web Interface. " +
+    "The overlay shows a four-digit code";
+  return codeTtlSeconds === null
+    ? `${lead}.`
+    : `${lead}, good for ${codeTtlSeconds} seconds.`;
+}
+
+/** 2b: "It expired, or it was mistyped. Codes last **120 seconds** and only
+ * work once." Without the host's number, the sentence keeps the half it can
+ * still prove. */
+function rejectedSentence(codeTtlSeconds: number | null): string {
+  return codeTtlSeconds === null
+    ? "It expired, or it was mistyped. Codes only work once."
+    : `It expired, or it was mistyped. Codes last ${codeTtlSeconds} seconds and only work once.`;
+}
+
 function lockoutSentence(lockoutSeconds: number | null): string {
   /** `null` means the host refused us without saying how long — which the
    * limiter does not normally do, so we say what we know and nothing more. */
@@ -185,7 +212,13 @@ export function attemptsLine(access: AccessState): string | null {
     return "no attempts left — this address is about to be rate-limited";
   }
   const attempts = left === 1 ? "attempt" : "attempts";
-  return `${left} ${attempts} left before this address is rate-limited for ${RATE_LIMIT_LOCKOUT_SECONDS}s`;
+  const head = `${left} ${attempts} left before this address is rate-limited`;
+  /** The host's `RATE_LIMIT_LOCKOUT_MS`. Absent means it did not say, and 2b's
+   * sentence is still true and still useful one clause shorter — which is the
+   * whole reason it is nullable rather than defaulted to a remembered 60. */
+  return access.lockoutLengthSeconds === null
+    ? head
+    : `${head} for ${access.lockoutLengthSeconds}s`;
 }
 
 /**

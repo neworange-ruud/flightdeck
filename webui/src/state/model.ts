@@ -301,11 +301,19 @@ export const ACCESS_CODE_LENGTH = 4;
 /**
  * Everything the four 2b screens render.
  *
- * `attemptsRemaining` and `lockoutSeconds` are the host's numbers, not ours:
- * `CredentialStore::attempts_remaining` and `AuthFailure::RateLimited {
- * retry_after_ms }` arrive in the `POST /auth/exchange` refusal body. The
- * browser must never compute its own attempt budget — it would disagree with
- * the limiter that actually decides.
+ * **Every number on this screen is the host's, and none of them is ours.**
+ * `attemptsRemaining`, `lockoutSeconds`, `lockoutLengthSeconds` and
+ * `codeTtlSeconds` all arrive in the refusal body from `refusal_body()` in
+ * `src/web/server.rs`. The browser must never compute its own attempt budget —
+ * it would disagree with the limiter that actually decides — and it no longer
+ * mirrors `RATE_LIMIT_LOCKOUT_MS` and `BOOTSTRAP_CODE_TTL_MS` as constants of
+ * its own, which was a duplication that would drift the moment either was
+ * tuned on the host.
+ *
+ * All four are nullable for the same reason: a screen can be reached without a
+ * refusal having been seen (the strip's `code` action), and a host from before
+ * these were sent answers without them. `null` means *we were not told*, and
+ * every sentence below has an honest shape that omits the clause.
  */
 export interface AccessState {
   readonly screen: AccessScreen;
@@ -315,8 +323,21 @@ export interface AccessState {
   readonly refused: string;
   /** From the host. `null` before any refusal has been seen. */
   readonly attemptsRemaining: number | null;
-  /** Seconds until this address may try again; `null` unless rate-limited. */
+  /** Seconds until this address may try again; `null` unless rate-limited.
+   * From `AuthFailure::RateLimited { retry_after_ms }`, so it exists only once
+   * the limiter has already fired. */
   readonly lockoutSeconds: number | null;
+  /**
+   * How long a lockout lasts, from the host's `RATE_LIMIT_LOCKOUT_MS`.
+   *
+   * Distinct from `lockoutSeconds` and needed *earlier*: 2b's footer says
+   * "3 attempts left before this address is rate-limited **for 60s**" while the
+   * address is still free to try, which `retry_after_ms` cannot answer.
+   */
+  readonly lockoutLengthSeconds: number | null;
+  /** How long a bootstrap code lives, from the host's `BOOTSTRAP_CODE_TTL_MS` —
+   * 2b: "Codes last 120 seconds and only work once". */
+  readonly codeTtlSeconds: number | null;
   /** 2b's revoked screen: `withdrew this browser's access 12s ago`. A label,
    * never a computed duration — the reducer has no clock. */
   readonly revokedAgo: string | null;
@@ -459,7 +480,23 @@ export type Seat = "controlling" | "observing";
  * number to total up.
  */
 export interface SeatInfo {
+  /** The compact chip's one line, rendered verbatim. */
   readonly label: string;
+  /**
+   * The address the host observed, or `null` when there is none to report —
+   * the desktop row, or a host from before the wire carried it separately.
+   *
+   * Host-observed, never client-supplied, and never recovered by splitting
+   * `label`: the browser half of that label is a user-agent string, which can
+   * contain the separator, so splitting it is a parse an attacker can steer.
+   */
+  readonly address: string | null;
+  /**
+   * What the browser said it is (`Chrome on macOS`), or `null` for unknown.
+   *
+   * A claim the host relays, not a fact it checked. Displayed and nothing else.
+   */
+  readonly browser: string | null;
   readonly seat: Seat;
   /** The desktop is not a viewer (`SeatInfo::viewer_id == null`). */
   readonly isDesktop: boolean;

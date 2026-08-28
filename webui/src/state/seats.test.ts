@@ -9,6 +9,8 @@ import type { SeatInfo } from "./model";
 
 const desktop: SeatInfo = {
   label: "desktop",
+  address: null,
+  browser: null,
   /** **Always** controlling: the desktop's keyboard is never revoked by a
    * browser taking over, which is why 2f gives it a transient strip and not a
    * dialog. */
@@ -18,7 +20,14 @@ const desktop: SeatInfo = {
 };
 
 function browser(label: string, seat: SeatInfo["seat"]): SeatInfo {
-  return { label, seat, isDesktop: false, sinceLabel: "14 minutes" };
+  return {
+    label,
+    address: "192.168.2.20",
+    browser: "Chrome on macOS",
+    seat,
+    isDesktop: false,
+    sinceLabel: "14 minutes",
+  };
 }
 
 describe("finding the web controller", () => {

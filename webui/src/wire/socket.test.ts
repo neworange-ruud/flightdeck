@@ -97,6 +97,116 @@ describe("wire/socket: live Delta::Activity", () => {
 });
 
 /**
+ * `remote-control-ll5.9`: artboard 2f lists three facts per seat — address,
+ * browser, connected — and a `Delta::Seats` used to deliver the first two and
+ * silently drop the third, because it carried no clock its rows' `since_ms`
+ * could be dated against. The panel therefore drew three rows or two depending
+ * on which frame the seat news happened to arrive in.
+ */
+describe("wire/socket: a seat delta dates its own rows", () => {
+  const seat = {
+    viewer_id: "v2",
+    label: "192.168.2.20 · Safari on iOS",
+    address: "192.168.2.20",
+    user_agent_label: "Safari on iOS",
+    seat: "controlling",
+    since_ms: 1_700_000_000_000,
+    is_you: false,
+  };
+
+  function deliverSeats(ws: FakeSocket, serverTimeMs: number | null): void {
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "delta",
+        change: "seats",
+        you: "observing",
+        seats: [seat],
+        ...(serverTimeMs === null ? {} : { server_time_ms: serverTimeMs }),
+      }),
+    });
+  }
+
+  function session(): { store: ReturnType<typeof createStore>; ws: FakeSocket } {
+    const store = createStore(createInitialState());
+    const ws = fakeSocket();
+    openSession({
+      store,
+      url: "ws://test/ws",
+      socketFactory: () => ws as unknown as WebSocket,
+    });
+    return { store, ws };
+  }
+
+  it("renders all three facts, dated on the host's clock", () => {
+    const { store, ws } = session();
+    deliverSeats(ws, 1_700_000_012_000);
+
+    const [row] = store.getState().seats;
+    expect(row?.address).toBe("192.168.2.20");
+    expect(row?.browser).toBe("Safari on iOS");
+    /** Twelve seconds measured entirely on the host's clock — never against
+     * `Date.now()`, which has no relationship to it. */
+    expect(row?.sinceLabel).toBe("12s ago");
+  });
+
+  it("leaves the row undated when the host sent no clock", () => {
+    /** Honest degradation for a host from before the field. Empty means "we
+     * cannot say", and 2f drops the row rather than drawing a fabricated or
+     * negative duration. */
+    const { store, ws } = session();
+    deliverSeats(ws, null);
+
+    const [row] = store.getState().seats;
+    expect(row?.sinceLabel).toBe("");
+    /** The other two facts still arrive: only the dating is lost. */
+    expect(row?.address).toBe("192.168.2.20");
+    expect(row?.browser).toBe("Safari on iOS");
+  });
+
+  it("treats serde's default 0 as no clock, not as 1970", () => {
+    const { store, ws } = session();
+    deliverSeats(ws, 0);
+    expect(store.getState().seats[0]?.sinceLabel).toBe("");
+  });
+
+  it("completes an arriving takeover panel that opened without a time", () => {
+    /**
+     * `WireError::seat_held` names the incumbent but is not a seat list, so the
+     * panel opens with `connected` blank. The dated list that follows finishes
+     * it — which is what makes the panel show the same three facts however the
+     * seat news arrived.
+     */
+    const { store, ws } = session();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "seat_held",
+        message: "192.168.2.20 · Safari on iOS is controlling this instance.",
+        incumbent: seat,
+      }),
+    });
+    expect(store.getState().takeover).toEqual({
+      kind: "arriving",
+      incumbent: {
+        address: "192.168.2.20",
+        browser: "Safari on iOS",
+        connected: "",
+      },
+    });
+
+    deliverSeats(ws, 1_700_000_012_000);
+    expect(store.getState().takeover).toEqual({
+      kind: "arriving",
+      incumbent: {
+        address: "192.168.2.20",
+        browser: "Safari on iOS",
+        connected: "12s ago",
+      },
+    });
+  });
+});
+
+/**
  * `remote-control-ll5.7`: split view is shared instance state (D3), so the
  * toggle round-trips through `sendCommand("toggle_split_view")` and the
  * layout only ever moves from what the host says next — never from the

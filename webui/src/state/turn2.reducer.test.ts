@@ -228,6 +228,8 @@ describe("2b — the access keypad", () => {
       screen: "code_entry",
       attemptsRemaining: null,
       lockoutSeconds: null,
+      lockoutLengthSeconds: null,
+      codeTtlSeconds: null,
     });
   }
 
@@ -263,6 +265,8 @@ describe("2b — the access keypad", () => {
       screen: "rejected",
       attemptsRemaining: 3,
       lockoutSeconds: null,
+      lockoutLengthSeconds: 60,
+      codeTtlSeconds: 120,
     });
     expect(state.access).toMatchObject({
       screen: "rejected",
@@ -278,6 +282,8 @@ describe("2b — the access keypad", () => {
       screen: "rejected",
       attemptsRemaining: 2,
       lockoutSeconds: null,
+      lockoutLengthSeconds: 60,
+      codeTtlSeconds: 120,
     });
     state = reduce(state, { type: "access/digit", digit: "1" });
     /** Continuing to shout "That code did not work" at someone who is answering

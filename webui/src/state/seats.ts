@@ -1,4 +1,4 @@
-import type { SeatInfo } from "./model";
+import type { Incumbent, SeatInfo } from "./model";
 
 /**
  * The viewer chip (2c/2f) and the one seat question that has a wrong answer.
@@ -71,4 +71,41 @@ export function viewerChipTitle(seats: readonly SeatInfo[]): string {
       return `${seat.label} — ${role}${since}`;
     })
     .join("\n");
+}
+
+/**
+ * The incumbent as the seat list describes it — 2f's three rows, each from its
+ * own field.
+ *
+ * **This is the function that must not be written naively.** The desktop's row
+ * is *always* `Seat::Controlling` — its keyboard is never revoked by a browser
+ * taking over — so "find the controlling seat" finds two rows and would name
+ * the desktop as the browser that evicted you. `webController` is the only
+ * correct question: a viewer (`viewer_id: Some(_)`) *and* controlling.
+ *
+ * The label is *not* split: a user-agent string is untrusted free text that can
+ * contain the separator, so the host keeps the facts apart on the wire instead
+ * (`SeatInfo::address`, `SeatInfo::user_agent_label`). A host that sends neither
+ * leaves us with the merged label and nothing to say about the browser — so the
+ * label goes in the slot it is a true answer for (it starts with the address),
+ * and the browser row is dropped rather than filled with half of a string we
+ * refused to parse.
+ *
+ * It lives here rather than beside the panel because the reducer uses it too:
+ * `WireError::seat_held` names the incumbent before any dated seat list has
+ * arrived, so the panel opens with `connected` blank and is completed the moment
+ * one does. See `refreshArrivingIncumbent` in `state/reducer.ts`.
+ */
+export function incumbentFromSeats(
+  seats: readonly SeatInfo[],
+): Incumbent | null {
+  const controller = webController(seats);
+  if (controller === null) {
+    return null;
+  }
+  return {
+    address: controller.address ?? controller.label,
+    browser: controller.browser ?? "",
+    connected: controller.sinceLabel,
+  };
 }

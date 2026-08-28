@@ -17,6 +17,22 @@ const ADDR_A: &str = "192.168.2.14";
 const ADDR_B: &str = "192.168.2.99";
 const PATH: &str = "/home/user/.flightdeck/web.json";
 
+/// What [`store`]'s fake clock reads in unix seconds, and therefore the moment
+/// any revocation in these tests happened.
+const REVOKED_AT: u64 = 1_700_000_000;
+
+/// `AuthFailure::TokenRevoked` at a known instant.
+///
+/// The instant is part of the refusal because artboard 2b's sentence — *"withdrew
+/// this browser's access 12s ago"* — needs it, and the browser must never guess
+/// it. Asserting the exact value here is the point: a refusal that forgot *when*
+/// would leave that sentence a clause short.
+fn revoked_at(unix_secs: u64) -> AuthFailure {
+    AuthFailure::TokenRevoked {
+        revoked_at_unix_secs: unix_secs,
+    }
+}
+
 /// A store over in-memory seams, with the fake clock returned so a test can
 /// move time.
 fn store() -> (CredentialStore, Arc<FakeFs>, Arc<FakeClock>) {
@@ -262,10 +278,10 @@ fn a_revoked_token_is_refused_and_says_so() {
     assert_eq!(s.active_tokens().count(), 0);
     assert_eq!(
         s.verify_token(ADDR_A, &secret),
-        Err(AuthFailure::TokenRevoked),
+        Err(revoked_at(REVOKED_AT)),
         "the browser needs the amber 'access revoked' screen, not code entry"
     );
-    assert_eq!(AuthFailure::TokenRevoked.screen(), AccessScreen::Revoked);
+    assert_eq!(revoked_at(REVOKED_AT).screen(), AccessScreen::Revoked);
 }
 
 #[test]
@@ -276,10 +292,7 @@ fn revoking_one_browser_leaves_the_others_alone() {
     let phone_id = s.verify_token(ADDR_A, &phone).expect("verify").clone();
 
     assert!(s.revoke(&phone_id).expect("revoke"));
-    assert_eq!(
-        s.verify_token(ADDR_A, &phone),
-        Err(AuthFailure::TokenRevoked)
-    );
+    assert_eq!(s.verify_token(ADDR_A, &phone), Err(revoked_at(REVOKED_AT)));
     assert!(s.verify_token(ADDR_B, &laptop).is_ok());
 }
 
@@ -300,8 +313,8 @@ fn revoke_all_withdraws_every_browser() {
     let b = bootstrap(&mut s, ADDR_B);
     assert_eq!(s.revoke_all().expect("revoke all"), 2);
     assert_eq!(s.revoke_all().expect("again"), 0);
-    assert_eq!(s.verify_token(ADDR_A, &a), Err(AuthFailure::TokenRevoked));
-    assert_eq!(s.verify_token(ADDR_B, &b), Err(AuthFailure::TokenRevoked));
+    assert_eq!(s.verify_token(ADDR_A, &a), Err(revoked_at(REVOKED_AT)));
+    assert_eq!(s.verify_token(ADDR_B, &b), Err(revoked_at(REVOKED_AT)));
 }
 
 #[test]
@@ -313,7 +326,7 @@ fn rotate_invalidates_every_prior_token_and_offers_a_fresh_code() {
     assert!(error.is_none(), "the fake filesystem persists fine");
     assert_eq!(
         s.verify_token(ADDR_A, &old),
-        Err(AuthFailure::TokenRevoked),
+        Err(revoked_at(REVOKED_AT)),
         "a rotation must not leave the old bookmark working"
     );
     assert_eq!(s.active_tokens().count(), 0);
@@ -435,10 +448,7 @@ fn an_unknown_token_spends_the_budget_but_a_revoked_one_does_not() {
     // The user's own stale cookie, presented repeatedly by a reloading tab:
     // it must not lock that browser out of the code-entry screen.
     for _ in 0..10 {
-        assert_eq!(
-            s.verify_token(ADDR_A, &secret),
-            Err(AuthFailure::TokenRevoked)
-        );
+        assert_eq!(s.verify_token(ADDR_A, &secret), Err(revoked_at(REVOKED_AT)));
     }
     assert_eq!(s.attempts_remaining(ADDR_A), 3);
 
@@ -568,7 +578,7 @@ fn a_stale_file_read_cannot_resurrect_a_revoked_token() {
 
     assert_eq!(
         s.verify_token(ADDR_A, &secret),
-        Err(AuthFailure::TokenRevoked),
+        Err(revoked_at(REVOKED_AT)),
         "revocation is one-way for the life of the process"
     );
     assert_eq!(s.active_tokens().count(), 0);
@@ -721,7 +731,7 @@ fn failure_spellings_are_stable_and_carry_nothing_secret() {
             AccessScreen::CodeEntry,
         ),
         (
-            AuthFailure::TokenRevoked,
+            revoked_at(REVOKED_AT),
             "token_revoked",
             AccessScreen::Revoked,
         ),

@@ -522,6 +522,21 @@ pub enum Seat {
 ///
 /// The identifying detail is what turn 2 asks for: enough for the two humans to
 /// work out who is who, and no more.
+///
+/// ## Why the facts are separate fields as well as one label
+///
+/// Two surfaces want the same information in two shapes. The viewer chip wants
+/// **one line** (`desktop + this tab`), so [`SeatInfo::label`] stays. Artboard
+/// 2f's arriving-viewer panel wants **three rows** — `address` / `browser` /
+/// `connected` — so each of those is its own field.
+///
+/// The alternative was for the browser to split `label` on its ` · ` separator,
+/// and that is not implementable honestly: the browser half of the label is a
+/// user-agent string, which is attacker-supplied free text and can contain
+/// anything, the separator included. Splitting untrusted display text is
+/// parsing it, and a parse that can be steered by the string it parses gives
+/// the wrong answer on demand. So the split belongs **on the wire**, where the
+/// host still knows which fact is which, and never in a browser-side parser.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatInfo {
     /// This viewer's id, or `null` for the desktop, which is not a viewer.
@@ -530,6 +545,23 @@ pub struct SeatInfo {
     /// One-line label for the chip, e.g. `192.168.2.20 · Chrome on macOS`, or
     /// `desktop`. Rendered verbatim.
     pub label: String,
+    /// The address the **host observed on the socket**, e.g. `192.168.2.20`, or
+    /// `null` for the desktop row, which arrived over no socket at all.
+    ///
+    /// Host-observed, never client-supplied: the rule that already governs
+    /// [`ClientInfo`] survives this split unchanged. A browser can tell the host
+    /// what kind of browser it is; it cannot tell the host where it is.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// What the browser said it is (`Chrome on macOS`), or `null` when it said
+    /// nothing and the host recognised nothing in its `User-Agent`.
+    ///
+    /// **A claim, not a fact.** It is displayed verbatim, sanitised and
+    /// length-capped, and it is never parsed, matched on, or allowed to stand in
+    /// for anything the host observed. `null` means we do not know — 2f's panel
+    /// then drops the `browser` row rather than printing a guess.
+    #[serde(default)]
+    pub user_agent_label: Option<String>,
     /// Whether this seat controls input.
     pub seat: Seat,
     /// Wall-clock (unix ms) the seat was taken — "how long it has been
@@ -541,10 +573,13 @@ pub struct SeatInfo {
     pub is_you: bool,
 }
 
-/// What the browser tells the host about itself, for [`SeatInfo::label`].
+/// What the browser tells the host about itself, for
+/// [`SeatInfo::user_agent_label`] and the chip's [`SeatInfo::label`].
 ///
 /// Optional and advisory: the host owns the address it observed and must not
-/// trust a client-supplied one for anything but display.
+/// trust a client-supplied one for anything but display. There is deliberately
+/// no `address` field here, and [`SeatInfo::address`] is filled from the socket
+/// rather than from anything in this struct.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientInfo {
     /// Browser/OS as the browser describes itself, e.g. `Chrome on macOS`.
@@ -1284,6 +1319,21 @@ pub enum Delta {
         you: Seat,
         /// Everyone attached, including the desktop.
         seats: Vec<SeatInfo>,
+        /// The host's clock when this frame was built, paired with the rows'
+        /// [`SeatInfo::since_ms`] the way [`Snapshot::server_time_ms`] is paired
+        /// with everything it dates.
+        ///
+        /// Without it a `since_ms` is a number the browser cannot honestly use:
+        /// dating it against `Date.now()` measures a host instant with a local
+        /// clock that may be wrong, and artboard 2f's `connected` row would be
+        /// a confident guess. So this frame carries its own reference clock, and
+        /// the seat rows are as complete here as they are inside a snapshot.
+        ///
+        /// `0` is the [`serde`] default and means *an older host said nothing*:
+        /// the row is then drawn without its `connected` line rather than with a
+        /// fabricated or negative duration.
+        #[serde(default)]
+        server_time_ms: i64,
     },
     /// A change this build does not know. Ignored by the receiver; see the
     /// forward-compatibility policy in the module docs.

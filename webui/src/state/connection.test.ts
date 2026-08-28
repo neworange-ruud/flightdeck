@@ -325,6 +325,8 @@ describe("2d — the five pane treatments", () => {
         refused: "",
         attemptsRemaining: null,
         lockoutSeconds: null,
+        lockoutLengthSeconds: null,
+        codeTtlSeconds: null,
         revokedAgo: "12s ago",
       },
     });

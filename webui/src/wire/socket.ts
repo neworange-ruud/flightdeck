@@ -22,7 +22,7 @@
 
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
-import { dialogOf, snapshotFromWire, statusFromLabel } from "./adapt";
+import { dialogOf, seatOf, snapshotFromWire, statusFromLabel } from "./adapt";
 import {
   decodeBase64,
   encodeBase64,
@@ -243,15 +243,23 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       case "seats": {
         const seats =
           (frame.seats as readonly WireSeatInfo[] | undefined) ?? [];
+        /**
+         * The host's own clock, sent beside the rows so `since_ms` can be dated
+         * without asking this machine what time it is. A host from before the
+         * field sends nothing (or a `0`, which is serde's default and not a
+         * time) — `null` then, and the rows come back undated rather than dated
+         * against a clock that has no relationship to the host's.
+         */
+        const serverTimeMs =
+          typeof frame.server_time_ms === "number" && frame.server_time_ms > 0
+            ? frame.server_time_ms
+            : null;
         store.dispatch({
           type: "seats/changed",
           seat: (frame.you as "controlling" | "observing") ?? "observing",
-          seats: seats.map((s) => ({
-            label: s.label,
-            seat: s.seat,
-            isDesktop: s.viewer_id === null,
-            sinceLabel: "",
-          })),
+          /** The same mapping the snapshot path uses, deliberately: 2f draws
+           * the same three facts however the seat news arrived. */
+          seats: seats.map((s) => seatOf(s, serverTimeMs)),
         });
         return;
       }
@@ -419,8 +427,16 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       store.dispatch({
         type: "takeover/held",
         incumbent: {
-          address: incumbent?.label ?? "another browser",
-          browser: incumbent?.label ?? "another browser",
+          /**
+           * 2f's three rows, each from its own field. The label is the
+           * fallback for the address only — it *starts* with the address the
+           * host observed — and it is never split to fill the browser row,
+           * because the half after the separator is a user-agent string that
+           * may contain another separator. An unknown browser leaves the row
+           * empty and `factList` drops it.
+           */
+          address: incumbent?.address ?? incumbent?.label ?? "another browser",
+          browser: incumbent?.user_agent_label ?? "",
           connected: "",
         },
       });

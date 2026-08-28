@@ -71,7 +71,10 @@ use crate::contracts::traits::Clock;
 use crate::remote::debuglog;
 use crate::remote::runtime;
 use crate::web::assets::{self, Lookup};
-use crate::web::credentials::{AccessScreen, AuthFailure, CredentialStore, TokenId};
+use crate::web::credentials::{
+    AccessScreen, AuthFailure, CredentialStore, TokenId, BOOTSTRAP_CODE_TTL_MS,
+    RATE_LIMIT_LOCKOUT_MS,
+};
 use crate::web::protocol::{
     check_version, Ack, AckOutcome, ActivityEvent, Attach, ClientMsg, Delta, DialogView, ErrorCode,
     Geometry, ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason,
@@ -732,9 +735,10 @@ impl Shared {
     /// Fan out a [`Delta::Seats`] to everyone (each recipient's `you` differs)
     /// and tell the TUI, after any seat change.
     fn announce_seats(&self) {
+        let now_ms = self.now_ms();
         let (frames, rows) = {
             let registry = self.registry();
-            (registry.seat_frames(), registry.seat_rows(None))
+            (registry.seat_frames(now_ms), registry.seat_rows(None))
         };
         {
             let mut registry = self.registry();
@@ -822,8 +826,9 @@ async fn await_shutdown(rx: &mut watch::Receiver<Option<ShutdownNotice>>) -> Shu
 /// One attached browser.
 struct Viewer {
     id: ViewerId,
-    address: IpAddr,
-    label: String,
+    /// The address off the socket plus the browser's own claim about itself,
+    /// kept apart so [`SeatInfo`] can carry each fact in its own field (2f).
+    identity: ViewerIdentity,
     seat: Seat,
     since_ms: i64,
     tx: mpsc::Sender<ServerMsg>,
@@ -833,7 +838,13 @@ impl Viewer {
     fn info(&self, you: Option<&ViewerId>) -> SeatInfo {
         SeatInfo {
             viewer_id: Some(self.id.clone()),
-            label: self.label.clone(),
+            label: self.identity.label(),
+            // Host-observed, always known for a viewer: this row exists because
+            // a socket connected from somewhere.
+            address: Some(self.identity.address.to_string()),
+            // The browser's claim, and `None` when it made none. 2f drops the
+            // `browser` row rather than printing a guess.
+            user_agent_label: self.identity.user_agent_label.clone(),
             seat: self.seat,
             since_ms: self.since_ms,
             is_you: you == Some(&self.id),
@@ -880,8 +891,7 @@ impl SeatRegistry {
     fn register(
         &mut self,
         id: ViewerId,
-        address: IpAddr,
-        label: String,
+        identity: ViewerIdentity,
         since_ms: i64,
         tx: mpsc::Sender<ServerMsg>,
     ) {
@@ -890,8 +900,7 @@ impl SeatRegistry {
         }
         self.viewers.push(Viewer {
             id,
-            address,
-            label,
+            identity,
             seat: Seat::Observing,
             since_ms,
             tx,
@@ -920,7 +929,7 @@ impl SeatRegistry {
         self.viewers
             .iter()
             .find(|v| &v.id == id)
-            .map(|v| v.label.clone())
+            .map(|v| v.identity.label())
     }
 
     /// Arbitrate one [`SeatRequest`]. The viewer must already be registered.
@@ -986,6 +995,11 @@ impl SeatRegistry {
         rows.push(SeatInfo {
             viewer_id: None,
             label: DESKTOP_SEAT_LABEL.to_string(),
+            // The desktop arrived over no socket, so there is no address the
+            // host observed and no browser to describe. `None` says so; a
+            // placeholder like `localhost` would be an invention.
+            address: None,
+            user_agent_label: None,
             seat: Seat::Controlling,
             since_ms: self.started_ms,
             is_you: false,
@@ -995,7 +1009,7 @@ impl SeatRegistry {
     }
 
     /// One `Delta::Seats` per viewer, each with that viewer's own `you`.
-    fn seat_frames(&self) -> Vec<(ViewerId, ServerMsg)> {
+    fn seat_frames(&self, server_time_ms: i64) -> Vec<(ViewerId, ServerMsg)> {
         self.viewers
             .iter()
             .map(|v| {
@@ -1004,6 +1018,11 @@ impl SeatRegistry {
                     ServerMsg::Delta(Delta::Seats {
                         you: v.seat,
                         seats: self.seat_rows(Some(&v.id)),
+                        // The reference clock for every row's `since_ms`. A
+                        // seat list without one is a seat list the browser
+                        // cannot date, which is how 2f's `connected` row came
+                        // to be silently dropped on this path.
+                        server_time_ms,
                     }),
                 )
             })
@@ -1020,7 +1039,7 @@ impl SeatRegistry {
         if viewer.tx.try_send(msg).is_err() {
             debuglog::log(&format!(
                 "web VIEWER dropped id={id} address={} reason=queue_full",
-                viewer.address
+                viewer.identity.address
             ));
             self.remove(id);
         }
@@ -1156,15 +1175,62 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
 
 /// The JSON body for a refusal: enough for the SPA to pick one of artboard 2b's
 /// screens and count down, and nothing about the credential itself.
-fn refusal_body(failure: AuthFailure, attempts_remaining: u32) -> serde_json::Value {
+///
+/// ## Why the two policy numbers ride on the refusal
+///
+/// Artboard 2b needs [`RATE_LIMIT_LOCKOUT_MS`] and [`BOOTSTRAP_CODE_TTL_MS`] in
+/// its copy — *"3 attempts left before this address is rate-limited for 60s"*
+/// and *"Codes last 120 seconds and only work once"* — and it needs the first of
+/// those **before the limiter has ever fired**, which `retry_after_ms` cannot
+/// give it: that value only exists once the address is already locked out. The
+/// browser used to mirror both as TypeScript constants, which is a duplication
+/// that drifts silently the moment either constant here is tuned.
+///
+/// `GET /auth/session` was the other candidate carrier, and it is unnecessary:
+/// the SPA's very first act is that call, a browser with no live cookie is
+/// **refused** by it, and that refusal comes through this same function. So
+/// every path that can reach one of 2b's screens has already been through here,
+/// while the `authenticated: true` body is only ever followed by the app — which
+/// draws none of that copy. One carrier, and no field nobody reads.
+///
+/// The numbers follow `attempts_remaining`'s precedent exactly: host-sent,
+/// never guessed, and the browser degrades to a sentence without the clause
+/// rather than filling the gap from memory.
+fn refusal_body(
+    failure: AuthFailure,
+    attempts_remaining: u32,
+    server_time_ms: i64,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "ok": false,
         "screen": screen_name(failure.screen()),
         "reason": failure.as_str(),
         "attempts_remaining": attempts_remaining,
+        // Whole seconds: the copy that reads them is written in seconds, and a
+        // millisecond value on a screen would be the browser's problem to round.
+        "lockout_seconds": RATE_LIMIT_LOCKOUT_MS / 1000,
+        "code_ttl_seconds": BOOTSTRAP_CODE_TTL_MS / 1000,
     });
     if let AuthFailure::RateLimited { retry_after_ms } = failure {
         body["retry_after_ms"] = serde_json::json!(retry_after_ms);
+    }
+    if let AuthFailure::TokenRevoked {
+        revoked_at_unix_secs,
+    } = failure
+    {
+        // 2b: "withdrew this browser's access **12s ago**". Sent as an absolute
+        // instant paired with the host's own clock, exactly as `Snapshot` pairs
+        // `since_ms` with `server_time_ms`, so the browser subtracts two host
+        // timestamps instead of measuring a host instant with its own clock.
+        //
+        // A zero is not a time — it is 1970 — so it is sent as no time at all
+        // and the browser renders the sentence without the clause. Better a
+        // shorter true sentence than a precise false one.
+        if revoked_at_unix_secs > 0 {
+            let revoked_at_ms = (revoked_at_unix_secs as i64).saturating_mul(1000);
+            body["revoked_at_ms"] = serde_json::json!(revoked_at_ms);
+            body["server_time_ms"] = serde_json::json!(server_time_ms);
+        }
     }
     body
 }
@@ -1180,10 +1246,14 @@ fn attach_retry_after(response: &mut Response, failure: AuthFailure) {
     }
 }
 
-fn refusal_response(failure: AuthFailure, attempts_remaining: u32) -> Response {
+fn refusal_response(
+    failure: AuthFailure,
+    attempts_remaining: u32,
+    server_time_ms: i64,
+) -> Response {
     let mut response = json_response(
         refusal_status(failure),
-        refusal_body(failure, attempts_remaining),
+        refusal_body(failure, attempts_remaining, server_time_ms),
     );
     attach_retry_after(&mut response, failure);
     response
@@ -1281,7 +1351,7 @@ async fn exchange_route(
                 "web AUTH exchange refused address={address} reason={} attempts_left={attempts}",
                 failure.as_str()
             ));
-            refusal_response(failure, attempts)
+            refusal_response(failure, attempts, shared.now_ms())
         }
     }
 }
@@ -1299,7 +1369,7 @@ async fn session_route(
                 .credentials
                 .unwrap_or_recover()
                 .attempts_remaining(&rate_limit_address(peer));
-            let mut body = refusal_body(failure, attempts);
+            let mut body = refusal_body(failure, attempts, shared.now_ms());
             body["authenticated"] = serde_json::json!(false);
             let mut response = json_response(refusal_status(failure), body);
             attach_retry_after(&mut response, failure);
@@ -1362,33 +1432,82 @@ async fn ws_route(
                 .credentials
                 .unwrap_or_recover()
                 .attempts_remaining(&address);
-            return refusal_response(failure, attempts);
+            return refusal_response(failure, attempts, shared.now_ms());
         }
     };
 
-    let label = viewer_label(peer, &headers);
+    let identity = viewer_identity(peer, &headers);
     debuglog::log(&format!(
-        "web WS upgrade address={address} token={token} label={label}"
+        "web WS upgrade address={address} token={token} label={}",
+        identity.label()
     ));
-    upgrade.on_upgrade(move |socket| serve_viewer(shared, socket, peer.ip(), label))
+    upgrade.on_upgrade(move |socket| serve_viewer(shared, socket, identity))
 }
 
-/// The chip label for a viewer: the address the host observed, plus whatever the
-/// browser says about itself.
+/// Who a viewer is, as two facts of very different standing.
 ///
-/// The address comes from the socket; the user-agent is the browser's own claim
-/// and is only ever displayed. Truncated so a hostile `User-Agent` cannot make
-/// the desktop's chip unreadable.
-fn viewer_label(peer: SocketAddr, headers: &HeaderMap) -> String {
-    let address = peer.ip().to_string();
-    let agent = headers
+/// They are kept apart all the way to [`SeatInfo`] rather than being merged into
+/// one string the browser would have to take back apart. A user-agent string is
+/// attacker-supplied and can contain the separator, so a browser-side split is a
+/// parse an attacker can steer — see the `SeatInfo` doc comment.
+///
+/// [`ViewerIdentity::label`] is the *derived* form: the one-line chip label, and
+/// the only place the two are ever joined.
+#[derive(Clone, Debug)]
+struct ViewerIdentity {
+    /// The peer address the host observed on the socket. Never client-supplied.
+    address: IpAddr,
+    /// What the browser said it is, already sanitised and length-capped, or
+    /// `None` when it said nothing we could use. Only ever displayed.
+    user_agent_label: Option<String>,
+}
+
+impl ViewerIdentity {
+    /// The one-line chip label, `192.168.2.20 · Chrome on macOS`.
+    ///
+    /// Joining is safe; it is the *un*joining that is not, which is why the
+    /// parts also travel on the wire in their own fields.
+    fn label(&self) -> String {
+        match &self.user_agent_label {
+            Some(agent) => format!("{} · {agent}", self.address),
+            None => self.address.to_string(),
+        }
+    }
+
+    /// Replace the browser's self-description with the claim it sent in its
+    /// [`Attach`] frame, if that claim survives sanitising. The address is left
+    /// alone unconditionally: it came off the socket, and no frame can move it.
+    fn with_claim(&self, claim: Option<&str>) -> ViewerIdentity {
+        let refined = claim
+            .map(|raw| truncate_chars(&sanitize_label(raw), MAX_LABEL_CHARS))
+            .filter(|s| !s.is_empty());
+        match refined {
+            Some(agent) => ViewerIdentity {
+                address: self.address,
+                user_agent_label: Some(agent),
+            },
+            // Nothing usable was claimed, so we keep whatever the `User-Agent`
+            // header gave us rather than forgetting a fact we already had.
+            None => self.clone(),
+        }
+    }
+}
+
+/// The identity of a viewer as the request itself describes it: the address off
+/// the socket, plus whatever the browser says about itself.
+///
+/// The user-agent is the browser's own claim and is only ever displayed.
+/// Truncated so a hostile `User-Agent` cannot make the desktop's chip unreadable.
+fn viewer_identity(peer: SocketAddr, headers: &HeaderMap) -> ViewerIdentity {
+    let user_agent_label = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(coarse_user_agent)
-        .filter(|s| !s.is_empty());
-    match agent {
-        Some(agent) => format!("{address} · {}", truncate_chars(&agent, MAX_LABEL_CHARS)),
-        None => address,
+        .filter(|s| !s.is_empty())
+        .map(|agent| truncate_chars(&agent, MAX_LABEL_CHARS));
+    ViewerIdentity {
+        address: peer.ip(),
+        user_agent_label,
     }
 }
 
@@ -1453,7 +1572,7 @@ fn new_viewer_id() -> ViewerId {
 }
 
 /// Drive one authenticated WebSocket for its whole life.
-async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, address: IpAddr, label: String) {
+async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerIdentity) {
     let guard = shared.drain.enter();
     let viewer_id = new_viewer_id();
     let (mut sink, mut stream) = socket.split();
@@ -1485,8 +1604,7 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, address: IpAddr, l
                 let verdict = handle_client_msg(
                     &shared,
                     &viewer_id,
-                    address,
-                    &label,
+                    &identity,
                     &tx,
                     &mut attached,
                     client_msg,
@@ -1587,8 +1705,7 @@ fn parse_client_msg(text: &str) -> Option<ClientMsg> {
 async fn handle_client_msg(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
-    address: IpAddr,
-    label: &str,
+    identity: &ViewerIdentity,
     tx: &mpsc::Sender<ServerMsg>,
     attached: &mut bool,
     msg: ClientMsg,
@@ -1596,10 +1713,7 @@ async fn handle_client_msg(
 ) -> Flow {
     match msg {
         ClientMsg::Attach(attach) => {
-            handle_attach(
-                shared, viewer_id, address, label, tx, attached, attach, sink,
-            )
-            .await
+            handle_attach(shared, viewer_id, identity, tx, attached, attach, sink).await
         }
         _ if !*attached => {
             // The seat, the cursors and the version are all established by
@@ -1674,8 +1788,7 @@ async fn handle_client_msg(
 async fn handle_attach(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
-    address: IpAddr,
-    label: &str,
+    identity: &ViewerIdentity,
     tx: &mpsc::Sender<ServerMsg>,
     attached: &mut bool,
     attach: Attach,
@@ -1692,28 +1805,21 @@ async fn handle_attach(
         return Flow::Close;
     }
 
-    // The browser's self-description refines the chip label, but never the
-    // address: that came off the socket.
-    let label = match attach
+    // The browser's self-description refines what we say the *browser* is, and
+    // nothing else. The address came off the socket and no frame can move it —
+    // which is exactly why the two are separate fields rather than one string.
+    let claim = attach
         .client
         .as_ref()
-        .and_then(|c| c.label.clone().or_else(|| c.user_agent.clone()))
-    {
-        Some(claim) => {
-            let claim = truncate_chars(&sanitize_label(&claim), MAX_LABEL_CHARS);
-            if claim.is_empty() {
-                label.to_string()
-            } else {
-                format!("{address} · {claim}")
-            }
-        }
-        None => label.to_string(),
-    };
+        .and_then(|c| c.label.clone().or_else(|| c.user_agent.clone()));
+    let identity = identity.with_claim(claim.as_deref());
+    let address = identity.address;
+    let label = identity.label();
 
     let now = shared.now_ms();
     let (outcome, last_input_seq) = {
         let mut registry = shared.registry();
-        registry.register(viewer_id.clone(), address, label.clone(), now, tx.clone());
+        registry.register(viewer_id.clone(), identity.clone(), now, tx.clone());
         let last_input_seq = match attach.resume_viewer.as_ref() {
             Some(previous) => registry.adopt_cursor(previous, viewer_id),
             None => registry.input_cursor(viewer_id),

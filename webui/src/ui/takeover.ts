@@ -1,4 +1,3 @@
-import { webController } from "../state/seats";
 import type { AppState } from "../state/types";
 import { clear, el } from "./dom";
 import type { Region } from "./dom";
@@ -41,6 +40,10 @@ export interface TakeoverOptions {
    */
   readonly onCancel?: () => void;
 }
+
+/** Lives in `state/seats.ts` now, because the reducer needs it too — see the
+ * note there on why "find the controlling seat" is the wrong question. */
+export { incumbentFromSeats } from "../state/seats";
 
 export function createTakeover(options: TakeoverOptions = {}): Region {
   const panel = el("div", { class: "fd-takeover__panel" });
@@ -116,34 +119,6 @@ export function createTakeover(options: TakeoverOptions = {}): Region {
   }
 
   return { el: layer, update: render };
-}
-
-/**
- * The incumbent as the seat list describes it, for a caller that has a
- * `Delta::Seats` but no `WireError::incumbent`.
- *
- * **This is the function that must not be written naively.** The desktop's row
- * is *always* `Seat::Controlling` — its keyboard is never revoked by a browser
- * taking over — so "find the controlling seat" finds two rows and would name
- * the desktop as the browser that evicted you. `webController` is the only
- * correct question: a viewer (`viewer_id: Some(_)`) *and* controlling.
- */
-export function incumbentFromSeats(state: AppState): {
-  readonly address: string;
-  readonly browser: string;
-  readonly connected: string;
-} | null {
-  const controller = webController(state.seats);
-  if (controller === null) {
-    return null;
-  }
-  return {
-    /** The host sends one label per seat, rendered verbatim; splitting it into
-     * address and browser here would be parsing untrusted display text. */
-    address: controller.label,
-    browser: "",
-    connected: controller.sinceLabel,
-  };
 }
 
 function head(title: string, eyebrow: string): HTMLElement {

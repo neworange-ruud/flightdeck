@@ -506,6 +506,11 @@ export type AppAction =
       readonly screen: AccessScreen;
       readonly attemptsRemaining: number | null;
       readonly lockoutSeconds: number | null;
+      /** `lockout_seconds` / `code_ttl_seconds` from the refusal body — the
+       * host's own policy numbers, which the browser no longer mirrors as
+       * constants of its own. `null` means it did not say. */
+      readonly lockoutLengthSeconds: number | null;
+      readonly codeTtlSeconds: number | null;
     }
   /** A digit was typed into 2b's four boxes. Extra digits are ignored, not
    * wrapped: a fifth keystroke means the user mistyped, not that they meant to
@@ -513,26 +518,29 @@ export type AppAction =
   | { readonly type: "access/digit"; readonly digit: string }
   | { readonly type: "access/backspace" }
   /**
-   * `POST /auth/exchange` refused. The body's numbers are the host's
-   * (`attempts_remaining`, `retry_after_ms`); the browser renders them and
-   * computes nothing.
+   * `POST /auth/exchange` refused. The body's numbers are all the host's
+   * (`attempts_remaining`, `retry_after_ms`, `lockout_seconds`,
+   * `code_ttl_seconds`); the browser renders them and computes nothing.
    */
   | {
       readonly type: "access/refused";
       readonly screen: AccessScreen;
       readonly attemptsRemaining: number | null;
       readonly lockoutSeconds: number | null;
+      readonly lockoutLengthSeconds: number | null;
+      readonly codeTtlSeconds: number | null;
     }
   /** The exchange succeeded — the cookie is set and the overlay comes down. */
   | { readonly type: "access/granted" }
   /**
    * Someone withdrew this browser's access from the desktop (2b/2c).
    *
-   * `revokedAgo` is nullable because the two ways we learn this carry different
-   * information: a `Shutdown { reason: TokenRevoked }` arrives the moment it
-   * happens, so "12s ago" is knowable, while an HTTP `401` on a later request
-   * says only that it happened. `null` renders the sentence without a time
-   * rather than with an invented one.
+   * `revokedAgo` is nullable because it may genuinely not be known. A
+   * `Shutdown { reason: TokenRevoked }` arrives the moment it happens, so
+   * "12s ago" is knowable; an HTTP refusal now carries `revoked_at_ms` beside
+   * the host's own `server_time_ms`, so it is knowable there too — but a host
+   * that keeps no tombstone time, or one from before that field, sends neither.
+   * `null` renders the sentence without a time rather than with an invented one.
    */
   | { readonly type: "access/revoked"; readonly revokedAgo: string | null }
   /** 2b's `Enter a new code` — back to a blank keypad from any other screen. */

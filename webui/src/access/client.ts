@@ -1,5 +1,6 @@
 import { parseAccessScreen } from "../state/access";
 import type { AccessScreen } from "../state/model";
+import { agoLabel } from "../wire/adapt";
 
 /**
  * The two HTTP calls the access screens make (Q4, D5).
@@ -39,6 +40,27 @@ export interface AccessRefusal {
   readonly attemptsRemaining: number | null;
   /** From `AuthFailure::RateLimited { retry_after_ms }`, in whole seconds. */
   readonly lockoutSeconds: number | null;
+  /**
+   * `RATE_LIMIT_LOCKOUT_MS` as whole seconds — how long a lockout *lasts*, as
+   * opposed to how much of one is left.
+   *
+   * 2b needs it before the limiter has ever fired, which `retry_after_ms`
+   * cannot answer, so the host sends it on every refusal. The browser used to
+   * mirror it as a TypeScript constant; a copy of someone else's constant is a
+   * lie waiting for them to change it.
+   */
+  readonly lockoutLengthSeconds: number | null;
+  /** `BOOTSTRAP_CODE_TTL_MS` as whole seconds — 2b's "Codes last 120 seconds". */
+  readonly codeTtlSeconds: number | null;
+  /**
+   * 2b's revoked screen: `withdrew this browser's access **12s ago**`.
+   *
+   * Already a label, because the two host timestamps it is computed from are
+   * both the host's — `revoked_at_ms` against the `server_time_ms` sent beside
+   * it, never against this browser's clock, which may be wrong. `null` when the
+   * host did not say when, and the sentence then renders without the clause.
+   */
+  readonly revokedAgo: string | null;
 }
 
 export type AccessResult =
@@ -145,7 +167,34 @@ async function readResult(response: Response): Promise<AccessResult> {
     reason: typeof record.reason === "string" ? record.reason : "unknown",
     attemptsRemaining: numberOrNull(record.attempts_remaining),
     lockoutSeconds: millisToSeconds(numberOrNull(record.retry_after_ms)),
+    lockoutLengthSeconds: numberOrNull(record.lockout_seconds),
+    codeTtlSeconds: numberOrNull(record.code_ttl_seconds),
+    revokedAgo: revokedAgoLabel(
+      numberOrNull(record.revoked_at_ms),
+      numberOrNull(record.server_time_ms),
+    ),
   };
+}
+
+/**
+ * `12s ago`, from the host's revocation instant and the host's own clock.
+ *
+ * **Both timestamps have to be the host's.** Subtracting a host instant from
+ * `Date.now()` would measure the gap with the wrong clock and print a confident
+ * wrong duration on a security screen; the host therefore sends `server_time_ms`
+ * beside `revoked_at_ms`, exactly as `Snapshot` pairs `server_time_ms` with
+ * every `since_ms`. Either one missing means we were not told, and the answer is
+ * `null` — 2b's sentence then reads "withdrew this browser's access." and stops,
+ * which is shorter and true.
+ */
+function revokedAgoLabel(
+  revokedAtMs: number | null,
+  serverTimeMs: number | null,
+): string | null {
+  if (revokedAtMs === null || serverTimeMs === null) {
+    return null;
+  }
+  return agoLabel(serverTimeMs - revokedAtMs);
 }
 
 function numberOrNull(value: unknown): number | null {

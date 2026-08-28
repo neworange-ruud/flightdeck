@@ -14,6 +14,7 @@ import { createApp } from "./app";
 import type { App } from "./app";
 import type { AppAction, AppState, ConnectionStatus } from "../state/types";
 import type { StripAction } from "../state/connection";
+import { incumbentFromSeats } from "./takeover";
 
 interface Harness {
   readonly app: App;
@@ -86,16 +87,30 @@ beforeEach(() => {
 /* ══ 2b — the four browser-side access screens ═══════════════════════════ */
 
 describe("2b — access screens", () => {
+  /**
+   * `extra` defaults `lockoutLengthSeconds`/`codeTtlSeconds` to the numbers the
+   * shipped host sends, because they are *host-sent* now rather than mirrored
+   * here — the tests that matter are the two that pass `null` explicitly and
+   * assert the sentence loses its clause instead of gaining an invention.
+   */
   function needCode(
     h: Harness,
     screen: "code_entry" | "rejected" | "rate_limited",
-    extra: { attemptsRemaining?: number; lockoutSeconds?: number } = {},
+    extra: {
+      attemptsRemaining?: number;
+      lockoutSeconds?: number;
+      lockoutLengthSeconds?: number | null;
+      codeTtlSeconds?: number | null;
+    } = {},
   ): void {
     h.app.store.dispatch({
       type: "access/required",
       screen,
       attemptsRemaining: extra.attemptsRemaining ?? null,
       lockoutSeconds: extra.lockoutSeconds ?? null,
+      lockoutLengthSeconds:
+        extra.lockoutLengthSeconds === undefined ? 60 : extra.lockoutLengthSeconds,
+      codeTtlSeconds: extra.codeTtlSeconds === undefined ? 120 : extra.codeTtlSeconds,
     });
   }
 
@@ -166,6 +181,10 @@ describe("2b — access screens", () => {
       screen: "rejected",
       attemptsRemaining: 3,
       lockoutSeconds: null,
+      /** The host's `RATE_LIMIT_LOCKOUT_MS` and `BOOTSTRAP_CODE_TTL_MS`, sent
+       * on every refusal. The browser no longer keeps copies of them. */
+      lockoutLengthSeconds: 60,
+      codeTtlSeconds: 120,
     });
 
     expect(h.text(".fd-access__title")).toBe("That code did not work");
@@ -200,6 +219,46 @@ describe("2b — access screens", () => {
     expect(h.text(".fd-access__attempts")).toContain("rate-limited for another 60s");
   });
 
+  it("prints the two policy numbers the host sent, not numbers of its own", () => {
+    const h = render({ attach: false });
+    /** A host tuned away from the shipped 60/120. The screens follow it,
+     * because they no longer hold copies of those constants. */
+    needCode(h, "rejected", {
+      attemptsRemaining: 2,
+      lockoutLengthSeconds: 90,
+      codeTtlSeconds: 45,
+    });
+    expect(h.text(".fd-access__body")).toContain("Codes last 45 seconds");
+    expect(h.text(".fd-access__attempts")).toBe(
+      "2 attempts left before this address is rate-limited for 90s",
+    );
+  });
+
+  it("drops the clause rather than inventing a number the host did not send", () => {
+    /**
+     * Honest degradation, and the reason all four numbers are nullable: a host
+     * that says nothing leaves each sentence one clause shorter and still true.
+     * Filling the gap from a remembered constant would be the browser asserting
+     * a policy it does not set.
+     */
+    const h = render({ attach: false });
+    needCode(h, "rejected", {
+      attemptsRemaining: 2,
+      lockoutLengthSeconds: null,
+      codeTtlSeconds: null,
+    });
+    expect(h.text(".fd-access__body")).toBe(
+      "It expired, or it was mistyped. Codes only work once.",
+    );
+    expect(h.text(".fd-access__attempts")).toBe(
+      "2 attempts left before this address is rate-limited",
+    );
+
+    needCode(h, "code_entry", { codeTtlSeconds: null });
+    expect(h.text(".fd-access__body")).toContain("The overlay shows a four-digit code.");
+    expect(h.text(".fd-access__body")).not.toContain("minutes");
+  });
+
   it("revoked: amber, from the desktop, and the photograph underneath", () => {
     const h = render();
     h.app.store.dispatch({ type: "access/revoked", revokedAgo: "12s ago" });
@@ -214,6 +273,17 @@ describe("2b — access screens", () => {
     /** Both offers: a new code, or stay and read the photograph. */
     expect(h.text(".fd-access__primary")).toContain("Enter a new code");
     expect(h.text(".fd-access__secondary")).toContain("Stay here");
+  });
+
+  it("revoked: says only that it happened when the host did not say when", () => {
+    /** 2b's sentence without its clause. A zero or a guessed duration on a
+     * security screen would be the first lie the user is shown. */
+    const h = render();
+    h.app.store.dispatch({ type: "access/revoked", revokedAgo: null });
+    const body = h.text(".fd-access__body");
+    expect(body).toContain("withdrew this browser's access.");
+    expect(body).toContain("Nothing is broken and nothing is lost");
+    expect(body).not.toContain("ago");
   });
 
   it("revoked: Esc stays here without claiming to be authorised", () => {
@@ -592,6 +662,86 @@ describe("2f — takeover", () => {
     ]);
   });
 
+  it("arriving: each of the three facts comes from its own field", () => {
+    /**
+     * The panel used to get the merged `SeatInfo::label` in the address slot and
+     * nothing in the browser slot — deliberately, because splitting untrusted
+     * display text on a separator is a parse the text itself can steer. The fix
+     * was on the wire: the host now sends `address` and `user_agent_label`
+     * apart, and the label stays for the compact chip.
+     */
+    const h = render();
+    h.app.store.dispatch({
+      type: "seats/changed",
+      seat: "observing",
+      seats: [
+        {
+          label: "desktop",
+          address: null,
+          browser: null,
+          seat: "controlling",
+          isDesktop: true,
+          sinceLabel: "since launch",
+        },
+        {
+          label: "192.168.2.20 · Safari · iOS 18",
+          address: "192.168.2.20",
+          /** A separator inside the browser's own claim: exactly the payload a
+           * browser-side split of the label would get wrong. */
+          browser: "Safari · iOS 18",
+          seat: "controlling",
+          isDesktop: false,
+          sinceLabel: "14 minutes",
+        },
+      ],
+    });
+
+    expect(incumbentFromSeats(h.state().seats)).toEqual({
+      address: "192.168.2.20",
+      browser: "Safari · iOS 18",
+      connected: "14 minutes",
+    });
+  });
+
+  it("arriving: an older host's merged label still names an address, and no browser", () => {
+    /** Honest degradation. With no `address`/`user_agent_label` on the wire the
+     * merged label is all we have — it is a true answer for the address slot,
+     * which it starts with — and the browser row is dropped rather than filled
+     * from a split we refuse to perform. */
+    const h = render();
+    h.app.store.dispatch({
+      type: "seats/changed",
+      seat: "observing",
+      seats: [
+        {
+          label: "192.168.2.20 · Safari on iOS",
+          address: null,
+          browser: null,
+          seat: "controlling",
+          isDesktop: false,
+          sinceLabel: "14 minutes",
+        },
+      ],
+    });
+
+    expect(incumbentFromSeats(h.state().seats)).toEqual({
+      address: "192.168.2.20 · Safari on iOS",
+      browser: "",
+      connected: "14 minutes",
+    });
+  });
+
+  it("arriving: a fact the host did not send is a row that is not drawn", () => {
+    const h = render();
+    h.app.store.dispatch({
+      type: "takeover/held",
+      incumbent: { address: "192.168.2.20", browser: "", connected: "" },
+    });
+    const rows = h.all(".fd-takeover__facts dt").map((dt) => dt.textContent);
+    expect(rows).toEqual(["address"]);
+    expect(h.text(".fd-takeover__facts")).toContain("192.168.2.20");
+  });
+
   it("arriving: taking over claims the seat", () => {
     const h = render();
     arriving(h);
@@ -850,6 +1000,8 @@ describe("the overlays stay keyboard-operable", () => {
           screen: "code_entry",
           attemptsRemaining: null,
           lockoutSeconds: null,
+          lockoutLengthSeconds: null,
+          codeTtlSeconds: null,
         });
       },
       (h: Harness) => {

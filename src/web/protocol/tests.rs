@@ -106,6 +106,8 @@ fn seat_info() -> SeatInfo {
     SeatInfo {
         viewer_id: Some(ViewerId::new("view_1")),
         label: "192.168.2.20 · Chrome on macOS".into(),
+        address: Some("192.168.2.20".into()),
+        user_agent_label: Some("Chrome on macOS".into()),
         seat: Seat::Controlling,
         since_ms: 1_700_000_000_000,
         is_you: true,
@@ -174,6 +176,8 @@ fn snapshot() -> Snapshot {
             SeatInfo {
                 viewer_id: None,
                 label: "desktop".into(),
+                address: None,
+                user_agent_label: None,
                 seat: Seat::Controlling,
                 since_ms: 1_699_999_000_000,
                 is_you: false,
@@ -257,6 +261,7 @@ fn all_deltas() -> Vec<Delta> {
         Delta::Seats {
             you: Seat::Observing,
             seats: vec![seat_info()],
+            server_time_ms: 1_700_000_012_000,
         },
     ]
 }
@@ -624,6 +629,71 @@ fn a_held_seat_is_refused_without_evicting_and_names_the_incumbent() {
 }
 
 #[test]
+fn a_seat_carries_its_three_facts_in_three_fields_never_one_string_to_split() {
+    // Artboard 2f's arriving-viewer panel lists address / browser / connected as
+    // three rows. The compact chip (2c) wants one line. Both are served, and the
+    // browser is never asked to take the line back apart — a user-agent string is
+    // attacker-supplied and may contain the ` · ` separator, so a split is a
+    // parse the attacker gets to steer.
+    let value = serde_json::to_value(seat_info()).unwrap();
+    assert_eq!(value["address"], "192.168.2.20");
+    assert_eq!(value["user_agent_label"], "Chrome on macOS");
+    assert_eq!(value["label"], "192.168.2.20 · Chrome on macOS");
+    assert!(value["since_ms"].as_i64().unwrap() > 0);
+    assert_eq!(round_trip(&seat_info()), seat_info());
+
+    // A separator inside the browser's own claim is exactly the case a
+    // browser-side split gets wrong, and exactly the case the wire gets right.
+    let hostile = SeatInfo {
+        user_agent_label: Some("Chrome · 10.0.0.1 on macOS".into()),
+        ..seat_info()
+    };
+    let back = round_trip(&hostile);
+    assert_eq!(
+        back.address.as_deref(),
+        Some("192.168.2.20"),
+        "the host-observed address is never displaced by anything the client said"
+    );
+    assert_eq!(back.user_agent_label, hostile.user_agent_label);
+}
+
+#[test]
+fn a_seat_without_the_split_fields_decodes_to_unknown_not_to_a_guess() {
+    // Both fields are additive `#[serde(default)]`, in the idiom the surrounding
+    // types already use, so a payload from before the split still decodes — and
+    // it decodes to "we do not know" rather than to an invented address. 2f then
+    // drops the row instead of printing a placeholder.
+    let mut value = serde_json::to_value(seat_info()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("address");
+    object.remove("user_agent_label");
+    let without: SeatInfo = serde_json::from_value(value).unwrap();
+    assert_eq!(without.address, None);
+    assert_eq!(without.user_agent_label, None);
+    assert_eq!(
+        without.label, "192.168.2.20 · Chrome on macOS",
+        "the one-line chip label still works, which is why it stays"
+    );
+}
+
+#[test]
+fn the_desktop_row_has_no_address_because_it_arrived_over_no_socket() {
+    let desktop = SeatInfo {
+        viewer_id: None,
+        label: "desktop".into(),
+        address: None,
+        user_agent_label: None,
+        seat: Seat::Controlling,
+        since_ms: 1_699_999_000_000,
+        is_you: false,
+    };
+    let value = serde_json::to_value(&desktop).unwrap();
+    assert!(value["address"].is_null(), "never a fabricated `localhost`");
+    assert!(value["user_agent_label"].is_null());
+    assert_eq!(round_trip(&desktop), desktop);
+}
+
+#[test]
 fn eviction_is_a_seat_delta_not_a_shutdown() {
     // An evicted controller keeps its socket and becomes an observer, which is
     // what lets it watch read-only instead of fighting (D14 as revised).
@@ -632,15 +702,60 @@ fn eviction_is_a_seat_delta_not_a_shutdown() {
         seats: vec![SeatInfo {
             viewer_id: Some(ViewerId::new("view_2")),
             label: "192.168.2.31 · Safari on iPadOS".into(),
+            address: Some("192.168.2.31".into()),
+            user_agent_label: Some("Safari on iPadOS".into()),
             seat: Seat::Controlling,
             since_ms: 1_700_000_100_000,
             is_you: false,
         }],
+        server_time_ms: 1_700_000_112_000,
     };
     let value = serde_json::to_value(&delta).unwrap();
     assert_eq!(value["change"], "seats");
     assert_eq!(value["you"], "observing");
     assert_eq!(round_trip(&delta), delta);
+}
+
+#[test]
+fn a_seat_delta_carries_the_clock_its_rows_are_dated_against() {
+    // A `since_ms` with no reference clock is a number the browser cannot
+    // honestly use: dating it against `Date.now()` measures a host instant with
+    // a local clock that may be wrong. `Snapshot` has always paired the two, and
+    // 2f's `connected` row was silently dropped on the delta path for want of
+    // the same pairing.
+    let delta = Delta::Seats {
+        you: Seat::Observing,
+        seats: vec![seat_info()],
+        server_time_ms: 1_700_000_012_000,
+    };
+    let value = serde_json::to_value(&delta).unwrap();
+    assert_eq!(value["server_time_ms"], 1_700_000_012_000i64);
+    assert_eq!(
+        value["seats"][0]["since_ms"], 1_700_000_000_000i64,
+        "12 seconds, measured entirely on the host's clock"
+    );
+    assert_eq!(round_trip(&delta), delta);
+
+    // Additive and defaulted, in the idiom the rest of these types use: a host
+    // from before this field still decodes, and decodes to `0` — which the
+    // browser reads as "no clock was sent" and renders the row without its
+    // `connected` line, never with a fabricated or negative duration.
+    let mut older = serde_json::to_value(&delta).unwrap();
+    older.as_object_mut().unwrap().remove("server_time_ms");
+    let without: Delta = serde_json::from_value(older).unwrap();
+    let Delta::Seats {
+        server_time_ms,
+        seats,
+        ..
+    } = &without
+    else {
+        panic!("still a seat delta");
+    };
+    assert_eq!(
+        *server_time_ms, 0,
+        "absent is not a time, and never a guess"
+    );
+    assert_eq!(seats.len(), 1, "the rows themselves survive intact");
 }
 
 #[test]

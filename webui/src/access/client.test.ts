@@ -89,6 +89,95 @@ describe("POST /auth/exchange", () => {
     expect(result).toMatchObject({ attemptsRemaining: 0, lockoutSeconds: 60 });
   });
 
+  it("takes the lockout length and code lifetime from the host, never from a copy", async () => {
+    /**
+     * These two used to be TypeScript constants mirroring
+     * `RATE_LIMIT_LOCKOUT_MS` and `BOOTSTRAP_CODE_TTL_MS`. They are host-sent
+     * now: 2b prints the lockout length while the address is *still allowed to
+     * try*, which `retry_after_ms` cannot answer because it only exists once
+     * the limiter has already fired.
+     */
+    const result = await exchangeCode("8412", {
+      fetch: async () =>
+        jsonResponse(401, {
+          ok: false,
+          screen: "rejected",
+          reason: "wrong_code",
+          attempts_remaining: 3,
+          lockout_seconds: 90,
+          code_ttl_seconds: 45,
+        }),
+    });
+    expect(result).toMatchObject({
+      lockoutLengthSeconds: 90,
+      codeTtlSeconds: 45,
+      /** Not the same field: nothing was locked out here. */
+      lockoutSeconds: null,
+    });
+  });
+
+  it("says it does not know rather than remembering the numbers itself", async () => {
+    /** A host that sends neither leaves both `null`, and the screens drop the
+     * clauses that would have used them. Defaulting to a remembered 60/120
+     * would be the browser asserting someone else's constant. */
+    const result = await exchangeCode("8412", {
+      fetch: async () =>
+        jsonResponse(401, { ok: false, screen: "rejected", reason: "wrong_code" }),
+    });
+    expect(result).toMatchObject({
+      lockoutLengthSeconds: null,
+      codeTtlSeconds: null,
+      attemptsRemaining: null,
+    });
+  });
+
+  it("dates the revocation on the host's clock, not on this browser's", async () => {
+    /**
+     * 2b: "withdrew this browser's access **12s ago**". Both timestamps are the
+     * host's — subtracting a host instant from `Date.now()` would measure the
+     * gap with a clock that may be wrong and print a confident wrong duration
+     * on a security screen.
+     */
+    const result = await exchangeCode("8412", {
+      fetch: async () =>
+        jsonResponse(401, {
+          ok: false,
+          screen: "revoked",
+          reason: "token_revoked",
+          revoked_at_ms: 1_700_000_000_000,
+          server_time_ms: 1_700_000_012_000,
+        }),
+    });
+    expect(result).toMatchObject({ screen: "revoked", revokedAgo: "12s ago" });
+  });
+
+  it("leaves the revocation undated when the host did not say when", async () => {
+    /** Honest degradation: the sentence renders without the clause. Never a
+     * fabricated time, and never a zero — which would print as 1970. */
+    const result = await exchangeCode("8412", {
+      fetch: async () =>
+        jsonResponse(401, {
+          ok: false,
+          screen: "revoked",
+          reason: "token_revoked",
+        }),
+    });
+    expect(result).toMatchObject({ screen: "revoked", revokedAgo: null });
+
+    /** And a `revoked_at_ms` with no `server_time_ms` beside it is not enough:
+     * there is no host clock to measure it against. */
+    const half = await exchangeCode("8412", {
+      fetch: async () =>
+        jsonResponse(401, {
+          ok: false,
+          screen: "revoked",
+          reason: "token_revoked",
+          revoked_at_ms: 1_700_000_000_000,
+        }),
+    });
+    expect(half).toMatchObject({ revokedAgo: null });
+  });
+
   it("falls back to the always-safe screen for a spelling it does not know", async () => {
     const result = await exchangeCode("8412", {
       fetch: async () =>

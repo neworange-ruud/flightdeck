@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { gitOf, sessionOf, snapshotFromWire, statusOf } from "./adapt";
+import { gitOf, seatOf, sessionOf, snapshotFromWire, statusOf } from "./adapt";
 import { decodeBase64, encodeBase64 } from "./frames";
 import type {
   WireCommandView,
   WireGitBar,
+  WireSeatInfo,
   WireSessionView,
   WireSnapshot,
   WireTerminalView,
@@ -223,6 +224,57 @@ describe("snapshot", () => {
     const seats = snapshotFromWire(wire).seats;
     expect(seats.map((s) => s.isDesktop)).toEqual([true, false]);
     expect(seats[1]?.sinceLabel).toBe("just now");
+  });
+
+  /**
+   * `remote-control-ll5.9`: artboard 2f's three facts must not depend on which
+   * frame delivered the seat. A snapshot and a `Delta::Seats` carry the same
+   * `WireSeatInfo` shape and the same `server_time_ms` beside it, and both go
+   * through `seatOf` — this pins that there is only one mapping, because two of
+   * them is exactly how one path came to drop the `connected` fact.
+   */
+  it("maps a seat identically whether it arrived in a snapshot or a delta", () => {
+    const row: WireSeatInfo = {
+      viewer_id: "v2",
+      label: "192.168.2.20 · Safari on iOS",
+      address: "192.168.2.20",
+      user_agent_label: "Safari on iOS",
+      seat: "controlling",
+      since_ms: 988_000,
+      is_you: false,
+    };
+
+    const fromSnapshot = snapshotFromWire({ ...wire, seats: [row] }).seats[0];
+    const fromDelta = seatOf(row, wire.server_time_ms);
+
+    expect(fromDelta).toEqual(fromSnapshot);
+    expect(fromDelta).toEqual({
+      label: "192.168.2.20 · Safari on iOS",
+      address: "192.168.2.20",
+      browser: "Safari on iOS",
+      seat: "controlling",
+      isDesktop: false,
+      sinceLabel: "12s ago",
+    });
+  });
+
+  it("undates a seat the host sent no clock for, and nothing else", () => {
+    /** The one difference a delta can have: an older host sends no
+     * `server_time_ms`. The row loses its date and keeps everything else —
+     * never a fabricated duration, and never a negative one. */
+    const row: WireSeatInfo = {
+      viewer_id: "v2",
+      label: "192.168.2.20 · Safari on iOS",
+      address: "192.168.2.20",
+      user_agent_label: "Safari on iOS",
+      seat: "controlling",
+      since_ms: 988_000,
+      is_you: false,
+    };
+    expect(seatOf(row, null)).toEqual({
+      ...seatOf(row, wire.server_time_ms),
+      sinceLabel: "",
+    });
   });
 
   it("falls back to the first session when the host reports no selection", () => {

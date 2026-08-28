@@ -103,7 +103,23 @@ export interface WireSelection {
 export interface WireSeatInfo {
   /** `null` is the desktop — the one seat that is never a browser. */
   readonly viewer_id: string | null;
+  /** The compact one-line chip label, `192.168.2.20 · Chrome on macOS`. */
   readonly label: string;
+  /**
+   * The address the **host observed on the socket**, or absent/`null` for the
+   * desktop row and for a host from before the split.
+   *
+   * This exists so 2f's panel never has to split `label` on its separator. A
+   * user-agent string is attacker-supplied free text and can contain ` · `, so
+   * a browser-side split is a parse the string itself gets to steer.
+   */
+  readonly address?: string | null;
+  /**
+   * What the browser said it is (`Chrome on macOS`) — the host's own word for
+   * a claim it only ever displays. Absent or `null` means nobody knows, and 2f
+   * drops the row rather than printing a guess.
+   */
+  readonly user_agent_label?: string | null;
   readonly seat: "controlling" | "observing";
   readonly since_ms: number;
   readonly is_you: boolean;
@@ -271,7 +287,14 @@ export interface WireShutdown {
   readonly detail?: string;
 }
 
-/** `delta` is tagged twice: `type: "delta"` then `change: …`. */
+/**
+ * `delta` is tagged twice: `type: "delta"` then `change: …`.
+ *
+ * `change: "seats"` carries `seats: WireSeatInfo[]`, `you`, and a
+ * `server_time_ms` — the host clock its rows' `since_ms` are dated against, the
+ * same pairing `WireSnapshot` has always had. Absent or `0` means an older host
+ * sent none, and the rows stay undated.
+ */
 export interface WireDeltaEnvelope {
   readonly type: "delta";
   readonly change: string;

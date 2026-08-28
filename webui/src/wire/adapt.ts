@@ -200,12 +200,39 @@ export function projectOf(project: WireProjectView): Project {
   };
 }
 
-function seatOf(seat: WireSeatInfo, serverTimeMs: number): SeatInfo {
+/**
+ * One seat row, from whichever frame delivered it.
+ *
+ * **Exported so there is exactly one of these.** A seat list reaches the browser
+ * two ways — inside a `Snapshot` and inside a `Delta::Seats` — and artboard 2f
+ * draws the same three facts either way. Two mapping functions is how one path
+ * came to quietly drop the `connected` row while the other kept it, so both
+ * paths call this and the panel cannot depend on how the news arrived.
+ *
+ * `serverTimeMs` is the **host's** clock, sent beside the rows in both frames.
+ * `null` means the host sent none (one from before `Delta::Seats` carried it),
+ * and the row is then undated rather than dated against `Date.now()` — a local
+ * clock cannot honestly measure a host instant, and a wrong one would print a
+ * confident wrong duration.
+ */
+export function seatOf(
+  seat: WireSeatInfo,
+  serverTimeMs: number | null,
+): SeatInfo {
   return {
     label: seat.label,
+    /**
+     * Both facts come from their own wire field, and neither is ever recovered
+     * from `label` by splitting it — see `WireSeatInfo`. A host from before the
+     * split sends neither, and `null` then means "unknown", which is what 2f
+     * renders as a missing row rather than as an empty one.
+     */
+    address: seat.address ?? null,
+    browser: seat.user_agent_label ?? null,
     seat: seat.seat,
     isDesktop: seat.viewer_id === null,
-    sinceLabel: agoLabel(serverTimeMs - seat.since_ms),
+    sinceLabel:
+      serverTimeMs === null ? "" : agoLabel(serverTimeMs - seat.since_ms),
   };
 }
 

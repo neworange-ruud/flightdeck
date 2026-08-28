@@ -325,7 +325,16 @@ pub enum AuthFailure {
     /// [`AuthFailure::UnknownToken`] because "someone withdrew your access" is a
     /// decision a person made, not a failure, and artboard 2b gives it its own
     /// amber screen.
-    TokenRevoked,
+    TokenRevoked {
+        /// When the revocation happened, from the tombstone this host kept.
+        ///
+        /// Carried on the failure for the same reason
+        /// [`AuthFailure::RateLimited`] carries `retry_after_ms`: artboard 2b's
+        /// sentence — *"withdrew this browser's access **12s ago**"* — needs a
+        /// number, and the only surface that knows it is the one refusing. A
+        /// browser that has to guess writes a lie.
+        revoked_at_unix_secs: u64,
+    },
     /// This address has spent its attempt budget.
     RateLimited {
         /// Milliseconds until the address is allowed to try again — the value
@@ -344,7 +353,7 @@ impl AuthFailure {
             AuthFailure::CodeExpired => "code_expired",
             AuthFailure::CodeAlreadyUsed => "code_already_used",
             AuthFailure::UnknownToken => "unknown_token",
-            AuthFailure::TokenRevoked => "token_revoked",
+            AuthFailure::TokenRevoked { .. } => "token_revoked",
             AuthFailure::RateLimited { .. } => "rate_limited",
         }
     }
@@ -358,7 +367,7 @@ impl AuthFailure {
             AuthFailure::WrongCode | AuthFailure::CodeExpired | AuthFailure::CodeAlreadyUsed => {
                 AccessScreen::Rejected
             }
-            AuthFailure::TokenRevoked => AccessScreen::Revoked,
+            AuthFailure::TokenRevoked { .. } => AccessScreen::Revoked,
             AuthFailure::RateLimited { .. } => AccessScreen::RateLimited,
         }
     }
@@ -989,7 +998,15 @@ impl CredentialStore {
                 self.touch(index);
                 Ok(self.state.tokens[index].id.clone())
             }
-            Some((_, false)) => Err(AuthFailure::TokenRevoked),
+            Some((index, false)) => Err(AuthFailure::TokenRevoked {
+                // A record that is not active has a revocation time by
+                // construction (`is_active` *is* `revoked_at_unix_secs.is_none`),
+                // so this branch never has to invent one. The `unwrap_or` is
+                // unreachable and deliberately degrades to "we do not know" —
+                // `0` would be a fabricated 1970 timestamp, so the wire treats a
+                // zero as no time at all (see `refusal_body`).
+                revoked_at_unix_secs: self.state.tokens[index].revoked_at_unix_secs.unwrap_or(0),
+            }),
             None => {
                 self.limiter.record_failure(address, now_ms);
                 Err(AuthFailure::UnknownToken)

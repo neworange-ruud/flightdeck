@@ -3,7 +3,8 @@ import { clampIndex, paletteColumns, paletteInventory } from "./commands";
 import { CONFIG_FIELDS, selectableConfigFields } from "./config";
 import { selectedChoice } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
-import type { AccessState, Project, Selection } from "./model";
+import type { AccessState, Project, SeatInfo, Selection } from "./model";
+import { incumbentFromSeats } from "./seats";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
 import type {
@@ -128,6 +129,9 @@ export function reduce(state: AppState, action: AppAction): AppState {
          * reading the palette off the wire instead of compiling it in.
          */
         commands: snapshot.commands,
+        /** A dated seat list completes an arriving takeover panel — see
+         * `refreshArrivingIncumbent`. */
+        takeover: refreshArrivingIncumbent(state.takeover, snapshot.seats),
       };
     }
 
@@ -247,6 +251,8 @@ export function reduce(state: AppState, action: AppAction): AppState {
           refused: "",
           attemptsRemaining: action.attemptsRemaining,
           lockoutSeconds: action.lockoutSeconds,
+          lockoutLengthSeconds: action.lockoutLengthSeconds,
+          codeTtlSeconds: action.codeTtlSeconds,
           revokedAgo: null,
         },
       };
@@ -299,6 +305,8 @@ export function reduce(state: AppState, action: AppAction): AppState {
           code: "",
           attemptsRemaining: action.attemptsRemaining,
           lockoutSeconds: action.lockoutSeconds,
+          lockoutLengthSeconds: action.lockoutLengthSeconds,
+          codeTtlSeconds: action.codeTtlSeconds,
         },
       };
     }
@@ -340,7 +348,12 @@ export function reduce(state: AppState, action: AppAction): AppState {
       };
 
     case "seats/changed":
-      return { ...state, seats: action.seats, seat: action.seat };
+      return {
+        ...state,
+        seats: action.seats,
+        seat: action.seat,
+        takeover: refreshArrivingIncumbent(state.takeover, action.seats),
+      };
 
     case "takeover/held":
       return {
@@ -850,6 +863,31 @@ function firstSelectionIn(project: Project): Selection {
 }
 
 /**
+ * Complete an open *arriving* takeover panel from a seat list.
+ *
+ * `WireError::seat_held` names the incumbent, but it is not a seat *list*: it
+ * carries no `server_time_ms`, so the `connected` row opens blank. The seat list
+ * that follows — a snapshot on the observe-attach, then a `Delta::Seats` — has
+ * the host's clock beside it, and naming the same seat from the more complete
+ * frame is what stops 2f drawing two rows on one path and three on another.
+ *
+ * Only the `arriving` panel, and only when the list still names a web
+ * controller: a list with nobody in the seat is not a reason to blank out the
+ * name of the browser we were just refused by. The panel is closed by the user's
+ * own answer (`takeover/claim`, `takeover/observe`), never by a seat list.
+ */
+function refreshArrivingIncumbent(
+  takeover: AppState["takeover"],
+  seats: readonly SeatInfo[],
+): AppState["takeover"] {
+  if (takeover === null || takeover.kind !== "arriving") {
+    return takeover;
+  }
+  const incumbent = incumbentFromSeats(seats);
+  return incumbent === null ? takeover : { kind: "arriving", incumbent };
+}
+
+/**
  * The access screen a refusal lands on when none was up yet — a `401` on a
  * request this browser made before it had ever asked for a code.
  */
@@ -860,6 +898,10 @@ function blankAccess(): AccessState {
     refused: "",
     attemptsRemaining: null,
     lockoutSeconds: null,
+    /** Not known until the host has refused us once and said so. Every sentence
+     * that would use these renders without its clause meanwhile. */
+    lockoutLengthSeconds: null,
+    codeTtlSeconds: null,
     revokedAgo: null,
   };
 }

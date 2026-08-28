@@ -11,6 +11,10 @@ use super::*;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// A fixed host clock reading, for the refusal bodies that pair an instant with
+/// the host's own `server_time_ms`.
+const NOW_MS: i64 = 1_700_000_000_000;
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -33,8 +37,10 @@ fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>)
         let (tx, rx) = mpsc::channel::<ServerMsg>(8);
         registry.register(
             viewer(&format!("v{index}")),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 2, 20 + index as u8)),
-            format!("192.168.2.{} · Chrome on macOS", 20 + index),
+            ViewerIdentity {
+                address: IpAddr::V4(Ipv4Addr::new(192, 168, 2, 20 + index as u8)),
+                user_agent_label: Some("Chrome on macOS".to_string()),
+            },
             2_000 + index as i64,
             tx,
         );
@@ -332,12 +338,21 @@ fn seat_frames_are_personalised_per_viewer() {
     registry.request_seat(&viewer("v0"), SeatRequest::Control);
     registry.request_seat(&viewer("v1"), SeatRequest::Observe);
 
-    let frames = registry.seat_frames();
+    let frames = registry.seat_frames(NOW_MS);
     assert_eq!(frames.len(), 2);
     for (id, msg) in frames {
-        let ServerMsg::Delta(Delta::Seats { you, seats }) = msg else {
+        let ServerMsg::Delta(Delta::Seats {
+            you,
+            seats,
+            server_time_ms,
+        }) = msg
+        else {
             panic!("a seat change is a Delta::Seats, never a Shutdown");
         };
+        // The reference clock for every row's `since_ms`. Without it the
+        // browser cannot date the rows, and 2f's `connected` fact silently
+        // disappears on this path while surviving on the snapshot path.
+        assert_eq!(server_time_ms, NOW_MS);
         let expected = if id == viewer("v0") {
             Seat::Controlling
         } else {
@@ -358,8 +373,10 @@ fn a_viewer_that_cannot_keep_up_is_dropped_from_the_registry() {
     let (tx, _rx) = mpsc::channel::<ServerMsg>(1);
     registry.register(
         viewer("slow"),
-        IpAddr::V6(Ipv6Addr::LOCALHOST),
-        "slow".to_string(),
+        ViewerIdentity {
+            address: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            user_agent_label: None,
+        },
         0,
         tx,
     );
@@ -424,7 +441,13 @@ fn every_auth_failure_maps_to_a_screen_and_a_status() {
         (AuthFailure::WrongCode, "rejected", 401),
         (AuthFailure::CodeExpired, "rejected", 401),
         (AuthFailure::CodeAlreadyUsed, "rejected", 401),
-        (AuthFailure::TokenRevoked, "revoked", 401),
+        (
+            AuthFailure::TokenRevoked {
+                revoked_at_unix_secs: 1_700_000_000,
+            },
+            "revoked",
+            401,
+        ),
         (
             AuthFailure::RateLimited {
                 retry_after_ms: 60_000,
@@ -452,13 +475,14 @@ fn a_refusal_body_carries_the_countdown_and_no_secret() {
             retry_after_ms: 41_500,
         },
         0,
+        NOW_MS,
     );
     assert_eq!(body["ok"], serde_json::json!(false));
     assert_eq!(body["screen"], serde_json::json!("rate_limited"));
     assert_eq!(body["retry_after_ms"], serde_json::json!(41_500));
     assert_eq!(body["attempts_remaining"], serde_json::json!(0));
 
-    let plain = refusal_body(AuthFailure::WrongCode, 2);
+    let plain = refusal_body(AuthFailure::WrongCode, 2, NOW_MS);
     assert_eq!(plain["reason"], serde_json::json!("wrong_code"));
     assert!(
         plain.get("retry_after_ms").is_none(),
@@ -531,16 +555,20 @@ fn the_chip_label_is_the_observed_address_plus_a_coarse_user_agent() {
             .parse()
             .expect("header parses"),
     );
+    let identity = viewer_identity(peer("192.168.2.20", 51_000), &headers);
+    assert_eq!(identity.label(), "192.168.2.20 · Chrome on macOS");
+    // The same two facts, still separable, because the chip's label is derived
+    // from them rather than the other way round (artboard 2f).
+    assert_eq!(identity.address.to_string(), "192.168.2.20");
     assert_eq!(
-        viewer_label(peer("192.168.2.20", 51_000), &headers),
-        "192.168.2.20 · Chrome on macOS"
+        identity.user_agent_label.as_deref(),
+        Some("Chrome on macOS")
     );
 
     // No user agent: the address alone, never a guess.
-    assert_eq!(
-        viewer_label(peer("127.0.0.1", 51_000), &HeaderMap::new()),
-        "127.0.0.1"
-    );
+    let bare = viewer_identity(peer("127.0.0.1", 51_000), &HeaderMap::new());
+    assert_eq!(bare.label(), "127.0.0.1");
+    assert_eq!(bare.user_agent_label, None, "unknown stays unknown");
 }
 
 #[test]
@@ -550,7 +578,80 @@ fn an_unrecognised_user_agent_adds_nothing_rather_than_guessing() {
         header::USER_AGENT,
         "curl/8.7.1".parse().expect("header parses"),
     );
-    assert_eq!(viewer_label(peer("10.0.0.4", 1), &headers), "10.0.0.4");
+    let identity = viewer_identity(peer("10.0.0.4", 1), &headers);
+    assert_eq!(identity.label(), "10.0.0.4");
+    assert_eq!(identity.user_agent_label, None);
+}
+
+/// The browser may refine what it *is*. It may never refine where it *is*.
+#[test]
+fn a_client_claim_replaces_the_browser_fact_and_never_the_address() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        "curl/8.7.1".parse().expect("header parses"),
+    );
+    let observed = viewer_identity(peer("10.0.0.4", 1), &headers);
+
+    // A claim that is really an address, separator and all — the exact payload
+    // that would fool a browser-side split of the merged label.
+    let refined = observed.with_claim(Some("9.9.9.9 · Chrome on macOS"));
+    assert_eq!(
+        refined.address.to_string(),
+        "10.0.0.4",
+        "the address came off the socket and no frame can move it"
+    );
+    assert_eq!(
+        refined.user_agent_label.as_deref(),
+        Some("9.9.9.9 · Chrome on macOS"),
+        "the claim is displayed verbatim in its own field, never parsed"
+    );
+
+    // A claim made of nothing but control bytes sanitises to empty, and an
+    // empty claim must not erase a fact we already had. (`curl/8.7.1` gave us
+    // nothing to keep, so `None` here is the header's answer surviving intact.)
+    let kept = viewer_identity(peer("10.0.0.4", 1), &headers).with_claim(Some("\u{1b}\u{7}\n"));
+    assert_eq!(kept.user_agent_label, None);
+    assert_eq!(kept.address.to_string(), "10.0.0.4");
+
+    // The same, over a header we *could* read: a junk claim must not throw away
+    // the coarse user agent the host had already worked out.
+    let mut chrome = HeaderMap::new();
+    chrome.insert(
+        header::USER_AGENT,
+        "Mozilla/5.0 (Macintosh) Chrome/131.0 Safari/537.36"
+            .parse()
+            .expect("header parses"),
+    );
+    let survivor = viewer_identity(peer("10.0.0.4", 1), &chrome).with_claim(Some("\u{1b}\u{7}"));
+    assert_eq!(
+        survivor.user_agent_label.as_deref(),
+        Some("Chrome on macOS"),
+        "an unusable claim erases nothing"
+    );
+}
+
+/// Artboard 2f lists address / browser / connected as three rows, so the seat
+/// row hands over three fields. The desktop, which arrived over no socket, has
+/// no address to hand over and says so rather than inventing one.
+#[test]
+fn seat_rows_split_the_address_from_the_browsers_own_claim() {
+    let (mut registry, _rx) = registry_with(1);
+    registry.request_seat(&viewer("v0"), SeatRequest::Control);
+    let rows = registry.seat_rows(Some(&viewer("v0")));
+
+    let desktop = &rows[0];
+    assert_eq!(desktop.address, None, "never a fabricated `localhost`");
+    assert_eq!(desktop.user_agent_label, None);
+
+    let browser = &rows[1];
+    assert_eq!(browser.address.as_deref(), Some("192.168.2.20"));
+    assert_eq!(browser.user_agent_label.as_deref(), Some("Chrome on macOS"));
+    assert_eq!(
+        browser.label, "192.168.2.20 · Chrome on macOS",
+        "the compact chip keeps its one line"
+    );
+    assert!(browser.since_ms > 0, "the third fact: connected-since");
 }
 
 /// A browser-supplied label reaches the desktop's chip, so it must not be able
@@ -656,8 +757,10 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
     let (tx, _rx) = mpsc::channel::<ServerMsg>(8);
     shared.registry().register(
         viewer("v0"),
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        "127.0.0.1".to_string(),
+        ViewerIdentity {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            user_agent_label: None,
+        },
         1_700_000_000_000,
         tx,
     );
