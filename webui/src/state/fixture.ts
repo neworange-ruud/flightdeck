@@ -377,12 +377,18 @@ export function fixtureSeats(): readonly SeatInfo[] {
   return [
     {
       label: "desktop",
+      /** No socket, so no address the host observed and no browser to name. */
+      address: null,
+      browser: null,
       seat: "controlling",
       isDesktop: true,
       sinceLabel: "since launch",
     },
     {
       label: "this tab",
+      /** 2f's three facts, each in its own field. */
+      address: "192.168.2.20",
+      browser: "Chrome on macOS",
       seat: "controlling",
       isDesktop: false,
       sinceLabel: "14 minutes, active 20s ago",
@@ -638,8 +644,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: null,
       target: null,
-      refusal:
-        "Git commands from the browser are not implemented in this build. Refused rather than dispatched: SPECS §5 gates every history-touching operation behind an explicit confirmation the browser cannot yet show.",
+      refusal: null,
     },
     {
       id: "abandon_worktree",
@@ -686,8 +691,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: null,
       target: null,
-      refusal:
-        "Git commands from the browser are not implemented in this build. Refused rather than dispatched: SPECS §5 gates every history-touching operation behind an explicit confirmation the browser cannot yet show.",
+      refusal: null,
     },
     {
       id: "finish_local_merge",
@@ -698,8 +702,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: "destructive",
       target: null,
-      refusal:
-        "Git commands from the browser are not implemented in this build. Refused rather than dispatched: SPECS §5 gates every history-touching operation behind an explicit confirmation the browser cannot yet show.",
+      refusal: null,
     },
     {
       id: "pull_base",
@@ -711,7 +714,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       annotation: null,
       target: null,
       refusal:
-        "Git commands from the browser are not implemented in this build. Refused rather than dispatched: SPECS §5 gates every history-touching operation behind an explicit confirmation the browser cannot yet show.",
+        "Pull Base rebases your local base branch — and stashes, pulls over and re-applies any uncommitted work in the base folder — with no confirmation step to read first (SPECS §5.2). Rebase Worktree is offered here because §5.1 puts a shared confirmation in front of it; this one has none, so run it from the desktop (Ctrl-u).",
     },
     {
       id: "show_git_status",

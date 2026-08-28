@@ -517,6 +517,21 @@ fn a_wrong_code_is_refused_and_the_address_is_rate_limited() {
                 body["attempts_remaining"].as_u64().is_some(),
                 "artboard 2b counts down: {body}"
             );
+            // 2b's footer — "3 attempts left before this address is
+            // rate-limited **for 60s**" — needs the lockout length *before* the
+            // limiter has ever fired, which `retry_after_ms` cannot supply. The
+            // browser used to mirror both numbers as TypeScript constants that
+            // would drift; they are host-sent now, like `attempts_remaining`.
+            assert_eq!(
+                body["lockout_seconds"].as_u64(),
+                Some(60),
+                "the lockout length, before the limiter fires: {body}"
+            );
+            assert_eq!(
+                body["code_ttl_seconds"].as_u64(),
+                Some(120),
+                "2b: \"Codes last 120 seconds and only work once\": {body}"
+            );
         }
 
         // The limiter inside `CredentialStore` is consulted on the HTTP path, so
@@ -722,11 +737,29 @@ fn a_revoked_cookie_is_refused_and_named_as_revoked() {
     on_runtime(async {
         let probe = get(&addr, "/auth/session", &[("Cookie", &cookie)]).await;
         assert_eq!(probe.status, 401, "{}", probe.body);
+        let body = probe.json();
         assert_eq!(
-            probe.json()["screen"],
+            body["screen"],
             serde_json::json!("revoked"),
             "someone withdrew access; that is a decision, not a typo: {}",
             probe.body
+        );
+        // 2b: "withdrew this browser's access **12s ago**". The host knows when,
+        // so it says when — paired with its own clock, so the browser subtracts
+        // two host timestamps rather than measuring a host instant with its own.
+        let revoked_at_ms = body["revoked_at_ms"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("2b needs the revocation time: {}", probe.body));
+        let server_time_ms = body["server_time_ms"]
+            .as_i64()
+            .expect("paired with the host's own clock");
+        assert!(
+            revoked_at_ms > 0,
+            "never a fabricated 1970: {revoked_at_ms}"
+        );
+        assert!(
+            server_time_ms >= revoked_at_ms,
+            "the revocation cannot be in the host's future: {body}"
         );
 
         let error = ws_connect(&addr, Some(&cookie))
@@ -779,6 +812,26 @@ fn an_authenticated_attach_is_answered_with_a_snapshot() {
             "and a coarse user agent: {}",
             you.label
         );
+
+        // Artboard 2f's arriving-viewer panel lists address / browser /
+        // connected as three rows, so each arrives in its own field. The
+        // browser never splits the one-line label on its separator: a
+        // user-agent string is attacker-supplied and can contain one.
+        assert_eq!(
+            you.address.as_deref(),
+            Some("127.0.0.1"),
+            "the address the host observed on the socket"
+        );
+        assert_eq!(
+            you.user_agent_label.as_deref(),
+            Some("Chrome on macOS"),
+            "the browser's own claim, in its own field"
+        );
+        assert_eq!(
+            snapshot.seats[0].address, None,
+            "the desktop arrived over no socket, so it has no address to report"
+        );
+        assert_eq!(snapshot.seats[0].user_agent_label, None);
     });
 
     // The TUI was told, and told enough to render the chip and answer a replay.
@@ -881,14 +934,29 @@ fn a_second_controller_is_refused_then_takes_over_and_the_first_becomes_an_obser
 
         // Eviction is a `Delta::Seats`, never a `Shutdown`: the evicted socket
         // stays open, watching read-only (2f).
-        let (you, seats) = frame_matching(&mut first, |frame| match frame {
-            ServerMsg::Delta(Delta::Seats { you, seats }) if you == Seat::Observing => {
-                Some((you, seats))
-            }
+        let (you, seats, server_time_ms) = frame_matching(&mut first, |frame| match frame {
+            ServerMsg::Delta(Delta::Seats {
+                you,
+                seats,
+                server_time_ms,
+            }) if you == Seat::Observing => Some((you, seats, server_time_ms)),
             _ => None,
         })
         .await;
         assert_eq!(you, Seat::Observing);
+        // The frame carries its own reference clock, so the rows it delivers are
+        // as datable as the ones inside a snapshot. Artboard 2f's `connected`
+        // fact must not depend on which frame the seat news arrived in.
+        assert!(
+            server_time_ms > 0,
+            "a seat list with no clock to date it against: {server_time_ms}"
+        );
+        for row in &seats {
+            assert!(
+                server_time_ms >= row.since_ms,
+                "a seat cannot have been taken in the host's future: {row:?}"
+            );
+        }
         assert_eq!(seats.len(), 3, "desktop + two tabs: {seats:?}");
         let web_controllers: Vec<_> = seats
             .iter()
@@ -1085,10 +1153,12 @@ fn releasing_the_seat_frees_it_for_the_next_browser() {
         .await;
         // Skip the `Delta::Seats` that the attach itself produced (`you:
         // controlling`) and wait for the one the release produced.
-        let (you, _) = frame_matching(&mut first, |frame| match frame {
-            ServerMsg::Delta(Delta::Seats { you, seats }) if you == Seat::Observing => {
-                Some((you, seats))
-            }
+        let (you, _, _) = frame_matching(&mut first, |frame| match frame {
+            ServerMsg::Delta(Delta::Seats {
+                you,
+                seats,
+                server_time_ms,
+            }) if you == Seat::Observing => Some((you, seats, server_time_ms)),
             _ => None,
         })
         .await;
@@ -2762,7 +2832,9 @@ use flightdeck::app::commands::{Command as AppCommand, Effect};
 use flightdeck::app::state::{AppState, Services};
 use flightdeck::contracts::domain::{Config, ProjectState, STATE_VERSION};
 use flightdeck::testing::{FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeGit};
-use flightdeck::web::commands::{self, Route, HOST_ONLY_REFUSAL, QUIT_REFUSAL};
+use flightdeck::web::commands::{
+    self, Confirmation, Route, HOST_ONLY_REFUSAL, PULL_BASE_REFUSAL, QUIT_REFUSAL,
+};
 use flightdeck::web::protocol::{command as names, CommandTarget};
 
 /// Send one command frame from a controlling browser, and hand back the socket
@@ -3187,41 +3259,88 @@ fn the_two_dialog_rows_that_still_refuse_say_which_task_owns_them() {
     on_runtime(await_snapshot(&mut ws));
 }
 
-/// SPECS §5: no browser-reachable path rewrites history or creates a PR. Proven
-/// over the wire in both directions — the history-touching names are offered
-/// (the row is visible) and refused, and every name the host *will* run carries
-/// a command that neither rewrites history nor opens a PR.
+/// **SPECS §5 over a real socket, restated for a browser that runs git**
+/// (`remote-control-ll5.5`).
+///
+/// Three git rows now reach the host, so the old assertion — "every git name is
+/// refused at the socket" — would be a rubber stamp if it were merely relaxed.
+/// What is proven here instead is the invariant that replaced it:
+///
+/// 1. The rows that run are **forwarded** rather than refused, and what travels
+///    is the frame the browser sent — the host then takes its payload from
+///    `INVENTORY`, never from the frame's `args`.
+/// 2. `pull_base` is still refused at the socket (SPECS §5.2), with the
+///    boundary decision as its reason rather than a placeholder.
+/// 3. Every command the table would forward either does not rewrite history, or
+///    is unconfirmed and therefore lands on §5.1's confirmation prompt — and
+///    none of them opens a pull request, with no exception.
 #[test]
-fn no_browser_reachable_command_rewrites_history_or_opens_a_pr() {
+fn no_browser_reachable_command_rewrites_unconfirmed_history_or_opens_a_pr() {
     let harness = Harness::start();
     let addr = harness.addr();
     let cookie = on_runtime(harness.authenticate());
     let mut ws = on_runtime(control(&addr, &cookie));
 
+    // 1. The git family reaches the host. Sent one at a time and drained one at
+    //    a time, so a row that was silently dropped shows up as a timeout here
+    //    rather than as a passing test.
     for (seq, name) in [
         (81, names::REBASE_WORKTREE),
-        (82, names::PULL_BASE),
-        (83, names::PUSH_BRANCH),
-        (84, names::FINISH_LOCAL_MERGE),
+        (82, names::PUSH_BRANCH),
+        (83, names::FINISH_LOCAL_MERGE),
     ] {
         on_runtime(command(&mut ws, seq, name));
-        let error = on_runtime(next_error(&mut ws));
-        assert_eq!(error.code, ErrorCode::NotSupported, "for `{name}`");
-        assert_eq!(error.seq, Some(seq));
+        let (_, _, forwarded) = wait_for_command(&harness);
+        assert_eq!(forwarded.name, name);
+        assert_eq!(forwarded.seq, seq);
+        assert!(
+            forwarded.args.is_none(),
+            "`{name}` carries no payload on the wire; the host takes its own"
+        );
     }
-    assert_nothing_forwarded(&harness);
 
-    // The other direction: whatever the host does forward cannot be one of
-    // them, whichever route a future change puts it on.
+    // 2. SPECS §5.2's row is the exception, and it says so in its own words.
+    on_runtime(command(&mut ws, 84, names::PULL_BASE));
+    let error = on_runtime(next_error(&mut ws));
+    assert_eq!(error.code, ErrorCode::NotSupported);
+    assert_eq!(error.seq, Some(84));
+    assert_eq!(error.message, PULL_BASE_REFUSAL);
+
+    // 3. The construction behind all of it, checked against the live table.
+    let mut rewriting: Vec<&str> = Vec::new();
     for spec in commands::INVENTORY {
         if let Some(cmd) = commands::dispatched_command(&spec.route) {
+            if commands::rewrites_history(cmd) {
+                rewriting.push(spec.name);
+                assert_eq!(
+                    commands::confirmation_of(cmd),
+                    Confirmation::Pending,
+                    "`{}` would rewrite history from a browser without asking",
+                    spec.name
+                );
+            }
+            assert_ne!(
+                commands::confirmation_of(cmd),
+                Confirmation::Given,
+                "`{}` carries a pre-confirmed {cmd:?}",
+                spec.name
+            );
             assert!(
-                !commands::rewrites_history(cmd) && !commands::creates_pull_request(cmd),
-                "`{}` would dispatch {cmd:?} from a browser",
+                !commands::creates_pull_request(cmd),
+                "`{}` would open a PR from a browser",
                 spec.name
             );
         }
     }
+    assert_eq!(
+        rewriting,
+        vec![names::REBASE_WORKTREE],
+        "SPECS §5.1 sanctions exactly one, and it is confirmation-gated"
+    );
+
+    // The socket is unharmed by the refusal, like any other.
+    on_runtime(command(&mut ws, 85, names::REQUEST_SNAPSHOT));
+    on_runtime(await_snapshot(&mut ws));
 }
 
 /// An `AppState` with no tabs — enough for the global view commands, which is

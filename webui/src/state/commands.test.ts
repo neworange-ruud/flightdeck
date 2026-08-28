@@ -289,11 +289,55 @@ describe("D16 and refusals come from the host, never from here", () => {
 
   it("a refused row is still offered — visible and honest beats hidden", () => {
     const commands = paletteInventory(stateWithSnapshot());
-    for (const name of ["quit", "push_branch", "show_git_status", "pair_phone"]) {
+    for (const name of ["quit", "pull_base", "show_git_status", "pair_phone"]) {
       const row = commands.find((c) => c.run.name === name);
       expect(row).toBeDefined();
       expect(row?.refusal).not.toBeNull();
     }
+  });
+});
+
+/**
+ * The git surface (`remote-control-ll5.5`; SPECS §5).
+ *
+ * Nothing in this module changed for it — that is the assertion. The host
+ * flipped four rows in its own table and the palette followed, because the
+ * palette has no git knowledge of its own to update: no list of runnable names,
+ * no idea which command touches history, no local copy of §5's boundary. So
+ * these tests read the recorded host payload and check the browser passed it
+ * through, which is the only correct thing for a browser to do with it.
+ */
+describe("the git rows are the host's answer, not the browser's", () => {
+  it("offers the three the host runs, with no refusal to show", () => {
+    const commands = paletteInventory(stateWithSnapshot());
+    for (const name of ["rebase_worktree", "push_branch", "finish_local_merge"]) {
+      const row = commands.find((c) => c.run.name === name);
+      expect(row, `no palette row sends '${name}'`).toBeDefined();
+      expect(row?.refusal, `'${name}' would be refused`).toBeNull();
+      /** A bare frame: SPECS §5's confirmation flags live in the host's table,
+       * never in `args` a browser could fill in. */
+      expect(row?.run.args).toBeUndefined();
+    }
+  });
+
+  it("shows Pull Base with the host's boundary decision, not a hidden row", () => {
+    const commands = paletteInventory(stateWithSnapshot());
+    const pullBase = commands.find((c) => c.run.name === "pull_base");
+    expect(pullBase).toBeDefined();
+    expect(pullBase?.refusal).toBe(hostRow("pull_base").refusal);
+    expect(pullBase?.refusal).toContain("SPECS §5.2");
+  });
+
+  it("would run Pull Base too, the day the host stops refusing it", () => {
+    /** The proof that the refusal is the host's position and not this file's:
+     * the same row with `refusal: null` is offered exactly like the other
+     * three, with nothing here to change. */
+    const host = hostRow("pull_base");
+    const commands = paletteInventory(
+      stateWithCommands([{ ...host, refusal: null }]),
+    );
+    expect(commands[0]?.run.name).toBe("pull_base");
+    expect(commands[0]?.refusal).toBeNull();
   });
 });
 

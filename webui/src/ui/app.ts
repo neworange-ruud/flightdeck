@@ -375,8 +375,14 @@ export function createApp(options: AppOptions): App {
       store.dispatch({
         type: "access/required",
         screen: "code_entry",
+        /** Nothing was refused, so there is nothing the host has told us. The
+         * screen renders its sentences without the clauses these numbers fill;
+         * the first refusal brings them, and they are never remembered from a
+         * constant of our own. */
         attemptsRemaining: null,
         lockoutSeconds: null,
+        lockoutLengthSeconds: null,
+        codeTtlSeconds: null,
       });
       return;
     }

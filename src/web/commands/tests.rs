@@ -178,21 +178,44 @@ fn quit_is_refused_by_the_table_not_by_a_check() {
 // The git-ownership boundary (SPECS §5)
 // ---------------------------------------------------------------------------
 
-/// SPECS §5: no browser-reachable path may rewrite history or create a pull
-/// request. This holds by construction, not by a runtime check — the two
-/// history-touching commands are simply not on a dispatching route, and the
-/// dispatching routes carry their own payloads so a frame cannot supply one.
+/// **The boundary invariant, restated for a browser that can now run git**
+/// (SPECS §5, §5.1, §5.2).
+///
+/// `remote-control-ll5.5` put the git family on dispatching routes, so "no
+/// browser-reachable route rewrites history" — true while every git row refused
+/// — would now be false, and weakening it into a rubber stamp would throw away
+/// the only thing making the surface safe. The invariant it becomes instead:
+///
+/// > No browser-reachable route may rewrite history **except** through a route
+/// > whose dispatched command is [`Confirmation::Pending`] and therefore lands
+/// > on §5.1's confirmation prompt; and no browser-reachable route may create a
+/// > pull request, ever, with no exception.
+///
+/// Both halves hold by construction. The exception is checkable rather than
+/// asserted in prose — a `Pending` value *cannot* perform the rewrite, because
+/// the first dispatch returns the prompt — and it is narrow by construction too:
+/// [`Command::PullBase`] has no confirmation step at all
+/// ([`Confirmation::None`]), so no value of it could ever satisfy the clause,
+/// which is why `pull_base` is not on a dispatching route.
 #[test]
-fn no_browser_reachable_route_rewrites_history_or_opens_a_pr() {
+fn no_browser_reachable_route_rewrites_unconfirmed_history_or_opens_a_pr() {
+    let mut rewriting: Vec<&str> = Vec::new();
     for spec in INVENTORY {
         let Some(cmd) = dispatched_command(&spec.route) else {
             continue;
         };
-        assert!(
-            !rewrites_history(cmd),
-            "'{}' would dispatch {cmd:?}, which rewrites history (SPECS §5)",
-            spec.name
-        );
+        if rewrites_history(cmd) {
+            rewriting.push(spec.name);
+            assert_eq!(
+                confirmation_of(cmd),
+                Confirmation::Pending,
+                "'{}' would dispatch {cmd:?}, which rewrites history without \
+                 landing on SPECS §5.1's confirmation prompt first",
+                spec.name
+            );
+        }
+        // No exception clause on this half, and there never is one: FlightDeck
+        // does not open pull requests, from any surface (SPECS §5).
         assert!(
             !creates_pull_request(cmd),
             "'{}' would dispatch {cmd:?}, which creates a PR (SPECS §5)",
@@ -200,15 +223,26 @@ fn no_browser_reachable_route_rewrites_history_or_opens_a_pr() {
         );
     }
 
-    // The two history-touching commands are named on the wire — the browser
-    // shows the row — and refused, so the surface is honest in both directions.
-    for name in [names::REBASE_WORKTREE, names::PULL_BASE] {
-        let spec = lookup(name).expect("the row is offered");
-        assert!(
-            spec.refusal().is_some(),
-            "'{name}' must refuse: it rewrites history"
-        );
-    }
+    // Exactly one row uses the exception, and it is the one §5.1 names. A second
+    // arrival here is not a test to update — it is a boundary decision that has
+    // to be argued in the spec first.
+    assert_eq!(
+        rewriting,
+        vec![names::REBASE_WORKTREE],
+        "SPECS §5.1 sanctions one history-rewriting command from a user surface"
+    );
+
+    // The other direction, so the surface is honest both ways: the row §5.2
+    // keeps off a dispatching route is still *offered*, carrying the sentence
+    // saying why it will be refused rather than being hidden from the palette.
+    let pull_base = lookup(names::PULL_BASE).expect("the row is offered, not hidden");
+    assert_eq!(pull_base.route, Route::NotSupported(PULL_BASE_REFUSAL));
+    assert_eq!(
+        confirmation_of(&Command::PullBase),
+        Confirmation::None,
+        "if pull-base ever grows a confirmation step, revisit the decision \
+         rather than the test"
+    );
 }
 
 /// A `Command` frame carries `args`, and a forwarding row ignores them: the
@@ -221,19 +255,90 @@ fn no_forwarding_row_carries_a_confirmation() {
         let Some(cmd) = dispatched_command(&spec.route) else {
             continue;
         };
-        let confirmed = matches!(
-            cmd,
-            Command::AbandonWorktree { confirm: true }
-                | Command::FinishLocalMerge { confirm: true }
-                | Command::RebaseWorktree { confirm: true }
-                | Command::PushBranch { confirm: Some(_) }
-        );
-        assert!(
-            !confirmed,
+        assert_ne!(
+            confirmation_of(cmd),
+            Confirmation::Given,
             "'{}' carries a pre-confirmed {cmd:?}",
             spec.name
         );
     }
+}
+
+/// **The smuggling attempt, made explicit.** `rebase_worktree` is the row the
+/// §5.1 exception rests on, and the exception is only worth anything while the
+/// confirmation is unforgeable from a frame.
+///
+/// A `Command` frame is `{ seq, name, args }`. The `args` are the browser's
+/// only input, and a forwarding row does not read them: `run_web_command` takes
+/// the [`PaletteAction`] out of *this table*. So the payload that reaches
+/// `AppState::dispatch` is the table's, whatever the frame said — which is why
+/// there is no arm below that could be handed `confirm: true`.
+#[test]
+fn a_frame_cannot_smuggle_a_confirmed_rebase() {
+    let spec = lookup(names::REBASE_WORKTREE).expect("the row is offered");
+
+    // 1. The table carries the unconfirmed value, and nothing else.
+    assert_eq!(
+        spec.route,
+        Route::Palette(PaletteAction::Dispatch(Command::RebaseWorktree {
+            confirm: false
+        })),
+        "the row must carry the value that can only ask (SPECS §5.1)"
+    );
+
+    // 2. The row a browser receives carries no `args` of its own to echo back,
+    //    so even a frame built from the host's own row starts from nothing.
+    assert!(spec.view().run.args.is_none());
+
+    // 3. And the payload is not reachable from the frame: `dispatched_command`
+    //    is the whole of what a forwarding row hands onward, and it is the
+    //    table's value. A frame carrying `{"confirm": true}` changes nothing
+    //    here, because nothing here reads a frame.
+    let dispatched = dispatched_command(&spec.route).expect("the row dispatches");
+    assert_eq!(confirmation_of(dispatched), Confirmation::Pending);
+    assert_eq!(dispatched, &Command::RebaseWorktree { confirm: false });
+}
+
+/// The git family is reachable, and each row carries the value its spec section
+/// requires. Pinned as a set so a later task cannot quietly hand one of them a
+/// confirmed payload — or drop a row back to a refusal — without saying so here.
+#[test]
+fn the_git_rows_dispatch_the_values_their_spec_sections_require() {
+    let expected = [
+        (
+            names::REBASE_WORKTREE,
+            Command::RebaseWorktree { confirm: false },
+        ),
+        (names::PUSH_BRANCH, Command::PushBranch { confirm: None }),
+        (
+            names::FINISH_LOCAL_MERGE,
+            Command::FinishLocalMerge { confirm: false },
+        ),
+    ];
+    for (name, cmd) in &expected {
+        let spec = lookup(name).expect("the row is offered");
+        assert_eq!(
+            dispatched_command(&spec.route),
+            Some(cmd),
+            "'{name}' must forward the unconfirmed value"
+        );
+        assert!(
+            spec.refusal().is_none(),
+            "'{name}' runs now — it must not also claim it will be refused"
+        );
+    }
+
+    // The two rows the git family still does not run, each for its own stated
+    // reason: §5.2's boundary decision, and an overlay with no browser design
+    // (`remote-control-ll5.8`). Neither is a dialog, so neither is ll5.4's.
+    assert_eq!(
+        lookup(names::PULL_BASE).map(|s| &s.route),
+        Some(&Route::NotSupported(PULL_BASE_REFUSAL))
+    );
+    assert_eq!(
+        lookup(names::SHOW_GIT_STATUS).map(|s| &s.route),
+        Some(&Route::NotSupported(UNDESIGNED_OVERLAY_REFUSAL))
+    );
 }
 
 // ---------------------------------------------------------------------------

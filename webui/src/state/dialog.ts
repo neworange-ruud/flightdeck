@@ -35,8 +35,14 @@ import type { AppState, DialogOutcome, DialogState } from "./types";
  * its key. A browser cannot reach an action the person at the desktop cannot
  * see, because the host refuses a key that is not on the open dialog.
  * `confirmable: false` is the host saying "you may cancel this one but not
- * confirm it" — the destructive family (`remote-control-ll5.4`) and the git
- * family (`.5`) — with `refusal` carrying the sentence to show.
+ * confirm it" — today the destructive family alone
+ * (`remote-control-ll5.4`) — with `refusal` carrying the sentence to show.
+ *
+ * The git confirmations (push / merge / rebase) were in that set until
+ * `remote-control-ll5.5` and no longer are: those dialogs *are* SPECS §5's
+ * confirmation, so a surface that could raise the question but not answer it
+ * would leave it stranded. Nothing here changed to allow it — the host sends
+ * `confirmable: true` now, and this module has never had a list of its own.
  */
 
 /** The wire name for confirming the open dialog (`command::DIALOG_CONFIRM`). */

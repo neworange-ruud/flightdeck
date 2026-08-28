@@ -43,20 +43,46 @@
 //!   to both surfaces with the origin that opened it, and either surface can
 //!   confirm or cancel; these two rows are how a browser does it.
 //! * [`Route::NotSupported`] — this build has no browser-side surface for it, and
-//!   the refusal names the task that owns one. What is left after D13 landed is
-//!   the git family (`remote-control-ll5.5`), the destructive confirmation
-//!   (`.4`), the configuration manager (`.6`), help/about (`.8`) and
-//!   `show_git_status`, which is not a dialog at all — nothing is being asked,
-//!   so there is nothing to answer.
+//!   the refusal names the task that owns one. What is left after D13 and the
+//!   git family landed is the destructive confirmation (`remote-control-ll5.4`),
+//!   the configuration manager (`.6`), help/about (`.8`), `show_git_status` —
+//!   which is not a dialog at all, nothing is being asked, so there is nothing
+//!   to answer — and `pull_base`, which is a boundary decision rather than a
+//!   missing surface (see [`PULL_BASE_REFUSAL`]).
 //!
 //! ## The git-ownership boundary holds by construction (SPECS §5)
 //!
-//! A `Command` frame carries `args`, and a `Route::Palette` row **ignores them
-//! entirely**: the action, including every `confirm` flag inside it, comes from
-//! this table. So no browser frame can smuggle `confirm: true` into
-//! `AbandonWorktree`, and the two history-rewriting commands
-//! ([`rewrites_history`]) are not on a forwarding route at all. Both facts are
-//! asserted in this module's tests.
+//! The git family dispatches from a browser (`remote-control-ll5.5`), and §5
+//! still holds without a runtime check standing over it. Two properties do the
+//! work, and both are asserted in this module's tests.
+//!
+//! **1. A forwarding row ignores the frame's `args` entirely.** The action —
+//! and every `confirm` flag inside it — comes from this table, so a browser
+//! cannot smuggle `confirm: true` into `RebaseWorktree` any more than it can
+//! into `AbandonWorktree`. [`confirmation_of`] names the three states a command
+//! *value* can be in, and no row in [`INVENTORY`] may carry
+//! [`Confirmation::Given`].
+//!
+//! **2. The exception §5.1 grants is the only one, and it is checkable.** Of
+//! every browser-reachable row, exactly one dispatches a command that
+//! [`rewrites_history`]: `rebase_worktree`, carrying
+//! `RebaseWorktree { confirm: false }`. §5.1 sanctions the worktree rebase as
+//! *user-initiated and explicitly confirmed* — "the first dispatch always
+//! returns a confirmation prompt before anything is rewritten" — so an
+//! unconfirmed dispatch cannot rewrite anything. It can only ask, and D13
+//! publishes the question to both surfaces, with the origin that raised it,
+//! before anyone answers. The invariant is therefore:
+//!
+//! > **No browser-reachable route may rewrite history except through a route
+//! > whose dispatched command is [`Confirmation::Pending`] and therefore lands
+//! > on §5.1's confirmation prompt; and no browser-reachable route may create a
+//! > pull request, ever, with no exception.**
+//!
+//! [`Command::PullBase`] is the row that clause excludes, and it excludes it
+//! *by construction rather than by name*: §5.2 gives pull-base no confirmation
+//! step, so its value is [`Confirmation::None`] and there is no unconfirmed
+//! variant the table could carry. See [`PULL_BASE_REFUSAL`] for the decision and
+//! `specs/WEB_INTERFACE.md` §6.5 R11 for the reasoning behind it.
 
 use crate::app::commands::{Command, Selector};
 use crate::tui::palette::PaletteAction;
@@ -167,20 +193,6 @@ pub const DESTRUCTIVE_DIALOG_REFUSAL: &str =
      is shared once the desktop opens it (D13) and you can cancel it from here — \
      but confirm it from the desktop.";
 
-/// Why a browser may not *confirm* a git dialog (`remote-control-ll5.5`,
-/// SPECS §5).
-///
-/// D13 shares the dialog, so a push / merge / rebase confirmation the desktop
-/// opened is visible in the browser and cancellable from it. Confirming it is
-/// the git family's own task, and SPECS §5 is the reason: every
-/// history-touching operation is gated behind a confirmation this build only
-/// knows how to collect at the desktop's keyboard.
-pub const GIT_DIALOG_REFUSAL: &str =
-    "This dialog confirms a git operation, and git commands from the browser are \
-     not implemented in this build (SPECS §5 gates every history-touching \
-     operation). You can see it and cancel it from here; confirm it from the \
-     desktop.";
-
 /// Why `Show Git Status` is still refused: it is not a dialog, and it has no
 /// browser design yet.
 ///
@@ -194,11 +206,35 @@ pub const UNDESIGNED_OVERLAY_REFUSAL: &str =
      design for it yet (design turn 3). It is not one of D13's shared dialogs: \
      nothing is being asked, so there is nothing to answer from here.";
 
-/// Why the git family is refused today (`remote-control-ll5.5`, SPECS §5).
-const GIT_REFUSAL: &str =
-    "Git commands from the browser are not implemented in this build. Refused \
-     rather than dispatched: SPECS §5 gates every history-touching operation \
-     behind an explicit confirmation the browser cannot yet show.";
+/// Why `Pull Base` alone in the git family is refused (`remote-control-ll5.5`,
+/// SPECS §5.2).
+///
+/// This is a decision, not an omission, and it is the one the module doc's
+/// invariant turns on. `rebase_worktree` is exposable because §5.1 puts a
+/// confirmation prompt in front of it and R7's forwarding rule makes that prompt
+/// unforgeable from a frame: the table carries the *unconfirmed* variant, so the
+/// first dispatch can only ask.
+///
+/// Pull base has no such step. §5.2 says so in as many words — "this is a global
+/// action that never touches an Agent Tab's worktree, so it is not
+/// confirmation-gated" — and it is guarded by preconditions instead (base branch
+/// checked out, conflict aborted). Those preconditions bound the *damage*; they
+/// do not make the invocation something anybody read first. And the
+/// implementation does more than §5.2's summary: a dirty base folder is stashed,
+/// pulled over and re-applied, so a single frame would move the user's own
+/// uncommitted work through the stash with nothing shown to either surface
+/// beforehand.
+///
+/// Inventing a browser-only confirmation was rejected for the reason this whole
+/// module exists: it would be a second flow the desktop does not have, and D13's
+/// dialog is shared precisely so there is only ever one. So the row is offered,
+/// visible, and refused in words that name what would have to change.
+pub const PULL_BASE_REFUSAL: &str =
+    "Pull Base rebases your local base branch — and stashes, pulls over and \
+     re-applies any uncommitted work in the base folder — with no confirmation \
+     step to read first (SPECS §5.2). Rebase Worktree is offered here because \
+     §5.1 puts a shared confirmation in front of it; this one has none, so run \
+     it from the desktop (Ctrl-u).";
 
 /// **Every command name this build accepts**, in palette display order.
 ///
@@ -310,13 +346,21 @@ pub static INVENTORY: &[CommandSpec] = &[
         route: Route::Palette(PaletteAction::Dispatch(Command::RestartAgent)),
     },
     // -- worktree ----------------------------------------------------------
+    // SPECS §5.1's carve-out, and the one browser-reachable row that reaches a
+    // history-rewriting command. It carries `confirm: false` — the same value
+    // the desktop's palette row carries — so the first dispatch can only return
+    // the confirmation prompt, which D13 then publishes to both surfaces. A
+    // frame's `args` are ignored, so `confirm: true` is unreachable from a
+    // browser by construction rather than by a check. See the module doc.
     CommandSpec {
         name: names::REBASE_WORKTREE,
         label: "Rebase Worktree",
         group: "Worktree",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(GIT_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::RebaseWorktree {
+            confirm: false,
+        })),
     },
     CommandSpec {
         name: names::ABANDON_WORKTREE,
@@ -343,29 +387,43 @@ pub static INVENTORY: &[CommandSpec] = &[
         route: Route::Rejected(HOST_ONLY_REFUSAL),
     },
     // -- git ---------------------------------------------------------------
+    // SPECS §14: pushes the branch and hands back the GitHub *compare* URL. It
+    // neither rewrites history nor opens a PR ([`creates_pull_request`] is
+    // `false` for it, and says why), and `confirm: None` means a worktree with
+    // uncommitted changes gets §14's warning dialog first rather than a silent
+    // partial push.
     CommandSpec {
         name: names::PUSH_BRANCH,
         label: "Push Branch",
         group: "Git",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(GIT_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::PushBranch {
+            confirm: None,
+        })),
     },
+    // SPECS §15: guarded, and `confirm: false` so the §13 dirty-base refusal and
+    // every §15 precondition are answered *before* anything merges. The
+    // go-ahead is D13's shared confirmation, not this row.
     CommandSpec {
         name: names::FINISH_LOCAL_MERGE,
         label: "Finish / Local Merge",
         group: "Git",
         host_only: false,
         annotation: Some("destructive"),
-        route: Route::NotSupported(GIT_REFUSAL),
+        route: Route::Palette(PaletteAction::Dispatch(Command::FinishLocalMerge {
+            confirm: false,
+        })),
     },
+    // SPECS §5.2: the one git row still refused, and the only one whose refusal
+    // is a boundary decision rather than a missing browser surface.
     CommandSpec {
         name: names::PULL_BASE,
         label: "Pull Base",
         group: "Git",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(GIT_REFUSAL),
+        route: Route::NotSupported(PULL_BASE_REFUSAL),
     },
     CommandSpec {
         name: names::SHOW_GIT_STATUS,
@@ -755,12 +813,94 @@ fn exposure_of_command(cmd: &Command) -> Exposure {
 // The git-ownership boundary (SPECS §5)
 // ===========================================================================
 
+/// Where one [`Command`] **value** stands relative to the confirmation SPECS §5
+/// requires before a guarded operation may land.
+///
+/// This is about the payload, not about the command's kind: `RebaseWorktree
+/// { confirm: false }` and `RebaseWorktree { confirm: true }` are the same
+/// command and opposite answers here. That is exactly the distinction the
+/// boundary invariant needs, because what makes a browser-reachable rebase safe
+/// is not *which* command the row names but *which value of it* the table
+/// carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirmation {
+    /// The command has a confirmation step and this value has not taken it. For
+    /// the §5.1 carve-out that is the strong statement the spec makes — "the
+    /// first dispatch always returns a confirmation prompt before anything is
+    /// rewritten" — so dispatching a `Pending` value can only ask.
+    Pending,
+    /// The command has a confirmation step and this value carries it: the effect
+    /// lands on dispatch, with nothing asked. No row in [`INVENTORY`] may carry
+    /// one, which is what stops a frame smuggling one in.
+    Given,
+    /// The command has no confirmation step at all — either because it needs
+    /// none, or because the spec gives it none ([`Command::PullBase`], SPECS
+    /// §5.2). A `None` value therefore cannot satisfy the boundary's exception
+    /// clause; there is no unconfirmed variant of it to carry.
+    None,
+}
+
+/// Which of [`Confirmation`]'s three states a command value is in.
+///
+/// Exhaustive with no wildcard arm, for the same reason [`exposure_of`] is: a
+/// new [`Command`] — or a new confirmation flag on an existing one — must say
+/// where it stands before this crate compiles again.
+pub fn confirmation_of(cmd: &Command) -> Confirmation {
+    let pending = |unconfirmed: bool| {
+        if unconfirmed {
+            Confirmation::Pending
+        } else {
+            Confirmation::Given
+        }
+    };
+    match cmd {
+        // SPECS §5.1: the first dispatch returns the confirmation prompt.
+        Command::RebaseWorktree { confirm } => pending(!confirm),
+        // SPECS §15: the first dispatch checks the preconditions and asks.
+        Command::FinishLocalMerge { confirm } => pending(!confirm),
+        // SPECS §5/§15: abandoning always asks first, even for a clean worktree.
+        Command::AbandonWorktree { confirm } => pending(!confirm),
+        // SPECS §14: a worktree with uncommitted changes gets the warning and
+        // the three-way choice; a clean one needs no second question, because
+        // choosing the row *is* the explicit confirmation §14 asks for.
+        Command::PushBranch { confirm } => pending(confirm.is_none()),
+        // SPECS §5.2 gives pull-base no confirmation step. Stated here rather
+        // than assumed, because it is the whole reason `pull_base` cannot be on
+        // a dispatching route.
+        Command::PullBase => Confirmation::None,
+        Command::NewAgentTab { .. }
+        | Command::RenameAgentTab { .. }
+        | Command::CloseAgentTab { .. }
+        | Command::CopyEnvFile
+        | Command::NewChildTerminal
+        | Command::NewAgentTerminal { .. }
+        | Command::CloseAgentTerminal
+        | Command::CloseChildTerminal
+        | Command::SwitchAgentTab(_)
+        | Command::SwitchChildTerminal(_)
+        | Command::SetManualStatus(_)
+        | Command::RestartAgent
+        | Command::OpenShell
+        | Command::ShowGitStatus
+        | Command::ShowHelp
+        | Command::ShowAbout
+        | Command::ToggleSplitView
+        | Command::OpenWorktreeInFileManager
+        | Command::Quit => Confirmation::None,
+    }
+}
+
 /// Whether an app command rewrites git history (SPECS §5, §5.1, §5.2).
 ///
 /// Exhaustive, so a new [`Command`] must classify itself here too. The two
 /// history-touching commands are the §5.1 worktree rebase carve-out and §5.2's
 /// `git pull --rebase` on the base folder; both go through
 /// [`crate::contracts::traits::GitExecutor`]'s single guarded op.
+///
+/// A `true` here does **not** mean "unreachable from a browser" — it means the
+/// row must clear the module doc's exception clause: its dispatched value has to
+/// be [`Confirmation::Pending`], so the dispatch can only ask. `RebaseWorktree`
+/// clears it; `PullBase` cannot, having no unconfirmed variant to carry.
 pub fn rewrites_history(cmd: &Command) -> bool {
     match cmd {
         Command::RebaseWorktree { .. } | Command::PullBase => true,

@@ -4703,12 +4703,38 @@ fn dispatch_command(
         _ => {}
     }
 
+    // Which half of a two-phase flow this is, read before `cmd` is consumed.
+    // Only used to classify the outcome for a browser (below) — the desktop's
+    // rendering is unchanged either way.
+    let unconfirmed =
+        crate::web::commands::confirmation_of(&cmd) == crate::web::commands::Confirmation::Pending;
+
     // A command that can't run (e.g. an action needing a selected tab when the
     // project has none, or a git failure) must surface as a message, never
     // crash the event loop. Errors always become a toast; only the Ok path
     // maps its effect onto the UI.
     match state.dispatch(cmd, services) {
-        Ok(effect) => apply_effect(effect, state, ui),
+        Ok(effect) => {
+            // `Effect::Warning` is genuinely two different facts, and only the
+            // command's phase separates them. From a *confirmed* dispatch it
+            // means the operation landed and the cleanup after it did not —
+            // applied-with-caveat, which is what `apply_effect` records. From an
+            // **unconfirmed** one it means a guard stopped the flow before it
+            // ever asked: SPECS §13's dirty base is the case that matters, where
+            // nothing merged and the browser must not be told otherwise. The
+            // phone path draws exactly this line in `dispatch_remote_merge_back`
+            // ("no merge happened, so it is a rejection"); this is the same rule
+            // for the browser, stated once for every two-phase command rather
+            // than per command. The sentence is the guard's own either way.
+            let warned = matches!(effect, Effect::Warning(_));
+            apply_effect(effect, state, ui);
+            if unconfirmed && warned {
+                ui.web_outcome = match ui.web_outcome.take() {
+                    Some(WebDispatch::Applied(Some(reason))) => Some(WebDispatch::Refused(reason)),
+                    other => other,
+                };
+            }
+        }
         Err(e) => {
             ui.web_outcome = Some(WebDispatch::Failed(e.to_string()));
             ui.message(format!("Error: {e}"));
@@ -4744,16 +4770,23 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         // also the only caller that can tell a *newly* opened dialog from one
         // that was already up.
         Effect::CloseTabOptions(_) => WebDispatch::Applied(None),
-        // The two families whose *confirmation* is still someone else's task:
-        // artboard 1g's two-step destructive step (`remote-control-ll5.4`) and
-        // the git commands (`.5`). They are unreachable from a browser row —
-        // the table refuses those names — so this is the second line of defence,
-        // and it refuses in the same words `browser_may_confirm` uses.
+        // The git confirmations (`remote-control-ll5.5`). SPECS §5 gates every
+        // history-touching operation behind one of these, and D13 publishes it
+        // to both surfaces — so opening one is the *point* of the row, exactly
+        // as it is for `CloseTabOptions` above. `run_web_command` notices the
+        // newly-opened dialog and acks `DIALOG_OPENED_DETAIL`; nothing has
+        // merged, pushed or been rewritten yet, and the browser is told that by
+        // being shown the question rather than a success.
+        Effect::PushWarning(_) | Effect::MergeConfirm { .. } | Effect::RebaseConfirm { .. } => {
+            WebDispatch::Applied(None)
+        }
+        // The one family whose *confirmation* is still someone else's task:
+        // artboard 1g's two-step destructive step (`remote-control-ll5.4`). It is
+        // unreachable from a browser row — the table refuses that name — so this
+        // is the second line of defence, refusing in the same words
+        // `browser_may_confirm` uses.
         Effect::AbandonWarning { .. } => {
             WebDispatch::Refused(crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL.to_string())
-        }
-        Effect::PushWarning(_) | Effect::MergeConfirm { .. } | Effect::RebaseConfirm { .. } => {
-            WebDispatch::Refused(crate::web::commands::GIT_DIALOG_REFUSAL.to_string())
         }
         // Not dialogs: read-only overlays with nothing to answer, and no browser
         // design yet (`remote-control-ll5.8`, design turn 3).
@@ -6597,7 +6630,7 @@ fn dialog_kind(prompt: &Prompt) -> &'static str {
 /// cannot destroy anything, and a shared dialog a remote surface can see but not
 /// dismiss would be worse than not sharing it.
 fn browser_may_confirm(prompt: &Prompt) -> std::result::Result<(), &'static str> {
-    use crate::web::commands::{DESTRUCTIVE_DIALOG_REFUSAL, GIT_DIALOG_REFUSAL};
+    use crate::web::commands::DESTRUCTIVE_DIALOG_REFUSAL;
     match prompt {
         // `remote-control-ll5.4`, artboard 1g: discarding work needs the
         // two-step typed-name confirmation this build has not got. The sidebar's
@@ -6605,11 +6638,19 @@ fn browser_may_confirm(prompt: &Prompt) -> std::result::Result<(), &'static str>
         Prompt::AbandonConfirm { .. } | Prompt::CloseAgentChoice { .. } => {
             Err(DESTRUCTIVE_DIALOG_REFUSAL)
         }
-        // `remote-control-ll5.5`, SPECS §5: the history-touching family.
-        Prompt::PushConfirm | Prompt::MergeConfirm { .. } | Prompt::RebaseConfirm { .. } => {
-            Err(GIT_DIALOG_REFUSAL)
-        }
-        Prompt::NewAgentForm { .. }
+        // The git family (`remote-control-ll5.5`, SPECS §5) used to refuse here.
+        // It no longer does, and the reason is the point: these three dialogs
+        // **are** SPECS §5's confirmation. §5.1 requires the rebase to be "user-
+        // initiated and explicitly confirmed"; a browser is a user surface, the
+        // dialog is D13-shared so it is read before it is answered, and the
+        // unconfirmed value that opened it came from `web::commands::INVENTORY`
+        // rather than from the frame. Refusing the confirm while offering the
+        // row would leave a question on screen that only one of the two surfaces
+        // could answer. See `specs/WEB_INTERFACE.md` §6.5 R11.
+        Prompt::PushConfirm
+        | Prompt::MergeConfirm { .. }
+        | Prompt::RebaseConfirm { .. }
+        | Prompt::NewAgentForm { .. }
         | Prompt::SelectChildAgent { .. }
         | Prompt::RenameTab { .. }
         | Prompt::SetManualStatus
@@ -11173,10 +11214,20 @@ mod tests {
             assert!(ui.prompt.is_none(), "cancelling is always allowed");
         }
 
-        /// The git family (`remote-control-ll5.5`, SPECS §5): same shape, its own
-        /// sentence.
+        /// **The git confirmations are answerable from a browser**
+        /// (`remote-control-ll5.5`, SPECS §5.1/§14/§15). Before this task all
+        /// three refused a browser's confirm with `GIT_DIALOG_REFUSAL`; the gate
+        /// is lifted, because these dialogs *are* §5's confirmation and D13
+        /// already shares them — the browser reads the same words the desktop
+        /// does, including §12's drift, before it answers.
+        ///
+        /// The refusal the browser gets here is the **dispatch's** own (this
+        /// workspace has no tab to rebase), which is the whole point: the
+        /// confirm was accepted and reached the real command, and the sentence
+        /// came back from the guard rather than from a gate standing in front of
+        /// it. Nothing was rewritten, because nothing could be.
         #[test]
-        fn a_git_dialog_refuses_a_browsers_confirm_with_the_git_sentence() {
+        fn a_git_dialog_is_confirmable_from_a_browser_and_acks_the_dispatch() {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
             start_prompt(
@@ -11189,15 +11240,85 @@ mod tests {
                 },
             );
 
+            // The browser is told it may confirm, and the dialog it reads names
+            // the branches and §12's drift — so nobody answers a question they
+            // could not see.
+            let view = view(&ui);
+            let body = body(&view);
+            assert_eq!(view.kind, "confirm_rebase");
+            assert!(body.confirmable, "the git gate is lifted (ll5.5)");
+            assert_eq!(body.refusal, None);
+            assert!(
+                view.title.contains("base moved 2 commits"),
+                "{}",
+                view.title
+            );
+
             let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
             let ack = run(&mut ws, &mut ui, &confirm);
 
+            // Accepted, dispatched, and refused by the command's own guard —
+            // never by `browser_may_confirm`, which no longer has an arm for it.
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(
+                detail.contains("no tab selected"),
+                "the guard's own words, not a gate's: {detail}"
+            );
+            assert!(ui.prompt.is_none(), "the dialog was answered, not blocked");
+        }
+
+        /// D13 + SPECS §5, the other half: cancelling a git confirmation is
+        /// still always allowed, and still tells the other surface the dialog
+        /// was dismissed rather than confirmed.
+        #[test]
+        fn a_git_dialog_can_still_be_cancelled_from_a_browser() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::PushConfirm);
+
+            let cancel = answer(1, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none());
+        }
+
+        /// **The git rows dispatch, and their refusals are the host's own.**
+        ///
+        /// This workspace has no Agent Session Tab, so every one of them hits
+        /// the same guard — which is exactly what makes the assertion useful:
+        /// the browser is handed the sentence the dispatch produced, not a
+        /// generic "that failed" and not the blanket refusal these rows carried
+        /// before this task. `pull_base` is the deliberate exception (SPECS
+        /// §5.2) and answers with the boundary decision instead.
+        #[test]
+        fn the_git_rows_reach_the_dispatch_and_ack_its_own_words() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            for (seq, name) in [
+                (10, names::REBASE_WORKTREE),
+                (11, names::PUSH_BRANCH),
+                (12, names::FINISH_LOCAL_MERGE),
+            ] {
+                let ack = run(&mut ws, &mut ui, &frame(seq, name, None));
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{name}`");
+                let detail = ack.detail.expect("a refusal states its reason");
+                assert!(
+                    detail.contains("no tab selected"),
+                    "`{name}` must ack the dispatch's own sentence: {detail}"
+                );
+                assert!(ui.prompt.is_none(), "`{name}` opened nothing");
+            }
+
+            let ack = run(&mut ws, &mut ui, &frame(13, names::PULL_BASE, None));
             assert_eq!(ack.outcome, AckOutcome::Rejected);
             assert_eq!(
                 ack.detail.as_deref(),
-                Some(crate::web::commands::GIT_DIALOG_REFUSAL)
+                Some(crate::web::commands::PULL_BASE_REFUSAL),
+                "§5.2's row refuses with the boundary decision, not with a guard"
             );
-            assert!(ui.prompt.is_some());
         }
 
         /// An answer for a dialog that has been replaced is refused, not applied
@@ -11395,6 +11516,381 @@ mod tests {
             let spec = crate::web::commands::lookup(names::MARK_ACTIVITY_READ)
                 .expect("the feed command is in the inventory");
             assert_eq!(spec.route, crate::web::commands::Route::ActivityRead);
+        }
+    }
+
+    /// **The git surface's refusal paths** (`remote-control-ll5.5`; SPECS §5,
+    /// §5.1, §12, §13, §14, §15, §26).
+    ///
+    /// `web_command_surface` above proves the *routing* — a git row reaches the
+    /// dispatch and is acked with whatever that dispatch reported. This module
+    /// proves the sentences it reports, against a `FakeGit` that can be made
+    /// dirty, moved, or left without a branch, because that is where the guards
+    /// actually live. Every test drives `dispatch_command`, which is the exact
+    /// function `run_web_command` reaches through `run_palette_action`, and
+    /// reads [`Ui::web_outcome`], which is the exact value the `Ack` is built
+    /// from — so a sentence asserted here is a sentence the browser receives.
+    ///
+    /// SPECS §26 asks for the refusal paths and not only the happy ones. The
+    /// four that matter for a remote surface are here: §13's dirty base, §5.1's
+    /// rebase preconditions, §14's uncommitted-changes warning, and git itself
+    /// failing outright.
+    mod web_git_guards {
+        use super::*;
+        use crate::web::commands::{confirmation_of, Confirmation};
+
+        const REPO: &str = "/repo";
+
+        /// A project with one Agent Session Tab, on a `FakeGit` whose dirtiness,
+        /// branches and drift the test drives. The agent worktree is left with
+        /// its own branch checked out, which is what the §5.1 preconditions
+        /// require (FakeGit's `current_branch` is one global, so it is set once
+        /// the created branch name is known).
+        fn one_tab(git: &FakeGit, pty: &FakePty, dir: &TempDir) -> AppState {
+            let agent = make_real_agent(dir, "opencode");
+            let mut config = config_with_agent(agent);
+            config.ui.default_agent = "opencode".to_string();
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            pty.queue_session();
+            let mut state = AppState::new(
+                config,
+                crate::persistence::project_state::default_state("main"),
+                REPO,
+                "/repo/.flightdeck/state.json",
+            );
+            state
+                .dispatch(
+                    Command::NewAgentTab {
+                        name: "Task".to_string(),
+                        agent_key: None,
+                    },
+                    &services,
+                )
+                .expect("the tab is created");
+            git.set_current_branch(state.tabs[0].meta.branch.clone());
+            state
+        }
+
+        /// The absolute path of the one tab's worktree, as the guards see it.
+        fn worktree(state: &AppState) -> PathBuf {
+            to_absolute(
+                Path::new(REPO),
+                Path::new(&state.tabs[0].meta.worktree_path_relative),
+            )
+        }
+
+        /// One browser dispatch: the command the table would forward, run
+        /// through the very function `run_palette_action` calls, with a dialog
+        /// origin set for exactly its duration the way `run_web_command` sets
+        /// one. Returns what the `Ack` would be built from.
+        fn dispatch(
+            cmd: Command,
+            state: &mut AppState,
+            git: &FakeGit,
+            pty: &FakePty,
+            ui: &mut Ui,
+        ) -> Option<WebDispatch> {
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            ui.web_outcome = None;
+            ui.web_dialog_origin = Some(crate::web::protocol::DialogOrigin::Browser {
+                viewer_id: Some(crate::web::protocol::ViewerId::new("viewer-1")),
+                label: "192.168.2.20".to_string(),
+            });
+            let result = dispatch_command(cmd, state, &services, ui);
+            ui.web_dialog_origin = None;
+            result.expect("a guard is a refusal, never an event-loop error");
+            ui.web_outcome.take()
+        }
+
+        /// The key the desktop's own dialog button would send, fed into the open
+        /// prompt exactly as `apply_web_dialog` feeds a browser's confirm.
+        fn press(c: char, state: &mut AppState, git: &FakeGit, pty: &FakePty, ui: &mut Ui) {
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            handle_prompt_key_project(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                state,
+                &services,
+                ui,
+                0,
+            )
+            .expect("a prompt key is never an event-loop error");
+        }
+
+        fn refusal(outcome: Option<WebDispatch>) -> String {
+            match outcome {
+                Some(WebDispatch::Refused(reason)) => reason,
+                other => panic!("expected a refusal the browser can read, got {other:?}"),
+            }
+        }
+
+        /// **SPECS §5.1, the carve-out in one test.** The row a browser sends
+        /// carries `confirm: false`, so the first dispatch *asks*: nothing is
+        /// rebased, a shared dialog opens carrying the origin that raised it and
+        /// §12's drift, and only the answer to that dialog rewrites anything.
+        ///
+        /// This is the property the whole boundary rests on. If it ever fails,
+        /// the browser can rewrite history without anybody reading a question,
+        /// and the module doc's exception clause is void.
+        #[test]
+        fn a_browsers_rebase_asks_before_it_rewrites_and_only_then_rebases() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+
+            // SPECS §12: the base has moved seven commits since this tab was cut.
+            git.set_ahead_behind(state.tabs[0].meta.base_commit_sha.clone(), "main", 7, 0);
+
+            // The value the table forwards — and nothing else can be forwarded,
+            // because `INVENTORY` carries this one.
+            let cmd = Command::RebaseWorktree { confirm: false };
+            assert_eq!(confirmation_of(&cmd), Confirmation::Pending);
+            let outcome = dispatch(cmd, &mut state, &git, &pty, &mut ui);
+
+            // Nothing was rewritten, and the browser is told a question opened
+            // rather than that something was done.
+            assert!(git.rebases().is_empty(), "SPECS §5.1: it asks first");
+            assert!(
+                matches!(outcome, Some(WebDispatch::Applied(None))),
+                "a question opened, and nothing else is claimed: {outcome:?}"
+            );
+
+            // The question is on both surfaces, answerable from either, and it
+            // names what it will do — including the drift it will pull in.
+            let view = web_dialog_view(&ui).expect("the dialog is published");
+            let body: crate::web::protocol::DialogBody =
+                serde_json::from_value(view.body.clone().expect("a body")).expect("a DialogBody");
+            assert_eq!(view.kind, "confirm_rebase");
+            assert!(body.confirmable, "the browser may answer its own question");
+            assert_eq!(body.refusal, None);
+            assert!(
+                view.title.contains("base moved 7 commits"),
+                "{}",
+                view.title
+            );
+            assert!(view.title.contains("Rewrites history"), "{}", view.title);
+            assert!(
+                matches!(
+                    view.origin,
+                    crate::web::protocol::DialogOrigin::Browser { .. }
+                ),
+                "the desktop must read who asked"
+            );
+
+            // Answering it — the same keypress `apply_web_dialog` synthesises —
+            // is what reaches `GitExecutor::rebase_onto`, once.
+            press('y', &mut state, &git, &pty, &mut ui);
+            assert_eq!(
+                git.rebases(),
+                vec![("main".to_string(), worktree(&state))],
+                "the confirmation is what rebases, and it rebases once"
+            );
+        }
+
+        /// **SPECS §5.1's preconditions, in the guard's own words.** A dirty
+        /// agent worktree is refused before anything is asked — FlightDeck never
+        /// stashes or discards — and the browser gets the sentence naming the
+        /// worktree, not a generic failure.
+        #[test]
+        fn a_failed_rebase_precondition_reaches_the_browser_verbatim() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::RebaseWorktree { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("has uncommitted changes") && reason.contains("before rebasing"),
+                "the precondition's own sentence: {reason}"
+            );
+            assert!(git.rebases().is_empty());
+            assert!(ui.prompt.is_none(), "a refusal asks nothing");
+        }
+
+        /// **SPECS §13: a dirty base disables local merge**, and the browser is
+        /// told so as a *refusal*.
+        ///
+        /// The dispatch reports this as `Effect::Warning`, which
+        /// `apply_effect` records as applied-with-caveat — correct for a
+        /// confirmed merge whose cleanup failed, and wrong here, where nothing
+        /// merged at all. `dispatch_command` separates the two by the command's
+        /// phase, the same line the phone's `dispatch_remote_merge_back` draws.
+        /// A browser told `Applied` over §13's sentence would be a surface
+        /// claiming something the host did not say.
+        #[test]
+        fn a_dirty_base_refuses_the_merge_rather_than_applying_a_warning() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(Path::new(REPO), true);
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("Local merge is disabled"),
+                "SPECS §13's own words: {reason}"
+            );
+            assert!(
+                reason.contains("push this branch and create a PR instead"),
+                "including what to do instead: {reason}"
+            );
+            assert!(git.merges().is_empty(), "nothing merged");
+            assert!(ui.prompt.is_none(), "and nothing was asked");
+        }
+
+        /// **SPECS §15's technical preconditions.** A dirty *agent* worktree is
+        /// a different refusal from §13's, and the browser gets that one instead
+        /// — the point of forwarding the guard's sentence rather than wording
+        /// one here.
+        #[test]
+        fn a_dirty_agent_worktree_refuses_the_merge_with_its_own_reason() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("before merging"),
+                "§15's precondition, not §13's: {reason}"
+            );
+            assert!(!reason.contains("Local merge is disabled"), "{reason}");
+            assert!(git.merges().is_empty());
+        }
+
+        /// **SPECS §14.** A worktree with uncommitted changes gets the warning
+        /// and the three-way choice first; the push happens only when that
+        /// dialog is answered. `confirm: None` in the table is what makes the
+        /// warning unskippable from a frame.
+        #[test]
+        fn a_push_over_uncommitted_changes_warns_before_it_pushes() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::PushBranch { confirm: None },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            assert!(git.pushes().is_empty(), "SPECS §14: it warns first");
+            assert!(
+                matches!(outcome, Some(WebDispatch::Applied(None))),
+                "a question opened, and nothing else is claimed: {outcome:?}"
+            );
+            let view = web_dialog_view(&ui).expect("the warning is published");
+            assert_eq!(view.kind, "confirm_push");
+            assert!(
+                view.title.contains("committed changes only"),
+                "{}",
+                view.title
+            );
+
+            // `p` is `Push committed` — the same key the desktop's button fires.
+            press('p', &mut state, &git, &pty, &mut ui);
+            assert_eq!(git.pushes().len(), 1, "the answer is what pushes");
+        }
+
+        /// **Git failing outright is not a guard, and must not be dressed as
+        /// one.** An executor error becomes `WebDispatch::Failed`, and the
+        /// browser is handed git's own message — a `Rejected` ack with the real
+        /// reason rather than "that did not work".
+        #[test]
+        fn a_git_error_reaches_the_browser_as_gits_own_message() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new()
+                .with_root(REPO)
+                .with_branches(["main"])
+                .with_current_branch_error("fatal: not a git repository");
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            match outcome {
+                Some(WebDispatch::Failed(message)) => assert!(
+                    message.contains("not a git repository"),
+                    "git's own words: {message}"
+                ),
+                other => panic!("expected the failure to reach the browser, got {other:?}"),
+            }
+            assert!(git.merges().is_empty());
         }
     }
 
