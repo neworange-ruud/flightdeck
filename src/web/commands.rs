@@ -694,6 +694,26 @@ pub static INVENTORY: &[CommandSpec] = &[
         ),
     },
     CommandSpec {
+        name: names::SHOW_WEB_ACCESS,
+        label: "Show Web Access",
+        group: "Remote",
+        // Not D16's badge, though it is desktop-only in effect. D16's badge
+        // means "this runs, and its effect lands on the host"; this one does
+        // not run at all from a browser, which is `Pair Phone`'s situation and
+        // gets `Pair Phone`'s treatment.
+        host_only: false,
+        annotation: None,
+        // The same refusal `Pair Phone` gets, for the same reason: the overlay
+        // is a QR and a code painted onto the desktop's screen, and this build
+        // has no way to render one into a browser. Nor should it — a browser
+        // that could ask the host to reveal its access code on demand would be
+        // handing out the credential that let it in.
+        route: Route::NotSupported(
+            "The access overlay shows a QR and a code on the desktop's screen, \
+             which this build cannot render in a browser.",
+        ),
+    },
+    CommandSpec {
         name: names::TAKE_INPUT_LOCK,
         label: "Take Input Lock",
         group: "Remote",
@@ -925,6 +945,7 @@ pub fn exposure_of(action: &PaletteAction) -> Exposure {
         PaletteAction::UnpairPhone => Exposure::Wire(names::UNPAIR_PHONE),
         PaletteAction::StartWebInterface => Exposure::Wire(names::START_WEB_INTERFACE),
         PaletteAction::StopWebInterface => Exposure::Wire(names::STOP_WEB_INTERFACE),
+        PaletteAction::ShowWebAccess => Exposure::Wire(names::SHOW_WEB_ACCESS),
         PaletteAction::TakeInputLock => Exposure::Wire(names::TAKE_INPUT_LOCK),
     }
 }

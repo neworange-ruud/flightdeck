@@ -12,6 +12,7 @@
 //!
 //! | Module | Decision | What it owns |
 //! | --- | --- | --- |
+//! | [`access`] | D5, Q1, Q7 | the desktop access overlay: mint, publish, reveal |
 //! | [`protocol`] | D12, Q3, Q5 | versioned JSON wire types, byte cursors |
 //! | [`arbiter`] | D14 | the input lock: which writer may type right now |
 //! | [`replay`] | D2, Q2 | per-terminal byte ring buffer + resume |
@@ -23,6 +24,7 @@
 //! | [`stream`] | D2, D8, D14 | PTY bytes out, keystrokes in, takeover |
 //! | [`commands`] | D3, D13, D16 | wire name to palette action, one table |
 
+pub mod access;
 pub mod activity;
 pub mod arbiter;
 pub mod assets;

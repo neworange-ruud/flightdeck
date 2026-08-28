@@ -107,8 +107,12 @@ Implementation notes:
 
 ### D5 — Auth: bearer token + QR, loopback by default
 
-- A palette command starts the server, mints a random token, and shows a QR plus
-  a short code, reusing the existing pairing overlay's visual language.
+- A palette command starts the server, mints a bootstrap code, and shows the
+  access overlay, reusing the existing pairing overlay's visual language.
+  **Amended by §6.5 R18:** whether that overlay shows a QR and a code depends on
+  the binding, which is Q1's answer — on loopback it shows neither, because
+  neither buys anything there. A third palette row, `Show Web Access`, reopens
+  the overlay for a server that is already running.
 - **Binds `127.0.0.1` by default.** Binding `0.0.0.0` is an explicit opt-in that
   shows a warning.
 - Token persists in `~/.flightdeck`, is revocable, and rotates on one command.
@@ -174,8 +178,12 @@ toggling from the browser, destructive operations.
 
 ### D10 — Lifecycle: palette command, plus a config opt-in to auto-start
 
-- `Start Web Interface` / `Stop Web Interface` palette commands, showing the QR
-  overlay on start — mirroring the existing `Pair Phone` flow.
+- `Start Web Interface` / `Stop Web Interface` palette commands, showing the
+  access overlay on start — mirroring the existing `Pair Phone` flow. **Amended
+  by §6.5 R18:** a third row, `Show Web Access`, reopens the overlay, because it
+  is dismissable and the config opt-in below starts a server with nobody
+  pressing anything. That opt-in deliberately does *not* pop the overlay at
+  launch: it asks for a server on every launch, not a modal on every launch.
 - A curated config setting (`[web] enabled`, `port`) so a user who wants it
   always available gets it on every launch. It sits beside the existing
   "FlightDeck Remote" row in the configuration manager.
@@ -637,6 +645,11 @@ states and the transition between them is part of the flow:
 3. **Code entry is rate-limited** — "3 attempts left before this address is
    rate-limited for 60s" (2b). Per-address, not global.
 
+**Built as answered** — see §6.5 R18 for the desktop half, which did not exist
+until then, and for the one caption in artboard 2a State A the implementation
+deliberately does not render (`already authenticated — no code needed on this
+machine`, which would have been a claim about a URL that carries no credential).
+
 ### Q2 — Replay ring buffer size · **provisional**
 
 **256 KiB per terminal**, configurable as `[web] replay_bytes`. Bytes, not lines,
@@ -696,7 +709,7 @@ Agreed before the job lands, per D15's accepted cost:
 Landed as written on 2026-08-27: non-blocking from that date, **required from
 2026-09-10**. §6.5 R6 records where each half lives.
 
-### Q7 — Is "hide the code while screen recording" implementable? · **provisional**
+### Q7 — Is "hide the code while screen recording" implementable? · **partly implemented, amended by R18**
 
 Turn 2 specifies that the code and QR render hidden by default "when a
 screen-recording API is active". This is on the **desktop overlay**, so detection
@@ -705,13 +718,24 @@ to ask it. macOS exposes partial signals, Linux has no common answer across
 compositors, and Windows differs again. FlightDeck holds a hard cross-platform
 parity requirement (`.agents/skills/flightdeck-cross-platform-parity`).
 
-**Provisional answer: do not gate the design on detection.** Ship the manual
-control, which works everywhere and is what the user actually controls:
+**Answer: do not gate the design on detection.** Ship the manual control, which
+works everywhere and is what the user actually controls:
 
-- The code and QR are **hidden behind a reveal** by default on every platform.
-- `r` toggles them, as the artboard specifies.
-- Where a platform *does* offer a trustworthy capture signal, use it to keep them
-  hidden and say why. Never use its *absence* to imply the screen is private.
+- ~~The code and QR are **hidden behind a reveal** by default on every
+  platform.~~ **Amended by §6.5 R18.** Artboard 2a — approved, and the later of
+  the two — draws the code and QR **visible**, with `r hide code` beside them and
+  `r hide` in the footer, and Q1's mitigation 1 reads "`r` to hide the code and
+  QR at any time". That is what shipped. Reveal-by-default would cost a keystroke
+  every single time in the one state that exists *because* a credential has to
+  cross a room, and it would buy protection only against an observer who, by
+  hypothesis, is watching the screen when the user presses reveal.
+- `r` toggles them, as the artboard specifies. **Implemented**, and it takes the
+  QR with the code by construction rather than by a second check.
+- **No capture detection is implemented on any platform, and none is claimed.**
+  Where a platform *does* offer a trustworthy capture signal it may later be used
+  to keep them hidden and say why. Never use its *absence* to imply the screen is
+  private — and today there is no such signal in the code, so there is nothing to
+  read the absence of.
 
 This keeps the security posture honest — never claiming a protection we cannot
 deliver — and keeps behaviour identical across platforms, which parity requires.
@@ -2146,6 +2170,164 @@ the stage scrolls to both edges. A `FitAddon`, a `transform: scale` or a
 `width: 100%` on the mount each fail that and none of them fails a jsdom test.
 That job is still R6's non-blocking one until 2026-09-10, which is the honest
 status of the pixel-level verification.
+
+---
+
+### R18 — the desktop half of D5 was never built, and a green suite could not see it
+
+**What was missing.** D5, Q1 and artboard 2a describe a desktop access overlay:
+the surface that mints a bootstrap code and shows a user how to get a browser
+in. It did not exist. Three pieces, each verifiable on its own:
+
+1. **No code was ever minted in production.** `CredentialStore::mint_bootstrap_code`
+   had two callers — `rotate()`, which had no callers at all, and the tests.
+   `mint_fixed_bootstrap_code` had one, `WebSurface::ensure_test_bootstrap_code`,
+   which is `#[cfg(debug_assertions)]` and gated on an environment variable.
+2. **Nothing rendered one.** `UiOverlay` had no web-access variant.
+   `draw_remote_overlay` is the *phone* pairing overlay, a different credential
+   with a different lifetime.
+3. **The address picker was dead code.** `src/web/interfaces.rs` says in its own
+   first line that it exists "for the access overlay's address picker" and had
+   no callers.
+
+Nothing else let a browser in. `POST /auth/exchange` requires a pending code and
+only the mint functions set one; there is no loopback bypass, deliberately. So a
+release build served a page that could not be authenticated at all, forever. The
+halves either side were built and correct — `remote-control-ce3w` was scoped
+"pure credential logic and persistence; no server, no HTTP", `remote-control-l7ya`
+built the browser-side access screens — and no issue was ever filed for the
+middle.
+
+**Why the suite did not see it.** The Playwright suite authenticates through
+`FLIGHTDECK_WEB_TEST_CODE`, which injects a *known* code straight into the store.
+That seam is legitimate and stays (see below), but it stands in for the exact
+step that did not exist, so every end-to-end test could pass while the feature
+was unreachable. The unused functions raised no dead-code warning because they
+are `pub`. **A green suite that routes around the missing piece is worse than a
+red one**, and the lesson generalises: a test seam that substitutes for a
+production path must be paired with something that exercises the production path,
+or it is load-bearing camouflage.
+
+**What now covers it.** Two tests in `tests/web_server.rs`, deliberately in Rust
+rather than Playwright:
+
+* `the_access_overlay_mints_a_code_a_browser_can_exchange` — opens
+  `web::access::WebAccess` against a real listener exactly as the event loop
+  does, presses `Enter`, and exchanges the code out of the URL's fragment over
+  the real `POST /auth/exchange`, then proves the cookie works on
+  `/auth/session`.
+* `the_qr_payload_carries_a_code_the_server_accepts` — the same for State B,
+  through the string the QR actually encodes, and then rotates and proves the
+  spent code is refused.
+
+Both call `assert_no_debug_seam()` first, so a developer with
+`FLIGHTDECK_WEB_TEST_CODE` exported cannot make them pass for the wrong reason.
+
+**Why Rust and not Playwright.** The overlay is a TUI surface painted on a PTY
+and its code is random, so a browser-driven test cannot read one without
+screen-scraping a terminal — the brittleness the debug seam exists to avoid. The
+honest split is: Playwright keeps the seam and proves the *browser* half (the
+fragment is read, the code is exchanged, the cookie survives a reload); Rust
+proves the *host* half (a release-shaped run mints a code and builds the URL that
+carries it). Neither is a substitute for the other, and `webui/e2e/support/host.ts`
+now says so where the seam is set up. A second Playwright path using a
+user-obtained code was considered and rejected: there is no way for a browser to
+obtain one that is not either the seam again or a PTY scrape.
+
+#### What was built, and the three places it differs from the drawings
+
+The overlay is `src/web/access.rs` (state, minting, the two states' key sets — no
+side effects), `draw_web_access_overlay` in `src/tui/render.rs` (drawing, no
+decisions), and the event loop in `src/lib.rs` (the side effects: launching a
+browser, the clipboard, rebinding the listener). `Start Web Interface` opens it,
+per D10; a third palette row, **`Show Web Access`**, reopens it, because the
+overlay is dismissable and `[web] enabled` starts a server without anyone
+pressing anything — without that row an auto-start user could never reach a code.
+`[web] enabled` deliberately does **not** pop the overlay at launch: it is a
+request for a server on every launch, not a modal on every launch.
+
+**1. "Open in browser, already authenticated" is a URL fragment, and the residual
+exposure is stated.** `Enter` builds `http://127.0.0.1:<port>/#<code>` and hands
+it to `crate::tui::opener::open_url` — the one seam this repo already had for
+"give something to the desktop" (`open` / `xdg-open` / `cmd /c start ""`), also
+used by D16's file-manager action and the help overlay's repository link. The
+fragment is Q4's convention and carries its guarantees: it never reaches the
+server, so the code cannot land in a request line, an access log, a proxy log, a
+`Referer` or a crash report. What it does not escape is **argv**: the URL is a
+command-line argument of the launcher, readable by another local user running
+`ps` for the second or two it lives. That is accepted, not hidden — there is no
+portable way to hand a URL to a browser without a command line, the code is
+single-use and dies in 120s, and the alternative people reach for (letting any
+loopback request in without a code) is strictly worse: a permanent standing grant
+to every local user instead of a two-second window. The module doc says all of
+this at the call site.
+
+Artboard 2a's State A draws the URL row with the caption *"already authenticated
+— no code needed on this machine"*. **The implementation does not say that**, and
+the difference is deliberate: the URL as drawn carries no credential, and a
+second browser opening it would be asked for a code. The row reads `c copies it
+with a one-time code attached`, and `c` copies `http://127.0.0.1:<port>/#<code>`
+— which is what makes Q1's "a copyable URL for a second browser" true rather than
+decorative. A surface must not claim something the host did not say, and the
+caption as drawn was a claim about a string that was not the one being handed
+out.
+
+**2. Q7's "hidden behind a reveal by default" is superseded by the artboard.**
+Q7 proposed rendering the code and QR hidden on every platform, with `r` to
+reveal. Artboard 2a — approved, and the later of the two — draws the code and QR
+**visible**, with `r hide code` in the QR column and `r hide` in the footer, and
+Q1's mitigation 1 says "`r` to hide the code and QR at any time". The artboard
+wins, and it is the better answer: a reveal-by-default costs a keystroke every
+single time in the one state that exists *because* a credential must cross the
+room, in exchange for a protection against an observer who, by hypothesis, is
+watching the screen when the user presses reveal. Q7's load-bearing half is
+untouched and implemented as written: **no detection is claimed on any platform,
+and the absence of a capture signal is never used to imply the screen is
+private.** Q7 has been amended in place to say what shipped.
+
+**3. The overlay is a terminal, so two lines from the drawing become two rows.**
+Artboard 2a's overlay is 780–900 CSS pixels wide; this one has to be legible in
+80 columns. The `● serving │ 127.0.0.1:7420 │ loopback only — nothing off this
+machine can reach it` header is one line there and two rows here, because a
+clause clipped mid-sentence is worse than a clause on the next row. And the
+code's 30px letterspaced numerals become spaced digits (`8 4 1 2`), centred, in
+the brightest tier the palette has.
+
+#### What is enforced rather than asserted
+
+* **The QR does not regress the phone overlay's hard-won fit.** The pairing
+  overlay's degradation — the art gives way, the code never does, and the note
+  names the size the QR would need *and* the size there is — is now a shared
+  helper (`qr_too_small_note`) used by both, and the access overlay reuses
+  `remote::pairing::qr_art` unchanged, so both surfaces draw the same scannable
+  half-block art at the same sizes. `pairing_layout`'s own arithmetic was not
+  touched, and its tests still pin a 57×29 QR into a 120×30 terminal.
+* **Hiding the code hides the QR by construction.** `WebAccess::view` builds the
+  QR payload *inside* the branch that decides the code is being drawn, so there
+  is no second check a renderer could forget. The test asserts an `r`-hidden view
+  has an empty `qr_rows` and a zero `qr_width`, not merely that no digits are
+  painted.
+* **The countdown cannot lie.** An expired code is reported (`code expired —
+  Space for a new one`) rather than silently re-minted behind a countdown that
+  never reaches zero. The one exception is the launch paths, which re-mint if the
+  outstanding code has gone — `Enter` must open a working browser rather than
+  report an expiry State A never showed the user.
+* **The two states' key sets are disjoint and exhaustive.** `AccessKey` is an
+  enum, not a `char`, and each state matches every variant; a key bound only in
+  the other state returns `Ignored` rather than doing something its footer never
+  promised. The footer legend is data (`WebAccessView::keys`), asserted against
+  artboard 2a's two footers.
+* **The overlay never outlives what it describes.** The credential store handle
+  is republished to the UI every tick while the server runs and withdrawn the
+  moment it stops, and the overlay comes down with it. A rebind that fails
+  restores the previous binding from the address the handle actually held, so
+  `n` on a port that cannot take a routable bind leaves the user where they
+  started rather than with no server at all.
+* **Closing puts the credential away only if it was ever taken out.** State B
+  clears the code on close — it was on screen, and a bystander who read it should
+  not keep a working credential after the user has hidden it. State A does not:
+  nothing was displayed, and a browser launched a moment ago is very likely still
+  starting up.
 
 ---
 

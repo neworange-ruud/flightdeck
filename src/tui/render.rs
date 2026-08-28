@@ -36,6 +36,7 @@ use crate::tui::layout;
 use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
+use crate::web::access::{AccessMode, WebAccessView};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -74,6 +75,10 @@ pub enum UiOverlay {
     /// The desktop pairing surface (Settings → Remote): the QR + 4-digit code
     /// and pairing status (spec §5.2).
     Remote(RemotePairing),
+    /// The browser access surface (`specs/WEB_INTERFACE.md` D5, Q1; design
+    /// `2a`): how a browser gets in, in whichever of the two states the current
+    /// binding puts it.
+    WebAccess(WebAccessView),
 }
 
 /// Render-ready snapshot of a pairing attempt for [`UiOverlay::Remote`]. Rebuilt
@@ -667,6 +672,7 @@ pub fn draw(
         }
         UiOverlay::Config(manager) => draw_config_overlay(frame, manager, area),
         UiOverlay::Remote(pairing) => draw_remote_overlay(frame, pairing, area),
+        UiOverlay::WebAccess(access) => draw_web_access_overlay(frame, access, area),
     }
 }
 
@@ -2310,6 +2316,20 @@ impl PairingLayout {
     }
 }
 
+/// The line both QR-bearing overlays show when the terminal cannot hold the art:
+/// the size it would need, the size there is, and what to do instead.
+///
+/// Shared by the phone pairing overlay ([`pairing_layout`]) and the browser
+/// access overlay ([`web_access_layout`]) so the two degrade with the same
+/// words. A bare "too small" leaves the user guessing which dimension to grow,
+/// which is the whole reason the numbers are in it.
+fn qr_too_small_note(needs_w: u16, needs_h: u16, area: Rect, instead: &str) -> String {
+    format!(
+        "Terminal too small for the QR (needs {}x{}, have {}x{}) — {instead}.",
+        needs_w, needs_h, area.width, area.height
+    )
+}
+
 /// Decide the pairing overlay's layout for `area`.
 ///
 /// The QR is what a phone actually scans, so it is fitted **first** and the
@@ -2358,12 +2378,11 @@ fn pairing_layout(pairing: &RemotePairing, area: Rect) -> PairingLayout {
     let status_lines = wrap_message(&pairing.status_line, content_w as usize);
     // Name the smallest terminal that would show the QR (the borderless fit) —
     // a bare "too small" leaves the user guessing which dimension to grow.
-    let note_text = format!(
-        "Terminal too small for the QR (needs {}x{}, have {}x{}) — enter the code below.",
+    let note_text = qr_too_small_note(
         qr_content_w,
         qr_h + art_required_h,
-        area.width,
-        area.height
+        area,
+        "enter the code below",
     );
 
     let mut budget = area
@@ -2511,6 +2530,516 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
 
     let para = Paragraph::new(lines).alignment(Alignment::Center);
     frame.render_widget(para, inner);
+}
+
+// ---------------------------------------------------------------------------
+// The browser access overlay (D5, Q1, Q7; design `2a`)
+// ---------------------------------------------------------------------------
+
+/// The access overlay's minimum content width.
+///
+/// 76 plus the 4 columns of chrome is exactly 80, the classic terminal floor:
+/// this is the widest the overlay can ask for and still be drawn whole on the
+/// narrowest terminal anybody actually uses. It is much wider than the pairing
+/// overlay's 44 because this surface carries sentences — the address picker's
+/// descriptions, D5's warning, a six-key legend — rather than a code and a
+/// status line.
+const WEB_ACCESS_MIN_CONTENT_W: u16 = 76;
+/// Left + right border plus one column of padding on each side.
+const WEB_ACCESS_CHROME_W: u16 = 4;
+/// Top + bottom border rows.
+const WEB_ACCESS_BORDER_H: u16 = 2;
+
+/// How readily a row gives way when the terminal is short. [`REQUIRED`] rows
+/// never do; higher tiers are dropped first, and a whole tier goes before the
+/// next one is touched.
+type Tier = u8;
+
+/// A row that is the surface: dropping it would make the overlay lie by
+/// omission (the status line, the code, the selected address, the key legend).
+const REQUIRED: Tier = 0;
+/// Explanatory prose: D5's warning body, the network door's consequence. High
+/// value, but the headline above each still says what it is.
+const TIER_PROSE: Tier = 1;
+/// Rows whose information is repeated in the key legend at the foot.
+const TIER_ECHOED: Tier = 2;
+/// Blank spacers. The first thing to go and the last thing anyone misses.
+const TIER_SPACER: Tier = 3;
+
+/// Drop rows tier by tier, from the bottom of each tier upward, until the list
+/// fits `height`.
+///
+/// Bottom-upward within a tier because these overlays put the most contextual
+/// material last (the browsers-holding-access line, the second warning
+/// paragraph): when two rows are equally droppable, the later one is the one
+/// the reader has already been prepared for by everything above it.
+///
+/// Split out from the drawing so the fit is unit-testable at exact terminal
+/// sizes, exactly as [`pairing_layout`] is.
+fn fit_rows(mut rows: Vec<(Tier, Line<'static>)>, height: u16) -> Vec<Line<'static>> {
+    let height = height as usize;
+    let mut tier = Tier::MAX;
+    while rows.len() > height && tier > REQUIRED {
+        // Highest tier still present, so a lower tier is never touched while a
+        // higher one still has rows to give.
+        tier = match rows.iter().map(|(t, _)| *t).filter(|t| *t > REQUIRED).max() {
+            Some(t) => t,
+            None => break,
+        };
+        while rows.len() > height {
+            match rows.iter().rposition(|(t, _)| *t == tier) {
+                Some(idx) => {
+                    rows.remove(idx);
+                }
+                None => break,
+            }
+        }
+    }
+    // Everything left is required and still does not fit: the terminal is
+    // smaller than the smallest honest form of this overlay, so the tail is
+    // clipped rather than something load-bearing being silently reordered.
+    rows.truncate(height);
+    rows.into_iter().map(|(_, line)| line).collect()
+}
+
+/// Pad `s` to `width` cells with the remainder split either side, so a QR or a
+/// code centres inside a left-aligned paragraph. Wider-than-`width` input is
+/// returned untouched — clipping is the caller's business, not the padder's.
+fn center_pad(s: &str, width: u16) -> String {
+    let len = s.chars().count();
+    let width = width as usize;
+    if len >= width {
+        return s.to_string();
+    }
+    let left = (width - len) / 2;
+    format!("{}{}", " ".repeat(left), s)
+}
+
+/// A `key` chip followed by its label, the way every FlightDeck overlay draws
+/// one (design turn 1: "every button shows its key").
+fn key_chip(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label.to_string(), Style::default().fg(Color::Gray)),
+    ]
+}
+
+/// Draw the browser access overlay (`specs/WEB_INTERFACE.md` D5, D10, Q1, Q7;
+/// design `2a`) in whichever of its two states the current binding puts it.
+///
+/// **State A (loopback, the default) never draws a credential.** There is no
+/// code and no QR to hide, because on this machine neither buys anything: the
+/// QR would encode an address that resolves nowhere else, and the code would be
+/// a shoulder-surfing hazard bought for nothing. The credential still exists —
+/// `Enter` and `c` spend one — it simply travels in a URL fragment instead of
+/// across the room. **State B** is where the QR earns its place, and it is
+/// drawn with the same black-on-white half-block art the phone pairing overlay
+/// uses, subject to the same honest degradation: when the terminal cannot hold
+/// it, the art gives way to a note naming the size it would need
+/// ([`qr_too_small_note`]) and the code stays, because the code is the path
+/// that always works.
+pub fn draw_web_access_overlay(frame: &mut Frame, view: &WebAccessView, area: Rect) {
+    let Some(mode) = view.mode else {
+        return;
+    };
+    let l = web_access_layout(view, area);
+
+    let box_w = (l.content_w + WEB_ACCESS_CHROME_W).min(area.width);
+    let box_h = (l.rows_h + WEB_ACCESS_BORDER_H).min(area.height);
+    let overlay = layout::centered_overlay(area, box_w, box_h);
+    frame.render_widget(Clear, overlay);
+
+    let title = match mode {
+        AccessMode::LocalOnly => " Web Interface ",
+        AccessMode::Network => " Web Interface — network access ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let rows = web_access_rows(view, mode, &l);
+    let lines = fit_rows(rows, inner.height);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What the access overlay decided about its own size: the content width, the
+/// QR's fate, and how tall the surviving rows are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebAccessLayout {
+    /// Content width the prose is wrapped to and the QR is centred in.
+    content_w: u16,
+    /// Render the QR art.
+    show_qr: bool,
+    /// The "terminal too small" note, when a QR exists but has no room.
+    note: Vec<String>,
+    /// Height of the rows that will actually be drawn.
+    rows_h: u16,
+}
+
+/// Decide the access overlay's layout for `area`.
+///
+/// The QR is fitted **first and against the required rows only**: it appears
+/// when the art plus everything that can never give way still fits. That is the
+/// same priority the pairing overlay gives it — a QR nobody can scan is worth
+/// nothing — but the required set here is larger, because this overlay also
+/// carries the address it is publishing and the warning about what that means,
+/// and neither may be silently dropped to make room for art.
+fn web_access_layout(view: &WebAccessView, area: Rect) -> WebAccessLayout {
+    let qr_w = view.qr_width as u16;
+    let qr_h = view.qr_rows.len() as u16;
+    let has_qr = !view.qr_rows.is_empty();
+
+    let content_w = qr_w
+        .max(WEB_ACCESS_MIN_CONTENT_W)
+        .min(area.width.saturating_sub(WEB_ACCESS_CHROME_W))
+        .max(1);
+    let inner_h = area.height.saturating_sub(WEB_ACCESS_BORDER_H);
+
+    // Probe with no QR and no note: what the required rows alone cost.
+    let probe = WebAccessLayout {
+        content_w,
+        show_qr: false,
+        note: Vec::new(),
+        rows_h: 0,
+    };
+    let mode = view.mode.unwrap_or(AccessMode::LocalOnly);
+    let required_h = web_access_rows(view, mode, &probe)
+        .iter()
+        .filter(|(tier, _)| *tier == REQUIRED)
+        .count() as u16;
+
+    let show_qr =
+        has_qr && qr_w + WEB_ACCESS_CHROME_W <= area.width && qr_h + required_h <= inner_h;
+    let note = if has_qr && !show_qr {
+        wrap_message(
+            &qr_too_small_note(
+                qr_w + WEB_ACCESS_CHROME_W,
+                qr_h + required_h + WEB_ACCESS_BORDER_H,
+                area,
+                "type the code instead",
+            ),
+            content_w as usize,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut decided = WebAccessLayout {
+        content_w,
+        show_qr,
+        note,
+        rows_h: 0,
+    };
+    let rows = web_access_rows(view, mode, &decided);
+    decided.rows_h = (fit_rows(rows, inner_h).len() as u16).max(1);
+    decided
+}
+
+/// Build the overlay's rows, each tagged with how readily it gives way.
+///
+/// One function for both states so the two can never drift into different
+/// chrome: the state only decides *which* rows exist, never how they are drawn.
+fn web_access_rows(
+    view: &WebAccessView,
+    mode: AccessMode,
+    l: &WebAccessLayout,
+) -> Vec<(Tier, Line<'static>)> {
+    let w = l.content_w;
+    let mut rows: Vec<(Tier, Line<'static>)> = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    let body = Style::default().fg(Color::Gray);
+    let bright = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let spacer = |rows: &mut Vec<(Tier, Line<'static>)>| rows.push((TIER_SPACER, Line::raw("")));
+
+    match mode {
+        AccessMode::LocalOnly => {
+            rows.push((REQUIRED, serving_line(view, mode)));
+            for line in wrap_message(&view.exposure_line, w as usize) {
+                rows.push((REQUIRED, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            let mut action = key_chip("Enter", "Open in browser");
+            action.push(Span::raw("   "));
+            action.extend(key_chip("c", "Copy URL"));
+            rows.push((REQUIRED, Line::from(action)));
+            rows.push((
+                TIER_ECHOED,
+                Line::from(Span::styled(
+                    "  launches the host's default browser · host only".to_string(),
+                    dim,
+                )),
+            ));
+            spacer(&mut rows);
+            rows.push((
+                REQUIRED,
+                Line::from(vec![
+                    Span::styled("url  ".to_string(), dim),
+                    Span::styled(view.url.clone(), Style::default().fg(Color::White)),
+                ]),
+            ));
+            // Never "already authenticated": the URL as drawn carries no
+            // credential, and a second browser opening it would be asked for a
+            // code. What `c` puts on the clipboard is a different string, and
+            // this says so rather than letting the row imply otherwise.
+            rows.push((
+                TIER_PROSE,
+                Line::from(Span::styled(
+                    "     c copies it with a one-time code attached".to_string(),
+                    dim,
+                )),
+            ));
+            spacer(&mut rows);
+            let mut door = vec![Span::styled(
+                "▸".to_string(),
+                Style::default().fg(Color::Cyan),
+            )];
+            door.extend(key_chip(
+                "n",
+                "Allow other devices on this network to connect",
+            ));
+            rows.push((REQUIRED, Line::from(door)));
+            for line in wrap_message(
+                "Rebinds to 0.0.0.0, then asks which address to publish and issues a scannable \
+                 code. Reaching FlightDeck from outside this network is your own tunnel — this \
+                 switch does not do it.",
+                w.saturating_sub(4).max(1) as usize,
+            ) {
+                rows.push((
+                    TIER_PROSE,
+                    Line::from(Span::styled(format!("    {line}"), dim)),
+                ));
+            }
+        }
+        AccessMode::Network => {
+            if l.show_qr {
+                let art = Style::default().fg(Color::Black).bg(Color::White);
+                for row in &view.qr_rows {
+                    rows.push((REQUIRED, Line::from(Span::styled(center_pad(row, w), art))));
+                }
+            }
+            for note in &l.note {
+                rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        note.clone(),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ));
+            }
+            match (&view.code, view.code_hidden, view.code_expired) {
+                (Some(code), _, _) => {
+                    // The terminal's answer to artboard 2a's 30px letterspaced
+                    // numerals: spaced digits, centred, in the brightest tier.
+                    let spaced: String = code
+                        .chars()
+                        .flat_map(|c| [c, ' '])
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string();
+                    rows.push((
+                        REQUIRED,
+                        Line::from(Span::styled(center_pad(&spaced, w), bright)),
+                    ));
+                    if let Some(secs) = view.seconds_remaining {
+                        rows.push((
+                            REQUIRED,
+                            Line::from(Span::styled(
+                                center_pad(&format!("expires in {secs}s"), w),
+                                Style::default().fg(Color::Yellow),
+                            )),
+                        ));
+                    }
+                }
+                (None, true, _) => rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        center_pad("code and QR hidden — r to show", w),
+                        dim,
+                    )),
+                )),
+                (None, false, true) => rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        center_pad("code expired — Space for a new one", w),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                )),
+                (None, false, false) => {}
+            }
+            spacer(&mut rows);
+            rows.push((REQUIRED, serving_line(view, mode)));
+            for line in wrap_message(&view.exposure_line, w as usize) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            rows.push((
+                TIER_ECHOED,
+                Line::from(Span::styled("PUBLISH WHICH ADDRESS".to_string(), dim)),
+            ));
+            for (idx, addr) in view.addresses.iter().enumerate() {
+                let selected = view.selected_address == Some(idx);
+                // The published address is required; the alternatives are the
+                // picker, and a short terminal shows the choice it made.
+                let tier = if selected { REQUIRED } else { TIER_ECHOED };
+                let name_style = if selected {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    dim
+                };
+                let addr_style = if selected { bright } else { body };
+                let mut spans = vec![
+                    Span::styled(
+                        if selected { "▸ " } else { "  " }.to_string(),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(format!("‹{}› ", addr.name), name_style),
+                    Span::styled(format!("{} ", addr.address), addr_style),
+                ];
+                if let Some(description) = addr.description {
+                    spans.push(Span::styled(format!("· {description}"), dim));
+                }
+                rows.push((tier, Line::from(spans)));
+            }
+            if view.addresses.is_empty() {
+                rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        "  no routable interface found on this host".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ));
+            }
+            spacer(&mut rows);
+            rows.push((
+                REQUIRED,
+                Line::from(Span::styled(
+                    "WHAT YOU ARE ALLOWING".to_string(),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+            ));
+            for line in wrap_message(
+                "Anyone on this network who has the code can read your repositories, type into \
+                 your agents, and push branches.",
+                w as usize,
+            ) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, body))));
+            }
+            for line in wrap_message(
+                "The code lasts 120s and buys a cookie in one browser. Revoke it and that \
+                 browser is locked out on its next request.",
+                w as usize,
+            ) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            let mut actions = key_chip("l", "Back to local only");
+            actions.push(Span::raw("   "));
+            actions.extend(key_chip("x", "Revoke browser access"));
+            rows.push((TIER_ECHOED, Line::from(actions)));
+            rows.push((TIER_ECHOED, browsers_line(view.active_browsers)));
+        }
+    }
+
+    if let Some(notice) = &view.notice {
+        spacer(&mut rows);
+        for line in wrap_message(notice, w as usize) {
+            rows.push((
+                TIER_PROSE,
+                Line::from(Span::styled(line, Style::default().fg(Color::Cyan))),
+            ));
+        }
+    }
+    spacer(&mut rows);
+    rows.push((REQUIRED, key_legend(&view.keys)));
+    rows
+}
+
+/// The `● serving │ <addr>` header, in the host's words.
+///
+/// The exposure clause the artboard puts on the same line is a row of its own
+/// here: the artboard's overlay is 780 CSS pixels wide and this one has to be
+/// legible in 80 columns, where `● serving │ 127.0.0.1:7420 │ loopback only —
+/// nothing off this machine can reach it` would be clipped mid-sentence. A
+/// clause that stops halfway is worse than a clause on the next line.
+fn serving_line(view: &WebAccessView, mode: AccessMode) -> Line<'static> {
+    let (dot, dot_style, label) = match mode {
+        AccessMode::LocalOnly => ("● ", Style::default().fg(Color::Green), "serving"),
+        // Amber, the one token turn 2 reserved for a state that must never be
+        // mistaken for the calm one.
+        AccessMode::Network => (
+            "● ",
+            Style::default().fg(Color::Yellow),
+            "serving on this network",
+        ),
+    };
+    Line::from(vec![
+        Span::styled(dot.to_string(), dot_style),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(view.bound.clone(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// How many browsers hold access, counted rather than rounded to "some".
+fn browsers_line(active: usize) -> Line<'static> {
+    let (dot_style, text) = match active {
+        0 => (
+            Style::default().fg(Color::DarkGray),
+            "no browser holds access".to_string(),
+        ),
+        1 => (
+            Style::default().fg(Color::Green),
+            "1 browser holds access".to_string(),
+        ),
+        n => (
+            Style::default().fg(Color::Green),
+            format!("{n} browsers hold access"),
+        ),
+    };
+    Line::from(vec![
+        Span::styled("● ".to_string(), dot_style),
+        Span::styled(text, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// The footer legend: every key the current state binds, and nothing it does
+/// not.
+fn key_legend(keys: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, (key, label)) in keys.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(
+                " · ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            (*label).to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Draw the configuration manager overlay (SPECS §8): a scope selector, the
@@ -4900,6 +5429,309 @@ mod tests {
         // App mode + setting off → no dim.
         ui.dim_terminal_in_app_mode = false;
         assert!(!super::dim_terminal(false, &ui));
+    }
+
+    // --- Access overlay (D5, Q1; design `2a`, both states) -----------------
+
+    /// The base of a State B view: a QR the size `qr_art` really produces for a
+    /// `http://192.168.2.14:7420/#8412` payload, the code beside it, the three
+    /// interfaces artboard 2a draws.
+    fn network_access_view() -> WebAccessView {
+        WebAccessView {
+            mode: Some(AccessMode::Network),
+            bound: "0.0.0.0:7420".to_string(),
+            exposure_line: "reachable by anyone on this network who has the code".to_string(),
+            url: "http://192.168.2.14:7420".to_string(),
+            code: Some("8412".to_string()),
+            code_hidden: false,
+            code_expired: false,
+            qr_rows: vec!["#".repeat(33); 17],
+            qr_width: 33,
+            seconds_remaining: Some(97),
+            addresses: vec![
+                crate::web::access::AddressRow {
+                    name: "en0".to_string(),
+                    address: "192.168.2.14".to_string(),
+                    description: Some("wifi · reachable by your phone"),
+                },
+                crate::web::access::AddressRow {
+                    name: "bridge100".to_string(),
+                    address: "192.168.64.1".to_string(),
+                    description: Some("vm bridge"),
+                },
+                crate::web::access::AddressRow {
+                    name: "tailscale0".to_string(),
+                    address: "100.87.14.3".to_string(),
+                    description: Some("your own tunnel"),
+                },
+            ],
+            selected_address: Some(0),
+            active_browsers: 1,
+            notice: None,
+            keys: vec![
+                ("↑↓", "address"),
+                ("Space", "new code"),
+                ("r", "hide"),
+                ("x", "revoke"),
+                ("l", "local only"),
+                ("Esc", "close"),
+            ],
+        }
+    }
+
+    fn local_access_view() -> WebAccessView {
+        WebAccessView {
+            mode: Some(AccessMode::LocalOnly),
+            bound: "127.0.0.1:7420".to_string(),
+            exposure_line: "loopback only — nothing off this machine can reach it".to_string(),
+            url: "http://127.0.0.1:7420".to_string(),
+            code: None,
+            code_hidden: false,
+            code_expired: false,
+            qr_rows: Vec::new(),
+            qr_width: 0,
+            seconds_remaining: None,
+            addresses: Vec::new(),
+            selected_address: None,
+            active_browsers: 0,
+            notice: None,
+            keys: vec![
+                ("Enter", "open"),
+                ("c", "copy"),
+                ("n", "network access"),
+                ("s", "stop server"),
+                ("Esc", "close"),
+            ],
+        }
+    }
+
+    /// Every cell of a drawn frame, as one string.
+    fn painted(width: u16, height: u16, view: &WebAccessView) -> String {
+        let mut term = test_terminal(width, height);
+        term.draw(|f| {
+            let area = f.area();
+            draw_web_access_overlay(f, view, area);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn state_a_draws_the_open_in_browser_door_and_never_a_code() {
+        let text = painted(120, 30, &local_access_view());
+        assert!(text.contains("Web Interface"), "{text}");
+        assert!(text.contains("serving"), "{text}");
+        assert!(
+            text.contains("loopback only"),
+            "the exposure line is the host's, verbatim: {text}"
+        );
+        assert!(text.contains("Open in browser"), "{text}");
+        assert!(text.contains("Copy URL"), "{text}");
+        assert!(text.contains("http://127.0.0.1:7420"), "{text}");
+        assert!(
+            text.contains("Allow other devices on this network to connect"),
+            "the door to State B states its consequence: {text}"
+        );
+        assert!(text.contains("this switch does not do it"), "{text}");
+        // The whole point of State A.
+        assert!(
+            !text.contains("expires in"),
+            "State A shows no countdown: {text}"
+        );
+        assert!(
+            !text.contains("WHAT YOU ARE ALLOWING"),
+            "nothing is being allowed off this machine: {text}"
+        );
+    }
+
+    #[test]
+    fn state_a_never_claims_the_bare_url_is_already_authenticated() {
+        // The URL row draws a credential-free URL; only `c` attaches a code. A
+        // row reading "already authenticated" would be a claim the host never
+        // made about the string next to it.
+        let text = painted(120, 30, &local_access_view());
+        assert!(!text.contains("already authenticated"), "{text}");
+        assert!(text.contains("one-time code attached"), "{text}");
+    }
+
+    #[test]
+    fn state_b_draws_the_qr_the_code_the_picker_and_the_warning() {
+        let text = painted(120, 44, &network_access_view());
+        assert!(
+            text.contains("network access"),
+            "the title names it: {text}"
+        );
+        assert!(text.contains("#".repeat(33).as_str()), "the QR art: {text}");
+        assert!(
+            text.contains("8 4 1 2"),
+            "the code, spaced out as artboard 2a's large type: {text}"
+        );
+        assert!(text.contains("expires in 97s"), "{text}");
+        assert!(text.contains("PUBLISH WHICH ADDRESS"), "{text}");
+        assert!(text.contains("192.168.2.14"), "{text}");
+        assert!(
+            text.contains("wifi · reachable by your phone"),
+            "interfaces.rs's one-line descriptions: {text}"
+        );
+        assert!(
+            text.contains("‹bridge100›") && text.contains("vm bridge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("‹tailscale0›") && text.contains("your own tunnel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WHAT YOU ARE ALLOWING"),
+            "D5's warning: {text}"
+        );
+        assert!(text.contains("push branches"), "{text}");
+        assert!(text.contains("1 browser holds access"), "{text}");
+        assert!(text.contains("Esc close"), "the legend: {text}");
+    }
+
+    #[test]
+    fn hiding_the_code_takes_the_qr_with_it_and_says_how_to_get_it_back() {
+        // What `r` produces: the view arrives with no code and no art at all,
+        // which is what makes "hidden" impossible to half-apply.
+        let mut view = network_access_view();
+        view.code = None;
+        view.code_hidden = true;
+        view.qr_rows = Vec::new();
+        view.qr_width = 0;
+
+        let text = painted(120, 44, &view);
+        assert!(!text.contains("8 4 1 2"), "{text}");
+        assert!(!text.contains("###"), "the QR goes with the code: {text}");
+        assert!(text.contains("code and QR hidden — r to show"), "{text}");
+        // Everything that is not the credential stays: the user still needs to
+        // see what this binding allows while the code is put away.
+        assert!(text.contains("WHAT YOU ARE ALLOWING"), "{text}");
+        assert!(text.contains("192.168.2.14"), "{text}");
+    }
+
+    #[test]
+    fn an_expired_code_is_reported_with_the_way_to_replace_it() {
+        let mut view = network_access_view();
+        view.code = None;
+        view.code_expired = true;
+        view.seconds_remaining = None;
+        view.qr_rows = Vec::new();
+        view.qr_width = 0;
+
+        let text = painted(120, 44, &view);
+        assert!(
+            text.contains("code expired — Space for a new one"),
+            "{text}"
+        );
+        assert!(!text.contains("expires in"), "{text}");
+    }
+
+    #[test]
+    fn the_qr_fits_a_terminal_that_can_hold_it_alongside_the_required_rows() {
+        let view = network_access_view();
+        let l = web_access_layout(&view, Rect::new(0, 0, 120, 44));
+        assert!(l.show_qr, "a 17-row QR fits a 44-row terminal");
+        assert!(l.note.is_empty());
+        assert!(l.content_w >= view.qr_width as u16);
+    }
+
+    #[test]
+    fn a_small_terminal_drops_the_qr_and_names_the_size_it_would_need() {
+        // The same degradation the phone pairing overlay already had: the art
+        // gives way, the code does not, and the note carries both sizes so the
+        // user knows which dimension to grow.
+        let view = network_access_view();
+        let l = web_access_layout(&view, Rect::new(0, 0, 60, 18));
+        assert!(!l.show_qr);
+        let note = l.note.join(" ");
+        assert!(
+            note.contains("have 60x18"),
+            "the note names the terminal it has: {note}"
+        );
+        let text = painted(60, 18, &view);
+        assert!(
+            text.contains("8 4 1 2"),
+            "the code survives when the art cannot: {text}"
+        );
+        assert!(text.contains("Terminal too small for the QR"), "{text}");
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_published_address_and_the_key_legend() {
+        // The tiering rule, at the size where it bites: prose and echoed rows
+        // give way, but the address being published and the keys that change it
+        // are what the overlay *is*.
+        let view = network_access_view();
+        for height in 10..=44u16 {
+            let text = painted(100, height, &view);
+            assert!(
+                text.contains("192.168.2.14"),
+                "the published address survives at height {height}: {text}"
+            );
+            assert!(
+                text.contains("Esc close"),
+                "the key legend survives at height {height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_is_shown_and_never_outlives_the_frame_that_carried_it() {
+        let mut view = network_access_view();
+        view.notice = Some("1 browser revoked — new code issued.".to_string());
+        let text = painted(120, 44, &view);
+        assert!(text.contains("1 browser revoked"), "{text}");
+
+        view.notice = None;
+        let text = painted(120, 44, &view);
+        assert!(!text.contains("revoked — new code"), "{text}");
+    }
+
+    #[test]
+    fn an_overlay_with_no_mode_draws_nothing() {
+        // `WebAccessView::default()` is what a renderer would get if a snapshot
+        // were ever built without a state. It must paint nothing rather than an
+        // empty frame claiming to be the access surface.
+        let text = painted(80, 24, &WebAccessView::default());
+        assert!(!text.contains("Web Interface"), "{text}");
+    }
+
+    #[test]
+    fn fit_rows_drops_whole_tiers_from_the_bottom_before_touching_the_next() {
+        let row = |tier: Tier, text: &str| (tier, Line::raw(text.to_string()));
+        let rows = vec![
+            row(REQUIRED, "a"),
+            row(TIER_PROSE, "b"),
+            row(TIER_SPACER, "c"),
+            row(TIER_ECHOED, "d"),
+            row(TIER_SPACER, "e"),
+            row(REQUIRED, "f"),
+        ];
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.spans[0].content.to_string())
+                .collect::<String>()
+        };
+
+        assert_eq!(text(fit_rows(rows.clone(), 6)), "abcdef");
+        // Spacers first, from the bottom.
+        assert_eq!(text(fit_rows(rows.clone(), 5)), "abcdf");
+        assert_eq!(text(fit_rows(rows.clone(), 4)), "abdf");
+        // Then the echoed row, then the prose — required rows never go.
+        assert_eq!(text(fit_rows(rows.clone(), 3)), "abf");
+        assert_eq!(text(fit_rows(rows.clone(), 2)), "af");
+        // Smaller than the required set: clipped, not reordered.
+        assert_eq!(text(fit_rows(rows, 1)), "a");
     }
 
     // --- Pairing overlay layout (remote pairing on small terminals) --------

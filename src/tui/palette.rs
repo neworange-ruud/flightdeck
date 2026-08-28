@@ -66,6 +66,14 @@ pub enum PaletteAction {
     /// Stop the embedded web interface: tell every attached browser why, then
     /// release the listener (Q5).
     StopWebInterface,
+    /// Show the access overlay for a web interface that is already running
+    /// (`specs/WEB_INTERFACE.md` D5, Q1; design `2a`).
+    ///
+    /// Separate from [`PaletteAction::StartWebInterface`], which opens it as
+    /// part of starting, because the overlay is dismissable and the server can
+    /// also come up from `[web] enabled` without anyone pressing anything. Both
+    /// paths need a way back to the code.
+    ShowWebAccess,
     /// Take the input lock now (`specs/WEB_INTERFACE.md` D14 as revised),
     /// interrupting whichever surface is mid-burst.
     ///
@@ -230,6 +238,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         group: "Remote",
+        label: "Show Web Access",
+        action: PaletteAction::ShowWebAccess,
+    },
+    PaletteEntry {
+        group: "Remote",
         label: "Take Input Lock",
         action: PaletteAction::TakeInputLock,
     },
@@ -266,8 +279,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// makes 31, plus the two FlightDeck Web lifecycle actions ("Start Web
 /// Interface" / "Stop Web Interface", D10) makes 33, plus
 /// "Take Input Lock" (D14 as revised — the desktop's half of the one explicit
-/// override in the input-arbitration model) makes 34.
-pub const REQUIRED_ACTION_COUNT: usize = 34;
+/// override in the input-arbitration model) makes 34, plus "Show Web Access"
+/// (D5/Q1's access overlay, reachable again after it is dismissed and for a
+/// server that came up from `[web] enabled` rather than from the palette) makes
+/// 35.
+pub const REQUIRED_ACTION_COUNT: usize = 35;
 
 /// Every §22 palette row, in display order, unfiltered and ungated.
 ///
@@ -349,6 +365,10 @@ impl CommandPalette {
             // Exactly one of the two web lifecycle actions is ever offered.
             PaletteAction::StartWebInterface => !self.web_running,
             PaletteAction::StopWebInterface => self.web_running,
+            // Nothing to show until something is listening: the overlay
+            // describes a live binding, and there is no honest way to draw one
+            // that does not exist.
+            PaletteAction::ShowWebAccess => self.web_running,
             // Nothing to interrupt while nothing else can type.
             PaletteAction::TakeInputLock => self.web_running,
             // An isolated run has one session in one project (SPECS §32).
@@ -565,12 +585,13 @@ mod tests {
 
     #[test]
     fn filter_empty_shows_all() {
-        // A fresh palette shows every action except the three the current state
+        // A fresh palette shows every action except the four the current state
         // has nothing to say about: "Unpair Phone" (nothing is paired), "Stop
-        // Web Interface" and "Take Input Lock" (nothing is listening, so there
-        // is one writer and nothing to interrupt).
+        // Web Interface", "Show Web Access" and "Take Input Lock" (nothing is
+        // listening, so there is no binding to describe, no code to show, one
+        // writer and nothing to interrupt).
         let palette = CommandPalette::new();
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
     }
 
     #[test]
@@ -595,8 +616,8 @@ mod tests {
         );
         assert!(labels.contains(&"Unpair Phone"), "unpair must be offered");
         // Exactly one of each gated pair is visible in either state; the web
-        // interface is still stopped, so its two running-only rows are hidden.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
+        // interface is still stopped, so its three running-only rows are hidden.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
     }
 
     /// D10: exactly one of the two FlightDeck Web lifecycle actions is offered
@@ -620,6 +641,12 @@ mod tests {
             !labels.contains(&"Start Web Interface"),
             "cannot start a server that is already listening"
         );
+        assert!(
+            labels.contains(&"Show Web Access"),
+            "a running server always has a way back to its code"
+        );
+        // "Start Web Interface" and "Unpair Phone" are the two hidden; "Show
+        // Web Access" is only hidden the other way round.
         assert_eq!(running.filtered().len(), REQUIRED_ACTION_COUNT - 2);
     }
 
@@ -736,8 +763,9 @@ mod tests {
         palette.clear_filter();
         assert_eq!(palette.filter(), "");
         // Unpaired and not listening: all actions except "Unpair Phone" and the
-        // two rows that only mean something while the web interface is running.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 3);
+        // three rows that only mean something while the web interface is
+        // running.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
     }
 
     #[test]

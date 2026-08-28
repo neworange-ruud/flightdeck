@@ -871,6 +871,11 @@ impl CredentialStore {
 
     /// Drop the outstanding code — dismissing the overlay stops the code
     /// working, rather than leaving it live for its remaining seconds.
+    ///
+    /// Called from [`crate::web::access::WebAccess::on_close`], which applies
+    /// it to the network state only: there the code was on screen and closing
+    /// should take it back, while on loopback nothing was ever displayed and a
+    /// browser launched a moment ago is very likely still starting up with it.
     pub fn clear_bootstrap_code(&mut self) {
         self.pending = None;
     }

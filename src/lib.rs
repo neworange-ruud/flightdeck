@@ -1242,6 +1242,29 @@ struct Ui {
     /// Set by "Stop Web Interface"; the event loop drains the viewers and
     /// releases the listener (Q5).
     pending_web_stop: bool,
+    /// The access overlay's live state while it is open (D5, Q1; design `2a`).
+    ///
+    /// Held beside `overlay` rather than inside it, exactly as `config` is,
+    /// because it carries mutable state the renderer must not own: which
+    /// address is selected, whether the code is revealed. `overlay` gets a
+    /// freshly built [`crate::web::access::WebAccessView`] every tick, which is
+    /// what makes the countdown move.
+    web_access: Option<crate::web::access::WebAccess>,
+    /// The credential store, while the server is running.
+    ///
+    /// The same `Arc` the server thread verifies against — the key handler has
+    /// to mint and revoke, and those decisions cannot wait a tick without
+    /// `Enter` opening a browser against a code that expired in the meantime.
+    /// Held on the same terms as `input_lock` above: a shared handle the key
+    /// path needs, `None` whenever there is no server to share it with.
+    web_credentials: Option<Arc<Mutex<crate::web::credentials::CredentialStore>>>,
+    /// Set by "Start Web Interface" and "Show Web Access"; the event loop opens
+    /// the access overlay once it knows what the listener actually bound.
+    pending_web_access_open: bool,
+    /// A bind address the access overlay asked for (`n` → `0.0.0.0`, `l` →
+    /// `127.0.0.1`). The event loop owns the listener, so it performs the
+    /// rebind and tells the overlay how it went.
+    pending_web_rebind: Option<String>,
     /// Set by "Take Input Lock"; the event loop interrupts whichever surface is
     /// mid-burst and takes the input lock for this desktop (D14 as revised).
     ///
@@ -1382,6 +1405,7 @@ impl Ui {
         self.palette.is_some()
             || self.prompt.is_some()
             || self.config.is_some()
+            || self.web_access.is_some()
             || !matches!(self.overlay, UiOverlay::None)
     }
 
@@ -1407,6 +1431,7 @@ impl Ui {
         self.palette = None;
         self.prompt = None;
         self.config = None;
+        self.web_access = None;
     }
 
     /// The overlay to render this frame: a live prompt dialog takes precedence
@@ -2217,6 +2242,10 @@ fn event_loop(
     // started here only when `[web] enabled` opted in — D10 makes auto-start the
     // TUI's decision, which is why `server::start` deliberately ignores the flag.
     let mut web_surface = WebSurface::new(&workspace.active_project().state.config.web);
+    // Q1 addition 2's address picker, behind its trait seam. One value for the
+    // process: enumeration is a syscall, not state, and the overlay re-runs it
+    // every time it opens so a cable plugged in mid-session shows up.
+    let interfaces = crate::web::interfaces::RealInterfaceEnumerator;
     // Test / E2E seam, debug builds only (read once at startup): when
     // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
     // always has *that* bootstrap code live, so the Playwright suite (D15) can
@@ -2229,18 +2258,10 @@ fn event_loop(
         .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
     if workspace.active_project().state.config.web.enabled {
         let config = workspace.active_project().state.config.web.clone();
-        let activity = web_surface.activity_events(env.clock);
-        let initial = build_web_host_state(
-            workspace,
-            &web_surface.streams,
-            activity,
-            web_dialog_view(
-                &ui,
-                &workspace.active_project().name,
-                &workspace.active_project().state,
-            ),
-            now0,
-        );
+        // Deliberately no access overlay here. `[web] enabled` is a user who
+        // asked for the server on every launch, not for a modal on every
+        // launch; `Show Web Access` in the palette is how they reach the code.
+        let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now0);
         match web_surface.start(&config, initial) {
             Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
             Err(e) => ui.message(format!("Web interface did not start: {e}")),
@@ -2645,37 +2666,67 @@ fn event_loop(
         if ui.pending_web_start {
             ui.pending_web_start = false;
             let config = workspace.active_project().state.config.web.clone();
-            let activity = web_surface.activity_events(env.clock);
-            // A dialog can already be open when the server starts (the palette
-            // that ran `Start Web Interface` is gone by now, but a prompt behind
-            // it is not), so the first snapshot carries it rather than lying.
-            let initial = build_web_host_state(
-                workspace,
-                &web_surface.streams,
-                activity,
-                web_dialog_view(
-                    &ui,
-                    &workspace.active_project().name,
-                    &workspace.active_project().state,
-                ),
-                now_ms,
-            );
+            let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now_ms);
             match web_surface.start(&config, initial) {
-                Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
-                Err(e) => ui.message(format!("Web interface did not start: {e}")),
+                // The access overlay carries the bound address *and* D5's
+                // warning in a stronger form than this one line does, so when
+                // it is about to open the line would only be overwritten by it
+                // — and a message the user never sees is worse than no message.
+                Ok((addr, exposure)) => {
+                    if !ui.pending_web_access_open {
+                        ui.message(web_started_message(addr, exposure));
+                    }
+                }
+                Err(e) => {
+                    ui.pending_web_access_open = false;
+                    ui.message(format!("Web interface did not start: {e}"));
+                }
             }
         }
         if ui.pending_web_stop {
             ui.pending_web_stop = false;
             if web_surface.running() {
                 web_surface.stop(crate::web::server::ShutdownNotice::server_stopped());
+                ui.web_access = None;
                 ui.message("Web interface stopped.".to_string());
             }
+        }
+
+        // --- The access overlay (D5, Q1; design 2a). --------------------------
+        //
+        // Everything the overlay cannot do for itself happens here, because
+        // everything it cannot do for itself needs the listener: rebinding
+        // between its two states, and knowing what address was actually bound.
+        // The store handle is republished every tick so the key handler can
+        // mint against exactly the store the server verifies against, and is
+        // withdrawn the moment there is no server — an overlay describing a
+        // binding that no longer exists is the thing this whole surface is
+        // meant to prevent.
+        ui.web_credentials = web_surface
+            .running()
+            .then(|| Arc::clone(&web_surface.credentials));
+        if let Some(bind) = ui.pending_web_rebind.take() {
+            rebind_web_interface(
+                workspace,
+                &mut web_surface,
+                &mut ui,
+                &interfaces,
+                env.clock,
+                now_ms,
+                bind,
+            );
+        }
+        if std::mem::take(&mut ui.pending_web_access_open) {
+            open_web_access_overlay(&mut web_surface, &mut ui, &interfaces);
         }
         #[cfg(debug_assertions)]
         if let Some(digits) = web_test_code.as_deref() {
             web_surface.ensure_test_bootstrap_code(digits);
         }
+        // Rebuilt every tick, which is what makes the countdown move without the
+        // renderer touching a credential — the same contract the phone pairing
+        // overlay has with `remote_pairing_view`.
+        refresh_web_access_overlay(&mut web_surface, &mut ui);
         ui.web_running = web_surface.running();
 
         // --- The input lock (D14 as revised). ---------------------------------
@@ -2973,6 +3024,305 @@ fn terminal_facts(
             ProcessState::Exited(code) => Some(code),
             _ => None,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the desktop access overlay (D5, D10, Q1; design `2a`)
+// ---------------------------------------------------------------------------
+
+/// The host snapshot a freshly started (or freshly rebound) server publishes.
+///
+/// A dialog can already be open when the server starts — the palette that ran
+/// `Start Web Interface` is gone by now, but a prompt behind it is not — so the
+/// first snapshot carries it rather than lying about an empty screen.
+fn web_host_state_now(
+    workspace: &Workspace,
+    web: &mut WebSurface,
+    ui: &Ui,
+    clock: &dyn Clock,
+    now_ms: u64,
+) -> crate::web::server::HostState {
+    let activity = web.activity_events(clock);
+    build_web_host_state(
+        workspace,
+        &web.streams,
+        activity,
+        web_dialog_view(
+            ui,
+            &workspace.active_project().name,
+            &workspace.active_project().state,
+        ),
+        now_ms,
+    )
+}
+
+/// Open the access overlay against the running listener, minting the bootstrap
+/// code that D5 has always called for and nothing ever produced.
+///
+/// The address and exposure come from the **handle**, never from config: a
+/// configured port of `7420` and a bound port of `7420` are usually the same
+/// number and occasionally are not, and an overlay that publishes a URL the
+/// listener is not on is worse than no overlay.
+fn open_web_access_overlay(
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+) {
+    let bound = match web.handle.as_ref() {
+        Some(handle) => (handle.bound_addr(), handle.exposure()),
+        None => {
+            ui.message("The web interface is not running — start it first.");
+            return;
+        }
+    };
+    match web.credentials.lock() {
+        Ok(mut store) => {
+            ui.web_access = Some(crate::web::access::WebAccess::open(
+                &mut store, interfaces, bound.0, bound.1,
+            ));
+        }
+        // A poisoned store means a panic already happened behind the mutex.
+        // Say so instead of drawing an overlay whose code came from nowhere.
+        Err(_) => ui.message("The access code store is unavailable in this session."),
+    }
+}
+
+/// Rebuild the overlay's render-ready view for this frame, or take it down if
+/// the server it describes has gone.
+///
+/// The QR encoder is handed in as a closure so [`crate::web::access`] keeps no
+/// dependency on it — and so this is the one place the phone's `qr_art` and the
+/// browser's QR meet, which is what keeps the two surfaces drawing the same
+/// scannable half-block art at the same sizes.
+fn refresh_web_access_overlay(web: &mut WebSurface, ui: &mut Ui) {
+    if ui.web_access.is_none() {
+        return;
+    }
+    if !web.running() {
+        ui.web_access = None;
+        if matches!(ui.overlay, UiOverlay::WebAccess(_)) {
+            ui.overlay = UiOverlay::None;
+        }
+        return;
+    }
+    let view = match (ui.web_access.as_ref(), web.credentials.lock()) {
+        (Some(access), Ok(store)) => access.view(&store, |payload| {
+            crate::remote::pairing::qr_art(payload).map(|art| (art.rows, art.width))
+        }),
+        (None, _) | (_, Err(_)) => return,
+    };
+    ui.overlay = UiOverlay::WebAccess(view);
+}
+
+/// Move the listener between D5's two bindings while the overlay stays open
+/// (`n` → `0.0.0.0`, `l` → `127.0.0.1`).
+///
+/// This is a stop and a start, because a bound `TcpListener` cannot change its
+/// address. Two consequences are handled rather than hoped away:
+///
+/// * **Every attached browser is disconnected**, so they are told why first
+///   (Q5) instead of seeing the socket vanish.
+/// * **The new bind can fail** — the port can be taken, or the OS can refuse a
+///   routable bind under a sandbox. The previous binding is then restored from
+///   the address the handle actually held, so a failed rebind leaves the user
+///   where they started rather than with no server at all. If even that fails,
+///   the overlay comes down: there is nothing left for it to describe.
+///
+/// The config file is deliberately **not** written. This door is a session
+/// decision the user made in front of the warning; `[web] bind` stays what they
+/// typed, and D5's "explicit opt-in the user types themselves" keeps meaning
+/// what it says.
+fn rebind_web_interface(
+    workspace: &Workspace,
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+    clock: &dyn Clock,
+    now_ms: u64,
+    bind: String,
+) {
+    let (previous_bind, port) = match web.handle.as_ref() {
+        Some(handle) => (
+            handle.bound_addr().ip().to_string(),
+            handle.bound_addr().port(),
+        ),
+        None => return,
+    };
+    web.stop(crate::web::server::ShutdownNotice::server_stopped());
+
+    let mut config = workspace.active_project().state.config.web.clone();
+    config.port = port;
+    config.bind = bind.clone();
+    let initial = web_host_state_now(workspace, web, ui, clock, now_ms);
+    let outcome = match web.start(&config, initial) {
+        Ok(bound) => Ok(bound),
+        Err(first) => {
+            config.bind = previous_bind.clone();
+            let initial = web_host_state_now(workspace, web, ui, clock, now_ms);
+            match web.start(&config, initial) {
+                Ok(bound) => Err((format!("{first}"), Some(bound))),
+                Err(second) => Err((format!("{first}; {second}"), None)),
+            }
+        }
+    };
+
+    match outcome {
+        Ok((addr, exposure)) => {
+            let notice = match exposure {
+                crate::web::server::BindExposure::Loopback => {
+                    "Back to loopback — nothing off this machine can reach it. New code issued."
+                        .to_string()
+                }
+                crate::web::server::BindExposure::Routable => {
+                    "Rebound to this network. New code issued; the previous one no longer works."
+                        .to_string()
+                }
+            };
+            reopen_web_access_overlay(web, ui, interfaces, addr, exposure, Some(notice));
+        }
+        Err((reason, Some((addr, exposure)))) => {
+            let notice = format!("Could not bind {bind} ({reason}) — still on {previous_bind}.");
+            reopen_web_access_overlay(web, ui, interfaces, addr, exposure, Some(notice));
+        }
+        Err((reason, None)) => {
+            ui.web_access = None;
+            ui.message(format!(
+                "Could not bind {bind} and could not return to {previous_bind} ({reason}). \
+                 The web interface is stopped."
+            ));
+        }
+    }
+}
+
+/// Point the open overlay at a newly bound listener, re-enumerating the
+/// interfaces and minting a code for the address it is now publishing.
+fn reopen_web_access_overlay(
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+    addr: std::net::SocketAddr,
+    exposure: crate::web::server::BindExposure,
+    notice: Option<String>,
+) {
+    match (ui.web_access.as_mut(), web.credentials.lock()) {
+        (Some(access), Ok(mut store)) => {
+            access.rebind(&mut store, interfaces, addr, exposure, notice)
+        }
+        (None, _) | (_, Err(_)) => {}
+    }
+}
+
+/// Lift a key press into the small alphabet the access overlay understands, or
+/// `None` for anything it does not bind.
+///
+/// A modified key is never one of the overlay's: `Ctrl-q` and friends belong to
+/// the app, and swallowing them because a modal happens to be up would make the
+/// overlay a trap.
+fn map_web_access_key(key: KeyEvent) -> Option<crate::web::access::AccessKey> {
+    use crate::web::access::AccessKey;
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Enter => Some(AccessKey::Enter),
+        KeyCode::Esc => Some(AccessKey::Esc),
+        KeyCode::Char(' ') => Some(AccessKey::Space),
+        KeyCode::Up => Some(AccessKey::Up),
+        KeyCode::Down => Some(AccessKey::Down),
+        KeyCode::Char(c) => Some(AccessKey::Char(c.to_ascii_lowercase())),
+        _ => None,
+    }
+}
+
+/// Drive the access overlay from one key press, performing the side effects it
+/// asks for.
+///
+/// The two it performs here — launching a browser and writing the clipboard —
+/// are done in the key handler rather than deferred to the event loop on
+/// purpose: both spend a bootstrap code, and a code that waits a tick can be a
+/// code that expired. The two it cannot perform (rebinding, stopping) are left
+/// as flags, because the listener is not this function's to touch.
+fn handle_web_access_key(key: KeyEvent, ui: &mut Ui) {
+    use crate::web::access::AccessOutcome;
+
+    let Some(access_key) = map_web_access_key(key) else {
+        return;
+    };
+    let Some(credentials) = ui.web_credentials.clone() else {
+        // The server went away underneath the overlay; there is nothing left to
+        // describe, so it goes with it rather than answering keys about a
+        // binding that no longer exists.
+        ui.web_access = None;
+        ui.overlay = UiOverlay::None;
+        return;
+    };
+
+    let outcome = match (ui.web_access.as_mut(), credentials.lock()) {
+        (Some(access), Ok(mut store)) => access.handle_key(access_key, &mut store),
+        (None, _) | (_, Err(_)) => return,
+    };
+
+    match outcome {
+        AccessOutcome::Ignored | AccessOutcome::Handled => {}
+        AccessOutcome::Close => {
+            if let (Some(access), Ok(mut store)) = (ui.web_access.as_ref(), credentials.lock()) {
+                access.on_close(&mut store);
+            }
+            ui.web_access = None;
+            ui.overlay = UiOverlay::None;
+        }
+        AccessOutcome::OpenBrowser(url) => {
+            let notice = launch_access_url(&url);
+            if let Some(access) = ui.web_access.as_mut() {
+                access.set_notice(Some(notice));
+            }
+        }
+        AccessOutcome::CopyUrl(url) => {
+            crate::tui::clipboard::copy(&url);
+            if let Some(access) = ui.web_access.as_mut() {
+                // `clipboard::copy` is best effort and reports nothing, so this
+                // says what was attempted, not that it landed.
+                access.set_notice(Some(
+                    "Sent to the clipboard: a URL carrying a one-time code, good for 120s."
+                        .to_string(),
+                ));
+            }
+        }
+        AccessOutcome::EnableNetwork => ui.pending_web_rebind = Some("0.0.0.0".to_string()),
+        AccessOutcome::BackToLocalOnly => ui.pending_web_rebind = Some("127.0.0.1".to_string()),
+        AccessOutcome::StopServer => {
+            ui.pending_web_stop = true;
+            ui.web_access = None;
+            ui.overlay = UiOverlay::None;
+        }
+    }
+}
+
+/// Hand the code-bearing URL to the platform's default browser, and report what
+/// happened in the overlay's own words.
+///
+/// One cross-platform seam does this on all three OSes
+/// ([`crate::tui::opener::open_url`]): `open` on macOS, `xdg-open` on Linux,
+/// `cmd /c start ""` on Windows. That last one re-parses its argument through
+/// cmd.exe, which is why the URL is checked against
+/// [`crate::tui::opener::url_is_cmd_safe`] first. The check should never fail —
+/// the URL is `http://<ip>:<port>/#<four digits>` and every part of it is
+/// generated — but a construction bug that put a `%` or an `&` in front of
+/// cmd.exe should refuse to launch, not launch something else.
+fn launch_access_url(url: &str) -> String {
+    if !crate::tui::opener::url_is_cmd_safe(url) {
+        return "Refusing to launch: the access URL contains characters a Windows shell \
+                would reinterpret."
+            .to_string();
+    }
+    match crate::tui::opener::open_url(url) {
+        Ok(()) => "Opening your default browser — it authenticates itself and the code is spent."
+            .to_string(),
+        Err(e) => e,
     }
 }
 
@@ -4545,6 +4895,142 @@ fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+mod web_access_key_tests {
+    use super::*;
+    use crate::web::access::AccessKey;
+
+    fn bare(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn the_overlays_own_keys_are_lifted_out_of_crossterm() {
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Enter)),
+            Some(AccessKey::Enter)
+        );
+        assert_eq!(map_web_access_key(bare(KeyCode::Esc)), Some(AccessKey::Esc));
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Char(' '))),
+            Some(AccessKey::Space)
+        );
+        assert_eq!(map_web_access_key(bare(KeyCode::Up)), Some(AccessKey::Up));
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Down)),
+            Some(AccessKey::Down)
+        );
+        for c in ['r', 'x', 'l', 'n', 'c', 's'] {
+            assert_eq!(
+                map_web_access_key(bare(KeyCode::Char(c))),
+                Some(AccessKey::Char(c)),
+                "{c} is one of the two footers' keys"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shifted_letter_still_reaches_the_binding_it_names() {
+        // The footers write `r`, `x`, `l`; caps lock must not make them inert.
+        assert_eq!(
+            map_web_access_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some(AccessKey::Char('r'))
+        );
+    }
+
+    #[test]
+    fn a_modified_key_is_never_the_overlays() {
+        // `Ctrl-q` belongs to the app. An overlay that swallowed it because it
+        // happened to be open would be a trap, not a modal.
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                map_web_access_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+                None,
+                "{modifiers:?} belongs to the app"
+            );
+            assert_eq!(
+                map_web_access_key(KeyEvent::new(KeyCode::Char('r'), modifiers)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_open_overlay_captures_input_instead_of_being_dismissed_by_it() {
+        // The bug this branch exists to prevent: falling through to the
+        // "any key dismisses" branch would make `r` close the overlay rather
+        // than hide the code, and `Space` close it rather than mint.
+        let mut ui = Ui::default();
+        assert!(!ui.modal_active());
+        ui.web_access = Some(access_for_test());
+        assert!(
+            ui.modal_active(),
+            "an open access overlay captures input like the config manager does"
+        );
+
+        // With no credential store published (the server stopped underneath it)
+        // the overlay takes itself down rather than answering keys about a
+        // binding that no longer exists.
+        handle_web_access_key(bare(KeyCode::Char('r')), &mut ui);
+        assert!(ui.web_access.is_none());
+        assert!(matches!(ui.overlay, UiOverlay::None));
+    }
+
+    /// An overlay over an in-memory store, on a loopback binding.
+    fn access_for_test() -> crate::web::access::WebAccess {
+        use crate::testing::{FakeClock, FakeFs};
+        let mut store = crate::web::credentials::CredentialStore::open(
+            Arc::new(FakeFs::new()),
+            Arc::new(FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        );
+        crate::web::access::WebAccess::open(
+            &mut store,
+            &crate::web::interfaces::FakeInterfaceEnumerator::new(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 7420)),
+            crate::web::server::BindExposure::Loopback,
+        )
+    }
+
+    #[test]
+    fn stopping_from_the_overlay_defers_to_the_event_loop_and_closes() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some(access_for_test());
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        handle_web_access_key(bare(KeyCode::Char('s')), &mut ui);
+        assert!(
+            ui.pending_web_stop,
+            "the listener is the event loop's to close"
+        );
+        assert!(ui.web_access.is_none());
+    }
+
+    #[test]
+    fn the_network_door_asks_the_event_loop_for_the_wildcard_bind() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some(access_for_test());
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        handle_web_access_key(bare(KeyCode::Char('n')), &mut ui);
+        assert_eq!(ui.pending_web_rebind.as_deref(), Some("0.0.0.0"));
+        assert!(
+            ui.web_access.is_some(),
+            "the overlay stays open across the rebind it asked for"
+        );
+    }
+}
+
+#[cfg(test)]
 mod help_repo_gesture_tests {
     use super::*;
 
@@ -4632,6 +5118,16 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return handle_config_key(key, workspace, env, ui).map(|_| false);
     }
 
+    // 2b. The access overlay, if open, captures input (D5, Q1; design `2a`).
+    //     Interactive like the configuration manager, and for the same reason:
+    //     its keys mint, reveal, rebind and revoke. It must not fall through to
+    //     the "any key dismisses" branch below, which would make `r` close the
+    //     overlay instead of hiding the code.
+    if ui.web_access.is_some() {
+        handle_web_access_key(key, ui);
+        return Ok(false);
+    }
+
     // 3. The command palette, if open, captures input next (SPECS §22).
     if ui.palette.is_some() {
         return handle_palette_key(key, workspace, env, ui).map(|_| false);
@@ -4652,7 +5148,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return Ok(false);
     }
 
-    // 4. No modal is capturing input (the three checks above are exhaustive):
+    // 4. No modal is capturing input (the four checks above are exhaustive):
     //    route through the mode-aware key map (SPECS §23).
     if ui.modal_active() {
         return Ok(false);
@@ -6603,10 +7099,21 @@ fn run_palette_action(
         // action cannot bind a socket from here.
         PaletteAction::StartWebInterface => {
             ui.pending_web_start = true;
+            // D10: "showing the QR overlay on start — mirroring the existing
+            // Pair Phone flow". Starting a server nobody can authenticate
+            // against is the bug this pairing of flags exists to prevent.
+            ui.pending_web_access_open = true;
             return Ok(());
         }
         PaletteAction::StopWebInterface => {
             ui.pending_web_stop = true;
+            return Ok(());
+        }
+        // Deferred for the same reason: the overlay describes the address the
+        // listener actually bound, and only the event loop holds the handle
+        // that knows it.
+        PaletteAction::ShowWebAccess => {
+            ui.pending_web_access_open = true;
             return Ok(());
         }
         // D14 as revised: the desktop's half of the one explicit override in
@@ -6675,6 +7182,7 @@ fn run_palette_action(
         | PaletteAction::UnpairPhone
         | PaletteAction::StartWebInterface
         | PaletteAction::StopWebInterface
+        | PaletteAction::ShowWebAccess
         | PaletteAction::TakeInputLock => Ok(()),
     }
 }

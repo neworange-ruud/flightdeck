@@ -2129,6 +2129,9 @@ pub mod command {
     pub const START_WEB_INTERFACE: &str = "start_web_interface";
     /// Stop the embedded web interface (Q5).
     pub const STOP_WEB_INTERFACE: &str = "stop_web_interface";
+    /// Show the desktop access overlay for a web interface that is already
+    /// running (D5, Q1; design `2a`).
+    pub const SHOW_WEB_ACCESS: &str = "show_web_access";
     /// Lay the selected session's terminals out side by side.
     pub const TOGGLE_SPLIT_VIEW: &str = "toggle_split_view";
     /// Show help / keybindings (SPECS §23).

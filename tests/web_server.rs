@@ -30,8 +30,10 @@ use flightdeck::contracts::real::{RealClock, RealFs};
 use flightdeck::contracts::traits::Clock;
 use flightdeck::contracts::{InterpretedStatus, ProcessState, TabId};
 use flightdeck::remote::runtime;
+use flightdeck::web::access::{AccessKey, AccessOutcome, WebAccess};
 use flightdeck::web::activity::{apply_mark_read, ActivityStore, Transition};
 use flightdeck::web::credentials::CredentialStore;
+use flightdeck::web::interfaces::FakeInterfaceEnumerator;
 use flightdeck::web::protocol::{
     AckOutcome, ActivityTier, Attach, ClientMsg, Command as WireCommand, Delta, ErrorCode, Input,
     ProjectId, Seat, SeatRequest, ServerMsg, ShutdownReason, PROTOCOL_VERSION,
@@ -3916,4 +3918,197 @@ fn app_state() -> AppState {
         std::path::Path::new("."),
         std::path::Path::new("state.json"),
     )
+}
+
+// ===========================================================================
+// The production path (§6.5 R18)
+// ===========================================================================
+//
+// Every other credential test in this file mints by calling
+// `mint_bootstrap_code` itself, and the Playwright suite authenticates through
+// `FLIGHTDECK_WEB_TEST_CODE` — a `#[cfg(debug_assertions)]` seam. Both are
+// legitimate, and between them they left the one thing nobody was testing: that
+// something in a *shipped* binary ever mints a code and shows it. For months
+// nothing did, and the whole suite stayed green while the web interface could
+// not be authenticated at all.
+//
+// These two tests close that. They drive `web::access::WebAccess` — the type
+// the TUI's event loop drives, the only production caller of
+// `mint_bootstrap_code` — and exchange what it produces over the real HTTP
+// endpoint. Nothing debug-only is compiled into the path they take, and the
+// first thing each asserts is that the debug seam's environment variable is not
+// set, so a developer running the suite with it exported cannot make them pass
+// for the wrong reason.
+
+/// The debug seam must be nowhere near these two tests. Asserted rather than
+/// assumed: `FLIGHTDECK_WEB_TEST_CODE` is exported in some local Playwright
+/// workflows, and a test that silently benefits from it would be back to
+/// proving nothing.
+fn assert_no_debug_seam() {
+    assert!(
+        std::env::var_os("FLIGHTDECK_WEB_TEST_CODE").is_none(),
+        "these tests prove the production mint path; unset FLIGHTDECK_WEB_TEST_CODE to run them"
+    );
+}
+
+/// The loopback default (D5, artboard 2a State A): `Enter` on the access
+/// overlay produces a URL, and the code in its fragment authenticates a real
+/// browser through the real endpoint.
+///
+/// This is the acceptance criterion of the bug, end to end and in one test: a
+/// release-shaped run mints a code, builds the URL it hands the browser, and
+/// that URL gets in.
+#[test]
+fn the_access_overlay_mints_a_code_a_browser_can_exchange() {
+    assert_no_debug_seam();
+    let harness = Harness::start();
+    let addr = harness.addr();
+
+    // Exactly what `open_web_access_overlay` does in the event loop: build the
+    // overlay against the running listener's own address, which mints.
+    let mut access = {
+        let mut store = harness.credentials.lock().expect("lock");
+        WebAccess::open(
+            &mut store,
+            &FakeInterfaceEnumerator::new(),
+            harness.handle.bound_addr(),
+            harness.handle.exposure(),
+        )
+    };
+
+    // And exactly what pressing `Enter` does.
+    let outcome = {
+        let mut store = harness.credentials.lock().expect("lock");
+        access.handle_key(AccessKey::Enter, &mut store)
+    };
+    let AccessOutcome::OpenBrowser(url) = outcome else {
+        panic!("Enter on the loopback state must hand a URL to the browser, got {outcome:?}");
+    };
+
+    // The credential is in the fragment and nowhere else (Q4): everything the
+    // server will ever see of this URL is the part before the `#`.
+    let (visible, code) = url.split_once('#').expect("the URL carries a fragment");
+    assert_eq!(
+        visible,
+        format!("http://{}/", harness.handle.bound_addr()),
+        "the request line the server sees carries no credential"
+    );
+    assert_eq!(code.len(), 4);
+    assert!(code.bytes().all(|b| b.is_ascii_digit()));
+
+    on_runtime(async {
+        // What the SPA does with `location.hash`: POST it in a body.
+        let response = post_json(
+            &addr,
+            "/auth/exchange",
+            &[],
+            &serde_json::json!({ "code": code, "label": "Firefox on Linux" }).to_string(),
+        )
+        .await;
+        assert_eq!(
+            response.status, 200,
+            "the overlay's own code must be exchangeable: {}",
+            response.body
+        );
+        let cookie = response
+            .cookie(COOKIE_NAME)
+            .expect("the exchange sets the access cookie");
+
+        // And the cookie actually works, so "authenticated" is not just a 200.
+        let probe = get(&addr, "/auth/session", &[("Cookie", cookie.as_str())]).await;
+        assert_eq!(probe.status, 200, "{}", probe.body);
+        assert_eq!(probe.json()["authenticated"], serde_json::json!(true));
+    });
+
+    assert_eq!(
+        harness
+            .credentials
+            .lock()
+            .expect("lock")
+            .active_tokens()
+            .count(),
+        1,
+        "one browser now holds access, minted by the production path"
+    );
+}
+
+/// The network state (artboard 2a State B, Q1 addition 1): the string the QR
+/// encodes is a URL whose fragment is the same live code, so a phone that scans
+/// it lands authenticated rather than on a code prompt.
+#[test]
+fn the_qr_payload_carries_a_code_the_server_accepts() {
+    assert_no_debug_seam();
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let port = harness.handle.bound_addr().port();
+
+    // A routable binding, so the overlay opens in its network state and the
+    // picker has an address to publish. The interface enumerator is faked (a CI
+    // box's real NICs are nobody's business), but everything downstream of it —
+    // the URL, the code, the exchange — is the shipped path.
+    let mut access = {
+        let mut store = harness.credentials.lock().expect("lock");
+        WebAccess::open(
+            &mut store,
+            &FakeInterfaceEnumerator::new()
+                .with_interface("en0", std::net::Ipv4Addr::new(192, 168, 2, 14)),
+            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+            BindExposure::Routable,
+        )
+    };
+
+    // The payload the QR is built from, read out of the view the renderer gets
+    // — so this is the string a phone camera would actually decode.
+    let payload = {
+        let store = harness.credentials.lock().expect("lock");
+        let view = access.view(&store, |payload| Some((vec![payload.to_string()], 0)));
+        assert!(view.code.is_some(), "State B shows the code beside the QR");
+        view.qr_rows.first().cloned().expect("a QR payload")
+    };
+    assert!(
+        payload.starts_with(&format!("http://192.168.2.14:{port}/#")),
+        "the QR encodes the published address and the code: {payload}"
+    );
+    let code = payload.rsplit('#').next().expect("a fragment").to_string();
+
+    on_runtime(async {
+        let response = post_json(
+            &addr,
+            "/auth/exchange",
+            &[],
+            &serde_json::json!({ "code": code, "label": "Safari/iOS" }).to_string(),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+    });
+
+    // D5's "rotates on one command", over the wire this time: `x` revokes the
+    // browser that just got in and issues a code the previous one is not.
+    let spent = code.clone();
+    {
+        let mut store = harness.credentials.lock().expect("lock");
+        assert_eq!(
+            access.handle_key(AccessKey::Char('x'), &mut store),
+            AccessOutcome::Handled
+        );
+        assert_eq!(
+            store.active_tokens().count(),
+            0,
+            "rotate revoked the browser"
+        );
+    }
+    on_runtime(async {
+        let response = post_json(
+            &addr,
+            "/auth/exchange",
+            &[],
+            &serde_json::json!({ "code": spent }).to_string(),
+        )
+        .await;
+        assert_ne!(
+            response.status, 200,
+            "the rotated-away code must not still work: {}",
+            response.body
+        );
+    });
 }

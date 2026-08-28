@@ -29,6 +29,21 @@
  *    real endpoint, still expires, is still single use, is still rate limited,
  *    and the method does not exist in a release build.
  *
+ *    **What it does not prove, and what does.** A real user's code is minted by
+ *    the desktop access overlay and read off a TUI overlay painted on a PTY —
+ *    neither random digits nor a PTY is something Playwright can read, which is
+ *    why this seam exists and why it should stay. But for a long time it was
+ *    also the *only* thing exercising a mint-and-exchange, and the production
+ *    path it stands in for did not exist at all: the suite was green while the
+ *    web interface could not be authenticated in a release build (see
+ *    `specs/WEB_INTERFACE.md` §6.5 R18). That gap is now covered where it can be
+ *    covered honestly — in Rust, by
+ *    `tests/web_server.rs::the_access_overlay_mints_a_code_a_browser_can_exchange`
+ *    and `::the_qr_payload_carries_a_code_the_server_accepts`, which drive
+ *    `web::access::WebAccess` (the overlay's own state machine, the only
+ *    production caller of `mint_bootstrap_code`) and exchange what it produces
+ *    over the real endpoint with the seam's variable asserted unset.
+ *
  * Unix only, for the same reason `tests/remote_e2e.rs` is: the launcher needs a
  * PTY and the GitHub Windows runners have neither that nor bash.
  */
