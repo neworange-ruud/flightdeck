@@ -382,10 +382,11 @@ export function createApp(options: AppOptions): App {
    *
    * Keys have no position. Their target is wherever focus happens to be, which
    * is not this component's business, so the keyboard belongs to the document.
-   * `Ctrl-g` alone uses capture because xterm consumes terminal keys before a
-   * bubbling document listener can see them. The chord FlightDeck claims must
-   * be handled on the way down, before xterm can turn it into a BEL byte for the
-   * hosted agent; every other app key keeps the normal bubbling order.
+   * `Ctrl-g` alone uses capture on the frame because xterm consumes terminal
+   * keys before a bubbling document listener can see them. The chord FlightDeck
+   * claims must be handled on the way down, before xterm can turn it into a BEL
+   * byte for the hosted agent. The document listener remains the fallback when
+   * focus is on `body`, outside the frame's event path.
    * The **pointer** handler below stays on the frame, because a click does have
    * a position and its target is a real element inside it.
    *
@@ -395,13 +396,17 @@ export function createApp(options: AppOptions): App {
    * without this each one's listener would outlive its DOM and keep reducing
    * into a store nobody is reading.
    */
-  document.addEventListener("keydown", handleCommandPaletteShortcut, true);
+  frame.addEventListener("keydown", handleCommandPaletteShortcut, true);
 
   document.addEventListener("keydown", (event: KeyboardEvent) => {
     if (!frame.isConnected) {
       return;
     }
     const state = store.getState();
+
+    if (handleCommandPaletteShortcut(event)) {
+      return;
+    }
 
     /**
      * The overlays claim the keyboard before the main screen does, in the order
@@ -604,9 +609,9 @@ export function createApp(options: AppOptions): App {
     }
   });
 
-  function handleCommandPaletteShortcut(event: KeyboardEvent): void {
+  function handleCommandPaletteShortcut(event: KeyboardEvent): boolean {
     if (!frame.isConnected || !isCommandPaletteShortcut(event)) {
-      return;
+      return false;
     }
     event.preventDefault();
     event.stopPropagation();
@@ -621,6 +626,7 @@ export function createApp(options: AppOptions): App {
         type: state.palette === null ? "palette/open" : "palette/close",
       });
     }
+    return true;
   }
 
   /**

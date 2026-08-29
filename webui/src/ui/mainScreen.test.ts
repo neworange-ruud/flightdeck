@@ -490,7 +490,7 @@ describe("the keyboard and pointer positions (§5)", () => {
     expect(h.app.store.getState().palette).not.toBeNull();
 
     h.app.store.dispatch({ type: "mode/set", mode: "app" });
-    terminalInput.dispatchEvent(
+    document.body.dispatchEvent(
       new KeyboardEvent("keydown", {
         key: "g",
         code: "KeyG",
@@ -499,6 +499,8 @@ describe("the keyboard and pointer positions (§5)", () => {
         cancelable: true,
       }),
     );
+    /** The App-mode press targeted body, so the terminal still saw only the
+     * first press — and frame capture kept even that one away from it. */
     expect(terminalHandler).not.toHaveBeenCalled();
     expect(h.app.store.getState().palette).toBeNull();
   });
