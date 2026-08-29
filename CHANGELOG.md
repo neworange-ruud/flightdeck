@@ -176,6 +176,42 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Revoking a browser's access now actually disconnects it.** Pressing revoke
+  withdrew the credential but never told the browser holding it, so an unwanted
+  browser kept full control of every terminal until it happened to reconnect —
+  while the desktop reported the eviction as done. Revoking now closes those
+  sessions immediately, and the browser says it lost access instead of silently
+  going stale. The access panel also lists each browser that holds access, with
+  its address, what it is, and how long it has been connected, so you can revoke
+  one rather than all of them.
+
+- **FlightDeck Web now tells you when output was lost.** Reconnecting to a
+  session that produced more than the host kept, the browser silently showed a
+  terminal with a hole in it. It now says so, shows the replay arriving with real
+  progress, and reports how stale the picture is and the round-trip time to the
+  host — three things the interface was built to display and never did.
+
+- **The browser's Configuration panel showed made-up values.** It rendered a
+  built-in list of settings with invented per-layer origins and names that did
+  not match FlightDeck's real ones, and saving silently did nothing. It now shows
+  your actual configuration, and edits are applied by the same code the desktop
+  uses.
+
+- **`ui.agent_tab_position = "right"` now moves the sidebar.** The setting has
+  always validated and appeared in the configuration manager, and never did
+  anything on either surface.
+
+- **Every iPhone was labelled "Safari on macOS"** in the viewer list and the
+  access panel, because iOS browsers describe themselves as "like Mac OS X".
+
+- **Smaller browser fixes:** the git bar no longer prints "↑0 ↓0" for a branch
+  with no upstream while the sidebar beside it correctly says there is none; the
+  New Agent form's "run from base" button no longer reads "off" while the form
+  shows it on; a destructive confirmation no longer offers two Cancel buttons;
+  arrow keys now move between sessions and split panes as the status bar has
+  always claimed; and the split view no longer insists it has three terminals
+  regardless of how many it has.
+
 - **FlightDeck Web could not be opened at all.** Starting the web interface
   printed a URL and stopped there: no access code was ever created, and nothing
   on the desktop showed one, so there was no way to get a browser in. Starting it
