@@ -1,7 +1,7 @@
 import { consumeBootstrapCode, windowUrlBar } from "./access/bootstrap";
 import { checkSession, exchangeCode } from "./access/client";
 import type { AccessResult } from "./access/client";
-import { SAVE_CONFIG_COMMAND } from "./state/config";
+import { OPEN_CONFIGURATION_COMMAND } from "./state/config";
 import {
   cancelArgs,
   confirmArgs,
@@ -143,18 +143,21 @@ const app = createApp({
     });
   },
   /**
-   * 1f, `remote-control-ll5.6`. `SAVE_CONFIG_COMMAND` is a placeholder —
-   * the web protocol has no `save_config` command yet (see `state/config.ts`'s
-   * module doc and the ll5.6 task report for the shape `remote-control-ll5.1`
-   * needs to add). Sending it today gets whatever the host does with an
-   * unrecognised command name, and `command/result` renders exactly that —
-   * never a fabricated success.
+   * 1f, `remote-control-ll5.6` / `remote-control-1p22`. `s` sends the staged
+   * edits as the `args` of an `open_configuration` frame — the same name the
+   * palette row sends, because the answer to a save *is* the manager: the host
+   * applies the edits, writes the two files and replies with the re-resolved
+   * layering, which `socket.ts` turns into `config/received` (§6.5 R22).
+   *
+   * Same seam as `onRunCommand`: the transport mints the seq, and
+   * `command/result` reports whatever really came back — never a fabricated
+   * success.
    */
   onSaveConfig: (request) => {
     if (session === null) {
       return;
     }
-    const seq = session.sendCommand(SAVE_CONFIG_COMMAND, request);
+    const seq = session.sendCommand(OPEN_CONFIGURATION_COMMAND, request);
     app.store.dispatch({ type: "config/dispatched", seq });
   },
   /**

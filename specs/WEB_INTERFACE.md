@@ -1656,6 +1656,12 @@ facts**.
   `OPEN_CONFIGURATION_REFUSAL`, now a named constant so the three read as one
   rule). The row is still the host's, so a host that stops offering the name
   stops offering the panel.
+  *(The `open_configuration` clause is superseded by R22: 1f's rows are a read
+  of two files on the host's disk, so the browser does **not** already have the
+  facts, the row dispatches like `show_git_status`, and
+  `OPEN_CONFIGURATION_REFUSAL` is gone. The line this bullet draws is unchanged
+  and is what decides it — help and About are still intercepted, for the reason
+  stated here.)*
 * **`show_git_status` dispatches.** SPECS §21 wants the upstream's *name*, the
   worktree path and §14's compare URL; none is on the snapshot, and the compare
   URL needs a `git remote` lookup nobody would want on the status poll. So the
@@ -1784,8 +1790,8 @@ overrule any of them.
    Clicking outside closes it, which is the pointer half of `Esc` and matches
    1a's advertised `click outside release keys` gesture.
 5. **One overlay at a time, structurally.** `AppState.readOnly` is a union
-   holding one panel, and opening one closes the palette — the handoff
-   `config/open` already makes informally, made a property of the type.
+   holding one panel, and opening one closes the palette — the handoff the
+   configuration manager already makes informally, made a property of the type.
 6. **Help is 900×620 (1d's size); About and git status are 760 wide and
    content-height.** The artboards give no size for a short panel, and 1d's box
    around twelve lines would be mostly empty.
@@ -2632,8 +2638,8 @@ comment. Neither of the two precedents applies: this is not
 understand, and it is not even `Delta::Seats::you_were_preempted`'s additive
 optional field — no field appeared.
 
-**What covers it.** `webui/src/wire/wiredScreen.test.ts`, eleven cases, all
-through the front door: a byte cursor is established by a real `term_bytes`
+**What covers it.** `webui/src/wire/wiredScreen.test.ts`, eleven cases at the
+time of writing, all through the front door: a byte cursor is established by a real `term_bytes`
 frame, the socket is closed, the retry loop opens the next one, and the second
 snapshot is what produces the catching-up state — asserted in the store *and* on
 `.fd-pane[data-tone]`, `.fd-statusbar` and `progress.fd-replay`. A chunked
@@ -2645,6 +2651,334 @@ that promises a replay and never sends it. Staleness is asserted as a climbing
 counter across a ticked clock with a fixed wall-clock beside it, and latency is
 asserted at attach, re-measured on a command ack, and absent — a bare
 `● connected` — until a round trip has actually been timed.
+
+---
+
+### R22 — the configuration manager was furniture, and the layering is the host's
+
+`remote-control-1p22`, found by the post-P0 audit. Artboard 1f drew a full
+configuration manager — three origin tags, a scope switch, "Unsaved changes" —
+over a `CONFIG_FIELDS` constant in `webui/src/state/config.ts` whose per-layer
+values were **invented**. A user opening it saw a picture of nobody's machine.
+Three separate things were wrong, and the third is the one that makes it the
+same class as the access-overlay P0:
+
+| What 1f showed | What was behind it |
+| --- | --- |
+| `[x] Notify when finished · (set here)` | `layers: { default: false, global: true, project: true }`, a fixture chosen to reproduce the tag |
+| the keys those rows write | `notifications.on_finished` and `updates.check_for_updates` — the host's are `notifications.on_finish` and `update.check` |
+| `s save` | `SAVE_CONFIG_COMMAND = "save_config"`, a name the host has never had, so every save was refused as unknown |
+| `Space toggle / edit` in the footer | bound to nothing — and the *browser's* footer omitted the line, so the artboard and the app were wrong in opposite directions |
+
+**The rule this violated is R7's, stated for the third time.** The host is the
+only thing that knows what it implements; R7 put the command inventory on the
+wire for it, R16 put help and About there, and the configuration manager is the
+same question with a harder answer, because a config file is not static.
+
+#### 1. Where the config rides: a per-viewer reply, not the snapshot and not a delta
+
+The two candidates both fail, and for reasons worth writing down.
+
+*Not the snapshot.* `Snapshot::help` rides there because it is **static for the
+life of the build** — there is no change for a `Delta` to describe. Config is
+the opposite: it changes when either surface saves, and it is read from two
+files on disk, so putting it on the snapshot would mean parsing
+`~/.flightdeck/config.toml` and `<repo>/.flightdeck/config.toml` on every attach
+*and* on every coalesced `request_snapshot` — which R5 sends several times a
+minute. That is R16's own objection to putting §14's compare URL on the status
+poll, one file lower down.
+
+*Not a delta either.* A `Delta` says what changed, and the host does not watch
+these files. Somebody can edit `config.toml` in `$EDITOR` — the `e` the manager
+itself offers — and nothing would emit anything. A browser holding a
+delta-fed cache would be showing a file that had changed underneath it, with no
+frame able to say so. **A read taken at the moment the panel opens is the only
+honest picture**, and it is the picture the desktop's own manager takes: the TUI
+builds a `ConfigManager` when you open it and throws it away when you close it.
+
+So `ServerMsg::Configuration`, per-viewer, exactly as `ServerMsg::GitStatus` is
+and for R16's reason: one reader opened the manager, so one reader is answered.
+Broadcasting it would put a configuration panel on four screens for a question
+none of them posed.
+
+**`open_configuration` therefore dispatches**, and `OPEN_CONFIGURATION_REFUSAL`
+is gone. That refusal read *"the configuration manager is a browser surface of
+its own; opening the desktop's overlay from here would put a modal on a screen
+this browser cannot see."* Both clauses are still true, and neither was ever the
+question. R16 already stated the line that decides it — *"whether the browser
+already has the facts"* — and the browser does not have these. What makes
+forwarding safe is that the host **routes by origin**, the same fork
+`Effect::GitStatus` takes: the desktop's `Open Configuration` still opens
+`Ui::config`, and a browser's run builds the manager, reads it out and leaves
+the desktop alone. `HELP_REFUSAL`'s doc comment now carries the contrast, so the
+next reader does not conclude that "the panel is the browser's" settles
+anything.
+
+**Both scopes ride in one frame.** 1f's `Tab` switches between Global and
+Project and the tag column is the whole point of the screen, so the host
+resolves the layering twice over the same two tables and sends both lists.
+Switching scope costs no round trip and the two halves cannot disagree about
+what is on disk.
+
+The frame carries **no `saved_status`**, deliberately. The host's own word for a
+save (`ConfigManager::status`, `"Saved."`) rides on the `Ack` for the same
+`seq`, which is where every outcome this panel reports already comes from —
+carrying it twice would be two fields able to disagree about one event.
+
+#### 2. How an edit travels: a field-addressed change list, on the row's own frame
+
+R7's answer was *"the row's route carries the very `PaletteAction` the desktop's
+palette hands to `run_palette_action`"*. R8's was *"synthesise the keypress the
+desktop's own handler already handles"*. **Neither transfers**, and the reason
+is the same in both cases: they work because there is one shared thing on the
+host to drive. R8's dialog is app state open on both surfaces, so a synthetic
+`Enter` lands in the prompt the desktop is already showing. There is no shared
+configuration manager — the browser's panel is its own, and opening a desktop
+overlay to drive keys into it is precisely the modal-on-an-unreadable-screen the
+old refusal forbade.
+
+So an edit names **the scope, the field's TOML key, and either the value to set
+or nothing (a clear)**, and the host applies it through the desktop's own
+mutators:
+
+```
+open_configuration { changes: [ { scope, key, value? } ] }
+   → build_config_manager()          the one builder `Open Configuration` uses
+   → set_scope / select_key
+   → set_selected(value) | clear_selected()
+   → write_config_manager()          the same outputs() the desktop's `s` writes
+   → reload_all_projects_config()    SPECS §8's "reloads every open project"
+   → ServerMsg::Configuration        the re-resolved layering
+```
+
+Four properties make that as tight as R7's forwarding rule:
+
+1. **One field list, one layer walk.** `build_config_manager` is factored out of
+   `open_config_manager`, so the browser and the desktop get the same
+   `CuratedField` table read from the same two files. `web.port` and
+   `web.replay_bytes` stay out of the browser for free — the exclusion is the
+   host's (`src/tui/config_manager.rs:485-494`, and it is *correct*: this
+   manager's text fields commit a TOML string, which would corrupt a `u16`).
+2. **One write path.** `toggle_selected` now computes its next value and hands
+   it to `set_selected`, which is the same function a browser's change goes
+   through. There is no second `set_value` call site.
+3. **A value a field does not admit never reaches the file.** `set_selected`
+   checks the value against the field's own kind and options and refuses in the
+   model's words (`` `Mode border` is one of: off, dim, normal, bright. ``), and
+   the write happens only after *every* change has landed in the model — so a
+   browser built against a different FlightDeck cannot half-save a config file
+   the desktop then fails to load. A key this build does not have is refused by
+   name, the same posture R7 gives an unknown command.
+4. **The route reads `args`, and that is not a hole in R7's rule.** R7's
+   "a forwarding row ignores the frame's `args` entirely" is a property of
+   `Route::Palette`, where the args would otherwise carry a command's *identity*
+   and its `confirm` flags. `Route::Config` sits beside `Route::Selection` and
+   `Route::Dialog`, the two routes that have always read args, and what its args
+   can name is bounded by the same table that draws the panel: one of the host's
+   curated fields, in one of two files, set to one of the values that field
+   admits.
+
+**Staging is local, and it is honest.** `Space`/`c` do not travel; `s` sends the
+whole set, exactly as the desktop's keys write into an in-memory table until
+`s`. Two facts on every row are what let the browser show a staged result
+without walking a layer: a staged *set* reads `(set here)` because putting a
+value in a scope is what "set here" means, and a staged *clear* reads the row's
+own `inherited` / `inherited_origin` — **the host's** answer to what `c` leaves
+behind, computed by `ConfigManager::inherited_rows`, which is one more `rows()`
+call over a probe copy with the curated keys removed. No second resolution
+order exists to disagree with `effective()`.
+
+#### 3. The gate: the seat, and nothing more
+
+Artboard 1g's typed-name step is for **destroying work or rewriting history**
+(R13), and a config change is neither: it is persistent and it affects the host,
+but it is a value in a file that the same panel can put back. Inventing a
+browser-only confirmation was rejected for the reason R11 gives about pull-base
+— it would be a flow the desktop does not have.
+
+What does gate it is D14's seat. `Route::Config` is `requires_control()`, like
+every route that is not answered from published state, so an observer is told
+`read_only` rather than being allowed to rewrite the host's configuration. That
+is the honest gate, and it was already the rule; the row simply now falls under
+it because it forwards.
+
+#### 4. `Space`, and the keys that now agree
+
+1f's footer promised `Space toggle / edit` from turn 1 and the browser bound
+nothing; the browser's own footer then omitted the line, so the artboard and the
+app were wrong in opposite directions. **`Space` is bound** — there was never a
+reason not to once edits could travel — and it does the two things
+`toggle_selected` does, with the fork decided by the *host's* `kind` for the
+row: a toggle or a choice stages the next value from the host's own options, and
+a text field opens the inline editor. The browser's footer now lists it. `Enter`
+is bound alongside it, as it is on the desktop.
+
+The inline editor is `handle_config_key`'s editing branch key for key — type,
+`Backspace`, `Enter` commits, `Esc` discards, moving the cursor discards — and
+it takes the keyboard whole while it is open, so `s` cannot save half a relay
+URL.
+
+**One thing the artboard drew that is now gone: the `host only` row.** 1f draws
+`use_f2_to_leave_terminal_focus` as `— … (host only)`, and the browser rendered
+it with no value and no origin tag. The host has no such concept: it is an
+ordinary curated bool in `build_fields`, saved to the same file as every other,
+and a browser that refused to set it while happily setting `notifications.sound`
+— also a desktop-only effect — was drawing a distinction nobody had made. The
+row is now an ordinary row. The footer's `e edit in $EDITOR — host only` stays,
+because *that* one is real: `$EDITOR` opens on the host's screen (D16).
+
+#### 5. **Protocol v3 → v4**
+
+`ServerMsg` grew `Configuration`, and a frame kind is a closed vocabulary under
+rule 1 — the `GitStatus` test applied unchanged. The concrete failure is the
+same one, one row along: the palette is host-driven, so a stale **v3** tab
+attached to this build would pass the version check (both say 3), be handed
+`open_configuration` as a row that *runs* — where it used to refuse — send it,
+be acked `applied`, and then drop the answer on its `default` branch. The user
+clicks **Open Configuration** and gets an ack and no panel.
+
+`MIN_SUPPORTED_VERSION` and `MAX_SUPPORTED_VERSION` move with it, as always, and
+`the_newest_frame_kind_is_covered_by_the_advertised_version` is re-pinned to
+`Configuration` (it fails against an un-bumped constant, which was checked). The
+mirror in `webui/src/wire/frames.ts` moves in the same commit.
+
+**What did not contribute**, stated because the two travelled together: the
+staged edits going the *other* way. `ConfigSaveRequest` rides inside
+`Command::args`, a free-form `serde_json::Value` since v1 chosen precisely so M2
+could grow command payloads without a bump — the same shelter `DialogBody`'s
+additions took in R19.
+
+#### 6. What covers it
+
+`webui/src/wire/wiredConfig.test.ts`, twelve cases, **all through the front
+door**: the palette row is run with real keystrokes, the `command` frame that
+left the socket is parsed and asserted, the panel is painted by a real
+`configuration` frame, and every edit is made with a key and read back off the
+DOM. Not one of them dispatches an action — which is exactly what the file it
+replaced did, and why a suite of nineteen green tests never saw that the data
+behind the renderer did not exist. It asserts the thing that was wrong most
+directly: **before the host answers there is no panel**, because there is
+nothing honest to put in one.
+
+On the host, six cases in `src/lib.rs`'s `web_command_surface` drive real
+`Command` frames through `run_web_command` over a `FakeFs` seeded with two real
+config files, and assert the origin tags against files the test wrote itself,
+the written TOML against `outputs()`, both refusals, and that a browser's read
+leaves `Ui::config` empty. `tests/web_server.rs` proves the row is forwarded
+over a real socket rather than refused; `src/tui/config_manager.rs` covers the
+model's new door, keys and all — including that
+`notifications.on_finished` and `updates.check_for_updates` are *not* among
+them.
+
+---
+
+### R23 — the git bar's `↑0 ↓0`, and four printed keys that were bound to nothing
+
+Two defects the post-P0 audit found (`remote-control-tzn2`,
+`remote-control-qlza`). They are recorded together because they share a shape:
+in both, the screen stated something the app could not back up.
+
+**1. The git bar resurrected the defect R2 says is unrepresentable.**
+`GitBar.has_upstream` has been on the wire since protocol v1, and its own doc
+says *"`false` renders `no-upstream`"*. `gitBarOf` never read it. So a branch
+with no upstream drew `↑0 ↓0`, titled *"commits ahead of and behind the
+upstream"*, three inches under a sidebar row that said `no-upstream` — the two
+disagreeing on screen, from one frame, at the same moment. R2's own words for
+this are "counts without an upstream to count against".
+
+**The fix is the type, not the render site**, because a conditional at the
+render site is exactly what was missing the first time. `GitBarInfo.ahead` and
+`.behind` are gone; in their place is `upstream: GitBarUpstream | null`, so the
+counts live *inside* the thing they count against and `↑0 ↓0` on an unpushed
+branch is not a value the browser can construct. That is `GitStatusPanel`'s
+existing shape, applied to the second surface that needed it — the panel had it
+from the start, which is why the overlay never had this bug. The adapter reads
+`has_upstream` for both halves now, so the bar and the sidebar row are two
+renderings of one bool rather than two independent readings of a frame.
+
+`no-upstream` renders at `--fd-text-quiet`, which §5.1 names for it by name.
+
+**The wire is unchanged**, and R2's ruling is why: the encoding is faithful, it
+has two peers, and widening it would be the change R2 declines. What did change
+host-side is one doc comment — `ahead`/`behind` now say they are meaningless
+while `has_upstream` is false, in the same voice `collected`'s already-present
+warning uses (*"renders `git: ?`, **not** `clean` — the two mean opposite
+things"*).
+
+**And the clean case now reads `clean`.** 2e's git bar is
+`⎇ branch │ clean │ 120×34 · host owns geometry`; the browser printed
+`+0 ~0 -0 (0 files)`. The predicate is the host's own `GitBar::is_clean`, whose
+doc already said it "renders `clean`", and the wording matches the git-status
+panel, which had made the same call.
+
+**2. Four keys were printed and none of them were bound.** 1h makes the status
+bar a promise — *"the status bar states both routes permanently — no discovery
+required"* — and a printed key that does nothing is worse than an unprinted one,
+because the user stops looking for the route that does exist.
+
+| Printed by | Key | Was | Now |
+| --- | --- | --- | --- |
+| `ui/sidebar.ts`'s App-mode footer (1b), 2e's hint row (`↑↓ sessions`) | `↑↓` | nothing — session navigation existed only by pointer | moves the selection, App mode only |
+| `ui/statusBar.ts` in split (1c) | `←/→` | nothing — `split/focus` was dispatched only from a click | moves the focused column, App mode only |
+
+**`↑↓` dispatches `selection/session` — the click's own action.** D3 makes
+selection instance-wide, so the arrow has to move the desktop too, and the way
+to guarantee that is to take the path the pointer already takes rather than
+invent a second one. It **clamps rather than wraps**: a wrap would carry the
+desktop from the last agent back to the first on a keystroke meant to do
+nothing. Movement is within the selected project, which is all
+`selection/session` accepts; crossing projects stays `selection/jump`'s job,
+and that action belongs to the feed row that names another project out loud.
+
+**`←/→` dispatches the pair a column click dispatches**, `split/focus` plus
+`selection/terminal`, for the same reason. It clamps its own index into range
+before stepping, because selecting a session with fewer terminals can leave
+`splitFocus` past the last column drawn — and an arrow that quietly did nothing
+there would be this entry's own defect, reintroduced.
+
+**Both are App-mode only, and this overrules one artboard detail.** §5 gives the
+app one chord (`Ctrl-g`) and licenses bare keys in App mode only; in Terminal
+mode the arrows are the agent's — shell history, `less`, a TUI's own menus — and
+the browser does not take them back for the sake of a layout. 1c draws split
+view with `MODE: TERMINAL` and the `←/→ move focus` hint together, which cannot
+both stand. **The hint gives way, not the agent's arrows:** in Terminal-mode
+split the row prints `Esc Esc app commands` — 1a's own hint, and the route to
+the keys — and prints `←/→ move focus` the moment the keys are actually ours.
+That is 1h's promise kept honestly: the route is stated permanently, and it is
+the route that exists. A turn 3 that wants the arrows in Terminal mode would be
+overruling §5, not this entry.
+
+App mode's hint row also gains 2e's `↑↓ sessions`, which it had been leaving out
+while the sidebar footer beneath it printed the same key.
+
+**3. `SPLIT 3 terminals` was a literal.** `hintsFor` returned 1c's three
+regardless of `session.terminals.length`, so a two- or four-terminal split was
+described as a screen the user was not looking at. It is read from the selected
+session now, singular included — the same count the split view draws a column
+for, so the hint cannot describe a different screen.
+
+**What covers it.** Two cases in `webui/src/wire/wiredScreen.test.ts`, R21's
+front-door file, added for R21's reason: the field that was missing is one the
+*adapter* never read, so a test that hands the renderer a `GitBarInfo` would
+supply the very thing production lacked. Both deliver a real `snapshot` frame
+and assert the rendered DOM — one with `has_upstream: false`, asserting
+`no-upstream` in the bar and the row at once and no `↑`/`↓` anywhere, plus
+`clean` in place of the four zeroes; one with an upstream, asserting the pair is
+still printed. `wire/adapt.test.ts` asserts the same bool decides both halves of
+the model.
+
+The key bindings are covered in `webui/src/ui/mainScreen.test.ts` by real
+`keydown` events dispatched on **`document.body`** — where a browser puts them,
+since the listener is on `document` and `activeElement` is `BODY` on a fresh
+load and after every re-render (§6.5 R17's finding, and the reason a press
+dispatched on the frame proves less than it looks). The cases: `↑↓` moves the
+selection and reaches the wire seam as `selection/session`; it clamps at both
+ends; it is refused in Terminal mode, asserted as `defaultPrevented === false`
+so the agent demonstrably still gets the key; it still works under the narrow
+slide-over, which swallows nothing. `←/→` moves the column *and* the selected
+terminal, clamps at both ends, and is refused both outside split view and inside
+Terminal-mode split. The terminal count is asserted against a one-terminal
+session, singular and all.
 
 ---
 

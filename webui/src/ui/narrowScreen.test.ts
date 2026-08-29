@@ -28,7 +28,7 @@
  *   never resized to fit.
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { fixtureSnapshot } from "../state/fixture";
+import { fixtureConfigDoc, fixtureSnapshot } from "../state/fixture";
 import { createApp } from "./app";
 import type { App } from "./app";
 import type { GitStatusPanel } from "../state/model";
@@ -447,7 +447,7 @@ describe("every overlay is still reachable at this width", () => {
     expect(h.maybe(".fd-palette__panel")).not.toBeNull();
     h.key("Escape");
 
-    h.app.store.dispatch({ type: "config/open" });
+    h.app.store.dispatch({ type: "config/received", doc: fixtureConfigDoc() });
     expect(h.maybe(".fd-config__panel")).not.toBeNull();
     h.key("Escape");
 
@@ -487,7 +487,7 @@ describe("every overlay is still reachable at this width", () => {
 
   it("keeps 1f's four cells per row, restacked rather than dropped", () => {
     const h = render();
-    h.app.store.dispatch({ type: "config/open" });
+    h.app.store.dispatch({ type: "config/received", doc: fixtureConfigDoc() });
     const rows = h.all(".fd-config__row");
     expect(rows.length).toBeGreaterThan(1);
     for (const row of rows) {

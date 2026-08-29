@@ -39,6 +39,7 @@ import type {
   Snapshot,
   TerminalTab,
 } from "../state/model";
+import type { ConfigDoc, ConfigRow } from "../state/config";
 import type { DialogState } from "../state/types";
 import type {
   WireAboutDoc,
@@ -46,6 +47,8 @@ import type {
   WireBucket,
   WireCommandView,
   WireDialogView,
+  WireConfigRow,
+  WireConfiguration,
   WireGitBar,
   WireGitStatus,
   WireHelpDoc,
@@ -146,6 +149,11 @@ export function gitOf(git: WireGitBar, recovered: boolean): SessionGit {
  *
  * A bar needs a branch name and a collected answer; without either the bar is
  * absent rather than half-drawn with zeros, which would read as `clean`.
+ *
+ * `has_upstream` is read here, and it is the same bool `gitOf` above reads to
+ * decide `no_upstream`, so the bar and the sidebar row cannot disagree about
+ * one session. Without an upstream the counts are not carried forward at all —
+ * `ahead` and `behind` are zeroes the host never measured (§6.5 R23).
  */
 export function gitBarOf(git: WireGitBar, base: string): GitBarInfo | null {
   if (!git.collected || git.branch === null) {
@@ -157,8 +165,9 @@ export function gitBarOf(git: WireGitBar, base: string): GitBarInfo | null {
     modified: git.modified,
     removed: git.removed,
     files: git.files_changed,
-    ahead: git.ahead,
-    behind: git.behind,
+    upstream: git.has_upstream
+      ? { ahead: git.ahead, behind: git.behind }
+      : null,
     baseAhead: git.drift,
     base,
   };
@@ -423,6 +432,41 @@ function aboutOf(wire: WireAboutDoc | null | undefined): AboutDoc | null {
     tagline: wire.tagline,
     credits: wire.credits.map((c) => ({ role: c.role, name: c.name })),
     url: wire.url,
+  };
+}
+
+/**
+ * SPECS §8's configuration manager (`remote-control-1p22`, §6.5 R22).
+ *
+ * A rename and nothing else, deliberately. Every fact the panel draws — the
+ * field list, the TOML keys, the values, the choices, the origin tags and what
+ * each row falls back to — is resolved on the host by the same `ConfigManager`
+ * the desktop's overlay is built from, so there is nothing here to compute and
+ * nothing to get wrong. The one `?? null` is the wire's one genuine absence: a
+ * host with no home directory has no global file to name.
+ */
+export function configDocOf(wire: WireConfiguration): ConfigDoc {
+  return {
+    projectName: wire.project_name,
+    globalPath: wire.global_path ?? null,
+    projectPath: wire.project_path,
+    rows: {
+      global: wire.global_rows.map(configRowOf),
+      project: wire.project_rows.map(configRowOf),
+    },
+  };
+}
+
+function configRowOf(wire: WireConfigRow): ConfigRow {
+  return {
+    key: wire.key,
+    label: wire.label,
+    kind: wire.kind,
+    value: wire.value,
+    choices: wire.choices ?? [],
+    origin: wire.origin,
+    inherited: wire.inherited,
+    inheritedOrigin: wire.inherited_origin,
   };
 }
 

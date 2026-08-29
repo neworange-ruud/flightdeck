@@ -7,6 +7,7 @@ import type {
   SeatInfo,
   Snapshot,
 } from "./model";
+import type { ConfigDoc, ConfigRow } from "./config";
 
 /**
  * The fixture snapshot the main screen renders against today.
@@ -59,8 +60,7 @@ const flightdeck: Project = {
         modified: 2,
         removed: 1,
         files: 6,
-        ahead: 3,
-        behind: 0,
+        upstream: { ahead: 3, behind: 0 },
         baseAhead: 4,
         base: "main",
       },
@@ -86,8 +86,7 @@ const flightdeck: Project = {
         modified: 0,
         removed: 0,
         files: 0,
-        ahead: 0,
-        behind: 0,
+        upstream: null,
         baseAhead: 0,
         base: "main",
       },
@@ -116,8 +115,7 @@ const flightdeck: Project = {
         modified: 1,
         removed: 2,
         files: 3,
-        ahead: 0,
-        behind: 0,
+        upstream: { ahead: 0, behind: 0 },
         baseAhead: 4,
         base: "main",
       },
@@ -146,8 +144,7 @@ const flightdeck: Project = {
         modified: 0,
         removed: 0,
         files: 0,
-        ahead: 0,
-        behind: 2,
+        upstream: { ahead: 0, behind: 2 },
         baseAhead: 7,
         base: "main",
       },
@@ -178,8 +175,7 @@ const flightdeck: Project = {
         modified: 0,
         removed: 0,
         files: 0,
-        ahead: 0,
-        behind: 0,
+        upstream: { ahead: 0, behind: 0 },
         baseAhead: 4,
         base: "main",
       },
@@ -230,8 +226,7 @@ const apiGateway: Project = {
         modified: 4,
         removed: 0,
         files: 4,
-        ahead: 0,
-        behind: 0,
+        upstream: null,
         baseAhead: 0,
         base: "main",
       },
@@ -260,8 +255,7 @@ const apiGateway: Project = {
         modified: 3,
         removed: 4,
         files: 9,
-        ahead: 1,
-        behind: 0,
+        upstream: { ahead: 1, behind: 0 },
         baseAhead: 0,
         base: "develop",
       },
@@ -293,8 +287,7 @@ const web: Project = {
         modified: 1,
         removed: 0,
         files: 1,
-        ahead: 0,
-        behind: 0,
+        upstream: null,
         baseAhead: 0,
         base: "main",
       },
@@ -323,8 +316,7 @@ const web: Project = {
         modified: 0,
         removed: 0,
         files: 0,
-        ahead: 0,
-        behind: 0,
+        upstream: { ahead: 0, behind: 0 },
         baseAhead: 0,
         base: "main",
       },
@@ -901,8 +893,9 @@ export function fixtureCommands(): readonly HostCommand[] {
       answersDialog: false,
       annotation: null,
       target: null,
-      refusal:
-        "The configuration manager is a browser surface of its own (remote-control-ll5.6); opening the desktop's overlay from here would put a modal on a screen this browser cannot see.",
+      /** Runs as of `remote-control-1p22`: the host answers it with
+       * `ServerMsg::Configuration`, so there is no refusal to render. */
+      refusal: null,
     },
     {
       id: "pair_phone",
@@ -1056,4 +1049,72 @@ export function fixtureCommands(): readonly HostCommand[] {
       refusal: null,
     },
   ];
+}
+
+/**
+ * A configuration manager as the host would answer one (1f,
+ * `remote-control-1p22`).
+ *
+ * **This is a fixture, not a field list.** The real rows arrive on
+ * `ServerMsg::Configuration`, resolved from the host's own two config files by
+ * the same `ConfigManager` the desktop's overlay is built from — which is the
+ * whole of what `remote-control-1p22` fixed. What is here is a stand-in for
+ * *tests that are about something else* (the narrow layout, the overlay stack),
+ * shaped to carry one of every field kind and one of every origin tag so those
+ * tests have all four cells to look at. The keys are the host's real ones, so
+ * a reader comparing this against `src/tui/config_manager.rs` finds the same
+ * spellings.
+ *
+ * Tests that are about the configuration manager itself do **not** use it:
+ * `wire/wiredConfig.test.ts` drives real frames through the real socket.
+ */
+export function fixtureConfigDoc(): ConfigDoc {
+  const rows: readonly ConfigRow[] = [
+    {
+      key: "notifications.enabled",
+      label: "OS notifications",
+      kind: "bool",
+      value: true,
+      choices: [],
+      origin: "global",
+      inherited: true,
+      inheritedOrigin: "default",
+    },
+    {
+      key: "notifications.on_finish",
+      label: "Notify when finished",
+      kind: "bool",
+      value: true,
+      choices: [],
+      origin: "set_here",
+      inherited: false,
+      inheritedOrigin: "default",
+    },
+    {
+      key: "ui.mode_border",
+      label: "Mode border",
+      kind: "choice",
+      value: "bright",
+      choices: ["off", "dim", "normal", "bright"],
+      origin: "default",
+      inherited: "off",
+      inheritedOrigin: "default",
+    },
+    {
+      key: "web.bind",
+      label: "Web interface bind address",
+      kind: "text",
+      value: "127.0.0.1",
+      choices: [],
+      origin: "default",
+      inherited: "127.0.0.1",
+      inheritedOrigin: "default",
+    },
+  ];
+  return {
+    projectName: "flightdeck",
+    globalPath: "/home/u/.flightdeck/config.toml",
+    projectPath: "/repo/.flightdeck/config.toml",
+    rows: { global: rows, project: rows },
+  };
 }

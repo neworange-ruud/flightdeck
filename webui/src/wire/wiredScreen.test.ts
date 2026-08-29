@@ -55,10 +55,12 @@ function fakeSocket(): FakeSocket {
 }
 
 /** One host snapshot. `byteLen`/`replayFrom` are the two facts Q3's resume
- * arithmetic is made of, so they are the only parameters. */
+ * arithmetic is made of; `git` is here for the one test that is about what git
+ * said rather than about bytes, and defaults to 1a's own numbers. */
 function snapshotFrame(over: {
   readonly byteLen: number;
   readonly replayFrom: number;
+  readonly git?: Record<string, unknown>;
 }): string {
   return JSON.stringify({
     type: "snapshot",
@@ -98,7 +100,7 @@ function snapshotFrame(over: {
               bucket: "in_progress",
               running_time_secs: 12,
             },
-            git: {
+            git: over.git ?? {
               branch: "flightdeck/fix-login",
               added: 3,
               modified: 2,
@@ -493,5 +495,54 @@ describe("2c's latency readout, measured rather than declared", () => {
     const h = harness();
     expect(h.app.store.getState().latencyMs).toBeNull();
     expect(h.text(".fd-statusbar")).not.toContain("ms");
+  });
+});
+
+describe("R2's ahead/behind, which cannot exist without an upstream", () => {
+  it("says no-upstream in the bar and the row at once, off the host's own bool", () => {
+    /**
+     * The defect this is written for: the bar printed `↑0 ↓0` titled "commits
+     * ahead of and behind the upstream" while the sidebar row three inches
+     * above it said `no-upstream`, on the same screen, from the same frame.
+     * Driven as a frame rather than as a `GitBarInfo`, because the field that
+     * was missing is one the adapter never read.
+     */
+    const h = harness();
+    h.deliver(
+      snapshotFrame({
+        byteLen: 8,
+        replayFrom: 0,
+        git: {
+          branch: "flightdeck/fix-login",
+          added: 0,
+          modified: 0,
+          removed: 0,
+          /** The zeroes a host sends beside `has_upstream: false`. They are
+           * not a measurement, and nothing may print them as one. */
+          ahead: 0,
+          behind: 0,
+          drift: 0,
+          has_upstream: false,
+          files_changed: 0,
+          collected: true,
+        },
+      }),
+    );
+
+    expect(h.text(".fd-gitbar")).toContain("no-upstream");
+    expect(h.text(".fd-gitbar")).not.toContain("↑");
+    expect(h.text(".fd-gitbar")).not.toContain("↓");
+    expect(h.text(".fd-session__facts")).toContain("no-upstream");
+    /** 2e's word for a worktree with nothing in it, in place of four zeroes. */
+    expect(h.text(".fd-gitbar")).toContain("clean");
+    expect(h.text(".fd-gitbar")).not.toContain("(0 files)");
+  });
+
+  it("prints the pair when the host says there is an upstream to count against", () => {
+    const h = harness();
+    h.deliver(snapshotFrame({ byteLen: 8, replayFrom: 0 }));
+    expect(h.text(".fd-gitbar")).toContain("↑3 ↓0");
+    expect(h.text(".fd-gitbar")).not.toContain("no-upstream");
+    expect(h.text(".fd-gitbar")).toContain("+3 ~2 -1 (6 files)");
   });
 });

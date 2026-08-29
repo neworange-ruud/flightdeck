@@ -2,6 +2,7 @@ import { connectionStrip, hasControl } from "../state/connection";
 import type { ConnectionStrip, StripAction } from "../state/connection";
 import { unreadChip } from "../state/activity";
 import { viewerChipText, viewerChipTitle } from "../state/seats";
+import { findSession } from "../state/model";
 import type { StatusGlyph } from "../state/model";
 import type { AppState } from "../state/types";
 import { append, clear, el, separator, spinnerGlyph } from "./dom";
@@ -319,19 +320,37 @@ function unreadChipEl(
  * The hint row, straight from the artboards: 1a in Terminal mode, 1b in App
  * mode, 1c in split. `Ctrl-g` is the only chord the app claims (§5), so it is
  * the only one that appears in every variant.
+ *
+ * **Every key printed here is bound** (§6.5 R23). 1h makes this row a promise
+ * — *"the status bar states both routes permanently — no discovery required"* —
+ * and a promise is only worth printing while it is kept, so two of these are
+ * conditional rather than constant:
+ *
+ *   - **The column count is read from the session**, not from 1c's own three.
+ *     A two-terminal split described as `SPLIT 3 terminals` is a fact the host
+ *     never sent.
+ *   - **`←/→ move focus` appears in App mode only.** 1c draws split view with
+ *     `MODE: TERMINAL`, but §5 gives the arrows to the agent there and the
+ *     browser does not take them back for a layout — so Terminal-mode split
+ *     prints the route to the keys instead of the keys, which is 1a's own
+ *     hint and is true in both layouts.
  */
 function hintsFor(state: AppState): readonly HTMLElement[] {
   if (state.layout === "split") {
+    const columns = splitColumns(state);
     return [
-      hint("SPLIT", "3 terminals"),
-      hint("←/→", "move focus"),
+      hint("SPLIT", `${columns} terminal${columns === 1 ? "" : "s"}`),
+      state.mode === "app"
+        ? hint("←/→", "move focus")
+        : hint("Esc Esc", "app commands"),
       hint("Ctrl-g", "palette → “split”"),
     ];
   }
   if (state.mode === "app") {
     return [
+      /** 2e's App-mode row: `↑↓ sessions`, then `a activity`. */
+      hint("↑↓", "sessions"),
       hint("Enter", "focus terminal"),
-      /** 2e puts `a activity` in App mode's hint row, next to `↑↓ sessions`. */
       hint("a", "activity"),
       hint("Ctrl-g", "command palette"),
       hint("?", "help"),
@@ -342,6 +361,17 @@ function hintsFor(state: AppState): readonly HTMLElement[] {
     hint("Ctrl-g", "command palette"),
     hint("click outside", "release keys"),
   ];
+}
+
+/** How many terminals the selected session actually has — the number the split
+ * view draws a column for, so the hint cannot describe a different screen. */
+function splitColumns(state: AppState): number {
+  const selection = state.selection;
+  const session =
+    selection === null
+      ? null
+      : findSession(state.projects, selection.projectId, selection.sessionId);
+  return session?.terminals.length ?? 0;
 }
 
 function hint(key: string, label: string): HTMLElement {

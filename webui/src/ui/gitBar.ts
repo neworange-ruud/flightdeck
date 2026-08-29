@@ -17,6 +17,9 @@ import type { Child, Region } from "./dom";
  *   - `(6 files)` stays `--fd-text-decor`: 2g names "item counts" as
  *     decoration, and the count adds no fact the three numbers beside it do not
  *     already carry.
+ *   - `no-upstream` replaces the ahead/behind pair when there is no upstream,
+ *     and §5.1 names it as a fact — so `--fd-text-quiet`, exactly where the
+ *     sidebar row and the git-status panel already put the same word.
  *
  * And the geometry chip, which D4 calls out by name as *not decoration*: it is
  * the honest explanation for why a large browser window has dark margins. It
@@ -68,21 +71,27 @@ function gitParts(git: GitBarInfo): Child[] {
     }),
     el("span", { class: "fd-gitbar__branch", text: git.branch }),
     separator(),
-    el("span", {}, [
-      el("span", { class: "fd-tone-ok", text: `+${git.added}` }),
-      " ",
-      el("span", { class: "fd-tone-focus", text: `~${git.modified}` }),
-      " ",
-      el("span", { class: "fd-tone-alert", text: `-${git.removed}` }),
-      " ",
-      el("span", { class: "fd-decor", text: `(${git.files} files)` }),
-    ]),
+    changeCounts(git),
     separator(),
-    el("span", {
-      class: "fd-tone-accent",
-      text: `↑${git.ahead} ↓${git.behind}`,
-      title: "commits ahead of and behind the upstream",
-    }),
+    /**
+     * The counts, or the reason there are none. A branch with no upstream has
+     * nothing to be ahead of, so the bar says `no-upstream` — the same fact the
+     * sidebar row states from the same bool, at the same lifted tier (§5.1
+     * names it), rather than the `↑0 ↓0` the two used to contradict each other
+     * with (§6.5 R23). The type is what makes that unrepresentable; this is
+     * only the rendering of it.
+     */
+    git.upstream === null
+      ? el("span", {
+          class: "fd-tone-quiet",
+          text: "no-upstream",
+          title: "this branch has no upstream — a push would have nowhere to go",
+        })
+      : el("span", {
+          class: "fd-tone-accent",
+          text: `↑${git.upstream.ahead} ↓${git.upstream.behind}`,
+          title: "commits ahead of and behind the upstream",
+        }),
     separator(),
     el("span", {
       class: "fd-tone-elsewhere",
@@ -92,6 +101,29 @@ function gitParts(git: GitBarInfo): Child[] {
     separator(),
     el("span", { class: "fd-tone-quiet", text: `base: ${git.base}` }),
   ];
+}
+
+/**
+ * `+3 ~2 -1 (6 files)`, or 2e's one word for the same worktree with nothing in
+ * it. 2e's git bar reads `⎇ branch │ clean │ 120×34 · host owns geometry`, and
+ * `+0 ~0 -0 (0 files)` is four numbers that say what one word says better — the
+ * same call the git-status panel already makes (`infoOverlay.ts`) and the same
+ * predicate the host already spells out (`GitBar::is_clean`, whose own doc says
+ * it "renders `clean`"), so every surface words a clean worktree identically.
+ */
+function changeCounts(git: GitBarInfo): HTMLElement {
+  if (git.added === 0 && git.modified === 0 && git.removed === 0) {
+    return el("span", { class: "fd-tone-ok", text: "clean" });
+  }
+  return el("span", {}, [
+    el("span", { class: "fd-tone-ok", text: `+${git.added}` }),
+    " ",
+    el("span", { class: "fd-tone-focus", text: `~${git.modified}` }),
+    " ",
+    el("span", { class: "fd-tone-alert", text: `-${git.removed}` }),
+    " ",
+    el("span", { class: "fd-decor", text: `(${git.files} files)` }),
+  ]);
 }
 
 /**

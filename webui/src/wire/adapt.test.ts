@@ -170,6 +170,22 @@ describe("session", () => {
       baseAhead: 4,
     });
   });
+
+  it("carries no ahead/behind for a branch with nothing to count against", () => {
+    /** §6.5 R2/R23: the counts live inside the upstream, so the zeroes the
+     * host sends alongside `has_upstream: false` have nowhere to land. */
+    const mapped = sessionOf(
+      { ...session, git: { ...git, has_upstream: false } },
+      "main",
+    );
+    expect(mapped.gitBar?.upstream).toBeNull();
+    /** And the sidebar's union reads the same bool, so the two agree. */
+    expect(mapped.git.kind).toBe("no_upstream");
+    expect(sessionOf(session, "main").gitBar?.upstream).toEqual({
+      ahead: 3,
+      behind: 0,
+    });
+  });
 });
 
 describe("snapshot", () => {

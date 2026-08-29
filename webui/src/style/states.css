@@ -1151,9 +1151,13 @@
   color: var(--fd-text-soft);
   cursor: pointer;
 }
-.fd-config__row[data-host-only="true"] {
-  cursor: default;
-  color: var(--fd-text-decor);
+/* A row with a staged, unsaved edit. The same `--fd-focus` the "Unsaved
+ * changes" chip and the note bars use, so "not written yet" reads as one
+ * colour across the panel rather than three. `remote-control-1p22` replaced
+ * the old `[data-host-only]` rule here: the host's field list has no host-only
+ * setting in it, and the browser no longer invents one. */
+.fd-config__row[data-staged="true"] .fd-config__value {
+  color: var(--fd-focus);
 }
 /* The selected row's wash + left rule, same recipe 1d's selected row and the
  * main pane's focus glow both use for "this is the one the accent points
@@ -1186,6 +1190,15 @@
 }
 .fd-config__value[data-kind="text"] {
   color: var(--fd-text-muted);
+}
+/* An open inline text edit, drawn the way the desktop's overlay draws one: the
+ * value highlighted, with the block cursor the component appends to the
+ * string. Wins over the per-kind colours above, and over the staged colour, by
+ * coming last — an edit in progress is the most specific thing a row can be. */
+.fd-config__row .fd-config__value[data-editing="true"] {
+  color: var(--fd-canvas);
+  background: var(--fd-accent);
+  font-weight: 700;
 }
 .fd-config__origin[data-origin="set_here"] {
   color: var(--fd-ok);

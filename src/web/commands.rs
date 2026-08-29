@@ -40,18 +40,25 @@
 //! * [`Route::Dialog`] — D13's shared dialog. The dialog is app state, published
 //!   to both surfaces with the origin that opened it, and either surface can
 //!   confirm or cancel; these two rows are how a browser does it.
+//! * [`Route::Config`] — SPECS §8's configuration manager
+//!   (`remote-control-1p22`). One row, `open_configuration`, whose `args` are
+//!   the browser's staged edits; the host builds the desktop's own manager,
+//!   applies them through its own mutators and answers the asking browser with
+//!   [`crate::web::protocol::ConfigView`].
 //! * [`Route::NotSupported`] — the host will not forward this name, and the
 //!   refusal says why. After D13, the git family, the destructive confirmation,
 //!   the configuration manager and the read-only overlays all landed, three
-//!   rows are left and **none of them is "not built yet"**:
-//!   `open_configuration`, `show_help` and `about_flightdeck` are each a
-//!   *browser* surface, drawn from state the host already sent, so forwarding
-//!   them would open a panel on the desktop that the asker cannot read
-//!   ([`OPEN_CONFIGURATION_REFUSAL`], [`HELP_REFUSAL`], [`ABOUT_REFUSAL`]); and
+//!   rows are left and **none of them is "not built yet"**: `show_help` and
+//!   `about_flightdeck` are each a *browser* surface drawn from state the host
+//!   already sent, so forwarding them would open a panel on the desktop that
+//!   the asker cannot read ([`HELP_REFUSAL`], [`ABOUT_REFUSAL`]); and
 //!   `pull_base` is a boundary decision (see [`PULL_BASE_REFUSAL`]).
 //!   `show_git_status` is the one read-only overlay that *does* dispatch,
 //!   because its facts are not on the snapshot — see
-//!   [`crate::web::protocol::GitStatusView`].
+//!   [`crate::web::protocol::GitStatusView`]. `open_configuration` left this
+//!   list in `remote-control-1p22` for the same reason: the panel is still the
+//!   browser's, but the *layering it draws* is a disk read only the host can
+//!   take (§6.5 R22).
 //!
 //! ## Destroying work from a browser takes two steps (artboard 1g)
 //!
@@ -134,6 +141,19 @@ pub enum Route {
     /// the TUI, by synthesising the very keypress the desktop's own dialog
     /// buttons synthesise — so there is no second dialog engine to drift.
     Dialog(DialogAct),
+    /// SPECS §8's configuration manager (`remote-control-1p22`, §6.5 R22).
+    /// Applied by the TUI, by building the very
+    /// [`crate::tui::config_manager::ConfigManager`] the desktop's
+    /// `Open Configuration` builds and calling the mutators the desktop's own
+    /// keys call — so there is no second config engine, no second field list
+    /// and no second layer walk to drift.
+    ///
+    /// Like [`Route::Selection`] and [`Route::Dialog`], and unlike
+    /// [`Route::Palette`], this route **reads the frame's `args`**: they are the
+    /// staged edits, not a command identity, so nothing about *what may happen*
+    /// comes from the browser — only which curated field, in which of the two
+    /// files, gets which of the values that field admits.
+    Config,
     /// Refused with [`crate::web::protocol::AckOutcome::Rejected`] and this
     /// reason: the host implements it, but its effect must not — or cannot —
     /// land for a browser.
@@ -306,13 +326,18 @@ pub const GATE_UNRESOLVED_REFUSAL: &str =
 
 /// Why `Show Help` is offered but not forwarded (`remote-control-ll5.8`).
 ///
-/// The same shape as [`OPEN_CONFIGURATION_REFUSAL`] and for the same reason: a
-/// browser's help is a browser surface, and dispatching this row would open a
-/// panel on the desktop that the person who asked cannot read. The difference
-/// from the configuration manager is only in where the words come from — the
-/// browser draws [`Snapshot::help`](crate::web::protocol::Snapshot::help),
-/// which is this build's own help screen, so the two surfaces cannot document
-/// different keyboards (`specs/WEB_INTERFACE.md` §6.5 R16).
+/// A browser's help is a browser surface, and dispatching this row would open a
+/// panel on the desktop that the person who asked cannot read. The whole of the
+/// help screen is already on the snapshot — the browser draws
+/// [`Snapshot::help`](crate::web::protocol::Snapshot::help), which is this
+/// build's own help screen, so the two surfaces cannot document different
+/// keyboards (`specs/WEB_INTERFACE.md` §6.5 R16).
+///
+/// The configuration manager used to refuse beside it and no longer does, which
+/// is the line worth keeping in view: its panel is a browser surface too, but
+/// what the panel *draws* is a read of two files on the host's disk, so the row
+/// forwards and the host answers the asker (§6.5 R22). Where the panel opens is
+/// not what decides this; whether the browser already has the facts is.
 ///
 /// The row is still listed, still visible, and its refusal is still the
 /// sentence a frame naming it gets back — because a browser from a later build
@@ -330,14 +355,6 @@ pub const ABOUT_REFUSAL: &str =
     "About is a browser surface of its own: this row opens the browser's About \
      panel, drawn from the version and credits this host sent with the \
      snapshot. Forwarding it would open a panel on the desktop instead.";
-
-/// Why `Open Configuration` is offered but not forwarded
-/// (`remote-control-ll5.6`), named so [`HELP_REFUSAL`] can point at the
-/// precedent it follows.
-pub const OPEN_CONFIGURATION_REFUSAL: &str =
-    "The configuration manager is a browser surface of its own \
-     (remote-control-ll5.6); opening the desktop's overlay from here \
-     would put a modal on a screen this browser cannot see.";
 
 /// Why `Pull Base` alone in the git family is refused (`remote-control-ll5.5`,
 /// SPECS §5.2).
@@ -663,7 +680,7 @@ pub static INVENTORY: &[CommandSpec] = &[
         group: "Configuration",
         host_only: false,
         annotation: None,
-        route: Route::NotSupported(OPEN_CONFIGURATION_REFUSAL),
+        route: Route::Config,
     },
     CommandSpec {
         name: names::PAIR_PHONE,
@@ -860,6 +877,7 @@ impl CommandSpec {
             | Route::ActivityRead
             | Route::Palette(_)
             | Route::Dialog(_)
+            | Route::Config
             | Route::Rejected(_)
             | Route::NotSupported(_) => true,
         }
@@ -873,7 +891,8 @@ impl CommandSpec {
             | Route::Selection(_)
             | Route::ActivityRead
             | Route::Palette(_)
-            | Route::Dialog(_) => None,
+            | Route::Dialog(_)
+            | Route::Config => None,
         }
     }
 
@@ -894,6 +913,7 @@ impl CommandSpec {
             Route::Server
             | Route::Palette(_)
             | Route::Dialog(_)
+            | Route::Config
             | Route::Rejected(_)
             | Route::NotSupported(_) => None,
         }
@@ -1188,6 +1208,7 @@ pub fn dispatched_command(route: &Route) -> Option<&Command> {
         Route::Palette(PaletteAction::Dispatch(cmd)) => Some(cmd),
         Route::Palette(_)
         | Route::Dialog(_)
+        | Route::Config
         | Route::Server
         | Route::Selection(_)
         | Route::ActivityRead

@@ -66,18 +66,33 @@ export type SessionGit =
   /** git has not answered yet (1a: `git: ?` while the worktree is created) */
   | { readonly kind: "unknown" };
 
-/** The git info bar (1a, bottom strip) for the selected session. */
+/**
+ * The git info bar (1a, bottom strip) for the selected session.
+ *
+ * `upstream` is a nested object rather than two numbers beside a bool for the
+ * reason §6.5 R2 gives and `GitStatusPanel` below already applies: the counts
+ * live *inside* the upstream, so `↑0 ↓0` on a branch with nothing to count
+ * against is not a state this type can hold. The sidebar reads the same fact
+ * off `SessionGit`, and the two cannot disagree on screen if neither can be
+ * built wrong (§6.5 R23).
+ */
 export interface GitBarInfo {
   readonly branch: string;
   readonly added: number;
   readonly modified: number;
   readonly removed: number;
   readonly files: number;
-  readonly ahead: number;
-  readonly behind: number;
+  /** `null` until the branch has been pushed — 1a's `no-upstream`, a fact. */
+  readonly upstream: GitBarUpstream | null;
   /** commits base has moved on by (1a: `base +4`) */
   readonly baseAhead: number;
   readonly base: string;
+}
+
+/** The half of the bar that exists only once there is an upstream. */
+export interface GitBarUpstream {
+  readonly ahead: number;
+  readonly behind: number;
 }
 
 /** A terminal tab inside a session (1a: `agent`, `shell 1`, `shell 2`). */

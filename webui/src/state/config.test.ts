@@ -1,127 +1,202 @@
 import { describe, expect, it } from "vitest";
 import {
-  CONFIG_FIELDS,
   isLoopbackAddress,
+  nextConfigValue,
+  NO_CONFIG_EDITS,
   resolveConfigRow,
-  selectableConfigFields,
+  ROUTABLE_BIND_WARNING,
+  stagedChanges,
+  stagedCount,
 } from "./config";
-import type { ConfigEdit, ConfigField } from "./config";
+import type { ConfigDoc, ConfigEdits, ConfigRow } from "./config";
 
 /**
- * `resolveConfigRow`'s origin attribution, in isolation from the DOM — see
- * `ui/configManager.test.ts` for the rendered rows. Pure logic only: no
- * store, no reducer, no jsdom.
+ * The staged-edit arithmetic, in isolation from the DOM — see
+ * `wire/wiredConfig.test.ts` for the panel itself, driven by real frames.
+ *
+ * These are the only functions in the configuration manager that *decide*
+ * anything in the browser, and each of them decides from a fact the host sent:
+ * `resolveConfigRow` swaps in the host's own `inherited` for a staged clear,
+ * and `nextConfigValue` advances through the host's own `choices`. There is no
+ * field list and no layer walk here to test, because there is none to have —
+ * that is what `remote-control-1p22` removed.
  */
 
-const NO_EDITS: Readonly<Record<string, ConfigEdit>> = {};
+function boolRow(over: Partial<ConfigRow> = {}): ConfigRow {
+  return {
+    key: "notifications.on_finish",
+    label: "Notify when finished",
+    kind: "bool",
+    value: true,
+    choices: [],
+    origin: "set_here",
+    inherited: false,
+    inheritedOrigin: "global",
+    ...over,
+  };
+}
 
-function field(key: string): ConfigField {
-  const found = CONFIG_FIELDS.find((f) => f.key === key);
-  if (found === undefined) {
-    throw new Error(`no curated field ${key}`);
-  }
-  return found;
+function choiceRow(): ConfigRow {
+  return {
+    key: "ui.mode_border",
+    label: "Mode border",
+    kind: "choice",
+    value: "dim",
+    choices: ["off", "dim", "normal", "bright"],
+    origin: "default",
+    inherited: "off",
+    inheritedOrigin: "default",
+  };
+}
+
+function textRow(value: string): ConfigRow {
+  return {
+    key: "web.bind",
+    label: "Web interface bind address",
+    kind: "text",
+    value,
+    choices: [],
+    origin: "default",
+    inherited: "127.0.0.1",
+    inheritedOrigin: "default",
+  };
+}
+
+function edits(scope: "global" | "project", key: string, edit: unknown): ConfigEdits {
+  return {
+    ...NO_CONFIG_EDITS,
+    [scope]: { [key]: edit },
+  } as ConfigEdits;
 }
 
 describe("resolveConfigRow", () => {
-  it("set here: a project override wins in Project scope", () => {
-    const resolved = resolveConfigRow(field("ui.agent_tab_position"), "project", NO_EDITS);
-    expect(resolved.origin).toBe("set_here");
-    expect(resolved.value).toBe("right");
-  });
-
-  it("global only: no project override, the global layer is what is in effect", () => {
-    const resolved = resolveConfigRow(field("notifications.enabled"), "project", NO_EDITS);
-    expect(resolved.origin).toBe("global");
+  it("passes the host's answer through untouched when nothing is staged", () => {
+    const resolved = resolveConfigRow(boolRow(), "project", NO_CONFIG_EDITS);
     expect(resolved.value).toBe(true);
-  });
-
-  it("default only: neither layer has an explicit value", () => {
-    const resolved = resolveConfigRow(field("notifications.sound"), "project", NO_EDITS);
-    expect(resolved.origin).toBe("default");
-    expect(resolved.value).toBe(false);
-  });
-
-  it("set here shadows a global value underneath it, until cleared", () => {
-    const shadowing = field("notifications.on_finished");
-    const set = resolveConfigRow(shadowing, "project", NO_EDITS);
-    expect(set.origin).toBe("set_here");
-    expect(set.value).toBe(true);
-
-    const cleared = resolveConfigRow(shadowing, "project", {
-      [shadowing.key]: { kind: "clear" },
-    });
-    expect(cleared.origin).toBe("global");
-    expect(cleared.value).toBe(true);
-  });
-
-  it("Global scope reads the global file's own explicit value as set here", () => {
-    const resolved = resolveConfigRow(field("notifications.enabled"), "global", NO_EDITS);
     expect(resolved.origin).toBe("set_here");
-    expect(resolved.value).toBe(true);
+    expect(resolved.staged).toBe(false);
   });
 
-  it("Global scope falls back to the default when the global file has nothing", () => {
-    const resolved = resolveConfigRow(field("ui.agent_tab_position"), "global", NO_EDITS);
-    expect(resolved.origin).toBe("default");
-    expect(resolved.value).toBe("left");
-  });
-
-  it("a host-only field has no browser-editable value or origin", () => {
+  it("a staged set reads `set here`, whatever the value", () => {
+    /** Setting a value in a scope *is* what "set here" means — including
+     * setting it to the same value the layer below already had, which is why
+     * this is never decided by comparing values. */
     const resolved = resolveConfigRow(
-      field("ui.use_f2_to_leave_terminal_focus"),
+      boolRow({ origin: "global", value: false }),
       "project",
-      NO_EDITS,
+      edits("project", "notifications.on_finish", { kind: "set", value: false }),
     );
-    expect(resolved.value).toBeNull();
-    expect(resolved.origin).toBeNull();
-    expect(resolved.warning).toBeNull();
+    expect(resolved.value).toBe(false);
+    expect(resolved.origin).toBe("set_here");
+    expect(resolved.staged).toBe(true);
+  });
+
+  it("a staged clear reads the host's own inherited value and tag", () => {
+    const resolved = resolveConfigRow(
+      boolRow(),
+      "project",
+      edits("project", "notifications.on_finish", { kind: "clear" }),
+    );
+    expect(resolved.value).toBe(false);
+    expect(resolved.origin).toBe("global");
+  });
+
+  it("an edit staged in one scope does not leak into the other", () => {
+    /** Nothing has been written yet, so the other scope really does still read
+     * what is on disk. Once the save lands the host re-resolves both. */
+    const resolved = resolveConfigRow(
+      boolRow(),
+      "global",
+      edits("project", "notifications.on_finish", { kind: "clear" }),
+    );
+    expect(resolved.origin).toBe("set_here");
+    expect(resolved.staged).toBe(false);
+  });
+
+  it("warns about a routable bind address and stays quiet about loopback", () => {
+    const loopback = resolveConfigRow(textRow("127.0.0.1"), "project", NO_CONFIG_EDITS);
+    expect(loopback.warning).toBeNull();
+    const routable = resolveConfigRow(textRow("0.0.0.0"), "project", NO_CONFIG_EDITS);
+    expect(routable.warning).toBe(ROUTABLE_BIND_WARNING);
+    /** The caution follows the *staged* value, so it appears before the save
+     * rather than after it. */
+    const staged = resolveConfigRow(
+      textRow("127.0.0.1"),
+      "project",
+      edits("project", "web.bind", { kind: "set", value: "192.168.2.14" }),
+    );
+    expect(staged.warning).toBe(ROUTABLE_BIND_WARNING);
   });
 });
 
-describe("D5: the routable-bind warning", () => {
-  it("warns when the resolved bind is not loopback", () => {
-    const resolved = resolveConfigRow(field("web.bind"), "project", NO_EDITS);
-    expect(resolved.value).toBe("0.0.0.0");
-    expect(resolved.warning).not.toBeNull();
+describe("nextConfigValue", () => {
+  it("flips a toggle", () => {
+    const resolved = resolveConfigRow(boolRow(), "project", NO_CONFIG_EDITS);
+    expect(nextConfigValue(resolved)).toBe(false);
   });
 
-  it("is silent once the value resolves to the loopback default", () => {
-    const bind = field("web.bind");
-    const resolved = resolveConfigRow(bind, "project", {
-      [bind.key]: { kind: "clear" },
-    });
-    expect(resolved.value).toBe("127.0.0.1");
-    expect(resolved.warning).toBeNull();
+  it("advances a choice through the host's options and wraps", () => {
+    const row = choiceRow();
+    let resolved = resolveConfigRow(row, "project", NO_CONFIG_EDITS);
+    expect(nextConfigValue(resolved)).toBe("normal");
+    resolved = resolveConfigRow(
+      row,
+      "project",
+      edits("project", row.key, { kind: "set", value: "bright" }),
+    );
+    expect(nextConfigValue(resolved)).toBe("off");
   });
 
-  it("is silent in Global scope, where no override is in play", () => {
-    const resolved = resolveConfigRow(field("web.bind"), "global", NO_EDITS);
-    expect(resolved.value).toBe("127.0.0.1");
-    expect(resolved.warning).toBeNull();
+  it("sets nothing on a text field — `Space` opens its editor instead", () => {
+    const resolved = resolveConfigRow(textRow("127.0.0.1"), "project", NO_CONFIG_EDITS);
+    expect(nextConfigValue(resolved)).toBeNull();
+  });
+
+  it("sets nothing for a choice the host sent no options for", () => {
+    /** A host that offers a choice with an empty option list — no agents
+     * configured, say — is offering nothing to cycle to, and the browser does
+     * not invent one. */
+    const resolved = resolveConfigRow(
+      { ...choiceRow(), choices: [] },
+      "project",
+      NO_CONFIG_EDITS,
+    );
+    expect(nextConfigValue(resolved)).toBeNull();
+  });
+});
+
+describe("stagedChanges", () => {
+  const doc: ConfigDoc = {
+    projectName: "flightdeck",
+    globalPath: "/home/u/.flightdeck/config.toml",
+    projectPath: "/repo/.flightdeck/config.toml",
+    rows: { global: [boolRow(), choiceRow()], project: [boolRow(), choiceRow()] },
+  };
+
+  it("carries each edit's own scope, so one save can write both files", () => {
+    const staged: ConfigEdits = {
+      global: { "ui.mode_border": { kind: "set", value: "bright" } },
+      project: { "notifications.on_finish": { kind: "clear" } },
+    };
+    expect(stagedChanges(doc, staged)).toEqual([
+      { scope: "global", key: "ui.mode_border", value: "bright" },
+      { scope: "project", key: "notifications.on_finish" },
+    ]);
+    expect(stagedCount(staged)).toBe(2);
+  });
+
+  it("is empty when nothing is staged", () => {
+    expect(stagedChanges(doc, NO_CONFIG_EDITS)).toEqual([]);
+    expect(stagedCount(NO_CONFIG_EDITS)).toBe(0);
   });
 });
 
 describe("isLoopbackAddress", () => {
-  it.each(["127.0.0.1", "::1", "localhost", "LOCALHOST"])(
-    "%s is loopback",
-    (address) => {
-      expect(isLoopbackAddress(address)).toBe(true);
-    },
-  );
-
-  it.each(["0.0.0.0", "192.168.1.20", "example.com"])(
-    "%s is not loopback",
-    (address) => {
-      expect(isLoopbackAddress(address)).toBe(false);
-    },
-  );
-});
-
-describe("selectableConfigFields", () => {
-  it("excludes host-only fields", () => {
-    const keys = selectableConfigFields().map((f) => f.key);
-    expect(keys).not.toContain("ui.use_f2_to_leave_terminal_focus");
-    expect(keys.length).toBe(CONFIG_FIELDS.length - 1);
+  it("knows the three spellings and treats everything else as routable", () => {
+    expect(isLoopbackAddress("127.0.0.1")).toBe(true);
+    expect(isLoopbackAddress(" ::1 ")).toBe(true);
+    expect(isLoopbackAddress("LOCALHOST")).toBe(true);
+    expect(isLoopbackAddress("0.0.0.0")).toBe(false);
+    expect(isLoopbackAddress("192.168.2.14")).toBe(false);
   });
 });

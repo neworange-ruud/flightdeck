@@ -25,6 +25,7 @@ import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
 import {
   agoLabel,
+  configDocOf,
   dialogOf,
   gitStatusOf,
   seatOf,
@@ -42,6 +43,7 @@ import {
   type WireDialogView,
   type WireError,
   type WireGeometry,
+  type WireConfiguration,
   type WireGitStatus,
   type WireSeatInfo,
   type WireShutdown,
@@ -922,6 +924,20 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     });
   }
 
+  /**
+   * SPECS §8's configuration manager, in answer to this tab's
+   * `open_configuration` (`remote-control-1p22`, §6.5 R22).
+   *
+   * Per-viewer like `git_status`, and handled the same way: the ack settles the
+   * palette row, this opens the panel with what the command produced. A save
+   * arrives as one of these too — the host applied the edits and re-resolved
+   * the layering, and this frame is that answer, so the panel never repaints
+   * from the browser's own optimism.
+   */
+  function onConfiguration(frame: WireConfiguration): void {
+    store.dispatch({ type: "config/received", doc: configDocOf(frame) });
+  }
+
   function onShutdown(frame: WireShutdown): void {
     const reason = shutdownReason(frame.reason);
     /** Q5: a deliberate quit is a terminal state, not a network failure. Only
@@ -954,6 +970,9 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         return;
       case "git_status":
         onGitStatus(frame as WireGitStatus);
+        return;
+      case "configuration":
+        onConfiguration(frame as WireConfiguration);
         return;
       case "error":
         onError(frame as WireError);

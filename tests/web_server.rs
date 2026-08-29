@@ -4044,6 +4044,18 @@ fn the_dialog_row_that_still_refuses_says_which_task_owns_it() {
         "the first dispatch asks; 1g's second step guards the answer"
     );
 
+    // And SPECS §8's configuration manager, which left this test in
+    // `remote-control-1p22` for the reason R22 states: the panel is still the
+    // browser's own, but what it draws is a read of two files on the host's
+    // disk, so the row forwards and the host answers the asker with
+    // `ServerMsg::Configuration`. It is a `Route::Config` row rather than a
+    // forwarding one because its `args` are the browser's staged edits.
+    on_runtime(command(&mut ws, 76, names::OPEN_CONFIGURATION));
+    let (_, _, forwarded) = wait_for_command(&harness);
+    assert_eq!(forwarded.name, names::OPEN_CONFIGURATION);
+    let spec = commands::lookup(&forwarded.name).expect("a forwarded name is a known name");
+    assert_eq!(spec.route, commands::Route::Config);
+
     // Still alive, like any other refusal.
     on_runtime(command(&mut ws, 74, names::REQUEST_SNAPSHOT));
     on_runtime(await_snapshot(&mut ws));

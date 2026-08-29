@@ -1,40 +1,42 @@
-import { CONFIG_FIELDS, resolveConfigRow } from "../state/config";
-import type { ConfigField, ConfigOrigin, ResolvedConfigRow } from "../state/config";
+import { resolveConfigRow, stagedCount } from "../state/config";
+import type { ConfigOrigin, ResolvedConfigRow } from "../state/config";
 import type { AppState, ConfigOutcome, ConfigState } from "../state/types";
 import { clear, el, hint, hostOnlyBadge } from "./dom";
 import type { Region } from "./dom";
 import type { Store } from "./store";
 
 /**
- * Artboard `1f — CONFIGURATION MANAGER` (`remote-control-ll5.6`), lines
- * 1381-1433 of `specs/design/flightdeck-web-turn2.dc.html`. Opened by the
- * palette's "Open Configuration" row (`ui/app.ts`'s `runCommand`), closed by
- * `Esc`.
+ * Artboard `1f — CONFIGURATION MANAGER` (`remote-control-ll5.6`, rebuilt on
+ * host state in `remote-control-1p22`), lines 611-663 of
+ * `specs/design/flightdeck-web-turn1.dc.html`. Opened by the palette's
+ * "Open Configuration" row — which is *sent to the host*, and the panel appears
+ * when `ServerMsg::Configuration` answers it — and closed by `Esc`.
  *
- * Same split as `ui/commandPalette.ts`: `state/config.ts` owns the curated
- * inventory and the origin-attribution logic; this module only ever renders
- * `state.config` and `resolveConfigRow`'s answer for each field. `Tab`/`↑↓`/
- * `c`/`s`/`Esc` are handled in `ui/app.ts`'s keydown listener, the same place
- * every other overlay's keyboard lives — this component only wires row clicks
- * (`config/select`), which is the mouse half of the same action `↑↓` drives.
+ * Same split as `ui/commandPalette.ts`: `state/config.ts` owns the shapes and
+ * the staged-edit arithmetic; this module only ever renders `state.config.doc`
+ * and `resolveConfigRow`'s answer for each row. `Space`/`Tab`/`↑↓`/`c`/`s`/`Esc`
+ * are handled in `ui/app.ts`'s keydown listener, the same place every other
+ * overlay's keyboard lives — this component only wires row clicks
+ * (`config/select`), which is the mouse half of the action `↑↓` drives.
  *
- * ## What is deliberately not here
+ * ## Every row here is the host's
  *
- * The dialog family, git commands, the palette itself and split-view
- * toggling are each a separate M2 task. Nor is a `Space`-driven "set a new
- * value" edit: SPECS §8 and the ll5.6 brief both name `Tab`/`c`/`s`/`e` as the
- * behaviour this task builds; only `c` (clear a project override) changes a
- * value, and it does so locally (staged in `state.config.edits`) until `s`
- * turns the whole staged set into one `save_config` command.
+ * There is no field list in this file and none in `state/config.ts`. The rows,
+ * their labels, their TOML keys, their values, a choice's options and all three
+ * origin tags arrive on the wire, resolved by the very `ConfigManager` the
+ * desktop's own overlay is drawn from (§6.5 R22). What this module adds is 1f's
+ * *presentation* of them — `[x]`, `‹bright›`, `(set here)` — plus two notes the
+ * design owns and the host has no opinion about: the relay's rate limit, and
+ * D5's caution when the bind address is not loopback.
  *
  * ## Saving follows the host's `Ack`, never optimism
  *
  * Pressing `s` does not clear "Unsaved changes" or repaint origin tags as if
  * the save succeeded. It adds a `pending` entry (`config/dispatched`) and
- * everything renders exactly as it did until `command/result` arrives — a
- * real `Ack` (`applied`/`rejected`/`ignored`) or the read-only refusal — at
- * which point `renderStatus` below is the only thing that changes, and the
- * staged edits are only cleared on `applied`.
+ * everything renders exactly as it did until `command/result` arrives — a real
+ * `Ack` (`applied`/`rejected`/`ignored`) or the read-only refusal — at which
+ * point the staged edits are cleared only on `applied`, and the *rows* are
+ * repainted only by the `configuration` frame the host sends beside it.
  */
 export function createConfigManager(store: Store): Region {
   const scopeTabs = el("span", { class: "fd-config__scopes" });
@@ -76,8 +78,9 @@ export function createConfigManager(store: Store): Region {
       ),
       el("div", { class: "fd-config__foot" }, [
         hint("↑↓", "move"),
-        hint("c", "clear override"),
+        hint("Space", "toggle / edit"),
         hint("Tab", "switch scope"),
+        hint("c", "clear override"),
         hint("s", "save"),
         el("span", { class: "fd-config__editor-hint" }, [
           el("span", { class: "fd-key", text: "e" }),
@@ -105,29 +108,32 @@ export function createConfigManager(store: Store): Region {
       return;
     }
 
-    renderScope(state, config);
+    renderScope(config);
     renderRows(config);
     renderStatus(config.pending, config.lastOutcome);
-    unsavedEl.hidden = Object.keys(config.edits).length === 0;
+    unsavedEl.hidden = stagedCount(config.edits) === 0;
   }
 
-  function renderScope(state: AppState, config: ConfigState): void {
-    const projectName =
-      state.projects.find((p) => p.id === state.selection?.projectId)?.name ??
-      null;
+  /**
+   * The scope tabs and the file being edited, both from the host's answer —
+   * the project's name included, so the tab says which project the override
+   * file belongs to rather than the browser guessing from the selection.
+   */
+  function renderScope(config: ConfigState): void {
     clear(scopeTabs);
     scopeTabs.append(
       scopeTab("global", "Global", config.scope === "global"),
       scopeTab(
         "project",
-        projectName === null ? "Project" : `Project (${projectName})`,
+        `Project (${config.doc.projectName})`,
         config.scope === "project",
       ),
     );
     pathEl.textContent =
       config.scope === "global"
-        ? "~/.flightdeck/config.toml"
-        : "<repo>/.flightdeck/config.toml";
+        ? (config.doc.globalPath ??
+          "no home directory on the host — there is no global base to edit")
+        : config.doc.projectPath;
   }
 
   function scopeTab(
@@ -151,19 +157,21 @@ export function createConfigManager(store: Store): Region {
 
   function renderRows(config: ConfigState): void {
     clear(body);
-    for (const field of CONFIG_FIELDS) {
-      const resolved = resolveConfigRow(field, config.scope, config.edits);
-      body.append(row(field, resolved, config.selectedKey === field.key));
+    for (const row of config.doc.rows[config.scope]) {
+      const resolved = resolveConfigRow(row, config.scope, config.edits);
+      const selected = config.selectedKey === row.key;
+      const editing = selected ? config.editing : null;
+      body.append(rowEl(resolved, selected, editing));
       if (resolved.warning !== null) {
         body.append(noteBar(resolved.warning, "fd-config__note--inline"));
       }
     }
   }
 
-  function row(
-    field: ConfigField,
+  function rowEl(
     resolved: ResolvedConfigRow,
     selected: boolean,
+    editing: string | null,
   ): HTMLElement {
     const cursor = el("span", {
       class: "fd-config__cursor",
@@ -172,38 +180,39 @@ export function createConfigManager(store: Store): Region {
     });
     const value = el("span", {
       class: "fd-config__value",
-      text: valueText(field, resolved),
+      text: valueText(resolved, editing),
       attrs: {
-        "data-kind": field.kind,
-        "data-checked": String(field.kind === "toggle" && resolved.value === true),
+        "data-kind": resolved.row.kind,
+        "data-checked": String(
+          resolved.row.kind === "bool" && resolved.value === true,
+        ),
+        "data-editing": String(editing !== null),
       },
     });
-    const label = el("span", { class: "fd-config__label", text: field.label });
-    const origin = originCell(resolved.origin);
+    const label = el("span", {
+      class: "fd-config__label",
+      text: resolved.row.label,
+    });
 
-    const rowEl = el(
+    const el_ = el(
       "div",
       {
         class: "fd-config__row",
         attrs: {
           "data-selected": String(selected),
-          "data-host-only": String(field.hostOnly === true),
+          "data-staged": String(resolved.staged),
+          "data-key": resolved.row.key,
         },
       },
-      [cursor, value, label, origin],
+      [cursor, value, label, originCell(resolved.origin)],
     );
-    if (field.hostOnly !== true) {
-      rowEl.addEventListener("click", () => {
-        store.dispatch({ type: "config/select", key: field.key });
-      });
-    }
-    return rowEl;
+    el_.addEventListener("click", () => {
+      store.dispatch({ type: "config/select", key: resolved.row.key });
+    });
+    return el_;
   }
 
-  function originCell(origin: ConfigOrigin | null): HTMLElement {
-    if (origin === null) {
-      return el("span", { class: "fd-config__origin" }, [hostOnlyBadge()]);
-    }
+  function originCell(origin: ConfigOrigin): HTMLElement {
     return el("span", {
       class: "fd-config__origin",
       text: originText(origin),
@@ -246,14 +255,19 @@ function noteBar(text: string, modifier?: string): HTMLElement {
   );
 }
 
-function valueText(field: ConfigField, resolved: ResolvedConfigRow): string {
-  if (resolved.value === null) {
-    return "—";
+/**
+ * 1f's value column. `editing` is the in-progress buffer for an open inline
+ * edit, drawn with the same block cursor the desktop's overlay appends — the
+ * two surfaces show a half-typed relay URL the same way.
+ */
+function valueText(resolved: ResolvedConfigRow, editing: string | null): string {
+  if (editing !== null) {
+    return `${editing}█`;
   }
-  if (field.kind === "toggle") {
+  if (resolved.row.kind === "bool") {
     return resolved.value === true ? "[x]" : "[ ]";
   }
-  if (field.kind === "choice") {
+  if (resolved.row.kind === "choice") {
     return `‹${String(resolved.value)}›`;
   }
   return String(resolved.value);
@@ -273,7 +287,9 @@ function originText(origin: ConfigOrigin): string {
 function statusText(outcome: ConfigOutcome): string {
   switch (outcome.outcome) {
     case "applied":
-      return "Saved";
+      /** The host's own word (`Saved.`) when it sent one; the ack for a plain
+       * open carries no detail, and there is nothing to report about it. */
+      return outcome.detail ?? "Saved";
     case "rejected":
       return outcome.detail === null ? "Save rejected" : `Save rejected — ${outcome.detail}`;
     case "ignored":

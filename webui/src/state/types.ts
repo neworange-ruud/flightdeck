@@ -20,7 +20,7 @@ import type {
   VersionMismatch,
 } from "./model";
 import { shouldRetry } from "./model";
-import type { ConfigEdit, ConfigScope } from "./config";
+import type { ConfigDoc, ConfigEdits, ConfigScope } from "./config";
 import type { ViewportWidth } from "./viewport";
 import type {
   ConfirmGate,
@@ -302,8 +302,16 @@ export interface AppState {
    * chord that opens it (§5), and it is the only chord the app claims. */
   readonly palette: PaletteState | null;
 
-  /** Artboard 1f (`remote-control-ll5.6`). `null` when the configuration
-   * manager is closed — opened by the palette's "Open Configuration" row. */
+  /**
+   * Artboard 1f (`remote-control-ll5.6`, rebuilt on host state in
+   * `remote-control-1p22`). `null` when the configuration manager is closed.
+   *
+   * Like `readOnly`'s git-status panel and unlike the other overlays, this one
+   * cannot be opened empty: the palette's "Open Configuration" row is sent to
+   * the host, and the panel appears when `ServerMsg::Configuration` answers it
+   * (§6.5 R22). There is no state in which it is open and showing rows nobody
+   * sent.
+   */
   readonly config: ConfigState | null;
 
   /**
@@ -375,7 +383,8 @@ export type ReadOnlyOverlay =
   | { readonly kind: "about" }
   | { readonly kind: "git_status"; readonly panel: GitStatusPanel };
 
-/** A `save_config` command this browser sent and has not heard back about. */
+/** An `open_configuration` command this browser sent and has not heard back
+ * about. */
 export interface PendingConfigSave {
   readonly seq: number;
 }
@@ -389,17 +398,31 @@ export interface ConfigOutcome {
 
 /** Artboard 1f's whole overlay state. */
 export interface ConfigState {
+  /**
+   * The host's answer: both scopes' rows, the two file paths, the project name.
+   * Replaced wholesale every time one arrives, because it is a fresh read of
+   * the host's disk and a merge would be this browser deciding which half of
+   * two reads to believe.
+   */
+  readonly doc: ConfigDoc;
   /** `Tab` switches between these two (SPECS §8's configuration manager). */
   readonly scope: ConfigScope;
-  /** `↑↓` moves this among `selectableConfigFields()`; `c` acts on it. */
+  /** `↑↓` moves this among the host's rows; `Space`/`c` act on it. */
   readonly selectedKey: string;
   /**
-   * Local, unsaved edits — keyed by `ConfigField.key`. `s` turns this into a
-   * `save_config` command; a real `applied` `Ack` is what clears it, never
-   * the keypress itself (requirement 5: no optimism). Non-empty is what 1f's
+   * Local, unsaved edits, per scope and keyed by the host's own `ConfigRow.key`.
+   * `s` turns them into one `open_configuration` frame; a real `applied` `Ack`
+   * is what clears them, never the keypress itself. Non-empty is what 1f's
    * "Unsaved changes" banner renders on.
    */
-  readonly edits: Readonly<Record<string, ConfigEdit>>;
+  readonly edits: ConfigEdits;
+  /**
+   * The in-progress buffer for an open inline text edit, or `null` when none
+   * is open — the browser's half of `ConfigManager::editing`, and the same
+   * shape: `Enter` commits it into `edits`, `Esc` throws it away, and moving
+   * the cursor discards it exactly as `select_next` does on the desktop.
+   */
+  readonly editing: string | null;
   /** Almost always at most one, for the same reason `PaletteState.pending` is
    * a list: nothing stops a second `s` before the first save's `Ack` lands. */
   readonly pending: readonly PendingConfigSave[];
@@ -796,25 +819,50 @@ export type AppAction =
       readonly detail?: string;
     }
 
-  /* --- Configuration manager (1f, remote-control-ll5.6) ------------------ */
+  /* --- Configuration manager (1f, remote-control-ll5.6/1p22) ------------- */
 
-  /** Opened by the palette's "Open Configuration" row. Always opens on
-   * Project scope, matching 1f's own default. */
-  | { readonly type: "config/open" }
+  /**
+   * The host answered an `open_configuration` frame (`ServerMsg::Configuration`).
+   * Opens the panel if it was closed — always on Project scope, matching 1f's
+   * own default — and otherwise replaces the rows in place, which is how a save
+   * repaints from the host.
+   *
+   * There is deliberately no `config/open` a component could dispatch. This
+   * panel draws the host's two config files, and a browser that opened it from
+   * nothing would have to invent them; that is precisely the defect
+   * `remote-control-1p22` fixed.
+   */
+  | { readonly type: "config/received"; readonly doc: ConfigDoc }
   | { readonly type: "config/close" }
-  /** `Tab`. */
+  /** `Tab`. Discards an open inline edit, exactly as the desktop's does. */
   | { readonly type: "config/scope" }
   /** `↑↓`. `delta` is `-1`/`+1`, clamped like the palette's own `move`. */
   | { readonly type: "config/move"; readonly delta: number }
   /** A row was clicked directly — same destination as `config/move`, without
    * requiring the keyboard to get there first. */
   | { readonly type: "config/select"; readonly key: string }
-  /** `c`: clears the *project* override on the selected field, staged locally
-   * until `s` saves it. A no-op in Global scope, or on a field with nothing to
-   * clear — SPECS §8 ties `c` to a *project* override specifically. */
+  /**
+   * `Space` (or `Enter`) on the selected row — `toggle_selected`, as one
+   * action, because it is one key.
+   *
+   * Which of its two acts happens is decided by the **host's** `kind` for the
+   * row, never by a list here: a toggle or a choice stages the value that comes
+   * next in the host's own options, and a text field opens the inline editor
+   * seeded with the value in effect.
+   */
+  | { readonly type: "config/activate" }
+  /** `c`: stages a clear of the selected field's override in the active scope,
+   * so the value re-inherits (SPECS §8). Both scopes, as on the desktop —
+   * clearing in Global scope drops to the shipped default. */
   | { readonly type: "config/clear" }
-  /** `s` sent the staged edits as a `save_config` command and the transport
-   * assigned it `seq` — mirrors `palette/dispatched`. */
+  /** A printable character, a `Backspace`, `Enter` and `Esc` — the desktop's
+   * `handle_config_key` editing branch, key for key. */
+  | { readonly type: "config/editType"; readonly char: string }
+  | { readonly type: "config/editBackspace" }
+  | { readonly type: "config/editCommit" }
+  | { readonly type: "config/editCancel" }
+  /** `s` sent the staged edits as an `open_configuration` frame and the
+   * transport assigned it `seq` — mirrors `palette/dispatched`. */
   | {
       readonly type: "config/dispatched";
       readonly seq: number;

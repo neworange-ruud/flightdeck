@@ -44,8 +44,16 @@
  * are additive optional fields, and a host that sends neither leaves this tab
  * rendering its "did not send its keybindings" path, which is a lesser panel
  * rather than a wrong one.
+ *
+ * **v4 adds `configuration`** (`remote-control-1p22`), the same argument one
+ * step along. A v4 host lists `open_configuration` as a row that *runs* — it
+ * used to refuse — so a stale v3 tab would send it, be acked `applied`, and
+ * then drop the panel on `handle`'s `default` branch: an ack and no
+ * configuration manager. The staged edits that travel the other way did not
+ * contribute, because they ride inside `Command.args`, which has been
+ * free-form since v1.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -383,6 +391,54 @@ export interface WireGitStatus {
   readonly compare_url?: string | null;
 }
 
+/**
+ * SPECS §8's configuration manager, in answer to one viewer's
+ * `open_configuration` (`remote-control-1p22`, `specs/WEB_INTERFACE.md`
+ * §6.5 R22).
+ *
+ * A per-viewer reply like `git_status`, and for the same reason: the two
+ * config files live on the host's disk and change under it, so this is a read
+ * taken at the moment the panel opens rather than something a snapshot could
+ * hold static or a delta could describe. One reader opened the manager, so one
+ * reader is answered.
+ *
+ * **Both scopes ride in one frame.** Artboard 1f's `Tab` switches between them
+ * and the origin tag column is the whole point of the screen, so the host
+ * resolves the layering twice and sends both lists — the browser never walks a
+ * layer itself.
+ */
+export interface WireConfiguration {
+  readonly type: "configuration";
+  readonly seq: number;
+  readonly project_name: string;
+  /** `null` when the host has no home directory to keep a global base in. */
+  readonly global_path?: string | null;
+  readonly project_path: string;
+  readonly project_rows: readonly WireConfigRow[];
+  readonly global_rows: readonly WireConfigRow[];
+}
+
+/** A config value is the JSON shape `config.toml` holds — a bare bool or a
+ * bare string — so nothing has to be unwrapped before it can be drawn. */
+export type WireConfigValue = boolean | string;
+
+/** One curated setting resolved for one scope (`protocol::ConfigRowView`). */
+export interface WireConfigRow {
+  /** The host's real TOML path, `section.key`. What a staged edit names. */
+  readonly key: string;
+  readonly label: string;
+  readonly kind: "bool" | "choice" | "text";
+  readonly value: WireConfigValue;
+  /** For `kind: "choice"`, the host's own cycle order; absent otherwise. */
+  readonly choices?: readonly string[];
+  readonly origin: "set_here" | "global" | "default";
+  /** What this row would read if the override in *this* scope were cleared —
+   * the host's answer to `c`, so a browser staging one need not resolve a
+   * layer to show what it will produce. */
+  readonly inherited: WireConfigValue;
+  readonly inherited_origin: "set_here" | "global" | "default";
+}
+
 export interface WireSnapshot {
   readonly type: "snapshot";
   readonly protocol_version: number;
@@ -495,6 +551,7 @@ export type ServerFrame =
   | WireError
   | WireShutdown
   | WireGitStatus
+  | WireConfiguration
   | WireDeltaEnvelope
   | { readonly type: string };
 

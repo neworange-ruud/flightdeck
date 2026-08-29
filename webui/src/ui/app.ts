@@ -10,10 +10,12 @@ import {
 } from "../state/dialog";
 import { highlightedCommand } from "../state/commands";
 import type { PaletteCommand } from "../state/commands";
+import { stagedChanges } from "../state/config";
 import type { ConfigSaveRequest } from "../state/config";
 import { createInitialState } from "../state/types";
 import type { AppAction, AppState } from "../state/types";
 import type { StripAction } from "../state/connection";
+import { findProject, findSession } from "../state/model";
 import type { ActivityEvent } from "../state/model";
 import { createAccessScreen } from "./accessScreen";
 import { createActivityFeed } from "./activityFeed";
@@ -110,8 +112,10 @@ export interface AppOptions {
    * `s` inside the configuration manager (1f, `remote-control-ll5.6`).
    * Sending the frame and finding out what happened to it are both outside
    * this component's remit, same as `onRunCommand` — `main.ts` calls
-   * `SessionSocket.sendCommand(SAVE_CONFIG_COMMAND, request)`, gets back the
-   * seq the transport assigned, and dispatches `config/dispatched` with it.
+   * `SessionSocket.sendCommand(OPEN_CONFIGURATION_COMMAND, request)`, gets
+   * back the seq the transport assigned, and dispatches `config/dispatched`
+   * with it. The host's answer is a fresh `configuration` frame, which is what
+   * repaints the rows (§6.5 R22).
    */
   readonly onSaveConfig?: (request: ConfigSaveRequest) => void;
   /**
@@ -505,6 +509,50 @@ export function createApp(options: AppOptions): App {
     }
 
     /**
+     * 1b's `↑↓ move`, 2e's `↑↓ sessions`, and 1h's *"bare-key App-mode nav
+     * (`↑↓ ←→ ? Enter`) survives untouched"* — three artboards printing one
+     * route that nothing was bound to (`remote-control-qlza`, §6.5 R23). The
+     * sidebar was pointer-only, so the footer under it named a key that did
+     * nothing.
+     *
+     * **App mode only**, which is not a hedge but §5's own line: in Terminal
+     * mode the arrows are the agent's — history, menus, `less` — and the app
+     * has no business reading them there. The gate is the same one `a`, `s`
+     * and `?` already sit behind.
+     *
+     * It dispatches `selection/session`, the *click's* action, so the desktop
+     * moves with it (D3) rather than the browser growing a second, local
+     * notion of which session is selected.
+     */
+    if (
+      isPlain(event) &&
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      state.mode === "app"
+    ) {
+      event.preventDefault();
+      moveSession(state, event.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
+
+    /**
+     * 1c's `←/→ move focus`, bound at last — same reasoning as the row above,
+     * and the same App-mode gate for the same §5 reason. 1c draws split view
+     * with `MODE: TERMINAL`; the resolution is in `statusBar.ts`'s `hintsFor`,
+     * which stops printing the keys where they are not ours rather than taking
+     * arrows the agent is waiting for.
+     */
+    if (
+      isPlain(event) &&
+      (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
+      state.mode === "app" &&
+      state.layout === "split"
+    ) {
+      event.preventDefault();
+      moveSplitFocus(state, event.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
+
+    /**
      * 2c's `r Retry now`, gated on the one state that offers it. `r` is a
      * letter, so it may only be claimed where nothing is listening for letters
      * — and `disconnected` is by definition that: "nothing you type will
@@ -695,36 +743,22 @@ export function createApp(options: AppOptions): App {
    * `AppOptions.onRunCommand`. */
   function runCommand(command: PaletteCommand): void {
     /**
-     * "Open Configuration" (1f, `remote-control-ll5.6`) never leaves the
-     * browser — same as `Ctrl-g` opening *this* palette, it is a local UI
-     * toggle, not a `Command` frame. The palette closes as it hands off, so
-     * only one full-screen overlay is ever up at once.
+     * Help and About are intercepted (`remote-control-ll5.8`): their content is
+     * already on the snapshot (`Snapshot::help` / `Snapshot::about`), so the
+     * answer is in hand and a round trip would buy nothing — while
+     * *forwarding* the row would open a panel on the desktop that the person
+     * who asked cannot read. The host's own refusals (`HELP_REFUSAL`,
+     * `ABOUT_REFUSAL`) say the same thing, which is what keeps this local
+     * interception honest rather than a shortcut: a host that stops offering
+     * the name stops offering the panel, because the *row* is still the host's
+     * like every other (R7).
      *
-     * The *row* is still the host's, like every other row
-     * (`remote-control-ll5.12`): a host that stops offering the name stops
-     * offering the manager. This is only about where the answer comes from —
-     * and the host's own refusal for the name says the same thing, that the
-     * configuration manager is a browser surface of its own.
-     */
-    if (command.id === "open_configuration") {
-      store.dispatch({ type: "palette/close" });
-      store.dispatch({ type: "config/open" });
-      return;
-    }
-    /**
-     * Help and About, for "Open Configuration"'s reason exactly
-     * (`remote-control-ll5.8`): their content is already on the snapshot
-     * (`Snapshot::help` / `Snapshot::about`), so the answer is in hand and a
-     * round trip would buy nothing — while *forwarding* the row would open a
-     * panel on the desktop that the person who asked cannot read. The host's
-     * own refusals (`HELP_REFUSAL`, `ABOUT_REFUSAL`) say the same thing, which
-     * is what keeps this local interception honest rather than a shortcut: a
-     * host that stops offering the name stops offering the panel, because the
-     * *row* is still the host's like every other (R7).
-     *
-     * `show_git_status` is deliberately **not** here. It is the one read-only
-     * panel whose facts the browser does not have, so it goes to the host like
-     * any other command and the panel opens when the answer arrives.
+     * Two rows are deliberately **not** here, and they are the two whose facts
+     * the browser does not have. `show_git_status` goes to the host like any
+     * other command and the panel opens when the answer arrives; so does
+     * `open_configuration` as of `remote-control-1p22`, because SPECS §8's
+     * layering is a read of two files on the host's disk and a browser that
+     * drew it locally would be drawing nobody's machine (§6.5 R22).
      */
     if (command.id === "show_help") {
       store.dispatch({ type: "help/open" });
@@ -778,14 +812,39 @@ export function createApp(options: AppOptions): App {
   }
 
   /**
-   * 1f: `↑↓` move, `Tab` switch scope, `c` clear a project override, `s`
-   * save, `Esc` close. `e` is claimed and swallowed — the footer's `host
-   * only` badge is the whole story from a browser (D16); there is nothing
-   * for this build to run.
+   * 1f: `↑↓` move, `Space` toggle or open the inline editor, `Tab` switch
+   * scope, `c` clear the override, `s` save, `Esc` close. `e` is claimed and
+   * swallowed — the footer's `host only` badge is the whole story from a
+   * browser (D16); `$EDITOR` opens on the host's screen.
+   *
+   * `Space` is bound as of `remote-control-1p22`. 1f's footer has promised
+   * `Space toggle / edit` since turn 1 and nothing was listening; it does the
+   * same two things the desktop's `Space` does, because it stages the value the
+   * host's own field definition says comes next and opens an editor seeded with
+   * the value in effect.
    */
   function configKey(event: KeyboardEvent, state: AppState): boolean {
-    if (state.config === null || !isPlain(event)) {
+    const config = state.config;
+    if (config === null || !isPlain(event)) {
       return false;
+    }
+    /** An open inline edit takes the keyboard whole, exactly as it does in
+     * `handle_config_key`: type to insert, `Backspace` to delete, `Enter` to
+     * commit, `Esc` to discard — and nothing else fires until it is resolved,
+     * so `s` cannot save half a relay URL and `Tab` cannot carry it into the
+     * other scope. */
+    if (config.editing !== null) {
+      event.preventDefault();
+      if (event.key === "Escape") {
+        store.dispatch({ type: "config/editCancel" });
+      } else if (event.key === "Enter") {
+        store.dispatch({ type: "config/editCommit" });
+      } else if (event.key === "Backspace") {
+        store.dispatch({ type: "config/editBackspace" });
+      } else if (event.key.length === 1) {
+        store.dispatch({ type: "config/editType", char: event.key });
+      }
+      return true;
     }
     if (event.key === "Escape") {
       event.preventDefault();
@@ -805,6 +864,15 @@ export function createApp(options: AppOptions): App {
     if (event.key === "ArrowDown") {
       event.preventDefault();
       store.dispatch({ type: "config/move", delta: 1 });
+      return true;
+    }
+    /** One key, two acts, exactly as `toggle_selected` has them: a toggle or a
+     * choice takes its next value; a text field opens the editor. Which of the
+     * two happens is decided by the *host's* `kind` for the row — the reducer
+     * asks it, and neither branch is a list this browser keeps. */
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      store.dispatch({ type: "config/activate" });
       return true;
     }
     if (event.key === "c") {
@@ -945,24 +1013,26 @@ export function createApp(options: AppOptions): App {
   }
 
   /**
-   * Turns whatever is staged in `state.config.edits` into one `save_config`
-   * command. A no-op with nothing staged: `s` on a config that was never
-   * touched has nothing honest to send, and sending an empty change set would
-   * still cost a round trip to say so.
+   * Turns whatever is staged in `state.config.edits` into one
+   * `open_configuration` frame. A no-op with nothing staged: `s` on a config
+   * that was never touched has nothing honest to send, and an empty change set
+   * would cost a round trip to be told so.
+   *
+   * Both scopes travel in one frame, because the desktop's `s` writes both
+   * dirty files — each change carries the scope it belongs to
+   * (`stagedChanges`), so a browser is not the lesser manager wearing the same
+   * footer.
    */
   function saveConfig(): void {
     const config = store.getState().config;
     if (config === null) {
       return;
     }
-    const changes = Object.entries(config.edits).map(([key, edit]) => ({
-      key,
-      action: edit.kind,
-    }));
+    const changes = stagedChanges(config.doc, config.edits);
     if (changes.length === 0) {
       return;
     }
-    options.onSaveConfig?.({ scope: config.scope, changes });
+    options.onSaveConfig?.({ changes });
   }
 
   /** 2e's footer: `a close`. `Esc` closes it too — it is a slide-over, and
@@ -1001,6 +1071,64 @@ export function createApp(options: AppOptions): App {
       return true;
     }
     return false;
+  }
+
+  /**
+   * The sidebar's `↑↓`, in the one shape the sidebar's own click already uses.
+   *
+   * **It clamps, it does not wrap.** Selection is instance-wide (D3), so a
+   * wrap would carry the desktop from the last agent back to the first on a
+   * keystroke meant to do nothing — a surprise that costs more than the
+   * keypress saves. Movement is within the selected project only, which is
+   * what `selection/session` accepts; crossing projects is `selection/jump`'s
+   * job and belongs to the feed row that names another project by name.
+   */
+  function moveSession(state: AppState, delta: number): void {
+    const selection = state.selection;
+    if (selection === null) {
+      return;
+    }
+    const sessions =
+      findProject(state.projects, selection.projectId)?.sessions ?? [];
+    const index = sessions.findIndex((s) => s.id === selection.sessionId);
+    const next = index === -1 ? undefined : sessions[index + delta];
+    if (next === undefined) {
+      return;
+    }
+    store.dispatch({ type: "selection/session", sessionId: next.id });
+  }
+
+  /**
+   * 1c's `←/→`, dispatching exactly the pair a click on a column dispatches
+   * (`ui/splitView.ts`): the focused column *and* the selected terminal, which
+   * is one fact told to two places. Clamped at both ends for `moveSession`'s
+   * reason — and because a column index outside the session's terminals would
+   * focus a column that is not on screen.
+   */
+  function moveSplitFocus(state: AppState, delta: number): void {
+    const selection = state.selection;
+    const session =
+      selection === null
+        ? null
+        : findSession(state.projects, selection.projectId, selection.sessionId);
+    const columns = session?.terminals.length ?? 0;
+    if (session === null || columns === 0) {
+      return;
+    }
+    /**
+     * Clamped into range *before* stepping. Moving to a session with fewer
+     * terminals leaves `splitFocus` past the last column it drew, and an arrow
+     * that silently did nothing there would be the very defect this binding
+     * was written to remove.
+     */
+    const from = Math.min(state.splitFocus, columns - 1);
+    const column = Math.min(Math.max(from + delta, 0), columns - 1);
+    const terminal = session.terminals[column];
+    if (terminal === undefined || column === state.splitFocus) {
+      return;
+    }
+    store.dispatch({ type: "split/focus", column });
+    store.dispatch({ type: "selection/terminal", terminalId: terminal.id });
   }
 
   /**

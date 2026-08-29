@@ -299,6 +299,50 @@ fn git_status_view() -> GitStatusView {
     }
 }
 
+/// SPECS §8's configuration manager with both scopes, all three field kinds
+/// and all three origin tags populated, so the round trip cannot skip one
+/// (`remote-control-1p22`, §6.5 R22).
+fn config_view() -> ConfigView {
+    ConfigView {
+        seq: 12,
+        project_name: "flightdeck".into(),
+        global_path: Some("/home/u/.flightdeck/config.toml".into()),
+        project_path: "/repo/.flightdeck/config.toml".into(),
+        project_rows: vec![
+            ConfigRowView {
+                key: "notifications.on_finish".into(),
+                label: "Notify when finished".into(),
+                kind: ConfigFieldKind::Bool,
+                value: ConfigValue::Bool(true),
+                choices: Vec::new(),
+                origin: ConfigOrigin::SetHere,
+                inherited: ConfigValue::Bool(false),
+                inherited_origin: ConfigOrigin::Global,
+            },
+            ConfigRowView {
+                key: "ui.mode_border".into(),
+                label: "Mode border".into(),
+                kind: ConfigFieldKind::Choice,
+                value: ConfigValue::Text("bright".into()),
+                choices: vec!["off".into(), "dim".into(), "normal".into(), "bright".into()],
+                origin: ConfigOrigin::Global,
+                inherited: ConfigValue::Text("off".into()),
+                inherited_origin: ConfigOrigin::Default,
+            },
+        ],
+        global_rows: vec![ConfigRowView {
+            key: "web.bind".into(),
+            label: "Web interface bind address".into(),
+            kind: ConfigFieldKind::Text,
+            value: ConfigValue::Text("127.0.0.1".into()),
+            choices: Vec::new(),
+            origin: ConfigOrigin::Default,
+            inherited: ConfigValue::Text("127.0.0.1".into()),
+            inherited_origin: ConfigOrigin::Default,
+        }],
+    }
+}
+
 /// Every [`ServerMsg`] variant except the `Unrecognized` catch-all, which is
 /// deserialize-only by design and covered by the forward-compat tests.
 fn all_server_msgs() -> Vec<ServerMsg> {
@@ -317,6 +361,7 @@ fn all_server_msgs() -> Vec<ServerMsg> {
         }),
         ServerMsg::Error(WireError::seat_held(seat_info())),
         ServerMsg::GitStatus(git_status_view()),
+        ServerMsg::Configuration(config_view()),
         ServerMsg::Shutdown {
             reason: ShutdownReason::HostQuit,
             self_initiated: true,
@@ -432,25 +477,27 @@ fn ids_are_plain_json_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn protocol_version_is_three_and_the_whole_supported_range() {
+fn protocol_version_is_four_and_the_whole_supported_range() {
     // v2 was D14 as revised: `Seat` and `SeatRequest` are closed vocabularies
-    // and both grew a member the peer must understand. **v3 is
-    // `ServerMsg::GitStatus`** (`remote-control-ll5.8`), a frame kind growing a
-    // member — the same clause, applied to the same kind of vocabulary.
+    // and both grew a member the peer must understand. **v3 was
+    // `ServerMsg::GitStatus`** (`remote-control-ll5.8`) and **v4 is
+    // `ServerMsg::Configuration`** (`remote-control-1p22`) — a frame kind
+    // growing a member, twice, which is the same clause applied to the same
+    // kind of vocabulary.
     //
     // The `#[serde(other)]` catch-all on `ServerMsg` is what makes a stale tab
     // *survive* an unknown frame; it is not what makes the frame safe to add
     // without a bump. Here it would be actively harmful: the palette is
-    // host-driven (R7), so a v2 tab would be handed the `show_git_status` row
-    // by a v3 host, send it, have it accepted, and then drop the answer — a
+    // host-driven (R7), so a v3 tab would be handed the `open_configuration`
+    // row by a v4 host, send it, have it accepted, and then drop the answer — a
     // button that does nothing, with no error anywhere.
     //
     // There is still no range, because server and SPA ship in one binary (D9)
     // and a stale tab is told to reload rather than served a half-spoken
     // protocol.
-    assert_eq!(PROTOCOL_VERSION, 3);
-    assert_eq!(MIN_SUPPORTED_VERSION, 3);
-    assert_eq!(MAX_SUPPORTED_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(MIN_SUPPORTED_VERSION, 4);
+    assert_eq!(MAX_SUPPORTED_VERSION, 4);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -466,10 +513,10 @@ fn protocol_version_is_three_and_the_whole_supported_range() {
 /// next person to add one has to read this comment to update it.
 #[test]
 fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
-    // `GitStatus` arrived with v3. If you are adding a frame kind and this line
-    // still says 3, the answer is almost certainly a bump — see the module doc's
-    // forward-compatibility rule 1.
-    let newest_frame_kind_arrived_in = 3;
+    // `Configuration` arrived with v4. If you are adding a frame kind and this
+    // line still says 4, the answer is almost certainly a bump — see the module
+    // doc's forward-compatibility rule 1.
+    let newest_frame_kind_arrived_in = 4;
     assert_eq!(
         PROTOCOL_VERSION, newest_frame_kind_arrived_in,
         "a frame kind was added without bumping PROTOCOL_VERSION: a peer at the \
@@ -478,6 +525,13 @@ fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
 
     // And it really is a frame this build sends, so the pairing above is about
     // live code rather than a number kept in step with nothing.
+    let frame = ServerMsg::Configuration(config_view());
+    assert_eq!(
+        serde_json::to_value(&frame).unwrap()["type"],
+        "configuration"
+    );
+    // The one before it is still on the wire, so the pairing above is a
+    // moving pin rather than a replacement.
     let frame = ServerMsg::GitStatus(git_status_view());
     assert_eq!(serde_json::to_value(&frame).unwrap()["type"], "git_status");
 }
@@ -489,36 +543,104 @@ fn matching_version_is_accepted() {
 
 #[test]
 fn mismatched_version_is_representable_and_detectable() {
-    // A stale tab left open across `flightdeck update`. **v2 is the case that
-    // matters now** (`remote-control-ll5.8`): that tab speaks D14's seat model
-    // perfectly well, so nothing about it *looks* broken — but it does not know
-    // `git_status`, and the host's own palette inventory would hand it the row
-    // that produces one. Refusing the attach is what turns a dead button into
-    // "reload to update".
-    let err = check_version(2).expect_err("v2 must not be accepted by a v3 host");
+    // A stale tab left open across `flightdeck update`. **v3 is the case that
+    // matters now** (`remote-control-1p22`): that tab speaks the seat model and
+    // `git_status` perfectly well, so nothing about it *looks* broken — but it
+    // does not know `configuration`, and the host's own palette inventory would
+    // hand it the `open_configuration` row that produces one. Refusing the
+    // attach is what turns a dead button into "reload to update".
+    let err = check_version(3).expect_err("v3 must not be accepted by a v4 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 3,
-            peer: 2,
-            min_supported: 3,
-            max_supported: 3,
+            local: 4,
+            peer: 3,
+            min_supported: 4,
+            max_supported: 4,
         }
     );
-    // v1 is equally refused, and for D14's original reason.
+    // v1 and v2 are equally refused, and for D14's original reason.
     assert!(check_version(1).is_err());
+    assert!(check_version(2).is_err());
     // Newer than our ceiling is equally a mismatch — there is no downgrade path,
     // because server and SPA ship together.
-    assert!(check_version(4).is_err());
+    assert!(check_version(5).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
     let value = serde_json::to_value(&frame).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
-    assert_eq!(value["version"]["peer"], 2);
-    assert_eq!(value["version"]["max_supported"], 3);
+    assert_eq!(value["version"]["peer"], 3);
+    assert_eq!(value["version"]["max_supported"], 4);
     assert_eq!(round_trip(&frame), frame);
+}
+
+/// A config value is the JSON shape `config.toml` holds, not a wrapper
+/// (`remote-control-1p22`, §6.5 R22).
+///
+/// `ConfigValue` is untagged for one reason: the browser renders `[x]` from a
+/// boolean and `‹bright›` from a string, and a tagged `{"bool": true}` would
+/// make it unwrap a value before it could draw it — one more place for a
+/// browser to decide what a host meant.
+#[test]
+fn a_config_value_is_a_bare_json_bool_or_string() {
+    let view = config_view();
+    let value = serde_json::to_value(ServerMsg::Configuration(view.clone())).unwrap();
+    assert_eq!(value["type"], "configuration");
+    assert_eq!(value["project_rows"][0]["value"], true);
+    assert_eq!(value["project_rows"][0]["inherited"], false);
+    assert_eq!(value["project_rows"][1]["value"], "bright");
+    // The tag column's three words, as machine names.
+    assert_eq!(value["project_rows"][0]["origin"], "set_here");
+    assert_eq!(value["project_rows"][0]["inherited_origin"], "global");
+    assert_eq!(value["project_rows"][1]["origin"], "global");
+    assert_eq!(value["global_rows"][0]["origin"], "default");
+    assert_eq!(
+        round_trip(&ServerMsg::Configuration(view.clone())),
+        ServerMsg::Configuration(view)
+    );
+}
+
+/// The browser's staged edits, as they travel: inside `Command::args`, which
+/// has been free-form since v1 — which is why they cost no version of their own
+/// (`remote-control-1p22`, §6.5 R22).
+///
+/// `value: None` is a clear, and it is absence rather than a magic value: a
+/// boolean field's `false` is a legal explicit override, so "clear" could never
+/// have been encoded as one.
+#[test]
+fn a_staged_edit_names_a_scope_a_key_and_either_a_value_or_a_clear() {
+    let request = ConfigSaveRequest {
+        changes: vec![
+            ConfigChange {
+                scope: ConfigScopeName::Project,
+                key: "notifications.on_finish".into(),
+                value: Some(ConfigValue::Bool(false)),
+            },
+            ConfigChange {
+                scope: ConfigScopeName::Global,
+                key: "ui.mode_border".into(),
+                value: None,
+            },
+        ],
+    };
+    let frame = ClientMsg::Command(Command {
+        seq: 7,
+        name: command::OPEN_CONFIGURATION.into(),
+        args: Some(serde_json::to_value(&request).unwrap()),
+    });
+    let value = serde_json::to_value(&frame).unwrap();
+    assert_eq!(value["name"], "open_configuration");
+    assert_eq!(value["args"]["changes"][0]["scope"], "project");
+    assert_eq!(value["args"]["changes"][0]["value"], false);
+    assert!(value["args"]["changes"][1]["value"].is_null());
+    assert_eq!(round_trip(&frame), frame);
+
+    // And a bare `open_configuration` is a read: absent args parse as no
+    // changes at all, never as "clear everything".
+    let read: ConfigSaveRequest = serde_json::from_value(json!({})).unwrap();
+    assert!(read.changes.is_empty());
 }
 
 /// SPECS §21's two absences survive the wire as absences

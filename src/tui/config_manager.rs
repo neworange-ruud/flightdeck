@@ -67,9 +67,30 @@ impl Origin {
     }
 }
 
+/// A value a caller wants to put in a field: a boolean or a string, which is
+/// every shape [`FieldKind`] admits.
+///
+/// The desktop never builds one — its keys *cycle* a field rather than naming a
+/// value — but FlightDeck Web's configuration manager does, because a browser
+/// stages its edits and sends the values it staged
+/// (`specs/WEB_INTERFACE.md` §6.5 R22). [`ConfigManager::set_selected`] is the
+/// one door both surfaces write through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValue {
+    Bool(bool),
+    Text(String),
+}
+
 /// A render-ready view of one curated field for the current scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigRow {
+    /// The TOML path this row writes, as `section.key` (`notifications.enabled`).
+    ///
+    /// The desktop addresses a row by its cursor position and never needs this;
+    /// a browser addresses one by name, and this is the name — read off the
+    /// same [`CuratedField`] the write goes to, so the two cannot drift
+    /// (`specs/WEB_INTERFACE.md` §6.5 R22).
+    pub key: String,
     pub label: String,
     /// Display value (`on`/`off` for a bool, the choice string otherwise).
     pub value: String,
@@ -84,6 +105,13 @@ pub struct ConfigRow {
     /// True when this text field is currently being edited (`value` holds the
     /// in-progress buffer, which a renderer may show with a cursor).
     pub editing: bool,
+    /// For a [`FieldKind::Choice`] field, the legal values in cycle order;
+    /// empty for a bool or a text field.
+    ///
+    /// The desktop cycles them itself and never reads this. A browser cannot:
+    /// the agent list is built from the live config, so a browser that shipped
+    /// its own would be offering agents this host does not have.
+    pub choices: Vec<String>,
 }
 
 /// The configuration manager model (SPECS §8).
@@ -230,6 +258,7 @@ impl ConfigManager {
                     }
                 };
                 ConfigRow {
+                    key: format!("{}.{}", f.section, f.key),
                     label: f.label.to_string(),
                     value: display,
                     origin,
@@ -238,25 +267,55 @@ impl ConfigManager {
                     bool_value,
                     is_text,
                     editing: editing_this,
+                    choices: match &f.kind {
+                        FieldKind::Choice(options) => options.clone(),
+                        FieldKind::Bool | FieldKind::Text => Vec::new(),
+                    },
                 }
             })
             .collect()
     }
 
+    /// The rows again, as they would read if every override in the current
+    /// scope were cleared — field by field, exactly what `c` leaves behind.
+    ///
+    /// The desktop never needs this: it clears and re-renders. FlightDeck Web
+    /// stages a clear locally and has to show the result *before* it is saved,
+    /// and the honest way to do that is to ask this model rather than to walk
+    /// the layers a second time in a browser
+    /// (`specs/WEB_INTERFACE.md` §6.5 R22). So it is one `rows()` call over a
+    /// probe copy with the curated keys removed: no second resolution order,
+    /// and nothing here that could disagree with [`Self::effective`].
+    pub fn inherited_rows(&self) -> Vec<ConfigRow> {
+        let mut probe = self.clone();
+        probe.editing = None;
+        for field in &self.fields {
+            if let Some(toml::Value::Table(section)) =
+                probe.scope_table_mut().get_mut(field.section)
+            {
+                section.remove(field.key);
+            }
+        }
+        probe.rows()
+    }
+
     /// Toggle a boolean or advance a choice for the selected field, writing the
     /// new value into the current scope as an explicit override.
+    ///
+    /// The *choosing* is here; the *writing* is [`Self::set_selected`], which
+    /// both surfaces go through — so a value a browser names and a value the
+    /// desktop cycles to land in the config file by the same route.
     pub fn toggle_selected(&mut self) {
         let Some(field) = self.fields.get(self.selected).cloned() else {
             return;
         };
         let (current, _) = self.effective(&field);
-        let new_value = match &field.kind {
-            FieldKind::Bool => toml::Value::Boolean(!current.as_bool().unwrap_or(false)),
+        let next = match &field.kind {
+            FieldKind::Bool => FieldValue::Bool(!current.as_bool().unwrap_or(false)),
             FieldKind::Choice(options) if !options.is_empty() => {
                 let cur = current.as_str().unwrap_or("");
                 let idx = options.iter().position(|o| o == cur).unwrap_or(0);
-                let next = options[(idx + 1) % options.len()].clone();
-                toml::Value::String(next)
+                FieldValue::Text(options[(idx + 1) % options.len()].clone())
             }
             FieldKind::Choice(_) => return,
             // A text field is not toggled — activating it opens an inline editor
@@ -268,8 +327,77 @@ impl ConfigManager {
                 return;
             }
         };
-        set_value(self.scope_table_mut(), field.section, field.key, new_value);
+        // Cycling can only produce a value the field's own kind admits, so this
+        // cannot fail; the `Result` is for the caller that names a value.
+        let _ = self.set_selected(next);
+    }
+
+    /// Write an explicit value into the selected field as an override in the
+    /// current scope.
+    ///
+    /// Refuses, in words naming what the field accepts, when the value does not
+    /// fit the field's kind. That check is here rather than at the caller
+    /// because this model owns the field table: a `[ui] mode_border = "purple"`
+    /// written from a browser would be a config file the desktop then fails to
+    /// load, and the only place that knows `mode_border`'s four options is the
+    /// same place that knows its TOML path.
+    pub fn set_selected(&mut self, value: FieldValue) -> std::result::Result<(), String> {
+        let Some(field) = self.fields.get(self.selected).cloned() else {
+            return Err("no field is selected.".to_string());
+        };
+        let written = match (&field.kind, value) {
+            (FieldKind::Bool, FieldValue::Bool(b)) => toml::Value::Boolean(b),
+            (FieldKind::Bool, FieldValue::Text(_)) => {
+                return Err(format!(
+                    "`{}` is a toggle: it takes true or false.",
+                    field.label
+                ));
+            }
+            (FieldKind::Choice(options), FieldValue::Text(s)) if options.contains(&s) => {
+                toml::Value::String(s)
+            }
+            (FieldKind::Choice(options), _) => {
+                return Err(format!(
+                    "`{}` is one of: {}.",
+                    field.label,
+                    options.join(", ")
+                ));
+            }
+            (FieldKind::Text, FieldValue::Text(s)) => toml::Value::String(s),
+            (FieldKind::Text, FieldValue::Bool(_)) => {
+                return Err(format!("`{}` is a text value.", field.label));
+            }
+        };
+        set_value(self.scope_table_mut(), field.section, field.key, written);
         self.mark_dirty();
+        Ok(())
+    }
+
+    /// Move the selection onto the field with this `section.key` path, if this
+    /// build has one. `false` means it does not — which is how a browser built
+    /// against a different FlightDeck is told so rather than silently writing
+    /// the wrong row.
+    pub fn select_key(&mut self, key: &str) -> bool {
+        let found = self
+            .fields
+            .iter()
+            .position(|f| format!("{}.{}", f.section, f.key) == key);
+        match found {
+            Some(i) => {
+                self.editing = None;
+                self.selected = i;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Edit `scope` from now on. [`Self::switch_scope`] is the desktop's `Tab`;
+    /// this is for a caller that already knows which scope it means.
+    pub fn set_scope(&mut self, scope: ConfigScope) {
+        if scope != self.scope {
+            self.switch_scope();
+        }
     }
 
     /// Whether an inline text edit is currently open.
@@ -817,6 +945,110 @@ mod tests {
             .unwrap();
         assert!(row.bool_value);
         assert_eq!(row.origin, Origin::Global);
+    }
+
+    // --- the browser's door onto this model (`specs/WEB_INTERFACE.md` R22) ---
+
+    #[test]
+    fn every_row_carries_the_toml_path_it_writes() {
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let keys: Vec<String> = m.rows().into_iter().map(|r| r.key).collect();
+        // The real keys, not the plausible ones: `notifications.on_finish` and
+        // `update.check` are what this build reads, and a browser that shipped
+        // `on_finished` / `updates.check_for_updates` would be writing rows
+        // FlightDeck never looks at.
+        assert!(keys.contains(&"notifications.on_finish".to_string()));
+        assert!(keys.contains(&"update.check".to_string()));
+        assert!(keys.contains(&"web.bind".to_string()));
+        assert!(!keys.iter().any(|k| k == "notifications.on_finished"));
+        assert!(!keys.iter().any(|k| k == "updates.check_for_updates"));
+    }
+
+    #[test]
+    fn a_choice_row_carries_its_options_and_a_bool_row_carries_none() {
+        let m = mgr(toml::Table::new(), toml::Table::new());
+        let rows = m.rows();
+        let agent = rows.iter().find(|r| r.label == "Default agent").unwrap();
+        // The live agent keys, so a browser cannot offer an agent this host
+        // has not been configured with.
+        assert_eq!(agent.choices, agents());
+        let notif = rows.iter().find(|r| r.label == "OS notifications").unwrap();
+        assert!(notif.choices.is_empty());
+    }
+
+    #[test]
+    fn selecting_by_key_moves_the_cursor_and_reports_an_unknown_key() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        assert!(m.select_key("ui.mode_border"));
+        assert_eq!(m.rows()[m.selected_index()].label, "Mode border");
+        assert!(!m.select_key("ui.no_such_setting"));
+    }
+
+    #[test]
+    fn setting_an_explicit_value_writes_an_override_and_refuses_a_wrong_kind() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        assert!(m.select_key("ui.mode_border"));
+        m.set_selected(FieldValue::Text("bright".to_string()))
+            .expect("`bright` is one of the four options");
+        let row = m
+            .rows()
+            .into_iter()
+            .find(|r| r.key == "ui.mode_border")
+            .unwrap();
+        assert_eq!(row.value, "bright");
+        assert_eq!(row.origin, Origin::SetHere);
+
+        // A value the field does not admit never reaches the file, and the
+        // refusal names the options rather than saying "invalid".
+        let err = m
+            .set_selected(FieldValue::Text("purple".to_string()))
+            .expect_err("`purple` is not an option");
+        assert!(err.contains("off, dim, normal, bright"), "{err}");
+        assert!(m
+            .set_selected(FieldValue::Bool(true))
+            .is_err_and(|e| e.contains("one of")));
+        assert!(m.select_key("notifications.enabled"));
+        assert!(m
+            .set_selected(FieldValue::Text("yes".to_string()))
+            .is_err_and(|e| e.contains("toggle")));
+    }
+
+    #[test]
+    fn inherited_rows_are_what_clearing_this_scope_would_leave() {
+        // Global says off, the project overrides it back on. Clearing the
+        // project override re-inherits the global's `off` — and the *global*
+        // scope's own clear would fall all the way to the shipped default.
+        let global: toml::Table = "[notifications]\nenabled = false\n".parse().unwrap();
+        let project: toml::Table = "[notifications]\nenabled = true\n".parse().unwrap();
+        let mut m = mgr(global, project);
+
+        let row = |rows: Vec<ConfigRow>| {
+            rows.into_iter()
+                .find(|r| r.key == "notifications.enabled")
+                .unwrap()
+        };
+        assert_eq!(row(m.rows()).origin, Origin::SetHere);
+        let inherited = row(m.inherited_rows());
+        assert!(!inherited.bool_value);
+        assert_eq!(inherited.origin, Origin::Global);
+
+        m.set_scope(ConfigScope::Global);
+        assert_eq!(row(m.rows()).origin, Origin::SetHere);
+        let inherited = row(m.inherited_rows());
+        assert!(inherited.bool_value, "the shipped default is on");
+        assert_eq!(inherited.origin, Origin::Default);
+
+        // Asking is not editing: the probe copy is thrown away.
+        assert!(!m.dirty());
+    }
+
+    #[test]
+    fn setting_a_scope_is_the_same_switch_tab_makes() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        m.set_scope(ConfigScope::Project);
+        assert_eq!(m.scope(), ConfigScope::Project, "already there: a no-op");
+        m.set_scope(ConfigScope::Global);
+        assert_eq!(m.scope(), ConfigScope::Global);
     }
 
     #[test]

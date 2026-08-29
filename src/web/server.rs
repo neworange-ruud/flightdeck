@@ -2508,8 +2508,16 @@ async fn handle_command(
             .await;
         }
         // D13: the dialog is app state on both surfaces, so answering it is the
-        // TUI's job — it holds the prompt and synthesises the keypress.
-        Route::Selection(_) | Route::ActivityRead | Route::Palette(_) | Route::Dialog(_) => {
+        // TUI's job — it holds the prompt and synthesises the keypress. SPECS
+        // §8's configuration manager forwards for the same kind of reason: the
+        // two config files and the layer walk live with the TUI's own manager,
+        // and this module has no business reading them a second time
+        // (`remote-control-1p22`, §6.5 R22).
+        Route::Selection(_)
+        | Route::ActivityRead
+        | Route::Palette(_)
+        | Route::Dialog(_)
+        | Route::Config => {
             shared.notify(WebInbound::Command {
                 viewer_id: viewer_id.clone(),
                 label: shared

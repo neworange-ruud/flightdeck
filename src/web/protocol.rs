@@ -175,6 +175,20 @@ mod tests;
 /// before — a lesser panel, not a wrong one. That is rule 4, the same reading
 /// `Delta::Seats`'s `you_were_preempted` got.
 ///
+/// **v4 is SPECS §8's configuration manager** (`remote-control-1p22`, §6.5
+/// R22): [`ServerMsg`] grew [`ServerMsg::Configuration`], which is the same
+/// closed-vocabulary growth `GitStatus` was, with the same concrete failure
+/// behind it. The palette is host-driven (R7), so a stale **v3** tab would be
+/// handed `open_configuration` as a row that runs — this build forwards it now
+/// instead of refusing it — send it, be acked `applied`, and then drop the
+/// answer on its `default` branch. The user clicks **Open Configuration** and
+/// gets an ack and no panel.
+///
+/// What did *not* contribute to it, in the same change: the frame's optional
+/// [`ConfigSaveRequest`] `args`. Those travel browser → host inside
+/// [`Command::args`], which has been a free-form `serde_json::Value` since v1
+/// precisely so M2 could grow command payloads without a bump.
+///
 /// It is deliberately the whole range — there is no older web protocol to
 /// interoperate with, because the browser SPA ships inside the same binary as
 /// the server (D9), and a stale tab is answered with "reload to update" rather
@@ -191,14 +205,14 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
 /// and SPA ship in the same binary (D9), so there is no older peer to keep.
-pub const MIN_SUPPORTED_VERSION: u16 = 3;
+pub const MIN_SUPPORTED_VERSION: u16 = 4;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 3;
+pub const MAX_SUPPORTED_VERSION: u16 = 4;
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -852,9 +866,12 @@ pub struct GitBar {
     pub modified: u32,
     /// Removed files (`-`).
     pub removed: u32,
-    /// Commits ahead of upstream (`↑`).
+    /// Commits ahead of upstream (`↑`). Only meaningful while
+    /// [`GitBar::has_upstream`] is true — with no upstream this is a zero
+    /// nobody measured, and no surface may render it.
     pub ahead: u32,
-    /// Commits behind upstream (`↓`).
+    /// Commits behind upstream (`↓`). Read under [`GitBar::has_upstream`],
+    /// exactly as [`GitBar::ahead`] is.
     pub behind: u32,
     /// Commits of drift from the base branch (`drift:n`).
     pub drift: u32,
@@ -1361,6 +1378,175 @@ pub struct GitUpstream {
     pub ahead: u32,
     /// Commits on the upstream that the branch does not have.
     pub behind: u32,
+}
+
+// ===========================================================================
+// SPECS §8's configuration manager (`remote-control-1p22`, §6.5 R22)
+// ===========================================================================
+
+/// The configuration manager as one browser receives it: the host's curated
+/// fields, resolved through SPECS §8's layering, in **both** scopes.
+///
+/// **A read, like [`GitStatusView`], and for the same reason.** The two files
+/// this is resolved from live on the host's disk and change under it — the
+/// desktop saves, or somebody opens `config.toml` in `$EDITOR` — so it is
+/// neither static for the life of the build (which is what puts
+/// [`Snapshot::help`] on the snapshot) nor something the host watches and can
+/// describe with a [`Delta`]. A read taken at the moment the panel opens is the
+/// only honest picture, and it is answered to the browser that asked and to
+/// nobody else: a second tab did not open the manager and does not want one.
+///
+/// **Both scopes ride in one frame** because artboard 1f's `Tab` switches
+/// between them and the tag column is the whole point of the screen. The two
+/// lists come from one [`crate::tui::config_manager::ConfigManager`] read
+/// twice, so `Global` and `Project` cannot disagree about what is on disk, and
+/// a browser never resolves a layer itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigView {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The active project's name, for 1f's `Project (flightdeck)` scope tab.
+    pub project_name: String,
+    /// `~/.flightdeck/config.toml`. `None` when there is no home directory, in
+    /// which case the Global scope has no file to write and the browser says so
+    /// rather than naming a path that does not exist.
+    #[serde(default)]
+    pub global_path: Option<String>,
+    /// `<repo>/.flightdeck/config.toml` for the active project.
+    pub project_path: String,
+    /// The curated fields resolved in Project scope, in the manager's order.
+    pub project_rows: Vec<ConfigRowView>,
+    /// The same fields resolved in Global scope.
+    pub global_rows: Vec<ConfigRowView>,
+}
+
+// A `saved_status` field is deliberately *not* here. The host's own word for a
+// save (`ConfigManager::status`, `"Saved."`) travels on the [`Ack`] for the same
+// `seq`, which is where every other outcome this browser reports comes from —
+// carrying it twice would be two fields that can disagree about one event.
+
+/// One curated setting, resolved for one scope.
+///
+/// The four facts artboard 1f draws — the value, the setting's name, where the
+/// value comes from, and (for a choice) what else it could be — plus the two a
+/// browser needs to *act*: the TOML path it writes, and what clearing it would
+/// leave behind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRowView {
+    /// The TOML path, as `section.key`. **The host's real key**: a browser
+    /// addresses a row by this and the host writes the row this names, so there
+    /// is no second spelling to drift (`notifications.on_finish`, not
+    /// `notifications.on_finished`).
+    pub key: String,
+    /// The label the desktop's own manager shows for this row.
+    pub label: String,
+    /// Which control 1f draws.
+    pub kind: ConfigFieldKind,
+    /// The value in effect for this scope.
+    pub value: ConfigValue,
+    /// For [`ConfigFieldKind::Choice`], the legal values in the desktop's cycle
+    /// order — the live agent list included, which is why a browser cannot
+    /// carry its own. Empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// Which of SPECS §8's three layers `value` came from.
+    pub origin: ConfigOrigin,
+    /// What this row would read if the override in *this* scope were cleared —
+    /// the host's own answer to `c`, resolved by the same layer walk.
+    ///
+    /// It is sent rather than derived because deriving it is exactly the
+    /// layering this frame exists to keep on the host: a browser staging a
+    /// clear must be able to show the result before it saves, without owning a
+    /// resolution order of its own.
+    pub inherited: ConfigValue,
+    /// Where [`ConfigRowView::inherited`] comes from — never
+    /// [`ConfigOrigin::SetHere`], since it is by construction what is left when
+    /// this scope sets nothing.
+    pub inherited_origin: ConfigOrigin,
+}
+
+/// Which control artboard 1f draws for a field. A closed vocabulary: these are
+/// the three [`crate::tui::config_manager::FieldKind`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigFieldKind {
+    /// A checkbox (`[x]` / `[ ]`).
+    Bool,
+    /// One of a fixed set, cycled (`‹right›`).
+    Choice,
+    /// Free text the user types (`wss://…`).
+    Text,
+}
+
+/// A config value on the wire: the two shapes a curated field can hold.
+///
+/// Untagged, so a bool is a JSON bool and a string is a JSON string — which is
+/// what they are in `config.toml`, and what keeps the browser from having to
+/// unwrap a value before rendering it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigValue {
+    /// A [`ConfigFieldKind::Bool`] field.
+    Bool(bool),
+    /// A [`ConfigFieldKind::Choice`] or [`ConfigFieldKind::Text`] field.
+    Text(String),
+}
+
+/// SPECS §8's three layers, as the origin tag column names them. A closed
+/// vocabulary — the layering has exactly three levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOrigin {
+    /// Explicitly set in the scope being shown (`(set here)`).
+    SetHere,
+    /// Project scope only: inherited from the global base (`(global)`).
+    Global,
+    /// Neither file sets it; the shipped default is in effect (`(default)`).
+    Default,
+}
+
+/// The `args` of an `open_configuration` frame that carries staged edits.
+///
+/// Absent args are a plain read. Present args are **save then read**: the host
+/// applies these changes to the manager it just built, writes the dirty scopes
+/// and reloads every project's effective config (SPECS §8's "saving reloads
+/// every open project's effective config immediately"), then answers with the
+/// re-resolved [`ConfigView`]. One round trip, because the answer to a save
+/// *is* the new layering — a browser that saved and then had to ask again would
+/// paint a stale picture in between.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSaveRequest {
+    /// The edits, in the order the browser staged them. Applied in that order,
+    /// so two edits to one field settle the way the user left them.
+    #[serde(default)]
+    pub changes: Vec<ConfigChange>,
+}
+
+/// One staged edit: which scope, which field, and what to do to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChange {
+    /// Which file this edit lands in. Per change rather than per request
+    /// because the desktop's `s` saves **both** dirty scopes, and a browser
+    /// that could only save one would be a lesser manager wearing the same
+    /// footer.
+    pub scope: ConfigScopeName,
+    /// The field's `section.key`, as [`ConfigRowView::key`] gave it. A key this
+    /// build does not have is refused by name rather than written blind.
+    pub key: String,
+    /// `None` clears the override in `scope` so the value re-inherits (`c`);
+    /// `Some` writes it as an explicit override.
+    #[serde(default)]
+    pub value: Option<ConfigValue>,
+}
+
+/// Which of SPECS §8's two editable files a [`ConfigChange`] lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigScopeName {
+    /// `~/.flightdeck/config.toml`.
+    Global,
+    /// `<repo>/.flightdeck/config.toml`.
+    Project,
 }
 
 // ===========================================================================
@@ -2005,6 +2191,17 @@ pub enum ServerMsg {
     /// forward-compatibility policy and is left with the ack, which is a
     /// lesser answer rather than a wrong one.
     GitStatus(GitStatusView),
+    /// SPECS §8's configuration manager, in answer to one viewer's
+    /// `open_configuration` (`remote-control-1p22`, §6.5 R22).
+    ///
+    /// Per-viewer for [`ServerMsg::GitStatus`]'s reason exactly: one reader
+    /// opened the manager, and putting a config panel on four other screens
+    /// would be an obstruction rather than news. It arrives **beside** the
+    /// [`Ack`] for the same `seq` — the ack says the frame was applied, this is
+    /// the manager it produced (and, when the frame carried
+    /// [`ConfigSaveRequest`] changes, the re-resolved layering the save left
+    /// behind).
+    Configuration(ConfigView),
     /// A refusal. Not fatal on its own — the socket stays open unless the host
     /// also sends [`ServerMsg::Shutdown`].
     Error(WireError),
@@ -2205,7 +2402,12 @@ pub mod command {
     pub const OPEN_SHELL: &str = "open_shell";
     /// Set or clear the manual status override (SPECS §24).
     pub const SET_MANUAL_STATUS: &str = "set_manual_status";
-    /// Open the configuration manager (SPECS §8).
+    /// Open the configuration manager (SPECS §8), and — when the frame carries
+    /// [`super::ConfigSaveRequest`] `args` — save the edits it names first.
+    ///
+    /// One name for both because the answer to a save *is* the manager: the
+    /// host replies with [`super::ServerMsg::Configuration`] either way
+    /// (`remote-control-1p22`, `specs/WEB_INTERFACE.md` §6.5 R22).
     pub const OPEN_CONFIGURATION: &str = "open_configuration";
     /// Begin pairing a phone (FlightDeck Remote).
     pub const PAIR_PHONE: &str = "pair_phone";
@@ -2243,6 +2445,11 @@ pub mod command {
 /// `clear_manual_status`, `dialog_confirm` / `dialog_cancel`, `toggle_split_view`,
 /// `open_palette`, and the configuration-manager writes. Each is a `name` plus an
 /// `args` object; none of them changes this type.
+///
+/// The configuration-manager writes are the case that proves the point: they
+/// arrived in `remote-control-1p22` as a [`ConfigSaveRequest`] inside `args` on
+/// the `open_configuration` name that already existed, and cost the wire
+/// nothing (§6.5 R22). The frame the host sends *back* is what took a version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
     /// Monotonic per-viewer sequence number, shared with [`Input`] so an [`Ack`]

@@ -15,7 +15,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureSnapshot } from "../state/fixture";
 import { createApp } from "./app";
 import type { App } from "./app";
-import type { TerminalGeometry } from "../state/types";
+import type { AppAction, TerminalGeometry } from "../state/types";
 
 interface Harness {
   readonly app: App;
@@ -26,7 +26,13 @@ interface Harness {
   text: (selector: string) => string;
 }
 
-function render(options: { readonly now?: () => number } = {}): Harness {
+function render(
+  options: {
+    readonly now?: () => number;
+    /** The wire seam (D3), when a test is about what the host is told. */
+    readonly onDispatch?: (action: AppAction) => void;
+  } = {},
+): Harness {
   const mounts: { geometry: TerminalGeometry; terminalId: string }[] = [];
   const disposes: string[] = [];
   const app = createApp({
@@ -36,6 +42,9 @@ function render(options: { readonly now?: () => number } = {}): Harness {
       return () => disposes.push(terminalId);
     },
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.onDispatch === undefined
+      ? {}
+      : { onDispatch: options.onDispatch }),
   });
   document.body.append(app.el);
 
@@ -460,6 +469,136 @@ describe("the keyboard and pointer positions (§5)", () => {
   });
 });
 
+/**
+ * `remote-control-qlza`, §6.5 R23 — the keys three artboards print.
+ *
+ * Every press here lands on `document.body`, which is where a browser puts one:
+ * `activeElement` is `BODY` on a fresh load and returns to it whenever a
+ * focused control is removed from the DOM, which every control on this screen
+ * is on every render. A press dispatched on the frame would be testing a target
+ * the app never actually sees.
+ */
+describe("the App-mode arrows the sidebar footer promises", () => {
+  it("moves the session selection, and moves the desktop with it (D3)", () => {
+    const seen: string[] = [];
+    const h = render({ onDispatch: (action) => seen.push(action.type) });
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    expect(h.app.store.getState().selection?.sessionId).toBe(
+      "s-fix-login-redirect",
+    );
+
+    bodyPress("ArrowDown");
+    expect(h.app.store.getState().selection?.sessionId).toBe("s-add-tests-api");
+    /** The click's own action, so `main.ts` sends the host the same command a
+     * click sends it. */
+    expect(seen).toContain("selection/session");
+    /** And the selection carries the session's first terminal with it. */
+    expect(h.app.store.getState().selection?.terminalId).toBe(
+      "t-add-tests-agent",
+    );
+
+    bodyPress("ArrowUp");
+    expect(h.app.store.getState().selection?.sessionId).toBe(
+      "s-fix-login-redirect",
+    );
+  });
+
+  it("clamps at both ends rather than wrapping the desktop around", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    bodyPress("ArrowUp");
+    expect(h.app.store.getState().selection?.sessionId).toBe(
+      "s-fix-login-redirect",
+    );
+
+    /** 1a draws six sessions; ten presses stop on the sixth. */
+    for (let i = 0; i < 10; i += 1) {
+      bodyPress("ArrowDown");
+    }
+    expect(h.app.store.getState().selection?.sessionId).toBe(
+      "s-hotfix-csp-header",
+    );
+  });
+
+  it("leaves the arrows to the agent in Terminal mode (§5)", () => {
+    const h = render();
+    expect(h.app.store.getState().mode).toBe("terminal");
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(h.app.store.getState().selection?.sessionId).toBe(
+      "s-fix-login-redirect",
+    );
+  });
+
+  it("still moves while the narrow slide-over is up, which swallows nothing", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "viewport/measured", pixels: 720 });
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    h.app.store.dispatch({ type: "sidebar/set", open: true });
+    bodyPress("ArrowDown");
+    expect(h.app.store.getState().selection?.sessionId).toBe("s-add-tests-api");
+  });
+});
+
+describe("1c's ←/→ move focus", () => {
+  it("moves the focused column and the selected terminal together", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    expect(h.app.store.getState().splitFocus).toBe(0);
+
+    bodyPress("ArrowRight");
+    expect(h.app.store.getState().splitFocus).toBe(1);
+    /** The pair a click on a column dispatches, both halves of it. */
+    expect(h.app.store.getState().selection?.terminalId).toBe("t-shell-1");
+    expect(
+      h.all(".fd-column").map((c) => c.getAttribute("data-focused")),
+    ).toEqual(["false", "true", "false"]);
+
+    bodyPress("ArrowRight");
+    expect(h.app.store.getState().splitFocus).toBe(2);
+    /** Clamped: there is no fourth column to focus. */
+    bodyPress("ArrowRight");
+    expect(h.app.store.getState().splitFocus).toBe(2);
+
+    bodyPress("ArrowLeft");
+    bodyPress("ArrowLeft");
+    bodyPress("ArrowLeft");
+    expect(h.app.store.getState().splitFocus).toBe(0);
+  });
+
+  it("does nothing outside split view, where there are no columns", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowRight",
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(h.app.store.getState().splitFocus).toBe(0);
+  });
+
+  it("leaves them to the agent in Terminal-mode split (§5)", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowRight",
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(h.app.store.getState().splitFocus).toBe(0);
+  });
+});
+
 describe("artboard 1c — split view", () => {
   it("replaces the tab bar with one labelled column per terminal", () => {
     const h = render();
@@ -494,7 +633,29 @@ describe("artboard 1c — split view", () => {
     const focused = h.all(".fd-column").map((c) => c.getAttribute("data-focused"));
     expect(focused).toEqual(["false", "false", "true"]);
     expect(h.text(".fd-statusbar")).toContain("SPLIT 3 terminals");
+    /**
+     * 1c draws `MODE: TERMINAL`, where §5 gives the arrows to the agent — so
+     * the row prints the route to the keys rather than the keys themselves,
+     * and prints them the moment they are ours (§6.5 R23).
+     */
+    expect(h.text(".fd-statusbar")).toContain("Esc Esc app commands");
+    expect(h.text(".fd-statusbar")).not.toContain("←/→ move focus");
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
     expect(h.text(".fd-statusbar")).toContain("←/→ move focus");
+  });
+
+  it("counts the columns it actually drew, not 1c's own three", () => {
+    /** `add-tests-api` has one terminal. `SPLIT 3 terminals` over one column
+     * is a fact the host never sent. */
+    const h = render();
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    h.app.store.dispatch({
+      type: "selection/session",
+      sessionId: "s-add-tests-api",
+    });
+    expect(h.all(".fd-column")).toHaveLength(1);
+    expect(h.text(".fd-statusbar")).toContain("SPLIT 1 terminal");
+    expect(h.text(".fd-statusbar")).not.toContain("1 terminals");
   });
 
   it("keeps the git bar and its geometry chip — those are still facts", () => {
@@ -573,6 +734,14 @@ describe("the store is the only state (D15)", () => {
 
 function press(h: Harness, key: string): void {
   h.app.el.dispatchEvent(
+    new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+  );
+}
+
+/** The same press, on the element a browser actually targets: the listener is
+ * on `document`, and `document.body` is where focus sits by default. */
+function bodyPress(key: string): void {
+  document.body.dispatchEvent(
     new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
   );
 }

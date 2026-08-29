@@ -1,6 +1,12 @@
 import { decideEscape } from "../input/escape";
 import { clampIndex, paletteColumns, paletteInventory } from "./commands";
-import { CONFIG_FIELDS, selectableConfigFields } from "./config";
+import {
+  editableText,
+  NO_CONFIG_EDITS,
+  nextConfigValue,
+  resolveConfigRow,
+} from "./config";
+import type { ConfigEdit, ConfigScope } from "./config";
 import { selectedChoice } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, SeatInfo, Selection } from "./model";
@@ -671,7 +677,7 @@ export function reduce(state: AppState, action: AppAction): AppState {
              * leaves them staged so the user sees exactly what did not make
              * it and can retry with `s`.
              */
-            edits: action.outcome === "applied" ? {} : config.edits,
+            edits: action.outcome === "applied" ? NO_CONFIG_EDITS : config.edits,
             lastOutcome: { outcome: action.outcome, detail: action.detail ?? null },
           },
         };
@@ -879,19 +885,45 @@ export function reduce(state: AppState, action: AppAction): AppState {
 
     /* --- Configuration manager (1f) ------------------------------------ */
 
-    case "config/open":
-      return state.config !== null
-        ? state
-        : {
-            ...state,
-            config: {
-              scope: "project",
-              selectedKey: selectableConfigFields()[0]?.key ?? "",
-              edits: {},
-              pending: [],
-              lastOutcome: null,
-            },
-          };
+    /**
+     * The host answered. A closed panel opens on Project scope (1f's own
+     * default); an open one keeps its scope, its cursor, its staged edits and
+     * its pending queue and takes the new rows — which is what makes a save's
+     * answer a repaint rather than a reset. The one thing it always discards is
+     * an open inline edit: the value under it may have just changed on disk.
+     */
+    case "config/received": {
+      const config = state.config;
+      if (config === null) {
+        return {
+          ...state,
+          palette: null,
+          config: {
+            doc: action.doc,
+            scope: "project",
+            selectedKey: action.doc.rows.project[0]?.key ?? "",
+            edits: NO_CONFIG_EDITS,
+            editing: null,
+            pending: [],
+            lastOutcome: null,
+          },
+        };
+      }
+      return {
+        ...state,
+        config: {
+          ...config,
+          doc: action.doc,
+          selectedKey:
+            action.doc.rows[config.scope].some(
+              (row) => row.key === config.selectedKey,
+            )
+              ? config.selectedKey
+              : (action.doc.rows[config.scope][0]?.key ?? ""),
+          editing: null,
+        },
+      };
+    }
 
     case "config/close":
       return state.config === null ? state : { ...state, config: null };
@@ -901,11 +933,21 @@ export function reduce(state: AppState, action: AppAction): AppState {
       if (config === null) {
         return state;
       }
+      const scope: ConfigScope =
+        config.scope === "project" ? "global" : "project";
+      /** The two scopes list the same fields, so the cursor survives the
+       * switch — but it is clamped against the rows the host actually sent for
+       * the scope being entered rather than assumed to. */
+      const rows = config.doc.rows[scope];
       return {
         ...state,
         config: {
           ...config,
-          scope: config.scope === "project" ? "global" : "project",
+          scope,
+          editing: null,
+          selectedKey: rows.some((row) => row.key === config.selectedKey)
+            ? config.selectedKey
+            : (rows[0]?.key ?? ""),
         },
       };
     }
@@ -915,16 +957,21 @@ export function reduce(state: AppState, action: AppAction): AppState {
       if (config === null) {
         return state;
       }
-      const fields = selectableConfigFields();
-      const currentIndex = fields.findIndex((f) => f.key === config.selectedKey);
+      const rows = config.doc.rows[config.scope];
+      const currentIndex = rows.findIndex(
+        (row) => row.key === config.selectedKey,
+      );
       const nextIndex = clampIndex(
         (currentIndex === -1 ? 0 : currentIndex) + action.delta,
-        fields.length,
+        rows.length,
       );
-      const key = fields[nextIndex]?.key ?? config.selectedKey;
-      return key === config.selectedKey
+      const key = rows[nextIndex]?.key ?? config.selectedKey;
+      /** Moving discards an open inline edit, exactly as `select_next` does on
+       * the desktop — an edit left behind on a row nobody is looking at is an
+       * edit that gets committed by accident. */
+      return key === config.selectedKey && config.editing === null
         ? state
-        : { ...state, config: { ...config, selectedKey: key } };
+        : { ...state, config: { ...config, selectedKey: key, editing: null } };
     }
 
     case "config/select": {
@@ -932,28 +979,90 @@ export function reduce(state: AppState, action: AppAction): AppState {
       if (config === null || config.selectedKey === action.key) {
         return state;
       }
-      return { ...state, config: { ...config, selectedKey: action.key } };
+      return {
+        ...state,
+        config: { ...config, selectedKey: action.key, editing: null },
+      };
+    }
+
+    /**
+     * `Space`, routed on the host's own field kind: a toggle or a choice stages
+     * the next value the host's options give; a text field opens the editor
+     * instead, which is exactly the fork `toggle_selected` makes.
+     */
+    case "config/activate": {
+      const config = state.config;
+      const resolved = selectedConfigRow(config);
+      if (config === null || resolved === null) {
+        return state;
+      }
+      if (resolved.row.kind === "text") {
+        return {
+          ...state,
+          config: { ...config, editing: editableText(resolved) },
+        };
+      }
+      const staged = stageOnSelected(config, () => {
+        const value = nextConfigValue(resolved);
+        return value === null ? null : { kind: "set", value };
+      });
+      return staged === null ? state : { ...state, config: staged };
     }
 
     case "config/clear": {
+      /** SPECS §8's `c`, in either scope — the same `clear_selected` the
+       * desktop's `c` calls, which removes this scope's own override and lets
+       * the value re-inherit. What it re-inherits *to* is the host's answer
+       * (`ConfigRow.inherited`), not a layer this browser walked. */
+      const staged = stageOnSelected(state.config, () => ({ kind: "clear" }));
+      return staged === null ? state : { ...state, config: staged };
+    }
+
+    /* --- the inline text editor, key for key with `handle_config_key` ----- */
+
+    case "config/editType": {
       const config = state.config;
-      /** SPECS §8: `c` clears a *project* override. Global scope, or a field
-       * with no project override to clear, is a no-op rather than a guess at
-       * what else `c` might mean there. */
-      if (config === null || config.scope !== "project") {
-        return state;
-      }
-      const field = CONFIG_FIELDS.find((f) => f.key === config.selectedKey);
-      if (field === undefined || field.hostOnly === true) {
+      if (config === null || config.editing === null) {
         return state;
       }
       return {
         ...state,
-        config: {
-          ...config,
-          edits: { ...config.edits, [field.key]: { kind: "clear" } },
-        },
+        config: { ...config, editing: config.editing + action.char },
       };
+    }
+
+    case "config/editBackspace": {
+      const config = state.config;
+      if (config === null || config.editing === null) {
+        return state;
+      }
+      return {
+        ...state,
+        config: { ...config, editing: config.editing.slice(0, -1) },
+      };
+    }
+
+    case "config/editCommit": {
+      const config = state.config;
+      if (config === null || config.editing === null) {
+        return state;
+      }
+      const buffer = config.editing;
+      const staged = stageOnSelected(config, () => ({
+        kind: "set",
+        value: buffer,
+      }));
+      return staged === null
+        ? { ...state, config: { ...config, editing: null } }
+        : { ...state, config: { ...staged, editing: null } };
+    }
+
+    case "config/editCancel": {
+      const config = state.config;
+      if (config === null || config.editing === null) {
+        return state;
+      }
+      return { ...state, config: { ...config, editing: null } };
     }
 
     case "config/dispatched": {
@@ -977,8 +1086,8 @@ export function reduce(state: AppState, action: AppAction): AppState {
      *
      * The palette closes because it is what opened this: 1d is the door, and
      * leaving it standing behind the panel would mean two overlays and two
-     * `Esc`s to get back to the terminal. The same handoff `config/open`
-     * already makes from `ui/app.ts`'s `runCommand`.
+     * `Esc`s to get back to the terminal. `config/received` makes the same
+     * handoff when the host's answer opens 1f.
      */
     case "help/open":
       return { ...state, palette: null, readOnly: { kind: "help" } };
@@ -1007,6 +1116,60 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return unreachable;
     }
   }
+}
+
+/**
+ * The row `↑↓` is pointing at, resolved through any staged edit — the value
+ * `Space` and `c` act on, which is the value on screen and not the one the
+ * host last sent.
+ */
+function selectedConfigRow(
+  config: ConfigState | null,
+): ReturnType<typeof resolveConfigRow> | null {
+  if (config === null) {
+    return null;
+  }
+  const row = config.doc.rows[config.scope].find(
+    (candidate) => candidate.key === config.selectedKey,
+  );
+  return row === undefined
+    ? null
+    : resolveConfigRow(row, config.scope, config.edits);
+}
+
+/**
+ * Stage one edit against the selected row in the active scope, or leave the
+ * state alone when there is nothing to stage (no panel, no cursor, or a key
+ * that does not act on this kind of field — `Space` on a text row, which opens
+ * the editor instead).
+ *
+ * One helper rather than three copies of the same spread, because the scope
+ * bookkeeping is the part that would rot: an edit written into the wrong
+ * scope's record is a save that writes the wrong file.
+ */
+function stageOnSelected(
+  config: ConfigState | null,
+  edit: (resolved: ReturnType<typeof resolveConfigRow>) => ConfigEdit | null,
+): ConfigState | null {
+  const resolved = selectedConfigRow(config);
+  if (config === null || resolved === null) {
+    return null;
+  }
+  const staged = edit(resolved);
+  if (staged === null) {
+    return null;
+  }
+  return {
+    ...config,
+    editing: null,
+    edits: {
+      ...config.edits,
+      [config.scope]: {
+        ...config.edits[config.scope],
+        [resolved.row.key]: staged,
+      },
+    },
+  };
 }
 
 /**

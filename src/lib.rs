@@ -2622,6 +2622,14 @@ fn event_loop(
                                 msg: crate::web::protocol::ServerMsg::GitStatus(view),
                             });
                         }
+                        // SPECS §8's manager, likewise to the viewer that
+                        // asked and after the ack (§6.5 R22).
+                        if let Some(view) = reply.config {
+                            handle.send(crate::web::server::WebOutbound::Viewer {
+                                viewer_id: viewer_id.clone(),
+                                msg: crate::web::protocol::ServerMsg::Configuration(view),
+                            });
+                        }
                     }
                     continue;
                 }
@@ -5660,6 +5668,141 @@ fn web_git_status_view(
     })
 }
 
+/// SPECS §8's configuration manager as one browser receives it
+/// (`remote-control-1p22`, §6.5 R22), plus the sentence the ack carries.
+///
+/// `args`, when present, are [`crate::web::protocol::ConfigSaveRequest`]'s
+/// staged edits: they are applied to the manager this just built, through the
+/// manager's own mutators, and written with the same
+/// [`write_config_manager`] the desktop's `s` calls. Absent args are a plain
+/// read and touch nothing.
+///
+/// **Nothing is written unless every change lands.** A key this build does not
+/// have, or a value a field does not admit, returns the model's own refusal
+/// before `outputs()` is ever called — so a browser built against a different
+/// FlightDeck cannot half-save a config file.
+fn apply_web_configuration(
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+) -> std::result::Result<(crate::web::protocol::ConfigView, Option<String>), String> {
+    use crate::tui::config_manager::{ConfigScope, FieldValue};
+    use crate::web::protocol::{ConfigChange, ConfigSaveRequest, ConfigScopeName, ConfigValue};
+
+    let request: ConfigSaveRequest = match args {
+        None => ConfigSaveRequest::default(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|e| format!("`open_configuration` could not read its edits: {e}"))?,
+    };
+
+    let mut cm = build_config_manager(workspace, env);
+    for ConfigChange { scope, key, value } in &request.changes {
+        cm.set_scope(match scope {
+            ConfigScopeName::Global => ConfigScope::Global,
+            ConfigScopeName::Project => ConfigScope::Project,
+        });
+        if !cm.select_key(key) {
+            return Err(format!(
+                "`{key}` is not a setting this FlightDeck's configuration manager has. \
+                 Nothing has been saved."
+            ));
+        }
+        match value {
+            None => cm.clear_selected(),
+            Some(ConfigValue::Bool(b)) => cm.set_selected(FieldValue::Bool(*b))?,
+            Some(ConfigValue::Text(t)) => cm.set_selected(FieldValue::Text(t.clone()))?,
+        }
+    }
+
+    let detail = if cm.dirty() {
+        write_config_manager(&mut cm, env).map_err(|e| e.to_string())?;
+        // SPECS §8: a save reloads every open project's effective config
+        // immediately, whichever surface asked for it.
+        reload_all_projects_config(workspace, env);
+        // The host's own word (`"Saved."`), read before `web_config_view`
+        // moves the scope — `switch_scope` clears the status line.
+        cm.status().map(str::to_string)
+    } else {
+        None
+    };
+    Ok((web_config_view(&mut cm), detail))
+}
+
+/// One built manager, read out for the wire: both scopes, in the order the
+/// desktop draws them.
+///
+/// The `&mut` is only for [`ConfigManager::set_scope`] — this reads, it never
+/// edits — and the manager is a throwaway built for this one frame, so moving
+/// its scope has no user-visible effect.
+fn web_config_view(cm: &mut ConfigManager) -> crate::web::protocol::ConfigView {
+    use crate::tui::config_manager::ConfigScope;
+
+    cm.set_scope(ConfigScope::Global);
+    let global_path = cm.current_path().map(|p| p.display().to_string());
+    let global_rows = web_config_rows(cm);
+    cm.set_scope(ConfigScope::Project);
+    let project_path = cm
+        .current_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let project_rows = web_config_rows(cm);
+
+    crate::web::protocol::ConfigView {
+        // Filled in by `run_web_command`, the only place that knows which frame
+        // this answers — same idiom as `web_git_status_view`.
+        seq: 0,
+        project_name: cm.project_name().to_string(),
+        global_path,
+        project_path,
+        project_rows,
+        global_rows,
+    }
+}
+
+/// The curated fields for the manager's current scope, each paired with what
+/// clearing it would leave behind ([`ConfigManager::inherited_rows`]).
+///
+/// Nothing here resolves a layer: both halves are the model's own answer, read
+/// twice from the same tables, so the browser's origin tags are the desktop's.
+fn web_config_rows(cm: &ConfigManager) -> Vec<crate::web::protocol::ConfigRowView> {
+    use crate::tui::config_manager::{ConfigRow, Origin};
+    use crate::web::protocol::{ConfigFieldKind, ConfigOrigin, ConfigRowView, ConfigValue};
+
+    let value_of = |row: &ConfigRow| {
+        if row.is_bool {
+            ConfigValue::Bool(row.bool_value)
+        } else {
+            ConfigValue::Text(row.value.clone())
+        }
+    };
+    let origin_of = |origin: Origin| match origin {
+        Origin::SetHere => ConfigOrigin::SetHere,
+        Origin::Global => ConfigOrigin::Global,
+        Origin::Default => ConfigOrigin::Default,
+    };
+
+    cm.rows()
+        .into_iter()
+        .zip(cm.inherited_rows())
+        .map(|(row, fallback)| ConfigRowView {
+            key: row.key.clone(),
+            label: row.label.clone(),
+            kind: if row.is_bool {
+                ConfigFieldKind::Bool
+            } else if row.is_text {
+                ConfigFieldKind::Text
+            } else {
+                ConfigFieldKind::Choice
+            },
+            value: value_of(&row),
+            choices: row.choices.clone(),
+            origin: origin_of(row.origin),
+            inherited: value_of(&fallback),
+            inherited_origin: origin_of(fallback.origin),
+        })
+        .collect()
+}
+
 /// Begin an interactive prompt, building its modal dialog.
 ///
 /// D13 lands here and nowhere else. The origin comes from
@@ -7330,6 +7473,12 @@ struct WebCommandReply {
     ack: crate::web::protocol::Ack,
     /// SPECS §21's panel, for the viewer that asked and no other.
     git_status: Option<crate::web::protocol::GitStatusView>,
+    /// SPECS §8's configuration manager, likewise for the viewer that asked
+    /// (`remote-control-1p22`, §6.5 R22). Two fields rather than one
+    /// "extra frame" slot, for the reason above: an ack, a git panel and a
+    /// config view are three different claims, and a union would let a future
+    /// row send the wrong one without the compiler noticing.
+    config: Option<crate::web::protocol::ConfigView>,
 }
 
 fn run_web_command(
@@ -7350,6 +7499,7 @@ fn run_web_command(
             detail,
         },
         git_status: None,
+        config: None,
     };
 
     let Some(spec) = crate::web::commands::lookup(&command.name) else {
@@ -7368,6 +7518,7 @@ fn run_web_command(
         Route::ActivityRead => WebCommandReply {
             ack: crate::web::activity::apply_mark_read(activity, command),
             git_status: None,
+            config: None,
         },
         // D3: the selection is shared, so this moves the desktop too.
         Route::Selection(target) => {
@@ -7432,6 +7583,23 @@ fn run_web_command(
                 Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
             }
         }
+        // SPECS §8's configuration manager (§6.5 R22). The panel is the
+        // browser's own, so nothing opens on the desktop; what the host does is
+        // read the two files — and, when the frame carried staged edits, write
+        // them through the desktop's own manager first.
+        Route::Config => match apply_web_configuration(command.args.as_ref(), workspace, env) {
+            Ok((mut view, detail)) => {
+                view.seq = command.seq;
+                WebCommandReply {
+                    config: Some(view),
+                    ..ack(AckOutcome::Applied, detail)
+                }
+            }
+            // A refusal produces no panel: nothing was read that is worth
+            // rendering, and a half-built manager would be the guess §5.1 rules
+            // out.
+            Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
+        },
         Route::Server => ack(
             AckOutcome::Ignored,
             Some(format!(
@@ -8137,13 +8305,25 @@ fn locate_web_terminal(
 // Configuration manager (SPECS §8)
 // ---------------------------------------------------------------------------
 
-/// Build and open the configuration manager for the active project, reading the
-/// global base and this project's override files into an editable model. Ensures
-/// the global base exists first so it is always editable — except in an
-/// isolated run, which must not create `~/.flightdeck/config.toml` merely by
-/// being opened (SPECS §32); the manager still opens and shows the effective
-/// settings without it.
+/// Build and open the configuration manager for the active project.
 fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    ui.config = Some(build_config_manager(workspace, env));
+}
+
+/// Build the configuration manager for the active project, reading the global
+/// base and this project's override files into an editable model. Ensures the
+/// global base exists first so it is always editable — except in an isolated
+/// run, which must not create `~/.flightdeck/config.toml` merely by being
+/// opened (SPECS §32); the manager still opens and shows the effective settings
+/// without it.
+///
+/// **The one builder both surfaces use.** The desktop's `Open Configuration`
+/// puts the result in [`Ui::config`]; a browser's `open_configuration` reads it
+/// out as a [`crate::web::protocol::ConfigView`] and throws it away
+/// (`remote-control-1p22`, `specs/WEB_INTERFACE.md` §6.5 R22). The field list,
+/// the two files and the layer walk are therefore the same on both, by
+/// construction rather than by review.
+fn build_config_manager(workspace: &Workspace, env: &Env) -> ConfigManager {
     let global_path = global_config_path();
     // An isolated run writes nothing to the user's config on its own (SPECS
     // §32): merely opening the manager to look must not create
@@ -8173,14 +8353,14 @@ fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
     let project = read_table(&project_path);
     let agent_keys: Vec<String> = p.state.config.agents.keys().cloned().collect();
 
-    ui.config = Some(ConfigManager::new(
+    ConfigManager::new(
         p.name.clone(),
         global_path,
         project_path,
         global,
         project,
         agent_keys,
-    ));
+    )
 }
 
 /// Handle a key while the configuration manager overlay is open (SPECS §8).
@@ -8236,11 +8416,25 @@ fn handle_config_key(
 /// Write the configuration manager's dirty scopes to disk, then reload the
 /// effective config for every open project (a global change affects them all).
 fn save_config_manager(workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<()> {
-    let outputs = match ui.config.as_ref() {
-        Some(cm) => cm.outputs()?,
-        None => return Ok(()),
+    let Some(cm) = ui.config.as_mut() else {
+        return Ok(());
     };
-    for (path, contents) in &outputs {
+    write_config_manager(cm, env)?;
+    reload_all_projects_config(workspace, env);
+    Ok(())
+}
+
+/// Write one manager's dirty scopes to disk and mark it saved.
+///
+/// Factored out of [`save_config_manager`] so a browser's save
+/// (`remote-control-1p22`) writes through the same three lines the desktop's
+/// `s` does: the same `outputs()`, the same parent-directory creation, the same
+/// `mark_saved`. The caller then reloads every project's effective config —
+/// which both callers do, because SPECS §8's "saving reloads every open
+/// project's effective config immediately" is not a property of the surface
+/// that asked.
+fn write_config_manager(cm: &mut ConfigManager, env: &Env) -> Result<()> {
+    for (path, contents) in &cm.outputs()? {
         if let Some(parent) = path.parent() {
             if !env.fs.exists(parent) {
                 env.fs.create_dir_all(parent)?;
@@ -8248,10 +8442,7 @@ fn save_config_manager(workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Res
         }
         env.fs.write(path, contents)?;
     }
-    if let Some(cm) = ui.config.as_mut() {
-        cm.mark_saved();
-    }
-    reload_all_projects_config(workspace, env);
+    cm.mark_saved();
     Ok(())
 }
 
@@ -11902,12 +12093,23 @@ mod tests {
         /// The same, keeping the whole reply — the ack *and* SPECS §21's panel,
         /// which is the half `show_git_status` exists to deliver (§6.5 R16).
         fn reply(workspace: &mut Workspace, ui: &mut Ui, command: &WireCommand) -> WebCommandReply {
-            let fs = FakeFs::new();
+            reply_on(&FakeFs::new(), workspace, ui, command)
+        }
+
+        /// The same, over a caller-supplied filesystem — for the rows whose
+        /// whole point is what they read from or write to disk (SPECS §8's
+        /// configuration manager).
+        fn reply_on(
+            fs: &FakeFs,
+            workspace: &mut Workspace,
+            ui: &mut Ui,
+            command: &WireCommand,
+        ) -> WebCommandReply {
             let pty = FakePty::new();
             let clock = FakeClock::default();
             let container = crate::testing::FakeContainerRuntime::new();
             let runner = crate::testing::FakeCommandRunner::new();
-            let e = env(&fs, &pty, &clock, &container, &runner);
+            let e = env(fs, &pty, &clock, &container, &runner);
             let mut activity = ActivityStore::new();
             run_web_command(command, &browser_origin(), workspace, &e, ui, &mut activity)
         }
@@ -13333,6 +13535,299 @@ mod tests {
                 matches!(spec.route, crate::web::commands::Route::Palette(_)),
                 "the row dispatches as of ll5.8"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // SPECS §8's configuration manager (`remote-control-1p22`, §6.5 R22)
+        // -------------------------------------------------------------------
+
+        /// A FakeFs holding the two config files this project layers, so a test
+        /// can assert an origin tag against a file it wrote itself.
+        ///
+        /// `global` is seeded rather than left to `ensure_global_config`
+        /// precisely so the layering under test is the test's, not the shipped
+        /// template's.
+        fn seeded_config_fs(global: &str, project: &str) -> (FakeFs, PathBuf, PathBuf) {
+            let fs = FakeFs::new();
+            let global_path = global_config_path().expect("HOME must be set for this test to run");
+            let project_path = PathBuf::from("/repo/.flightdeck/config.toml");
+            fs.write(&global_path, global)
+                .expect("seed the global base");
+            fs.write(&project_path, project)
+                .expect("seed the project override");
+            (fs, global_path, project_path)
+        }
+
+        /// A frame naming `open_configuration`, with or without staged edits.
+        fn config_frame(seq: u64, changes: serde_json::Value) -> WireCommand {
+            let args = if changes.as_array().is_some_and(|a| a.is_empty()) {
+                None
+            } else {
+                Some(json!({ "changes": changes }))
+            };
+            frame(seq, names::OPEN_CONFIGURATION, args)
+        }
+
+        fn row<'a>(
+            rows: &'a [crate::web::protocol::ConfigRowView],
+            key: &str,
+        ) -> &'a crate::web::protocol::ConfigRowView {
+            rows.iter()
+                .find(|r| r.key == key)
+                .unwrap_or_else(|| panic!("no `{key}` row: {:?}", rows.iter().map(|r| &r.key)))
+        }
+
+        /// The row forwards now, and what comes back is the host's own layering
+        /// — read off the two files on the host's disk, with the host's own
+        /// keys and the host's own three origin tags.
+        ///
+        /// It is also the R16 routing rule, applied a second time: a browser's
+        /// read answers *that browser* and leaves the desktop alone. Nothing
+        /// opens in `Ui::config`, because a configuration modal the person at
+        /// the keyboard never asked for is an obstruction.
+        #[test]
+        fn a_browsers_open_configuration_is_answered_with_the_hosts_own_layering() {
+            let (fs, _, _) = seeded_config_fs("[notifications]\nenabled = false\n", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(&fs, &mut ws, &mut ui, &config_frame(4, json!([])));
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let view = reply.config.expect("the browser is answered");
+            assert_eq!(view.seq, 4, "`run_web_command` stamps the frame it answers");
+            assert!(
+                ui.config.is_none(),
+                "a browser's read must not open the desktop's overlay"
+            );
+
+            // The keys are the host's real ones. A browser that shipped
+            // `notifications.on_finished` or `updates.check_for_updates` would
+            // be writing rows this FlightDeck never reads.
+            let keys: Vec<&str> = view.project_rows.iter().map(|r| r.key.as_str()).collect();
+            assert!(keys.contains(&"notifications.on_finish"));
+            assert!(keys.contains(&"update.check"));
+            assert!(!keys.contains(&"notifications.on_finished"));
+            assert!(!keys.contains(&"updates.check_for_updates"));
+            // And the two the manager deliberately does not curate stay out of
+            // the browser too, because there is one field list (`:485-494`).
+            assert!(!keys.contains(&"web.port"));
+            assert!(!keys.contains(&"web.replay_bytes"));
+
+            // The tag column, both ways round, from the one file that set it.
+            let project = row(&view.project_rows, "notifications.enabled");
+            assert_eq!(project.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(
+                project.value,
+                crate::web::protocol::ConfigValue::Bool(false)
+            );
+            let global = row(&view.global_rows, "notifications.enabled");
+            assert_eq!(global.origin, crate::web::protocol::ConfigOrigin::SetHere);
+            // Clearing it in Global scope falls all the way to the shipped
+            // default, and the host says so rather than leaving the browser to
+            // work it out.
+            assert_eq!(
+                global.inherited,
+                crate::web::protocol::ConfigValue::Bool(true)
+            );
+            assert_eq!(
+                global.inherited_origin,
+                crate::web::protocol::ConfigOrigin::Default
+            );
+
+            // A choice row carries the host's own options, agents included.
+            assert_eq!(
+                row(&view.project_rows, "ui.mode_border").choices,
+                vec!["off", "dim", "normal", "bright"]
+            );
+            assert_eq!(view.project_name, "proj");
+        }
+
+        /// A staged edit lands in the file the desktop's `s` would have written,
+        /// through the same `outputs()` — and the answer is the re-resolved
+        /// layering, so the browser repaints from the host rather than from its
+        /// own optimism.
+        #[test]
+        fn a_browsers_save_writes_the_file_the_desktop_writes() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    5,
+                    json!([{ "scope": "project", "key": "ui.mode_border", "value": "bright" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            // The host's own word for what happened — not one the browser made
+            // up while waiting.
+            assert_eq!(reply.ack.detail.as_deref(), Some("Saved."));
+            let body = fs.file_contents(&project_path).expect("the project file");
+            assert!(body.contains("[ui]"), "{body}");
+            assert!(body.contains("mode_border = \"bright\""), "{body}");
+            // A project override still stores only what it overrides (SPECS §8).
+            assert!(!body.contains("[containers]"), "{body}");
+
+            let view = reply.config.expect("a save answers with the new manager");
+            let border = row(&view.project_rows, "ui.mode_border");
+            assert_eq!(
+                border.value,
+                crate::web::protocol::ConfigValue::Text("bright".into())
+            );
+            assert_eq!(border.origin, crate::web::protocol::ConfigOrigin::SetHere);
+        }
+
+        /// `c` from a browser is the same clear the desktop makes: the override
+        /// leaves the file and the value re-inherits — to exactly what the row
+        /// said it would (`inherited` / `inherited_origin`).
+        #[test]
+        fn a_browsers_clear_removes_the_override_and_re_inherits() {
+            let (fs, _, project_path) = seeded_config_fs(
+                "[notifications]\nenabled = false\n",
+                "[notifications]\nenabled = true\n",
+            );
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            // What the row promised before the clear.
+            let before = reply_on(&fs, &mut ws, &mut ui, &config_frame(6, json!([])))
+                .config
+                .expect("answered");
+            let promised = row(&before.project_rows, "notifications.enabled");
+            assert_eq!(promised.origin, crate::web::protocol::ConfigOrigin::SetHere);
+            assert_eq!(
+                promised.inherited,
+                crate::web::protocol::ConfigValue::Bool(false)
+            );
+            assert_eq!(
+                promised.inherited_origin,
+                crate::web::protocol::ConfigOrigin::Global
+            );
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    7,
+                    json!([{ "scope": "project", "key": "notifications.enabled" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let body = fs.file_contents(&project_path).expect("the project file");
+            assert!(!body.contains("enabled"), "the override is gone: {body}");
+            let view = reply.config.expect("answered");
+            let after = row(&view.project_rows, "notifications.enabled");
+            assert_eq!(after.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(after.value, crate::web::protocol::ConfigValue::Bool(false));
+        }
+
+        /// A value the field does not admit is refused **before** anything is
+        /// written, in the model's own words — so a browser built against a
+        /// different FlightDeck cannot leave a config file the desktop then
+        /// fails to load.
+        #[test]
+        fn a_value_a_field_does_not_admit_is_refused_and_nothing_is_written() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    8,
+                    json!([
+                        { "scope": "project", "key": "notifications.enabled", "value": false },
+                        { "scope": "project", "key": "ui.mode_border", "value": "purple" },
+                    ]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            let detail = reply.ack.detail.unwrap_or_default();
+            assert!(detail.contains("off, dim, normal, bright"), "{detail}");
+            assert!(reply.config.is_none(), "a refusal produces no panel");
+            // Including the change *before* the bad one: the write happens once,
+            // after every change has landed in the model.
+            assert!(
+                fs.file_contents(&project_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "nothing may be written when a change is refused"
+            );
+        }
+
+        /// A key this build does not have is refused by name rather than
+        /// written blind — the same posture the palette takes for a command
+        /// name it does not know (R7).
+        #[test]
+        fn a_key_this_build_does_not_have_is_refused_by_name() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    9,
+                    json!([{ "scope": "project", "key": "web.port", "value": "7421" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            let detail = reply.ack.detail.unwrap_or_default();
+            assert!(detail.contains("web.port"), "{detail}");
+            assert!(
+                fs.file_contents(&project_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "the excluded numeric fields stay unwritable from a browser"
+            );
+        }
+
+        /// The desktop's `s` saves **both** dirty scopes, and so does a
+        /// browser's: the changes carry their own scope, one per edit.
+        #[test]
+        fn one_save_can_touch_both_files() {
+            let (fs, global_path, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    10,
+                    json!([
+                        { "scope": "global", "key": "notifications.sound", "value": true },
+                        { "scope": "project", "key": "remote.enabled", "value": true },
+                    ]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let global = fs.file_contents(&global_path).unwrap_or_default();
+            assert!(global.contains("sound = true"), "{global}");
+            let project = fs.file_contents(&project_path).unwrap_or_default();
+            assert!(project.contains("[remote]"), "{project}");
+            assert!(project.contains("enabled = true"), "{project}");
+
+            // And the project scope now reads the global one as inherited.
+            let view = reply.config.expect("answered");
+            let sound = row(&view.project_rows, "notifications.sound");
+            assert_eq!(sound.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(sound.value, crate::web::protocol::ConfigValue::Bool(true));
         }
 
         /// Help and About are **not** forwarded, and the refusal says why
