@@ -437,6 +437,14 @@ pub static INVENTORY: &[CommandSpec] = &[
         route: Route::Palette(PaletteAction::CloseProject),
     },
     CommandSpec {
+        name: names::CHANGE_PROJECT_DEFAULT_BASE,
+        label: "Change Project Default Base",
+        group: "Projects",
+        host_only: false,
+        annotation: None,
+        route: Route::Palette(PaletteAction::ChangeProjectBase),
+    },
+    CommandSpec {
         name: names::NEXT_PROJECT,
         label: "Next Project",
         group: "Projects",
@@ -974,6 +982,7 @@ pub fn exposure_of(action: &PaletteAction) -> Exposure {
         PaletteAction::SetManualStatus => Exposure::Wire(names::SET_MANUAL_STATUS),
         PaletteAction::OpenProject => Exposure::Wire(names::OPEN_PROJECT),
         PaletteAction::CloseProject => Exposure::Wire(names::CLOSE_PROJECT),
+        PaletteAction::ChangeProjectBase => Exposure::Wire(names::CHANGE_PROJECT_DEFAULT_BASE),
         PaletteAction::SwitchProjectNext => Exposure::Wire(names::NEXT_PROJECT),
         PaletteAction::SwitchProjectPrev => Exposure::Wire(names::PREVIOUS_PROJECT),
         PaletteAction::OpenConfig => Exposure::Wire(names::OPEN_CONFIGURATION),

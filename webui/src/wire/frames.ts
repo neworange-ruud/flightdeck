@@ -52,8 +52,13 @@
  * configuration manager. The staged edits that travel the other way did not
  * contribute, because they ride inside `Command.args`, which has been
  * free-form since v1.
+ *
+ * **v5 makes the new-agent target a host-driven three-state cycle** after
+ * `Change Project Default Base` added existing-branch attachment. A stale v4
+ * tab only understands the old local boolean and would display the wrong form,
+ * so it must reload rather than answer a target it did not render.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -220,26 +225,6 @@ export interface WireDialogKey {
 }
 
 /**
- * Artboard 1e's `Tab` toggle, in **both** of its wordings
- * (`protocol::DialogToggle`, `specs/WEB_INTERFACE.md` §6.5 R19).
- *
- * R8 keeps the toggle a local draft, so it moves here before the host hears
- * about it. The host therefore sends the words for both states and the browser
- * picks the pair its draft is in — host-authored words, browser-chosen state,
- * which is R7/ll5.12 intact.
- */
-export interface WireDialogToggle {
-  readonly key: string;
-  /** Whether the **host's** copy has it on right now: where the local draft
-   * starts, and what the confirm's `toggle` flip is measured against. */
-  readonly on: boolean;
-  readonly title_off: string;
-  readonly label_off: string;
-  readonly title_on: string;
-  readonly label_on: string;
-}
-
-/**
  * `DialogView::body` (`protocol::DialogBody`) — the dialog *shell* artboard 1d
  * describes, which every dialog uses and which 1e's new-agent form is one
  * instance of. Every field is optional on the wire (`skip_serializing_if`), so
@@ -248,6 +233,7 @@ export interface WireDialogToggle {
 export interface WireDialogBody {
   readonly input?: string | null;
   readonly list?: readonly WireDialogChoice[];
+  readonly list_filter?: boolean;
   readonly buttons?: readonly WireDialogKey[];
   /** `false` means the host will refuse a `dialog_confirm` for this dialog. */
   readonly confirmable?: boolean;
@@ -255,10 +241,6 @@ export interface WireDialogBody {
   /** Artboard 1g's second step, when one of this dialog's buttons has one
    * (`protocol::ConfirmGate`, `specs/WEB_INTERFACE.md` §6.5 R13). */
   readonly confirm_gate?: WireConfirmGate | null;
-  /** Artboard 1e's `Tab` toggle, when this dialog has one
-   * (`protocol::DialogToggle`, §6.5 R19). Absent on every dialog but the
-   * new-agent form. */
-  readonly toggle?: WireDialogToggle | null;
 }
 
 /**

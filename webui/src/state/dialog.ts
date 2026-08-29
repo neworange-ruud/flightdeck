@@ -16,9 +16,10 @@ import type { AppState, DialogOutcome, DialogState } from "./types";
  * ## Why there is a local draft, and why that is not optimism
  *
  * 1e's form has three things the user fills in — the agent radio, the branch
- * name, and the `Tab` run-from-base toggle — and the host only learns about them
- * when the dialog is *confirmed* (`dialog_confirm` carries `list_index`, `text`
- * and `toggle`; see `src/web/protocol.rs`'s `command::DIALOG_CONFIRM`). That is
+ * name, and the selected target. The host learns the target immediately on
+ * `Tab`, and learns the radio and text
+ * values when the dialog is *confirmed* (`dialog_confirm` carries `list_index`
+ * and `text`; see `src/web/protocol.rs`'s `command::DIALOG_CONFIRM`). That is
  * deliberate on the wire: a keystroke-per-character round trip would make a
  * remote form unusable, and the host synthesises the same keypresses on confirm
  * either way.
@@ -81,31 +82,6 @@ export interface DialogKey {
 }
 
 /**
- * Artboard 1e's `Tab` toggle, in **both** of its wordings
- * (`protocol::DialogToggle`, §6.5 R19).
- *
- * The toggle is a local draft (see above), so it moves here before the host
- * hears about it; the host's own `run_on_base` does not flip until the confirm
- * lands. Sending only the wording that matches the host's flag is what put
- * `Run from base: off` on a button the user had just switched on. So the host
- * sends both pairs and the browser draws the one its draft is in — host-worded,
- * browser-chosen, with R7/ll5.12's "the browser authors nothing" intact and R8's
- * local draft untouched.
- */
-export interface DialogToggle {
-  /** The button that flips it, read off the wire rather than spelled here. */
-  readonly key: string;
-  /** Whether the **host's** copy has it on. Where the draft opens, and what a
-   * confirm's `toggle` flip is measured against — the host answers a confirm by
-   * synthesising a `Tab` press, which flips rather than sets. */
-  readonly on: boolean;
-  readonly titleOff: string;
-  readonly labelOff: string;
-  readonly titleOn: string;
-  readonly labelOn: string;
-}
-
-/**
  * Who opened the dialog (D13).
  *
  * `label` is the host's seat label, rendered verbatim — splitting it into an
@@ -123,8 +99,6 @@ export interface DialogDraft {
   /** Index into `DialogState.list`, or `null` when nothing has been moved and
    * the host's own highlight still stands. */
   readonly index: number | null;
-  /** 1e's `Tab` — run from the base branch, no worktree. */
-  readonly toggled: boolean;
   /** 1g step 2's field: the name typed back. Empty until the user types, and
    * never pre-filled from `gate.expected` — a gate that fills itself in is a
    * button with extra steps. */
@@ -203,8 +177,19 @@ export function selectedChoice(dialog: DialogState): number {
   if (dialog.draft.index !== null) {
     return dialog.draft.index;
   }
-  const hosted = dialog.list.findIndex((choice) => choice.selected);
+  const hosted = visibleChoices(dialog).findIndex((choice) => choice.selected);
   return hosted === -1 ? 0 : hosted;
+}
+
+/** The rows the host's filter rule makes visible for the browser's local draft. */
+export function visibleChoices(dialog: DialogState): readonly DialogChoice[] {
+  if (!dialog.listFilter || dialog.draft.text === "") {
+    return dialog.list;
+  }
+  const needle = dialog.draft.text.toLowerCase();
+  return dialog.list.filter((choice) =>
+    choice.label.toLowerCase().includes(needle),
+  );
 }
 
 /**
@@ -213,7 +198,12 @@ export function selectedChoice(dialog: DialogState): number {
  * host would ignore.
  */
 export function branchFieldVisible(dialog: DialogState): boolean {
-  return dialog.input !== null && !dialog.draft.toggled;
+  return dialog.input !== null;
+}
+
+/** The host's base target has no branch field; the other new-agent targets do. */
+export function runsOnBase(dialog: DialogState): boolean {
+  return dialog.kind === "new_agent" && dialog.input === null;
 }
 
 /** The button that `Enter` presses: the first one, which is the affirmative
@@ -222,39 +212,21 @@ export function primaryKey(dialog: DialogState): DialogKey | null {
   return dialog.buttons[0] ?? null;
 }
 
-/** Whether the dialog offers a `Tab` option at all (only 1e's form does). The
- * host's `toggle` block is the answer: a dialog it did not describe has none. */
+/** Whether the dialog offers a `Tab` option at all (only 1e's form does). */
 export function hasToggle(dialog: DialogState): boolean {
-  return dialog.toggle !== null;
+  return toggleButton(dialog) !== null;
 }
 
 /**
- * The **title** for the state the local draft is in (§6.5 R19).
- *
- * `dialog.title` is the host's wording for the state the *host* is in, which is
- * the right answer for every dialog without a toggle and the wrong one for 1e
- * the moment the draft moves. Both wordings arrive together, so this picks;
- * nothing here composes a sentence.
+ * The host-authored title for the current dialog target (§6.5 R19).
  */
 export function dialogTitle(dialog: DialogState): string {
-  if (dialog.toggle === null) {
-    return dialog.title;
-  }
-  return dialog.draft.toggled ? dialog.toggle.titleOn : dialog.toggle.titleOff;
+  return dialog.title;
 }
 
-/** The toggling button as the local draft has it: the host's own label for the
- * state the draft is in, on the key the host named. */
+/** The host's target-cycling button, if this dialog has one. */
 export function toggleButton(dialog: DialogState): DialogKey | null {
-  const toggle = dialog.toggle;
-  if (toggle === null) {
-    return null;
-  }
-  return {
-    key: toggle.key,
-    label: dialog.draft.toggled ? toggle.labelOn : toggle.labelOff,
-    cancels: false,
-  };
+  return dialog.buttons.find((button) => button.key === "Tab") ?? null;
 }
 
 /** The button the host marked as this dialog's cancel (`n`, `c`, `Esc`), or
@@ -274,11 +246,12 @@ export function cancelButton(dialog: DialogState): DialogKey | null {
  * host that named no cancel at all must not turn its `Esc` button into one.
  */
 export function decidingKeys(dialog: DialogState): readonly DialogKey[] {
+  const toggleKey = toggleButton(dialog)?.key;
   return dialog.buttons.filter(
     (button) =>
       !button.cancels &&
       button.key !== "Esc" &&
-      button.key !== dialog.toggle?.key,
+      button.key !== toggleKey,
   );
 }
 
@@ -306,15 +279,7 @@ export function confirmArgs(
   if (choice !== null && choice !== primaryKey(dialog)?.key) {
     args["choice"] = choice;
   }
-  /** The host answers this by synthesising a `Tab` **press**, which flips its
-   * own `run_on_base` rather than setting it — so it is sent when the draft has
-   * moved away from the state the host is in, and not merely when the draft is
-   * on. A browser attaching to a dialog the desktop had already toggled starts
-   * its draft on `toggle.on` and sends nothing. */
-  if (dialog.toggle !== null && dialog.draft.toggled !== dialog.toggle.on) {
-    args["toggle"] = true;
-  }
-  if (dialog.list.length > 0) {
+  if (visibleChoices(dialog).length > 0) {
     args["list_index"] = selectedChoice(dialog);
   }
   if (branchFieldVisible(dialog) && dialog.draft.text !== "") {

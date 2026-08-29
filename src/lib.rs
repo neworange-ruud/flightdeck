@@ -6398,34 +6398,6 @@ fn digit_accel(i: usize) -> DialogAccel {
     DialogAccel::Char(char::from_digit((i as u32 + 1) % 10, 10).unwrap_or('?'))
 }
 
-/// Artboard 1e's title, in the state `run_on_base` names.
-///
-/// A function rather than an inline `if` because both wordings travel to the
-/// browser at once: the toggle is a *local draft* there (§6.5 R8/R19), so the
-/// browser picks the sentence its own draft is in and the host would otherwise
-/// only ever word the one it is in itself. See
-/// [`DialogToggle`](crate::web::protocol::DialogToggle).
-fn new_agent_title(run_on_base: bool, base_branch: &str) -> String {
-    if run_on_base {
-        format!(
-            "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\n\
-             Runs on base branch '{base_branch}' in the project root — no worktree."
-        )
-    } else {
-        "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)".to_string()
-    }
-}
-
-/// Artboard 1e's `Tab` button label, in the state `run_on_base` names. Paired
-/// with [`new_agent_title`], and travels to the browser for the same reason.
-fn new_agent_base_label(run_on_base: bool, base_branch: &str) -> String {
-    if run_on_base {
-        format!("Run from base: {base_branch}")
-    } else {
-        "Run from base: off".to_string()
-    }
-}
-
 /// Build the modal [`Dialog`] for a prompt: the question/notification text plus
 /// one button per available action. Each button's accelerator matches the key
 /// [`handle_prompt_key`] expects, so mouse and keyboard stay in lockstep.
@@ -7725,6 +7697,14 @@ fn web_dialog_view(
                 selected: item.selected,
             })
             .collect(),
+        list_filter: matches!(
+            &open.prompt,
+            Prompt::ChangeProjectBase { .. }
+                | Prompt::NewAgentForm {
+                    use_existing_branch: true,
+                    ..
+                }
+        ),
         buttons: open
             .dialog
             .buttons
@@ -7740,7 +7720,6 @@ fn web_dialog_view(
         confirmable: refusal.is_none(),
         refusal: refusal.map(str::to_string),
         confirm_gate,
-        toggle: dialog_toggle(&open.prompt),
     };
     Some(wire::DialogView {
         dialog_id: open.id.clone(),
@@ -7752,30 +7731,6 @@ fn web_dialog_view(
         // degrades to "no body" instead of taking the event loop with it.
         body: serde_json::to_value(&body).ok(),
     })
-}
-
-/// Artboard 1e's `Tab` toggle for a browser, in **both** wordings (§6.5 R19).
-///
-/// The new-agent form is the only prompt with one. Both pairs are sent whatever
-/// `run_on_base` currently is, because the browser flips its own draft before
-/// the host hears about it (R8) and must be able to word either state without
-/// consulting `on` — see [`crate::web::protocol::DialogToggle`].
-fn dialog_toggle(prompt: &Prompt) -> Option<crate::web::protocol::DialogToggle> {
-    match prompt {
-        Prompt::NewAgentForm {
-            run_on_base,
-            base_branch,
-            ..
-        } => Some(crate::web::protocol::DialogToggle {
-            key: dialog_accel_key(DialogAccel::Tab),
-            on: *run_on_base,
-            title_off: new_agent_title(false, base_branch),
-            label_off: new_agent_base_label(false, base_branch),
-            title_on: new_agent_title(true, base_branch),
-            label_on: new_agent_base_label(true, base_branch),
-        }),
-        _ => None,
-    }
 }
 
 /// The wire `kind` for one prompt (D13). Stable strings: the browser switches on
@@ -7795,6 +7750,7 @@ fn dialog_kind(prompt: &Prompt) -> &'static str {
         Prompt::MergeConfirm { .. } => "confirm_merge",
         Prompt::RebaseConfirm { .. } => "confirm_rebase",
         Prompt::OpenProject { .. } => "open_project",
+        Prompt::ChangeProjectBase { .. } => "change_project_base",
         Prompt::CloseProjectConfirm { .. } => "close_project",
         Prompt::UnpairConfirm => "unpair_phone",
         Prompt::QuitConfirm => "confirm_quit",
@@ -7874,6 +7830,7 @@ fn browser_confirm_gate(prompt: &Prompt) -> crate::web::commands::BrowserConfirm
         | Prompt::CloseTab { .. }
         | Prompt::CloseChildConfirm { .. }
         | Prompt::OpenProject { .. }
+        | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
         | Prompt::UnpairConfirm => BrowserConfirm::OneStep,
     }
@@ -7986,10 +7943,6 @@ fn apply_web_dialog(
     let dialog = open.dialog.clone();
     let choice = args.and_then(|a| a.get("choice")).and_then(|c| c.as_str());
     let text = args.and_then(|a| a.get("text")).and_then(|t| t.as_str());
-    let toggle = args
-        .and_then(|a| a.get("toggle"))
-        .and_then(|t| t.as_bool())
-        .unwrap_or(false);
     let list_index = args
         .and_then(|a| a.get("list_index"))
         .and_then(|i| i.as_u64());
@@ -8057,48 +8010,51 @@ fn apply_web_dialog(
         }
     }
 
-    // 1. The `Tab` option (1e's "run from base branch"), if asked for.
-    if toggle {
-        if !dialog.buttons.iter().any(|b| b.accel == DialogAccel::Tab) {
-            return Err("This dialog has no `Tab` option to toggle.".to_string());
+    // 1. The text field. Replace the host's draft with the browser's exact
+    //    draft through ordinary keypresses. This matters now that `Tab` is a
+    //    host round-trip: a second cycle must not append the same text twice.
+    //    Text comes before list selection because searchable branch dialogs
+    //    interpret `list_index` against the filtered rows the browser showed.
+    if let Some(text) = text {
+        if dialog.input.is_none() {
+            return Err("This dialog has no text field.".to_string());
         }
-        feed_dialog_key(KeyCode::Tab, workspace, env, ui);
+        if text.chars().any(char::is_control) {
+            return Err("A dialog's text field takes printable characters only.".to_string());
+        }
+        for _ in dialog.input.as_deref().unwrap_or_default().chars() {
+            feed_dialog_key(KeyCode::Backspace, workspace, env, ui);
+        }
+        for c in text.chars() {
+            feed_dialog_key(KeyCode::Char(c), workspace, env, ui);
+        }
     }
-    // 2. The choice row (1e's agent radio). Driven to the top first, so the
-    //    index the browser sent is absolute rather than relative to wherever the
-    //    highlight happened to be — the desktop may have moved it since.
+    // 2. The choice row (1e's agent radio or a filtered branch). Driven to the
+    //    top first, so the index is absolute rather than relative to a desktop
+    //    highlight that may have moved since the browser rendered it.
     if let Some(index) = list_index {
-        if dialog.list.is_empty() {
+        let live_list = ui
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.dialog.list.clone())
+            .unwrap_or_else(|| dialog.list.clone());
+        if live_list.is_empty() {
             return Err("This dialog has no list to choose from.".to_string());
         }
-        if index as usize >= dialog.list.len() {
+        if index as usize >= live_list.len() {
             return Err(format!(
                 "This dialog has {} choices, so `list_index: {index}` names none of them.",
-                dialog.list.len()
+                live_list.len()
             ));
         }
-        for _ in 0..dialog.list.len() {
+        for _ in 0..live_list.len() {
             feed_dialog_key(KeyCode::Up, workspace, env, ui);
         }
         for _ in 0..index {
             feed_dialog_key(KeyCode::Down, workspace, env, ui);
         }
     }
-    // 3. The text field. Typed character by character, exactly as a person
-    //    would: the handlers own what a character means, including refusing it
-    //    while the field is disabled.
-    if let Some(text) = text {
-        if dialog.input.is_none() {
-            return Err("This dialog has no text field.".to_string());
-        }
-        for c in text.chars() {
-            if c.is_control() {
-                return Err("A dialog's text field takes printable characters only.".to_string());
-            }
-            feed_dialog_key(KeyCode::Char(c), workspace, env, ui);
-        }
-    }
-    // 4. The decision.
+    // 3. The decision.
     let code = match deciding {
         DialogAccel::Char(c) => KeyCode::Char(c),
         DialogAccel::Enter => KeyCode::Enter,
@@ -8107,6 +8063,9 @@ fn apply_web_dialog(
     };
     feed_dialog_key(code, workspace, env, ui);
 
+    if deciding == DialogAccel::Tab && ui.prompt.is_some() {
+        return Ok(Some("Changed the dialog target.".to_string()));
+    }
     if ui.prompt.is_some() {
         // Nothing wrong happened: a form that rejects an empty branch name keeps
         // prompting, on both surfaces. Reported as a refusal rather than as an
@@ -12451,6 +12410,26 @@ mod tests {
             body.buttons.iter().map(|b| b.key.clone()).collect()
         }
 
+        /// Open the three-target new-agent form against the git trait seam.
+        fn open_new_agent(ws: &Workspace, ui: &mut Ui, origin: crate::web::protocol::DialogOrigin) {
+            let git = FakeGit::new().with_branches(["main", "feature/existing"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            ui.web_origin = Some(origin);
+            start_new_tab_flow(&ws.active_project().state, &services, ui);
+        }
+
         /// A `dialog_confirm` / `dialog_cancel` frame for the dialog that is
         /// open, with whatever the browser filled in.
         fn answer(seq: u64, name: &str, ui: &Ui, args: serde_json::Value) -> WireCommand {
@@ -12468,16 +12447,12 @@ mod tests {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
 
-            let ack = run(
-                &mut ws,
-                &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
-            );
+            let ack = run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
 
             assert_eq!(ack.outcome, AckOutcome::Applied);
             assert_eq!(ack.detail.as_deref(), Some(DIALOG_OPENED_DETAIL));
             let view = view(&ui, &ws);
-            assert_eq!(view.kind, "new_agent");
+            assert_eq!(view.kind, "unpair_phone");
             assert_eq!(view.origin, browser_origin(), "D13: tagged with who asked");
             // And the desktop is rendering the origin sentence, not just holding
             // the structured fact.
@@ -12494,8 +12469,22 @@ mod tests {
         fn a_desktop_dialog_reaches_the_browser_with_no_origin_line() {
             let ws = one_project_workspace(false);
             let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
 
-            start_new_tab_flow(&ws.projects[0].state, &mut ui);
+            start_new_tab_flow(&ws.projects[0].state, &services, &mut ui);
 
             let view = view(&ui, &ws);
             assert_eq!(view.origin, crate::web::protocol::DialogOrigin::Desktop);
@@ -12510,14 +12499,10 @@ mod tests {
         /// as an input, and `Enter` / `Tab` / `Esc` as its keys.
         #[test]
         fn the_new_agent_dialog_carries_artboard_1es_form() {
-            let mut ws = one_project_workspace(false);
+            let ws = one_project_workspace(false);
             let mut ui = Ui::default();
 
-            run(
-                &mut ws,
-                &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
-            );
+            open_new_agent(&ws, &mut ui, browser_origin());
 
             let view = view(&ui, &ws);
             let body = body(&view);
@@ -12530,105 +12515,68 @@ mod tests {
             assert_eq!(body.refusal, None);
         }
 
-        /// 1e's right-hand state: `Tab` hides the branch field, because there is
-        /// nothing to name. Driven from the browser, and the desktop's dialog
-        /// changes with it — one dialog, two surfaces.
+        /// The browser sends `Tab` to the host, which cycles the complete form
+        /// through new, existing and base targets on both surfaces.
         #[test]
-        fn toggling_run_from_base_from_the_browser_hides_the_branch_field() {
+        fn the_browser_cycles_all_three_new_agent_targets_on_the_host() {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
-            run(
+            open_new_agent(&ws, &mut ui, browser_origin());
+            let initial = body(&view(&ui, &ws));
+            assert!(initial.input.is_some());
+            assert!(!initial.list_filter);
+
+            let cycle = |seq, args, ws: &mut Workspace, ui: &mut Ui| {
+                let command = answer(seq, names::DIALOG_CONFIRM, ui, args);
+                run(ws, ui, &command)
+            };
+
+            let ack = cycle(
+                1,
+                json!({ "choice": "Tab", "text": "existing", "list_index": 0 }),
                 &mut ws,
                 &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
             );
-            assert!(body(&view(&ui, &ws)).input.is_some());
-
-            // A `Tab` with no decision key is not a thing the wire offers, so
-            // the toggle rides on the confirm — and the form is gone by then.
-            // What this asserts instead is the desktop half of the same key,
-            // proving the browser's view tracks it.
-            let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-            let fs = FakeFs::new();
-            let pty = FakePty::new();
-            let clock = FakeClock::default();
-            let container = crate::testing::FakeContainerRuntime::new();
-            let runner = crate::testing::FakeCommandRunner::new();
-            let e = env(&fs, &pty, &clock, &container, &runner);
-            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
-
-            let body = body(&view(&ui, &ws));
-            assert_eq!(body.input, None, "1e: branch field hidden on run-from-base");
-            assert!(body
-                .buttons
-                .iter()
-                .any(|b| b.label.contains("Run from base")));
-        }
-
-        /// **§6.5 R19: the toggle travels in both wordings, whichever state the
-        /// host is in.**
-        ///
-        /// 1e's toggle is a *local draft* in the browser (R8, so a coalesced
-        /// resync mid-typing cannot empty the branch field), and the host's own
-        /// `run_on_base` does not flip until the confirm lands. A host that sent
-        /// only the wording matching its own flag therefore put
-        /// `Run from base: off` on a button the reader had just switched on.
-        ///
-        /// Both pairs are sent unconditionally, so the browser never has to
-        /// consult `on` to word anything — asserted here from **both** sides of
-        /// the toggle, with the toggled pair identical either way.
-        #[test]
-        fn the_new_agent_toggle_carries_both_wordings_from_either_state() {
-            let mut ws = one_project_workspace(false);
-            let mut ui = Ui::default();
-            run(
-                &mut ws,
-                &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
-            );
-
-            let off = body(&view(&ui, &ws)).toggle.expect("1e has a toggle");
-            assert_eq!(off.key, "Tab", "the key is named, not spelled by the SPA");
-            assert!(!off.on, "the host opens the form with run-from-base off");
-            assert_eq!(off.label_off, "Run from base: off");
-            assert_eq!(off.label_on, "Run from base: main");
-            assert!(
-                off.title_on
-                    .contains("Runs on base branch 'main' in the project root — no worktree."),
-                "1e's toggled sentence, which a toggled browser never saw: {}",
-                off.title_on
-            );
-            assert!(off.title_off.contains("type branch"), "{}", off.title_off);
-            // The host's own `title` is the state the *host* is in, and it is
-            // the untoggled one — which is exactly why the browser cannot use it.
-            assert_eq!(view(&ui, &ws).title, off.title_off);
-
-            // Now flip the host's copy, from the desktop's keyboard.
-            let fs = FakeFs::new();
-            let pty = FakePty::new();
-            let clock = FakeClock::default();
-            let container = crate::testing::FakeContainerRuntime::new();
-            let runner = crate::testing::FakeCommandRunner::new();
-            let e = env(&fs, &pty, &clock, &container, &runner);
-            handle_prompt_key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-                &mut ws,
-                &e,
-                &mut ui,
-            )
-            .unwrap();
-
-            let on = body(&view(&ui, &ws)).toggle.expect("still a toggle");
-            assert!(on.on, "the host is in the toggled state now");
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{:?}", ack.detail);
+            let existing = body(&view(&ui, &ws));
             assert_eq!(
-                (&on.title_off, &on.label_off, &on.title_on, &on.label_on),
-                (&off.title_off, &off.label_off, &off.title_on, &off.label_on),
-                "the words do not depend on which state the host happens to be in"
+                existing.input.as_deref(),
+                Some(""),
+                "the host clears the field when changing target modes"
             );
-            // And the host's own title has moved to the toggled sentence, while
-            // both wordings stayed put — the pair the browser draws is chosen by
-            // its draft, never by this.
-            assert_eq!(view(&ui, &ws).title, on.title_on);
+            assert!(existing.list_filter);
+            assert_eq!(existing.list[0].label, "feature/existing");
+            assert!(view(&ui, &ws).title.contains("existing branch"));
+
+            assert_eq!(
+                cycle(
+                    2,
+                    json!({ "choice": "Tab", "text": "existing", "list_index": 0 }),
+                    &mut ws,
+                    &mut ui,
+                )
+                .outcome,
+                AckOutcome::Applied
+            );
+            let base = body(&view(&ui, &ws));
+            assert_eq!(base.input, None);
+            assert!(!base.list_filter);
+            assert!(view(&ui, &ws).title.contains("no worktree"));
+
+            assert_eq!(
+                cycle(
+                    3,
+                    json!({ "choice": "Tab", "list_index": 0 }),
+                    &mut ws,
+                    &mut ui,
+                )
+                .outcome,
+                AckOutcome::Applied
+            );
+            let new_branch = body(&view(&ui, &ws));
+            assert_eq!(new_branch.input.as_deref(), Some(""));
+            assert!(!new_branch.list_filter);
+            assert!(new_branch.list[0].label.contains("Codex"));
         }
 
         /// **§6.5 R19: which button cancels is the host's word, not the SPA's.**
@@ -12644,11 +12592,7 @@ mod tests {
             let mut ui = Ui::default();
 
             // A form: the cancel is `Esc`, and nothing else claims to cancel.
-            run(
-                &mut ws,
-                &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
-            );
+            open_new_agent(&ws, &mut ui, browser_origin());
             let form = body(&view(&ui, &ws));
             let cancels: Vec<&str> = form
                 .buttons
@@ -12804,11 +12748,7 @@ mod tests {
         fn confirming_with_the_cancel_key_is_refused() {
             let mut ws = one_project_workspace(false);
             let mut ui = Ui::default();
-            run(
-                &mut ws,
-                &mut ui,
-                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
-            );
+            open_new_agent(&ws, &mut ui, browser_origin());
 
             let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "Esc" }));
             let ack = run(&mut ws, &mut ui, &ack);
@@ -13028,7 +12968,7 @@ mod tests {
             // branches and §12's drift — before it answers (R11).
             let question = view(&ui, &ws);
             assert!(
-                question.title.contains("base moved 4 commits"),
+                question.title.contains("target advanced 4 commits"),
                 "{}",
                 question.title
             );
@@ -14226,7 +14166,7 @@ mod tests {
             assert!(body.confirmable, "the browser may answer its own question");
             assert_eq!(body.refusal, None);
             assert!(
-                view.title.contains("base moved 7 commits"),
+                view.title.contains("target advanced 7 commits"),
                 "{}",
                 view.title
             );

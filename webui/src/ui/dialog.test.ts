@@ -71,12 +71,11 @@ function render(): Harness {
   };
 }
 
-/** 1e's two titles, worded by the host (`new_agent_title` in `src/lib.rs`) and
- * sent together, because the toggle they describe is a local draft here. */
+/** New-agent target titles, worded and published by the host. */
 const NEW_AGENT_TITLE_OFF =
-  "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)";
+  "New Agent Session Tab — new branch   (↑/↓ agent · type task name · Tab changes target)";
 const NEW_AGENT_TITLE_ON =
-  "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\nRuns on base branch 'main' in the project root — no worktree.";
+  "New Agent Session Tab   (↑/↓ agent · Tab changes target)\nRuns on base branch 'main' in the project root — no worktree.";
 
 /** 1e, as the host sends it when a *browser* asked for it. */
 function newAgentFromBrowser(): WireDialogView {
@@ -94,20 +93,10 @@ function newAgentFromBrowser(): WireDialogView {
       ],
       buttons: [
         { key: "Enter", label: "Create" },
-        { key: "Tab", label: "Run from base: off" },
+        { key: "Tab", label: "Target: new branch" },
         { key: "Esc", label: "Cancel", cancels: true },
       ],
       confirmable: true,
-      /** §6.5 R19: both wordings, so the panel and its own button can never
-       * disagree about which state the local draft is in. */
-      toggle: {
-        key: "Tab",
-        on: false,
-        title_off: NEW_AGENT_TITLE_OFF,
-        label_off: "Run from base: off",
-        title_on: NEW_AGENT_TITLE_ON,
-        label_on: "Run from base: main",
-      },
     },
   };
 }
@@ -122,20 +111,13 @@ function newAgentToggledOnTheHost(): WireDialogView {
     title: NEW_AGENT_TITLE_ON,
     body: {
       ...wire.body,
+      input: null,
       buttons: [
         { key: "Enter", label: "Create" },
-        { key: "Tab", label: "Run from base: main" },
+        { key: "Tab", label: "Target: base (main)" },
         { key: "Esc", label: "Cancel", cancels: true },
       ],
       confirmable: true,
-      toggle: {
-        key: "Tab",
-        on: true,
-        title_off: NEW_AGENT_TITLE_OFF,
-        label_off: "Run from base: off",
-        title_on: NEW_AGENT_TITLE_ON,
-        label_on: "Run from base: main",
-      },
     },
   };
 }
@@ -284,49 +266,37 @@ describe("artboard 1e, left-hand state", () => {
   });
 });
 
-describe("artboard 1e, right-hand state", () => {
-  it("Tab hides the branch field and recolours the frame", () => {
+describe("the host-driven new-agent target", () => {
+  it("Tab asks the host to cycle the target without changing the local form", () => {
     const h = render();
     h.open(newAgentFromBrowser());
     h.key("Tab");
 
-    expect(h.q(".fd-dialog__panel").getAttribute("data-toggled")).toBe("true");
-    /** 1e's own words, and a sentence rather than a disabled input: nobody
-     * should have to wonder whether the text they typed is still in play. */
-    expect(h.text(".fd-dialog__note")).toBe(
-      "branch field hidden — there is nothing to name",
-    );
-    expect(h.all(".fd-dialog__field-label")).toHaveLength(0);
-    expect(h.text(".fd-dialog__kind")).toBe("no worktree");
+    expect(h.answers).toEqual(["Tab"]);
+    expect(h.q(".fd-dialog__panel").getAttribute("data-toggled")).toBe("false");
+    expect(h.text(".fd-dialog__field-label")).toBe("Branch");
   });
 
-  it("the title and the Tab button move with the draft, not with the host", () => {
-    /** **§6.5 R19, the whole bug.** The toggle is a local draft (R8), so the
-     * host's `run_on_base` has not moved: before this the panel badged itself
-     * `no worktree` while its own button still read `Run from base: off`. Both
-     * wordings now arrive together and the browser picks by its draft. */
+  it("repaints the title, field and Tab button from the host's next view", () => {
     const h = render();
     h.open(newAgentFromBrowser());
     const tab = () =>
       h.all(".fd-dialog__action").find((b) => b.getAttribute("data-key") === "Tab");
     expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
-    expect(tab()?.textContent).toContain("Run from base: off");
+    expect(tab()?.textContent).toContain("Target: new branch");
     expect(tab()?.getAttribute("data-on")).toBe("false");
 
     h.key("Tab");
+    h.open(newAgentToggledOnTheHost());
     expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_ON);
-    expect(tab()?.textContent).toContain("Run from base: main");
+    expect(tab()?.textContent).toContain("Target: base (main)");
     expect(tab()?.getAttribute("data-on")).toBe("true");
-    /** And back, on the same host frame — nothing was refetched. */
-    h.key("Tab");
-    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
-    expect(tab()?.textContent).toContain("Run from base: off");
+    expect(h.text(".fd-dialog__kind")).toBe("no worktree");
+    expect(h.all(".fd-dialog__field-label")).toHaveLength(0);
   });
 
   it("opens in the state the host is already in, and words it the same way", () => {
-    /** A tab attaching to a form the desktop had already switched to
-     * run-from-base: the draft starts on `toggle.on`, so the panel is not
-     * showing the other state's words either. */
+    /** A tab attaching after the desktop selected the base target. */
     const h = render();
     h.open(newAgentToggledOnTheHost());
     expect(h.q(".fd-dialog__panel").getAttribute("data-toggled")).toBe("true");
@@ -335,11 +305,11 @@ describe("artboard 1e, right-hand state", () => {
     expect(
       h.all(".fd-dialog__action")
         .find((b) => b.getAttribute("data-key") === "Tab")?.textContent,
-    ).toContain("Run from base: main");
+    ).toContain("Target: base (main)");
 
     h.key("Tab");
-    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
-    expect(h.text(".fd-dialog__field-label")).toBe("Branch");
+    expect(h.answers).toEqual(["Tab"]);
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_ON);
   });
 
   it("Tab is left to the browser on a dialog with no toggle", () => {

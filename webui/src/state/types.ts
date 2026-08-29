@@ -29,7 +29,6 @@ import type {
   DialogDraft,
   DialogKey,
   DialogOrigin,
-  DialogToggle,
 } from "./dialog";
 
 /**
@@ -477,6 +476,8 @@ export interface DialogState {
   /** The text field's host-side content, or `null` when it has no field. */
   readonly input: string | null;
   readonly list: readonly DialogChoice[];
+  /** The host says the input filters the list by branch-name substring. */
+  readonly listFilter: boolean;
   readonly buttons: readonly DialogKey[];
   /** `false` when the host will refuse a confirm from a browser. Cancelling
    * stays available, which is why this is not "read-only". */
@@ -487,9 +488,6 @@ export interface DialogState {
    * dialog's buttons (`remote-control-ll5.4`, §6.5 R13). `null` — the common
    * case — means every button is one press away. */
   readonly gate: ConfirmGate | null;
-  /** Artboard 1e's `Tab` toggle, with the host's words for **both** of its
-   * states (§6.5 R19). `null` on every dialog that has no toggle. */
-  readonly toggle: DialogToggle | null;
   readonly draft: DialogDraft;
   readonly pending: readonly PendingDialogAnswer[];
   readonly lastOutcome: DialogOutcome | null;
@@ -920,8 +918,6 @@ export type AppAction =
   | { readonly type: "dialog/move"; readonly delta: number }
   /** A choice row was clicked — the mouse half of `dialog/move`. */
   | { readonly type: "dialog/choose"; readonly index: number }
-  /** `Tab`: 1e's `run from base branch`. Local until the confirm carries it. */
-  | { readonly type: "dialog/toggle" }
   /**
    * Artboard 1g's step 1 → step 2: the gated button was pressed, so the name
    * field opens. Deliberately **not** a frame — the host is told nothing until

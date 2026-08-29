@@ -485,7 +485,7 @@ fn ids_are_plain_json_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn protocol_version_is_four_and_the_whole_supported_range() {
+fn protocol_version_is_five_and_the_whole_supported_range() {
     // v2 was D14 as revised: `Seat` and `SeatRequest` are closed vocabularies
     // and both grew a member the peer must understand. **v3 was
     // `ServerMsg::GitStatus`** (`remote-control-ll5.8`) and **v4 is
@@ -503,9 +503,9 @@ fn protocol_version_is_four_and_the_whole_supported_range() {
     // There is still no range, because server and SPA ship in one binary (D9)
     // and a stale tab is told to reload rather than served a half-spoken
     // protocol.
-    assert_eq!(PROTOCOL_VERSION, 4);
-    assert_eq!(MIN_SUPPORTED_VERSION, 4);
-    assert_eq!(MAX_SUPPORTED_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(MIN_SUPPORTED_VERSION, 5);
+    assert_eq!(MAX_SUPPORTED_VERSION, 5);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -525,8 +525,8 @@ fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
     // line still says 4, the answer is almost certainly a bump — see the module
     // doc's forward-compatibility rule 1.
     let newest_frame_kind_arrived_in = 4;
-    assert_eq!(
-        PROTOCOL_VERSION, newest_frame_kind_arrived_in,
+    assert!(
+        PROTOCOL_VERSION >= newest_frame_kind_arrived_in,
         "a frame kind was added without bumping PROTOCOL_VERSION: a peer at the \
          advertised version would silently drop it"
     );
@@ -557,14 +557,14 @@ fn mismatched_version_is_representable_and_detectable() {
     // does not know `configuration`, and the host's own palette inventory would
     // hand it the `open_configuration` row that produces one. Refusing the
     // attach is what turns a dead button into "reload to update".
-    let err = check_version(3).expect_err("v3 must not be accepted by a v4 host");
+    let err = check_version(4).expect_err("v4 must not be accepted by a v5 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 4,
-            peer: 3,
-            min_supported: 4,
-            max_supported: 4,
+            local: 5,
+            peer: 4,
+            min_supported: 5,
+            max_supported: 5,
         }
     );
     // v1 and v2 are equally refused, and for D14's original reason.
@@ -572,15 +572,15 @@ fn mismatched_version_is_representable_and_detectable() {
     assert!(check_version(2).is_err());
     // Newer than our ceiling is equally a mismatch — there is no downgrade path,
     // because server and SPA ship together.
-    assert!(check_version(5).is_err());
+    assert!(check_version(6).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
     let value = serde_json::to_value(&frame).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
-    assert_eq!(value["version"]["peer"], 3);
-    assert_eq!(value["version"]["max_supported"], 4);
+    assert_eq!(value["version"]["peer"], 4);
+    assert_eq!(value["version"]["max_supported"], 5);
     assert_eq!(round_trip(&frame), frame);
 }
 

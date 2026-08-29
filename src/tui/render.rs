@@ -4503,13 +4503,20 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_status_names_the_input_lock_holder() {
+        let state = state_with_tabs(1);
+        let flat = flatten(&compact_status_bar_text(&state, Some("Safari/iOS"), 100));
+        assert!(flat.contains("INPUT: Safari/iOS"), "got: {flat:?}");
+    }
+
+    #[test]
     fn very_narrow_collapsed_status_renders_safety_mode_update_and_default() {
         let mut state = state_with_tabs(1);
         state.focus_terminal();
         state.isolated = true;
         state.update_available = Some("2.0.0".to_string());
         let mut term = test_terminal(43, 24); // 40-column main pane.
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let row = buffer_row(term.backend().buffer(), 23);
         assert!(row.contains("ISOLATED"), "row: {row:?}");

@@ -21,6 +21,7 @@ import {
   hasToggle,
   primaryKey,
   selectedChoice,
+  visibleChoices,
 } from "./dialog";
 import { fixtureSnapshot } from "./fixture";
 import { reduce } from "./reducer";
@@ -50,22 +51,28 @@ function newAgentWire(
       ],
       buttons: [
         { key: "Enter", label: "Create" },
-        { key: "Tab", label: "Run from base: off" },
+        { key: "Tab", label: "Target: new branch" },
         { key: "Esc", label: "Cancel", cancels: true },
       ],
       confirmable: true,
-      /** Both wordings, as the host really sends them (§6.5 R19): the browser
-       * picks the pair its own draft is in. */
-      toggle: {
-        key: "Tab",
-        on: false,
-        title_off:
-          "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)",
-        label_off: "Run from base: off",
-        title_on:
-          "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\nRuns on base branch 'main' in the project root — no worktree.",
-        label_on: "Run from base: main",
-      },
+    },
+  };
+}
+
+function newAgentBaseWire(): WireDialogView {
+  const wire = newAgentWire();
+  return {
+    ...wire,
+    title:
+      "New Agent Session Tab   (↑/↓ agent · Tab changes target)\nRuns on base branch 'main' in the project root — no worktree.",
+    body: {
+      ...wire.body,
+      input: null,
+      buttons: [
+        { key: "Enter", label: "Create" },
+        { key: "Tab", label: "Target: base (main)" },
+        { key: "Esc", label: "Cancel", cancels: true },
+      ],
     },
   };
 }
@@ -163,7 +170,6 @@ describe("the wire → model mapping", () => {
     expect(dialog.draft).toEqual({
       text: "",
       index: null,
-      toggled: false,
       /** 1g's field starts empty and at step 1: a gate that pre-filled itself
        * would be a button with extra steps. */
       confirmName: "",
@@ -293,12 +299,37 @@ describe("1e's local draft", () => {
     expect(selectedChoice(dialogOf_(state))).toBe(0);
   });
 
-  it("hides the branch field when run-from-base is on (1e, right)", () => {
-    let state = opened(newAgentWire());
-    expect(branchFieldVisible(dialogOf_(state))).toBe(true);
-    state = reduce(state, { type: "dialog/toggle" });
-    expect(dialogOf_(state).draft.toggled).toBe(true);
-    expect(branchFieldVisible(dialogOf_(state))).toBe(false);
+  it("reads branch-field visibility from the host's current target", () => {
+    expect(branchFieldVisible(dialogOf_(opened(newAgentWire())))).toBe(true);
+    expect(branchFieldVisible(dialogOf_(opened(newAgentBaseWire())))).toBe(false);
+  });
+
+  it("filters a host-marked branch list with the local text draft", () => {
+    const original = newAgentWire();
+    const wire: WireDialogView = {
+      ...original,
+      body: {
+        ...original.body,
+        list_filter: true,
+        list: [
+          { label: "feature/existing", selected: true },
+          { label: "release/v2", selected: false },
+        ],
+      },
+    };
+    let state = opened(wire);
+    for (const char of "REL") {
+      state = reduce(state, { type: "dialog/type", char });
+    }
+    const dialog = dialogOf_(state);
+    expect(visibleChoices(dialog).map((choice) => choice.label)).toEqual([
+      "release/v2",
+    ]);
+    expect(confirmArgs(dialog, "Enter")).toEqual({
+      dialog_id: "dialog-7",
+      list_index: 0,
+      text: "REL",
+    });
   });
 
   it("survives a coalesced resync of the same dialog", () => {
@@ -311,6 +342,21 @@ describe("1e's local draft", () => {
       snapshot: { ...fixtureSnapshot(), dialog: dialogOf(newAgentWire()) },
     });
     expect(dialogOf_(state).draft.text).toBe("x");
+  });
+
+  it("keeps text but not a radio index when Tab changes the list domain", () => {
+    let state = opened(newAgentWire());
+    state = reduce(state, { type: "dialog/move", delta: 2 });
+    state = reduce(state, { type: "dialog/type", char: "x" });
+    const next = newAgentWire();
+    state = opened(
+      {
+        ...next,
+        body: { ...next.body, list_filter: true },
+      },
+      state,
+    );
+    expect(dialogOf_(state).draft).toMatchObject({ text: "x", index: null });
   });
 
   it("is discarded when a different dialog replaces it", () => {
@@ -344,17 +390,10 @@ describe("the confirm frame", () => {
     });
   });
 
-  it("sends the toggle and drops the text when run-from-base is on", () => {
-    /** 1e: the branch field is gone, so there is nothing to name — sending text
-     * the host would ignore would be describing a form the user cannot see. */
-    let state = opened(newAgentWire());
-    for (const char of "ignored") {
-      state = reduce(state, { type: "dialog/type", char });
-    }
-    state = reduce(state, { type: "dialog/toggle" });
+  it("sends no text when the host's base target has no field", () => {
+    const state = opened(newAgentBaseWire());
     expect(confirmArgs(dialogOf_(state), "Enter")).toEqual({
       dialog_id: "dialog-7",
-      toggle: true,
       list_index: 0,
     });
   });

@@ -205,7 +205,7 @@ export function createApp(options: AppOptions): App {
       onCancel: () => options.onAnswerDialog?.(null),
     },
     (index) => store.dispatch({ type: "dialog/choose", index }),
-    () => store.dispatch({ type: "dialog/toggle" }),
+    (key) => options.onAnswerDialog?.(key),
     /** 1g step 1 → step 2. Local, and sends nothing: pressing the destructive
      * button from a browser opens the name field, it does not answer. */
     () => store.dispatch({ type: "dialog/advance" }),
@@ -967,7 +967,10 @@ export function createApp(options: AppOptions): App {
         return false;
       }
       event.preventDefault();
-      store.dispatch({ type: "dialog/toggle" });
+      const toggle = dialog.buttons.find((button) => button.key === "Tab");
+      if (toggle !== undefined) {
+        options.onAnswerDialog?.(toggle.key);
+      }
       return true;
     }
     if (event.key === "ArrowUp" || event.key === "ArrowDown") {

@@ -165,17 +165,6 @@ mod tests;
 /// not a wrong one. That is rule 4, and it is why the bump is attributed to
 /// the frame kind alone.
 ///
-/// **R19 is v3 as well, deliberately.** `remote-control-pz1j` added
-/// [`DialogBody::toggle`] and [`DialogKey::cancels`] — an additive
-/// `#[serde(default)]` field apiece, inside the free-form `body` slot v1 chose
-/// precisely so M2 could grow dialog bodies without a bump. No frame kind
-/// appeared and no closed vocabulary grew a member, so the `GitStatus` test
-/// ("a peer that drops this is silent where an answer was expected") does not
-/// apply: a host that sends neither leaves a browser rendering the host's own
-/// button label and its own `Esc Cancel`, which is exactly what it rendered
-/// before — a lesser panel, not a wrong one. That is rule 4, the same reading
-/// `Delta::Seats`'s `you_were_preempted` got.
-///
 /// **v4 is SPECS §8's configuration manager** (`remote-control-1p22`, §6.5
 /// R22): [`ServerMsg`] grew [`ServerMsg::Configuration`], which is the same
 /// closed-vocabulary growth `GitStatus` was, with the same concrete failure
@@ -189,6 +178,12 @@ mod tests;
 /// [`ConfigSaveRequest`] `args`. Those travel browser → host inside
 /// [`Command::args`], which has been a free-form `serde_json::Value` since v1
 /// precisely so M2 could grow command payloads without a bump.
+///
+/// **v5 is the three-target New Agent form.** The target now cycles through a
+/// new branch, an existing branch and the project base. `Tab` therefore became
+/// an immediate host-owned dialog action instead of a local browser boolean,
+/// and the old toggle metadata was removed. A stale v4 tab would render and
+/// confirm the wrong form, so it must reload.
 ///
 /// It is deliberately the whole range — there is no older web protocol to
 /// interoperate with, because the browser SPA ships inside the same binary as
@@ -206,14 +201,14 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
 /// and SPA ship in the same binary (D9), so there is no older peer to keep.
-pub const MIN_SUPPORTED_VERSION: u16 = 4;
+pub const MIN_SUPPORTED_VERSION: u16 = 5;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 4;
+pub const MAX_SUPPORTED_VERSION: u16 = 5;
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -1161,6 +1156,9 @@ pub struct DialogBody {
     /// The choice rows (1e's agent radio, the folder browser's subdirectories).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub list: Vec<DialogChoice>,
+    /// Whether `input` filters `list` by a case-insensitive substring match.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub list_filter: bool,
     /// The action buttons, in display order. The first is the primary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<DialogKey>,
@@ -1178,53 +1176,6 @@ pub struct DialogBody {
     /// every button this dialog shows is one press away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_gate: Option<ConfirmGate>,
-    /// Artboard 1e's `Tab` toggle, when this dialog has one
-    /// (`specs/WEB_INTERFACE.md` §6.5 R19). Absent — every dialog but the
-    /// new-agent form — means there is nothing to flip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toggle: Option<DialogToggle>,
-}
-
-/// Artboard 1e's `Tab` toggle, **in both of its wordings** at once
-/// (`specs/WEB_INTERFACE.md` §6.5 R19).
-///
-/// # Why both, rather than the one that is true now
-///
-/// R8 keeps 1e's typed branch, radio position and `Tab` toggle as a *local
-/// draft* in the browser, so a coalesced resync mid-typing cannot empty the
-/// field. The toggle therefore moves in the browser before the host hears
-/// anything — the host's own `run_on_base` does not flip until the confirm
-/// lands. Sending only the wording that matches the host's flag means a browser
-/// in the toggled state renders `Run from base: off` on the very button it just
-/// switched on, beside a panel that has already hidden the branch field.
-///
-/// The seam is fixed by moving the *choice* to the browser and leaving the
-/// *words* with the host, which is R7/ll5.12's rule intact: every string here is
-/// written by [`prompt_dialog`](crate::prompt_dialog) exactly as the desktop
-/// writes it, and the browser only picks which pair to draw. It picks by its own
-/// draft, so the panel and its button can never disagree — and because both
-/// pairs travel unconditionally, the browser never has to reason about [`on`]
-/// to word anything.
-///
-/// [`on`]: DialogToggle::on
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DialogToggle {
-    /// The [`DialogKey::key`] that flips it (`Tab`), so the browser reads the
-    /// toggling button off the wire rather than hard-coding a spelling.
-    pub key: String,
-    /// Whether the **host's** copy has it on right now. The browser opens its
-    /// draft here — and sends `toggle` on the confirm only when its draft has
-    /// since moved away from it, because the host answers a confirm by
-    /// synthesising a `Tab` *press*, which flips rather than sets.
-    pub on: bool,
-    /// [`DialogView::title`] as the host words it with the toggle **off**.
-    pub title_off: String,
-    /// The toggling button's own label with the toggle **off**.
-    pub label_off: String,
-    /// [`DialogView::title`] as the host words it with the toggle **on**.
-    pub title_on: String,
-    /// The toggling button's own label with the toggle **on**.
-    pub label_on: String,
 }
 
 /// Artboard 1g's **step 2**: the typed-name gate a remote surface must pass
@@ -2381,7 +2332,7 @@ pub mod command {
     /// Confirm the open dialog, whichever surface opened it (D13).
     ///
     /// `args` names the dialog and, when it has one, what the browser filled in:
-    /// `{ dialog_id, choice?, text?, toggle?, confirm_name? }`. `choice` is the
+    /// `{ dialog_id, choice?, text?, confirm_name? }`. `choice` is the
     /// *key label* of a button the dialog is currently showing (`y`, `1`, `i`,
     /// `Enter`) and `text` is the input field's content, so a browser can only
     /// ever press a key the dialog is offering — the same power the desktop's
@@ -2403,6 +2354,8 @@ pub mod command {
     pub const OPEN_PROJECT: &str = "open_project";
     /// Close the active project.
     pub const CLOSE_PROJECT: &str = "close_project";
+    /// Change the active project's default base branch.
+    pub const CHANGE_PROJECT_DEFAULT_BASE: &str = "change_project_default_base";
     /// Switch to the next open project.
     pub const NEXT_PROJECT: &str = "next_project";
     /// Switch to the previous open project.

@@ -1067,7 +1067,7 @@ never read".
 **A dialog rides on the snapshot as well as on deltas**, because a dialog is
 state: a tab that attaches while one is open paints it from `Snapshot::dialog`
 and never saw the `DialogOpened`. On the browser side the local *draft* (1e's
-typed branch, the radio position, the `Tab` toggle) survives a re-announcement of
+typed branch, the radio position, the current target mode) survives a re-announcement of
 the same dialog, so a coalesced resync mid-typing does not empty the field — and
 it is never rendered as accepted state: the confirm is settled by the host's own
 `Ack`, and an `applied` `Ack` does **not** close the panel. Only
@@ -3185,8 +3185,8 @@ once, at startup, so the fact settles seconds into the run and never moves
 again; a tab attaching after that — which is every tab, the server being started
 from the palette — is told in the frame it paints from, and there is no change
 for a `Delta` to describe. The field is additive and `#[serde(default)]`, so it
-is the forward-compatibility policy's **rule 4**, the reading `DialogBody::toggle`
-and `Delta::Seats::you_were_preempted` got: a host that sends nothing leaves the
+is the forward-compatibility policy's **rule 4**, the reading
+`Delta::Seats::you_were_preempted` got: a host that sends nothing leaves the
 browser exactly where it was, with no chip. It is not the `ServerMsg::GitStatus`
 case that forced v2 → v3 or the `ServerMsg::Configuration` case that forced
 v3 → v4 — no frame kind appeared and no closed vocabulary grew a member — and
@@ -3420,6 +3420,31 @@ two reasons: moving it would not have stopped it shipping, and `finalize` and
 `RawInterface` are private, so the move would have meant publishing both of them
 to serve a double. `cargo check --release --locked` is what proves nothing in
 production reaches it.
+
+### R27 — the New Agent target is a host-owned three-state cycle
+
+Main added existing-branch attachment to the New Agent form, changing `Tab`
+from a boolean `new branch ↔ base` toggle into `new branch → existing branch →
+base`. R19's local `draft.toggled` could not represent that third state, and the
+existing-branch state changes more than a label: it replaces the agent radio
+with a searchable branch list while keeping the text field as its filter.
+
+The browser now sends the host's `Tab` button immediately through
+`dialog_confirm`. The host runs the same prompt key handler as the desktop and
+republishes the complete dialog view, so its title, list, input and button labels
+move together. Typed text remains a browser draft, but each round-trip replaces
+the host's prompt buffer through ordinary Backspace/character keypresses rather
+than appending it, so repeated cycles cannot duplicate the filter.
+`DialogBody.list_filter` marks the two branch pickers whose input filters their
+rows; the browser applies the host's case-insensitive substring rule locally,
+then submits the selected index against those visible rows.
+
+This supersedes R19's local-toggle ruling; R19's separate `DialogKey::cancels`
+ruling remains. `DialogToggle`, `draft.toggled` and the confirm frame's `toggle`
+argument are removed. The browser discovers the cycle from the host's `Tab`
+button, and **Change Project Default Base** is added to the host-owned browser
+inventory at the same seam. This is web protocol **v5**: a stale v4 tab would
+render a two-state form against a three-state host, so it is told to reload.
 
 #### Four doc comments that named something that does not exist
 

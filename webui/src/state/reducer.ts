@@ -7,7 +7,7 @@ import {
   resolveConfigRow,
 } from "./config";
 import type { ConfigEdit, ConfigScope } from "./config";
-import { selectedChoice } from "./dialog";
+import { selectedChoice, visibleChoices } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
 import type { AccessState, Project, SeatInfo, Selection } from "./model";
 import { incumbentFromSeats } from "./seats";
@@ -767,7 +767,15 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           ...state,
           dialog: {
             ...action.dialog,
-            draft: current.draft,
+            draft: {
+              ...current.draft,
+              // `Tab` can replace the agent radios with filtered branches.
+              // Their row indexes are different domains; the text is not.
+              index:
+                current.listFilter === action.dialog.listFilter
+                  ? current.draft.index
+                  : null,
+            },
             pending: current.pending,
             lastOutcome: current.lastOutcome,
           },
@@ -795,7 +803,11 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         ...state,
         dialog: {
           ...dialog,
-          draft: { ...dialog.draft, text: dialog.draft.text + action.char },
+          draft: {
+            ...dialog.draft,
+            text: dialog.draft.text + action.char,
+            index: dialog.listFilter ? null : dialog.draft.index,
+          },
         },
       };
     }
@@ -809,21 +821,25 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         ...state,
         dialog: {
           ...dialog,
-          draft: { ...dialog.draft, text: dialog.draft.text.slice(0, -1) },
+          draft: {
+            ...dialog.draft,
+            text: dialog.draft.text.slice(0, -1),
+            index: dialog.listFilter ? null : dialog.draft.index,
+          },
         },
       };
     }
 
     case "dialog/move": {
       const dialog = state.dialog;
-      if (dialog === null || dialog.list.length === 0) {
+      if (dialog === null || visibleChoices(dialog).length === 0) {
         return state;
       }
       const from = selectedChoice(dialog);
       /** Clamped, not wrapped — the same rule the palette's `move` follows. */
       const index = Math.min(
         Math.max(from + action.delta, 0),
-        dialog.list.length - 1,
+        visibleChoices(dialog).length - 1,
       );
       return { ...state, dialog: { ...dialog, draft: { ...dialog.draft, index } } };
     }
@@ -833,30 +849,13 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       if (
         dialog === null ||
         action.index < 0 ||
-        action.index >= dialog.list.length
+        action.index >= visibleChoices(dialog).length
       ) {
         return state;
       }
       return {
         ...state,
         dialog: { ...dialog, draft: { ...dialog.draft, index: action.index } },
-      };
-    }
-
-    case "dialog/toggle": {
-      /** Only a dialog the host gave a toggle has one to flip — the same shape
-       * `dialog/advance` uses for the gate. Flipping a draft nothing renders
-       * would hide the branch field of a form that has no run-from-base. */
-      const dialog = state.dialog;
-      if (dialog === null || dialog.toggle === null) {
-        return state;
-      }
-      return {
-        ...state,
-        dialog: {
-          ...dialog,
-          draft: { ...dialog.draft, toggled: !dialog.draft.toggled },
-        },
       };
     }
 

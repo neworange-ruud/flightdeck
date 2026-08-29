@@ -9,8 +9,10 @@ import {
   gateSatisfied,
   gatedKey,
   hasToggle,
+  runsOnBase,
   selectedChoice,
   toggleButton,
+  visibleChoices,
 } from "../state/dialog";
 import type { DialogKey } from "../state/dialog";
 import type { AppState, DialogState } from "../state/types";
@@ -42,24 +44,12 @@ import type { Region } from "./dom";
  * 2g's "another actor acted" hue, shared with drift, App mode and the takeover
  * panel, which is exactly the fact being reported.
  *
- * ## 1e's two states are one panel and one local flag
+ * ## 1e's targets are one host-owned panel
  *
- * Left-hand state: the agent radio, the branch field, `Enter Create` /
- * `Tab Run from base: off` / `Esc Cancel`. Right-hand state: `Tab` pressed, the
- * branch field gone ("there is nothing to name"), the frame in `--fd-focus`
- * instead of `--fd-accent`. That is `state.dialog.draft.toggled`, rendered as
- * `data-toggled` on the panel — one panel, not two components, because it is
- * one dialog in two states and the artboard draws them side by side only to
- * show both at once.
- *
- * **The title and that button's label move with the draft** (§6.5 R19). The
- * toggle stays a local draft — R8's reason for it is that a coalesced resync
- * mid-typing must not empty the branch field, and that is untouched — so the
- * host sends the words for *both* states and `dialogTitle` / `toggleButton`
- * pick the pair the draft is in. Before that the panel could badge itself
- * `no worktree` while its own button read `Run from base: off`, because the
- * button's words were the host's `run_on_base`, which does not flip until the
- * confirm lands.
+ * `Tab` cycles new branch, existing branch and base on the host. The browser
+ * sends that key immediately and repaints the complete host view, because the
+ * target changes the title, list, field and buttons together. `data-toggled`
+ * remains the styling hook for the no-worktree base state.
  *
  * ## Artboard 1g's two steps are the same panel again
  *
@@ -96,7 +86,7 @@ export interface DialogOptions {
 export function createDialog(
   options: DialogOptions = {},
   onChoose?: (index: number) => void,
-  onToggle?: () => void,
+  onToggle?: (key: string) => void,
   onAdvance?: () => void,
 ): Region {
   const titleEl = el("span", { class: "fd-dialog__title" });
@@ -139,7 +129,7 @@ export function createDialog(
     }
 
     panel.setAttribute("data-kind", dialog.kind);
-    panel.setAttribute("data-toggled", String(dialog.draft.toggled));
+    panel.setAttribute("data-toggled", String(runsOnBase(dialog)));
     panel.setAttribute("data-confirmable", String(dialog.confirmable));
     /** 1g's `step 1 of 2` / `step 2 of 2`, as an attribute so the panel can be
      * styled — and read by a test — without parsing the header's words. */
@@ -154,7 +144,7 @@ export function createDialog(
     titleEl.textContent = dialogTitle(dialog);
     /** 1e's right-hand header reads `no worktree` when run-from-base is on;
      * every other dialog gets the keys it is waiting for. */
-    kindEl.textContent = dialog.draft.toggled
+    kindEl.textContent = runsOnBase(dialog)
       ? "no worktree"
       : keyHintFor(dialog);
 
@@ -227,12 +217,13 @@ export function createDialog(
   function renderList(dialog: DialogState): void {
     clear(listEl);
     /** At step 2 the question has been read; the panel is about the name. */
-    listEl.hidden = dialog.list.length === 0 || atNameStep(dialog);
+    const choices = visibleChoices(dialog);
+    listEl.hidden = choices.length === 0 || atNameStep(dialog);
     if (listEl.hidden) {
       return;
     }
     const selected = selectedChoice(dialog);
-    dialog.list.forEach((choice, index) => {
+    choices.forEach((choice, index) => {
       const row = el(
         "button",
         {
@@ -339,8 +330,8 @@ export function createDialog(
     }
     const toggle = toggleButton(dialog);
     if (toggle !== null) {
-      const row = action("secondary", toggle, true, () => onToggle?.());
-      row.setAttribute("data-on", String(dialog.draft.toggled));
+      const row = action("secondary", toggle, true, () => onToggle?.(toggle.key));
+      row.setAttribute("data-on", String(runsOnBase(dialog)));
       actionsEl.append(row);
     }
     actionsEl.append(cancelAction(dialog));

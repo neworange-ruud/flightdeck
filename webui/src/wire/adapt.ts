@@ -549,6 +549,7 @@ export function dialogOf(wire: WireDialogView): DialogState {
       label: choice.label,
       selected: choice.selected,
     })),
+    listFilter: body.list_filter ?? false,
     buttons: (body.buttons ?? []).map((button) => ({
       key: button.key,
       label: button.label,
@@ -573,27 +574,13 @@ export function dialogOf(wire: WireDialogView): DialogState {
             expected: body.confirm_gate.expected,
             instruction: body.confirm_gate.instruction,
           },
-    /** Absent means the host described no toggle, which is every dialog but
-     * 1e's form: `hasToggle` is then false and the panel has nothing to flip. */
-    toggle:
-      body.toggle === undefined || body.toggle === null
-        ? null
-        : {
-            key: body.toggle.key,
-            on: body.toggle.on,
-            titleOff: body.toggle.title_off,
-            labelOff: body.toggle.label_off,
-            titleOn: body.toggle.title_on,
-            labelOn: body.toggle.label_on,
-          },
     /** The draft opens where the **host** has the toggle, so a tab attaching to
      * a form the desktop had already switched to run-from-base paints the state
      * that is really pending rather than the other one. Every other field starts
      * empty: `index: null` means "the host's own highlight stands". */
     draft: {
-      text: "",
+      text: body.input ?? "",
       index: null,
-      toggled: body.toggle?.on ?? false,
       confirmName: "",
       step: 1,
     },
