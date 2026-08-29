@@ -752,9 +752,11 @@ mod r2 {
         });
         assert!(!git.collected, "the browser renders `git: ?` from this");
         assert!(is_git_unknown(&git));
-        assert!(
-            git.is_clean(),
-            "the counts are zero, which is exactly why `collected` has to exist"
+        assert_eq!(
+            (git.added, git.modified, git.removed),
+            (0, 0, 0),
+            "the counts are zero — which is exactly why `collected` has to exist, \
+             since zeroed counts are what every surface renders as `clean`"
         );
         assert_eq!(git.branch.as_deref(), Some("flightdeck/fix-login"));
     }

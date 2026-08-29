@@ -426,6 +426,14 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 
 /// Whether the bound address is reachable from other machines (D5).
+///
+/// Derived in exactly one place — from the address the listener really got, in
+/// [`start`] — and never from the configured `[web] bind` string. The string
+/// can lie (`0.0.0.0` is not an address anything is reachable at, `localhost`
+/// is whatever the resolver says today) and the socket cannot, so there is one
+/// classifier rather than a pre-bind guess beside a post-bind fact. A second,
+/// string-based one existed and nothing called it — `specs/WEB_INTERFACE.md`
+/// §6.5 R26.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindExposure {
     /// `127.0.0.1` / `::1` — this machine only. The default.
@@ -434,30 +442,6 @@ pub enum BindExposure {
     /// `[web] bind` themselves, and the UI warns when the server actually
     /// starts.
     Routable,
-}
-
-/// Classify a configured `[web] bind` string **before** binding, so the access
-/// overlay can warn the user about what they are about to do.
-///
-/// Anything that is not recognisably loopback is treated as [`Routable`]. The
-/// conservative direction is deliberate: a hostname this function cannot parse
-/// must produce a warning, never silence.
-///
-/// [`Routable`]: BindExposure::Routable
-pub fn bind_exposure(bind: &str) -> BindExposure {
-    let trimmed = bind.trim();
-    if trimmed.eq_ignore_ascii_case("localhost") {
-        return BindExposure::Loopback;
-    }
-    // `[::1]` as well as `::1`, since a user may copy the bracketed form.
-    let bare = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    match bare.parse::<IpAddr>() {
-        Ok(ip) if ip.is_loopback() => BindExposure::Loopback,
-        _ => BindExposure::Routable,
-    }
 }
 
 // ===========================================================================

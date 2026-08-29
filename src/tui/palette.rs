@@ -289,9 +289,19 @@ pub const REQUIRED_ACTION_COUNT: usize = 35;
 ///
 /// The desktop reaches these through [`CommandPalette::filtered`], which hides
 /// the rows that do not apply to the current pairing / web / isolation state.
-/// This accessor exists for the *other* consumer:
-/// [`crate::web::commands`] maps each row to a wire name so a browser can run
-/// it, and its coverage test walks this list to prove none was missed.
+///
+/// **This accessor exists for the tests, and that is the whole arrangement.**
+/// The browser's command surface is *not* derived from this list: it is
+/// [`crate::web::commands::INVENTORY`], a hand-maintained parallel table with
+/// its own labels, groups, annotations and routes — because a wire name, a
+/// `host only` badge and an artboard's annotation are facts about the *browser*
+/// that no `PaletteAction` carries. What keeps the two lists from drifting is
+/// `src/web/commands/tests.rs`, which walks this one and fails if a row's
+/// claimed wire name is missing from `INVENTORY`, if the two labels or groups
+/// disagree, or if either list changes length. So the coupling is real and
+/// enforced, but it is enforced by a test rather than by a function call — and
+/// nothing in `src/web/commands.rs` itself ever reads this
+/// (`specs/WEB_INTERFACE.md` §6.5 R26).
 pub fn all_entries() -> &'static [PaletteEntry] {
     ALL_ENTRIES
 }

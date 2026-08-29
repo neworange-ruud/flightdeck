@@ -18,7 +18,8 @@ import type { Child, Region } from "./dom";
  *      structure below guarantees it mechanically: `.fd-spacer` is always the
  *      element immediately before `.fd-conn`, in every state, so the
  *      connection group is always pushed to the same edge. That is asserted
- *      directly in `src/ui/connectionStates.test.ts` rather than eyeballed.
+ *      directly in `src/ui/turn2Screens.test.ts` ("never moves the connection
+ *      strip's position") rather than eyeballed.
  *   2. **Anything that costs the user control drains the mode chip** — see
  *      `modeChip`, which asks `hasControl` rather than re-deciding.
  *   3. **The whole bar takes the state's frame colour**, the only chrome in the

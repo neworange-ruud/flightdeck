@@ -174,29 +174,14 @@ fn proxy_headers_cannot_forge_the_rate_limit_address() {
 // Bind exposure (D5)
 // ---------------------------------------------------------------------------
 
+/// D5's default, asserted against the config rather than against a second
+/// classifier for it. That the *listener* then reports `Loopback` is asserted
+/// end to end, against a real socket, in
+/// `tests/web_server.rs::the_default_bind_is_loopback_and_the_port_is_reported_back`
+/// — which is the only place [`BindExposure`] is decided (§6.5 R26).
 #[test]
-fn loopback_is_the_default_and_anything_else_is_routable() {
-    // The shipped default must be loopback, with no opt-in anywhere.
-    assert_eq!(
-        bind_exposure(&WebConfig::default().bind),
-        BindExposure::Loopback,
-        "D5: the default bind is loopback"
-    );
-
-    for loopback in ["127.0.0.1", "::1", "[::1]", "localhost", "127.5.5.5"] {
-        assert_eq!(
-            bind_exposure(loopback),
-            BindExposure::Loopback,
-            "{loopback} is loopback"
-        );
-    }
-    for routable in ["0.0.0.0", "192.168.2.20", "::", "my-laptop.local", ""] {
-        assert_eq!(
-            bind_exposure(routable),
-            BindExposure::Routable,
-            "{routable} must warn"
-        );
-    }
+fn the_shipped_default_bind_is_loopback() {
+    assert_eq!(WebConfig::default().bind, "127.0.0.1");
 }
 
 #[test]

@@ -1872,10 +1872,8 @@ fn a_graceful_stop_sends_shutdown_before_the_socket_closes() {
                     !self_initiated,
                     "this browser did not ask for the quit, so it sees a failure screen"
                 );
-                assert!(
-                    !reason.should_retry(),
-                    "the browser must stop retrying against a host that is gone"
-                );
+                // Whether that reason is worth retrying is the browser's call
+                // and is asserted in `webui`; the host's job is to name it.
                 seen_shutdown = true;
             }
             Some(_) => continue,
@@ -3953,6 +3951,66 @@ fn a_writer_can_take_the_input_lock_by_name() {
             Some(&second_snapshot.viewer_id)
         );
         assert_ne!(first_snapshot.viewer_id, second_snapshot.viewer_id);
+    });
+}
+
+/// `specs/WEB_INTERFACE.md` §6.5 R26. Artboard 2f's third panel gives the
+/// **desktop** a transient `● browser control moved … dismisses in 6s` strip.
+/// What the desktop got instead is the persistent `INPUT: <holder>` chip, and
+/// this is the assertion that makes that a substitution rather than a gap.
+///
+/// The chip is not merely a readout that happens to be correct afterwards: it
+/// **changes at the moment of the event**, in place, at a fixed position —
+/// `INPUT: desktop` becomes `INPUT: <the browser>` on the next render tick, one
+/// `POLL_TIMEOUT` later. That is what the strip was drawn to do. It then keeps
+/// answering past the six seconds a strip would have lasted, which is when the
+/// person at the machine actually asks the question — they ask it by typing.
+#[test]
+fn a_browser_preempting_the_desktop_moves_the_desktops_input_chip() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut browser = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut browser, SeatRequest::Write).await;
+        await_snapshot(&mut browser).await;
+
+        // The person at the machine holds the turn. `preempt_input_for_desktop`
+        // on a free lock is the palette door to the same claim `desktop_may_type`
+        // makes by typing, and it interrupts nobody here.
+        let now = RealClock.now_millis() as i64;
+        assert_eq!(harness.handle.preempt_input_for_desktop(now), None);
+        assert_eq!(
+            harness.handle.input_holder_label().as_deref(),
+            Some(server::DESKTOP_SEAT_LABEL),
+            "the desktop's own chip reads `INPUT: desktop` while it holds the turn"
+        );
+
+        // A browser confirms 2f's `Take over` — the one movement that is not an
+        // ordinary idle hand-off.
+        command(&mut browser, 95, names::TAKE_INPUT_LOCK).await;
+        let ack = next_ack(&mut browser).await;
+        assert_eq!(ack.seq, 95);
+        assert_eq!(ack.outcome, AckOutcome::Applied);
+
+        // Both halves of what the desktop draws move together, from the one
+        // published fact: the chip is shown at all (a browser is a writer, so
+        // there is a contest), and it now names the browser rather than the
+        // desktop.
+        assert!(
+            harness.handle.has_browser_writer(),
+            "a browser is seated as a writer, so the chip is drawn"
+        );
+        let holder = harness
+            .handle
+            .input_holder_label()
+            .expect("somebody holds the input lock");
+        assert_ne!(
+            holder,
+            server::DESKTOP_SEAT_LABEL,
+            "the desktop lost the turn, and its status bar is the thing that says so"
+        );
     });
 }
 

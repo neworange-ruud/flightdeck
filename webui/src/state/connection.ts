@@ -15,7 +15,7 @@ import type { AppState, ConnectionStatus } from "./types";
  *   1. **The position never moves**, so a glance always lands on it. Enforced
  *      by the status bar's structure (the flexible spacer always sits
  *      immediately before `.fd-conn`), and asserted in
- *      `src/ui/connectionStates.test.ts`.
+ *      `src/ui/turn2Screens.test.ts`.
  *   2. **Anything that costs the user control drains the mode chip**, because
  *      the mode is a lie while input is not arriving — see `modeChip` in
  *      `src/ui/statusBar.ts`.
@@ -282,7 +282,7 @@ function shutdownMessage(shutdown: ShutdownState | null): string {
       return `this browser's access was withdrawn${detail}`;
     case "restarting":
       return `the host is restarting${detail}`;
-    /** An unknown reason is still final (`should_retry` says no), and the
+    /** An unknown reason is still final (`shouldRetry` says no), and the
      * host's own `detail` is the part the user can act on, so it is never
      * dropped in favour of a tidier sentence of ours. */
     case "unknown":

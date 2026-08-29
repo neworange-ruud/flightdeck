@@ -106,8 +106,15 @@ const MAX_REALIGN_CREDITS: u32 = 3;
 /// The relay `pong`-driven link indicator measures the desktop↔relay hop only, so
 /// it reads healthy while the phone is dark — which is exactly why the reported
 /// failure ran for 17 days unnoticed. This is the peer-side half of the story,
-/// derived from end-to-end ack evidence, and is what the UI must show alongside
-/// (not instead of) the relay link state.
+/// derived from end-to-end ack evidence.
+///
+/// **No surface renders it today.** It is the readable name for the
+/// `peer_present`/`peer_dark` pair that [`RemoteBridge::tick`] gates the
+/// per-tick feed on, and it exists so that the state machine those two private
+/// flags make up can be asserted as three named states rather than as two
+/// booleans. If a desktop indicator for the peer hop is ever built, this is the
+/// value it reads — but a doc that said it already did is what
+/// `specs/WEB_INTERFACE.md` §6.5 R26 was written about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerLiveness {
     /// No phone is attached to the pairing (or there is no pairing at all): the
@@ -668,9 +675,9 @@ impl RemoteBridge {
     }
 
     /// Whether the attached phone is still earning its presence — see
-    /// [`PeerLiveness`]. This is the peer-side half of the link status the UI
-    /// must show: `Dark` means the relay link is up but the phone is not
-    /// receiving, which used to be indistinguishable from a healthy link
+    /// [`PeerLiveness`], which also records who reads this (today: the tests,
+    /// and nothing on screen). `Dark` means the relay link is up but the phone
+    /// is not receiving, which used to be indistinguishable from a healthy link
     /// (remote-control-5qu).
     pub fn peer_liveness(&self) -> PeerLiveness {
         if !self.peer_present || self.pairing.is_none() {

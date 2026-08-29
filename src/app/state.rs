@@ -722,11 +722,6 @@ impl AppState {
         }
     }
 
-    /// Index of the tab with the given id, if present.
-    pub fn tab_index(&self, id: &TabId) -> Option<usize> {
-        self.tabs.iter().position(|t| t.meta.id == id.0)
-    }
-
     /// Resolve a [`Selector`] against `len` and the current index.
     fn resolve_selector(sel: Selector, current: Option<usize>, len: usize) -> Option<usize> {
         if len == 0 {

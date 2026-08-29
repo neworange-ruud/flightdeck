@@ -1238,20 +1238,6 @@ fn shutdown_tells_i_asked_for_this_from_the_host_went_away() {
     assert_eq!(parsed, theirs);
 }
 
-#[test]
-fn only_a_restart_asks_the_browser_to_keep_retrying() {
-    assert!(ShutdownReason::Restarting.should_retry());
-    for reason in [
-        ShutdownReason::HostQuit,
-        ShutdownReason::ServerStopped,
-        ShutdownReason::TokenRevoked,
-        // An unrecognised final word means stop, not spin.
-        ShutdownReason::Unknown,
-    ] {
-        assert!(!reason.should_retry(), "{reason:?} must not retry");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 7. Status vocabulary — the D12 anti-drift guard
 // ---------------------------------------------------------------------------
@@ -1463,7 +1449,10 @@ fn the_git_bar_does_not_drift_from_the_phone_protocols_indicators() {
     // The two web-only facts the phone row has no use for.
     assert_eq!(web_json["files_changed"], 6);
     assert_eq!(web_json["collected"], true);
-    assert_eq!(phone.is_clean(), web.is_clean());
+    // The `clean` predicate itself is not mirrored here: the browser owns it
+    // (`webui/src/ui/gitBar.ts`), and the phone owns its own
+    // (`GitIndicators::is_clean`). What must not drift is the *input* to it,
+    // which the loop above already checks key by key.
 }
 
 #[test]
@@ -1471,9 +1460,11 @@ fn not_collected_is_not_clean() {
     // `git: ?` and `clean` mean opposite things; the wire must be able to say so.
     let uncollected = GitBar::default();
     assert!(!uncollected.collected);
-    assert!(
-        uncollected.is_clean(),
-        "an empty count set looks clean, which is exactly why `collected` exists"
+    assert_eq!(
+        (uncollected.added, uncollected.modified, uncollected.removed),
+        (0, 0, 0),
+        "an empty count set looks clean to every surface, which is exactly why \
+         `collected` has to be a separate field"
     );
     assert_eq!(round_trip(&uncollected), uncollected);
 }
@@ -1655,8 +1646,12 @@ fn an_unknown_error_code_degrades_but_keeps_its_message() {
     );
 }
 
+/// The host's half of Q5's retry rule, and the only half it has: it must be
+/// able to *say* "unknown" honestly. Whether an unknown reason is worth
+/// retrying is the browser's decision and is asserted where it runs
+/// (`shouldRetry` in `webui/src/state/model.ts`, `state/connection.test.ts`).
 #[test]
-fn an_unknown_shutdown_reason_still_stops_the_retry_loop() {
+fn an_unrecognised_shutdown_reason_degrades_to_unknown() {
     let parsed: ServerMsg = serde_json::from_value(json!({
         "type": "shutdown",
         "reason": "abducted",
@@ -1667,7 +1662,6 @@ fn an_unknown_shutdown_reason_still_stops_the_retry_loop() {
         panic!("expected a shutdown");
     };
     assert_eq!(reason, ShutdownReason::Unknown);
-    assert!(!reason.should_retry());
 }
 
 #[test]

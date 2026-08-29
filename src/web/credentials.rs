@@ -206,11 +206,6 @@ impl BootstrapCode {
         &self.digits
     }
 
-    /// The [`Clock::now_millis`] reading after which this code is dead.
-    pub fn expires_at_millis(&self) -> u64 {
-        self.expires_at_ms
-    }
-
     /// Whole seconds left before expiry, saturating at zero — the overlay's
     /// countdown, mirroring [`crate::remote::pairing::PairingSession::seconds_remaining`].
     pub fn seconds_remaining(&self, now_ms: u64) -> u64 {

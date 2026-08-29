@@ -157,11 +157,6 @@ impl PairingSession {
         &self.phase
     }
 
-    /// Whether this attempt reached [`PairingPhase::Established`].
-    pub fn is_established(&self) -> bool {
-        matches!(self.phase, PairingPhase::Established { .. })
-    }
-
     /// The pairing id, once an offer has been minted (for unpair / bookkeeping).
     pub fn pairing_id(&self) -> Option<&PairingId> {
         self.pairing_id.as_ref()

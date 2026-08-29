@@ -542,6 +542,12 @@ both states · 2b the three browser-side access screens · 2c every connection
 state · 2d live/asleep/stale/asleep-and-stale/catching-up · 2e activity feed ·
 2f takeover trio · 2g the semantic reference sheet.
 
+2f's third panel — the **desktop's** transient `browser control moved` strip —
+is the one turn-2 panel deliberately not drawn as designed. D14's second
+revision made the movement it announces the ordinary one, and the desktop's
+persistent `INPUT: <holder>` chip answers the same question at the moment it is
+asked rather than for six seconds after an event: §6.5 **R26**.
+
 ### 5.1 Requirements turn 2 introduced
 
 Behaviour the artboards specify that no decision above covered. All of it is
@@ -1558,8 +1564,11 @@ a browser's `take_input_lock`, and `preempt_input_for_desktop` — all of which 
 through `preempt_for_viewer`, which reads the holder *before* the preemption and
 returns `None` when the claimant already held it, so confirming `Take over`
 twice does not show the panel to the person who pressed the button. An
-interrupted *desktop* flags nobody: 2f gives the person at the machine a
-transient strip, because their keyboard was never revoked.
+interrupted *desktop* flags nobody, because it needs no flag: it is not sent
+`Delta::Seats` at all, and the `INPUT: <holder>` chip in its own status bar has
+already changed to name the browser. **R26 is where that is settled** — 2f gave
+the person at the machine a transient strip instead, and the chip supersedes it.
+Either way their keyboard was never revoked, which is why neither is a dialog.
 
 **Not a version bump, and the reasoning is the policy's own.** §3's
 forward-compatibility rules make a bump necessary when a field's meaning
@@ -2917,9 +2926,11 @@ things"*).
 
 **And the clean case now reads `clean`.** 2e's git bar is
 `⎇ branch │ clean │ 120×34 · host owns geometry`; the browser printed
-`+0 ~0 -0 (0 files)`. The predicate is the host's own `GitBar::is_clean`, whose
-doc already said it "renders `clean`", and the wording matches the git-status
-panel, which had made the same call.
+`+0 ~0 -0 (0 files)`. The predicate is the browser's, and the wording matches
+the git-status panel, which had made the same call. *(At the time this was
+written the host carried a `GitBar::is_clean` of its own and this paragraph
+named it as the source; nothing ever called it, and R26 removed it. The rule
+runs in `webui/src/ui/gitBar.ts` and always did.)*
 
 **2. Four keys were printed and none of them were bound.** 1h makes the status
 bar a promise — *"the status bar states both routes permanently — no discovery
@@ -3266,6 +3277,177 @@ end-to-end one: two credentials, two live authenticated sockets, the overlay
 opened against the running listener, `2` pressed, and both directions asserted —
 the named browser is closed with `TokenRevoked`, and the one nobody named is not
 closed, is told nothing, and still types through to the host seam.
+
+### R26 — 2f's desktop strip is the chip, and six `pub` items nothing called
+
+`remote-control-em6b`, `remote-control-0rlu`. Two findings from the audit that
+followed R25's P0, and they belong in one entry because they are the same
+lesson read from two ends: an unused `pub` item raises no `dead_code` warning,
+and a doc comment written in the present tense goes on describing an intention
+long after it stopped being a plan. R25's bug lived in that gap for two
+milestones.
+
+#### 2f's third panel: the strip is a chip, deliberately
+
+Artboard 2f's takeover trio has three panels, and the third is the **desktop's**:
+`● browser control moved · 192.168.2.20 → 192.168.2.11 · dismisses in 6s`,
+captioned *"On the host it is a transient strip in D13's origin vocabulary and
+nothing more — the desktop never loses control, so a dialog would be
+interrupting someone who has no decision to make."* `grep "control moved" src/`
+returns nothing. What the desktop has instead is the persistent `INPUT: <holder>`
+chip in its status bar (`web_input_holder` in `src/lib.rs`, drawn by
+`status_bar_text`), plus a one-shot notification when the desktop *itself*
+preempts.
+
+**The chip stands, and the strip is not built.** The reasoning is D14's second
+revision, which landed after 2f was drawn and changed what the event *means*.
+
+2f was drawn against "one controlling browser": control moving was rare,
+discrete, and therefore an event worth announcing — a thing that had happened,
+which a strip is the right shape for. Under D14 as revised the input lock moves
+to whoever types next once the holder has been quiet for `INPUT_LOCK_IDLE_MS`,
+so `192.168.2.20 → 192.168.2.11` is now the *ordinary* movement and happens
+several times a minute between two people working together. A six-second strip
+firing on each of them is noise on the desktop about a contest the desktop is
+not even in — and it is noise of the worst kind, because it is indistinguishable
+from the one movement that would matter.
+
+The chip is better on the axis the strip was chosen for, not merely cheaper:
+
+- **It changes at the moment of the event, which is the whole of what a strip
+  buys.** `INPUT: desktop` becomes `INPUT: 192.168.2.11 · Chrome on macOS` on
+  the next render tick — one `POLL_TIMEOUT`, 50 ms. Same fixed position, same
+  glance, no new rendering concept in the TUI.
+- **It survives the six seconds.** A strip answers a question at a moment it
+  chooses; the chip answers it at the moment it is asked. The person at the
+  machine asks by typing, and they type when they type — often well after a
+  strip would have dismissed itself, at which point a transient design has
+  nothing left on screen and the keystroke that was just refused has no
+  explanation. §5.1 does not allow that.
+- **It is the same published fact both surfaces read.** The chip is built from
+  `SeatInfo::holds_input` off the same rows the browser's viewer chip reads
+  (D14), so the two cannot name different holders. A strip would be a second
+  derivation of the same fact, in the surface that has no `Delta` to repaint
+  itself from.
+
+That leaves the case the strip could still have earned — **explicit**
+preemption, which is rare and deliberate, and which the wire already separates
+from an idle hand-off via the per-recipient `Delta::Seats::you_were_preempted`
+(R15). It splits in two, and neither half wants a strip:
+
+- *The desktop preempts a browser.* Already announced, and correctly: the user
+  pressed `Take Input Lock`, so a notification dialog is feedback for an act
+  they just performed rather than an interruption. `preempt_input_for_desktop`
+  returns whom it cut into and `src/lib.rs` says so by name.
+- *A browser preempts the desktop.* The chip moves, in place, at the moment of
+  the act — and a dialog here is exactly what 2f's own caption rules out, since
+  the person at the machine has no decision to make and their keyboard was never
+  revoked. `tests/web_server.rs::a_browser_preempting_the_desktop_moves_the_desktops_input_chip`
+  is the assertion, and it is what makes this a substitution rather than a gap:
+  the desktop holds the turn, a browser confirms `Take over`, and the desktop's
+  chip is shown and names the browser.
+
+R15's sentence promising that interrupted desktop a transient strip is amended
+above; it was describing this panel, and this is the answer it gets.
+
+#### Six `pub` items nothing called
+
+The audit's reachability scan. None of these was a second P0 — no user-visible
+behaviour depended on any of them — but three were *mirrors*, and a rule with
+two implementations is a rule that can disagree with itself.
+
+| Item | Outcome |
+| --- | --- |
+| `AppState::tab_index` | Removed. Zero references anywhere, tests included. |
+| `GitBar::is_clean` | Removed. The browser owns the predicate. |
+| `ShutdownReason::should_retry` | Removed. The browser owns the predicate. |
+| `BootstrapCode::expires_at_millis` | Removed. `seconds_remaining` / `is_live` cover every real need. |
+| `PairingSession::is_established` | Removed. `phase()` is public and says the same thing. |
+| `RemoteBridge::peer_liveness` | **Kept**, doc corrected. |
+| `web::server::bind_exposure` | Removed. |
+
+**The two mirrors are gone and the surviving copy is named where a reader will
+look.** `GitBar::is_clean` and `ShutdownReason::should_retry` were host-side
+spellings of rules that only ever run in a browser: a host does not decide
+whether a worktree renders as `clean`, and a host has no reconnect loop, so
+neither predicate had a caller on the side it lived on. `GitBar` now says
+outright that it carries counts and no predicates over them, and
+`webui/src/ui/gitBar.ts` says the rule runs there and only there. `shouldRetry`
+in `webui/src/state/model.ts` says the same about itself — and `socket.ts`,
+which had been re-spelling `reason !== "restarting"` inline, now asks it, so the
+browser has one copy rather than two.
+
+**`bind_exposure` is a deleted second classifier, not a deleted feature.** It
+parsed the configured `[web] bind` string, and its doc said it existed "so the
+access overlay can warn the user **before** binding". No pre-bind warning was
+ever built, and the access overlay that now exists is opened against a running
+listener, so there is no moment at which it could have used one. Production
+derives `BindExposure` from `bound.ip().is_loopback()` — the address the
+listener really got — which is not merely different but strictly better: the
+config string can lie (`0.0.0.0` is not an address anything is reachable *at*,
+`localhost` is whatever the resolver says today) and the socket cannot. So the
+answer to "fix the doc or build the thing" is neither: one classifier, at the
+only point where the answer is a fact. Its unit test is replaced by an assertion
+on the shipped default itself, with the exposure half covered end to end against
+a real socket in `tests/web_server.rs`.
+
+**`peer_liveness` is kept because it is the only window onto a state machine
+that shipped a 17-day bug.** `peer_present` and `peer_dark` are private, are
+read directly by the per-tick feed gate, and were the subject of
+`remote-control-5qu`; `PeerLiveness` is the readable three-state name for their
+combination, and about twenty assertions in `src/remote/bridge/tests.rs` are
+written in it. Deleting the accessor would have meant deleting the vocabulary
+and rewriting those assertions as pairs of booleans — losing observability of a
+state machine with a P0 behind it, to remove one method. What was actually wrong
+was its doc, which said this is "what the UI must show". No surface shows it.
+The doc now says so, and says what it *is*.
+
+#### A test double that shipped in the release binary
+
+`FakeInterfaceEnumerator` (with `with_interface` / `with_interface_no_ipv4`) was
+`pub` and **not** `#[cfg(test)]`, so every released binary compiled the access
+overlay's test double. It cannot simply be `#[cfg(test)]`: `tests/web_server.rs`
+is an external crate and needs it.
+
+It is now `#[cfg(debug_assertions)]`, which is how this repo already reconciles
+exactly those two facts — `CredentialStore::mint_fixed_bootstrap_code`, the
+Playwright bootstrap seam, is gated the same way and for the same reason, and
+every shipped binary is a `--release` build (`dist-workspace.toml`,
+`.github/workflows/release.yml`). It stays in `src/web/interfaces.rs` rather
+than moving to `src/testing/` — the home of the *service-trait* fakes, which are
+deliberately compiled in normal builds so integration tests can reach them — for
+two reasons: moving it would not have stopped it shipping, and `finalize` and
+`RawInterface` are private, so the move would have meant publishing both of them
+to serve a double. `cargo check --release --locked` is what proves nothing in
+production reaches it.
+
+#### Four doc comments that named something that does not exist
+
+Each was true when written and outlived the thing it named. Fixed, not
+rewritten — a doc comment is only worth reading if a reader can trust its
+nouns.
+
+- **`palette::all_entries`** said "`crate::web::commands` maps each row to a
+  wire name". It does not: `src/web/commands.rs` never calls it, and the
+  browser's `INVENTORY` is a hand-maintained parallel table with its own labels,
+  groups, annotations and routes — because a wire name, a `host only` badge and
+  an artboard's annotation are facts about the *browser* that no `PaletteAction`
+  carries. What holds the two lists together is `src/web/commands/tests.rs`,
+  which walks this one and fails if a claimed wire name is missing, if the
+  labels or groups disagree, or if either list changes length. The coupling is
+  real and enforced; it is enforced by a test rather than by a function call,
+  and the doc now says which.
+- **`webui/src/ui/statusBar.ts` and `webui/src/state/connection.ts`** both cited
+  `src/ui/connectionStates.test.ts` for 2c's first rule. There is no such file;
+  the spacer-before-`.fd-conn` assertion lives in `src/ui/turn2Screens.test.ts`
+  ("never moves the connection strip's position"). Both now name it.
+- **`webui/src/ui/dialog.test.ts` and `webui/src/ui/infoOverlay.test.ts`** both
+  described themselves as rendering through `createApp` "as
+  `configManager.test.ts` renders 1f". That file was deleted by R22, which
+  replaced it with `wire/wiredConfig.test.ts` precisely because the old one
+  dispatched the action production was missing. Both now name the file that
+  exists — and the one that would actually catch the bug.
+
 
 ---
 

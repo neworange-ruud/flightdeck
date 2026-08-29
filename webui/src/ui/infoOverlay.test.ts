@@ -3,8 +3,8 @@
  *
  * The three read-only panels (`remote-control-ll5.8`,
  * `specs/WEB_INTERFACE.md` §6.5 R16), rendered through `createApp` exactly as
- * `configManager.test.ts` renders 1f — real elements, real keyboard events, no
- * snapshot files.
+ * `wire/wiredConfig.test.ts` renders 1f — real elements, real keyboard events,
+ * no snapshot files.
  *
  * What these tests are actually defending is the honesty rule, in the two
  * places it can be broken quietly: a panel that renders a fact the host never

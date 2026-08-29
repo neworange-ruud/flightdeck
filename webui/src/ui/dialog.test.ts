@@ -2,8 +2,9 @@
  * @vitest-environment jsdom
  *
  * Artboard `1e — NEW AGENT DIALOG, BOTH STATES` rendered through `createApp`,
- * the same way `commandPalette.test.ts` renders 1d and `configManager.test.ts`
- * renders 1f — real elements, real keyboard events, no snapshot files.
+ * the same way `commandPalette.test.ts` renders 1d and
+ * `wire/wiredConfig.test.ts` renders 1f — real elements, real keyboard events,
+ * no snapshot files.
  *
  * Three properties are load-bearing and each has a test below:
  *

@@ -21,6 +21,7 @@
  */
 
 import { isStale } from "../state/connection";
+import { shouldRetry } from "../state/model";
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
 import {
@@ -957,8 +958,10 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   function onShutdown(frame: WireShutdown): void {
     const reason = shutdownReason(frame.reason);
     /** Q5: a deliberate quit is a terminal state, not a network failure. Only
-     * `restarting` is worth waiting for. */
-    closedForGood = reason !== "restarting";
+     * `restarting` is worth waiting for — asked of `shouldRetry` rather than
+     * re-spelled here, because it is the one place that rule lives (§6.5 R26)
+     * and the reducer reads the same answer. */
+    closedForGood = !shouldRetry(reason);
     store.dispatch({
       type: "connection/shutdown",
       shutdown: {

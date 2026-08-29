@@ -107,9 +107,13 @@ function gitParts(git: GitBarInfo): Child[] {
  * `+3 ~2 -1 (6 files)`, or 2e's one word for the same worktree with nothing in
  * it. 2e's git bar reads `⎇ branch │ clean │ 120×34 · host owns geometry`, and
  * `+0 ~0 -0 (0 files)` is four numbers that say what one word says better — the
- * same call the git-status panel already makes (`infoOverlay.ts`) and the same
- * predicate the host already spells out (`GitBar::is_clean`, whose own doc says
- * it "renders `clean`"), so every surface words a clean worktree identically.
+ * same call the git-status panel already makes (`infoOverlay.ts`), so both
+ * surfaces word a clean worktree identically.
+ *
+ * **The rule runs here and only here.** The host sends the three counts and no
+ * predicate over them: `GitBar` carries data, and "clean" is a rendering
+ * decision this file makes (§6.5 R26). There is nothing on the wire to disagree
+ * with.
  */
 function changeCounts(git: GitBarInfo): HTMLElement {
   if (git.added === 0 && git.modified === 0 && git.removed === 0) {

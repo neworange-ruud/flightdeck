@@ -857,6 +857,13 @@ pub struct TerminalView {
 /// — the design renders the latter as a dim `git: ?`, and turn 2 §5.1 puts it in
 /// the lifted `--fd-text-quiet` tier precisely because mistaking one for the
 /// other would lose a fact.
+///
+/// **This type carries the counts and no predicates over them.** "Clean" is a
+/// rendering decision and the surface that renders it owns it: the browser's
+/// `webui/src/ui/gitBar.ts` and `webui/src/ui/infoOverlay.ts` decide it from
+/// these three numbers, and the phone has its own
+/// `GitIndicators::is_clean`. The host used to carry a third copy that nothing
+/// called — see `specs/WEB_INTERFACE.md` §6.5 R26.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitBar {
     /// Branch name, if a branch is checked out.
@@ -883,14 +890,6 @@ pub struct GitBar {
     /// False until git status has been collected for this worktree. Renders
     /// `git: ?`, **not** `clean` — the two mean opposite things.
     pub collected: bool,
-}
-
-impl GitBar {
-    /// True when there are no uncommitted file changes (renders `clean`). Only
-    /// meaningful once [`GitBar::collected`] is true.
-    pub fn is_clean(&self) -> bool {
-        self.added == 0 && self.modified == 0 && self.removed == 0
-    }
 }
 
 /// Where a session is in its lifecycle, for the sidebar's special states.
@@ -2186,15 +2185,6 @@ impl ShutdownReason {
             "restarting" => ShutdownReason::Restarting,
             _ => ShutdownReason::Unknown,
         }
-    }
-
-    /// Whether a browser seeing this reason should keep trying to reconnect.
-    ///
-    /// Only a restart says yes. An unknown reason says **no**: the honest default
-    /// for "the host said something final that we do not understand" is to stop
-    /// and say so, not to spin.
-    pub fn should_retry(self) -> bool {
-        matches!(self, ShutdownReason::Restarting)
     }
 }
 

@@ -541,10 +541,14 @@ export interface ShutdownState {
 }
 
 /**
- * Q5 / `ShutdownReason::should_retry`: **only a restart is worth retrying.** An
- * unknown reason says no, because the honest default for "the host said
- * something final we do not understand" is to stop and say so, not to spin.
- * Mirrored here rather than re-decided, so the two halves cannot disagree.
+ * Q5: **only a restart is worth retrying.** An unknown reason says no, because
+ * the honest default for "the host said something final we do not understand"
+ * is to stop and say so, not to spin.
+ *
+ * **This is the only implementation of the rule** (§6.5 R26). Retrying is a
+ * browser act — the host has no reconnect loop to run — so the host sends the
+ * reason and nothing more. It used to carry a `ShutdownReason::should_retry`
+ * mirror that nothing called; it does not any more.
  */
 export function shouldRetry(reason: ShutdownReason): boolean {
   return reason === "restarting";

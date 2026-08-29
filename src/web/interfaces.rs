@@ -72,9 +72,10 @@
 //! ## Trait seam (flightdeck-architecture-seams)
 //!
 //! [`InterfaceEnumerator`] is the seam: [`RealInterfaceEnumerator`] wraps
-//! `if_addrs::get_if_addrs()`, and [`FakeInterfaceEnumerator`] supplies
-//! OS-shaped fixtures in tests. Both funnel through the same private
-//! [`finalize`] pipeline, so tests exercise the *real* filtering,
+//! `if_addrs::get_if_addrs()`, and `FakeInterfaceEnumerator` supplies
+//! OS-shaped fixtures in tests — the latter behind `#[cfg(debug_assertions)]`,
+//! so it is not in a release binary at all (§6.5 R26). Both funnel through the
+//! same private [`finalize`] pipeline, so tests exercise the *real* filtering,
 //! classification and ordering logic, not a reimplementation of it. This
 //! trait lives here rather than in `src/contracts/traits.rs` because
 //! `web::interfaces` is its only consumer today; move it alongside
@@ -155,8 +156,10 @@ struct RawInterface {
 /// The shared pipeline: drop entries with no IPv4 address, drop loopback,
 /// classify each remaining name, then sort by `(name, address)` for a
 /// stable, documented order. Both [`RealInterfaceEnumerator`] and
-/// [`FakeInterfaceEnumerator`] funnel through this so the same logic is
-/// under test regardless of where the raw data came from.
+/// `FakeInterfaceEnumerator` funnel through this so the same logic is
+/// under test regardless of where the raw data came from. (Plain code span,
+/// not a doc link: the double is `#[cfg(debug_assertions)]` and is not there
+/// to link to in a release-profile doc build.)
 fn finalize(raw: Vec<RawInterface>) -> Vec<NetworkInterface> {
     let mut out: Vec<NetworkInterface> = raw
         .into_iter()
@@ -273,11 +276,24 @@ impl InterfaceEnumerator for RealInterfaceEnumerator {
 /// (`(name, ipv4)` pairs). Runs the identical [`finalize`] pipeline the real
 /// enumerator uses, so tests exercise the actual classification, loopback
 /// exclusion and ordering logic rather than a hand-rolled stand-in for it.
+///
+/// **Not present in a release build.** The whole double is
+/// `#[cfg(debug_assertions)]`, which `cargo build --release` — how every shipped
+/// binary is produced (`dist-workspace.toml`, `.github/workflows/release.yml`) —
+/// does not compile at all. It is `pub` rather than `#[cfg(test)]` because
+/// `tests/web_server.rs` is an external crate and needs it; `debug_assertions`
+/// is how this repo already reconciles those two facts for a seam that must not
+/// ship (see `CredentialStore::mint_fixed_bootstrap_code`). It lives here rather
+/// than in `src/testing/` — the home of the *service-trait* fakes — because
+/// [`finalize`] and `RawInterface` are private, and moving the double would mean
+/// publishing both of them to serve it (`specs/WEB_INTERFACE.md` §6.5 R26).
+#[cfg(debug_assertions)]
 #[derive(Debug, Clone, Default)]
 pub struct FakeInterfaceEnumerator {
     raw: Vec<RawInterface>,
 }
 
+#[cfg(debug_assertions)]
 impl FakeInterfaceEnumerator {
     /// An empty fixture (no interfaces at all).
     pub fn new() -> Self {
@@ -305,6 +321,7 @@ impl FakeInterfaceEnumerator {
     }
 }
 
+#[cfg(debug_assertions)]
 impl InterfaceEnumerator for FakeInterfaceEnumerator {
     fn enumerate(&self) -> Vec<NetworkInterface> {
         finalize(self.raw.clone())
