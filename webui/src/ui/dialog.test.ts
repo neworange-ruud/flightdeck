@@ -70,12 +70,19 @@ function render(): Harness {
   };
 }
 
+/** 1e's two titles, worded by the host (`new_agent_title` in `src/lib.rs`) and
+ * sent together, because the toggle they describe is a local draft here. */
+const NEW_AGENT_TITLE_OFF =
+  "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)";
+const NEW_AGENT_TITLE_ON =
+  "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\nRuns on base branch 'main' in the project root — no worktree.";
+
 /** 1e, as the host sends it when a *browser* asked for it. */
 function newAgentFromBrowser(): WireDialogView {
   return {
     dialog_id: "dialog-7",
     kind: "new_agent",
-    title: "New Agent Session Tab",
+    title: NEW_AGENT_TITLE_OFF,
     origin: { origin: "browser", label: "192.168.2.20" },
     body: {
       input: "",
@@ -87,9 +94,47 @@ function newAgentFromBrowser(): WireDialogView {
       buttons: [
         { key: "Enter", label: "Create" },
         { key: "Tab", label: "Run from base: off" },
-        { key: "Esc", label: "Cancel" },
+        { key: "Esc", label: "Cancel", cancels: true },
       ],
       confirmable: true,
+      /** §6.5 R19: both wordings, so the panel and its own button can never
+       * disagree about which state the local draft is in. */
+      toggle: {
+        key: "Tab",
+        on: false,
+        title_off: NEW_AGENT_TITLE_OFF,
+        label_off: "Run from base: off",
+        title_on: NEW_AGENT_TITLE_ON,
+        label_on: "Run from base: main",
+      },
+    },
+  };
+}
+
+/** The same form as the host sends it once the **desktop** has pressed `Tab`:
+ * the host's own title and button label are the toggled ones, and `on` says so.
+ */
+function newAgentToggledOnTheHost(): WireDialogView {
+  const wire = newAgentFromBrowser();
+  return {
+    ...wire,
+    title: NEW_AGENT_TITLE_ON,
+    body: {
+      ...wire.body,
+      buttons: [
+        { key: "Enter", label: "Create" },
+        { key: "Tab", label: "Run from base: main" },
+        { key: "Esc", label: "Cancel", cancels: true },
+      ],
+      confirmable: true,
+      toggle: {
+        key: "Tab",
+        on: true,
+        title_off: NEW_AGENT_TITLE_OFF,
+        label_off: "Run from base: off",
+        title_on: NEW_AGENT_TITLE_ON,
+        label_on: "Run from base: main",
+      },
     },
   };
 }
@@ -113,7 +158,7 @@ function abandonFromDesktop(): WireDialogView {
     body: {
       buttons: [
         { key: "y", label: "Abandon (force)" },
-        { key: "n", label: "Cancel" },
+        { key: "n", label: "Cancel", cancels: true },
       ],
       confirmable: true,
       confirm_gate: {
@@ -136,7 +181,7 @@ function closeTerminalFromDesktop(): WireDialogView {
     body: {
       buttons: [
         { key: "y", label: "Close" },
-        { key: "n", label: "Cancel" },
+        { key: "n", label: "Cancel", cancels: true },
       ],
       confirmable: true,
     },
@@ -154,7 +199,7 @@ function unresolvedGateFromDesktop(): WireDialogView {
     body: {
       buttons: [
         { key: "y", label: "Abandon (force)" },
-        { key: "n", label: "Cancel" },
+        { key: "n", label: "Cancel", cancels: true },
       ],
       confirmable: false,
       refusal:
@@ -175,7 +220,7 @@ describe("the dialog layer", () => {
     h.open(newAgentFromBrowser());
     expect(h.q(".fd-dialog").hidden).toBe(false);
     expect(h.app.el.getAttribute("data-dialog")).toBe("true");
-    expect(h.text(".fd-dialog__title")).toBe("New Agent Session Tab");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
   });
 });
 
@@ -252,6 +297,48 @@ describe("artboard 1e, right-hand state", () => {
     );
     expect(h.all(".fd-dialog__field-label")).toHaveLength(0);
     expect(h.text(".fd-dialog__kind")).toBe("no worktree");
+  });
+
+  it("the title and the Tab button move with the draft, not with the host", () => {
+    /** **§6.5 R19, the whole bug.** The toggle is a local draft (R8), so the
+     * host's `run_on_base` has not moved: before this the panel badged itself
+     * `no worktree` while its own button still read `Run from base: off`. Both
+     * wordings now arrive together and the browser picks by its draft. */
+    const h = render();
+    h.open(newAgentFromBrowser());
+    const tab = () =>
+      h.all(".fd-dialog__action").find((b) => b.getAttribute("data-key") === "Tab");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
+    expect(tab()?.textContent).toContain("Run from base: off");
+    expect(tab()?.getAttribute("data-on")).toBe("false");
+
+    h.key("Tab");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_ON);
+    expect(tab()?.textContent).toContain("Run from base: main");
+    expect(tab()?.getAttribute("data-on")).toBe("true");
+    /** And back, on the same host frame — nothing was refetched. */
+    h.key("Tab");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
+    expect(tab()?.textContent).toContain("Run from base: off");
+  });
+
+  it("opens in the state the host is already in, and words it the same way", () => {
+    /** A tab attaching to a form the desktop had already switched to
+     * run-from-base: the draft starts on `toggle.on`, so the panel is not
+     * showing the other state's words either. */
+    const h = render();
+    h.open(newAgentToggledOnTheHost());
+    expect(h.q(".fd-dialog__panel").getAttribute("data-toggled")).toBe("true");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_ON);
+    expect(h.text(".fd-dialog__kind")).toBe("no worktree");
+    expect(
+      h.all(".fd-dialog__action")
+        .find((b) => b.getAttribute("data-key") === "Tab")?.textContent,
+    ).toContain("Run from base: main");
+
+    h.key("Tab");
+    expect(h.text(".fd-dialog__title")).toBe(NEW_AGENT_TITLE_OFF);
+    expect(h.text(".fd-dialog__field-label")).toBe("Branch");
   });
 
   it("Tab is left to the browser on a dialog with no toggle", () => {
@@ -491,6 +578,46 @@ describe("the two-step destructive confirmation (1g)", () => {
     h.key("y");
     expect(h.answers).toEqual(["y"]);
     expect(h.q(".fd-dialog__gate").hidden).toBe(true);
+  });
+});
+
+/**
+ * **§6.5 R19's other half.** 1g's step 1 draws two buttons — the verb and one
+ * cancel — and the browser was drawing three, because the host's own `n Cancel`
+ * arrived as a deciding key and this component appended its `Esc Cancel` on top.
+ */
+describe("one cancel, and the destructive verb beside it", () => {
+  it("draws the verb and a single cancel at step 1", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    expect(h.all(".fd-dialog__action").map((b) => b.getAttribute("data-key")))
+      .toEqual(["y", "Esc"]);
+    /** The word is still the host's — read off the button it marked `cancels`. */
+    expect(
+      h.all(".fd-dialog__action")[1]?.textContent,
+    ).toContain("Cancel");
+  });
+
+  it("styles the destructive verb apart from the cancel", () => {
+    const h = render();
+    h.open(abandonFromDesktop());
+    const [verb, cancel] = h.all(".fd-dialog__action");
+    /** `danger` is worn by the button the **host** gated, never by a browser's
+     * guess about which dialogs look dangerous. */
+    expect(verb?.className).toContain("fd-dialog__action--danger");
+    expect(cancel?.className).toContain("fd-dialog__action--tertiary");
+  });
+
+  it("the host's own cancel key still cancels, through `dialog_cancel`", () => {
+    /** It is no longer a button, but `n` is what the desktop prints and what a
+     * reader of the two surfaces will press. It sends the cancel frame, which
+     * is never gated — R8 — rather than a confirm carrying `n`. */
+    const h = render();
+    h.open(closeTerminalFromDesktop());
+    expect(h.all(".fd-dialog__action").map((b) => b.getAttribute("data-key")))
+      .toEqual(["y", "Esc"]);
+    h.key("n");
+    expect(h.answers).toEqual([null]);
   });
 });
 

@@ -176,6 +176,21 @@ pub enum AccessOutcome {
     BackToLocalOnly,
     /// Stop the server (State A's `s`).
     StopServer,
+    /// Credentials were withdrawn in the store (State B's `x`), and the live
+    /// sockets holding them must now be closed.
+    ///
+    /// The store side is already done by the time this is returned — this
+    /// module owns the credential decision — but the *eviction* is not, because
+    /// the sockets live behind [`crate::web::server::WebServerHandle`], which
+    /// only the event loop holds. Without it a revoked browser keeps typing
+    /// into every terminal until it happens to reconnect, which is what
+    /// `remote-control-glmt` was.
+    ///
+    /// It carries no token ids on purpose. The store is the one authority on
+    /// which credential is live, every socket consults it about its own token,
+    /// and a list copied out of it here would be a second answer that could
+    /// disagree with the first.
+    Revoked,
 }
 
 /// Render-ready snapshot of the access overlay, rebuilt every tick from
@@ -310,6 +325,17 @@ impl WebAccess {
     /// how many browsers were locked out, plus any persistence error — the
     /// in-memory revocation still stands, but a caller must be able to say the
     /// rotation might not survive a restart.
+    ///
+    /// **This is the credential half only.** A browser that is attached right
+    /// now keeps its socket until somebody closes it, which is why `x` returns
+    /// [`AccessOutcome::Revoked`] rather than [`AccessOutcome::Handled`].
+    ///
+    /// It is all-or-nothing today because [`CredentialStore::rotate`] calls
+    /// `revoke_all` — D5 asks for one command that locks *everyone* out, and
+    /// State B's footer says `x revoke`, not `x revoke this one`. Per-browser
+    /// revocation is `remote-control-gk94`; the eviction machinery underneath
+    /// is already per-token, so that issue changes which credentials are
+    /// withdrawn and nothing about what happens to the sockets holding them.
     pub fn rotate(&self, store: &mut CredentialStore) -> (usize, Option<String>) {
         let active = store.active_tokens().count();
         let (_code, error) = store.rotate();
@@ -429,7 +455,10 @@ impl WebAccess {
                 let (revoked, error) = self.rotate(store);
                 self.revealed = true;
                 self.notice = Some(rotate_notice(revoked, error.as_deref()));
-                AccessOutcome::Handled
+                // Not `Handled`: the notice above claims those browsers are out,
+                // and until the event loop closes their sockets that claim is
+                // false. The outcome is what makes the claim true.
+                AccessOutcome::Revoked
             }
             AccessKey::Char('l') => AccessOutcome::BackToLocalOnly,
             AccessKey::Enter | AccessKey::Esc => AccessOutcome::Ignored,

@@ -351,7 +351,9 @@ export function fixtureSnapshot(): Snapshot {
     geometry: { cols: 120, rows: 34 },
     /** 1a drew a count; 2c/2f name the seats instead — see `fixtureSeats`. */
     viewers: 2,
-    latencyMs: 18,
+    /** No `latencyMs`: 1a's `18ms` is a transport measurement, not a host
+     * fact, so the screens that draw it dispatch `latency/set` on top of this
+     * snapshot the same way the real socket does. */
     update: { version: "v1.16.0" },
     /** 1a is a browser that types, so it asked for and got a writer's seat.
      * An observer would see `MODE: —`, correctly. */
@@ -668,7 +670,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       run: { name: "new_agent_session_tab" },
       hostOnly: false,
       answersDialog: false,
-      annotation: null,
+      annotation: "new worktree",
       target: null,
       refusal: null,
     },
@@ -794,7 +796,7 @@ export function fixtureCommands(): readonly HostCommand[] {
       run: { name: "pull_base" },
       hostOnly: false,
       answersDialog: false,
-      annotation: null,
+      annotation: "rebases the base branch",
       target: null,
       refusal:
         "Pull Base rebases your local base branch — and stashes, pulls over and re-applies any uncommitted work in the base folder — with no confirmation step to read first (SPECS §5.2). Rebase Worktree is offered here because §5.1 puts a shared confirmation in front of it; this one has none, so run it from the desktop (Ctrl-u).",

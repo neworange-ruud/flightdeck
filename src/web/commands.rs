@@ -441,7 +441,12 @@ pub static INVENTORY: &[CommandSpec] = &[
         label: "New Agent Session Tab",
         group: "Agent Session Tabs",
         host_only: false,
-        annotation: None,
+        // Artboard 1d draws this tag, and 1d's `wor` filter *matches this row
+        // through it* — the label has no `wor` in it, which is why the artboard
+        // highlights nothing on this row and still lists it. Static and true of
+        // the row: what the row does is open 1e, and 1e creates a worktree
+        // unless the person answering it presses `Tab`.
+        annotation: Some("new worktree"),
         route: Route::Palette(PaletteAction::NewAgentTab),
     },
     CommandSpec {
@@ -561,7 +566,18 @@ pub static INVENTORY: &[CommandSpec] = &[
         label: "Pull Base",
         group: "Git",
         host_only: false,
-        annotation: None,
+        // Artboard 1d draws `Pull Base (rebase)` with a `base: main` tag. The
+        // branch name is **not** available here and deliberately so: this table
+        // is `&'static` and `Snapshot::commands` is built from it once, "static
+        // for the life of the build" (`web::server::snapshot_for`), while the
+        // base branch belongs to whichever project is selected and changes
+        // under §22's project switch with no `Delta` to describe it. A literal
+        // `base: main` would therefore be the host asserting a branch it had
+        // not looked up. So the tag says what is true of the row on every
+        // project, and absorbs the artboard's dimmed `(rebase)` qualifier —
+        // which stays out of the label, because the label matches the TUI's own
+        // palette row and that is asserted in `tests.rs`.
+        annotation: Some("rebases the base branch"),
         route: Route::NotSupported(PULL_BASE_REFUSAL),
     },
     // `remote-control-ll5.8`: this one really does dispatch. Unlike help and

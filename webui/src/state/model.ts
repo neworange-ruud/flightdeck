@@ -310,7 +310,14 @@ export interface Snapshot {
    * sent no seat list.
    */
   readonly viewers: number;
-  readonly latencyMs: number | null;
+  /**
+   * There is deliberately no `latencyMs` here. 2c's `● connected 18ms` is a
+   * measurement of *this link from this end*, which no frame the host sends
+   * can carry; it reaches the store as `latency/set` from `wire/socket.ts`,
+   * which times `Attach`→`Snapshot` and `Command`→`Ack` on one clock. This
+   * model did carry the field, and the adapter filled it with `null` for every
+   * host, so the readout could never appear.
+   */
   readonly update: UpdateInfo | null;
   /** D14/2f: the named occupants of the viewer chip. */
   readonly seats: readonly SeatInfo[];

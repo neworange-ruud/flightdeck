@@ -275,6 +275,32 @@ describe("2b — access screens", () => {
     expect(h.text(".fd-access__secondary")).toContain("Stay here");
   });
 
+  /** §6.5 R20. The whole point of drawing 2b over a live session is the
+   * mid-session case, and until the host closed revoked sockets that case never
+   * arrived — `access/revoked` came only from a page load. */
+  it("revoked: a Shutdown frame raises the panel over the live session", () => {
+    const h = render();
+    expect(h.q(".fd-access").hidden).toBe(true);
+
+    h.app.store.dispatch({
+      type: "connection/shutdown",
+      shutdown: {
+        reason: "token_revoked",
+        selfInitiated: false,
+        detail: "",
+        atLabel: "16:42",
+      },
+    });
+
+    expect(h.q(".fd-access").hidden).toBe(false);
+    expect(h.text(".fd-access__title")).toBe("Access revoked");
+    /** 2c's revoked row behind the panel, not the stopped row: the host is
+     * fine, and telling this user to restart it would be advice about the
+     * wrong machine. */
+    expect(h.text(".fd-conn")).toContain("not allowed");
+    expect(h.q(".fd-pane").getAttribute("data-tone")).toBe("stale");
+  });
+
   it("revoked: says only that it happened when the host did not say when", () => {
     /** 2b's sentence without its clause. A zero or a guessed duration on a
      * security screen would be the first lie the user is shown. */

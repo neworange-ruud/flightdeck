@@ -301,6 +301,46 @@ async fn frame_matching<T>(ws: &mut Ws, mut pick: impl FnMut(ServerMsg) -> Optio
     panic!("the expected frame did not arrive within 16 frames");
 }
 
+/// Everything the socket has to say within `window`, plus whether it closed.
+///
+/// The counterpart to [`frame_matching`], and the tool for asserting a
+/// *failure* direction (SPECS §26): "this socket was never told to go away" and
+/// "this keystroke was never acknowledged" are claims about frames that must not
+/// arrive, which a helper that waits for a frame cannot make.
+async fn drain_frames(ws: &mut Ws, window: Duration) -> (Vec<ServerMsg>, bool) {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut frames = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return (frames, false);
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            // The window elapsed with the socket still open, which for a
+            // "must not be evicted" assertion is the answer we came for.
+            Err(_) => return (frames, false),
+            Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) => return (frames, true),
+            Ok(Some(Ok(Message::Text(text)))) => frames.push(
+                serde_json::from_str(text.as_str()).expect("the host speaks the web protocol"),
+            ),
+            // Ping/pong and anything else v1 does not use.
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
+}
+
+/// The one [`ServerMsg::Shutdown`] in `frames`, or `None` if the host sent none.
+fn shutdown_in(frames: &[ServerMsg]) -> Option<(ShutdownReason, bool)> {
+    frames.iter().find_map(|frame| match frame {
+        ServerMsg::Shutdown {
+            reason,
+            self_initiated,
+            ..
+        } => Some((*reason, *self_initiated)),
+        _ => None,
+    })
+}
+
 async fn attach(ws: &mut Ws, seat: SeatRequest) -> ClientMsg {
     let msg = ClientMsg::Attach(Attach {
         protocol_version: PROTOCOL_VERSION,
@@ -771,6 +811,195 @@ fn a_revoked_cookie_is_refused_and_named_as_revoked() {
             error,
             tokio_tungstenite::tungstenite::Error::Http(_)
         ));
+    });
+}
+
+/// §6.5 R20 (`remote-control-glmt`). The sibling of the test above, and the one
+/// that was missing: a credential is not only checked when a socket is *opened*.
+///
+/// Three sockets, two credentials. One credential is withdrawn, and the two
+/// sockets holding it must both stop working — the one that keeps typing and the
+/// one that says nothing at all — while the third, whose credential nobody
+/// touched, notices nothing.
+#[test]
+fn revoking_one_credential_evicts_its_live_sockets_and_leaves_the_others_alone() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    // Two separate exchanges, so these are two genuinely different browsers
+    // rather than one cookie used twice.
+    let (doomed_cookie, kept_cookie) =
+        on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+
+    let (doomed_id, kept_id) = {
+        let store = harness.credentials.lock().expect("lock");
+        let records = store.records();
+        assert_eq!(records.len(), 2, "one record per exchange, in issue order");
+        (records[0].id.clone(), records[1].id.clone())
+    };
+    assert_ne!(doomed_id, kept_id, "two exchanges, two credentials");
+
+    on_runtime(async {
+        // Two tabs on the doomed credential, because a browser is not a socket:
+        // revoking one credential has to reach every socket holding it.
+        let mut typing = ws_connect(&addr, Some(&doomed_cookie))
+            .await
+            .expect("upgrade");
+        attach(&mut typing, SeatRequest::Write).await;
+        await_snapshot(&mut typing).await;
+
+        let mut idle = ws_connect(&addr, Some(&doomed_cookie))
+            .await
+            .expect("upgrade");
+        attach(&mut idle, SeatRequest::Write).await;
+        await_snapshot(&mut idle).await;
+
+        let mut kept = ws_connect(&addr, Some(&kept_cookie))
+            .await
+            .expect("upgrade");
+        attach(&mut kept, SeatRequest::Write).await;
+        await_snapshot(&mut kept).await;
+
+        // The desktop withdraws one browser's access — the store half only. The
+        // server has *not* been told yet, which is the window the old code left
+        // wide open and the reason the next assertion is about `typing` rather
+        // than about the eviction.
+        assert!(
+            harness
+                .credentials
+                .lock()
+                .expect("lock")
+                .revoke(&doomed_id)
+                .expect("the revocation persists"),
+            "an active credential was withdrawn"
+        );
+
+        // A keystroke sent inside that window. It must not be forwarded and must
+        // not be acknowledged: the host answers the frame by closing the socket.
+        send(
+            &mut typing,
+            &ClientMsg::Input(Input {
+                seq: 91,
+                terminal_id: "t-agent".into(),
+                data: b"rm -rf /\r".to_vec(),
+            }),
+        )
+        .await;
+        let (frames, closed) = drain_frames(&mut typing, WAIT).await;
+        assert!(closed, "a revoked credential does not keep its socket");
+        assert_eq!(
+            shutdown_in(&frames),
+            Some((ShutdownReason::TokenRevoked, false)),
+            "2b's revoked panel is reachable only if the host names the reason, \
+             and the browser did not ask for this: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, ServerMsg::Ack(ack) if ack.seq == 91)),
+            "a withdrawn credential must not have its keystrokes acknowledged: {frames:?}"
+        );
+
+        // Now the half the event loop performs. `idle` has sent nothing since
+        // attaching, so nothing but this can reach it — which is exactly the
+        // case the old code could never handle.
+        harness.handle.recheck_credentials();
+        let (frames, closed) = drain_frames(&mut idle, WAIT).await;
+        assert!(
+            closed,
+            "a browser that is merely watching is still a browser with access"
+        );
+        assert_eq!(
+            shutdown_in(&frames),
+            Some((ShutdownReason::TokenRevoked, false)),
+            "the browser lands on 2b's revoked panel without reloading: {frames:?}"
+        );
+
+        // The third socket holds a credential nobody revoked. Revocation is
+        // per-token, so it is untouched — and still able to type.
+        send(
+            &mut kept,
+            &ClientMsg::Input(Input {
+                seq: 77,
+                terminal_id: "t-agent".into(),
+                data: b"echo still here\r".to_vec(),
+            }),
+        )
+        .await;
+        let (frames, closed) = drain_frames(&mut kept, Duration::from_millis(500)).await;
+        assert!(!closed, "revoking one credential must not evict another");
+        assert_eq!(
+            shutdown_in(&frames),
+            None,
+            "nor tell it the host is going away: {frames:?}"
+        );
+    });
+
+    // The host seam is the last word on which keystrokes were really delivered.
+    let inputs: Vec<u64> = harness
+        .inbound()
+        .iter()
+        .filter_map(|event| match event {
+            WebInbound::Input { input, .. } => Some(input.seq),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        inputs.contains(&77),
+        "the credential nobody revoked still types: {inputs:?}"
+    );
+    assert!(
+        !inputs.contains(&91),
+        "a revoked credential reached the terminal: {inputs:?}"
+    );
+}
+
+/// The same eviction, driven the way a human drives it: artboard 2a State B's
+/// `x`. The overlay prints `1 browser revoked — new code issued.`, and this is
+/// the test that the sentence is true.
+#[test]
+fn the_overlays_revoke_key_closes_the_browser_it_says_it_locked_out() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let bound = harness.handle.bound_addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    let mut ws = on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Write).await;
+        await_snapshot(&mut ws).await;
+        ws
+    });
+
+    let mut access = {
+        let mut store = harness.credentials.lock().expect("lock");
+        WebAccess::open(
+            &mut store,
+            &FakeInterfaceEnumerator::new()
+                .with_interface("en0", std::net::Ipv4Addr::new(192, 168, 2, 14)),
+            std::net::SocketAddr::from(([0, 0, 0, 0], bound.port())),
+            BindExposure::Routable,
+        )
+    };
+    {
+        let mut store = harness.credentials.lock().expect("lock");
+        assert_eq!(
+            access.handle_key(AccessKey::Char('x'), &mut store),
+            AccessOutcome::Revoked,
+            "`x` cannot close a socket itself; it has to ask"
+        );
+    }
+    // What `handle_web_access_key` defers to the event loop, and the event loop
+    // then performs on the listener it owns.
+    harness.handle.recheck_credentials();
+
+    on_runtime(async {
+        let (frames, closed) = drain_frames(&mut ws, WAIT).await;
+        assert!(closed, "`x` locks out the browser that is connected now");
+        assert_eq!(
+            shutdown_in(&frames),
+            Some((ShutdownReason::TokenRevoked, false)),
+            "and says why, so the tab shows 2b rather than `reconnecting…`: {frames:?}"
+        );
     });
 }
 
@@ -4089,7 +4318,8 @@ fn the_qr_payload_carries_a_code_the_server_accepts() {
         let mut store = harness.credentials.lock().expect("lock");
         assert_eq!(
             access.handle_key(AccessKey::Char('x'), &mut store),
-            AccessOutcome::Handled
+            AccessOutcome::Revoked,
+            "the store half is done here; the sockets are the event loop's"
         );
         assert_eq!(
             store.active_tokens().count(),

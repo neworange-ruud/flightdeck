@@ -1474,6 +1474,14 @@
   background: var(--fd-focus);
   color: color-mix(in srgb, var(--fd-focus) 12%, var(--fd-canvas));
 }
+/* 1g draws the destructive verb red and the cancel beside it plain, and the
+ * two must not look alike. `danger` is worn only by the button the **host**
+ * gated (`ConfirmGate::key`) — nothing here decides what is dangerous. */
+.fd-dialog__action--danger {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
 .fd-dialog__action--secondary,
 .fd-dialog__action--tertiary {
   background: none;

@@ -96,9 +96,21 @@ pub const COOKIE_NAME: &str = "flightdeck_web";
 ///
 /// "Long-lived" is Q4's own word, and the reason it is safe is that expiry is
 /// not the revocation mechanism: the cookie is worthless the moment the desktop
-/// revokes or rotates its token, because [`CredentialStore::verify_token`] is
-/// consulted on every connection. A short `Max-Age` would only mean the user
-/// re-enters a code for no security gain.
+/// revokes or rotates its token. That holds for a *live* socket as well as a
+/// new one, and the two are enforced separately:
+///
+/// * a new connection is refused by [`CredentialStore::verify_token`], which
+///   `ws_route` consults before the upgrade; and
+/// * an attached socket is refused by [`CredentialStore::is_token_active`],
+///   which [`Shared::credential_is_active`] consults on **every frame it
+///   sends**, and is closed with [`ShutdownReason::TokenRevoked`] the moment
+///   [`WebServerHandle::recheck_credentials`] tells it to look.
+///
+/// The second half is the one that did not exist until §6.5 R20
+/// (`remote-control-glmt`): "consulted on every connection" was true, and was
+/// not enough, because an already-connected browser never makes another one.
+/// A short `Max-Age` would only mean the user re-enters a code for no security
+/// gain.
 pub const COOKIE_MAX_AGE_SECS: u64 = 400 * 24 * 60 * 60;
 
 /// Where the browser POSTs its bootstrap code (Q4).
@@ -435,6 +447,9 @@ pub struct WebServerHandle {
     exposure: BindExposure,
     /// `None` once [`WebServerHandle::stop`] has taken it.
     shutdown: Option<watch::Sender<Option<ShutdownNotice>>>,
+    /// The desktop's end of [`Shared::revocations`]. Held for the life of the
+    /// handle: unlike `shutdown`, sending on it is not a terminal event.
+    revocations: watch::Sender<u64>,
     /// Reports `Disconnected` when the server task has finished, which is how
     /// `stop` waits for the listener to be released without needing a runtime
     /// context.
@@ -572,6 +587,34 @@ impl WebServerHandle {
         self.shared.registry().viewers.len()
     }
 
+    /// Have every attached socket re-check its own credential, closing the ones
+    /// whose credential has been withdrawn.
+    ///
+    /// This is the second half of a revocation, and the half that makes the
+    /// first half mean anything. The desktop's `x` (artboard 2a State B) writes
+    /// the revocation into the [`CredentialStore`]; a browser that is *already*
+    /// connected never asks that store another question of its own accord, so
+    /// without this call it keeps full read/write control of every terminal for
+    /// as long as it stays connected — `remote-control-glmt`, §6.5 R20.
+    ///
+    /// Takes no argument, and that is the design rather than an omission. Each
+    /// socket asks about the one token it holds, so a revocation that named one
+    /// browser closes that browser's sockets and leaves everyone else attached,
+    /// with no set to build here and no chance of this side and the store
+    /// disagreeing about who was revoked. `WebAccess`'s `x` happens to revoke
+    /// everybody (`CredentialStore::rotate` is `revoke_all`); when
+    /// `remote-control-gk94` makes it per-browser, nothing here changes.
+    ///
+    /// Cheap and safe to call when nothing was revoked: every socket looks, and
+    /// every socket that is still authorised carries on.
+    pub fn recheck_credentials(&self) {
+        // `send_modify` marks the value changed even if the counter wrapped to
+        // the same observed state, which `send` would not guarantee. A failed
+        // send would mean no sockets are listening — nothing to evict.
+        self.revocations
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
     /// Tell every viewer why the socket is closing, then close the listener and
     /// end the task (Q5).
     ///
@@ -633,7 +676,8 @@ impl std::fmt::Debug for WebServerHandle {
 ///
 /// `credentials` is shared with the TUI (which mints bootstrap codes, revokes
 /// and rotates) rather than owned here, so a revocation takes effect on the very
-/// next connection.
+/// next connection — and, once the TUI calls
+/// [`WebServerHandle::recheck_credentials`], on every socket already open.
 ///
 /// Returns once the listener is bound, so `bound_addr` is immediately usable.
 /// The `bind` itself happens **inside** the spawned task, because tokio I/O
@@ -652,6 +696,7 @@ pub fn start(
 
     let address = listen_address(&config.bind, config.port);
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownNotice>>(None);
+    let (revocations_tx, revocations_rx) = watch::channel::<u64>(0);
     let (state_tx, state_rx) = watch::channel(Arc::new(initial_state));
     let started_ms = clock.now_millis() as i64;
 
@@ -665,6 +710,7 @@ pub fn start(
         input_lock: InputArbiter::shared(),
         announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
+        revocations: revocations_rx,
         drain: Arc::new(Drain::default()),
     });
 
@@ -720,6 +766,7 @@ pub fn start(
                 bound,
                 exposure,
                 shutdown: Some(shutdown_tx),
+                revocations: revocations_tx,
                 done: Some(done_rx),
             })
         }
@@ -806,6 +853,17 @@ struct Shared {
     /// [`WebServerHandle::sync_input_lock`].
     announced_holder: Mutex<Option<Writer>>,
     shutdown: watch::Receiver<Option<ShutdownNotice>>,
+    /// Bumped by [`WebServerHandle::recheck_credentials`]. Every live socket
+    /// watches it and, when it moves, asks the credential store whether *its
+    /// own* token is still active.
+    ///
+    /// The value is a counter and not a list of revoked ids on purpose. A list
+    /// would be a second copy of a fact the store already owns, and a `watch`
+    /// keeps only the latest value, so two revocations inside one tick would
+    /// lose the first list. A counter cannot go stale: it says "go and look",
+    /// and the place it sends you is the same authority the input path
+    /// consults.
+    revocations: watch::Receiver<u64>,
     drain: Arc<Drain>,
 }
 
@@ -819,6 +877,23 @@ impl Shared {
 
     fn now_ms(&self) -> i64 {
         self.clock.now_millis() as i64
+    }
+
+    /// Whether the credential a socket authenticated with still grants access.
+    ///
+    /// Asked of the store rather than of a flag cached beside the socket, and
+    /// that is the difference between a check and a race. The desktop revokes by
+    /// writing to this store; anything else the server could compare against is
+    /// a copy that is made *after* the revocation lands and is therefore wrong
+    /// for as long as it takes to make.
+    ///
+    /// Recovered rather than propagated if a poisoned lock is found, on the same
+    /// terms as [`Shared::registry`] — except that the failure direction here is
+    /// the other way round and deliberately so: a panicking surface must not be
+    /// able to turn every browser's credential into "unknown", so recovery hands
+    /// back the real state instead of a refusal.
+    fn credential_is_active(&self, token: &TokenId) -> bool {
+        self.credentials.unwrap_or_recover().is_token_active(token)
     }
 
     /// The input lock, recovered rather than propagated if a writer panicked
@@ -987,6 +1062,19 @@ async fn await_shutdown(rx: &mut watch::Receiver<Option<ShutdownNotice>>) -> Shu
             // than holding the listener past the app's lifetime.
             return ShutdownNotice::server_stopped();
         }
+    }
+}
+
+/// Resolve once the desktop has asked the live sockets to re-check their
+/// credentials ([`WebServerHandle::recheck_credentials`]).
+///
+/// A dropped sender means the handle is going away, which
+/// [`await_shutdown`] already answers with a `Shutdown` frame — so this then
+/// never resolves at all rather than resolving forever, which would spin the
+/// `select!` it sits in.
+async fn await_revocation(rx: &mut watch::Receiver<u64>) {
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1622,23 +1710,34 @@ async fn ws_route(
         }
     };
 
-    let identity = viewer_identity(peer, &headers);
+    // The `TokenId` goes *into* the identity rather than being dropped here.
+    // That is the whole of R20's fix on this side: a socket that cannot name its
+    // own credential cannot be told that credential was withdrawn.
+    let identity = viewer_identity(peer, &headers, token);
     debuglog::log(&format!(
-        "web WS upgrade address={address} token={token} label={}",
+        "web WS upgrade address={address} token={} label={}",
+        identity.token,
         identity.label()
     ));
     upgrade.on_upgrade(move |socket| serve_viewer(shared, socket, identity))
 }
 
-/// Who a viewer is, as two facts of very different standing.
+/// Who a viewer is, as three facts of very different standing.
 ///
-/// They are kept apart all the way to [`SeatInfo`] rather than being merged into
-/// one string the browser would have to take back apart. A user-agent string is
-/// attacker-supplied and can contain the separator, so a browser-side split is a
-/// parse an attacker can steer — see the `SeatInfo` doc comment.
+/// The two *displayed* facts — address and user-agent — are kept apart all the
+/// way to [`SeatInfo`] rather than being merged into one string the browser
+/// would have to take back apart. A user-agent string is attacker-supplied and
+/// can contain the separator, so a browser-side split is a parse an attacker can
+/// steer — see the `SeatInfo` doc comment.
+///
+/// The third fact, `token`, is never displayed and never sent anywhere: it is
+/// the credential this socket authenticated with, so the host can ask the
+/// credential store about *this* socket rather than about sockets in general.
+/// It is what makes revocation per-browser instead of all-or-nothing (§6.5
+/// R20).
 ///
 /// [`ViewerIdentity::label`] is the *derived* form: the one-line chip label, and
-/// the only place the two are ever joined.
+/// the only place the two displayed facts are ever joined.
 #[derive(Clone, Debug)]
 struct ViewerIdentity {
     /// The peer address the host observed on the socket. Never client-supplied.
@@ -1646,6 +1745,12 @@ struct ViewerIdentity {
     /// What the browser said it is, already sanitised and length-capped, or
     /// `None` when it said nothing we could use. Only ever displayed.
     user_agent_label: Option<String>,
+    /// The credential [`ws_route`] verified before the upgrade.
+    ///
+    /// A public identifier, not a secret — [`TokenId`]'s own docs say so, which
+    /// is why the auth `debuglog` line prints it. The secret itself is seen once
+    /// by [`CredentialStore::verify_token`] and never held here.
+    token: TokenId,
 }
 
 impl ViewerIdentity {
@@ -1671,6 +1776,10 @@ impl ViewerIdentity {
             Some(agent) => ViewerIdentity {
                 address: self.address,
                 user_agent_label: Some(agent),
+                // The credential is not up for renegotiation either: an `Attach`
+                // frame refines what we *say* the browser is, never what it is
+                // allowed to do.
+                token: self.token.clone(),
             },
             // Nothing usable was claimed, so we keep whatever the `User-Agent`
             // header gave us rather than forgetting a fact we already had.
@@ -1680,11 +1789,17 @@ impl ViewerIdentity {
 }
 
 /// The identity of a viewer as the request itself describes it: the address off
-/// the socket, plus whatever the browser says about itself.
+/// the socket, the credential the upgrade already verified, plus whatever the
+/// browser says about itself.
 ///
 /// The user-agent is the browser's own claim and is only ever displayed.
 /// Truncated so a hostile `User-Agent` cannot make the desktop's chip unreadable.
-fn viewer_identity(peer: SocketAddr, headers: &HeaderMap) -> ViewerIdentity {
+///
+/// `token` is a parameter rather than something read out of the headers here,
+/// because the only honest source for it is the verification [`ws_route`]
+/// already performed: re-deriving it would be a second answer to a question
+/// that has one.
+fn viewer_identity(peer: SocketAddr, headers: &HeaderMap, token: TokenId) -> ViewerIdentity {
     let user_agent_label = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -1694,6 +1809,7 @@ fn viewer_identity(peer: SocketAddr, headers: &HeaderMap) -> ViewerIdentity {
     ViewerIdentity {
         address: peer.ip(),
         user_agent_label,
+        token,
     }
 }
 
@@ -1764,6 +1880,7 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(VIEWER_QUEUE_FRAMES);
     let mut shutdown = shared.shutdown.clone();
+    let mut revocations = shared.revocations.clone();
     let mut attached = false;
 
     loop {
@@ -1813,6 +1930,29 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
                     // not keep up) or the server is going away.
                     None => break,
                 }
+            }
+            // The desktop withdrew somebody's access. Ask whether it was
+            // ours — every socket wakes, only the revoked ones leave.
+            //
+            // `changed()` is level-triggered and cancel-safe, so a bump that
+            // arrives while another branch of this `select!` is running is still
+            // seen on the next pass rather than lost.
+            _ = await_revocation(&mut revocations) => {
+                if shared.credential_is_active(&identity.token) {
+                    continue;
+                }
+                debuglog::log(&format!(
+                    "web WS revoked token={} label={}",
+                    identity.token,
+                    identity.label()
+                ));
+                // Best effort, exactly as the shutdown branch below: a socket
+                // that cannot take this frame is already gone, and it has lost
+                // its powers either way — the gate in `handle_client_msg`
+                // does not depend on this frame arriving.
+                let _ = send_msg(&mut sink, &revoked_frame()).await;
+                let _ = sink.send(Message::Close(None)).await;
+                break;
             }
             // The host is shutting down (Q5).
             notice = await_shutdown(&mut shutdown) => {
@@ -1894,6 +2034,37 @@ fn parse_client_msg(text: &str) -> Option<ClientMsg> {
     serde_json::from_str::<ClientMsg>(text).ok()
 }
 
+/// The frame a socket is closed with when its credential has been withdrawn.
+///
+/// `self_initiated` is unconditionally `false`: the browser did not ask for
+/// this, the desktop did, and Q5 is explicit that the difference is not
+/// derivable from the reason alone. `detail` is `None` because the host has
+/// nothing to add that the browser cannot say better — 2b's revoked panel
+/// already knows the words, and inventing a time here would be a claim about
+/// *when* that this frame has no honest source for.
+fn revoked_frame() -> ServerMsg {
+    ServerMsg::Shutdown {
+        reason: ShutdownReason::TokenRevoked,
+        self_initiated: false,
+        detail: None,
+    }
+}
+
+/// Handle one frame from the browser.
+///
+/// **Every frame is gated on the credential first.** Not just `Input`: a
+/// revoked browser must not be able to open a dialog, run a palette command,
+/// re-attach under a new seat or resize anything either, and listing the
+/// dangerous frames would be a list that goes stale the next time the wire
+/// grows a member.
+///
+/// The gate is here, on the frame's own path, rather than in the `select!`
+/// branch that closes the socket, because those two are not the same guarantee.
+/// The branch is *prompt*; this is *total*. A keystroke that arrived in the
+/// microseconds between the desktop writing the revocation and this socket
+/// noticing it is refused by this check, because this check asks the store —
+/// the same store, the same instant — instead of asking a flag that had not
+/// been set yet.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_msg(
     shared: &Arc<Shared>,
@@ -1904,6 +2075,15 @@ async fn handle_client_msg(
     msg: ClientMsg,
     sink: &mut Sink,
 ) -> Flow {
+    if !shared.credential_is_active(&identity.token) {
+        debuglog::log(&format!(
+            "web WS frame refused — revoked token={} label={}",
+            identity.token,
+            identity.label()
+        ));
+        let _ = send_msg(sink, &revoked_frame()).await;
+        return Flow::Close;
+    }
     match msg {
         ClientMsg::Attach(attach) => {
             handle_attach(shared, viewer_id, identity, tx, attached, attach, sink).await

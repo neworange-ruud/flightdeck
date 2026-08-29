@@ -2329,6 +2329,323 @@ the brightest tier the palette has.
   nothing was displayed, and a browser launched a moment ago is very likely still
   starting up.
 
+### R19 — the host words both states of 1e's toggle, and the browser picks one
+
+**The bug.** Artboard 1e's toggled state draws `Tab Run from base: main`. The
+browser drew `Run from base: off` on that same button while the panel beside it
+had already hidden the branch field and badged itself `no worktree` — the panel
+and its own button disagreeing about which state the form was in.
+
+**Both halves were individually right, and the seam between them was wrong.**
+R8 keeps 1e's typed branch, radio position and `Tab` toggle a **local browser
+draft**, so a coalesced resync mid-typing cannot empty the field. The button's
+words came from the host and were computed from the host's own `run_on_base`,
+which does not flip until the confirm lands. So the draft moved and the
+host-authored label did not.
+
+**R8's local draft is preserved, not overturned.** Nothing about where the
+toggle lives changed: `dialog/toggle` still flips `draft.toggled` alone,
+`mergeDialog` and `dialog/opened` still keep the draft across a re-announcement
+of the same dialog, and the host still hears nothing until `dialog_confirm`.
+What changed is that the **words** stopped depending on the host's copy of the
+state. Making the toggle non-local would have undone R8's whole reason for
+existing; having the browser word the label itself would have broken R7/ll5.12's
+rule that the browser authors nothing the host did not send. So:
+
+* `protocol::DialogToggle` carries the toggling button's `key`, the host's `on`,
+  and **both** wordings of both strings — `title_off` / `label_off` and
+  `title_on` / `label_on`. `prompt_dialog`'s two branches were factored into
+  `new_agent_title` and `new_agent_base_label`, so the desktop and the wire
+  cannot word 1e differently.
+* The browser's `dialogTitle` / `toggleButton` pick the pair `draft.toggled` is
+  in. Host-authored words, browser-chosen state. Because both pairs travel
+  unconditionally, the browser never consults `on` to word anything, so it
+  cannot reintroduce the same seam from the other side.
+* `on` closes the mirror-image bug: `dialogOf` opens the draft on it, so a tab
+  attaching to a form the desktop had already toggled paints the state that is
+  really pending. `confirmArgs` then sends `toggle` only when the draft has
+  moved *away* from `on`, because the host answers a confirm by synthesising a
+  `Tab` **press**, which flips rather than sets.
+
+**One cancel, and the destructive verb apart from it.** 1g's step 1 drew three
+buttons, two of which cancelled: the host's `n Cancel` arrived as a deciding key
+and `ui/dialog.ts` appended its own `Esc Cancel` on top. `protocol::DialogKey`
+grew `cancels`, from the same rule `dialog_decision` already used to classify a
+keypress (`DialogButton::cancels`, the label), so the browser no longer has to
+read labels to find the cancel. `decidingKeys` drops it and the panel keeps the
+single `Esc Cancel` — the frame that is never gated and never refused, where the
+host's `n` would have travelled as a `dialog_confirm`. `Esc` keeps working as a
+key, the host's own cancel key still cancels (through `dialog_cancel`), the word
+on the button is read off the host's cancel button, and R8's "cancelling is never
+gated" survives structurally rather than by care. The gated button now wears a
+`danger` rank in 2g's `--fd-alert` instead of the same `primary` as the cancel;
+which button that is remains the host's `ConfirmGate::key`.
+
+**Two of artboard 1d's tags were never sent.** `New Agent Session Tab` carried
+`annotation: None` while 1d draws `new worktree` on it *and*
+`webui/src/state/commands.ts`'s own doc comment said 1d's `wor` query matches
+that row through the tag — a comment describing behaviour the data could not
+produce. The tag is now in `INVENTORY`, and the comment is true: the label has
+no `wor` in it, so the row matches with no highlighted span, exactly as the
+artboard draws it.
+
+`Pull Base` is deliberately **not** given 1d's literal `base: main`. `INVENTORY`
+is `&'static` and `Snapshot::commands` is built from it once, "static for the
+life of the build" — while the base branch belongs to whichever project is
+selected and changes under §22's project switch with no `Delta` to describe it.
+A hard-coded branch name would be the host asserting something it never looked
+up, so the row carries `rebases the base branch`, which is true on every project
+and absorbs the artboard's dimmed `(rebase)` qualifier. The label stays
+`Pull Base`, matching the TUI's own palette row.
+
+**No `PROTOCOL_VERSION` bump.** Both additions are `#[serde(default)]` fields
+inside `DialogView::body`, the free-form slot v1 chose precisely so M2 could
+grow dialog bodies without one. No frame kind appeared and no closed vocabulary
+grew a member, so the `ServerMsg::GitStatus` test that forced v2 → v3 — a peer
+that drops this is silent where an answer was expected — does not apply here. A
+host that sends neither leaves a browser rendering the host's own button label
+and its own `Esc Cancel`, which is what it rendered before: a lesser panel, not
+a wrong one. That is the same rule 4 reading `Delta::Seats`'s
+`you_were_preempted` got.
+
+### R20 — revoking browser access revoked nothing that was already connected
+
+**The bug.** Artboard 2a State B offers `x Revoke browser access` and promises
+"revoke it and that browser is locked out". Pressing it ran `WebAccess::rotate`
+→ `CredentialStore::rotate` → `revoke_all`, returned `AccessOutcome::Handled`,
+and stopped. The credential was withdrawn from the store and **nothing else
+happened**. A browser that was already attached kept full read/write control of
+every terminal, indefinitely — a socket, once open, never asked the store another
+question. Meanwhile the overlay printed `1 browser revoked — new code issued.`
+and dropped its holder count to zero, so the desktop actively asserted an
+eviction that had not occurred. `remote-control-glmt`, P0.
+
+Three separate pieces were missing, and each was individually invisible:
+
+1. **`ShutdownReason::TokenRevoked` was on the wire and nothing ever sent it.**
+   The only `ShutdownNotice` constructors were `server_stopped()` and
+   `host_quit()`. The variant existed in `protocol.rs`, in the browser's
+   `SHUTDOWN_REASONS`, in `shutdownMessage`, in `shutdownNote` — a complete
+   vocabulary for an event no host could produce.
+2. **`ws_route` verified the credential and threw it away.** It bound the
+   `TokenId`, logged it, and called `serve_viewer(shared, socket, identity)`
+   without it. A socket that cannot name its own credential cannot be told that
+   credential was withdrawn, so no re-check was even expressible.
+3. **The browser could only reach 2b's revoked panel by reloading.**
+   `access/revoked` was dispatched from exactly one place, `main.ts`'s page-load
+   probe. The panel is *drawn over a live session* — that is its entire visual
+   premise — and the mid-session case it was drawn for could not happen.
+
+**And a comment asserted the opposite.** `COOKIE_MAX_AGE_SECS` explained that a
+400-day cookie is safe because "the cookie is worthless the moment the desktop
+revokes or rotates its token, because `verify_token` is consulted on every
+connection". Every clause is true and the conclusion does not follow: an
+already-connected browser never makes another connection. A confident comment
+that answers the question one step short of where the risk lives is worse than no
+comment, because it retires the question. It now names both halves and which
+one this refinement added.
+
+**Why a green suite did not see it.** Every revocation test in the suite tested
+the *next* connection: `a_revoked_cookie_is_refused_and_named_as_revoked` rotates
+and then opens a socket; `the_qr_payload_carries_a_code_the_server_accepts`
+rotates and then exchanges the spent code. Both are correct and both authenticate
+**after** the revocation, so they exercise the one path that already worked. No
+test held a socket open across a revocation, because that is the only shape in
+which the bug exists, and the shape a test does not have is the bug a suite
+cannot see. The generalisation R18 made about test seams has a sibling here: a
+lifecycle event needs a test that spans it, not two tests either side of it.
+
+**What now enforces it.** The credential store is the one authority, and both
+halves of the fix ask *it*:
+
+* `CredentialStore::is_token_active(&TokenId)` answers the question a live socket
+  has — "is the credential I already proved still good?" — without a secret. The
+  socket keeps the `TokenId` (a public identifier, already logged), never the
+  token.
+* `ViewerIdentity` carries that `TokenId` beside the address and the user-agent,
+  as a third fact of a third standing: never displayed, never sent, and never
+  refinable by an `Attach` claim. It is what makes the mechanism **per-token** —
+  each socket asks about the one credential it holds, so revoking one browser
+  cannot evict another.
+* `handle_client_msg` refuses **every** frame from a credential the store no
+  longer honours, answering with `Shutdown { TokenRevoked }` and closing. This is
+  the guarantee that is *total* rather than prompt: a keystroke that arrives in
+  the microseconds between the desktop writing the revocation and the socket
+  noticing it is refused, because this check reads the same store at the same
+  instant instead of a flag that had not been set yet. Gating every frame rather
+  than listing the dangerous ones is deliberate — a list goes stale the next time
+  the wire grows a member.
+* `WebServerHandle::recheck_credentials()` bumps a `watch` counter every socket
+  is parked on; each then asks about its own token and leaves if the answer is
+  no. This is the guarantee that is *prompt*: it reaches a browser that is only
+  watching and will never send another frame. The counter carries no list of
+  revoked ids on purpose — a list would be a second copy of a fact the store
+  owns, and a `watch` keeps only its latest value, so two revocations in one tick
+  would lose the first.
+* `AccessOutcome::Revoked` replaces `Handled` on `x`, and `Ui` defers it to the
+  event loop beside `pending_web_stop` and `pending_web_rebind`, for the same
+  reason as those two: the listener is not the key handler's to touch. Deferring
+  is safe *here* only because the frame gate above is not deferred.
+
+**All-or-nothing today, per-token by construction.** `x` still revokes every
+browser, because `CredentialStore::rotate` is `revoke_all` and D5 asks for one
+command that locks everyone out — State B's footer says `x revoke`, not `x revoke
+this one`. That behaviour is unchanged. The eviction machinery underneath is
+per-token anyway, so `remote-control-gk94` changes which credentials are
+withdrawn and nothing about what happens to the sockets holding them.
+
+**The browser now lands on 2b without reloading.** The `connection/shutdown`
+reducer raises the revoked access screen from the frame, not only from the HTTP
+refusal, and `revokedAgo` stays `null` — the frame carries no revocation time and
+2b prints its sentence without the "12s ago" clause rather than with an invented
+one. 2c's precedence also changed: `revoked` is now checked **before**
+`shutdown`, because this is the one shutdown that is not about the host. The
+stopped row would have put `FLIGHTDECK STOPPED` on a machine that is running
+perfectly well and offered "start it again on the machine" to a user whose only
+problem is a credential.
+
+**What covers it.** `revoking_one_credential_evicts_its_live_sockets_and_leaves_the_others_alone`
+in `tests/web_server.rs` drives three live authenticated sockets over two
+credentials, revokes one credential, and asserts in both directions: the socket
+that keeps typing is closed with `TokenRevoked` and its keystroke reaches neither
+an `Ack` nor the host seam; the socket that says nothing is closed too; the
+socket holding the other credential is not closed, is told nothing, and still
+types. `the_overlays_revoke_key_closes_the_browser_it_says_it_locked_out` drives
+the same eviction through artboard 2a's actual `x`. A `drain_frames` helper makes
+the failure directions assertable — "this socket was never told to go away" is a
+claim about a frame that must not arrive, which a helper that waits for a frame
+cannot make. On the browser side, `turn2.reducer.test.ts` proves a `token_revoked`
+frame raises the panel and that no other reason does, and `turn2Screens.test.ts`
+proves the panel appears over the live session with 2c's revoked row behind it.
+
+**No `PROTOCOL_VERSION` bump.** Nothing new appears on the wire.
+`ShutdownReason::TokenRevoked` already existed in both mirrors and every shipped
+browser already routes it; this change only makes a host that had never sent it
+send it. `ShutdownReason` is an **open** vocabulary under the forward-compatibility
+policy's rule 2 — it round-trips through `from_str_lossy` — so it is not the
+closed vocabulary rule 3 governs, and no frame kind and no field appeared. The
+`ServerMsg::GitStatus` precedent that forced v2 → v3 was a closed vocabulary
+growing a member the peer must understand; this is not that, and it is not even
+`Delta::Seats::you_were_preempted`'s additive-field case, because there is
+nothing added at all.
+
+---
+
+### R21 — three states were rendered, styled and unit-tested, and nothing ever dispatched them
+
+**The bug, in one shape, three times.** `catching_up`, `staleness` and
+`latencyMs` each had a renderer, a token, a CSS rule and a passing unit test —
+and no producer anywhere outside a test. The browser therefore could not reach
+any of them:
+
+| State | Rendered by | Dispatched by |
+| --- | --- | --- |
+| `connection: "catching_up"` (Q3, 2c/2d) | `paneTone`, `terminalPane`'s replay banner, 2c's `catching up` row | nothing — `connection/changed` only ever carried `connected`, `connecting`/`reconnecting` and `disconnected` |
+| `staleness` (2c's `terminal stale 34s`, 2d's frozen clock) | `staleChipFor`, `terminalPane`'s banner | nothing |
+| `latencyMs` (2c's `● connected 18ms`) | `connectionStrip` | nothing — `wire/adapt.ts` hardcoded `null` |
+
+**Why the suite was green.** A unit test that dispatches `staleness/set` and
+asserts the chip appears is testing the half that was never broken; the action
+it dispatches *is* the thing production was missing. This is the browser's
+instance of the failure mode R18 records on the desktop, and the answer is the
+same: the test has to enter through the production door. `webui/src/wire/wiredScreen.test.ts`
+therefore wires the **real** app store to `openSession` through a fake
+`WebSocket` and asserts the rendered DOM — every case in it delivers a frame or
+drops a socket, and not one of them dispatches an action.
+
+**The knock-on, which was the serious half.** `replay/set` *was* dispatched — on
+a `TermBytes` carrying `truncated: true` — but `renderBanner` only draws replay
+children while the tone is `catching_up`, a tone nothing entered. So Q3's
+sentence, *"output older than the host's buffer was lost — this is not a
+continuous replay"*, was unreachable. That sentence is the entire reason
+`truncated` is on the wire: without it a user gets a terminal with a silent hole
+in it and no way to know. Two things fix it, not one:
+
+* the catching-up state is entered, so the banner exists to draw into; and
+* **the notice outlives the state**. `stream.rs`'s `attach_frames` answers a
+  resume with *one* `TermBytes` per terminal, so catching-up can be over in
+  milliseconds — a warning legible only during it is a warning nobody reads. The
+  transport leaves `replay` in place for eight seconds after the drain, with
+  `bytesDone == bytesTotal`, and the pane prints the loss in the past tense over
+  a terminal that is live again. Nothing in that window claims a replay is still
+  running.
+
+**Where each of the three facts now comes from, and why not from the obvious
+place.** The rule that shaped all of this is the one `ui/tokens.guard.test.ts`
+rule 3 already enforced: the state and view layers never read a clock, and a
+host instant is never dated against `Date.now()`.
+
+1. **Catching up** is decided from the **snapshot**, which is the only frame
+   that knows how much is outstanding *before* it arrives:
+   `max(cursor, TerminalView::replay_from)` is where the host will resume from
+   (the same `replay_from > cursor` inequality it uses to set `truncated`), and
+   `TerminalView::byte_len` is the end of the stream, so the total is a
+   subtraction of two host numbers. `bytesDone` counts the frames that really
+   arrived. That is what makes the progress bar honest: it previously set
+   `bytesDone` and `bytesTotal` both to the arriving frame's length, so it read
+   100% for every replay that ever happened. A first attach — no cursor — is
+   **not** catching up: it has missed nothing. A backlog of zero is not entered
+   at all, because `Resume::UpToDate` and an emptied ring both send no frame and
+   the state would hang waiting for one; a ten-second dead-man's handle covers
+   the host that promises bytes and sends none.
+2. **Staleness** is the gap between two *local* events — the last `TermBytes`
+   that arrived, and now — because that is what it actually is. The host does not
+   timestamp `TermBytes` (a clock on the hot path, for a fact only a stopped
+   stream needs) and does not have to: "my picture stopped updating 34 seconds
+   ago" is a statement about this browser's stream, and both ends of the
+   subtraction are its own clock. The frozen wall-clock 2d prints is this
+   browser's too, the same clock `Shutdown`'s `atLabel` is stamped from, because
+   the reader is here and not on the host. It **ticks**, from the transport,
+   because the chip's job is to be a counter the user can watch climb — a
+   one-shot value would be a number frozen at the wrong moment. Which states are
+   stale is not restated in the transport: it asks `state/connection.ts`'s
+   `isStale`, now exported, because two of the four ways to be stale (an access
+   screen, an eviction) never reach the transport as a connection change, and a
+   second copy of the list would have drawn a photograph with no clock on it in
+   exactly the two states 2b and 2f spell the fact out in words.
+   `frozen a moment ago` — the fallback that had been *masking* all of this — is
+   gone: an unmeasured age now drops the clause rather than printing a duration
+   nobody measured.
+3. **Latency** is one round trip timed at one end: `Attach` → `Snapshot` on
+   connect, and `Command` → `Ack` after that (`requestSnapshotSoon` sends one
+   whenever a delta arrives that the store only takes wholesale, so an ordinary
+   session re-measures several times a minute without a heartbeat frame of its
+   own). Input acks are deliberately excluded — they travel through the input
+   lock and the PTY write, so a `seat_held` refusal or a busy terminal would be
+   reported to the user as network latency. `Snapshot::server_time_ms` looks like
+   the answer and its doc comment used to say it was; subtracting it from the
+   browser's `Date.now()` gives a number wrong by the clock skew, silently, with
+   no way to tell a 200ms link from a 200ms clock offset. That doc comment is now
+   corrected in place, and states what the field really is: the clock every
+   *other* host instant in the frame (`since_ms`, `at_ms`) is dated against.
+   `latencyMs` also stopped being a field on the browser's `Snapshot` model,
+   which is what let the adapter fill it with `null` for every host: the host
+   cannot see this link from this end, so it is not a host fact and a snapshot
+   must not clear it.
+
+**No `PROTOCOL_VERSION` bump.** Nothing was added to the wire and nothing was
+read from it that was not already there. `TermBytes::truncated`,
+`TerminalView::byte_len` and `TerminalView::replay_from` have been in v1 since
+Q3, and the two clocks are the browser's own. The only Rust change is a doc
+comment. Neither of the two precedents applies: this is not
+`ServerMsg::GitStatus`'s closed vocabulary growing a member the peer must
+understand, and it is not even `Delta::Seats::you_were_preempted`'s additive
+optional field — no field appeared.
+
+**What covers it.** `webui/src/wire/wiredScreen.test.ts`, eleven cases, all
+through the front door: a byte cursor is established by a real `term_bytes`
+frame, the socket is closed, the retry loop opens the next one, and the second
+snapshot is what produces the catching-up state — asserted in the store *and* on
+`.fd-pane[data-tone]`, `.fd-statusbar` and `progress.fd-replay`. A chunked
+replay proves the bar moves through a real intermediate value rather than
+snapping to 100%; the truncated case asserts Q3's sentence twice, during the
+drain and after it, and asserts it is gone once the notice expires; two more
+cover the states that must **not** be entered (nothing to replay) and the host
+that promises a replay and never sends it. Staleness is asserted as a climbing
+counter across a ticked clock with a fixed wall-clock beside it, and latency is
+asserted at attach, re-measured on a command ack, and absent — a bare
+`● connected` — until a round trip has actually been timed.
+
 ---
 
 ## 7. Reference

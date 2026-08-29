@@ -192,6 +192,41 @@ fn no_row_can_dispatch_a_confirmed_quit() {
     );
 }
 
+/// **Artboard 1d's two missing tags** (`remote-control-pz1j`, §6.5 R19).
+///
+/// 1d draws a `new worktree` tag on `New Agent Session Tab`, and the SPA's own
+/// `matchCommand` doc comment says 1d's `wor` query matches that row *through*
+/// the tag — the label has no `wor` in it, which is why the artboard highlights
+/// nothing on that row and still lists it. The row carried `annotation: None`,
+/// so the comment described behaviour the data could not produce. It can now.
+///
+/// `Pull Base` is the other half, and it is deliberately **not** 1d's literal
+/// `base: main`: this table is `&'static` and the snapshot's inventory is built
+/// from it once for the life of the build, while the base branch belongs to
+/// whichever project is selected. A hard-coded branch name would be the host
+/// asserting something it never looked up.
+#[test]
+fn the_two_rows_artboard_1d_tags_carry_their_tags() {
+    let new_tab = lookup(names::NEW_AGENT_SESSION_TAB).expect("a name the host knows");
+    assert_eq!(new_tab.view().annotation.as_deref(), Some("new worktree"));
+    assert!(
+        !new_tab.label.to_lowercase().contains("wor"),
+        "1d's `wor` query can only reach this row through the tag: {}",
+        new_tab.label
+    );
+
+    let pull_base = lookup(names::PULL_BASE).expect("a name the host knows");
+    let tag = pull_base.view().annotation.expect("1d draws a tag here");
+    assert!(
+        !tag.contains("main"),
+        "the base branch is per-project; a static table cannot name it: {tag}"
+    );
+    assert!(tag.contains("base branch"), "{tag}");
+    // The label still matches the TUI's own palette row — 1d's dimmed
+    // `(rebase)` qualifier lives in the tag, not in the label.
+    assert_eq!(pull_base.label, "Pull Base");
+}
+
 /// **The destructive pair carry their unconfirmed values, and only those.**
 ///
 /// `abandon_worktree` joined `rebase_worktree` on a dispatching route in

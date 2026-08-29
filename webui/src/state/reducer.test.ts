@@ -154,7 +154,18 @@ describe("reduce — the main screen", () => {
     });
     expect(state.geometry).toEqual({ cols: 120, rows: 34 });
     expect(state.viewers).toBe(2);
-    expect(state.latencyMs).toBe(18);
+    /**
+     * **Not** on the snapshot. Latency is this link measured from this end, so
+     * a host frame cannot carry it and must not clear it: it arrives from the
+     * transport, and a resync in the middle of a session leaves it alone.
+     */
+    expect(state.latencyMs).toBeNull();
+    const measured = reduce(state, { type: "latency/set", latencyMs: 18 });
+    expect(measured.latencyMs).toBe(18);
+    expect(
+      reduce(measured, { type: "snapshot/received", snapshot: fixtureSnapshot() })
+        .latencyMs,
+    ).toBe(18);
     expect(state.update).toEqual({ version: "v1.16.0" });
   });
 

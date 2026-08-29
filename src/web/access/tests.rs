@@ -150,7 +150,10 @@ fn rotate_revokes_every_browser_and_invalidates_the_previous_code() {
 
     assert_eq!(
         access.handle_key(AccessKey::Char('x'), &mut s),
-        AccessOutcome::Handled
+        AccessOutcome::Revoked,
+        "the credentials are gone, but the sockets holding them are the event \
+         loop's to close — `Handled` would be this overlay claiming an eviction \
+         it cannot perform (§6.5 R20)"
     );
     assert_eq!(
         s.active_tokens().count(),

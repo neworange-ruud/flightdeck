@@ -149,6 +149,18 @@ impl DialogButton {
         }
     }
 
+    /// Whether this button **dismisses** the dialog rather than deciding it.
+    ///
+    /// The dialogs do not agree on a cancel key — `n` in the close
+    /// confirmations, `c` in the push confirmation, `Esc` in the forms — but
+    /// they all agree on the *label*, because `prompt_dialog` writes it. One
+    /// rule, read by `dialog_decision` (which key cancelled) and by
+    /// `web_dialog_view` (which button a browser should cancel with), so the
+    /// two cannot drift.
+    pub fn cancels(&self) -> bool {
+        self.label == "Cancel"
+    }
+
     /// The rendered cell text, e.g. `" [y] Close "`.
     fn cell(&self) -> String {
         format!(" [{}] {} ", self.accel.key_label(), self.label)

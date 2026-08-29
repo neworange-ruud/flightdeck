@@ -94,13 +94,16 @@ export const READ_ONLY = "read-only · your keystrokes are not being sent";
  *     dead socket first.
  *   - **`shutdown` outranks every transport state**, because Q5's entire point
  *     is that a host which said goodbye must never be described as coming back.
+ *   - **`revoked` outranks `shutdown`**, because it is the one shutdown that is
+ *     not about the host at all. The host closed the socket, so a `Shutdown`
+ *     frame is recorded (§6.5 R20) — but drawing the stopped row for it would
+ *     put `FLIGHTDECK STOPPED` on a machine that is running perfectly well and
+ *     offer "start it again on the machine" to a user whose only problem is a
+ *     credential. 2c gives this its own row for exactly that reason.
  *   - **`seat` is checked while connected**, since read-only is the one loss of
  *     control that happens with a perfectly good connection.
  */
 export function connectionStrip(state: AppState): ConnectionStrip {
-  if (state.connection === "stopped" || state.shutdown !== null) {
-    return stoppedStrip(state);
-  }
   if (state.connection === "revoked") {
     return {
       frame: "stale",
@@ -120,6 +123,9 @@ export function connectionStrip(state: AppState): ConnectionStrip {
       staleChip: staleChipFor(state),
       note: null,
     };
+  }
+  if (state.connection === "stopped" || state.shutdown !== null) {
+    return stoppedStrip(state);
   }
   if (state.connection === "disconnected") {
     const attempts = state.retry?.attempt ?? null;
@@ -394,8 +400,15 @@ export function paneTone(state: AppState): PaneTone {
  *
  * `connecting` is deliberately absent: there is nothing on screen yet to be a
  * photograph of.
+ *
+ * **Exported because the clock lives elsewhere.** 2d's frozen clock and 2c's
+ * `terminal stale 34s` are durations, and nothing under `state/` or `ui/` may
+ * read a clock (`ui/tokens.guard.test.ts` rule 3). `wire/socket.ts` — which
+ * owns `now` — asks *this* function whether the picture is frozen, rather than
+ * keeping a second list of connection states that would have missed the two
+ * stale states the transport cannot see: an access screen and an eviction.
  */
-function isStale(state: AppState): boolean {
+export function isStale(state: AppState): boolean {
   if (state.access !== null) {
     return true;
   }

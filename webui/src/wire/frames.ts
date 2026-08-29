@@ -203,6 +203,32 @@ export interface WireDialogChoice {
 export interface WireDialogKey {
   readonly key: string;
   readonly label: string;
+  /** Whether pressing this button **dismisses** the dialog rather than deciding
+   * it (`protocol::DialogKey::cancels`, §6.5 R19). The dialogs do not agree on
+   * a cancel key — `n` in the close confirmations, `c` in the push
+   * confirmation, `Esc` in the forms — so the host says which one it is rather
+   * than leaving the browser to read the labels. */
+  readonly cancels?: boolean;
+}
+
+/**
+ * Artboard 1e's `Tab` toggle, in **both** of its wordings
+ * (`protocol::DialogToggle`, `specs/WEB_INTERFACE.md` §6.5 R19).
+ *
+ * R8 keeps the toggle a local draft, so it moves here before the host hears
+ * about it. The host therefore sends the words for both states and the browser
+ * picks the pair its draft is in — host-authored words, browser-chosen state,
+ * which is R7/ll5.12 intact.
+ */
+export interface WireDialogToggle {
+  readonly key: string;
+  /** Whether the **host's** copy has it on right now: where the local draft
+   * starts, and what the confirm's `toggle` flip is measured against. */
+  readonly on: boolean;
+  readonly title_off: string;
+  readonly label_off: string;
+  readonly title_on: string;
+  readonly label_on: string;
 }
 
 /**
@@ -221,6 +247,10 @@ export interface WireDialogBody {
   /** Artboard 1g's second step, when one of this dialog's buttons has one
    * (`protocol::ConfirmGate`, `specs/WEB_INTERFACE.md` §6.5 R13). */
   readonly confirm_gate?: WireConfirmGate | null;
+  /** Artboard 1e's `Tab` toggle, when this dialog has one
+   * (`protocol::DialogToggle`, §6.5 R19). Absent on every dialog but the
+   * new-agent form. */
+  readonly toggle?: WireDialogToggle | null;
 }
 
 /**

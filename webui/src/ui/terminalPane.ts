@@ -96,6 +96,27 @@ function renderBanner(banner: HTMLElement, state: AppState, tone: PaneTone): voi
     return;
   }
   if (!frozen(tone)) {
+    /**
+     * Q3's warning outlives the state that produced it.
+     *
+     * The host answers a resume with **one** frame per terminal, so a
+     * truncated replay can be over in milliseconds — and a sentence nobody can
+     * read is the same silence the flag exists to break. `wire/socket.ts`
+     * therefore leaves `replay` in place for a few seconds after the drain,
+     * with `bytesDone === bytesTotal`. Nothing here claims a replay is still
+     * running: the bar and the outstanding count belong to the branch above,
+     * and this prints only the loss, in the past tense.
+     */
+    if (state.replay?.truncated === true) {
+      banner.hidden = false;
+      append(banner, [
+        el("span", {
+          class: "fd-pane__banner-text",
+          text: "output older than the host's buffer was lost — the terminal above has a gap in it",
+        }),
+      ]);
+      return;
+    }
     banner.hidden = true;
     return;
   }
@@ -117,13 +138,24 @@ function renderBanner(banner: HTMLElement, state: AppState, tone: PaneTone): voi
         }),
     el("span", {
       class: "fd-pane__banner-text",
+      /**
+       * `ago` is the transport's, ticking (`staleness/set`). When it is
+       * genuinely absent the clause is **dropped**, not filled in: this used to
+       * read `frozen a moment ago`, which is a duration nobody measured, and it
+       * hid the fact that nothing was computing one at all for the whole of
+       * turn 2. An unmeasured age says nothing rather than something small.
+       */
       text:
         tone === "asleep_stale"
           ? /** 2d's own wording: the second clause matters, because in App mode
              * the keys would not have reached the terminal anyway, and a user
              * who does not know that will blame the connection for both. */
-            `frozen ${ago ?? "a moment"} ago · and FlightDeck has focus, so keys would go to the sidebar anyway.`
-          : `frozen ${ago ?? "a moment"} ago — this is a photograph. Nothing you type is arriving.`,
+            ago === null
+            ? "this is a photograph · and FlightDeck has focus, so keys would go to the sidebar anyway."
+            : `frozen ${ago} ago · and FlightDeck has focus, so keys would go to the sidebar anyway.`
+          : ago === null
+            ? "this is a photograph. Nothing you type is arriving."
+            : `frozen ${ago} ago — this is a photograph. Nothing you type is arriving.`,
     }),
     /**
      * §5.1 made visible where the user is actually looking. The status bar

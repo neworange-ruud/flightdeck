@@ -20,6 +20,7 @@
  *    and `attach` has gone out; keystrokes typed before that are queued.
  */
 
+import { isStale } from "../state/connection";
 import type { ShutdownReason } from "../state/model";
 import type { Store } from "../ui/store";
 import {
@@ -64,6 +65,77 @@ const LOCAL_SCROLLBACK_BYTES = 256 * 1024;
 /** Reconnect backoff, capped. Deliberately short at first — a host restart is
  * usually over in a second and the tab should not sit there looking dead. */
 const RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+
+/**
+ * How often 2d's frozen clock re-reads its own age while the picture is a
+ * photograph. One second, because the label it feeds counts in seconds
+ * (`terminal stale 34s`) and a slower tick would show a number the user can
+ * watch being wrong.
+ */
+const STALE_TICK_MS = 1_000;
+
+/**
+ * How long Q3's *"output older than the host's buffer was lost"* stays on
+ * screen **after** the replay has landed.
+ *
+ * The host answers a resume with **one** `TermBytes` per terminal
+ * (`stream.rs`'s `attach_frames` → `resume_frame`), so the catching-up state
+ * itself can be over in a few milliseconds — far too short to read a sentence
+ * that is the whole reason `truncated` is on the wire. The notice therefore
+ * outlives the state that produced it. It is not a claim that anything is
+ * still replaying: by then `bytesDone === bytesTotal`, the connection reads
+ * `connected` again, and the pane prints the loss in the past tense.
+ */
+const TRUNCATION_NOTICE_MS = 8_000;
+
+/**
+ * The catching-up state's dead-man's handle.
+ *
+ * `catching_up` is entered from the *snapshot* (which is where the outstanding
+ * byte count is known) and left when those bytes arrive. A host that promised
+ * a backlog in `TerminalView::byte_len` and then never sent it would otherwise
+ * leave the tab spinning for ever, which is a worse bug than the one this
+ * state exists to fix.
+ */
+const CATCH_UP_TIMEOUT_MS = 10_000;
+
+/**
+ * `34s` / `4m` / `2h` — a bare duration, not `agoLabel`'s "N ago".
+ *
+ * 2c prints it as `terminal stale 34s` and 2d as `frozen 34s ago`, so the word
+ * belongs to the sentence and not to the number. Under a second it reads `0s`
+ * rather than borrowing `agoLabel`'s `just now`: the chip's whole job is to be
+ * a counter the user can watch climb, and a phrase that has to become a number
+ * a moment later reads as a glitch.
+ */
+export function staleLabel(millis: number): string {
+  const seconds = Math.max(0, Math.round(millis / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  if (seconds < 3600) {
+    return `${Math.round(seconds / 60)}m`;
+  }
+  return `${Math.round(seconds / 3600)}h`;
+}
+
+/**
+ * A resume being drained, from the snapshot that announced it to the frame
+ * that finishes it.
+ *
+ * Every number here is the host's: `total` is `TerminalView::byte_len` minus
+ * the offset the host will actually resume from, and `done` counts the bytes
+ * of the frames that really arrived. Nothing is estimated, which is the whole
+ * difference between this and a progress bar that reads 100% because both ends
+ * were set to the same value.
+ */
+interface CatchUp {
+  readonly terminalId: string;
+  readonly fromByte: number;
+  readonly total: number;
+  done: number;
+  truncated: boolean;
+}
 
 interface QueuedInput {
   readonly seq: number;
@@ -164,6 +236,44 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
    * events, never a host instant against a local clock.
    */
   let lastAppliedInputAtMs: number | null = null;
+  /**
+   * When the last `term_bytes` frame arrived — the instant 2d's frozen clock
+   * names ("the time of the last byte that arrived"), and the instant its
+   * `frozen 34s ago` counts from.
+   *
+   * A **local** instant on purpose, and not a host one. The host does not
+   * timestamp `TermBytes` (it is the hot path; a clock on every frame would be
+   * a per-frame cost for a fact only a stopped stream ever needs), and it does
+   * not have to: staleness is a statement about *this browser's* stream. Both
+   * ends of the subtraction below are therefore this machine's clock, the same
+   * property that makes `lastAppliedInputAtMs` honest — never a host instant
+   * dated against `Date.now()`.
+   */
+  let lastBytesAtMs: number | null = null;
+  /** The photograph's own moment, fixed the instant the picture froze. */
+  let frozenAtMs: number | null = null;
+  let staleTimer: ReturnType<typeof setInterval> | null = null;
+  let staleLabelShown: string | null = null;
+  let unsubscribe: (() => void) | null = null;
+  /** The resume being drained, or `null` when the stream is continuous. */
+  let catchUp: CatchUp | null = null;
+  let catchUpTimer: ReturnType<typeof setTimeout> | null = null;
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * When the outstanding half of a request/response pair was sent, so its
+   * answer can be dated — the latency readout, and 2c's `● connected 18ms`.
+   *
+   * **A round trip measured end to end on one clock.** The host sends
+   * `Snapshot::server_time_ms`, and subtracting it from `Date.now()` would be
+   * the obvious way to get a number here — and would be wrong by however far
+   * the two machines' clocks have drifted, silently, with no way to tell a
+   * 200ms link from a 200ms clock offset. The two pairs below are answers the
+   * host sends *immediately* on receipt (`Attach` → `Snapshot`, and
+   * `Command` → `Ack`), so the gap between sending and reading them is the
+   * link, measured twice on the same clock.
+   */
+  let attachSentAtMs: number | null = null;
+  const commandSentAtMs = new Map<number, number>();
   let seq = 0;
   let viewerId: string | null = null;
   let socket: WebSocket | null = null;
@@ -198,6 +308,193 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     }
     socket.send(JSON.stringify(frame));
     return true;
+  }
+
+  // -- 2d's frozen clock (§5.1's stale terminal) ---------------------------
+
+  /**
+   * Keep `staleness` in step with the store's own answer to "is the picture on
+   * screen a photograph".
+   *
+   * The predicate is `state/connection.ts`'s `isStale` — the same function
+   * `paneTone` uses to decide the amber cast — rather than a second list of
+   * connection states kept in this file. That matters because two of the four
+   * ways to become stale (an access screen, an eviction) never reach the
+   * transport as a connection change: a copy of the rule here would have drawn
+   * a photograph with no clock on it, in exactly the two states 2b and 2f
+   * spell the fact out in words.
+   *
+   * This is the only layer allowed to do it. The store and the view may not
+   * read a clock (`ui/tokens.guard.test.ts` rule 3), and a duration that is
+   * *always* growing has to be re-read from somewhere; the transport owns
+   * `now`, so the transport owns the tick.
+   */
+  function syncStaleness(): void {
+    const stale = isStale(store.getState());
+    if (!stale) {
+      if (frozenAtMs === null) {
+        return;
+      }
+      frozenAtMs = null;
+      staleLabelShown = null;
+      if (staleTimer !== null) {
+        clearInterval(staleTimer);
+        staleTimer = null;
+      }
+      store.dispatch({ type: "staleness/set", staleness: null });
+      return;
+    }
+    if (frozenAtMs !== null) {
+      return;
+    }
+    /**
+     * The picture froze at the last byte that arrived. With no bytes yet there
+     * is no earlier honest instant than this one, and "0s" is then true rather
+     * than flattering: nothing has been shown to go out of date.
+     */
+    frozenAtMs = lastBytesAtMs ?? now();
+    /** Set before the dispatch below, so the re-entrant `syncStaleness` the
+     * dispatch triggers finds the work already done and stops. */
+    publishStaleness();
+    if (staleTimer === null) {
+      staleTimer = setInterval(publishStaleness, STALE_TICK_MS);
+    }
+  }
+
+  function publishStaleness(): void {
+    if (frozenAtMs === null) {
+      return;
+    }
+    const label = staleLabel(now() - frozenAtMs);
+    if (label === staleLabelShown) {
+      return;
+    }
+    staleLabelShown = label;
+    store.dispatch({
+      type: "staleness/set",
+      staleness: {
+        /**
+         * A wall-clock time, because 2d chose one: `16:41:08` is checkable
+         * against the user's own memory of when they last looked, and a
+         * duration is not. It is this browser's wall clock — the same one
+         * `onShutdown` stamps its `atLabel` from — because the reader is here,
+         * not on the host.
+         */
+        frozenAt: new Date(frozenAtMs).toLocaleTimeString(),
+        ago: label,
+      },
+    });
+  }
+
+  // -- Q3's catching-up state ---------------------------------------------
+
+  /** Stop drawing the replay, whatever phase it was in. */
+  function clearCatchUp(): void {
+    catchUp = null;
+    if (catchUpTimer !== null) {
+      clearTimeout(catchUpTimer);
+      catchUpTimer = null;
+    }
+    if (noticeTimer !== null) {
+      clearTimeout(noticeTimer);
+      noticeTimer = null;
+    }
+  }
+
+  function publishReplay(state: CatchUp): void {
+    store.dispatch({
+      type: "replay/set",
+      replay: {
+        bytesDone: state.done,
+        bytesTotal: state.total,
+        fromByte: state.fromByte,
+        truncated: state.truncated,
+      },
+    });
+  }
+
+  /**
+   * The replay landed (or gave up waiting): the stream is continuous again.
+   *
+   * Q3's warning is the one thing that outlives the state — see
+   * `TRUNCATION_NOTICE_MS`. The bytes are already on screen by then, so the
+   * pane prints the loss and nothing else; `connection` is `connected`, so
+   * neither the strip nor the pane claims a replay is still running.
+   */
+  function finishCatchUp(): void {
+    const finished = catchUp;
+    clearCatchUp();
+    /**
+     * Leave only the state we are actually in. A `Shutdown` can land while a
+     * replay is still draining, and Q5 is emphatic that a host which said
+     * goodbye must never be described as coming back — a blind `connected`
+     * here would clear the terminal state the goodbye had just set.
+     */
+    if (store.getState().connection === "catching_up") {
+      store.dispatch({ type: "connection/changed", status: "connected" });
+    }
+    if (finished === null || !finished.truncated) {
+      store.dispatch({ type: "replay/set", replay: null });
+      return;
+    }
+    noticeTimer = setTimeout(() => {
+      noticeTimer = null;
+      store.dispatch({ type: "replay/set", replay: null });
+    }, TRUNCATION_NOTICE_MS);
+  }
+
+  /**
+   * Decide, from the snapshot alone, whether this attach is a resume with a
+   * backlog — and how big it is.
+   *
+   * Three host facts and one local one, no estimates:
+   *
+   *   - `cursors` — the offset this tab last consumed, which is exactly what
+   *     `Attach::cursors` just asked to resume from. **Absent means a first
+   *     attach**, and a first attach is not catching up on anything: it has
+   *     missed nothing, so the whole ring is simply its history.
+   *   - `TerminalView::replay_from` — the oldest byte the host still holds. The
+   *     host resumes from `max(cursor, replay_from)`, and the inequality
+   *     `replay_from > cursor` is *the* definition of `TermBytes::truncated`
+   *     (`stream.rs`'s `resume_frame`), so the browser can predict the flag
+   *     rather than wait for it. The frame is still believed over this when it
+   *     arrives.
+   *   - `TerminalView::byte_len` — the end of the stream, which makes the
+   *     outstanding count a subtraction rather than a guess.
+   *
+   * Returns `null` when there is nothing to drain, which covers both "you are
+   * up to date" and "the ring is empty" (`replay_from === byte_len`) — the two
+   * cases where `resume_frame` sends no frame at all and a catching-up state
+   * would hang waiting for one.
+   */
+  function catchUpFromSnapshot(frame: WireSnapshot): CatchUp | null {
+    const terminalId = store.getState().selection?.terminalId ?? null;
+    if (terminalId === null) {
+      return null;
+    }
+    const cursor = cursors.get(terminalId);
+    if (cursor === undefined) {
+      return null;
+    }
+    const view = frame.projects
+      .flatMap((project) => project.sessions)
+      .flatMap((session) => session.terminals)
+      .find((terminal) => terminal.terminal_id === terminalId);
+    if (view === undefined) {
+      return null;
+    }
+    const fromByte = Math.max(cursor, view.replay_from);
+    const total = view.byte_len - fromByte;
+    if (total <= 0) {
+      return null;
+    }
+    return {
+      terminalId,
+      fromByte,
+      total,
+      done: 0,
+      truncated: view.replay_from > cursor,
+    };
   }
 
   function flushHeld(): void {
@@ -242,6 +539,19 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       return;
     }
     viewerId = frame.viewer_id;
+    /**
+     * One half of the latency readout: the host answers `Attach` with this
+     * frame and nothing else in between, so the gap is the round trip. Cleared
+     * either way, because a `Snapshot` that came from `request_snapshot`
+     * rather than an attach is dated by that command's own ack instead.
+     */
+    if (attachSentAtMs !== null) {
+      store.dispatch({
+        type: "latency/set",
+        latencyMs: Math.max(0, Math.round(now() - attachSentAtMs)),
+      });
+      attachSentAtMs = null;
+    }
     /** Everything the host has already applied leaves the held queue (§5.1). */
     held = held.filter((item) => item.seq > frame.last_input_seq);
     seq = Math.max(seq, frame.last_input_seq);
@@ -251,22 +561,44 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     /** 1a is drawn in Terminal mode, and a browser that just attached is here
      * to watch a terminal. */
     store.dispatch({ type: "mode/set", mode: "terminal" });
+    /**
+     * Q3's catching-up state, entered here because **this is the frame that
+     * knows how much is outstanding**: the host announces the end of the
+     * stream in `TerminalView::byte_len` and then sends the backlog, so the
+     * total is available before the first byte of it is. Reading it off the
+     * arriving frames instead is what produced a bar that could only ever say
+     * 100%.
+     *
+     * A previous notice is dropped first: a new attach has a new answer, and a
+     * warning about the *last* resume must not be re-dated onto this one.
+     */
+    clearCatchUp();
+    const resume = catchUpFromSnapshot(frame);
+    if (resume !== null) {
+      catchUp = resume;
+      publishReplay(resume);
+      store.dispatch({ type: "connection/changed", status: "catching_up" });
+      catchUpTimer = setTimeout(finishCatchUp, CATCH_UP_TIMEOUT_MS);
+    } else {
+      store.dispatch({ type: "replay/set", replay: null });
+    }
     flushHeld();
   }
 
   function onTermBytes(frame: WireTermBytes): void {
     const bytes = decodeBase64(frame.data);
     cursors.set(frame.terminal_id, frame.offset + bytes.length);
-    if (frame.truncated === true) {
-      store.dispatch({
-        type: "replay/set",
-        replay: {
-          bytesDone: bytes.length,
-          bytesTotal: bytes.length,
-          fromByte: frame.offset,
-          truncated: true,
-        },
-      });
+    lastBytesAtMs = now();
+    if (catchUp !== null && frame.terminal_id === catchUp.terminalId) {
+      catchUp.done += bytes.length;
+      /** The host's own word wins over the prediction made from the snapshot;
+       * they agree by construction, and if they ever stop agreeing the frame
+       * is the one that was actually sent. */
+      catchUp.truncated = catchUp.truncated || frame.truncated === true;
+      publishReplay(catchUp);
+      if (catchUp.done >= catchUp.total) {
+        finishCatchUp();
+      }
     }
     remember(frame.terminal_id, bytes);
     sinks.get(frame.terminal_id)?.(bytes);
@@ -524,6 +856,26 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   }
 
   function onAck(frame: WireAck): void {
+    /**
+     * The other half of the latency readout, and the one that keeps it fresh:
+     * every command the host settles itself is answered on receipt, and
+     * `requestSnapshotSoon` sends one whenever a delta arrives that the store
+     * only takes wholesale — so an ordinary session re-measures the link
+     * several times a minute without a heartbeat frame of its own.
+     *
+     * Input acks are deliberately *not* used. They travel through the input
+     * lock and the PTY write, so a `seat_held` refusal or a busy terminal
+     * would be reported to the user as network latency, which is a different
+     * fact wearing the same number.
+     */
+    const sentAt = commandSentAtMs.get(frame.seq);
+    if (sentAt !== undefined) {
+      commandSentAtMs.delete(frame.seq);
+      store.dispatch({
+        type: "latency/set",
+        latencyMs: Math.max(0, Math.round(now() - sentAt)),
+      });
+    }
     if (pendingCommands.has(frame.seq)) {
       pendingCommands.delete(frame.seq);
       store.dispatch({
@@ -622,6 +974,8 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     /** `attached` gates every *other* frame, so it has to be true for the
      * attach itself to go out. */
     attached = true;
+    /** The clock starts on the request; `onSnapshot` reads it off the answer. */
+    attachSentAtMs = now();
     socket.send(
       JSON.stringify({
         type: "attach",
@@ -676,6 +1030,15 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     ws.onclose = () => {
       socket = null;
       attached = false;
+      /**
+       * A replay that was still draining when the link died is not draining
+       * any more, and its dead-man's handle must not fire a `connected` into a
+       * tab that is reconnecting. The next snapshot recomputes the backlog
+       * from scratch, which is the only honest source for it.
+       */
+      clearCatchUp();
+      attachSentAtMs = null;
+      commandSentAtMs.clear();
       if (closedForGood) {
         return;
       }
@@ -708,11 +1071,23 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     seq += 1;
     const mySeq = seq;
     pendingCommands.add(mySeq);
-    send(args === undefined
+    const went = send(args === undefined
       ? { type: "command", seq: mySeq, name }
       : { type: "command", seq: mySeq, name, args });
+    /** Only a frame that actually left can be timed; one refused by a closed
+     * socket would date its eventual answer from long before it was asked. */
+    if (went) {
+      commandSentAtMs.set(mySeq, now());
+    }
     return mySeq;
   }
+
+  /**
+   * 2d's frozen clock follows the *store's* idea of staleness, not the
+   * socket's, so it is driven from a subscription rather than from the
+   * connection callbacks — see `syncStaleness`.
+   */
+  unsubscribe = store.subscribe(syncStaleness);
 
   connect();
 
@@ -751,6 +1126,13 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         clearTimeout(retryTimer);
         retryTimer = null;
       }
+      if (staleTimer !== null) {
+        clearInterval(staleTimer);
+        staleTimer = null;
+      }
+      clearCatchUp();
+      unsubscribe?.();
+      unsubscribe = null;
       socket?.close();
       socket = null;
     },

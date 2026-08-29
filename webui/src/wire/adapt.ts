@@ -360,7 +360,9 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
     geometry: { cols: wire.geometry.cols, rows: wire.geometry.rows },
     /** The chip counts seats, and the desktop is one of them. */
     viewers: wire.seats.length,
-    latencyMs: null,
+    /** No `latencyMs`: it is not on this wire and never was. This adapter used
+     * to hardcode `null` for it, which is why 2c's readout could not appear —
+     * `wire/socket.ts` measures the round trip and dispatches `latency/set`. */
     /** The update chip is the *updater's* business, not the protocol's. */
     update: null,
     seats: wire.seats.map((s) => seatOf(s, wire.server_time_ms)),
@@ -486,6 +488,10 @@ export function dialogOf(wire: WireDialogView): DialogState {
     buttons: (body.buttons ?? []).map((button) => ({
       key: button.key,
       label: button.label,
+      /** Absent means "the host did not say this button cancels", and the
+       * honest reading of that is that it decides — the browser keeps its own
+       * `Esc Cancel` and nothing is dropped from the row. */
+      cancels: button.cancels ?? false,
     })),
     /** Absent means "the host did not say", and the honest reading of that is
      * *not* confirmable: a browser that guessed `true` would send a confirm the
@@ -503,7 +509,30 @@ export function dialogOf(wire: WireDialogView): DialogState {
             expected: body.confirm_gate.expected,
             instruction: body.confirm_gate.instruction,
           },
-    draft: { text: "", index: null, toggled: false, confirmName: "", step: 1 },
+    /** Absent means the host described no toggle, which is every dialog but
+     * 1e's form: `hasToggle` is then false and the panel has nothing to flip. */
+    toggle:
+      body.toggle === undefined || body.toggle === null
+        ? null
+        : {
+            key: body.toggle.key,
+            on: body.toggle.on,
+            titleOff: body.toggle.title_off,
+            labelOff: body.toggle.label_off,
+            titleOn: body.toggle.title_on,
+            labelOn: body.toggle.label_on,
+          },
+    /** The draft opens where the **host** has the toggle, so a tab attaching to
+     * a form the desktop had already switched to run-from-base paints the state
+     * that is really pending rather than the other one. Every other field starts
+     * empty: `index: null` means "the host's own highlight stands". */
+    draft: {
+      text: "",
+      index: null,
+      toggled: body.toggle?.on ?? false,
+      confirmName: "",
+      step: 1,
+    },
     pending: [],
     lastOutcome: null,
   };

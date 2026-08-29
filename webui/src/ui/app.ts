@@ -1,6 +1,7 @@
 import { accessCopy, canSubmit } from "../state/access";
 import {
   atNameStep,
+  cancelButton,
   decidingKeys,
   gateSatisfied,
   gatedKey,
@@ -911,6 +912,16 @@ export function createApp(options: AppOptions): App {
        */
       if (dialog.input !== null) {
         store.dispatch({ type: "dialog/type", char: event.key });
+        return true;
+      }
+      /** The host's own cancel key (`n` in the close confirmations, `c` in the
+       * push confirmation) still cancels, and it cancels through
+       * `dialog_cancel` — the frame that is never gated and never refused —
+       * rather than through a confirm carrying that key. It is no longer a
+       * *deciding* key, because the panel no longer draws it as a second
+       * button beside `Esc Cancel` (§6.5 R19). */
+      if (cancelButton(dialog)?.key === event.key) {
+        options.onAnswerDialog?.(null);
         return true;
       }
       const pressed = decidingKeys(dialog).find(

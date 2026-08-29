@@ -443,6 +443,31 @@ describe("matchCommand", () => {
   it("is null when the filter hits neither the label nor the annotation", () => {
     expect(matchCommand(command, "nonexistent")).toBeNull();
   });
+
+  it("reproduces artboard 1d's `wor` query against the host's own rows", () => {
+    /** 1d types `wor` and lists `New Agent Session Tab` with **nothing
+     * highlighted in its label**, because the hit is in that row's tag. That
+     * only works if the host puts the tag there, and until §6.5 R19 it sent
+     * `annotation: null` — a doc comment describing behaviour the data could
+     * not produce. This asserts the data, through the recorded host payload. */
+    const rows = paletteInventory(stateWithSnapshot());
+    const newTab = rows.find((c) => c.run.name === "new_agent_session_tab");
+    expect(newTab?.annotation).toBe("new worktree");
+
+    const matched = matchCommand(newTab as PaletteCommand, "wor");
+    expect(matched).not.toBeNull();
+    expect(matched?.labelSpans).toEqual([
+      { text: "New Agent Session Tab", matched: false },
+    ]);
+
+    /** And the label-side half of the same query still highlights. */
+    const abandon = rows.find((c) => c.run.name === "abandon_worktree");
+    expect(matchCommand(abandon as PaletteCommand, "wor")?.labelSpans).toEqual([
+      { text: "Abandon ", matched: false },
+      { text: "Wor", matched: true },
+      { text: "ktree", matched: false },
+    ]);
+  });
 });
 
 describe("paletteColumns", () => {

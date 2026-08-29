@@ -795,6 +795,32 @@ impl CredentialStore {
         &self.state.tokens
     }
 
+    /// Whether the record named by `id` still grants access **right now**.
+    ///
+    /// This is the question a *live* socket asks, and it is deliberately a
+    /// different question from [`CredentialStore::verify_token`]: the socket
+    /// never sees the secret again after the upgrade, and it must not have to.
+    /// It kept the [`TokenId`] the upgrade handed it — a public identifier, safe
+    /// to hold and safe to log — and asks about that.
+    ///
+    /// Because this store is the one authority on revocation, and because the
+    /// web server consults it on every frame a socket sends (see
+    /// `super::server::Shared::credential_is_active`), there is **no window**
+    /// between a revocation landing here and that socket losing its powers.
+    /// A design that cached "revoked" beside each socket would have one.
+    ///
+    /// Not constant time, and deliberately so: an id is not a secret, nobody
+    /// authenticates with one, and every caller already holds a specific id it
+    /// was given rather than a guess it is testing. An unknown id answers
+    /// `false`, which is the safe direction — a record pruned by
+    /// `prune_tombstones` grants nothing.
+    pub fn is_token_active(&self, id: &TokenId) -> bool {
+        self.state
+            .tokens
+            .iter()
+            .any(|record| &record.id == id && record.is_active())
+    }
+
     /// Write `web.json` now.
     pub fn save(&mut self) -> Result<()> {
         match save_web_credentials(&*self.fs, &self.path, &self.state) {

@@ -1242,6 +1242,18 @@ struct Ui {
     /// Set by "Stop Web Interface"; the event loop drains the viewers and
     /// releases the listener (Q5).
     pending_web_stop: bool,
+    /// Set by the access overlay's `x`: credentials were withdrawn from the
+    /// store, and the sockets holding them must now be closed.
+    ///
+    /// Deferred for the same reason as the two lifecycle flags above — the
+    /// sockets live behind [`crate::web::server::WebServerHandle`], which only
+    /// the event loop holds. Deferring is safe here in a way it would not be if
+    /// this were the *only* enforcement: the store is revoked synchronously
+    /// inside the key handler, and the server refuses every frame from a
+    /// credential that store no longer honours, so nothing a revoked browser
+    /// sends in the meantime is acted on. This flag is what makes the socket
+    /// actually go away, so 2b's revoked panel appears without a reload.
+    pending_web_recheck_credentials: bool,
     /// The access overlay's live state while it is open (D5, Q1; design `2a`).
     ///
     /// Held beside `overlay` rather than inside it, exactly as `config` is,
@@ -2691,6 +2703,16 @@ fn event_loop(
                 ui.message("Web interface stopped.".to_string());
             }
         }
+        // A revocation is two halves, and this is the one the listener owns: the
+        // key handler took the credentials away, and this closes the sockets
+        // that were still using them (§6.5 R20). Nothing is reported back — the
+        // overlay's own notice already says what was revoked, and a second
+        // sentence from here would be the desktop congratulating itself.
+        if std::mem::take(&mut ui.pending_web_recheck_credentials) {
+            if let Some(handle) = web_surface.handle.as_ref() {
+                handle.recheck_credentials();
+            }
+        }
 
         // --- The access overlay (D5, Q1; design 2a). --------------------------
         //
@@ -3268,6 +3290,12 @@ fn handle_web_access_key(key: KeyEvent, ui: &mut Ui) {
 
     match outcome {
         AccessOutcome::Ignored | AccessOutcome::Handled => {}
+        AccessOutcome::Revoked => {
+            // The overlay has already withdrawn the credentials and printed how
+            // many browsers it locked out. That sentence is only true once the
+            // event loop closes their sockets, which is what this asks for.
+            ui.pending_web_recheck_credentials = true;
+        }
         AccessOutcome::Close => {
             if let (Some(access), Ok(mut store)) = (ui.web_access.as_ref(), credentials.lock()) {
                 access.on_close(&mut store);
@@ -5028,6 +5056,48 @@ mod web_access_key_tests {
             "the overlay stays open across the rebind it asked for"
         );
     }
+
+    /// §6.5 R20. `x` used to end at the credential store, which is why a
+    /// browser that was already connected kept typing after the desktop said it
+    /// had been locked out. The key handler cannot close a socket, so the one
+    /// thing it must do is *ask*.
+    #[test]
+    fn revoking_from_the_overlay_asks_the_event_loop_to_close_the_live_sockets() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some({
+            let mut store = credentials.lock().expect("a fresh store lock");
+            crate::web::access::WebAccess::open(
+                &mut store,
+                &crate::web::interfaces::FakeInterfaceEnumerator::new()
+                    .with_interface("en0", std::net::Ipv4Addr::new(192, 168, 2, 14)),
+                std::net::SocketAddr::from(([0, 0, 0, 0], 7420)),
+                crate::web::server::BindExposure::Routable,
+            )
+        });
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        // Nothing has been revoked, so nothing has been asked for.
+        handle_web_access_key(bare(KeyCode::Char('r')), &mut ui);
+        assert!(
+            !ui.pending_web_recheck_credentials,
+            "hiding the code revokes nothing and must ask for nothing"
+        );
+
+        handle_web_access_key(bare(KeyCode::Char('x')), &mut ui);
+        assert!(
+            ui.pending_web_recheck_credentials,
+            "the sockets are the event loop's to close"
+        );
+        assert!(
+            ui.web_access.is_some(),
+            "the overlay stays up to show the new code it just issued"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6130,6 +6200,34 @@ fn digit_accel(i: usize) -> DialogAccel {
     DialogAccel::Char(char::from_digit((i as u32 + 1) % 10, 10).unwrap_or('?'))
 }
 
+/// Artboard 1e's title, in the state `run_on_base` names.
+///
+/// A function rather than an inline `if` because both wordings travel to the
+/// browser at once: the toggle is a *local draft* there (§6.5 R8/R19), so the
+/// browser picks the sentence its own draft is in and the host would otherwise
+/// only ever word the one it is in itself. See
+/// [`DialogToggle`](crate::web::protocol::DialogToggle).
+fn new_agent_title(run_on_base: bool, base_branch: &str) -> String {
+    if run_on_base {
+        format!(
+            "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\n\
+             Runs on base branch '{base_branch}' in the project root — no worktree."
+        )
+    } else {
+        "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)".to_string()
+    }
+}
+
+/// Artboard 1e's `Tab` button label, in the state `run_on_base` names. Paired
+/// with [`new_agent_title`], and travels to the browser for the same reason.
+fn new_agent_base_label(run_on_base: bool, base_branch: &str) -> String {
+    if run_on_base {
+        format!("Run from base: {base_branch}")
+    } else {
+        "Run from base: off".to_string()
+    }
+}
+
 /// Build the modal [`Dialog`] for a prompt: the question/notification text plus
 /// one button per available action. Each button's accelerator matches the key
 /// [`handle_prompt_key`] expects, so mouse and keyboard stay in lockstep.
@@ -6476,8 +6574,9 @@ fn handle_prompt_key(
 ///
 /// The dialogs do not agree on a cancel key — `n` in the close confirmations,
 /// `c` in the push confirmation, `Esc` in the forms — but they all agree on the
-/// *label*, because [`prompt_dialog`] writes it. So the button whose accelerator
-/// this key fires is the authority, and `Esc` is cancel everywhere by rule
+/// *label*, because [`prompt_dialog`] writes it, which is what
+/// [`DialogButton::cancels`] reads. So the button whose accelerator this key
+/// fires is the authority, and `Esc` is cancel everywhere by rule
 /// (`handle_prompt_key_inner` clears on it before looking at anything else).
 ///
 /// Anything else that closes a dialog is a decision: `Clear` in the status menu
@@ -6494,7 +6593,7 @@ fn dialog_decision(dialog: &Dialog, key: KeyEvent) -> crate::web::protocol::Dial
         DialogAccel::Tab => key.code == KeyCode::Tab,
     });
     match pressed {
-        Some(button) if button.label == "Cancel" => DialogOutcome::Cancelled,
+        Some(button) if button.cancels() => DialogOutcome::Cancelled,
         _ => DialogOutcome::Confirmed,
     }
 }
@@ -7410,11 +7509,15 @@ fn web_dialog_view(
             .map(|button| wire::DialogKey {
                 key: dialog_accel_key(button.accel),
                 label: button.label.clone(),
+                // Which button dismisses, said out loud rather than left to the
+                // browser to infer from the label (§6.5 R19).
+                cancels: button.cancels(),
             })
             .collect(),
         confirmable: refusal.is_none(),
         refusal: refusal.map(str::to_string),
         confirm_gate,
+        toggle: dialog_toggle(&open.prompt),
     };
     Some(wire::DialogView {
         dialog_id: open.id.clone(),
@@ -7426,6 +7529,30 @@ fn web_dialog_view(
         // degrades to "no body" instead of taking the event loop with it.
         body: serde_json::to_value(&body).ok(),
     })
+}
+
+/// Artboard 1e's `Tab` toggle for a browser, in **both** wordings (§6.5 R19).
+///
+/// The new-agent form is the only prompt with one. Both pairs are sent whatever
+/// `run_on_base` currently is, because the browser flips its own draft before
+/// the host hears about it (R8) and must be able to word either state without
+/// consulting `on` — see [`crate::web::protocol::DialogToggle`].
+fn dialog_toggle(prompt: &Prompt) -> Option<crate::web::protocol::DialogToggle> {
+    match prompt {
+        Prompt::NewAgentForm {
+            run_on_base,
+            base_branch,
+            ..
+        } => Some(crate::web::protocol::DialogToggle {
+            key: dialog_accel_key(DialogAccel::Tab),
+            on: *run_on_base,
+            title_off: new_agent_title(false, base_branch),
+            label_off: new_agent_base_label(false, base_branch),
+            title_on: new_agent_title(true, base_branch),
+            label_on: new_agent_base_label(true, base_branch),
+        }),
+        _ => None,
+    }
 }
 
 /// The wire `kind` for one prompt (D13). Stable strings: the browser switches on
@@ -12172,6 +12299,109 @@ mod tests {
                 .buttons
                 .iter()
                 .any(|b| b.label.contains("Run from base")));
+        }
+
+        /// **§6.5 R19: the toggle travels in both wordings, whichever state the
+        /// host is in.**
+        ///
+        /// 1e's toggle is a *local draft* in the browser (R8, so a coalesced
+        /// resync mid-typing cannot empty the branch field), and the host's own
+        /// `run_on_base` does not flip until the confirm lands. A host that sent
+        /// only the wording matching its own flag therefore put
+        /// `Run from base: off` on a button the reader had just switched on.
+        ///
+        /// Both pairs are sent unconditionally, so the browser never has to
+        /// consult `on` to word anything — asserted here from **both** sides of
+        /// the toggle, with the toggled pair identical either way.
+        #[test]
+        fn the_new_agent_toggle_carries_both_wordings_from_either_state() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+
+            let off = body(&view(&ui, &ws)).toggle.expect("1e has a toggle");
+            assert_eq!(off.key, "Tab", "the key is named, not spelled by the SPA");
+            assert!(!off.on, "the host opens the form with run-from-base off");
+            assert_eq!(off.label_off, "Run from base: off");
+            assert_eq!(off.label_on, "Run from base: main");
+            assert!(
+                off.title_on
+                    .contains("Runs on base branch 'main' in the project root — no worktree."),
+                "1e's toggled sentence, which a toggled browser never saw: {}",
+                off.title_on
+            );
+            assert!(off.title_off.contains("type branch"), "{}", off.title_off);
+            // The host's own `title` is the state the *host* is in, and it is
+            // the untoggled one — which is exactly why the browser cannot use it.
+            assert_eq!(view(&ui, &ws).title, off.title_off);
+
+            // Now flip the host's copy, from the desktop's keyboard.
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            handle_prompt_key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                &mut ws,
+                &e,
+                &mut ui,
+            )
+            .unwrap();
+
+            let on = body(&view(&ui, &ws)).toggle.expect("still a toggle");
+            assert!(on.on, "the host is in the toggled state now");
+            assert_eq!(
+                (&on.title_off, &on.label_off, &on.title_on, &on.label_on),
+                (&off.title_off, &off.label_off, &off.title_on, &off.label_on),
+                "the words do not depend on which state the host happens to be in"
+            );
+            // And the host's own title has moved to the toggled sentence, while
+            // both wordings stayed put — the pair the browser draws is chosen by
+            // its draft, never by this.
+            assert_eq!(view(&ui, &ws).title, on.title_on);
+        }
+
+        /// **§6.5 R19: which button cancels is the host's word, not the SPA's.**
+        ///
+        /// The dialogs do not agree on a cancel key — `n` in the close
+        /// confirmations, `Esc` in the forms — so the browser was appending an
+        /// `Esc Cancel` of its own beside the host's, giving 1g's step 1 three
+        /// buttons, two of which cancelled. The flag is the same rule
+        /// `dialog_decision` reads, so the two cannot drift.
+        #[test]
+        fn every_dialog_names_the_button_that_cancels_it() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            // A form: the cancel is `Esc`, and nothing else claims to cancel.
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::NEW_AGENT_SESSION_TAB, None),
+            );
+            let form = body(&view(&ui, &ws));
+            let cancels: Vec<&str> = form
+                .buttons
+                .iter()
+                .filter(|b| b.cancels)
+                .map(|b| b.key.as_str())
+                .collect();
+            assert_eq!(cancels, vec!["Esc"]);
+
+            // A y/n confirmation: the cancel is `n`, which is exactly the button
+            // the browser must stop drawing a second time.
+            ui.clear();
+            run(&mut ws, &mut ui, &frame(2, names::UNPAIR_PHONE, None));
+            let confirm = body(&view(&ui, &ws));
+            assert_eq!(keys(&confirm), vec!["y", "n"]);
+            assert!(!confirm.buttons[0].cancels, "`y Unpair` decides");
+            assert!(confirm.buttons[1].cancels, "`n Cancel` dismisses");
         }
 
         /// Either surface can confirm (D13). The browser's confirm goes through

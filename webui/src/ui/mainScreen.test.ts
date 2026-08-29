@@ -41,6 +41,9 @@ function render(options: { readonly now?: () => number } = {}): Harness {
 
   app.store.dispatch({ type: "snapshot/received", snapshot: fixtureSnapshot() });
   app.store.dispatch({ type: "connection/changed", status: "connected" });
+  /** 1a's `18ms`. The transport measures the round trip and dispatches this;
+   * no host frame carries it, so the fixture cannot supply it. */
+  app.store.dispatch({ type: "latency/set", latencyMs: 18 });
   app.store.dispatch({ type: "mode/set", mode: "terminal" });
 
   const q = (selector: string): HTMLElement => {

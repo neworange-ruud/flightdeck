@@ -51,9 +51,21 @@ function newAgentWire(
       buttons: [
         { key: "Enter", label: "Create" },
         { key: "Tab", label: "Run from base: off" },
-        { key: "Esc", label: "Cancel" },
+        { key: "Esc", label: "Cancel", cancels: true },
       ],
       confirmable: true,
+      /** Both wordings, as the host really sends them (§6.5 R19): the browser
+       * picks the pair its own draft is in. */
+      toggle: {
+        key: "Tab",
+        on: false,
+        title_off:
+          "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)",
+        label_off: "Run from base: off",
+        title_on:
+          "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\nRuns on base branch 'main' in the project root — no worktree.",
+        label_on: "Run from base: main",
+      },
     },
   };
 }
@@ -68,7 +80,7 @@ function unpairWire(): WireDialogView {
     body: {
       buttons: [
         { key: "y", label: "Unpair" },
-        { key: "n", label: "Cancel" },
+        { key: "n", label: "Cancel", cancels: true },
       ],
       confirmable: true,
     },
@@ -89,7 +101,7 @@ function abandonWire(): WireDialogView {
     body: {
       buttons: [
         { key: "y", label: "Abandon (force)" },
-        { key: "n", label: "Cancel" },
+        { key: "n", label: "Cancel", cancels: true },
       ],
       confirmable: true,
       confirm_gate: {
@@ -350,7 +362,11 @@ describe("the confirm frame", () => {
   it("omits `choice` for the primary action and names any other button", () => {
     const state = opened(unpairWire());
     const dialog = dialogOf_(state);
-    expect(primaryKey(dialog)).toEqual({ key: "y", label: "Unpair" });
+    expect(primaryKey(dialog)).toEqual({
+      key: "y",
+      label: "Unpair",
+      cancels: false,
+    });
     expect(confirmArgs(dialog, "y")).toEqual({ dialog_id: "dialog-3" });
     expect(confirmArgs(dialog, "n")).toEqual({
       dialog_id: "dialog-3",

@@ -44,16 +44,25 @@ export function reduce(state: AppState, action: AppAction): AppState {
        * really did come back, it is back, and pretending otherwise would leave
        * a working session behind a dead-end screen. Reaching it clears the
        * terminal state.
+       *
+       * `catching_up` is the same exception wearing a different word, and for
+       * the same reason: Q3's drain is only ever entered off a `Snapshot`, so
+       * reaching it *is* the host answering. Refusing it would leave a tab that
+       * had genuinely reattached painting a dead host while bytes arrived
+       * behind the screen.
        */
-      if (isTerminalConnection(state) && action.status !== "connected") {
+      const live = action.status === "connected" || action.status === "catching_up";
+      if (isTerminalConnection(state) && !live) {
         return state;
       }
-      if (action.status === "connected") {
+      if (live) {
         return {
           ...state,
-          connection: "connected",
+          connection: action.status,
           shutdown: null,
-          /** The picture is live again, so the photograph's clock goes away. */
+          /** The picture is live again, so the photograph's clock goes away.
+           * 2d is explicit that catching-up counts as live: "colour is back,
+           * so it is trustworthy". */
           staleness: null,
         };
       }
@@ -103,7 +112,14 @@ export function reduce(state: AppState, action: AppAction): AppState {
         layout: snapshot.splitView ? "split" : "single",
         geometry: snapshot.geometry,
         viewers: snapshot.viewers,
-        latencyMs: snapshot.latencyMs,
+        /**
+         * `latencyMs` is deliberately **not** here. It is not a host fact —
+         * the host cannot see this link from this end — so it arrives from the
+         * transport as `latency/set` and a snapshot must not clear it. It used
+         * to be a field on this model that the adapter filled with `null` for
+         * every host, which is why 2c never drew anything but a bare
+         * `● connected`.
+         */
         update: snapshot.update,
         seats: snapshot.seats,
         /** D14: the host says which seat we got; we never assume it. */
@@ -220,6 +236,7 @@ export function reduce(state: AppState, action: AppAction): AppState {
 
     case "connection/shutdown": {
       const { shutdown } = action;
+      const revoked = shutdown.reason === "token_revoked";
       return {
         ...state,
         shutdown,
@@ -233,11 +250,34 @@ export function reduce(state: AppState, action: AppAction): AppState {
          * host is fine, your credential is not, and the fix is a code rather
          * than restarting anything.
          */
-        connection: shouldRetry(shutdown.reason)
-          ? "reconnecting"
-          : shutdown.reason === "token_revoked"
-            ? "revoked"
+        connection: revoked
+          ? "revoked"
+          : shouldRetry(shutdown.reason)
+            ? "reconnecting"
             : "stopped",
+        /**
+         * And it raises 2b's revoked panel, here, from the frame — not only
+         * from the HTTP refusal `main.ts` reads on a page load.
+         *
+         * The panel was drawn *over a live session* precisely for this case, and
+         * for a long time the only way to reach it was to reload, which is the
+         * one thing a user whose access just vanished has no reason to do
+         * (`remote-control-glmt`, §6.5 R20). The host now closes the socket with
+         * this reason the moment the desktop revokes, so the frame is the
+         * earliest and most certain news there is.
+         *
+         * `revokedAgo` stays `null`: the frame carries no revocation time, and
+         * 2b prints the sentence without its "12s ago" clause rather than with
+         * an invented one. A reload afterwards goes through the refusal, which
+         * does carry the time, and fills it in.
+         *
+         * Any access screen already up is replaced rather than merged over,
+         * because a half-typed code on the entry screen is an answer to a
+         * question that has just been overtaken.
+         */
+        access: revoked
+          ? { ...blankAccess(), screen: "revoked", revokedAgo: null }
+          : state.access,
       };
     }
 
@@ -251,6 +291,9 @@ export function reduce(state: AppState, action: AppAction): AppState {
 
     case "replay/set":
       return { ...state, replay: action.replay };
+
+    case "latency/set":
+      return { ...state, latencyMs: action.latencyMs };
 
     case "access/required":
       return {
@@ -754,8 +797,11 @@ export function reduce(state: AppState, action: AppAction): AppState {
     }
 
     case "dialog/toggle": {
+      /** Only a dialog the host gave a toggle has one to flip — the same shape
+       * `dialog/advance` uses for the gate. Flipping a draft nothing renders
+       * would hide the branch field of a form that has no run-from-base. */
       const dialog = state.dialog;
-      if (dialog === null) {
+      if (dialog === null || dialog.toggle === null) {
         return state;
       }
       return {

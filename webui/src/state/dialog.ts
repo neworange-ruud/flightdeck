@@ -72,6 +72,37 @@ export interface DialogKey {
   /** `y`, `1`, `i`, `Enter`, `Tab`, `Esc` — the desktop's own accelerator. */
   readonly key: string;
   readonly label: string;
+  /** Whether this button **dismisses** the dialog rather than deciding it
+   * (`protocol::DialogKey::cancels`, §6.5 R19). The host's word, because the
+   * dialogs do not agree on a cancel key — `n` in the close confirmations, `c`
+   * in the push confirmation, `Esc` in the forms — and reading the labels to
+   * find out would be the browser authoring a fact the host never sent. */
+  readonly cancels: boolean;
+}
+
+/**
+ * Artboard 1e's `Tab` toggle, in **both** of its wordings
+ * (`protocol::DialogToggle`, §6.5 R19).
+ *
+ * The toggle is a local draft (see above), so it moves here before the host
+ * hears about it; the host's own `run_on_base` does not flip until the confirm
+ * lands. Sending only the wording that matches the host's flag is what put
+ * `Run from base: off` on a button the user had just switched on. So the host
+ * sends both pairs and the browser draws the one its draft is in — host-worded,
+ * browser-chosen, with R7/ll5.12's "the browser authors nothing" intact and R8's
+ * local draft untouched.
+ */
+export interface DialogToggle {
+  /** The button that flips it, read off the wire rather than spelled here. */
+  readonly key: string;
+  /** Whether the **host's** copy has it on. Where the draft opens, and what a
+   * confirm's `toggle` flip is measured against — the host answers a confirm by
+   * synthesising a `Tab` press, which flips rather than sets. */
+  readonly on: boolean;
+  readonly titleOff: string;
+  readonly labelOff: string;
+  readonly titleOn: string;
+  readonly labelOn: string;
 }
 
 /**
@@ -191,19 +222,63 @@ export function primaryKey(dialog: DialogState): DialogKey | null {
   return dialog.buttons[0] ?? null;
 }
 
-/** Whether the dialog offers a `Tab` option at all (only 1e's form does). */
+/** Whether the dialog offers a `Tab` option at all (only 1e's form does). The
+ * host's `toggle` block is the answer: a dialog it did not describe has none. */
 export function hasToggle(dialog: DialogState): boolean {
-  return dialog.buttons.some((button) => button.key === "Tab");
+  return dialog.toggle !== null;
 }
 
 /**
- * The keyed buttons a click or a keypress may fire, in display order —
- * everything except `Esc`, which is the cancel frame's job rather than a
- * confirm's, and `Tab`, which toggles rather than decides.
+ * The **title** for the state the local draft is in (§6.5 R19).
+ *
+ * `dialog.title` is the host's wording for the state the *host* is in, which is
+ * the right answer for every dialog without a toggle and the wrong one for 1e
+ * the moment the draft moves. Both wordings arrive together, so this picks;
+ * nothing here composes a sentence.
+ */
+export function dialogTitle(dialog: DialogState): string {
+  if (dialog.toggle === null) {
+    return dialog.title;
+  }
+  return dialog.draft.toggled ? dialog.toggle.titleOn : dialog.toggle.titleOff;
+}
+
+/** The toggling button as the local draft has it: the host's own label for the
+ * state the draft is in, on the key the host named. */
+export function toggleButton(dialog: DialogState): DialogKey | null {
+  const toggle = dialog.toggle;
+  if (toggle === null) {
+    return null;
+  }
+  return {
+    key: toggle.key,
+    label: dialog.draft.toggled ? toggle.labelOn : toggle.labelOff,
+    cancels: false,
+  };
+}
+
+/** The button the host marked as this dialog's cancel (`n`, `c`, `Esc`), or
+ * `null` when it showed none. */
+export function cancelButton(dialog: DialogState): DialogKey | null {
+  return dialog.buttons.find((button) => button.cancels) ?? null;
+}
+
+/**
+ * The keyed buttons a click or a keypress may *decide* with, in display order —
+ * everything except the toggle, which flips rather than decides, and the cancel,
+ * which is `dialog_cancel`'s job rather than a confirm's.
+ *
+ * Dropping the cancel here is what leaves 1g's step 1 with the two buttons the
+ * artboard draws instead of three, two of which cancelled (§6.5 R19). `Esc` is
+ * still excluded by name as well: the host refuses a confirm carrying it, so a
+ * host that named no cancel at all must not turn its `Esc` button into one.
  */
 export function decidingKeys(dialog: DialogState): readonly DialogKey[] {
   return dialog.buttons.filter(
-    (button) => button.key !== "Esc" && button.key !== "Tab",
+    (button) =>
+      !button.cancels &&
+      button.key !== "Esc" &&
+      button.key !== dialog.toggle?.key,
   );
 }
 
@@ -231,7 +306,12 @@ export function confirmArgs(
   if (choice !== null && choice !== primaryKey(dialog)?.key) {
     args["choice"] = choice;
   }
-  if (dialog.draft.toggled) {
+  /** The host answers this by synthesising a `Tab` **press**, which flips its
+   * own `run_on_base` rather than setting it — so it is sent when the draft has
+   * moved away from the state the host is in, and not merely when the draft is
+   * on. A browser attaching to a dialog the desktop had already toggled starts
+   * its draft on `toggle.on` and sends nothing. */
+  if (dialog.toggle !== null && dialog.draft.toggled !== dialog.toggle.on) {
     args["toggle"] = true;
   }
   if (dialog.list.length > 0) {

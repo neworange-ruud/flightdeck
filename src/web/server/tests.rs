@@ -27,6 +27,13 @@ fn viewer(id: &str) -> ViewerId {
     ViewerId::new(id)
 }
 
+/// A credential id for an identity that is not the subject of the test. Fresh
+/// each call, so nothing here can accidentally depend on two viewers sharing
+/// one.
+fn token() -> TokenId {
+    TokenId::generate()
+}
+
 /// A registry with `count` viewers registered (all observers, as `register`
 /// leaves them), plus the channel receivers so nothing is dropped mid-test.
 #[allow(clippy::type_complexity)]
@@ -40,6 +47,7 @@ fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>)
             ViewerIdentity {
                 address: IpAddr::V4(Ipv4Addr::new(192, 168, 2, 20 + index as u8)),
                 user_agent_label: Some("Chrome on macOS".to_string()),
+                token: token(),
             },
             2_000 + index as i64,
             tx,
@@ -439,6 +447,7 @@ fn a_viewer_that_cannot_keep_up_is_dropped_from_the_registry() {
         ViewerIdentity {
             address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             user_agent_label: None,
+            token: token(),
         },
         0,
         tx,
@@ -618,7 +627,7 @@ fn the_chip_label_is_the_observed_address_plus_a_coarse_user_agent() {
             .parse()
             .expect("header parses"),
     );
-    let identity = viewer_identity(peer("192.168.2.20", 51_000), &headers);
+    let identity = viewer_identity(peer("192.168.2.20", 51_000), &headers, token());
     assert_eq!(identity.label(), "192.168.2.20 · Chrome on macOS");
     // The same two facts, still separable, because the chip's label is derived
     // from them rather than the other way round (artboard 2f).
@@ -629,7 +638,7 @@ fn the_chip_label_is_the_observed_address_plus_a_coarse_user_agent() {
     );
 
     // No user agent: the address alone, never a guess.
-    let bare = viewer_identity(peer("127.0.0.1", 51_000), &HeaderMap::new());
+    let bare = viewer_identity(peer("127.0.0.1", 51_000), &HeaderMap::new(), token());
     assert_eq!(bare.label(), "127.0.0.1");
     assert_eq!(bare.user_agent_label, None, "unknown stays unknown");
 }
@@ -641,7 +650,7 @@ fn an_unrecognised_user_agent_adds_nothing_rather_than_guessing() {
         header::USER_AGENT,
         "curl/8.7.1".parse().expect("header parses"),
     );
-    let identity = viewer_identity(peer("10.0.0.4", 1), &headers);
+    let identity = viewer_identity(peer("10.0.0.4", 1), &headers, token());
     assert_eq!(identity.label(), "10.0.0.4");
     assert_eq!(identity.user_agent_label, None);
 }
@@ -654,11 +663,15 @@ fn a_client_claim_replaces_the_browser_fact_and_never_the_address() {
         header::USER_AGENT,
         "curl/8.7.1".parse().expect("header parses"),
     );
-    let observed = viewer_identity(peer("10.0.0.4", 1), &headers);
+    let observed = viewer_identity(peer("10.0.0.4", 1), &headers, token());
 
     // A claim that is really an address, separator and all — the exact payload
     // that would fool a browser-side split of the merged label.
     let refined = observed.with_claim(Some("9.9.9.9 · Chrome on macOS"));
+    assert_eq!(
+        refined.token, observed.token,
+        "and it may never refine which credential it holds either"
+    );
     assert_eq!(
         refined.address.to_string(),
         "10.0.0.4",
@@ -673,7 +686,8 @@ fn a_client_claim_replaces_the_browser_fact_and_never_the_address() {
     // A claim made of nothing but control bytes sanitises to empty, and an
     // empty claim must not erase a fact we already had. (`curl/8.7.1` gave us
     // nothing to keep, so `None` here is the header's answer surviving intact.)
-    let kept = viewer_identity(peer("10.0.0.4", 1), &headers).with_claim(Some("\u{1b}\u{7}\n"));
+    let kept =
+        viewer_identity(peer("10.0.0.4", 1), &headers, token()).with_claim(Some("\u{1b}\u{7}\n"));
     assert_eq!(kept.user_agent_label, None);
     assert_eq!(kept.address.to_string(), "10.0.0.4");
 
@@ -686,7 +700,8 @@ fn a_client_claim_replaces_the_browser_fact_and_never_the_address() {
             .parse()
             .expect("header parses"),
     );
-    let survivor = viewer_identity(peer("10.0.0.4", 1), &chrome).with_claim(Some("\u{1b}\u{7}"));
+    let survivor =
+        viewer_identity(peer("10.0.0.4", 1), &chrome, token()).with_claim(Some("\u{1b}\u{7}"));
     assert_eq!(
         survivor.user_agent_label.as_deref(),
         Some("Chrome on macOS"),
@@ -800,6 +815,9 @@ fn test_shared() -> Arc<Shared> {
     };
     let (state_tx, state_rx) = watch::channel(Arc::new(state));
     let (_shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownNotice>>(None);
+    // Nothing bumps this in a unit test; the eviction path is driven end to end
+    // in `tests/web_server.rs`, where there is a socket to evict.
+    let (_revocations_tx, revocations_rx) = watch::channel::<u64>(0);
     // The shutdown sender is dropped, which every reader treats as
     // "server_stopped" — harmless here, since nothing awaits it.
     Arc::new(Shared {
@@ -812,6 +830,7 @@ fn test_shared() -> Arc<Shared> {
         input_lock: InputArbiter::shared(),
         announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
+        revocations: revocations_rx,
         drain: Arc::new(Drain::default()),
     })
 }
@@ -825,6 +844,7 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
         ViewerIdentity {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             user_agent_label: None,
+            token: token(),
         },
         1_700_000_000_000,
         tx,

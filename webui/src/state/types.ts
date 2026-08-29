@@ -28,6 +28,7 @@ import type {
   DialogDraft,
   DialogKey,
   DialogOrigin,
+  DialogToggle,
 } from "./dialog";
 
 /**
@@ -449,6 +450,9 @@ export interface DialogState {
    * dialog's buttons (`remote-control-ll5.4`, §6.5 R13). `null` — the common
    * case — means every button is one press away. */
   readonly gate: ConfirmGate | null;
+  /** Artboard 1e's `Tab` toggle, with the host's words for **both** of its
+   * states (§6.5 R19). `null` on every dialog that has no toggle. */
+  readonly toggle: DialogToggle | null;
   readonly draft: DialogDraft;
   readonly pending: readonly PendingDialogAnswer[];
   readonly lastOutcome: DialogOutcome | null;
@@ -582,6 +586,17 @@ export type AppAction =
   | { readonly type: "staleness/set"; readonly staleness: Staleness | null }
   /** 2d's catching-up bar. `null` clears it (the replay landed). */
   | { readonly type: "replay/set"; readonly replay: ReplayProgress | null }
+  /**
+   * 2c's `● connected 18ms`, from the transport's own round-trip measurement.
+   *
+   * It is an action rather than a field on the snapshot because **the host
+   * does not know this number**. Latency is a property of the link as seen
+   * from this browser, and the only honest way to have it is to time a request
+   * against its answer on one clock — which is `wire/socket.ts`'s job, not the
+   * adapter's. `null` means "not measured yet", and 2c then renders a bare
+   * `● connected` rather than a zero.
+   */
+  | { readonly type: "latency/set"; readonly latencyMs: number | null }
 
   /* --- Access (2b) ------------------------------------------------------- */
 

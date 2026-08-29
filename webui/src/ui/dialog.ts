@@ -1,13 +1,16 @@
 import {
   atNameStep,
   branchFieldVisible,
+  cancelButton,
   decidingKeys,
   dialogOriginLabel,
   dialogStatus,
+  dialogTitle,
   gateSatisfied,
   gatedKey,
   hasToggle,
   selectedChoice,
+  toggleButton,
 } from "../state/dialog";
 import type { DialogKey } from "../state/dialog";
 import type { AppState, DialogState } from "../state/types";
@@ -48,6 +51,15 @@ import type { Region } from "./dom";
  * `data-toggled` on the panel — one panel, not two components, because it is
  * one dialog in two states and the artboard draws them side by side only to
  * show both at once.
+ *
+ * **The title and that button's label move with the draft** (§6.5 R19). The
+ * toggle stays a local draft — R8's reason for it is that a coalesced resync
+ * mid-typing must not empty the branch field, and that is untouched — so the
+ * host sends the words for *both* states and `dialogTitle` / `toggleButton`
+ * pick the pair the draft is in. Before that the panel could badge itself
+ * `no worktree` while its own button read `Run from base: off`, because the
+ * button's words were the host's `run_on_base`, which does not flip until the
+ * confirm lands.
  *
  * ## Artboard 1g's two steps are the same panel again
  *
@@ -136,7 +148,10 @@ export function createDialog(
       dialog.gate === null ? "" : String(dialog.draft.step),
     );
 
-    titleEl.textContent = dialog.title;
+    /** The host's wording for the state the **draft** is in, not the state the
+     * host is in — see the header. A dialog with no toggle has one title and
+     * this is it. */
+    titleEl.textContent = dialogTitle(dialog);
     /** 1e's right-hand header reads `no worktree` when run-from-base is on;
      * every other dialog gets the keys it is waiting for. */
     kindEl.textContent = dialog.draft.toggled
@@ -300,45 +315,60 @@ export function createDialog(
       const label = gated?.label ?? "Confirm";
       actionsEl.append(
         action(
-          "primary",
-          { key: "Enter", label },
+          "danger",
+          { key: "Enter", label, cancels: false },
           dialog.confirmable && gateSatisfied(dialog),
           () => options.onConfirm?.(dialog.gate?.key ?? "Enter"),
         ),
       );
-      actionsEl.append(cancelAction());
+      actionsEl.append(cancelAction(dialog));
       return;
     }
     for (const button of decidingKeys(dialog)) {
       /** The gated button does not decide anything at step 1: it opens step 2,
-       * locally, and the host hears nothing until a name is typed. */
+       * locally, and the host hears nothing until a name is typed. It is also
+       * the one the host has marked destructive, so it wears 2g's alert hue
+       * rather than the accent every other verb wears — 1g draws the red button
+       * and the cancel beside it, and they must not look alike. */
       const gated = gatedKey(dialog, button.key);
       actionsEl.append(
-        action("primary", button, dialog.confirmable, () =>
+        action(gated ? "danger" : "primary", button, dialog.confirmable, () =>
           gated ? onAdvance?.() : options.onConfirm?.(button.key),
         ),
       );
     }
-    if (hasToggle(dialog)) {
-      const toggle = dialog.buttons.find((b) => b.key === "Tab");
-      if (toggle !== undefined) {
-        const row = action("secondary", toggle, true, () => onToggle?.());
-        row.setAttribute("data-on", String(dialog.draft.toggled));
-        actionsEl.append(row);
-      }
+    const toggle = toggleButton(dialog);
+    if (toggle !== null) {
+      const row = action("secondary", toggle, true, () => onToggle?.());
+      row.setAttribute("data-on", String(dialog.draft.toggled));
+      actionsEl.append(row);
     }
-    actionsEl.append(cancelAction());
+    actionsEl.append(cancelAction(dialog));
   }
 
-  /** `Esc Cancel` is added by this component rather than read off the host's
-   * buttons: not every dialog lists one (the y/n confirmations use `n`), and
-   * D13 gives every dialog a cancel from either surface. **Always enabled, at
-   * both of 1g's steps** — dismissing a confirmation cannot destroy anything,
-   * and a shared dialog a remote surface can see but not dismiss would be worse
-   * than not sharing it (R8). */
-  function cancelAction(): HTMLElement {
-    return action("tertiary", { key: "Esc", label: "Cancel" }, true, () =>
-      options.onCancel?.(),
+  /**
+   * The one cancel, on the one key that cancels every dialog on both surfaces.
+   *
+   * It is drawn by this component rather than taken from the host's button row
+   * because it is a different *frame*: `dialog_cancel`, which is never gated and
+   * never refused, where the host's `n` would travel as a `dialog_confirm` — the
+   * frame artboard 1g's gate stands in front of. Rendering both put three
+   * buttons on 1g's step 1, two of which cancelled, so `decidingKeys` now drops
+   * the button the host marked `cancels` and this is what remains (§6.5 R19).
+   *
+   * The **word** is still the host's: `Cancel` is read off that button, and the
+   * literal is only the fallback for a dialog the host gave no cancel at all.
+   * **Always enabled, at both of 1g's steps** — dismissing a confirmation
+   * cannot destroy anything, and a shared dialog a remote surface can see but
+   * not dismiss would be worse than not sharing it (R8).
+   */
+  function cancelAction(dialog: DialogState): HTMLElement {
+    const label = cancelButton(dialog)?.label ?? "Cancel";
+    return action(
+      "tertiary",
+      { key: "Esc", label, cancels: true },
+      true,
+      () => options.onCancel?.(),
     );
   }
 

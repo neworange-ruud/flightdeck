@@ -164,6 +164,17 @@ mod tests;
 /// not a wrong one. That is rule 4, and it is why the bump is attributed to
 /// the frame kind alone.
 ///
+/// **R19 is v3 as well, deliberately.** `remote-control-pz1j` added
+/// [`DialogBody::toggle`] and [`DialogKey::cancels`] — an additive
+/// `#[serde(default)]` field apiece, inside the free-form `body` slot v1 chose
+/// precisely so M2 could grow dialog bodies without a bump. No frame kind
+/// appeared and no closed vocabulary grew a member, so the `GitStatus` test
+/// ("a peer that drops this is silent where an answer was expected") does not
+/// apply: a host that sends neither leaves a browser rendering the host's own
+/// button label and its own `Esc Cancel`, which is exactly what it rendered
+/// before — a lesser panel, not a wrong one. That is rule 4, the same reading
+/// `Delta::Seats`'s `you_were_preempted` got.
+///
 /// It is deliberately the whole range — there is no older web protocol to
 /// interoperate with, because the browser SPA ships inside the same binary as
 /// the server (D9), and a stale tab is answered with "reload to update" rather
@@ -1150,6 +1161,53 @@ pub struct DialogBody {
     /// every button this dialog shows is one press away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_gate: Option<ConfirmGate>,
+    /// Artboard 1e's `Tab` toggle, when this dialog has one
+    /// (`specs/WEB_INTERFACE.md` §6.5 R19). Absent — every dialog but the
+    /// new-agent form — means there is nothing to flip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggle: Option<DialogToggle>,
+}
+
+/// Artboard 1e's `Tab` toggle, **in both of its wordings** at once
+/// (`specs/WEB_INTERFACE.md` §6.5 R19).
+///
+/// # Why both, rather than the one that is true now
+///
+/// R8 keeps 1e's typed branch, radio position and `Tab` toggle as a *local
+/// draft* in the browser, so a coalesced resync mid-typing cannot empty the
+/// field. The toggle therefore moves in the browser before the host hears
+/// anything — the host's own `run_on_base` does not flip until the confirm
+/// lands. Sending only the wording that matches the host's flag means a browser
+/// in the toggled state renders `Run from base: off` on the very button it just
+/// switched on, beside a panel that has already hidden the branch field.
+///
+/// The seam is fixed by moving the *choice* to the browser and leaving the
+/// *words* with the host, which is R7/ll5.12's rule intact: every string here is
+/// written by [`prompt_dialog`](crate::prompt_dialog) exactly as the desktop
+/// writes it, and the browser only picks which pair to draw. It picks by its own
+/// draft, so the panel and its button can never disagree — and because both
+/// pairs travel unconditionally, the browser never has to reason about [`on`]
+/// to word anything.
+///
+/// [`on`]: DialogToggle::on
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogToggle {
+    /// The [`DialogKey::key`] that flips it (`Tab`), so the browser reads the
+    /// toggling button off the wire rather than hard-coding a spelling.
+    pub key: String,
+    /// Whether the **host's** copy has it on right now. The browser opens its
+    /// draft here — and sends `toggle` on the confirm only when its draft has
+    /// since moved away from it, because the host answers a confirm by
+    /// synthesising a `Tab` *press*, which flips rather than sets.
+    pub on: bool,
+    /// [`DialogView::title`] as the host words it with the toggle **off**.
+    pub title_off: String,
+    /// The toggling button's own label with the toggle **off**.
+    pub label_off: String,
+    /// [`DialogView::title`] as the host words it with the toggle **on**.
+    pub title_on: String,
+    /// The toggling button's own label with the toggle **on**.
+    pub label_on: String,
 }
 
 /// Artboard 1g's **step 2**: the typed-name gate a remote surface must pass
@@ -1197,6 +1255,18 @@ pub struct DialogKey {
     pub key: String,
     /// Rendered verbatim.
     pub label: String,
+    /// Whether pressing this button **dismisses** the dialog rather than
+    /// deciding it (`specs/WEB_INTERFACE.md` §6.5 R19).
+    ///
+    /// The dialogs do not agree on a cancel key — `n` in the close
+    /// confirmations, `c` in the push confirmation, `Esc` in the forms — so a
+    /// browser that wanted to know which button cancels would have to read the
+    /// labels, i.e. author a fact the host never sent. It is stated here
+    /// instead, from the same rule `dialog_decision` in `src/lib.rs` already
+    /// uses to classify the keypress. A browser answers a cancelling button
+    /// with [`command::DIALOG_CANCEL`], which is never gated and never refused.
+    #[serde(default)]
+    pub cancels: bool,
 }
 
 // ===========================================================================
@@ -1311,8 +1381,24 @@ pub struct Snapshot {
     /// The host's FlightDeck version string, so the reload prompt can name what
     /// changed and stay distinguishable from the update-available chip.
     pub host_version: String,
-    /// Host wall-clock (unix ms) the snapshot was taken, for the latency readout
-    /// and for the frozen-clock badge on a stale terminal.
+    /// Host wall-clock (unix ms) the snapshot was taken: **the clock every other
+    /// host instant in this frame is dated against.**
+    ///
+    /// [`SeatInfo::since_ms`] and [`ActivityEvent::at_ms`] are host instants, and
+    /// the browser renders both as durations. It computes them against *this*
+    /// number rather than against its own clock, which is what makes
+    /// `connected 14 minutes` and `40s ago` right on a machine whose clock is
+    /// minutes out. [`Delta::Seats`] carries the field for the same reason.
+    ///
+    /// It is deliberately **not** what the browser's latency readout or its
+    /// stale-terminal clock are built from, despite an earlier note here saying
+    /// so (`remote-control-74q0`). Both of those are gaps rather than instants,
+    /// and both are measurable at one end: latency is `Attach`→`Snapshot` timed
+    /// on the browser's clock alone, and staleness is the gap between the last
+    /// [`TermBytes`] that arrived and now — also on the browser's clock alone.
+    /// Subtracting this field from the browser's `Date.now()` would have given
+    /// both of them a number that is wrong by the clock skew, silently and with
+    /// no way to tell a slow link from a fast one on a badly-set machine.
     pub server_time_ms: i64,
     /// This viewer's id, to be presented back in [`Attach::resume_viewer`].
     pub viewer_id: ViewerId,

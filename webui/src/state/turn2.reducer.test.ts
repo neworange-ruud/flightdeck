@@ -194,6 +194,37 @@ describe("Q5 — a host that said goodbye stays gone", () => {
     expect(state.connection).toBe("revoked");
   });
 
+  /** §6.5 R20. The frame has to raise the panel itself. Before the host closed
+   * revoked sockets there was no frame at all, and 2b's revoked panel — drawn
+   * over a live session — could only be reached by reloading the tab. */
+  it("a revoked token raises 2b's revoked panel without a reload", () => {
+    const state = reduce(attached(), {
+      type: "connection/shutdown",
+      shutdown: {
+        reason: "token_revoked",
+        selfInitiated: false,
+        detail: "",
+        atLabel: "16:42",
+      },
+    });
+    expect(state.access?.screen).toBe("revoked");
+    /** The frame carries no revocation time, so the sentence prints without
+     * its "12s ago" clause rather than with an invented one. */
+    expect(state.access?.revokedAgo).toBeNull();
+  });
+
+  /** The failure direction: every other reason is about the *host*, and none of
+   * them is an access problem, so none of them may put an access screen up. */
+  it("no other shutdown reason raises an access screen", () => {
+    for (const reason of ["host_quit", "server_stopped", "restarting", "unknown"] as const) {
+      const state = reduce(attached(), {
+        type: "connection/shutdown",
+        shutdown: { reason, selfInitiated: false, detail: "", atLabel: "16:42" },
+      });
+      expect(state.access, `${reason} is not an access problem`).toBeNull();
+    }
+  });
+
   it("lets a host that really came back come back", () => {
     let state = reduce(attached(), {
       type: "connection/shutdown",
