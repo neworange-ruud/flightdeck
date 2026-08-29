@@ -82,6 +82,9 @@ pub fn default_global_config() -> Config {
 const MODE_COLORS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white"];
 /// Allowed live-pane border levels (SPECS §23).
 const MODE_BORDER_LEVELS: &[&str] = &["off", "dim", "normal", "bright"];
+/// Allowed Agent Tabs sidebar positions (SPECS §8, `specs/WEB_INTERFACE.md`
+/// §6.5 R24). The same two words the configuration manager cycles.
+const AGENT_TAB_POSITIONS: &[&str] = &["left", "right"];
 
 /// Validate a parsed config, rejecting structurally invalid configs with clear
 /// errors (SPECS §8, §26 "Rejects invalid config").
@@ -124,6 +127,17 @@ pub fn validate(config: &Config) -> Result<()> {
         return Err(FlightDeckError::Config(format!(
             "ui.mode_border '{}' is not valid (expected one of {MODE_BORDER_LEVELS:?})",
             config.ui.mode_border
+        )));
+    }
+    // Checked here for the reason its neighbours are, and only since R24 made
+    // it worth checking: until the key moved the sidebar, an unexpected value
+    // and the default drew the same screen, so rejecting one would have been
+    // pedantry. Now `agent_tab_position = "rihgt"` would silently draw `left`,
+    // which is the exact class of quiet-nothing this validation exists for.
+    if !AGENT_TAB_POSITIONS.contains(&config.ui.agent_tab_position.as_str()) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.agent_tab_position '{}' is not valid (expected one of {AGENT_TAB_POSITIONS:?})",
+            config.ui.agent_tab_position
         )));
     }
 
@@ -323,6 +337,17 @@ mod tests {
         cfg.agents.get_mut("claude").unwrap().command = "".to_string();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("claude"));
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_agent_tab_position() {
+        let mut cfg = default_config("proj", "main");
+        assert!(validate(&cfg).is_ok(), "the default is valid");
+        cfg.ui.agent_tab_position = "right".to_string();
+        assert!(validate(&cfg).is_ok(), "1h position 4's other value");
+        cfg.ui.agent_tab_position = "rihgt".to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("ui.agent_tab_position"));
     }
 
     // --- [containers] validation (SPECS §31) ---

@@ -37,6 +37,39 @@ import type {
  * actions replace these placeholders.
  */
 export function reduce(state: AppState, action: AppAction): AppState {
+  return clampSplitFocus(reduceAction(state, action));
+}
+
+/**
+ * `remote-control-zbwx`, §6.5 R24: `splitFocus` is an index into the *selected
+ * session's* terminals, so any action that moves the selection or replaces the
+ * project list can leave it pointing past the last column — and then 1c's glow
+ * is on no column at all, because `ui/splitView.ts` sets `data-focused` by
+ * comparing each index against it.
+ *
+ * Applied here, once, rather than in each `selection/*` case: the reachable
+ * paths are a sidebar click, a feed row's jump, a project switch and a
+ * host-driven selection (which lands as a whole `snapshot/received` — see
+ * `wire/socket.ts`'s `selection` delta), and a fix per case is a fix that the
+ * next case added will not have. `moveSplitFocus` in `ui/app.ts` clamps as well
+ * and stays as it is: it clamps *before stepping*, which is a different job.
+ *
+ * Identity when nothing moved, so this costs an unrelated action no re-render.
+ */
+function clampSplitFocus(state: AppState): AppState {
+  const selection = state.selection;
+  const session =
+    selection === null
+      ? null
+      : findSession(state.projects, selection.projectId, selection.sessionId);
+  const columns = session?.terminals.length ?? 0;
+  /** No session, or a session with no terminals yet: column 0 is where the
+   * first one will be, which is also the initial state's value. */
+  const clamped = columns === 0 ? 0 : Math.min(state.splitFocus, columns - 1);
+  return clamped === state.splitFocus ? state : { ...state, splitFocus: clamped };
+}
+
+function reduceAction(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "connection/changed": {
       /**
@@ -161,6 +194,14 @@ export function reduce(state: AppState, action: AppAction): AppState {
          */
         help: snapshot.help,
         about: snapshot.about,
+        /**
+         * 1h position 4 (`remote-control-ecsv`, §6.5 R24): `[ui]
+         * agent_tab_position` is the host's setting, so it arrives with every
+         * other host fact and is replaced wholesale like them. The browser
+         * never keeps a preference of its own here — the desktop and this tab
+         * mirror on the same word out of the same file.
+         */
+        sidebarPosition: snapshot.sidebarPosition,
         /** A dated seat list completes an arriving takeover panel — see
          * `refreshArrivingIncumbent`. */
         takeover: refreshArrivingIncumbent(state.takeover, snapshot.seats),

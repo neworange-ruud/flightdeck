@@ -260,9 +260,30 @@ impl Default for GitConfig {
     }
 }
 
+/// Which end of the body row the Agent Tabs sidebar occupies
+/// (`[ui] agent_tab_position`, SPECS §8; artboard 1h position 4).
+///
+/// A domain type rather than a renderer's private enum because *both* surfaces
+/// branch on it — the TUI's `layout::compute` and the browser, which is handed
+/// this value on [`crate::web::protocol::Snapshot`]. One parse, in one place, is
+/// what keeps the desktop and the browser from disagreeing about a setting the
+/// user set once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTabPosition {
+    /// The default: the sidebar is the first column of the body row.
+    #[default]
+    Left,
+    /// The sidebar is the last column; the terminal takes the other end.
+    Right,
+}
+
 /// `[ui]` config section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Which end of the body row the Agent Tabs sidebar takes: `left` (the
+    /// default) or `right`. Read through [`UiConfig::agent_tab_side`] — the
+    /// string itself is the on-disk spelling and nothing branches on it.
     pub agent_tab_position: String,
     pub default_agent: String,
     /// Use F2 instead of the platform-default modified-Esc shortcut to leave
@@ -320,6 +341,23 @@ impl Default for UiConfig {
             app_mode_color: default_app_mode_color(),
             mode_border: default_mode_border(),
             dim_terminal_in_app_mode: true,
+        }
+    }
+}
+
+impl UiConfig {
+    /// Read [`UiConfig::agent_tab_position`].
+    ///
+    /// Anything other than `right` is [`AgentTabPosition::Left`]: config
+    /// validation rejects unexpected values at load, so that arm is only ever
+    /// reached by the default itself. Same shape as
+    /// `crate::tui::mode_style::border_enabled`, and for the same reason — the
+    /// validated string becomes the value renderers branch on in exactly one
+    /// function.
+    pub fn agent_tab_side(&self) -> AgentTabPosition {
+        match self.agent_tab_position.as_str() {
+            "right" => AgentTabPosition::Right,
+            _ => AgentTabPosition::Left,
         }
     }
 }

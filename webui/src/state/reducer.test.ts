@@ -20,6 +20,9 @@ describe("createInitialState", () => {
        * reach a PTY it has not heard about yet. */
       mode: "app",
       layout: "single",
+      /** The host owns it, and nothing has been heard from the host yet, so
+       * this is the setting's own default (§6.5 R24). */
+      sidebarPosition: "left",
       splitFocus: 0,
       viewers: 0,
       latencyMs: null,
@@ -166,7 +169,7 @@ describe("reduce — the main screen", () => {
       reduce(measured, { type: "snapshot/received", snapshot: fixtureSnapshot() })
         .latencyMs,
     ).toBe(18);
-    expect(state.update).toEqual({ version: "v1.16.0" });
+    expect(state.update).toEqual({ version: "1.16.0" });
   });
 
   it("selection/session moves the instance-wide selection (D3)", () => {

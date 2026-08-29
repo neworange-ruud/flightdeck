@@ -936,6 +936,22 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
    */
   function onConfiguration(frame: WireConfiguration): void {
     store.dispatch({ type: "config/received", doc: configDocOf(frame) });
+    /**
+     * §6.5 R24. A save that lands changes the host's effective config, and one
+     * of those settings — `[ui] agent_tab_position` — is a fact this browser
+     * *lays out from* (`Snapshot::sidebar_position`). Without this, saving
+     * `right` from 1f would move the desktop's sidebar and leave the browser's
+     * where it was until the tab was reloaded, which is the defect R24 exists
+     * to remove wearing different clothes.
+     *
+     * `requestSnapshotSoon` rather than a new delta or a bumped frame: it is
+     * the same coalesced fallback every unhandled delta already takes, and the
+     * host's own answer for a browser that believes it has drifted. It is sent
+     * for a plain read too, because the frame carries nothing that separates a
+     * read from a save — one coalesced round trip on a panel a human just
+     * opened is the cheaper of the two mistakes.
+     */
+    requestSnapshotSoon();
   }
 
   function onShutdown(frame: WireShutdown): void {

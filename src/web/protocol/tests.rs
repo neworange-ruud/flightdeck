@@ -204,6 +204,14 @@ fn snapshot() -> Snapshot {
         // actually vary (`remote-control-ll5.8`, §6.5 R16).
         help: Some(crate::tui::help::help_doc(true, true)),
         about: Some(crate::tui::help::about_doc()),
+        // Present, so the round trip carries SPECS §30's notice rather than
+        // only its absence (`remote-control-gk94`, §6.5 R25).
+        update: Some(UpdateNotice {
+            latest_version: "1.16.0".into(),
+        }),
+        // The non-default setting, so the round trip carries 1h position 4
+        // rather than only its default (`remote-control-ecsv`, §6.5 R24).
+        sidebar_position: crate::contracts::AgentTabPosition::Right,
     }
 }
 
@@ -701,6 +709,30 @@ fn help_and_about_are_additive_and_absent_parses_as_absent() {
     // for anything but its own panel.
     assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
     assert_eq!(parsed.projects.len(), snapshot().projects.len());
+}
+
+/// `[ui] agent_tab_position` on the snapshot is additive too, which is why R24
+/// is **not** a [`PROTOCOL_VERSION`] bump.
+///
+/// A host that does not send it is a host that has said nothing about the
+/// setting, and `left` — the default the setting itself has — is what the
+/// browser then lays out. Rule 4 again: a lesser answer, not a wrong one.
+#[test]
+fn sidebar_position_is_additive_and_absent_parses_as_left() {
+    let mut value = serde_json::to_value(snapshot()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    assert_eq!(
+        obj.get("sidebar_position").and_then(|v| v.as_str()),
+        Some("right"),
+        "the wire spells the setting the way the config file does"
+    );
+    obj.remove("sidebar_position");
+
+    let parsed: Snapshot = serde_json::from_value(value).expect("still parses");
+    assert_eq!(
+        parsed.sidebar_position,
+        crate::contracts::AgentTabPosition::Left
+    );
 }
 
 #[test]

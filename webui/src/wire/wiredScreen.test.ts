@@ -24,6 +24,8 @@
  *   3. **Latency (2c).** One round trip, `Attach` → `Snapshot`, timed on one
  *      clock at one end.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../ui/app";
 import type { App } from "../ui/app";
@@ -61,6 +63,12 @@ function snapshotFrame(over: {
   readonly byteLen: number;
   readonly replayFrom: number;
   readonly git?: Record<string, unknown>;
+  /** SPECS §30's notice. Omitted is the host having none, which is what every
+   * other case in this file sends. */
+  readonly update?: { readonly latest_version: string };
+  /** `[ui] agent_tab_position`. Omitted is a host that does not send it, which
+   * is every other case in this file. */
+  readonly sidebarPosition?: "left" | "right";
 }): string {
   return JSON.stringify({
     type: "snapshot",
@@ -137,6 +145,8 @@ function snapshotFrame(over: {
     geometry: { cols: 120, rows: 34 },
     replay_capacity_bytes: 262_144,
     activity: [],
+    update: over.update,
+    sidebar_position: over.sidebarPosition,
   });
 }
 
@@ -544,5 +554,142 @@ describe("R2's ahead/behind, which cannot exist without an upstream", () => {
     expect(h.text(".fd-gitbar")).toContain("↑3 ↓0");
     expect(h.text(".fd-gitbar")).not.toContain("no-upstream");
     expect(h.text(".fd-gitbar")).toContain("+3 ~2 -1 (6 files)");
+  });
+});
+
+/**
+ * `remote-control-gk94` — 1a's `● v1.16.0 available` chip, which could not
+ * appear at all until the host had a way to say so.
+ *
+ * The bug had the shape this whole file exists for: `statusBar.ts` rendered
+ * `state.update`, the reducer set it from `snapshot.update`, and
+ * `wire/adapt.ts` hardcoded `update: null` because `Snapshot` carried no such
+ * field. A unit test that dispatched a snapshot with an `update` on it would
+ * have passed against the broken build — so both cases here deliver a real
+ * frame through the socket instead.
+ */
+describe("SPECS §30's update chip, delivered by the host", () => {
+  it("draws the chip when the host reports a newer release", () => {
+    const h = harness();
+    h.deliver(
+      snapshotFrame({
+        byteLen: 8,
+        replayFrom: 0,
+        update: { latest_version: "1.16.0" },
+      }),
+    );
+
+    expect(h.text(".fd-update")).toContain("v1.16.0 available");
+    /** The spacer is what the bar drew for every host before this frame. */
+    expect(document.querySelector(".fd-statusbar__pad")).toBeNull();
+  });
+
+  it("draws the spacer, never an up-to-date claim, when the host sends no notice", () => {
+    const h = harness();
+    h.deliver(snapshotFrame({ byteLen: 8, replayFrom: 0 }));
+
+    /**
+     * An absent `update` covers four different host states — the check is off,
+     * the run is `--isolated`, the build has no updater, or the answer has not
+     * come back — and the bar must not resolve them into a claim about any of
+     * them. Nothing is drawn, which is exactly what the desktop's own status
+     * bar draws.
+     */
+    expect(document.querySelector(".fd-update")).toBeNull();
+    expect(document.querySelector(".fd-statusbar__pad")).not.toBeNull();
+    expect(h.app.store.getState().update).toBeNull();
+  });
+});
+
+/**
+ * `remote-control-ecsv` — artboard 1h position 4, `specs/WEB_INTERFACE.md`
+ * §6.5 R24.
+ *
+ * The same shape as the update chip above, and the reason it belongs in this
+ * file: `ui.agent_tab_position` was declared, validated, round-tripped and
+ * offered as an editable row on both surfaces, and read by nothing. A unit test
+ * that put `sidebarPosition: "right"` into a fixture snapshot would have passed
+ * against every build that ever shipped it, including the ones where the value
+ * never left the config file. So the setting arrives here the way the user's
+ * does: as a field on a host frame.
+ */
+describe("1h position 4 — the sidebar mirrors on the host's setting", () => {
+  it("mirrors the body row when the host says right", () => {
+    const h = harness();
+    h.deliver(
+      snapshotFrame({ byteLen: 8, replayFrom: 0, sidebarPosition: "right" }),
+    );
+
+    expect(h.el(".fd-frame").getAttribute("data-sidebar-side")).toBe("right");
+    expect(h.app.store.getState().sidebarPosition).toBe("right");
+    /**
+     * The three things 1h names as flipping have to have something to flip:
+     * each is a rule keyed off an element that must still be in the DOM under
+     * the mirrored frame. jsdom computes no boxes, so this is the honest half
+     * of the assertion — `webui/e2e` is where a real engine reads the pixels.
+     */
+    expect(h.el(".fd-body")).toBeTruthy();
+    expect(h.el('.fd-session[data-selected="true"]')).toBeTruthy();
+    expect(h.el(".fd-session__close")).toBeTruthy();
+  });
+
+  it("lays the sidebar out on the left for a host that says nothing", () => {
+    const h = harness();
+    h.deliver(snapshotFrame({ byteLen: 8, replayFrom: 0 }));
+
+    /** Rule 4 of the forward-compatibility policy: an absent field is the
+     * setting's own default, not a guess and not a blank attribute. */
+    expect(h.el(".fd-frame").getAttribute("data-sidebar-side")).toBe("left");
+    expect(h.app.store.getState().sidebarPosition).toBe("left");
+  });
+
+  it("keeps the mirror out of the sidebar's own markup", () => {
+    /**
+     * The DOM order is sidebar-then-main at both settings: the mirror is
+     * `flex-direction`, so a screen reader hears 1a's order either way and the
+     * tab order is not inverted. Same trade the git-bar fold makes in
+     * `narrow.css`, and the reason `row-reverse` was chosen there too.
+     */
+    const h = harness();
+    h.deliver(
+      snapshotFrame({ byteLen: 8, replayFrom: 0, sidebarPosition: "right" }),
+    );
+
+    const children = Array.from(h.el(".fd-body").children);
+    expect(children[0]?.classList.contains("fd-sidebar")).toBe(true);
+    expect(children[1]?.classList.contains("fd-main")).toBe(true);
+  });
+
+  it("hands the attribute to a stylesheet that reads it", () => {
+    /**
+     * The other half of "reaches the layout", and the half jsdom cannot see: an
+     * attribute no rule keys off would be the same defect one layer along —
+     * a value that is computed, published and then does nothing. So the rules
+     * are asserted where they live.
+     */
+    const css = readFileSync(join(process.cwd(), "src/style/main.css"), "utf8");
+    const mirrored = (declaration: string): boolean =>
+      new RegExp(
+        `\\[data-sidebar-side="right"\\][^{]*\\{[^}]*${declaration}`,
+      ).test(css);
+
+    /** The body row itself. */
+    expect(mirrored("flex-direction: row-reverse")).toBe(true);
+    /** 1h's three: the seam the focus glow hands between the panes, the
+     * selection stripe, and the ✕ column. */
+    expect(mirrored("border-left: 1px solid var\\(--fd-rule\\)")).toBe(true);
+    expect(mirrored("border-right: 1px solid var\\(--fd-rule\\)")).toBe(true);
+    expect(mirrored("box-shadow: inset -2px 0 0 var\\(--fd-focus\\)")).toBe(
+      true,
+    );
+    expect(mirrored("left: 10px")).toBe(true);
+
+    /** R17's slide-over is not one of them: below 900px the sidebar is over
+     * the pane rather than in the row, and 2e already owns the right edge. */
+    const narrow = readFileSync(
+      join(process.cwd(), "src/style/narrow.css"),
+      "utf8",
+    );
+    expect(narrow).not.toContain('[data-sidebar-side="right"]');
   });
 });

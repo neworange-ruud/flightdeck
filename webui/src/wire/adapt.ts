@@ -372,8 +372,21 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
     /** No `latencyMs`: it is not on this wire and never was. This adapter used
      * to hardcode `null` for it, which is why 2c's readout could not appear —
      * `wire/socket.ts` measures the round trip and dispatches `latency/set`. */
-    /** The update chip is the *updater's* business, not the protocol's. */
-    update: null,
+    /**
+     * SPECS §30's notice, host-sent (`remote-control-gk94`, §6.5 R25). This
+     * line used to read `update: null` with a comment claiming the chip was
+     * "the updater's business, not the protocol's" — which is why 1a's chip
+     * could never appear: the updater runs on the host and no frame carried
+     * what it found.
+     *
+     * Absent is the host having no notice, never "up to date", so it maps to
+     * `null` and the bar draws its spacer — the same nothing the desktop's
+     * status bar draws.
+     */
+    update:
+      wire.update === undefined || wire.update === null
+        ? null
+        : { version: wire.update.latest_version },
     seats: wire.seats.map((s) => seatOf(s, wire.server_time_ms)),
     seat: wire.seat as Seat,
     activity: wire.activity.map((e) => activityOf(e, wire.server_time_ms)),
@@ -396,6 +409,13 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
      */
     help: helpOf(wire.help),
     about: aboutOf(wire.about),
+    /**
+     * 1h position 4 (`remote-control-ecsv`, §6.5 R24). `left` for a host that
+     * sends nothing *and* for a host that sends anything else: the desktop's
+     * own reader treats every unexpected value as the default too, so an
+     * unrecognised word cannot make the two surfaces disagree.
+     */
+    sidebarPosition: wire.sidebar_position === "right" ? "right" : "left",
   };
 }
 

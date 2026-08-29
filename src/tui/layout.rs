@@ -10,6 +10,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::modes::InputMode;
+use crate::contracts::AgentTabPosition;
 
 /// Width of the Agent Tabs sidebar in columns (SPECS §20).
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -103,6 +104,10 @@ pub fn chrome_for(area: Rect, mode: InputMode) -> Chrome {
 /// │                      │ status_bar                               │
 /// └──────────────────────┴──────────────────────────────────────────┘
 /// ```
+///
+/// Drawn at [`AgentTabPosition::Left`]. `right` mirrors the body row — the two
+/// columns swap places and nothing else changes, including their widths, which
+/// is why the PTY geometry is the same on both settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainLayout {
     /// Full-width branded header (logo) row at the very top.
@@ -111,7 +116,8 @@ pub struct MainLayout {
     pub project_tabs: Rect,
     /// Full-width divider row between the header and the rest of the app.
     pub divider: Rect,
-    /// Left Agent Tabs sidebar.
+    /// The Agent Tabs sidebar, on whichever end of the body row
+    /// [`AgentTabPosition`] puts it.
     pub sidebar: Rect,
     /// Horizontal child-terminal tab bar (top of the main pane).
     pub child_tabs: Rect,
@@ -135,15 +141,23 @@ pub struct MainLayout {
 /// Compute the main layout from a total `area` (SPECS §20).
 ///
 /// Returns [`MainLayout`] with the four sub-rects. The sidebar is
-/// [`SIDEBAR_WIDTH`] columns wide; the rest fills the right pane. The right
-/// pane is split vertically: one row for the child tab bar, one row for the
-/// status bar, and the remainder for the terminal viewport.
+/// [`SIDEBAR_WIDTH`] columns wide; the rest fills the other pane. That pane is
+/// split vertically: one row for the child tab bar, one row for the status bar,
+/// and the remainder for the terminal viewport.
 ///
 /// `chrome` selects the full layout or the collapsed one (see [`chrome_for`]).
+/// `side` decides which end of the body row the sidebar takes (see
+/// [`crate::contracts::UiConfig::agent_tab_side`]); every other rect is the
+/// same size on both settings.
 ///
 /// If the area is too small (e.g. less than the minimum heights/widths),
 /// sub-rects may be zero-sized — callers must handle this gracefully.
-pub fn compute(area: Rect, chrome: Chrome, reserve_border: bool) -> MainLayout {
+pub fn compute(
+    area: Rect,
+    chrome: Chrome,
+    reserve_border: bool,
+    side: AgentTabPosition,
+) -> MainLayout {
     let collapsed = chrome == Chrome::Collapsed;
     // Hidden bars keep their field on `MainLayout` but shrink to zero, so every
     // caller keeps compiling and `rect_contains` can never match them.
@@ -165,9 +179,20 @@ pub fn compute(area: Rect, chrome: Chrome, reserve_border: bool) -> MainLayout {
     ])
     .areas(area);
 
-    // Split the body horizontally: sidebar | main pane.
-    let [sidebar, main] =
-        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Fill(1)]).areas(body);
+    // Split the body horizontally. The constraint pair is the same either way
+    // — a fixed sidebar and a filling main pane — so `right` really is a mirror
+    // of the row and not a second layout with its own arithmetic.
+    let [sidebar, main] = match side {
+        AgentTabPosition::Left => {
+            Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Fill(1)]).areas(body)
+        }
+        AgentTabPosition::Right => {
+            let [main, sidebar] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(sidebar_w)])
+                    .areas(body);
+            [sidebar, main]
+        }
+    };
 
     // Split main pane vertically: child_tabs | terminal | info_divider
     // | info_bar | status_divider | status_bar.
@@ -307,7 +332,6 @@ pub fn centered_overlay(area: Rect, max_w: u16, max_h: u16) -> Rect {
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +349,7 @@ mod tests {
     #[test]
     fn header_project_tabs_and_divider_span_full_width_at_top() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         // Header is the very first row, full width.
         assert_eq!(layout.header.y, 0);
         assert_eq!(layout.header.x, 0);
@@ -348,7 +372,7 @@ mod tests {
 
     #[test]
     fn sidebar_has_correct_width() {
-        let layout = compute(full_terminal(), Chrome::Full, false);
+        let layout = compute(full_terminal(), Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.sidebar.width, SIDEBAR_WIDTH);
         assert_eq!(layout.sidebar.x, 0);
         assert_eq!(layout.sidebar.y, TOP_BAND);
@@ -357,14 +381,14 @@ mod tests {
     #[test]
     fn sidebar_fills_remaining_height_below_top_band() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
     }
 
     #[test]
     fn main_pane_starts_after_sidebar() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.child_tabs.x, SIDEBAR_WIDTH);
         assert_eq!(layout.terminal.x, SIDEBAR_WIDTH);
         assert_eq!(layout.status_bar.x, SIDEBAR_WIDTH);
@@ -374,7 +398,7 @@ mod tests {
     fn main_pane_fills_remaining_width() {
         let area = full_terminal();
         let expected_main_w = area.width - SIDEBAR_WIDTH;
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.child_tabs.width, expected_main_w);
         assert_eq!(layout.terminal.width, expected_main_w);
         assert_eq!(layout.info_bar.width, expected_main_w);
@@ -384,7 +408,7 @@ mod tests {
     #[test]
     fn info_bar_sits_directly_above_status_bar() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.info_bar.height, INFO_BAR_HEIGHT);
         assert_eq!(layout.info_bar.x, SIDEBAR_WIDTH);
         // A divider row now sits between the info bar and the status bar.
@@ -399,7 +423,7 @@ mod tests {
 
     #[test]
     fn child_tabs_bar_height() {
-        let layout = compute(full_terminal(), Chrome::Full, false);
+        let layout = compute(full_terminal(), Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.child_tabs.height, CHILD_TAB_BAR_HEIGHT);
         // The child tab bar is the first row of the body, below the top band.
         assert_eq!(layout.child_tabs.y, TOP_BAND);
@@ -408,7 +432,7 @@ mod tests {
     #[test]
     fn status_bar_height_and_at_bottom() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert_eq!(layout.status_bar.height, STATUS_BAR_HEIGHT);
         assert_eq!(
             layout.status_bar.y,
@@ -420,7 +444,7 @@ mod tests {
     #[test]
     fn terminal_viewport_fills_remaining() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         // top band (2) + child_tabs (1) + terminal (?) + info_divider (1)
         // + info_bar (1) + status_divider (1) + status (1).
         let expected_h = area.height
@@ -436,7 +460,7 @@ mod tests {
 
     #[test]
     fn rects_do_not_overlap() {
-        let layout = compute(full_terminal(), Chrome::Full, false);
+        let layout = compute(full_terminal(), Chrome::Full, false, AgentTabPosition::Left);
         // Sidebar and main pane must not overlap horizontally.
         assert!(layout.sidebar.right() <= layout.terminal.left());
         // Vertical panes must not overlap within main pane.
@@ -450,7 +474,7 @@ mod tests {
     #[test]
     fn total_area_accounted_for() {
         let area = full_terminal();
-        let layout = compute(area, Chrome::Full, false);
+        let layout = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         // Sidebar spans the full height below the top band.
         assert_eq!(layout.sidebar.height, area.height - TOP_BAND);
         // Width sum: sidebar + main pane columns.
@@ -471,9 +495,24 @@ mod tests {
     #[test]
     fn minimum_area_does_not_panic() {
         // Degenerate area: should produce valid (possibly zero-sized) rects.
-        let _ = compute(Rect::new(0, 0, 0, 0), Chrome::Full, false);
-        let _ = compute(Rect::new(0, 0, 1, 1), Chrome::Full, false);
-        let _ = compute(Rect::new(0, 0, 10, 3), Chrome::Full, false);
+        let _ = compute(
+            Rect::new(0, 0, 0, 0),
+            Chrome::Full,
+            false,
+            AgentTabPosition::Left,
+        );
+        let _ = compute(
+            Rect::new(0, 0, 1, 1),
+            Chrome::Full,
+            false,
+            AgentTabPosition::Left,
+        );
+        let _ = compute(
+            Rect::new(0, 0, 10, 3),
+            Chrome::Full,
+            false,
+            AgentTabPosition::Left,
+        );
     }
 
     #[test]
@@ -502,7 +541,12 @@ mod tests {
 
     #[test]
     fn collapsed_hides_project_row_and_info_bar_and_narrows_the_sidebar() {
-        let l = compute(full_terminal(), Chrome::Collapsed, false);
+        let l = compute(
+            full_terminal(),
+            Chrome::Collapsed,
+            false,
+            AgentTabPosition::Left,
+        );
         assert_eq!(l.project_tabs.height, 0);
         assert_eq!(l.info_divider.height, 0);
         assert_eq!(l.info_bar.height, 0);
@@ -518,8 +562,8 @@ mod tests {
     #[test]
     fn collapsing_grows_the_terminal_by_exactly_the_reclaimed_chrome() {
         let area = full_terminal();
-        let full = compute(area, Chrome::Full, false);
-        let collapsed = compute(area, Chrome::Collapsed, false);
+        let full = compute(area, Chrome::Full, false, AgentTabPosition::Left);
+        let collapsed = compute(area, Chrome::Collapsed, false, AgentTabPosition::Left);
         // Three rows back: project tabs, info divider, info bar.
         assert_eq!(collapsed.terminal.height, full.terminal.height + 3);
         assert_eq!(
@@ -531,7 +575,7 @@ mod tests {
     #[test]
     fn collapsed_rects_do_not_overlap_and_account_for_the_area() {
         let area = full_terminal();
-        let l = compute(area, Chrome::Collapsed, false);
+        let l = compute(area, Chrome::Collapsed, false, AgentTabPosition::Left);
         assert!(l.sidebar.right() <= l.terminal.left());
         assert!(l.child_tabs.bottom() <= l.terminal.top());
         assert!(l.terminal.bottom() <= l.status_divider.top());
@@ -550,9 +594,24 @@ mod tests {
 
     #[test]
     fn collapsed_minimum_area_does_not_panic() {
-        let _ = compute(Rect::new(0, 0, 0, 0), Chrome::Collapsed, false);
-        let _ = compute(Rect::new(0, 0, 1, 1), Chrome::Collapsed, false);
-        let _ = compute(Rect::new(0, 0, 10, 3), Chrome::Collapsed, false);
+        let _ = compute(
+            Rect::new(0, 0, 0, 0),
+            Chrome::Collapsed,
+            false,
+            AgentTabPosition::Left,
+        );
+        let _ = compute(
+            Rect::new(0, 0, 1, 1),
+            Chrome::Collapsed,
+            false,
+            AgentTabPosition::Left,
+        );
+        let _ = compute(
+            Rect::new(0, 0, 10, 3),
+            Chrome::Collapsed,
+            false,
+            AgentTabPosition::Left,
+        );
     }
 
     #[test]
@@ -577,7 +636,7 @@ mod tests {
 
     #[test]
     fn split_region_reclaims_the_tab_bar_row() {
-        let ml = compute(full_terminal(), Chrome::Full, false);
+        let ml = compute(full_terminal(), Chrome::Full, false, AgentTabPosition::Left);
         let region = split_region(&ml);
         // Starts at the tab bar row and spans both it and the terminal viewport.
         assert_eq!(region.x, ml.child_tabs.x);
@@ -642,7 +701,7 @@ mod tests {
     #[test]
     fn compute_without_border_matches_legacy_geometry() {
         let area = Rect::new(0, 0, 120, 40);
-        let ml = compute(area, Chrome::Full, false);
+        let ml = compute(area, Chrome::Full, false, AgentTabPosition::Left);
         assert!(ml.sidebar_frame.is_none());
         assert!(ml.terminal_frame.is_none());
         // Terminal keeps full width (sidebar is SIDEBAR_WIDTH columns).
@@ -652,8 +711,8 @@ mod tests {
     #[test]
     fn compute_with_border_insets_panes_by_one() {
         let area = Rect::new(0, 0, 120, 40);
-        let plain = compute(area, Chrome::Full, false);
-        let framed = compute(area, Chrome::Full, true);
+        let plain = compute(area, Chrome::Full, false, AgentTabPosition::Left);
+        let framed = compute(area, Chrome::Full, true, AgentTabPosition::Left);
         // Frames are the pre-inset outer rects.
         assert_eq!(framed.terminal_frame, Some(plain.terminal));
         assert_eq!(framed.sidebar_frame, Some(plain.sidebar));
@@ -663,5 +722,57 @@ mod tests {
         assert_eq!(framed.terminal.x, plain.terminal.x + 1);
         assert_eq!(framed.terminal.y, plain.terminal.y + 1);
         assert_eq!(framed.sidebar.width, plain.sidebar.width - 2);
+    }
+
+    #[test]
+    fn right_puts_the_sidebar_at_the_far_end_of_the_body_row() {
+        let area = full_terminal();
+        let left = compute(area, Chrome::Full, false, AgentTabPosition::Left);
+        let right = compute(area, Chrome::Full, false, AgentTabPosition::Right);
+
+        assert_eq!(left.sidebar.x, 0);
+        assert_eq!(left.terminal.x, SIDEBAR_WIDTH);
+        // Mirrored: the terminal starts at the left edge and the sidebar ends
+        // at the right one.
+        assert_eq!(right.terminal.x, 0);
+        assert_eq!(right.sidebar.x, area.width - SIDEBAR_WIDTH);
+        assert_eq!(right.sidebar.right(), area.width);
+    }
+
+    /// The claim `viewport_pty_size` relies on: the setting moves the sidebar,
+    /// it does not resize anything, so a PTY sized on one setting is correct on
+    /// the other.
+    #[test]
+    fn agent_tab_side_does_not_change_either_pane_size() {
+        for (w, h) in [(120_u16, 40_u16), (108, 32), (10, 3)] {
+            for chrome in [Chrome::Full, Chrome::Collapsed] {
+                for border in [false, true] {
+                    let area = Rect::new(0, 0, w, h);
+                    let left = compute(area, chrome, border, AgentTabPosition::Left);
+                    let right = compute(area, chrome, border, AgentTabPosition::Right);
+                    assert_eq!(
+                        (left.terminal.width, left.terminal.height),
+                        (right.terminal.width, right.terminal.height),
+                        "terminal size at {w}x{h} {chrome:?} border={border}"
+                    );
+                    assert_eq!(
+                        (left.sidebar.width, left.sidebar.height),
+                        (right.sidebar.width, right.sidebar.height),
+                        "sidebar size at {w}x{h} {chrome:?} border={border}"
+                    );
+                    // The full-width top band is above the body row, so it
+                    // must not notice the setting at all. The git and status
+                    // bars are *inside* the main pane in this layout and
+                    // therefore travel with it, exactly as its tab bar does.
+                    assert_eq!(left.header, right.header);
+                    assert_eq!(left.project_tabs, right.project_tabs);
+                    assert_eq!(left.divider, right.divider);
+                    assert_eq!(
+                        (left.status_bar.width, left.status_bar.height),
+                        (right.status_bar.width, right.status_bar.height)
+                    );
+                }
+            }
+        }
     }
 }

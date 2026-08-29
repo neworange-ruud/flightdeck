@@ -365,10 +365,12 @@ pub enum HitTarget {
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
     let chrome = layout::chrome_for(area, state.mode());
+    let side = state.config.ui.agent_tab_side();
     let ml = layout::compute(
         area,
         chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        side,
     );
     if rect_contains(ml.sidebar, col, row) {
         // A click on the `✕` on a tab's name row closes it; elsewhere on a tab
@@ -377,7 +379,7 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, col, row)
+            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, side, col, row)
                 .unwrap_or(HitTarget::Sidebar),
         );
     }
@@ -436,10 +438,11 @@ fn sidebar_hit(
     area: Rect,
     tab_count: usize,
     chrome: layout::Chrome,
+    side: crate::contracts::AgentTabPosition,
     col: u16,
     row: u16,
 ) -> Option<HitTarget> {
-    let inner = Block::default().borders(Borders::RIGHT).inner(area);
+    let inner = Block::default().borders(sidebar_seam(side)).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
@@ -458,12 +461,19 @@ fn sidebar_hit(
         return None;
     }
     // Within a full tab block the rows are: divider(0), name(1), agent(2),
-    // git(3). The `✕` lives on the name row at the far right; give it a
-    // forgiving 3-column target so it stays easy to click. The collapsed strip
-    // has no close control — use APP mode to close an agent.
+    // git(3). The `✕` lives on the name row at the sidebar's outer end — the
+    // far right at `left`, the far left at `right`, mirrored with the row it
+    // is drawn in (`sidebar_name_line`). Give it a forgiving 3-column target so
+    // it stays easy to click. The collapsed strip has no close control — use
+    // APP mode to close an agent.
     if chrome == layout::Chrome::Full && rel % rows_per_tab == 1 {
-        let close_col = inner.x.saturating_add(inner.width).saturating_sub(1);
-        if col >= close_col.saturating_sub(2) {
+        let hit = match side {
+            crate::contracts::AgentTabPosition::Left => {
+                col >= inner.x.saturating_add(inner.width).saturating_sub(3)
+            }
+            crate::contracts::AgentTabPosition::Right => col < inner.x.saturating_add(3),
+        };
+        if hit {
             return Some(HitTarget::CloseAgentTab(idx));
         }
     }
@@ -598,6 +608,7 @@ pub fn draw(
         area,
         chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
 
     draw_header(frame, ml.header);
@@ -920,12 +931,13 @@ pub fn draw_sidebar(
 
     // When the live-pane border feature is on, the focused pane's frame
     // already supplies the separating vertical line, so the sidebar's own
-    // right divider is suppressed here — otherwise two adjacent vertical
+    // seam divider is suppressed here — otherwise two adjacent vertical
     // lines would be drawn (SPECS §23).
+    let side = state.config.ui.agent_tab_side();
     let block = if mode_style::border_enabled(&state.config.ui) {
         Block::default()
     } else {
-        Block::default().borders(Borders::RIGHT)
+        Block::default().borders(sidebar_seam(side))
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -981,6 +993,7 @@ pub fn draw_sidebar(
             let spin = Style::default().fg(Color::Red);
             lines.push(sidebar_name_line(
                 width,
+                side,
                 marker,
                 name_style,
                 Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
@@ -1013,6 +1026,7 @@ pub fn draw_sidebar(
         let indicator = status_indicator(ds.interpreted, now_ms);
         lines.push(sidebar_name_line(
             width,
+            side,
             marker,
             name_style,
             Span::styled(
@@ -1057,7 +1071,7 @@ pub fn draw_sidebar(
 /// Draw the collapsed agent strip: one indicator glyph per agent, no heading
 /// and no close control, for windows too small to afford the full sidebar.
 fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
-    let block = Block::default().borders(Borders::RIGHT);
+    let block = Block::default().borders(sidebar_seam(state.config.ui.agent_tab_side()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1121,6 +1135,7 @@ fn collapsed_agent_span(
 /// with an ellipsis if it would collide with the close control (SPECS §20/§23).
 fn sidebar_name_line(
     width: usize,
+    side: crate::contracts::AgentTabPosition,
     marker: &'static str,
     name_style: Style,
     lead: Span<'static>,
@@ -1128,19 +1143,48 @@ fn sidebar_name_line(
 ) -> Line<'static> {
     let marker_w = marker.chars().count();
     let lead_w = lead.content.chars().count();
-    // Reserve two columns at the far right for a padding space and the glyph.
+    // Reserve two columns at the sidebar's outer end for a padding space and
+    // the glyph.
     let name_budget = width.saturating_sub(marker_w + lead_w + 2);
     let shown = truncate_ellipsis(name, name_budget);
     let used = marker_w + lead_w + shown.chars().count();
-    // Pad so the glyph lands in the last inner column.
+    // Pad so the glyph lands in the outermost inner column.
     let pad = width.saturating_sub(used).saturating_sub(1);
-    Line::from(vec![
+    let close = Span::styled(CLOSE_GLYPH, Style::default().fg(Color::Red));
+    let name_spans = [
         Span::styled(marker, name_style),
         lead,
         Span::styled(shown, name_style),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(CLOSE_GLYPH, Style::default().fg(Color::Red)),
-    ])
+    ];
+    // The `✕` column mirrors with the sidebar: it stays on the end furthest
+    // from the terminal, so it never sits against the seam the two panes share.
+    // The name itself does not mirror — it is text, and text keeps its reading
+    // order on both settings.
+    match side {
+        crate::contracts::AgentTabPosition::Left => Line::from(
+            name_spans
+                .into_iter()
+                .chain([Span::raw(" ".repeat(pad)), close])
+                .collect::<Vec<_>>(),
+        ),
+        crate::contracts::AgentTabPosition::Right => Line::from(
+            [close, Span::raw(" ".to_string())]
+                .into_iter()
+                .chain(name_spans)
+                .chain([Span::raw(" ".repeat(pad.saturating_sub(1)))])
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// The one-cell divider the sidebar draws on the seam it shares with the main
+/// pane: its right edge at `left`, its left edge at `right`. One function so
+/// drawing and hit-testing can never disagree about which column it eats.
+fn sidebar_seam(side: crate::contracts::AgentTabPosition) -> Borders {
+    match side {
+        crate::contracts::AgentTabPosition::Left => Borders::RIGHT,
+        crate::contracts::AgentTabPosition::Right => Borders::LEFT,
+    }
 }
 
 /// Truncate `s` to at most `max` display columns, appending `…` when clipped.
@@ -2959,7 +3003,10 @@ fn web_access_rows(
             actions.push(Span::raw("   "));
             actions.extend(key_chip("x", "Revoke browser access"));
             rows.push((TIER_ECHOED, Line::from(actions)));
-            rows.push((TIER_ECHOED, browsers_line(view.active_browsers)));
+            rows.push((TIER_ECHOED, browsers_line(&view.browsers)));
+            for browser in &view.browsers {
+                rows.push((TIER_ECHOED, browser_row_line(browser)));
+            }
         }
     }
 
@@ -3008,26 +3055,65 @@ fn serving_line(view: &WebAccessView, mode: AccessMode) -> Line<'static> {
     ])
 }
 
-/// How many browsers hold access, counted rather than rounded to "some".
-fn browsers_line(active: usize) -> Line<'static> {
-    let (dot_style, text) = match active {
+/// How many browsers hold access, counted rather than rounded to "some" — and
+/// which digits withdraw one of them (`remote-control-gk94`, §6.5 R25).
+///
+/// The `1-n` hint lives here rather than in the footer legend because it is
+/// only true of the rows underneath it: those rows are an echoed tier that a
+/// short terminal drops, and the range names exactly the digits that are bound,
+/// so a tenth browser — listed, revocable by `x`, but past the last digit —
+/// cannot be implied to have a key it does not have.
+fn browsers_line(browsers: &[crate::web::access::BrowserRow]) -> Line<'static> {
+    let keyed = browsers.iter().filter(|b| b.key.is_some()).count();
+    let (dot_style, text) = match browsers.len() {
         0 => (
             Style::default().fg(Color::DarkGray),
             "no browser holds access".to_string(),
         ),
         1 => (
             Style::default().fg(Color::Green),
-            "1 browser holds access".to_string(),
+            "1 browser holds access — 1 revokes it".to_string(),
         ),
         n => (
             Style::default().fg(Color::Green),
-            format!("{n} browsers hold access"),
+            format!("{n} browsers hold access — 1-{keyed} revokes one"),
         ),
     };
     Line::from(vec![
         Span::styled("● ".to_string(), dot_style),
         Span::styled(text, Style::default().fg(Color::DarkGray)),
     ])
+}
+
+/// One holder of access, as artboard 2a State B draws it: the digit that
+/// revokes it, then the facts that tell it from an intruder
+/// (`remote-control-gk94`, `specs/WEB_INTERFACE.md` §6.5 R25).
+///
+/// The pieces are joined with the same ` · ` the rest of the overlay uses and
+/// each is drawn only when the host actually has it — a record from before the
+/// address was stored is drawn short, never with a placeholder standing in for
+/// something nobody observed.
+fn browser_row_line(browser: &crate::web::access::BrowserRow) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::styled(
+        match browser.key {
+            // Two spaces where the digit would be, so an unkeyed tenth row
+            // still lines up under the ones above it.
+            None => "    ".to_string(),
+            Some(key) => format!("  {key} "),
+        },
+        Style::default().fg(Color::Yellow),
+    )];
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(address) = &browser.address {
+        facts.push(address.clone());
+    }
+    if let Some(label) = &browser.browser {
+        facts.push(label.clone());
+    }
+    facts.push(crate::web::access::age_label(browser.granted_secs_ago));
+    spans.push(Span::styled(facts.join(" · "), dim));
+    Line::from(spans)
 }
 
 /// The footer legend: every key the current state binds, and nothing it does
@@ -3746,18 +3832,49 @@ mod tests {
         let area = Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6);
         // One row per tab, starting at the sidebar's first row — no heading offset.
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 0),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                0
+            ),
             Some(HitTarget::AgentTab(0))
         );
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 2),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                2
+            ),
             Some(HitTarget::AgentTab(2))
         );
         // Past the last agent resolves to nothing (the caller falls back to chrome).
-        assert_eq!(sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 3), None);
+        assert_eq!(
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                3
+            ),
+            None
+        );
         // The rightmost inner column selects; it is never a close control.
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 1, 1),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                1,
+                1
+            ),
             Some(HitTarget::AgentTab(1))
         );
     }
@@ -3826,7 +3943,12 @@ mod tests {
         term.draw(|frame| {
             let area = frame.area();
             let chrome = layout::chrome_for(area, state.mode());
-            let ml = layout::compute(area, chrome, mode_style::border_enabled(&state.config.ui));
+            let ml = layout::compute(
+                area,
+                chrome,
+                mode_style::border_enabled(&state.config.ui),
+                state.config.ui.agent_tab_side(),
+            );
             draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
             draw(frame, state, &empty_cache(), &UiOverlay::None, None, 0);
         })
@@ -4203,7 +4325,12 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area, layout::Chrome::Full, false));
+        let region = layout::split_region(&layout::compute(
+            area,
+            layout::Chrome::Full,
+            false,
+            crate::contracts::AgentTabPosition::Left,
+        ));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
@@ -4758,6 +4885,7 @@ mod tests {
             area,
             layout::Chrome::Full,
             mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
         let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
@@ -5361,6 +5489,145 @@ mod tests {
         );
     }
 
+    /// `remote-control-ecsv`, `specs/WEB_INTERFACE.md` §6.5 R24.
+    ///
+    /// The front door on purpose: the only thing this test does differently
+    /// between the two runs is set the TOML key a user sets, and everything it
+    /// asserts is read back out of the drawn buffer. Nothing here calls
+    /// `compute` or hands the renderer a side — the point of the test is that
+    /// the setting *reaches* the layout, which is precisely what it did not do
+    /// before.
+    #[test]
+    fn agent_tab_position_right_mirrors_the_body_row_in_the_drawn_buffer() {
+        const W: u16 = 120;
+        const H: u16 = 40;
+
+        fn draw_buffer(state: &AppState) -> ratatui::buffer::Buffer {
+            let mut term = test_terminal(W, H);
+            let cache = empty_cache();
+            term.draw(|frame| draw(frame, state, &cache, &UiOverlay::None, None, 0))
+                .unwrap();
+            term.backend().buffer().clone()
+        }
+
+        /// The `(x, y)` of the first cell of `needle`, scanning row by row.
+        fn find(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+            let chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+            for y in 0..H {
+                for x in 0..=W.saturating_sub(chars.len() as u16) {
+                    if chars
+                        .iter()
+                        .enumerate()
+                        .all(|(i, c)| buffer[(x + i as u16, y)].symbol() == c)
+                    {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("{needle:?} is not on screen");
+        }
+
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+
+        let left = draw_buffer(&state);
+        state.config.ui.agent_tab_position = "right".to_string();
+        let right = draw_buffer(&state);
+
+        // The sidebar's heading — the column itself.
+        let (left_heading, heading_row) = find(&left, "Agents");
+        let (right_heading, _) = find(&right, "Agents");
+        assert!(
+            left_heading < layout::SIDEBAR_WIDTH,
+            "default: the sidebar is the first column"
+        );
+        assert!(
+            right_heading >= W - layout::SIDEBAR_WIDTH,
+            "right: the sidebar is the last column, got x={right_heading}"
+        );
+
+        // The `✕` column, which 1h names explicitly: at the sidebar's outer
+        // end on both settings, so it never sits on the seam. Searched on the
+        // first agent's name row, because the child tab bar draws a `✕` of its
+        // own on the same screen row.
+        let name_row = heading_row + 2;
+        let close_x = |buffer: &ratatui::buffer::Buffer| -> u16 {
+            (0..W)
+                .find(|&x| buffer[(x, name_row)].symbol() == CLOSE_GLYPH)
+                .expect("the agent row draws a close control")
+        };
+        let left_close = close_x(&left);
+        let right_close = close_x(&right);
+        assert_eq!(
+            left_close,
+            layout::SIDEBAR_WIDTH - 2,
+            "default: the last inner column, inside the sidebar's right divider"
+        );
+        assert_eq!(
+            right_close,
+            W - layout::SIDEBAR_WIDTH + 1,
+            "right: the first inner column, inside the sidebar's left divider"
+        );
+
+        // The seam between the two panes moves with them, and the top band
+        // does not move at all.
+        assert_eq!(
+            left[(layout::SIDEBAR_WIDTH - 1, heading_row)].symbol(),
+            "\u{2502}",
+            "default: the divider is the sidebar's right edge"
+        );
+        assert_eq!(
+            right[(W - layout::SIDEBAR_WIDTH, heading_row)].symbol(),
+            "\u{2502}",
+            "right: the divider is the sidebar's left edge"
+        );
+        for y in 0..layout::HEADER_HEIGHT + layout::PROJECT_TAB_BAR_HEIGHT + layout::DIVIDER_HEIGHT
+        {
+            assert_eq!(
+                buffer_row(&left, y),
+                buffer_row(&right, y),
+                "the full-width top band does not move (row {y})"
+            );
+        }
+    }
+
+    /// The click path, which is the other half of the same fact: a `✕` that is
+    /// drawn on the left and hit-tested on the right would close nothing.
+    #[test]
+    fn agent_tab_position_right_moves_the_hit_targets_with_the_sidebar() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+
+        // The first agent's name row, in both layouts.
+        let name_row = layout::HEADER_HEIGHT
+            + layout::PROJECT_TAB_BAR_HEIGHT
+            + layout::DIVIDER_HEIGHT
+            + SIDEBAR_HEADER_ROWS
+            + 1;
+
+        assert_eq!(
+            hit_test(area, &state, 4, name_row),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            hit_test(area, &state, layout::SIDEBAR_WIDTH - 2, name_row),
+            Some(HitTarget::CloseAgentTab(0))
+        );
+        // The same columns are the terminal once the sidebar has moved.
+        state.config.ui.agent_tab_position = "right".to_string();
+        assert_eq!(hit_test(area, &state, 4, name_row), None);
+        let sidebar_x = area.width - layout::SIDEBAR_WIDTH;
+        assert_eq!(
+            hit_test(area, &state, sidebar_x + 6, name_row),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            hit_test(area, &state, sidebar_x + 1, name_row),
+            Some(HitTarget::CloseAgentTab(0))
+        );
+    }
+
     // --- §24: simplified sidebar status ------------------------------------
 
     #[test]
@@ -5478,7 +5745,12 @@ mod tests {
                 },
             ],
             selected_address: Some(0),
-            active_browsers: 1,
+            browsers: vec![crate::web::access::BrowserRow {
+                key: Some('1'),
+                address: Some("192.168.2.20".to_string()),
+                browser: Some("Safari on iOS".to_string()),
+                granted_secs_ago: 14 * 60,
+            }],
             notice: None,
             keys: vec![
                 ("↑↓", "address"),
@@ -5505,7 +5777,7 @@ mod tests {
             seconds_remaining: None,
             addresses: Vec::new(),
             selected_address: None,
-            active_browsers: 0,
+            browsers: Vec::new(),
             notice: None,
             keys: vec![
                 ("Enter", "open"),
@@ -5608,6 +5880,55 @@ mod tests {
         assert!(text.contains("push branches"), "{text}");
         assert!(text.contains("1 browser holds access"), "{text}");
         assert!(text.contains("Esc close"), "the legend: {text}");
+    }
+
+    /// 2a State B's `● 1 browser holds access · 192.168.2.20 · Safari/iOS ·
+    /// 14m`, and the digit that takes it out (`remote-control-gk94`, §6.5 R25).
+    /// The count alone is what this line used to be, and it could not answer
+    /// the question it was drawn for.
+    #[test]
+    fn state_b_names_each_holder_and_the_digit_that_revokes_it() {
+        let mut view = network_access_view();
+        view.browsers.push(crate::web::access::BrowserRow {
+            key: Some('2'),
+            address: Some("192.168.2.31".to_string()),
+            browser: Some("Chrome on macOS".to_string()),
+            granted_secs_ago: 2 * 3600,
+        });
+
+        let text = painted(120, 44, &view);
+        assert!(
+            text.contains("2 browsers hold access — 1-2 revokes one"),
+            "the header counts them and names the keys: {text}"
+        );
+        assert!(
+            text.contains("1 192.168.2.20 · Safari on iOS · 14m"),
+            "the first row, with its digit: {text}"
+        );
+        assert!(
+            text.contains("2 192.168.2.31 · Chrome on macOS · 2h"),
+            "the second row: {text}"
+        );
+    }
+
+    /// A row the host knows nothing about is drawn short, never padded out with
+    /// a stand-in for a fact nobody observed.
+    #[test]
+    fn a_holder_with_no_address_and_no_claim_is_drawn_without_them() {
+        let mut view = network_access_view();
+        view.browsers = vec![crate::web::access::BrowserRow {
+            key: Some('1'),
+            address: None,
+            browser: None,
+            granted_secs_ago: 45,
+        }];
+
+        let text = painted(120, 44, &view);
+        assert!(text.contains("1 45s"), "the age is all there is: {text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("(none)"),
+            "no placeholder: {text}"
+        );
     }
 
     #[test]

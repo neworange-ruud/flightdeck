@@ -797,7 +797,12 @@ Default layout:
 └──────────────────────┴──────────────────────────────────────────┘
 ```
 
-Left sidebar shows Agent Tabs.
+The sidebar shows Agent Tabs. It is the **left** column by default and the
+right one when `[ui] agent_tab_position = "right"`, which mirrors the body row
+on both surfaces — the desktop's and the browser's (`specs/WEB_INTERFACE.md`
+§6.5 R24). Only the two columns swap: their widths, the full-width header and
+project row, and every other rect are unchanged, and the one-cell divider
+follows the seam the two panes share.
 
 Each Agent Tab row should show:
 

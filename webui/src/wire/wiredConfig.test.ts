@@ -619,6 +619,25 @@ describe("the save's answer is the host's, never the browser's optimism", () => 
     expect(h.row("notifications.on_finish").origin).toBe("(set here)");
   });
 
+  it("asks for a fresh snapshot, because a saved setting can change the layout", () => {
+    /**
+     * §6.5 R24. `[ui] agent_tab_position` is a config key the *browser lays out
+     * from*, and it reaches the browser on `Snapshot::sidebar_position`. So a
+     * save that lands has to be followed by a snapshot, or the desktop mirrors
+     * its sidebar and this tab does not until it is reloaded.
+     */
+    const h = harness();
+    h.deliver(snapshotFrame());
+    runOpenConfiguration(h);
+    h.deliver(configFrame({ seq: 1 }));
+
+    /** Coalesced: it is a timer, exactly like every other resync this socket
+     * asks for. */
+    expect(h.commands().map((c) => c.name)).not.toContain("request_snapshot");
+    vi.advanceTimersByTime(200);
+    expect(h.commands().map((c) => c.name)).toContain("request_snapshot");
+  });
+
   it("leaves a refused save staged, in the host's words", () => {
     const h = harness();
     h.deliver(snapshotFrame());

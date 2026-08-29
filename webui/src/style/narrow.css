@@ -86,6 +86,13 @@
  * redesigned, and the 14% of viewport left uncovered is what tells the reader
  * at a glance that the terminal is still there behind it — 2e makes the same
  * trade with `min(470px, 100%)` on a panel that has more to say.
+ *
+ * **`[ui] agent_tab_position = right` does not move it** (§6.5 R24). The
+ * setting mirrors the body *row*, and at this width there is no row to mirror:
+ * the sidebar is absolutely positioned over the pane, so `row-reverse` does not
+ * reach it. Following the setting anyway would put it on the edge 2e's feed
+ * already owns, which is the one thing the paragraph above rules out — and both
+ * panels can be open at once.
  */
 .fd-frame[data-width="narrow"] .fd-body {
   /* The slide-over's containing block. `.fd-main` already has this for 2e. */
@@ -100,7 +107,12 @@
   z-index: 2;
   margin: 0;
   opacity: 1;
+  /* Both seams, because `[ui] agent_tab_position = right` moves the wide
+   * layout's rule to the other edge (§6.5 R24) and a slide-over has no seam at
+   * either: it is over the pane, not beside it. Its own accent edge below is
+   * what separates it from the terminal. */
   border-right: 0;
+  border-left: 0;
   background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
   box-shadow:
     inset -1px 0 0 var(--fd-accent),
@@ -156,9 +168,11 @@
 }
 /* 1b draws this border as the seam between the sidebar column and the pane.
  * There is no column here — the sidebar is over the pane, not beside it — so
- * the seam would be a line separating the pane from nothing. */
+ * the seam would be a line separating the pane from nothing. Both edges, for
+ * the reason above: R24 moves it to the right when the sidebar sits there. */
 .fd-frame[data-width="narrow"][data-mode="app"] .fd-main {
   border-left: 0;
+  border-right: 0;
 }
 .fd-frame[data-width="narrow"] .fd-sessionchip {
   position: sticky;

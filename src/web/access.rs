@@ -24,6 +24,7 @@
 //!   n      allow other devices  ──────────────▶ ↑↓ pick which address to publish
 //!   s      stop the server                      Space  a fresh code
 //!   Esc    close                                r      hide code and QR
+//!                                               1-9    revoke that one browser
 //!                                               x      revoke every browser
 //!                                               l      back to local only
 //!   never shows a code                          Esc    close
@@ -135,6 +136,41 @@ pub struct AddressRow {
     pub description: Option<&'static str>,
 }
 
+/// One browser that currently holds access, as artboard 2a State B draws it:
+/// `● 192.168.2.20 · Safari on iOS · 14m`.
+///
+/// Every field is a fact the host already stored, and each is presented at the
+/// standing it has. [`BrowserRow::address`] is the host's own observation off
+/// the socket; [`BrowserRow::browser`] is the browser's claim about itself,
+/// coarsened and stripped of control characters and **never parsed** — R12's
+/// rule, applied to the second surface that shows a user-agent. Nothing here is
+/// split back out of a joined string, because a user-agent may contain any
+/// separator you might split on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserRow {
+    /// The digit that revokes this row (`1`..=`9`), or `None` past the ninth —
+    /// a tenth browser is still listed and still revoked by `x`, it just has no
+    /// key of its own. See [`WebAccess::network_key`] for why digits and not a
+    /// second `↑↓` picker.
+    pub key: Option<char>,
+    /// The address the host observed when it granted this credential, or `None`
+    /// for a record issued before the address was stored. The row then goes
+    /// without it rather than printing a placeholder.
+    pub address: Option<String>,
+    /// What the browser said it was, coarsened to `Safari on iOS` and capped.
+    /// `None` when it said nothing usable.
+    pub browser: Option<String>,
+    /// How long ago this browser was let in, on the **host's** clock — the
+    /// store's own [`crate::contracts::Clock`], the one that stamped the
+    /// record, so the two numbers are always from the same source.
+    pub granted_secs_ago: u64,
+}
+
+/// How many listed browsers get a digit of their own. Nine, because `0` would
+/// have to mean "the tenth" and a key whose label is off by one is worse than
+/// no key.
+const MAX_KEYED_BROWSERS: usize = 9;
+
 /// One key press the access overlay understands, already lifted out of
 /// crossterm's [`KeyEvent`] by the event loop.
 ///
@@ -228,9 +264,13 @@ pub struct WebAccessView {
     pub addresses: Vec<AddressRow>,
     /// Index of the selected row in [`WebAccessView::addresses`].
     pub selected_address: Option<usize>,
-    /// How many browsers currently hold access, for the "1 browser holds
-    /// access" line.
-    pub active_browsers: usize,
+    /// Every browser that currently holds access, in the store's issue order —
+    /// the header line counts them and the rows name them.
+    ///
+    /// One list rather than a count beside it: the count *is* `browsers.len()`,
+    /// and a separate field would be a second answer to "how many" that could
+    /// disagree with the rows underneath it.
+    pub browsers: Vec<BrowserRow>,
     /// The result of the last action, shown for one glance and then replaced.
     pub notice: Option<String>,
     /// The footer legend: `(key, label)` in the order the artboard lists them.
@@ -330,16 +370,43 @@ impl WebAccess {
     /// now keeps its socket until somebody closes it, which is why `x` returns
     /// [`AccessOutcome::Revoked`] rather than [`AccessOutcome::Handled`].
     ///
-    /// It is all-or-nothing today because [`CredentialStore::rotate`] calls
-    /// `revoke_all` — D5 asks for one command that locks *everyone* out, and
-    /// State B's footer says `x revoke`, not `x revoke this one`. Per-browser
-    /// revocation is `remote-control-gk94`; the eviction machinery underneath
-    /// is already per-token, so that issue changes which credentials are
-    /// withdrawn and nothing about what happens to the sockets holding them.
+    /// It is all-or-nothing **on purpose**, and stayed that way through
+    /// `remote-control-gk94`: D5 asks for one command that locks *everyone*
+    /// out, and redefining the key the artboard draws would have taken that
+    /// command away. [`WebAccess::revoke_one`] is the addition beside it, on
+    /// the numbered rows, and it withdraws one credential through the same
+    /// per-token machinery.
     pub fn rotate(&self, store: &mut CredentialStore) -> (usize, Option<String>) {
         let active = store.active_tokens().count();
         let (_code, error) = store.rotate();
         (active, error.map(|e| e.to_string()))
+    }
+
+    /// Withdraw **one** browser's access: the `index`th row of
+    /// [`WebAccessView::browsers`], which is the `index`th active token
+    /// (`remote-control-gk94`, §6.5 R25).
+    ///
+    /// Returns how the revoked browser was described on screen, plus any
+    /// persistence error, or `None` when there is no such row — a digit pressed
+    /// past the end of the list must do nothing, not revoke the last one.
+    ///
+    /// The row is rebuilt here rather than remembered from the last render so
+    /// the list a key acts on is the list the store has *now*. Issue order is
+    /// what makes that safe: a browser that authenticated since the last draw
+    /// appends, so it cannot renumber a row the user is looking at.
+    ///
+    /// Like [`WebAccess::rotate`] this is the credential half only; the sockets
+    /// are closed by the event loop, which is why the caller returns
+    /// [`AccessOutcome::Revoked`].
+    pub fn revoke_one(
+        &self,
+        store: &mut CredentialStore,
+        index: usize,
+    ) -> Option<(String, Option<String>)> {
+        let described = describe_browser(browser_rows(store).get(index)?);
+        let id = store.active_tokens().nth(index)?.id.clone();
+        let error = store.revoke(&id).err().map(|e| e.to_string());
+        Some((described, error))
     }
 
     /// A code that is live *right now*, minting one if the outstanding code has
@@ -461,6 +528,30 @@ impl WebAccess {
                 AccessOutcome::Revoked
             }
             AccessKey::Char('l') => AccessOutcome::BackToLocalOnly,
+            // `1`..`9` revoke the browser on that numbered row.
+            //
+            // Digits rather than a second `↑↓` picker because `↑↓` already
+            // belongs to the address list, and a second list would need a focus
+            // concept the overlay does not have — two lists, one pair of arrows
+            // and an invisible mode is exactly how a revoke lands on the wrong
+            // browser. Each row prints its own digit, so the affordance is on
+            // screen next to the thing it acts on rather than only in the
+            // footer, and `x` keeps meaning what D5 and 2a's footer say it
+            // means: everyone out.
+            AccessKey::Char(d) if d.is_ascii_digit() && d != '0' => {
+                let index = (d as usize) - ('1' as usize);
+                match self.revoke_one(store, index) {
+                    // A digit past the end of the list revokes nothing. Silence
+                    // rather than a notice: there was no row there to act on,
+                    // and reporting a refusal for a key the overlay never
+                    // offered would be noise.
+                    None => AccessOutcome::Ignored,
+                    Some((described, error)) => {
+                        self.notice = Some(revoke_one_notice(&described, error.as_deref()));
+                        AccessOutcome::Revoked
+                    }
+                }
+            }
             AccessKey::Enter | AccessKey::Esc => AccessOutcome::Ignored,
             AccessKey::Char(_) => AccessOutcome::Ignored,
         }
@@ -582,7 +673,7 @@ impl WebAccess {
                 })
                 .collect(),
             selected_address: (!self.addresses.is_empty()).then_some(self.selected),
-            active_browsers: store.active_tokens().count(),
+            browsers: browser_rows(store),
             notice: self.notice.clone(),
             keys: keys_for(self.mode),
         }
@@ -612,10 +703,119 @@ fn keys_for(mode: AccessMode) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "address"),
             ("Space", "new code"),
             ("r", "hide"),
+            // 2a's footer, byte for byte. `x` still locks everyone out, which
+            // is what D5 asks for and what this label has always meant.
+            //
+            // `1-9` is deliberately **not** here. It belongs to the browser
+            // list — every row prints its own digit and the header above them
+            // says what the digits do — and that is where it has to be said:
+            // the list is an echoed tier that a short terminal drops, and a
+            // footer entry for keys whose rows are not on screen would be
+            // pointing at nothing. The legend also has to survive at 100
+            // columns, where a seventh pair pushes `Esc close` off the end.
             ("x", "revoke"),
             ("l", "local only"),
             ("Esc", "close"),
         ],
+    }
+}
+
+/// The overlay's list of who holds access, built from the store and nothing
+/// else.
+///
+/// Read through [`CredentialStore::active_tokens`] so the rows are in the same
+/// issue order the digit keys index into — the nth row and the nth active token
+/// are the same browser by construction, not by two places agreeing.
+fn browser_rows(store: &CredentialStore) -> Vec<BrowserRow> {
+    let now = store.now_unix_secs();
+    store
+        .active_tokens()
+        .enumerate()
+        .map(|(index, token)| BrowserRow {
+            key: (index < MAX_KEYED_BROWSERS)
+                .then(|| char::from_digit(index as u32 + 1, 10))
+                .flatten(),
+            address: token.address.clone(),
+            browser: token.label.as_deref().and_then(browser_label),
+            // `saturating_sub` rather than a signed difference: a record stamped
+            // in the future (a clock that moved backwards) is drawn as `0s`,
+            // never as a negative age — the same refusal to print a fabricated
+            // duration that R12 records for the seat rows.
+            granted_secs_ago: now.saturating_sub(token.created_unix_secs),
+        })
+        .collect()
+}
+
+/// The browser's own claim about itself, reduced to something safe to draw.
+///
+/// The stored label is whatever the browser POSTed to `/auth/exchange` — in
+/// practice the raw `navigator.userAgent`, in principle any bytes at all. It
+/// goes through the *same* reduction the viewer chip uses
+/// ([`crate::web::server::coarse_user_agent`]) so both surfaces say `Safari on
+/// iOS` about the same browser, and a claim that reduces to nothing falls back
+/// to the sanitised, capped text rather than being dropped: a custom client
+/// that named itself honestly should still be identifiable.
+///
+/// `None` when nothing usable survives, and the row is then drawn without a
+/// browser rather than with a guess.
+fn browser_label(raw: &str) -> Option<String> {
+    let coarse = crate::web::server::coarse_user_agent(raw);
+    let text = if coarse.is_empty() {
+        crate::web::server::sanitize_label(raw)
+    } else {
+        coarse
+    };
+    let text = crate::web::server::truncate_chars(&text, crate::web::server::MAX_LABEL_CHARS);
+    (!text.is_empty()).then_some(text)
+}
+
+/// `14m` — a duration in the artboard's compact shape, rounded down so it never
+/// claims more time than has passed.
+///
+/// Deliberately not the browser's `agoLabel` shape (`4m ago`): this sits at the
+/// end of a row of facts, where the trailing `ago` reads as prose rather than
+/// as the fourth fact.
+pub fn age_label(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// How one browser reads on screen, for the notice that reports its removal.
+///
+/// The same facts the row drew, joined — and joining is the safe direction, the
+/// one R12 keeps: the parts were never merged in storage, so nothing here has
+/// to be split apart again.
+fn describe_browser(row: &BrowserRow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(address) = &row.address {
+        parts.push(address.clone());
+    }
+    if let Some(browser) = &row.browser {
+        parts.push(browser.clone());
+    }
+    if parts.is_empty() {
+        // A record from before the address was stored, by a browser that
+        // claimed nothing usable. It is still a real credential and it was
+        // still revoked, so the notice says so without naming what it cannot.
+        return "That browser".to_string();
+    }
+    parts.join(" · ")
+}
+
+/// What a digit did. Names the browser it locked out, because "1 browser
+/// revoked" is the answer the user could already have worked out and the whole
+/// point of the numbered rows is that they can be told apart.
+fn revoke_one_notice(described: &str, error: Option<&str>) -> String {
+    let head = format!("{described} is locked out — its access was revoked.");
+    match error {
+        None => head,
+        Some(error) => {
+            format!("{head} Could not save the revocation ({error}); it may not survive a restart.")
+        }
     }
 }
 

@@ -19,7 +19,8 @@
 //!
 //! What it *does* borrow is the **vocabulary**, and it borrows it by reusing the
 //! domain types rather than restating them: [`InterpretedStatus`],
-//! [`ManualStatus`] and [`TabId`] travel on this wire as themselves, encoded
+//! [`ManualStatus`], [`AgentTabPosition`] and [`TabId`] travel on this wire as
+//! themselves, encoded
 //! through the same `as_str`/`from_str_lossy` labels the TUI and `state.json`
 //! already use. That is the concrete answer to D12's accepted cost ("`AgentStatus`
 //! and git-detail semantics will exist in two places and must not drift"): for
@@ -122,7 +123,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agents::status::DisplayStatus;
-use crate::contracts::{InterpretedStatus, ManualStatus, PtySize, TabId};
+use crate::contracts::{AgentTabPosition, InterpretedStatus, ManualStatus, PtySize, TabId};
 use crate::terminal::session::TerminalKind;
 
 #[cfg(test)]
@@ -1648,6 +1649,60 @@ pub struct Snapshot {
     /// is complete on its own, and the reload chip renders that one.
     #[serde(default)]
     pub about: Option<AboutDoc>,
+    /// SPECS §30's update notice, when this host has one to give
+    /// (`remote-control-gk94`, `specs/WEB_INTERFACE.md` §6.5 R25).
+    ///
+    /// **`None` does not mean "up to date".** It means this host has no notice,
+    /// which it also says when the once-a-day check is off (`[update] check =
+    /// false`), when the run is `--isolated` and so makes no network call at
+    /// all (SPECS §32), when the build has no self-updater, and when the check
+    /// simply has not come back yet. The desktop cannot tell those apart — its
+    /// `AppState::update_available` is the same `Option` — so neither can this,
+    /// and a field that claimed otherwise would be inventing the difference.
+    /// The browser therefore renders 1a's chip on `Some` and the same empty
+    /// spacer it has always rendered on `None`, which is exactly what the
+    /// status bar does on the desktop.
+    ///
+    /// On the snapshot rather than in a [`Delta`] because the check runs once,
+    /// at startup: `crate::update::start_check` returns a cached finding
+    /// synchronously and spawns at most one background query, so the fact
+    /// settles seconds into the run and never moves again. A tab that attaches
+    /// after that — which is every tab, the server being started from the
+    /// palette — is told in the frame it paints from.
+    #[serde(default)]
+    pub update: Option<UpdateNotice>,
+    /// `[ui] agent_tab_position` — which end of the body row the sidebar takes
+    /// (artboard 1h position 4, `specs/WEB_INTERFACE.md` §6.5 R24).
+    ///
+    /// On the snapshot rather than on [`ServerMsg::Configuration`], even though
+    /// the configuration manager sends the very same key: that frame is an
+    /// *answer to a request*, sent only while someone has 1f open, and the
+    /// layout has to be right in the first frame a tab paints. Same reasoning
+    /// as [`Snapshot::replay_capacity_bytes`], which is also a config value the
+    /// browser needs before it has asked anything.
+    ///
+    /// It is **not** a [`PROTOCOL_VERSION`] bump. An additive, defaulted field
+    /// under rule 4, exactly as [`Snapshot::help`] and [`Snapshot::about`] were:
+    /// a host that does not send it leaves a browser laying the sidebar out on
+    /// the left, which is the default the setting itself has — a lesser answer,
+    /// not a wrong one.
+    #[serde(default)]
+    pub sidebar_position: AgentTabPosition,
+}
+
+/// A newer FlightDeck release than the one running, as the host learnt it
+/// (SPECS §30).
+///
+/// A *notice*, never an instruction: §30's check informs and never downloads,
+/// so this carries the version and nothing that could be mistaken for an
+/// action. Acting on it stays `flightdeck update` on the host's own machine —
+/// there is no command name here on purpose, because a browser cannot run it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateNotice {
+    /// The newer published version, bare (`1.16.0`), the same shape
+    /// [`Snapshot::host_version`] carries. The `v` belongs to whoever draws the
+    /// chip.
+    pub latest_version: String,
 }
 
 /// One row of the browser's command palette, as the host describes it.

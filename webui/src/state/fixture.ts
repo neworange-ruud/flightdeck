@@ -346,7 +346,7 @@ export function fixtureSnapshot(): Snapshot {
     /** No `latencyMs`: 1a's `18ms` is a transport measurement, not a host
      * fact, so the screens that draw it dispatch `latency/set` on top of this
      * snapshot the same way the real socket does. */
-    update: { version: "v1.16.0" },
+    update: { version: "1.16.0" },
     /** 1a is a browser that types, so it asked for and got a writer's seat.
      * An observer would see `MODE: —`, correctly. */
     seat: "writing",
@@ -365,6 +365,11 @@ export function fixtureSnapshot(): Snapshot {
      * cannot keep passing. */
     help: fixtureHelp(),
     about: fixtureAbout(),
+    /** 1a and every other artboard but 1h position 4 is drawn with the sidebar
+     * on the left, so that is what the fixture carries; `right` is reached by
+     * a snapshot that says so (see `mainScreen.test.ts`), never by a flag set
+     * here. Same posture as `splitView` above. */
+    sidebarPosition: "left",
   };
 }
 

@@ -953,6 +953,120 @@ fn revoking_one_credential_evicts_its_live_sockets_and_leaves_the_others_alone()
     );
 }
 
+/// Artboard 2a State B's numbered rows, driven the way a human drives them
+/// (`remote-control-gk94`, §6.5 R25).
+///
+/// Two browsers, two credentials, two live sockets. The overlay names both
+/// rows from what the host stored — the address it observed and the user-agent
+/// it was handed at the exchange — and `2` takes out the browser on row two and
+/// nobody else. This is the half `x` could never do: it locks everyone out, so
+/// it can never prove that a revocation was *aimed*.
+#[test]
+fn a_numbered_row_revokes_the_browser_it_names_and_leaves_the_other_typing() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let bound = harness.handle.bound_addr();
+    let (kept_cookie, doomed_cookie) =
+        on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+
+    let (mut kept, mut doomed) = on_runtime(async {
+        let mut kept = ws_connect(&addr, Some(&kept_cookie))
+            .await
+            .expect("upgrade");
+        attach(&mut kept, SeatRequest::Write).await;
+        await_snapshot(&mut kept).await;
+        let mut doomed = ws_connect(&addr, Some(&doomed_cookie))
+            .await
+            .expect("upgrade");
+        attach(&mut doomed, SeatRequest::Write).await;
+        await_snapshot(&mut doomed).await;
+        (kept, doomed)
+    });
+
+    let mut access = {
+        let mut store = harness.credentials.lock().expect("lock");
+        WebAccess::open(
+            &mut store,
+            &FakeInterfaceEnumerator::new()
+                .with_interface("en0", std::net::Ipv4Addr::new(192, 168, 2, 14)),
+            std::net::SocketAddr::from(([0, 0, 0, 0], bound.port())),
+            BindExposure::Routable,
+        )
+    };
+
+    {
+        let store = harness.credentials.lock().expect("lock");
+        let view = access.view(&store, |_| None);
+        assert_eq!(view.browsers.len(), 2, "one row per browser that got in");
+        for (index, row) in view.browsers.iter().enumerate() {
+            assert_eq!(
+                row.address.as_deref(),
+                Some("127.0.0.1"),
+                "the address is the one the socket reported, row {index}"
+            );
+            assert_eq!(
+                row.browser.as_deref(),
+                Some("Chrome on macOS"),
+                "and the browser is what it claimed at the exchange, row {index}"
+            );
+        }
+        assert_eq!(view.browsers[0].key, Some('1'));
+        assert_eq!(view.browsers[1].key, Some('2'));
+    }
+
+    {
+        let mut store = harness.credentials.lock().expect("lock");
+        assert_eq!(
+            access.handle_key(AccessKey::Char('2'), &mut store),
+            AccessOutcome::Revoked,
+            "the credential is withdrawn; the socket is still the event loop's"
+        );
+        assert_eq!(
+            store.active_tokens().count(),
+            1,
+            "one digit, one credential — `2` is not `x`"
+        );
+    }
+    // The half the event loop performs, exactly as it does for `x`.
+    harness.handle.recheck_credentials();
+
+    on_runtime(async {
+        let (frames, closed) = drain_frames(&mut doomed, WAIT).await;
+        assert!(closed, "the browser on row two is out");
+        assert_eq!(
+            shutdown_in(&frames),
+            Some((ShutdownReason::TokenRevoked, false)),
+            "and lands on 2b rather than on `reconnecting…`: {frames:?}"
+        );
+
+        send(
+            &mut kept,
+            &ClientMsg::Input(Input {
+                seq: 55,
+                terminal_id: "t-agent".into(),
+                data: b"echo still here\r".to_vec(),
+            }),
+        )
+        .await;
+        let (frames, closed) = drain_frames(&mut kept, Duration::from_millis(500)).await;
+        assert!(!closed, "row one was not named and must not be evicted");
+        assert_eq!(shutdown_in(&frames), None, "nor told anything: {frames:?}");
+    });
+
+    let inputs: Vec<u64> = harness
+        .inbound()
+        .iter()
+        .filter_map(|event| match event {
+            WebInbound::Input { input, .. } => Some(input.seq),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        inputs.contains(&55),
+        "the browser nobody named still types: {inputs:?}"
+    );
+}
+
 /// The same eviction, driven the way a human drives it: artboard 2a State B's
 /// `x`. The overlay prints `1 browser revoked — new code issued.`, and this is
 /// the test that the sentence is true.
@@ -1655,6 +1769,53 @@ fn published_state_is_what_the_next_attach_sees() {
         assert_eq!(snapshot.host_version, "9.9.9-published");
         assert_eq!(snapshot.geometry.cols, 120);
         assert_eq!(snapshot.replay_capacity_bytes, 4096);
+    });
+}
+
+/// SPECS §30's notice, over a real socket (`remote-control-gk94`, §6.5 R25).
+///
+/// The chip's whole failure was that nothing carried this: the browser rendered
+/// `state.update`, the reducer set it from `snapshot.update`, and `Snapshot` had
+/// no such field, so the adapter hardcoded `null`. This is the frame that
+/// closes the gap, so it is asserted on the frame rather than on the struct the
+/// host published.
+#[test]
+fn the_update_notice_the_host_learnt_rides_on_the_snapshot() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    harness.handle.publish_state(HostState {
+        update: Some(flightdeck::web::protocol::UpdateNotice {
+            latest_version: "1.17.0".to_string(),
+        }),
+        ..HostState::default()
+    });
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Write).await;
+        let snapshot = await_snapshot(&mut ws).await;
+        assert_eq!(
+            snapshot.update.map(|u| u.latest_version).as_deref(),
+            Some("1.17.0"),
+            "1a's `● v1.16.0 available` chip has a source at last"
+        );
+    });
+}
+
+/// A host that learnt nothing says nothing — and that is not the same claim as
+/// "you are up to date", which no surface makes.
+#[test]
+fn a_host_with_no_update_finding_sends_no_notice() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Write).await;
+        assert_eq!(await_snapshot(&mut ws).await.update, None);
     });
 }
 

@@ -2148,15 +2148,11 @@ fn event_loop(
     // finding immediately and, when due, kick off a background check. Applied to
     // every project so whichever is active shows the hint.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    // An isolated run makes no network call and writes no cache (SPECS §32).
-    let check_enabled = !workspace.active_project().state.isolated
-        && workspace.active_project().state.config.update.check;
+    let check_enabled = update_check_enabled(&workspace.active_project().state);
     if let Some(latest) =
         crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
     {
-        for p in workspace.projects.iter_mut() {
-            p.state.update_available = Some(latest.clone());
-        }
+        apply_update_notice(workspace, latest);
     }
 
     // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
@@ -2377,9 +2373,7 @@ fn event_loop(
 
         // --- Apply a completed background update check (SPECS §30). ---
         while let Ok(latest) = update_rx.try_recv() {
-            for p in workspace.projects.iter_mut() {
-                p.state.update_available = Some(latest.clone());
-            }
+            apply_update_notice(workspace, latest);
         }
 
         // --- Drain relay-client events (link state, envelopes, presence) into
@@ -2818,6 +2812,7 @@ fn event_loop(
                     area,
                     chrome,
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
+                    p.state.config.ui.agent_tab_side(),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
                 draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
@@ -2898,6 +2893,32 @@ fn event_loop(
     }
 
     Ok(())
+}
+
+/// Whether SPECS §30's once-a-day update check may run for this project.
+///
+/// Two facts, both the project's own: the user can turn the notice off
+/// (`[update] check = false`), and an `--isolated` run makes no network call
+/// and writes no cache at all (SPECS §32). Pure and named rather than inline
+/// so the isolated rule is assertable — a run that checks nothing must also
+/// *tell* nobody, which is what keeps `Snapshot::update` honest for an
+/// isolated host.
+fn update_check_enabled(state: &crate::app::state::AppState) -> bool {
+    !state.isolated && state.config.update.check
+}
+
+/// Record a completed update check on every open project (SPECS §30).
+///
+/// Every project, not just the active one, because the hint belongs to the
+/// binary rather than to a repository: whichever project is on screen when the
+/// answer arrives is the one that must show it. Shared by the two sites that
+/// learn the version — the cached finding `start_check` returns immediately,
+/// and the background thread's later answer — so the browser's snapshot and the
+/// desktop's status bar can never be reading two different fields.
+fn apply_update_notice(workspace: &mut Workspace, latest: String) {
+    for p in workspace.projects.iter_mut() {
+        p.state.update_available = Some(latest.clone());
+    }
 }
 
 /// Build the state the browser paints from, out of every open project.
@@ -3031,6 +3052,23 @@ fn build_web_host_state(
             active.state.isolated,
         ),
         about: crate::tui::help::about_doc(),
+        // SPECS §30's notice, read from the same field the desktop's own status
+        // bar draws from rather than from a second copy — there is one update
+        // check per run and it writes exactly one place
+        // (`remote-control-gk94`, `specs/WEB_INTERFACE.md` §6.5 R25). `None`
+        // when no check has reported a newer release, which includes every
+        // reason there was no check at all; see `Snapshot::update` for why that
+        // is not the same claim as "up to date".
+        update: active.state.update_available.as_ref().map(|latest| {
+            crate::web::protocol::UpdateNotice {
+                latest_version: latest.clone(),
+            }
+        }),
+        // Artboard 1h position 4 (`specs/WEB_INTERFACE.md` §6.5 R24), read
+        // from the active project's config through the same
+        // `UiConfig::agent_tab_side` the TUI's own layout reads — so the two
+        // surfaces cannot end up mirroring on different rules.
+        sidebar_position: active.state.config.ui.agent_tab_side(),
     }
 }
 
@@ -4379,10 +4417,15 @@ fn restore_terminal_modes(keyboard_enhanced: bool) {
 /// columns and the hidden bars' rows to the viewport.
 fn viewport_pty_size(full: PtySize, mode: InputMode, reserve_border: bool) -> PtySize {
     let area = Rect::new(0, 0, full.cols, full.rows);
+    // `[ui] agent_tab_position` moves the sidebar without resizing it, so the
+    // viewport is the same number of cells on both settings and this function
+    // does not need to be told which one is in force. `layout.rs`'s
+    // `agent_tab_side_does_not_change_either_pane_size` holds that true.
     let ml = crate::tui::layout::compute(
         area,
         crate::tui::layout::chrome_for(area, mode),
         reserve_border,
+        crate::contracts::AgentTabPosition::default(),
     );
     PtySize {
         rows: ml.terminal.height.max(1),
@@ -4437,6 +4480,7 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
             area,
             chrome,
             crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
+            workspace.active_project().state.config.ui.agent_tab_side(),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
         if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
@@ -4701,6 +4745,7 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
         area,
         crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
     if state.split_view {
         let region = crate::tui::layout::split_region(&ml);
@@ -4725,6 +4770,7 @@ fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Opt
         area,
         crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
     if !state.split_view {
         return Some(ml.terminal);
@@ -4960,6 +5006,15 @@ mod web_access_key_tests {
                 map_web_access_key(bare(KeyCode::Char(c))),
                 Some(AccessKey::Char(c)),
                 "{c} is one of the two footers' keys"
+            );
+        }
+        // The browser list's own keys (`remote-control-gk94`): a digit that
+        // never reached the overlay would leave every numbered row inert.
+        for c in ['1', '5', '9'] {
+            assert_eq!(
+                map_web_access_key(bare(KeyCode::Char(c))),
+                Some(AccessKey::Char(c)),
+                "{c} revokes the browser on that row"
             );
         }
     }
@@ -8842,6 +8897,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
             area,
             crate::tui::layout::chrome_for(area, state.mode()),
             crate::tui::mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let region = crate::tui::layout::split_region(&ml);
         let n = state.tabs[idx].session.child_count() + 1;
@@ -8878,6 +8934,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
             area,
             crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let size = PtySize {
             rows: ml.terminal.height.max(1),
@@ -11922,7 +11979,12 @@ mod tests {
                 width: 80,
                 height: 24,
             };
-            let ml = crate::tui::layout::compute(area, crate::tui::layout::Chrome::Full, false);
+            let ml = crate::tui::layout::compute(
+                area,
+                crate::tui::layout::Chrome::Full,
+                false,
+                crate::contracts::AgentTabPosition::Left,
+            );
             let names: Vec<String> = ws.projects.iter().map(|p| p.name.clone()).collect();
             let row = crate::tui::layout::HEADER_HEIGHT;
             // Find a column that hits the second project's tab, wherever the
@@ -13870,6 +13932,137 @@ mod tests {
     /// four that matter for a remote surface are here: §13's dirty base, §5.1's
     /// rebase preconditions, §14's uncommitted-changes warning, and git itself
     /// failing outright.
+    /// SPECS §30's update notice, from the field the host keeps it in to the
+    /// frame the browser paints (`remote-control-gk94`, §6.5 R25).
+    ///
+    /// `AppState::update_available` is the one place the check writes — both
+    /// `crate::update::start_check`'s cached finding and the background
+    /// thread's later answer land there through `apply_update_notice` — so
+    /// driving that field is driving the production path, not a stand-in for
+    /// it. What was missing was everything downstream: `HostState` had no such
+    /// field and `Snapshot` had no such field, so the chip could not appear.
+    mod web_update_notice {
+        use super::isolated_refusals::one_project_workspace;
+        use super::*;
+
+        fn host_state(workspace: &Workspace) -> crate::web::server::HostState {
+            build_web_host_state(
+                workspace,
+                &crate::web::stream::TerminalStreams::new(4096),
+                Vec::new(),
+                None,
+                0,
+            )
+        }
+
+        #[test]
+        fn a_newer_release_reaches_the_snapshot_the_browser_paints_from() {
+            let mut workspace = one_project_workspace(false);
+            apply_update_notice(&mut workspace, "1.17.0".to_string());
+
+            assert_eq!(
+                host_state(&workspace).update,
+                Some(crate::web::protocol::UpdateNotice {
+                    latest_version: "1.17.0".to_string(),
+                }),
+                "1a's chip renders this, and nothing else on the wire carries it"
+            );
+        }
+
+        /// Every open project, because the hint belongs to the binary: a browser
+        /// looking at the background project must see the same chip.
+        #[test]
+        fn the_notice_is_recorded_on_every_open_project() {
+            let mut workspace = super::isolated_refusals::two_project_workspace(false);
+            apply_update_notice(&mut workspace, "1.17.0".to_string());
+
+            for project in workspace.projects.iter() {
+                assert_eq!(
+                    project.state.update_available.as_deref(),
+                    Some("1.17.0"),
+                    "whichever project is active when the answer lands shows it"
+                );
+            }
+        }
+
+        /// A host that has learnt nothing sends nothing. `None` is not the same
+        /// claim as "you are up to date", and neither surface makes that one.
+        #[test]
+        fn a_host_with_no_finding_sends_no_notice() {
+            let workspace = one_project_workspace(false);
+            assert_eq!(host_state(&workspace).update, None);
+        }
+
+        /// SPECS §32: an isolated run makes no network call and writes no
+        /// cache, so it has nothing to report and must not report anything.
+        #[test]
+        fn an_isolated_run_never_checks_and_so_never_has_a_notice_to_send() {
+            let workspace = one_project_workspace(true);
+            assert!(
+                !update_check_enabled(&workspace.active_project().state),
+                "no check runs at all in an isolated session"
+            );
+            assert_eq!(
+                host_state(&workspace).update,
+                None,
+                "and with no check there is nothing honest to send"
+            );
+        }
+
+        /// The other way to have no notice: the user turned it off.
+        #[test]
+        fn the_check_can_be_switched_off_in_config() {
+            let mut workspace = one_project_workspace(false);
+            assert!(
+                update_check_enabled(&workspace.active_project().state),
+                "SPECS §30 is on by default"
+            );
+            workspace.projects[0].state.config.update.check = false;
+            assert!(!update_check_enabled(&workspace.projects[0].state));
+        }
+    }
+
+    /// `[ui] agent_tab_position` from the config file to the frame the browser
+    /// lays out from (`remote-control-ecsv`, `specs/WEB_INTERFACE.md` §6.5
+    /// R24).
+    ///
+    /// The desktop half is proved in `tui::render` against a drawn buffer; this
+    /// is the other surface's half, and it is the link that did not exist: the
+    /// key was read by nothing, so nothing carried it. Driving
+    /// `build_web_host_state` is driving the production path — it is the one
+    /// function the event loop publishes from.
+    mod web_sidebar_position {
+        use super::isolated_refusals::one_project_workspace;
+        use super::*;
+
+        fn host_state(workspace: &Workspace) -> crate::web::server::HostState {
+            build_web_host_state(
+                workspace,
+                &crate::web::stream::TerminalStreams::new(4096),
+                Vec::new(),
+                None,
+                0,
+            )
+        }
+
+        #[test]
+        fn the_setting_reaches_the_snapshot_the_browser_lays_out_from() {
+            let mut workspace = one_project_workspace(false);
+            assert_eq!(
+                host_state(&workspace).sidebar_position,
+                crate::contracts::AgentTabPosition::Left,
+                "the default the setting itself has"
+            );
+
+            workspace.projects[0].state.config.ui.agent_tab_position = "right".to_string();
+            assert_eq!(
+                host_state(&workspace).sidebar_position,
+                crate::contracts::AgentTabPosition::Right,
+                "1h position 4 mirrors the browser's body row on this word"
+            );
+        }
+    }
+
     mod web_git_guards {
         use super::*;
         use crate::web::commands::{confirmation_of, Confirmation};

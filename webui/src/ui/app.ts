@@ -309,6 +309,14 @@ export function createApp(options: AppOptions): App {
      */
     frame.setAttribute("data-width", state.width);
     frame.setAttribute("data-sidebar", String(state.sidebarOpen));
+    /**
+     * 1h position 4 (`remote-control-ecsv`, §6.5 R24): the tenth attribute, and
+     * the last piece of `[ui] agent_tab_position`. `main.css` reads it and
+     * mirrors the body row; nothing here measures or branches, exactly as
+     * `data-width` above hands `narrow.css` an answer rather than a media
+     * query.
+     */
+    frame.setAttribute("data-sidebar-side", state.sidebarPosition);
 
     if (state.layout === "split") {
       if (split === null) {

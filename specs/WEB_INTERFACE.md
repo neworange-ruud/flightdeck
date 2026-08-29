@@ -526,7 +526,15 @@ Positions the design locked in, which this spec adopts: palette-primary with
 `Ctrl-g` as the only chord claimed; `Esc Esc` (within 400ms) or click-outside to
 leave terminal focus, with a single `Esc` still passing through to the agent;
 dark-only; `● connected 18ms` and a viewer count in the status bar; slide-over
-sidebar below 900px.
+sidebar below 900px; and **1h position 4's mirror** — `[ui]
+agent_tab_position = right` moves the sidebar to the other end of the body row,
+taking the focus glow's seam, the `✕` column and the selection stripe with it.
+
+All four of 1h's positions are honoured. Position 4 was the last: the key
+parsed, validated and was editable from both configuration managers for the
+whole of M1 and M2 while moving nothing on either surface. It is implemented,
+and its derivation — including why the narrow slide-over deliberately does
+*not* follow it — is §6.5 **R24**.
 
 Delivered in turn 2 (brief: `specs/WEBAPP_DESIGN_BRIEFING_T2.md`, artboards
 vendored at `specs/design/flightdeck-web-turn2.dc.html`): 2a access overlay in
@@ -2499,6 +2507,8 @@ command that locks everyone out — State B's footer says `x revoke`, not `x rev
 this one`. That behaviour is unchanged. The eviction machinery underneath is
 per-token anyway, so `remote-control-gk94` changes which credentials are
 withdrawn and nothing about what happens to the sockets holding them.
+**Done in R25**, and `x` is unchanged by it: the numbered rows added `1`–`9`
+beside it rather than redefining the key D5 asks for.
 
 **The browser now lands on 2b without reloading.** The `connection/shutdown`
 reducer raises the revoked access screen from the frame, not only from the HTTP
@@ -2982,6 +2992,283 @@ session, singular and all.
 
 ---
 
+### R24 — a setting that validated and did nothing, and an index that outlived its columns
+
+Two more from the post-P0 audit (`remote-control-ecsv`,
+`remote-control-zbwx`), recorded together because they are the same failure at
+two altitudes: a value the app computes, publishes and then never reads.
+
+**1. `[ui] agent_tab_position` is honoured, on both surfaces.**
+
+The key was declared (`src/contracts/domain.rs`), defaulted, round-tripped
+through the layered loader, and offered as an editable choice row in the
+desktop's configuration manager — and read by nothing. `grep
+'\.agent_tab_position' src/` returned two test assertions.
+`src/tui/layout.rs` hardcoded `Layout::horizontal([sidebar, main])`, and in the
+browser the sidebar was unconditionally the first child of `.fd-body`. Setting
+it to `right` moved nothing, on either surface, silently. After R22 wired the
+browser's configuration manager to the host's real config, the same dead key
+became settable from a second place, which made it worse rather than better.
+
+**The choice was honour or withdraw, and the reason to honour it is that the
+design asked for it and the cost is small.** Artboard 1h position 4 is entirely
+about this key — *"`ui.agent_tab_position = right` mirrors the body row; the
+focus glow, the ✕ column and the selection stripe all flip with it — nothing
+else moves"* — and positions 1 through 3 of the same panel are all honoured.
+Withdrawing would have meant deleting a setting users can already see in two
+configuration managers and in the generated global `config.toml`, to save a
+layout change that came to one `match` in the TUI and one scoped CSS block in
+the browser. A dead key is the worst of the three options; between the other
+two, the one the design drew wins.
+
+**1h's three named items are not decoration, they are the list of directional
+facts.** A bare `row-reverse` gets the columns right and leaves three things
+pointing the wrong way, and those three are exactly what the sentence names:
+
+* **the focus glow** — 1b hands a one-pixel seam back and forth between the two
+  panes as the keyboard moves (`.fd-sidebar`'s `border-right` becomes
+  `.fd-main`'s `border-left` in App mode). Mirrored, the seam is the sidebar's
+  *left* edge and the main pane's *right* one;
+* **the ✕ column** — pinned to a session row's right inset. Mirrored, it takes
+  the left inset, and the row's text is padded off it, because unlike the right
+  inset the left one is where 1a's caret and status glyph already are;
+* **the selection stripe** — 1a's 2px inset bar, mirrored to the row's outer
+  edge, the one against the window rather than the one against the terminal.
+
+Everything else in the region is symmetric and mirrors for free, which is why
+nothing else is listed and why the CSS block is scoped to
+`[data-sidebar-side="right"]`: `left` is the layout it has always been, to the
+pixel, and the setting is paid for only by the people who set it.
+
+**The desktop mirrors the same three where it has them.** `compute` takes an
+`AgentTabPosition` and swaps the constraint order — the same pair either way,
+so `right` is a mirror of the row and not a second layout with its own
+arithmetic — the sidebar's one-cell divider follows the seam, and
+`sidebar_name_line` puts the `✕` on the sidebar's outer end. The TUI has no 2px
+stripe; its selection marker is the `▸` beside the name, which stays with the
+name, because 1h names the stripe and not 1a's caret. Widths do not change on
+either surface, which is what lets `viewport_pty_size` stay side-blind and is
+asserted rather than asserted-in-prose
+(`agent_tab_side_does_not_change_either_pane_size`).
+
+**One parse, in `contracts`, because two surfaces read it.** The validated
+string becomes `AgentTabPosition` in exactly one function,
+`UiConfig::agent_tab_side` — the shape `mode_style::border_enabled` already had
+— and that enum is what the TUI branches on *and* what travels on the wire, the
+way `InterpretedStatus` and `TabId` already do. Two independent readings of the
+same string is how one surface ends up honouring a setting and the other not,
+which is the defect one layer along.
+
+**It rides on the `Snapshot`, and it is not a version bump.**
+`Snapshot::sidebar_position` is `#[serde(default)]`, so rule 4 of the
+forward-compatibility policy covers it exactly as it covered `help` and
+`about`: a host that does not send it leaves a browser laying the sidebar out
+on the left, which is the default the setting itself has — a lesser answer, not
+a wrong one. It is on the snapshot rather than on `ServerMsg::Configuration`,
+even though 1f lists the same key, because that frame answers a *request* and
+only arrives while someone has the panel open; the body row has to be right in
+the first frame a tab paints. Same reasoning as `replay_capacity_bytes`, which
+is also a config value the browser needs before it has asked anything.
+
+**A save now resyncs.** The configuration frame carries nothing that separates
+a read from a save, so `wire/socket.ts` asks for a fresh snapshot on either —
+one coalesced round trip on a panel a human just opened, against the
+alternative of saving `right` from 1f, watching the desktop's sidebar move, and
+watching this tab's stay put until it was reloaded. That would have been this
+same defect wearing different clothes.
+
+**Below 900px the slide-over does not move**, and that is R17's rule rather
+than an omission. The setting mirrors the body *row*; at that width there is no
+row to mirror, because the sidebar is absolutely positioned over the pane and
+`row-reverse` does not reach it. Following the setting anyway would put it on
+the edge 2e's feed already owns — the collision R17 chose the left edge to
+avoid, with both panels openable at once. `narrow.css` therefore mentions
+`data-sidebar-side` nowhere, and a test asserts that it does not.
+
+**The value is now validated**, alongside `mode_border` and the two mode
+colours. Until R24 an unexpected value and the default drew the same screen, so
+rejecting one would have been pedantry; now `agent_tab_position = "rihgt"`
+would quietly draw `left`, which is the exact class of silent-nothing that
+validation is for.
+
+**2. `selection/session` reset nothing, so `splitFocus` outlived its columns.**
+
+`splitFocus` is an index into the *selected session's* terminals. Moving to a
+session with fewer terminals left it past the last column, and
+`ui/splitView.ts` marks a column focused by comparing its own index against it
+— so 1c's glow was on **no column at all**. `remote-control-qlza` hardened
+`moveSplitFocus` in `ui/app.ts`, which made the *key* path safe and left the
+reducer gap untouched; a sidebar click, a feed row's jump, a project switch and
+a host-driven selection (which lands as a whole `snapshot/received` — see
+`wire/socket.ts`'s `selection` delta) could all still strand it.
+
+**Fixed once, in the reducer, as a clamp applied after every action.** Not per
+case: the four reachable paths are four cases today, and a fix per case is a
+fix the fifth case will not have. `reduce` is now a two-line wrapper around
+`reduceAction`, and it returns the same object when nothing moved, so an
+unrelated action costs no re-render. `moveSplitFocus` stays as it is — it
+clamps *before stepping*, which is a different job.
+
+**What covers it.** For the setting, the front door on both surfaces, and
+nothing that dispatches a layout.
+`tui::render::tests::agent_tab_position_right_mirrors_the_body_row_in_the_drawn_buffer`
+sets the TOML key, draws twice, and reads the heading column, the `✕` column
+and the divider column back out of the rendered buffer, plus that the
+full-width top band is byte-identical between the two;
+`agent_tab_position_right_moves_the_hit_targets_with_the_sidebar` does the same
+for clicks, because a `✕` drawn on one side and hit-tested on the other would
+close nothing. `tests::web_sidebar_position` drives `build_web_host_state` —
+the one function the event loop publishes from — from the config field to the
+frame. `webui/src/wire/wiredScreen.test.ts` delivers a real snapshot frame with
+`sidebar_position: "right"` through the app's own store and asserts the
+attribute on `.fd-frame`, that an absent field lays out `left`, and that the
+DOM order is unchanged so a screen reader hears 1a's order either way — and it
+reads `main.css` to assert the attribute is not inert, which is the half jsdom
+cannot see. `protocol/tests.rs` round-trips the non-default value and asserts
+the additive-absent behaviour the no-bump claim rests on.
+
+For `splitFocus`, `ui/mainScreen.test.ts` drives the two paths a keystroke
+cannot reach: a real click on a real `.fd-session__select`, and a host snapshot
+whose selection is not this browser's. Both assert the state *and* the rendered
+`data-focused` row, because the state was only ever the cause — the missing
+glow was the symptom, and it is the symptom a user reported.
+
+---
+
+### R25 — the update chip had no source, and `x Revoke` could not see who it was locking out
+
+`remote-control-gk94`. Two findings from the post-P0 audit with one cause: a
+surface drew a fact the host never sent.
+
+**1. The chip could not appear.** Artboard 1a draws `● v1.16.0 available` at the
+right end of the status bar and 2c gives it a row of its own. `ui/statusBar.ts`
+rendered it from `state.update`, the reducer set that from `snapshot.update`,
+and `wire/adapt.ts` hardcoded `update: null` under a comment saying the chip was
+*"the updater's business, not the protocol's"* — which was exactly backwards.
+The updater is the host's (SPECS §29/§30): `crate::update::start_check` returns
+yesterday's cached finding synchronously and spawns at most one background query
+against GitHub, and both land in `AppState::update_available`, which is what the
+desktop's own status bar draws. `Snapshot` had no field for it, so there was
+nothing for the adapter to read and the browser drew the empty
+`.fd-statusbar__pad` for every host.
+
+`Snapshot::update: Option<UpdateNotice>` carries it now, filled in
+`build_web_host_state` from that same field — the one the check writes, not a
+second copy. `apply_update_notice` is the one place that writes it, shared by
+`start_check`'s immediate answer and the background thread's later one, so the
+two surfaces cannot end up reading different fields.
+
+**`None` is "this host has no notice", never "you are up to date".** It is the
+answer for four different host states — `[update] check = false`, an
+`--isolated` run (SPECS §32 makes no network call and writes no cache), a build
+without the self-updater, and a check that has not come back — and the desktop
+cannot tell them apart either, because `update_available` is the same `Option`.
+So the wire does not pretend to: the browser renders the chip on `Some` and the
+same spacer it always drew on `None`, which is precisely what the desktop's
+status bar does. §30's *"surface = a status-bar hint only, never a modal, never
+an interruption"* therefore reads identically on both surfaces, and the browser
+is never more insistent than the machine it is looking at.
+
+**On the snapshot, not a delta, and no `PROTOCOL_VERSION` bump.** The check runs
+once, at startup, so the fact settles seconds into the run and never moves
+again; a tab attaching after that — which is every tab, the server being started
+from the palette — is told in the frame it paints from, and there is no change
+for a `Delta` to describe. The field is additive and `#[serde(default)]`, so it
+is the forward-compatibility policy's **rule 4**, the reading `DialogBody::toggle`
+and `Delta::Seats::you_were_preempted` got: a host that sends nothing leaves the
+browser exactly where it was, with no chip. It is not the `ServerMsg::GitStatus`
+case that forced v2 → v3 or the `ServerMsg::Configuration` case that forced
+v3 → v4 — no frame kind appeared and no closed vocabulary grew a member — and
+nobody *asked* for this news, so a peer that dropped it would be silent where
+silence was already the answer. The protocol stays at **v4**.
+
+**2. `x Revoke browser access` was blind, and is now aimed.** Artboard 2a State
+B draws `● 1 browser holds access · 192.168.2.20 · Safari/iOS · 14m`.
+`WebAccessView` carried `active_browsers: usize` and `browsers_line` rendered
+the count alone, so the owner could not tell their own phone from an intruder —
+the one question the line exists to answer. Most of the data was already stored
+and unused: `BrowserToken` has `label`, `created_unix_secs` and
+`last_seen_unix_secs`. The address was not: it was passed to `exchange_code` for
+rate-limiting and thrown away.
+
+`BrowserToken::address` stores it now, and it is stored **as the host's
+observation** — `peer.ip()` off the socket, the same string the limiter is
+consulted about, never a header a client could set. That is R12's rule applied a
+second time, and it is why the two facts sit in two fields: the address is
+something we watched happen, the label is something a browser said. The label is
+never parsed. It goes through the same `coarse_user_agent` reduction the viewer
+chip uses, so both surfaces call one browser the same thing, and a claim that
+reduces to nothing falls back to the sanitised, capped text rather than to a
+guess. A user-agent full of ` · ` separators is still one field and still one
+row; a control character never reaches the terminal. It is also capped at 256
+characters **before** it is persisted, because `web.json` keeps it for the life
+of the credential.
+
+`coarse_user_agent` gained one fix in passing: it tested `Mac OS X` before
+`iPhone`, and every iOS user-agent contains `like Mac OS X`, so every phone was
+labelled `Safari on macOS` — on this list *and* on 2f's viewer chip. iOS and
+Android are tested first now, before the strings their user-agents also contain.
+
+**Ages are dated on the host's own clock.** `WebAccessView` is built from the
+store, and the store holds the `Clock` seam that stamped the record, so
+`granted_secs_ago` is one clock's difference against itself. A record stamped in
+the future saturates to `0s` rather than printing a negative duration — the same
+refusal R12 records for the seat rows.
+
+**Revoke is per-browser now, and `x` still means everyone.** `remote-control-glmt`
+built the eviction machinery per-token for this task, so this changes which
+credentials are withdrawn and nothing about what happens to the sockets holding
+them. `x` is untouched: D5 asks for one command that locks *everyone* out and 2a's
+footer draws it, so redefining that key would have taken the command away.
+`1`–`9` are the addition beside it, and each numbered row prints its own digit.
+
+Digits rather than a second `↑↓` picker, because `↑↓` already belongs to the
+address list and a second list would need a focus concept the overlay does not
+have — two lists, one pair of arrows and an invisible mode is how a revoke lands
+on the wrong browser. The `1-n` hint lives on the `● 2 browsers hold access —
+1-2 revokes one` header rather than in the footer legend, for two reasons: the
+rows are an echoed tier that a short terminal drops, and a legend entry for keys
+whose rows are off screen points at nothing; and the legend has to survive at
+100 columns, where a seventh pair pushes `Esc close` off the end. The range names
+exactly the digits that are bound, so a tenth browser — listed, revocable by
+`x`, past the last digit — is never implied to have a key it does not have.
+Ordering is the store's issue order, in the rows and in what a digit indexes, so
+a browser that authenticates between two frames appends and can never renumber a
+row the user is looking at. A digit with no row under it is silent, not a
+refusal. `revoke_one` returns `AccessOutcome::Revoked` for the same reason `x`
+does: the credential is withdrawn here, the socket is the event loop's to close,
+and the notice is only true once it has been.
+
+**What covers it.** For the chip, three doors on the one path.
+`tests::web_update_notice` in `src/lib.rs` drives `apply_update_notice` — the
+function both update-check sites call — and asserts the notice reaches
+`HostState`, that it is recorded on *every* open project, that a host with no
+finding sends none, and that `update_check_enabled` is false for an `--isolated`
+run so there is nothing to send. `tests/web_server.rs` publishes it and reads it
+back off a real `Snapshot` frame over a real socket, plus the negative. And
+`webui/src/wire/wiredScreen.test.ts` — R21's front-door file — delivers a real
+snapshot frame through the app's own store and asserts `v1.16.0 available` in
+the DOM, and that a frame with no `update` draws the spacer and no claim. Not one
+of them dispatches an action: an action-driven test would have supplied the
+exact thing production was missing, which is how this defect survived a green
+suite in the first place.
+
+For the overlay, `src/web/access/tests.rs` asserts each row's three facts come
+out of the store, that a digit revokes the browser it names and leaves the
+other, that a digit past the list revokes nothing, that a hostile user-agent
+cannot forge a field or reach the terminal, that `x` still takes all three of
+three, and that a record from an **older `web.json`** — no `address`, no `label`
+— is still listed and still revocable, drawn short rather than padded with a
+placeholder. `src/tui/render.rs` paints the overlay and asserts the drawn rows.
+`tests/web_server.rs`'s
+`a_numbered_row_revokes_the_browser_it_names_and_leaves_the_other_typing` is the
+end-to-end one: two credentials, two live authenticated sockets, the overlay
+opened against the running listener, `2` pressed, and both directions asserted —
+the named browser is closed with `TokenRevoked`, and the one nobody named is not
+closed, is told nothing, and still types through to the host seam.
+
+---
+
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.
@@ -3008,6 +3295,8 @@ session, singular and all.
   measured pixel width, and why it is not a media query (R17).
 - `webui/src/style/narrow.css` — everything below 900px, keyed off `data-width`
   on `.fd-frame`: the slide-over sidebar, the fold, and the restacked panels.
+- `src/contracts/domain.rs` — `AgentTabPosition` and `UiConfig::agent_tab_side`,
+  the one place `[ui] agent_tab_position` is parsed for both surfaces (R24).
 - `src/web/arbiter.rs` — the input lock behind D14's second revision (R14): who
   may type, why 400 ms, and why no surface has precedence.
 - `src/remote/client.rs` — the blocking relay client retired by D6/D7.

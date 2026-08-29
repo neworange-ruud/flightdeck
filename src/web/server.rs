@@ -198,6 +198,23 @@ pub struct HostState {
     /// The About screen's content. Constant for the build; carried here so
     /// [`Shared::snapshot_for`] has one place to read both overlays from.
     pub about: crate::tui::help::AboutDoc,
+    /// SPECS §30's update notice, mirrored straight from the desktop's own
+    /// `AppState::update_available` (`remote-control-gk94`, §6.5 R25).
+    ///
+    /// Published rather than pushed, like [`HostState::help`]: the check runs
+    /// once at startup and the answer never moves again, so there is no change
+    /// for a [`crate::web::protocol::Delta`] to describe. `None` is "this host
+    /// has no notice", not "you are up to date" — see
+    /// [`crate::web::protocol::Snapshot::update`] for the four ways to get one.
+    pub update: Option<crate::web::protocol::UpdateNotice>,
+    /// `[ui] agent_tab_position`, so the browser lays the body row out the way
+    /// the desktop does (`remote-control-ecsv`, §6.5 R24).
+    ///
+    /// Published rather than pushed, like [`HostState::help`] and for the same
+    /// reason — it is a `[ui]` setting the event loop holds, it changes at most
+    /// once per config save, and the browser picks the current one up on its
+    /// next snapshot.
+    pub sidebar_position: crate::contracts::AgentTabPosition,
 }
 
 impl Default for HostState {
@@ -217,6 +234,13 @@ impl Default for HostState {
             // to off.
             help: crate::tui::help::help_doc(false, false),
             about: crate::tui::help::about_doc(),
+            // A server that has never heard from the event loop has heard
+            // nothing about a release either, and says so.
+            update: None,
+            // A server that has not heard from the event loop has not been
+            // told the user's `[ui]` either, and `left` is the default that
+            // setting itself has.
+            sidebar_position: crate::contracts::AgentTabPosition::default(),
         }
     }
 }
@@ -957,6 +981,11 @@ impl Shared {
             // renders them rather than authoring a copy (§6.5 R16).
             help: Some(state.help.clone()),
             about: Some(state.about.clone()),
+            // SPECS §30's notice, as the desktop's own status bar has it.
+            update: state.update.clone(),
+            // 1h position 4: the browser mirrors the body row on the same
+            // setting the desktop mirrors it on, read from the same config.
+            sidebar_position: state.sidebar_position,
         }
     }
 
@@ -1601,7 +1630,19 @@ async fn exchange_route(
         // `exchange_code` consults the per-address limiter itself before it
         // looks at the digits, so the HTTP path is rate-limited by construction
         // rather than by remembering to ask.
-        let result = store.exchange_code(&address, &request.code, request.label.as_deref());
+        // The label is whatever the browser said about itself — in practice
+        // `navigator.userAgent`, in principle anything that fits in a JSON
+        // body. It is stripped of control characters and capped **before** it
+        // is persisted, because `web.json` keeps it for the life of the
+        // credential and a megabyte of it would be a megabyte on disk forever.
+        // The cap is generous enough for every real user-agent; the desktop's
+        // own list shortens it further when it draws it.
+        let label = request
+            .label
+            .as_deref()
+            .map(|raw| truncate_chars(&sanitize_label(raw), MAX_STORED_LABEL_CHARS))
+            .filter(|s| !s.is_empty());
+        let result = store.exchange_code(&address, &request.code, label.as_deref());
         let attempts = store.attempts_remaining(&address);
         (result, attempts)
     };
@@ -1814,18 +1855,24 @@ fn viewer_identity(peer: SocketAddr, headers: &HeaderMap, token: TokenId) -> Vie
 }
 
 /// How much of a browser-supplied label the chip will carry.
-const MAX_LABEL_CHARS: usize = 48;
+pub(crate) const MAX_LABEL_CHARS: usize = 48;
+
+/// How much of it `web.json` will keep. Longer than [`MAX_LABEL_CHARS`] because
+/// what is *stored* is the raw claim and what is *drawn* is a reduction of it
+/// ([`coarse_user_agent`] needs the whole string to find `Safari/` and
+/// `iPhone`), and shorter than any browser's user-agent is unbounded.
+const MAX_STORED_LABEL_CHARS: usize = 256;
 
 /// Keep the first `max` **characters**, never splitting a codepoint.
 /// `String::truncate` panics on a byte index that is not a char boundary, and
 /// the label is attacker-supplied UTF-8.
-fn truncate_chars(raw: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(raw: &str, max: usize) -> String {
     raw.chars().take(max).collect()
 }
 
 /// Reduce a `User-Agent` to the `Chrome on macOS` shape turn 2 asks for, keeping
 /// only characters that are safe to render verbatim in a terminal chip.
-fn coarse_user_agent(raw: &str) -> String {
+pub(crate) fn coarse_user_agent(raw: &str) -> String {
     let browser = if raw.contains("Firefox/") {
         "Firefox"
     } else if raw.contains("Edg/") {
@@ -1837,14 +1884,19 @@ fn coarse_user_agent(raw: &str) -> String {
     } else {
         ""
     };
-    let os = if raw.contains("Mac OS X") || raw.contains("Macintosh") {
+    // iOS is tested **before** macOS on purpose: Safari on an iPhone sends
+    // `(iPhone; CPU iPhone OS 17_0 like Mac OS X)`, so a `Mac OS X` test that
+    // ran first would call every phone a Mac — and telling a phone from a
+    // desktop is exactly what this label is for (`remote-control-gk94`).
+    // Android is likewise before Linux, which its user-agent also contains.
+    let os = if raw.contains("iPhone") || raw.contains("iPad") {
+        "iOS"
+    } else if raw.contains("Android") {
+        "Android"
+    } else if raw.contains("Mac OS X") || raw.contains("Macintosh") {
         "macOS"
     } else if raw.contains("Windows") {
         "Windows"
-    } else if raw.contains("Android") {
-        "Android"
-    } else if raw.contains("iPhone") || raw.contains("iPad") {
-        "iOS"
     } else if raw.contains("Linux") {
         "Linux"
     } else {
@@ -2370,7 +2422,7 @@ fn preempt_for_viewer(
 /// Keep a browser-supplied label renderable: printable characters only, no
 /// control bytes that could move a terminal cursor when the desktop draws the
 /// chip.
-fn sanitize_label(raw: &str) -> String {
+pub(crate) fn sanitize_label(raw: &str) -> String {
     raw.chars()
         .filter(|c| !c.is_control())
         .collect::<String>()

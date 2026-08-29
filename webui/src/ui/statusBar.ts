@@ -172,7 +172,10 @@ export function createStatusBar(options: StatusBarOptions = {}): Region {
         ? el("span", { class: "fd-statusbar__pad" })
         : el("span", { class: "fd-update" }, [
             el("span", { text: "●", attrs: { "aria-hidden": "true" } }),
-            `${state.update.version} available`,
+            /** 1a draws `● v1.16.0 available`. The wire carries the bare
+             * version, the same shape `host_version` has, so the `v` is added
+             * here — the one place that knows it is drawing a chip. */
+            `v${state.update.version} available`,
           ]),
     );
 

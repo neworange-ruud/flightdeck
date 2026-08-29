@@ -291,8 +291,13 @@ export interface GitUpstream {
   readonly behind: number;
 }
 
-/** An available update (1a's status-bar chip). */
+/**
+ * An available update (1a's status-bar chip), as SPECS §30's host-side check
+ * found it. `null` on the state is the host having *no notice* — never a claim
+ * that this host is up to date.
+ */
 export interface UpdateInfo {
+  /** Bare, as the host sent it (`1.16.0`); the chip prefixes the `v`. */
   readonly version: string;
 }
 
@@ -381,7 +386,26 @@ export interface Snapshot {
   readonly help: HelpDoc | null;
   /** The About screen, or `null` from a host that sends none. */
   readonly about: AboutDoc | null;
+  /**
+   * `[ui] agent_tab_position` — artboard 1h position 4, §6.5 R24.
+   *
+   * On the snapshot rather than on the configuration frame, even though 1f
+   * lists the very same key: that frame answers a request and only arrives
+   * while someone has the panel open, and the body row has to be laid out
+   * correctly in the first frame this tab paints. `left` from a host that does
+   * not send it, which is the default the setting itself has.
+   */
+  readonly sidebarPosition: SidebarPosition;
 }
+
+/**
+ * Which end of the body row the sidebar takes (`[ui] agent_tab_position`).
+ *
+ * The host's own vocabulary, spelled the way the config file spells it: the
+ * desktop reads the same two words out of the same key, and 1h's mirror is one
+ * rule applied on two surfaces rather than two rules that happen to agree.
+ */
+export type SidebarPosition = "left" | "right";
 
 /** Look-ups used by both the reducer and the components. */
 export function findProject(

@@ -483,6 +483,34 @@ export interface WireSnapshot {
   readonly help?: WireHelpDoc | null;
   /** The About screen, on the snapshot for `help`'s reason. */
   readonly about?: WireAboutDoc | null;
+  /**
+   * SPECS §30's update notice — 1a's `● v1.16.0 available` chip
+   * (`remote-control-gk94`, §6.5 R25). Rides on the snapshot because the host
+   * checks once, at startup, so there is no later change for a delta to carry.
+   *
+   * Absent or `null` is the host saying **it has no notice**, which is not the
+   * same claim as "you are up to date": the check may be off, the run may be
+   * `--isolated`, or the answer may not have come back. The chip is simply not
+   * drawn, exactly as the desktop's status bar draws nothing.
+   */
+  readonly update?: WireUpdateNotice | null;
+  /**
+   * `[ui] agent_tab_position` (`remote-control-ecsv`, §6.5 R24) — artboard 1h
+   * position 4's mirror, as the host has the setting.
+   *
+   * Rides on the snapshot rather than on `ServerMsg::Configuration` because
+   * that frame only arrives while 1f is open, and the body row has to be right
+   * in the first frame. Absent from a host that predates it, and `left` is then
+   * what is laid out — the default the setting itself has, so an old host gets
+   * the layout it has always drawn rather than a guess.
+   */
+  readonly sidebar_position?: "left" | "right" | null;
+}
+
+/** A newer release than the host is running (SPECS §30). */
+export interface WireUpdateNotice {
+  /** Bare, like `host_version` (`1.16.0`). The `v` belongs to the chip. */
+  readonly latest_version: string;
 }
 
 export interface WireTermBytes {

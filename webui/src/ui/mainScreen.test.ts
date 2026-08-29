@@ -599,6 +599,76 @@ describe("1c's ←/→ move focus", () => {
   });
 });
 
+/**
+ * `remote-control-zbwx`, `specs/WEB_INTERFACE.md` §6.5 R24.
+ *
+ * `remote-control-qlza` hardened `moveSplitFocus` — the *key* path — and left
+ * the reducer gap alone, so every other way of moving the selection could still
+ * strand the index past the last column. These two drive the two that were
+ * unreachable from a keystroke: a click in the sidebar, and the host moving the
+ * selection out from under the tab (which lands as a whole snapshot; see
+ * `wire/socket.ts`'s `selection` delta).
+ *
+ * The symptom is specific and worth asserting rather than summarising: with
+ * `splitFocus` out of range, `ui/splitView.ts` marks **no** column focused,
+ * because each column compares its own index against it.
+ */
+describe("moving to a session with fewer terminals", () => {
+  it("clamps splitFocus when a sidebar click lands on a smaller session", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    bodyPress("ArrowRight");
+    bodyPress("ArrowRight");
+    expect(h.app.store.getState().splitFocus).toBe(2);
+
+    /** The real control, clicked. `s-add-tests-api` has one terminal against
+     * the selected session's three. */
+    h.all(".fd-session__select")[1]?.click();
+
+    expect(h.app.store.getState().selection?.sessionId).toBe("s-add-tests-api");
+    expect(h.app.store.getState().splitFocus).toBe(0);
+    expect(
+      h.all(".fd-column").map((c) => c.getAttribute("data-focused")),
+    ).toEqual(["true"]);
+  });
+
+  it("clamps splitFocus when the host moves the selection itself", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "layout/set", layout: "split" });
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    bodyPress("ArrowRight");
+    bodyPress("ArrowRight");
+    expect(h.app.store.getState().splitFocus).toBe(2);
+
+    /**
+     * What the desktop selecting elsewhere actually delivers: a fresh snapshot
+     * whose `selection` — and whose `split_view` — are the host's
+     * (`wire/socket.ts` answers a `Delta::Selection` with a resync, so this is
+     * the frame that lands). Nothing in the browser asked for it, and nothing
+     * clamped on the way in before R24.
+     */
+    const snapshot = fixtureSnapshot();
+    h.app.store.dispatch({
+      type: "snapshot/received",
+      snapshot: {
+        ...snapshot,
+        splitView: true,
+        selection: {
+          projectId: "p-flightdeck",
+          sessionId: "s-add-tests-api",
+          terminalId: "t-add-tests-agent",
+        },
+      },
+    });
+
+    expect(h.app.store.getState().splitFocus).toBe(0);
+    expect(
+      h.all(".fd-column").map((c) => c.getAttribute("data-focused")),
+    ).toEqual(["true"]);
+  });
+});
+
 describe("artboard 1c — split view", () => {
   it("replaces the tab bar with one labelled column per terminal", () => {
     const h = render();

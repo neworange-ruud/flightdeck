@@ -174,7 +174,241 @@ fn rotate_revokes_every_browser_and_invalidates_the_previous_code() {
         view.notice.as_deref(),
         Some("1 browser revoked — new code issued.")
     );
-    assert_eq!(view.active_browsers, 0);
+    assert!(view.browsers.is_empty());
+}
+
+// -- who holds access, and revoking one of them (`remote-control-gk94`) ----
+
+/// Let `count` browsers in, each from its own address, and return the digits
+/// spent. The user-agents are the raw strings a real browser sends, because
+/// coarsening them is one of the things under test.
+fn let_browsers_in(s: &mut CredentialStore, agents: &[(&str, &str)]) {
+    for (address, agent) in agents {
+        let code = s.mint_bootstrap_code().reveal().to_string();
+        s.exchange_code(address, &code, Some(agent))
+            .expect("the code was just minted");
+    }
+}
+
+/// The line 2a State B draws — `● 1 browser holds access · 192.168.2.20 ·
+/// Safari/iOS · 14m` — needs three facts per holder, and every one of them has
+/// to come out of the store rather than out of the renderer's imagination.
+#[test]
+fn each_holder_is_named_from_what_the_host_stored_about_it() {
+    let (access, mut s, clock) = network();
+    let_browsers_in(
+        &mut s,
+        &[(
+            "192.168.2.20",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        )],
+    );
+    clock.set_unix_secs(1_700_000_000 + 14 * 60);
+
+    let view = access.view(&s, echo_qr);
+    let [row] = view.browsers.as_slice() else {
+        panic!("one browser holds access: {:?}", view.browsers);
+    };
+    assert_eq!(
+        row.address.as_deref(),
+        Some("192.168.2.20"),
+        "the address is the host's observation off the socket, not a claim"
+    );
+    assert_eq!(
+        row.browser.as_deref(),
+        Some("Safari on iOS"),
+        "the user-agent is coarsened the same way the viewer chip coarsens it"
+    );
+    assert_eq!(
+        row.granted_secs_ago,
+        14 * 60,
+        "dated against the store's own clock — the one that stamped the record"
+    );
+    assert_eq!(row.key, Some('1'), "the first row is revoked by `1`");
+}
+
+/// The whole point of the row: two browsers are two rows, and a digit takes
+/// exactly one of them out.
+#[test]
+fn a_digit_revokes_the_browser_on_that_row_and_leaves_the_other_alone() {
+    let (mut access, mut s, _clock) = network();
+    let_browsers_in(
+        &mut s,
+        &[
+            ("192.168.2.20", "Safari/604.1 iPhone"),
+            ("192.168.2.31", "Chrome/120.0 Macintosh"),
+        ],
+    );
+    let second_id = s
+        .active_tokens()
+        .nth(1)
+        .expect("two browsers hold access")
+        .id
+        .clone();
+
+    assert_eq!(
+        access.handle_key(AccessKey::Char('2'), &mut s),
+        AccessOutcome::Revoked,
+        "the credential is withdrawn here; the socket is the event loop's to \
+         close, exactly as `x` is (§6.5 R20)"
+    );
+
+    let view = access.view(&s, echo_qr);
+    let [row] = view.browsers.as_slice() else {
+        panic!("one browser is left: {:?}", view.browsers);
+    };
+    assert_eq!(row.address.as_deref(), Some("192.168.2.20"));
+    assert!(
+        !s.is_token_active(&second_id),
+        "the browser the digit named is the one that lost access"
+    );
+    assert_eq!(
+        view.notice.as_deref(),
+        Some("192.168.2.31 · Chrome on macOS is locked out — its access was revoked."),
+        "the notice names the browser, which is what the numbered rows are for"
+    );
+    assert_eq!(
+        s.active_tokens().count(),
+        1,
+        "one digit, one credential — not a rotation"
+    );
+}
+
+/// A digit past the end of the list is not "the last one".
+#[test]
+fn a_digit_with_no_row_under_it_revokes_nothing() {
+    let (mut access, mut s, _clock) = network();
+    let_browsers_in(&mut s, &[("192.168.2.20", "Safari/604.1 iPhone")]);
+
+    assert_eq!(
+        access.handle_key(AccessKey::Char('4'), &mut s),
+        AccessOutcome::Ignored,
+        "nothing was on row 4, so nothing may be revoked"
+    );
+    assert_eq!(s.active_tokens().count(), 1);
+    assert_eq!(
+        access.view(&s, echo_qr).notice,
+        None,
+        "a key the overlay never offered is silent, not a refusal"
+    );
+}
+
+/// R12's rule, on the second surface that shows a user-agent: the string is
+/// attacker-supplied, so it is reduced and never parsed — a separator inside it
+/// cannot become a field boundary, and a control character cannot reach the
+/// terminal.
+#[test]
+fn a_hostile_user_agent_cannot_forge_a_field_or_reach_the_terminal() {
+    let (access, mut s, _clock) = network();
+    let_browsers_in(
+        &mut s,
+        &[("192.168.2.20", "\u{1b}[2J · 10.0.0.1 · Administrator")],
+    );
+
+    let view = access.view(&s, echo_qr);
+    let [row] = view.browsers.as_slice() else {
+        panic!("one browser holds access");
+    };
+    assert_eq!(
+        row.address.as_deref(),
+        Some("192.168.2.20"),
+        "the address row still reads the address the socket reported"
+    );
+    let browser = row.browser.as_deref().expect("something was claimed");
+    assert!(
+        !browser.contains('\u{1b}'),
+        "no escape sequence survives into a drawn row: {browser:?}"
+    );
+    assert!(
+        browser.contains(" · 10.0.0.1 · "),
+        "the claim is carried whole and unparsed — the separators inside it are \
+         text, not field boundaries, which is why it can never become a second \
+         address: {browser:?}"
+    );
+    assert_eq!(
+        view.browsers.len(),
+        1,
+        "one credential is one row, however many separators its claim contains"
+    );
+}
+
+/// The digits and `x` are two different reaches, and adding the first must not
+/// have quietly narrowed the second (D5: one command locks everyone out).
+#[test]
+fn x_still_means_everyone_and_the_footer_still_says_so() {
+    let (mut access, mut s, _clock) = network();
+    let_browsers_in(
+        &mut s,
+        &[
+            ("192.168.2.20", "Safari/604.1 iPhone"),
+            ("192.168.2.31", "Chrome/120.0 Macintosh"),
+            ("192.168.2.44", "Firefox/121.0 X11; Linux"),
+        ],
+    );
+
+    assert_eq!(
+        access.handle_key(AccessKey::Char('x'), &mut s),
+        AccessOutcome::Revoked
+    );
+    assert_eq!(s.active_tokens().count(), 0, "all three, not the first");
+    assert!(
+        access.view(&s, echo_qr).keys.contains(&("x", "revoke")),
+        "2a's footer is unchanged"
+    );
+}
+
+/// A record from before the address was stored is still a real credential.
+///
+/// The store is opened over a `web.json` written by an **older build** — no
+/// `address`, no `label` — because that is the file every upgrading install
+/// already has on disk, and serde's defaults are the only thing standing
+/// between it and a row that invents what it was never told.
+#[test]
+fn a_record_from_an_older_build_is_still_listed_and_still_revocable() {
+    let fs = Arc::new(FakeFs::new().with_file(
+        PATH,
+        r#"{"version":1,"tokens":[{"id":"tok_old","token_sha256":"abc",
+            "created_unix_secs":1700000000,"last_seen_unix_secs":1700000000}]}"#,
+    ));
+    let clock = Arc::new(FakeClock::default());
+    clock.set_millis(1_000_000);
+    clock.set_unix_secs(1_700_000_000);
+    let mut s = CredentialStore::open(fs, clock, PATH);
+    assert_eq!(s.load_error(), None, "the older file still loads");
+    let mut access = WebAccess::open(
+        &mut s,
+        &three_interfaces(),
+        wildcard(),
+        BindExposure::Routable,
+    );
+
+    let view = access.view(&s, echo_qr);
+    let [row] = view.browsers.as_slice() else {
+        panic!("one browser holds access");
+    };
+    assert_eq!(row.address, None, "no placeholder stands in for it");
+    assert_eq!(row.browser, None);
+    assert_eq!(
+        access.handle_key(AccessKey::Char('1'), &mut s),
+        AccessOutcome::Revoked
+    );
+    assert_eq!(
+        access.view(&s, echo_qr).notice.as_deref(),
+        Some("That browser is locked out — its access was revoked."),
+        "it says what it did without naming what it cannot"
+    );
+}
+
+/// `age_label` is what turns a stored timestamp into 2a's `14m`.
+#[test]
+fn an_age_is_rounded_down_so_it_never_claims_more_time_than_has_passed() {
+    assert_eq!(age_label(0), "0s");
+    assert_eq!(age_label(59), "59s");
+    assert_eq!(age_label(60), "1m");
+    assert_eq!(age_label(14 * 60 + 59), "14m");
+    assert_eq!(age_label(3600), "1h");
+    assert_eq!(age_label(47 * 3600), "1d");
 }
 
 // -- State A: the common case never shows a code ---------------------------

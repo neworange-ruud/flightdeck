@@ -409,6 +409,22 @@ pub struct BrowserToken {
     /// Free text supplied by the browser, so treat it as untrusted for display.
     #[serde(default)]
     pub label: Option<String>,
+    /// The peer address the **host observed** on the request that spent the
+    /// bootstrap code, e.g. `192.168.2.20` (`remote-control-gk94`,
+    /// `specs/WEB_INTERFACE.md` §6.5 R25).
+    ///
+    /// Never client-supplied, which is the whole distinction R12 draws between
+    /// this and [`BrowserToken::label`]: the label is a claim and may say
+    /// anything, the address is something the socket told us. It is the grant's
+    /// address and is not refreshed as the browser moves — the honest reading
+    /// is *"this is who I let in, and from where"*, which is the question the
+    /// overlay's line exists to answer.
+    ///
+    /// `None` on a record issued before this field existed. The overlay then
+    /// draws the row without an address rather than with a placeholder, the
+    /// same way artboard 2f drops a seat fact it was told nothing about.
+    #[serde(default)]
+    pub address: Option<String>,
     /// Unix seconds when this token was issued.
     #[serde(default)]
     pub created_unix_secs: u64,
@@ -784,9 +800,22 @@ impl CredentialStore {
         self.last_persist_error.as_deref()
     }
 
-    /// Every browser that currently has access.
+    /// Every browser that currently has access, in issue order.
+    ///
+    /// The order is load-bearing for the access overlay: it numbers these rows
+    /// and revokes the one a digit names, so the nth row and the nth active
+    /// token have to be the same browser. Issue order gives that for free —
+    /// a new grant appends and can never renumber a row already on screen.
     pub fn active_tokens(&self) -> impl Iterator<Item = &BrowserToken> + '_ {
         self.state.tokens.iter().filter(|t| t.is_active())
+    }
+
+    /// The host's own wall clock, for dating what [`CredentialStore::records`]
+    /// remembers. Read through the store because it holds the [`Clock`] seam
+    /// the tokens were stamped with, so an age can never be measured against a
+    /// second, differently-faked clock.
+    pub fn now_unix_secs(&self) -> u64 {
+        self.clock.now_unix_secs()
     }
 
     /// Every record, tombstones included — for tests and for a desktop view
@@ -945,7 +974,7 @@ impl CredentialStore {
                     pending.consumed = true;
                 }
                 self.limiter.reset(address);
-                let token = self.issue_token(label);
+                let token = self.issue_token(address, label);
                 // Persist the new token before the caller hands out the cookie.
                 let _ = self.save();
                 Ok(token)
@@ -978,7 +1007,11 @@ impl CredentialStore {
     }
 
     /// Mint, record and return a persistent token.
-    fn issue_token(&mut self, label: Option<&str>) -> AccessToken {
+    ///
+    /// `address` is the peer the exchange came from — the same string the
+    /// limiter was consulted about, which is `peer.ip()` off the socket and
+    /// never a header a client could set.
+    fn issue_token(&mut self, address: &str, label: Option<&str>) -> AccessToken {
         let secret = random_token_secret();
         let id = TokenId::generate();
         let now = self.clock.now_unix_secs();
@@ -986,6 +1019,7 @@ impl CredentialStore {
             id: id.clone(),
             token_sha256: token_hash(&secret),
             label: label.map(str::to_string),
+            address: Some(address.to_string()),
             created_unix_secs: now,
             last_seen_unix_secs: now,
             revoked_at_unix_secs: None,

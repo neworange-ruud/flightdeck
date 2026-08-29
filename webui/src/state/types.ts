@@ -13,6 +13,7 @@ import type {
   SeatInfo,
   Selection,
   ShutdownState,
+  SidebarPosition,
   Snapshot,
   Staleness,
   TakeoverState,
@@ -217,7 +218,20 @@ export interface AppState {
   readonly selection: Selection | null;
   readonly mode: UiMode;
   readonly layout: ViewLayout;
-  /** Column index with focus in split view (1c: the glow tracks it). */
+  /**
+   * Which end of the body row the sidebar takes — the host's
+   * `[ui] agent_tab_position`, never a browser preference (1h position 4,
+   * §6.5 R24). Replaced wholesale by every snapshot, like everything else the
+   * host owns.
+   */
+  readonly sidebarPosition: SidebarPosition;
+  /**
+   * Column index with focus in split view (1c: the glow tracks it).
+   *
+   * An index into the *selected session's* terminals, so it is only meaningful
+   * against a selection — `reduce` clamps it into range after every action for
+   * that reason (§6.5 R24, `remote-control-zbwx`).
+   */
   readonly splitFocus: number;
   readonly viewers: number;
   readonly latencyMs: number | null;
@@ -494,6 +508,8 @@ export function createInitialState(): AppState {
      * heard about yet. */
     mode: "app",
     layout: "single",
+    /** The setting's own default, and what a host that does not send it gets. */
+    sidebarPosition: "left",
     splitFocus: 0,
     viewers: 0,
     latencyMs: null,

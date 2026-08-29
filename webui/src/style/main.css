@@ -404,6 +404,59 @@
   border-left: 1px solid var(--fd-rule);
   box-shadow: none;
 }
+
+/* ── 1h position 4: `[ui] agent_tab_position = right` ────────────────────── */
+/*
+ * *"`ui.agent_tab_position = right` mirrors the body row; the focus glow, the
+ * ✕ column and the selection stripe all flip with it — nothing else moves."*
+ *
+ * The whole setting is this block, and 1h's three named items are exactly the
+ * three directional facts a bare `row-reverse` would leave pointing the wrong
+ * way: the one-pixel seam that 1b hands back and forth between the two panes as
+ * the glow moves, the `✕` pinned to a row's right inset, and the 2px selection
+ * bar inset from a row's left. Everything else in the region is symmetric and
+ * mirrors for free, which is why nothing else is listed.
+ *
+ * Scoped to `[data-sidebar-side="right"]` rather than written as two symmetric
+ * halves: `left` is then the layout it has always been, to the pixel, and the
+ * cost of the setting is paid only by the people who set it.
+ *
+ * The value is the host's (`Snapshot.sidebar_position`), never a browser
+ * preference — see `state/model.ts`'s `SidebarPosition`.
+ */
+.fd-frame[data-sidebar-side="right"] .fd-body {
+  flex-direction: row-reverse;
+}
+/* The seam is one rule between the panes and belongs to whichever edge they
+ * share, so it follows them across. */
+.fd-frame[data-sidebar-side="right"] .fd-sidebar {
+  border-right: 0;
+  border-left: 1px solid var(--fd-rule);
+}
+.fd-frame[data-sidebar-side="right"][data-mode="app"] .fd-sidebar {
+  border-left: 0;
+}
+.fd-frame[data-sidebar-side="right"][data-mode="app"] .fd-main {
+  border-left: 0;
+  border-right: 1px solid var(--fd-rule);
+}
+/* 1a's selection bar marks the row on the sidebar's *outer* edge — the one
+ * against the window, not the one against the terminal. */
+.fd-frame[data-sidebar-side="right"] .fd-session[data-selected="true"] {
+  box-shadow: inset -2px 0 0 var(--fd-focus);
+}
+/* The `✕` keeps the end furthest from the terminal too. The row's text is
+ * padded off it, because unlike the right inset the left one is where 1a's
+ * caret and status glyph already are — an unpadded mirror would put the close
+ * control on top of them. */
+.fd-frame[data-sidebar-side="right"] .fd-session__close {
+  right: auto;
+  left: 10px;
+}
+.fd-frame[data-sidebar-side="right"] .fd-session__select {
+  padding-right: 10px;
+  padding-left: 26px;
+}
 .fd-tabs {
   height: 30px;
   flex: none;
