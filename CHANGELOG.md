@@ -8,6 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Start a session on any existing local branch.** The New Agent form's `Tab`
+  target control now cycles between creating a generated branch, selecting an
+  existing local branch from a searchable picker, and running in the project
+  root on the base branch. Selecting an existing branch uses its name verbatim,
+  creates or reuses a managed worktree, marks the tab as existing, and retains
+  the safety refusal when that branch is checked out elsewhere.
 - **`flightdeck --isolated` / `-I`: a throwaway run.** Launches exactly one
   fresh Agent Session Tab, running the default agent in the repository root on
   the branch already checked out — no worktree, no git mutation, and nothing

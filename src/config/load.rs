@@ -190,6 +190,48 @@ pub fn parse_table(toml_str: &str) -> Result<toml::Table> {
         .map_err(|e| FlightDeckError::Config(format!("failed to parse config.toml: {e}")))
 }
 
+/// Update only `[project].default_base_branch` while preserving the rest of the
+/// user-authored TOML, including comments and ordering. The configuration
+/// manager serializes whole tables, but this focused picker should not rewrite a
+/// committed file just to change one string.
+pub fn set_project_default_base(contents: &str, branch: &str) -> Result<String> {
+    use toml_edit::{Item, Table, Value};
+
+    let uses_crlf = contents.contains('\n')
+        && contents
+            .match_indices('\n')
+            .all(|(index, _)| index > 0 && contents.as_bytes()[index - 1] == b'\r');
+    let mut document = if contents.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        contents
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| FlightDeckError::Config(format!("failed to parse config.toml: {e}")))?
+    };
+    let project = document["project"]
+        .or_insert(Item::Table(Table::new()))
+        .as_table_like_mut()
+        .ok_or_else(|| FlightDeckError::Config("[project] must be a table".to_string()))?;
+    if let Some(item) = project.get_mut("default_base_branch") {
+        let current = item.as_value_mut().ok_or_else(|| {
+            FlightDeckError::Config("project.default_base_branch must be a string".to_string())
+        })?;
+        let decor = current.decor().clone();
+        let mut replacement = Value::from(branch);
+        *replacement.decor_mut() = decor;
+        *current = replacement;
+    } else {
+        project.insert("default_base_branch", toml_edit::value(branch));
+    }
+
+    let output = document.to_string();
+    if uses_crlf {
+        Ok(output.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        Ok(output)
+    }
+}
+
 /// Deep-merge `over` onto `base` in place (SPECS §8). Scalars and arrays in
 /// `over` replace their counterparts in `base`; sub-tables merge recursively —
 /// except the top-level `agents` table, which is replaced wholesale so a project
@@ -568,6 +610,38 @@ command = \"mytool\"
         .unwrap();
         assert_eq!(cfg.project.name, "p");
         assert_eq!(cfg.agents.len(), 3);
+    }
+
+    #[test]
+    fn focused_base_update_preserves_comments_and_other_sections() {
+        let original = "# project note\nnotes = '''\ndefault_base_branch = \"not a setting\"\n'''\n[project]\nname = \"demo\"\ndefault_base_branch = \"main\" # keep this note\n\n# ui note\n[ui]\nauto_continue = false\n";
+        let updated = set_project_default_base(original, "release/next").unwrap();
+        assert!(updated.contains("# project note"));
+        assert!(updated.contains("# ui note"));
+        assert!(updated.contains("default_base_branch = \"not a setting\""));
+        assert!(updated.contains("# keep this note"));
+        assert!(updated.contains("name = \"demo\""));
+        assert!(updated.contains("default_base_branch = \"release/next\""));
+        assert!(updated.contains("auto_continue = false"));
+        assert_eq!(updated.lines().count(), original.lines().count());
+    }
+
+    #[test]
+    fn focused_base_update_preserves_crlf_line_endings() {
+        let original = "[project]\r\nname = \"demo\"\r\ndefault_base_branch = \"main\"\r\n";
+        let updated = set_project_default_base(original, "develop").unwrap();
+        assert_eq!(updated, original.replace("\"main\"", "\"develop\""));
+    }
+
+    #[test]
+    fn focused_base_update_adds_a_missing_project_key() {
+        let original = "[project]\nname = \"demo\"\n\n[ui]\nauto_continue = false\n";
+        let updated = set_project_default_base(original, "develop").unwrap();
+        let project = parse_table(&updated).unwrap();
+        assert_eq!(
+            project["project"]["default_base_branch"].as_str(),
+            Some("develop")
+        );
     }
 
     #[test]

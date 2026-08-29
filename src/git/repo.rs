@@ -113,10 +113,37 @@ impl GitExecutor for GitCli {
     }
 
     fn branch_exists(&self, name: &str) -> Result<bool> {
-        // `git branch --list <name>` prints the branch if it exists locally.
-        let out = self.run(&["branch", "--list", name])?;
-        require_success(&out, "branch --list")?;
-        Ok(!stdout_trimmed(&out).is_empty())
+        let valid = self.run(&["check-ref-format", "--branch", name])?;
+        if !valid.status.success() {
+            return Ok(false);
+        }
+        let refname = format!("refs/heads/{name}");
+        let out = self.run(&["show-ref", "--verify", "--quiet", &refname])?;
+        if out.status.success() {
+            Ok(true)
+        } else if out.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            Err(FlightDeckError::Git(format!(
+                "show-ref --verify {refname} failed: {}",
+                stderr_trimmed(&out)
+            )))
+        }
+    }
+
+    fn list_local_branches(&self) -> Result<Vec<String>> {
+        let out = self.run(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)",
+            "refs/heads/",
+        ])?;
+        require_success(&out, "for-each-ref refs/heads/")?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+            .collect())
     }
 
     fn create_branch(&self, name: &str, from: &str) -> Result<()> {

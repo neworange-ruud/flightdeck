@@ -112,9 +112,8 @@ pub enum DialogAccel {
     Enter,
     /// The Esc key (cancel/dismiss).
     Esc,
-    /// The Tab key (toggle a checkbox-style option, e.g. "run from base branch"
-    /// in the New Agent form — chosen because it never collides with the text
-    /// being typed into an adjacent input field).
+    /// The Tab key (cycle a form option, e.g. the target mode in the New Agent
+    /// form — chosen because it never collides with text typed into an input).
     Tab,
 }
 
@@ -615,7 +614,14 @@ pub fn draw(
     }
     let status_divider = Paragraph::new(divider_line(ml.status_divider.width as usize));
     frame.render_widget(status_divider, ml.status_divider);
-    draw_status_bar(frame, state, ml.status_bar);
+    if chrome == layout::Chrome::Collapsed {
+        frame.render_widget(
+            Paragraph::new(compact_status_bar_text(state, ml.status_bar.width)),
+            ml.status_bar,
+        );
+    } else {
+        draw_status_bar(frame, state, ml.status_bar);
+    }
 
     // Draw overlay on top if active.
     match overlay {
@@ -1180,10 +1186,10 @@ fn build_git_indicator_line(
                 ));
                 spans.push(Span::raw(" "));
             }
-            // Base drift.
+            // Target-base movement.
             if ws.base_drift > 0 {
-                let drift = format!("drift:{}", ws.base_drift);
-                spans.push(Span::styled(drift, Style::default().fg(Color::Magenta)));
+                let moved = format!("target+{}", ws.base_drift);
+                spans.push(Span::styled(moved, Style::default().fg(Color::Magenta)));
             }
         }
     }
@@ -1556,17 +1562,83 @@ fn info_sep() -> Span<'static> {
     Span::styled(" │ ", Style::default().fg(Color::DarkGray))
 }
 
+fn shorten_branch(branch: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = branch.chars().collect();
+    if chars.len() <= max_chars {
+        return branch.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let left = (max_chars - 3) / 2;
+    let right = max_chars - 3 - left;
+    format!(
+        "{}...{}",
+        chars[..left].iter().collect::<String>(),
+        chars[chars.len() - right..].iter().collect::<String>()
+    )
+}
+
 /// Build the git info bar [`Line`] for the selected tab. Exported for testing.
 pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> {
+    let configured_default = state
+        .invalid_base_branch
+        .as_deref()
+        .unwrap_or(&state.base_branch);
+    let configured_default = shorten_branch(configured_default, 18);
+    let invalid_default = state.invalid_base_branch.is_some();
     let Some(tab) = state.selected() else {
-        return Line::from(Span::styled(
-            " No Agent Session Tab selected",
-            Style::default().fg(Color::DarkGray),
-        ));
+        return Line::from(vec![
+            Span::styled(" Default base: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if invalid_default {
+                    format!("{configured_default} (not local)")
+                } else {
+                    configured_default
+                },
+                if invalid_default {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+            info_sep(),
+            Span::styled(
+                "No Agent Session Tab selected",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
     };
     let git = cache.get(&tab.meta.id);
 
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans = vec![Span::styled(
+        if invalid_default {
+            format!(" default: {configured_default} (not local)")
+        } else {
+            format!(" default: {configured_default}")
+        },
+        if invalid_default {
+            Style::default().fg(Color::Red)
+        } else if tab.meta.base_branch == state.base_branch {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        },
+    )];
+    spans.push(info_sep());
+    spans.push(Span::styled(
+        format!("target: {}", shorten_branch(&tab.meta.base_branch, 18)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if let Some(ws) = git {
+        if ws.base_drift > 0 {
+            spans.push(info_sep());
+            spans.push(Span::styled(
+                format!("target advanced +{}", ws.base_drift),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+    }
 
     // Branch (prefer the freshly-collected name; fall back to stored meta).
     let branch = git
@@ -1626,22 +1698,6 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-
-            // Base drift (only when the base has moved).
-            if ws.base_drift > 0 {
-                spans.push(info_sep());
-                spans.push(Span::styled(
-                    format!("base +{}", ws.base_drift),
-                    Style::default().fg(Color::Magenta),
-                ));
-            }
-
-            // Base branch for context.
-            spans.push(info_sep());
-            spans.push(Span::styled(
-                format!("base: {}", ws.base_branch),
-                Style::default().fg(Color::DarkGray),
-            ));
         }
     }
 
@@ -1680,6 +1736,90 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
+}
+
+/// Compact terminal-mode status used when the git info row is reclaimed. Safety
+/// and mode indicators come first, followed by bounded base context; optional
+/// shortcut hints are the first content allowed to clip.
+fn compact_status_bar_text(state: &AppState, width: u16) -> Line<'static> {
+    let branch_limit = match width {
+        0..=49 => 4,
+        50..=79 => 8,
+        _ => 16,
+    };
+    let configured_default = state
+        .invalid_base_branch
+        .as_deref()
+        .unwrap_or(&state.base_branch);
+    let configured_default = shorten_branch(configured_default, branch_limit);
+    let mut spans = Vec::new();
+    if state.isolated {
+        spans.push(Span::styled(
+            " ISOLATED",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(info_sep());
+    }
+    spans.push(Span::styled(
+        if width < 80 { "TERM" } else { "MODE: TERMINAL" },
+        Style::default()
+            .fg(Color::Black)
+            .bg(crate::tui::mode_style::chip_color(
+                &state.config.ui,
+                InputMode::Terminal,
+            ))
+            .add_modifier(Modifier::BOLD),
+    ));
+    if let Some(version) = &state.update_available {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            if width < 80 {
+                "UPDATE".to_string()
+            } else {
+                format!("v{version} update")
+            },
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    spans.push(info_sep());
+    spans.push(Span::styled(
+        if state.invalid_base_branch.is_some() {
+            format!("default: !{configured_default}")
+        } else {
+            format!("default: {configured_default}")
+        },
+        if state.invalid_base_branch.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::White)
+        },
+    ));
+    if width >= 50 {
+        if let Some(tab) = state.selected() {
+            spans.push(info_sep());
+            spans.push(Span::styled(
+                format!(
+                    "target: {}",
+                    shorten_branch(&tab.meta.base_branch, branch_limit)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    if width >= 100 {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            crate::tui::platform::leave_focus_key(state.config.ui.use_f2_to_leave_terminal_focus),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(": app | "));
+        spans.push(Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw(": palette"));
+    }
+    Line::from(spans)
 }
 
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
@@ -1790,7 +1930,7 @@ pub fn draw_git_status_overlay(
         Span::styled(status.branch.clone(), Style::default().fg(Color::Yellow)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Base branch:", Style::default().fg(Color::Gray)),
+        Span::styled("Target base:", Style::default().fg(Color::Gray)),
         Span::raw(" "),
         Span::styled(
             status.base_branch.clone(),
@@ -1798,12 +1938,13 @@ pub fn draw_git_status_overlay(
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Base drift: ", Style::default().fg(Color::Gray)),
+        Span::styled("Target moved:", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
         Span::styled(
             if status.base_drift == 0 {
                 "none".to_string()
             } else {
-                format!("{} commits ahead since creation", status.base_drift)
+                format!("{} commits since this tab last synced", status.base_drift)
             },
             if status.base_drift == 0 {
                 Style::default().fg(Color::Green)
@@ -3049,11 +3190,12 @@ mod tests {
         // info bar's branch marker and appears nowhere else in the main view.
         assert!(!all.contains("Agents"), "collapsed sidebar has no heading");
         assert!(!all.contains('⎇'), "collapsed layout has no git info bar");
-        // The status bar stays — it carries the mode and the command hints.
-        assert!(
-            !buffer_row(&buffer, h - 1).trim().is_empty(),
-            "the status bar must still be drawn when collapsed"
-        );
+        // The compact status bar retains base context and mode cues when the
+        // dedicated info row is reclaimed.
+        let status = buffer_row(&buffer, h - 1);
+        assert!(status.contains("default: main"), "status: {status:?}");
+        assert!(status.contains("target: main"), "status: {status:?}");
+        assert!(status.contains("MODE: TERMINAL"), "status: {status:?}");
     }
 
     #[test]
@@ -3569,6 +3711,7 @@ mod tests {
     fn info_bar_without_selection_says_no_tab() {
         let state = empty_state();
         let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(flat.contains("Default base: main"), "got: {flat:?}");
         assert!(
             flat.contains("No Agent Session Tab selected"),
             "got: {flat:?}"
@@ -3581,6 +3724,87 @@ mod tests {
         let flat = flatten(&info_bar_line(&state, &empty_cache()));
         assert!(flat.contains("flightdeck/tab0"), "branch missing: {flat:?}");
         assert!(flat.contains("git: ?"), "unknown marker missing: {flat:?}");
+        assert!(flat.contains("target: main"), "target missing: {flat:?}");
+    }
+
+    #[test]
+    fn info_bar_distinguishes_tab_target_from_project_default() {
+        let mut state = state_with_tabs(1);
+        state.base_branch = "develop".to_string();
+        let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(flat.contains("target: main"), "target missing: {flat:?}");
+        assert!(
+            flat.contains("default: develop"),
+            "project default missing: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn info_bar_marks_an_invalid_project_default() {
+        let mut state = state_with_tabs(1);
+        state.invalid_base_branch = Some("missing".to_string());
+        let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(
+            flat.contains("default: missing (not local)"),
+            "got: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_default_is_visible_without_a_selected_tab() {
+        let mut state = empty_state();
+        state.invalid_base_branch = Some("missing".to_string());
+        let flat = flatten(&info_bar_line(&state, &empty_cache()));
+        assert!(
+            flat.contains("Default base: missing (not local)"),
+            "got: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_status_keeps_default_and_target_visible_first() {
+        let mut state = state_with_tabs(1);
+        state.base_branch = "develop".to_string();
+        let flat = flatten(&compact_status_bar_text(&state, 100));
+        assert!(flat.contains("default: develop"), "got: {flat:?}");
+        assert!(flat.contains("target: main"), "got: {flat:?}");
+    }
+
+    #[test]
+    fn collapsed_status_retains_isolated_and_update_indicators() {
+        let mut state = state_with_tabs(1);
+        state.isolated = true;
+        state.update_available = Some("2.0.0".to_string());
+        let flat = flatten(&compact_status_bar_text(&state, 100));
+        assert!(flat.contains("ISOLATED"), "got: {flat:?}");
+        assert!(flat.contains("v2.0.0 update"), "got: {flat:?}");
+    }
+
+    #[test]
+    fn very_narrow_collapsed_status_renders_safety_mode_update_and_default() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        state.update_available = Some("2.0.0".to_string());
+        let mut term = test_terminal(43, 24); // 40-column main pane.
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+            .unwrap();
+        let row = buffer_row(term.backend().buffer(), 23);
+        assert!(row.contains("ISOLATED"), "row: {row:?}");
+        assert!(row.contains("TERM"), "row: {row:?}");
+        assert!(row.contains("UPDATE"), "row: {row:?}");
+        assert!(row.contains("default: main"), "row: {row:?}");
+    }
+
+    #[test]
+    fn long_base_names_are_shortened_before_required_context_is_clipped() {
+        let mut state = state_with_tabs(1);
+        state.base_branch = "feature/a-very-long-project-default-branch".to_string();
+        state.tabs[0].meta.base_branch = "release/a-very-long-pinned-target-branch".to_string();
+        let flat = flatten(&compact_status_bar_text(&state, 80));
+        assert!(flat.contains("default: featur...-branch"), "got: {flat:?}");
+        assert!(flat.contains("target: releas...-branch"), "got: {flat:?}");
+        assert!(flat.contains("MODE: TERMINAL"), "got: {flat:?}");
     }
 
     #[test]
@@ -3612,8 +3836,8 @@ mod tests {
         assert!(flat.contains("-3"), "deleted: {flat:?}");
         assert!(flat.contains("(6 files)"), "total: {flat:?}");
         assert!(flat.contains("↑4 ↓5"), "ahead/behind: {flat:?}");
-        assert!(flat.contains("base +6"), "drift: {flat:?}");
-        assert!(flat.contains("base: main"), "base branch: {flat:?}");
+        assert!(flat.contains("target advanced +6"), "movement: {flat:?}");
+        assert!(flat.contains("target: main"), "target branch: {flat:?}");
     }
 
     #[test]

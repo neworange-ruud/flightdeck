@@ -61,13 +61,14 @@ use crate::app::state::{materialize_worktree, AppState, Services, TabPhase, Work
 use crate::config::init::{ensure_global_config, initialize};
 use crate::config::load::{
     global_config_path, load_config, load_layered_config, serialize_global_config,
+    set_project_default_base,
 };
 use crate::config::schema::{default_config, default_global_config};
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
     Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus,
-    Notifier, ProcessState, PtyBackend, PtySize,
+    Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -797,7 +798,7 @@ fn startup(
     // overrides), so a partial project config.toml is honoured even on a
     // machine that has never run FlightDeck normally (SPECS §4).
     let global_path = global_config_path();
-    let config = if isolated.is_none() {
+    let loaded_config = if isolated.is_none() {
         if let Some(gp) = &global_path {
             let _ = ensure_global_config(services.fs, gp);
         }
@@ -807,8 +808,15 @@ fn startup(
         }
     } else {
         effective_config_without_writing(services.fs, global_path.as_deref(), &config_path)
+    };
+    let project_config_loaded = loaded_config.is_ok();
+    let mut config = loaded_config.unwrap_or_else(|_| default_config(&project_name, &base_branch));
+    // With no project setting (notably an isolated first run), use the detected
+    // checked-out branch. An explicit setting remains visible even when invalid
+    // so startup can warn instead of silently switching the default.
+    if pre_configured_base.is_none() {
+        config.project.default_base_branch = base_branch.clone();
     }
-    .unwrap_or_else(|_| default_config(&project_name, &base_branch));
 
     // Append .gitignore entries and surface the §6 notice if it changed.
     // Skipped for an isolated run: nothing under the project is touched.
@@ -835,6 +843,36 @@ fn startup(
     } else {
         let mut ps =
             load_state(services.fs, &state_path).unwrap_or_else(|_| default_state(&base_branch));
+        let migrated_legacy_state = ps.version < STATE_VERSION;
+        if migrated_legacy_state && project_config_loaded {
+            // Before v2 the top-level state value was the real runtime source of
+            // truth, and editing state.json was the only supported workaround
+            // for changing it. Preserve that user choice once by migrating it
+            // into the now-authoritative committed project config.
+            let legacy_base = ps.base_branch.clone();
+            if legacy_base != config.project.default_base_branch
+                && services.git.branch_exists(&legacy_base).unwrap_or(false)
+            {
+                let contents = services.fs.read_to_string(&config_path)?;
+                services.fs.write(
+                    &config_path,
+                    &set_project_default_base(&contents, &legacy_base)?,
+                )?;
+                config.project.default_base_branch = legacy_base;
+            }
+            ps.version = STATE_VERSION;
+        } else if migrated_legacy_state
+            && services.git.branch_exists(&ps.base_branch).unwrap_or(false)
+        {
+            // Keep a v1 user's chosen base in memory when malformed project
+            // TOML prevented migration. Startup must remain usable; migration
+            // will retry after the user repairs the config.
+            config.project.default_base_branch = ps.base_branch.clone();
+        }
+        // The committed project config is authoritative for the default used by
+        // newly-created and newly-discovered tabs. Existing tabs retain their
+        // own persisted targets during recovery.
+        ps.base_branch = config.project.default_base_branch.clone();
         let report = recover(
             services.fs,
             services.git,
@@ -842,6 +880,9 @@ fn startup(
             &worktrees_root,
             &mut ps,
         )?;
+        if migrated_legacy_state && project_config_loaded {
+            save_state(services.fs, &state_path, &ps)?;
+        }
         (ps, report)
     };
 
@@ -852,6 +893,18 @@ fn startup(
         // would hold only until the first Restart Agent replayed a captured
         // resume command (SPECS §32 §4).
         state.config.ui.auto_continue = false;
+    }
+
+    if !services
+        .git
+        .branch_exists(&state.base_branch)
+        .unwrap_or(false)
+    {
+        state.invalid_base_branch = Some(state.base_branch.clone());
+        state.warnings.push(format!(
+            "Configured default base '{}' is not a local branch. Use 'Change Project Default Base' to select one.",
+            state.base_branch
+        ));
     }
 
     // Surface stale entries (worktree missing on disk / unregistered in git)
@@ -1029,10 +1082,9 @@ fn restore_terminal_title() -> std::io::Result<()> {
 /// New/Rename, single-key choice menus for Set Status / Close / Push.
 enum Prompt {
     /// The combined New Agent Session Tab form (SPECS §4, §22): pick the agent
-    /// (radio, ↑/↓), type a branch name, and optionally toggle "run from base
-    /// branch" (Tab), which disables the branch field and runs the agent — and
-    /// any child shells — directly in the project root on the base branch (no
-    /// worktree). Confirming (Enter) dispatches the async new-tab flow.
+    /// (radio, ↑/↓), type a new branch name, select an existing local branch,
+    /// or run directly from the base branch. Tab cycles those target modes.
+    /// Confirming (Enter) dispatches the async new-tab flow.
     NewAgentForm {
         /// `(key, display_name)` of each registered agent, in registry order.
         agents: Vec<(String, String)>,
@@ -1040,6 +1092,13 @@ enum Prompt {
         selected: usize,
         /// The branch/tab name being typed. Ignored when `run_on_base`.
         branch: String,
+        /// Local branches available to the existing-branch target mode.
+        existing_branches: Vec<String>,
+        /// Index into the filtered `existing_branches` list.
+        branch_selected: usize,
+        /// When true, the input filters `existing_branches` instead of naming a
+        /// newly-created branch.
+        use_existing_branch: bool,
         /// When true, run on the base branch in the project root (no worktree);
         /// the branch field is disabled.
         run_on_base: bool,
@@ -1088,6 +1147,13 @@ enum Prompt {
     /// Confirm closing an open project tab (`index`). Closing stops that
     /// project's agents and removes it from the workspace.
     CloseProjectConfirm { index: usize },
+    /// Pick a local branch to become the project default for future agents.
+    /// Existing agents retain their individually-persisted target branches.
+    ChangeProjectBase {
+        branches: Vec<String>,
+        filter: String,
+        selected: usize,
+    },
     /// Confirm unpairing the phone (FlightDeck Remote). On confirm the event
     /// loop forgets the pairing and reverts to the passthrough sealer.
     UnpairConfirm,
@@ -3720,7 +3786,7 @@ fn dispatch_command(
     // Intercept commands that need interactive input before dispatch.
     match &cmd {
         Command::NewAgentTab { name, .. } if name.is_empty() => {
-            start_new_tab_flow(state, ui);
+            start_new_tab_flow(state, services, ui);
             return Ok(());
         }
         Command::RenameAgentTab { new_name } if new_name.is_empty() => {
@@ -3882,9 +3948,9 @@ const ISOLATED_REFUSAL: &str =
      directory and opens nothing else.";
 
 /// Begin the New Agent Tab flow (SPECS §4, §22): open the combined form —
-/// agent radio, branch name, and the "run from base branch" toggle — with the
-/// configured default agent preselected.
-fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
+/// agent radio and new/existing/base target modes — with the configured default
+/// agent preselected.
+fn start_new_tab_flow(state: &AppState, services: &Services, ui: &mut Ui) {
     if state.isolated {
         ui.message(ISOLATED_REFUSAL);
         return;
@@ -3900,12 +3966,27 @@ fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
         .iter()
         .position(|(k, _)| k == &state.registry.default_key)
         .unwrap_or(0);
+    let existing_branches = match services.git.list_local_branches() {
+        Ok(branches) => branches
+            .into_iter()
+            // The base branch already has the project-root worktree; its
+            // dedicated no-worktree mode is the next Tab target instead.
+            .filter(|branch| branch != &state.base_branch)
+            .collect(),
+        Err(e) => {
+            ui.message(format!("Error listing local branches: {e}"));
+            return;
+        }
+    };
     start_prompt(
         ui,
         Prompt::NewAgentForm {
             agents,
             selected,
             branch: String::new(),
+            existing_branches,
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: false,
             base_branch: state.base_branch.clone(),
         },
@@ -3919,7 +4000,7 @@ fn start_new_tab_flow(state: &AppState, ui: &mut Ui) {
 fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mut Ui) {
     if state.selected().is_none() {
         state.focus_app();
-        start_new_tab_flow(state, ui);
+        start_new_tab_flow(state, services, ui);
         return;
     }
     let agents: Vec<(String, String)> = state
@@ -3995,6 +4076,166 @@ fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
             },
         },
     );
+}
+
+/// Begin the project-default-base flow with every local branch available for
+/// filtering. The current default is preselected; existing tabs are not part of
+/// this choice because each keeps its own persisted target branch.
+fn start_change_project_base_flow(workspace: &Workspace, ui: &mut Ui) {
+    let p = workspace.active_project();
+    if p.state.isolated {
+        ui.message(ISOLATED_REFUSAL);
+        return;
+    }
+    match p.git.list_local_branches() {
+        Ok(branches) if branches.is_empty() => ui.message("This repository has no local branches."),
+        Ok(branches) => {
+            let selected = branches
+                .iter()
+                .position(|branch| branch == &p.state.base_branch)
+                .unwrap_or(0);
+            start_prompt(
+                ui,
+                Prompt::ChangeProjectBase {
+                    branches,
+                    filter: String::new(),
+                    selected,
+                },
+            );
+        }
+        Err(e) => ui.message(format!("Could not list local branches: {e}")),
+    }
+}
+
+fn matching_branches<'a>(branches: &'a [String], filter: &str) -> Vec<&'a String> {
+    let needle = filter.to_lowercase();
+    branches
+        .iter()
+        .filter(|branch| needle.is_empty() || branch.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Persist a new project default in the committed project config, reload its
+/// effective config, and mirror the value into state.json. Existing tabs remain
+/// pinned to their own target branches.
+fn change_project_default_base(
+    workspace: &mut Workspace,
+    env: &Env,
+    branch: &str,
+) -> Result<(String, usize)> {
+    let active = workspace.active;
+    let p = &workspace.projects[active];
+    if !p.git.branch_exists(branch)? {
+        return Err(FlightDeckError::Git(format!(
+            "local branch '{branch}' does not exist"
+        )));
+    }
+    let previous = p.state.base_branch.clone();
+    let existing_tabs = p.state.tabs.len();
+    let project_path = p.git.root().join(".flightdeck").join("config.toml");
+    let contents = if env.fs.exists(&project_path) {
+        env.fs.read_to_string(&project_path)?
+    } else {
+        String::new()
+    };
+    env.fs
+        .write(&project_path, &set_project_default_base(&contents, branch)?)?;
+
+    let loaded = match global_config_path() {
+        Some(global_path) => load_layered_config(env.fs, &global_path, &project_path)?,
+        None => effective_config_without_writing(env.fs, None, &project_path)?,
+    };
+    let p = &mut workspace.projects[active];
+    p.state.reload_config(loaded);
+    p.state.invalid_base_branch = None;
+    p.state
+        .warnings
+        .retain(|warning| !warning.starts_with("Configured default base '"));
+    let services = env.services(&p.git);
+    persist_quietly(&p.state, &services)?;
+    Ok((previous, existing_tabs))
+}
+
+/// Handle the searchable local-branch picker and apply the selected project
+/// default on Enter.
+fn handle_change_project_base_key(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    let Some(mut pstate) = ui.prompt.take() else {
+        return Ok(());
+    };
+
+    if key.code == KeyCode::Enter {
+        let branch = match &pstate.prompt {
+            Prompt::ChangeProjectBase {
+                branches,
+                filter,
+                selected,
+            } => matching_branches(branches, filter)
+                .get(*selected)
+                .cloned()
+                .cloned(),
+            _ => None,
+        };
+        let Some(branch) = branch else {
+            ui.prompt = Some(pstate);
+            return Ok(());
+        };
+        match change_project_default_base(workspace, env, &branch) {
+            Ok((previous, _)) if previous == branch => {
+                ui.message(format!("Project default base saved as '{branch}'."));
+            }
+            Ok((previous, existing_tabs)) => {
+                let retained = if existing_tabs == 1 {
+                    "1 existing agent keeps its current target".to_string()
+                } else {
+                    format!("{existing_tabs} existing agents keep their current targets")
+                };
+                ui.message(format!(
+                    "Project default base changed: {previous} -> {branch}. {retained}."
+                ));
+            }
+            Err(e) => ui.message(format!("Could not change project default base: {e}")),
+        }
+        return Ok(());
+    }
+
+    let Prompt::ChangeProjectBase {
+        branches,
+        filter,
+        selected,
+    } = &mut pstate.prompt
+    else {
+        ui.prompt = Some(pstate);
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Up => *selected = selected.saturating_sub(1),
+        KeyCode::Down => {
+            let len = matching_branches(branches, filter).len();
+            if *selected + 1 < len {
+                *selected += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            filter.pop();
+            *selected = 0;
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            filter.push(c);
+            *selected = 0;
+        }
+        _ => {}
+    }
+    pstate.dialog = prompt_dialog(&pstate.prompt);
+    ui.prompt = Some(pstate);
+    Ok(())
 }
 
 /// Begin the Close Project flow: confirm first (SPECS §25 no-surprise rule).
@@ -4202,39 +4443,79 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             agents,
             selected,
             branch,
+            existing_branches,
+            branch_selected,
+            use_existing_branch,
             run_on_base,
             base_branch,
         } => {
-            // Agents as a radio list: the highlighted row is both selected and
-            // marked, so ↑/↓ moves the choice.
-            let list: Vec<DialogListItem> = agents
-                .iter()
-                .enumerate()
-                .map(|(i, (_key, display))| {
-                    let marker = if i == *selected { "(•)" } else { "( )" };
-                    DialogListItem {
-                        label: format!("{marker} {display}"),
-                        selected: i == *selected,
-                    }
-                })
-                .collect();
+            let list: Vec<DialogListItem> = if *use_existing_branch {
+                let matches = matching_branches(existing_branches, branch);
+                if matches.is_empty() {
+                    vec![DialogListItem {
+                        label: "(no matching local branches)".to_string(),
+                        selected: false,
+                    }]
+                } else {
+                    matches
+                        .iter()
+                        .enumerate()
+                        .map(|(i, branch)| DialogListItem {
+                            label: (*branch).clone(),
+                            selected: i == *branch_selected,
+                        })
+                        .collect()
+                }
+            } else {
+                // Agents as a radio list: the highlighted row is both selected
+                // and marked, so ↑/↓ moves the choice in new/base modes.
+                agents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_key, display))| {
+                        let marker = if i == *selected { "(•)" } else { "( )" };
+                        DialogListItem {
+                            label: format!("{marker} {display}"),
+                            selected: i == *selected,
+                        }
+                    })
+                    .collect()
+            };
             let title = if *run_on_base {
                 format!(
-                    "New Agent Session Tab   (↑/↓ agent · Tab toggles base)\n\
+                    "New Agent Session Tab   (↑/↓ agent · Tab changes target)\n\
                      Runs on base branch '{base_branch}' in the project root — no worktree."
                 )
+            } else if *use_existing_branch {
+                let agent = agents
+                    .get(*selected)
+                    .map(|(_, display)| display.as_str())
+                    .unwrap_or("default agent");
+                format!(
+                    "New Agent Session Tab — existing branch   \
+                     (type to filter · ↑/↓ select · Tab changes target)\n\
+                     Agent: {agent}"
+                )
             } else {
-                "New Agent Session Tab   (↑/↓ agent · type branch · Tab = run from base branch)"
+                "New Agent Session Tab — new branch   \
+                 (↑/↓ agent · type task name · Tab changes target)"
                     .to_string()
             };
-            let base_label = if *run_on_base {
-                format!("Run from base: {base_branch}")
+            let target_label = if *run_on_base {
+                format!("Target: base ({base_branch})")
+            } else if *use_existing_branch {
+                "Target: existing branch".to_string()
             } else {
-                "Run from base: off".to_string()
+                "Target: new branch".to_string()
+            };
+            let confirm_label = if *use_existing_branch {
+                "Use branch"
+            } else {
+                "Create"
             };
             let buttons = vec![
-                DialogButton::new(DialogAccel::Enter, "Create"),
-                DialogButton::new(DialogAccel::Tab, base_label),
+                DialogButton::new(DialogAccel::Enter, confirm_label),
+                DialogButton::new(DialogAccel::Tab, target_label),
                 cancel,
             ];
             // Hide the branch textbox entirely when running on base.
@@ -4348,8 +4629,8 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
         } => {
             let moved = match drift {
                 0 => String::new(),
-                1 => " (base moved 1 commit)".to_string(),
-                n => format!(" (base moved {n} commits)"),
+                1 => " (target advanced 1 commit)".to_string(),
+                n => format!(" (target advanced {n} commits)"),
             };
             let running = if *primary_running {
                 "; agent is running — its HEAD will be rewritten"
@@ -4396,6 +4677,37 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 list,
                 vec![
                     DialogButton::new(DialogAccel::Enter, "Open"),
+                    DialogButton::new(DialogAccel::Esc, "Cancel"),
+                ],
+            )
+        }
+        Prompt::ChangeProjectBase {
+            branches,
+            filter,
+            selected,
+        } => {
+            let matches = matching_branches(branches, filter);
+            let list = if matches.is_empty() {
+                vec![DialogListItem {
+                    label: "(no matching local branches)".to_string(),
+                    selected: false,
+                }]
+            } else {
+                matches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, branch)| DialogListItem {
+                        label: (*branch).clone(),
+                        selected: i == *selected,
+                    })
+                    .collect()
+            };
+            Dialog::browser(
+                "Change project default base   (type to filter · ↑/↓ select · Enter apply)",
+                filter.clone(),
+                list,
+                vec![
+                    DialogButton::new(DialogAccel::Enter, "Use branch"),
                     DialogButton::new(DialogAccel::Esc, "Cancel"),
                 ],
             )
@@ -4447,6 +4759,9 @@ fn handle_prompt_key(
         Some(Prompt::OpenProject { .. }) => {
             return handle_open_project_key(key, workspace, env, ui)
         }
+        Some(Prompt::ChangeProjectBase { .. }) => {
+            return handle_change_project_base_key(key, workspace, env, ui)
+        }
         Some(Prompt::CloseProjectConfirm { .. }) => {
             return handle_close_project_key(key, workspace, env, ui)
         }
@@ -4492,45 +4807,98 @@ fn handle_prompt_key_project(
             match key.code {
                 // ↑/↓ move the agent radio selection.
                 KeyCode::Up => {
-                    if let Prompt::NewAgentForm { selected, .. } = &mut pstate.prompt {
-                        *selected = selected.saturating_sub(1);
+                    if let Prompt::NewAgentForm {
+                        selected,
+                        branch_selected,
+                        use_existing_branch,
+                        ..
+                    } = &mut pstate.prompt
+                    {
+                        if *use_existing_branch {
+                            *branch_selected = branch_selected.saturating_sub(1);
+                        } else {
+                            *selected = selected.saturating_sub(1);
+                        }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 KeyCode::Down => {
                     if let Prompt::NewAgentForm {
-                        selected, agents, ..
+                        selected,
+                        agents,
+                        branch,
+                        existing_branches,
+                        branch_selected,
+                        use_existing_branch,
+                        ..
                     } = &mut pstate.prompt
                     {
-                        if *selected + 1 < agents.len() {
+                        let branch_count = matching_branches(existing_branches, branch).len();
+                        if *use_existing_branch && *branch_selected + 1 < branch_count {
+                            *branch_selected += 1;
+                        } else if !*use_existing_branch && *selected + 1 < agents.len() {
                             *selected += 1;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
-                // Tab toggles "run from base branch" (disables the branch field).
+                // Tab cycles new branch → existing branch → base branch. Skip
+                // the existing mode when there are no non-base local branches.
                 KeyCode::Tab => {
-                    if let Prompt::NewAgentForm { run_on_base, .. } = &mut pstate.prompt {
-                        *run_on_base = !*run_on_base;
+                    if let Prompt::NewAgentForm {
+                        branch,
+                        existing_branches,
+                        branch_selected,
+                        use_existing_branch,
+                        run_on_base,
+                        ..
+                    } = &mut pstate.prompt
+                    {
+                        if *run_on_base {
+                            *run_on_base = false;
+                        } else if *use_existing_branch {
+                            *use_existing_branch = false;
+                            *run_on_base = true;
+                        } else if existing_branches.is_empty() {
+                            *run_on_base = true;
+                        } else {
+                            *use_existing_branch = true;
+                        }
+                        branch.clear();
+                        *branch_selected = 0;
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
                     ui.prompt = Some(pstate);
                 }
                 KeyCode::Enter => {
-                    let (agent_key, name, run_on_base) = match &pstate.prompt {
+                    let (agent_key, name, use_existing_branch, run_on_base) = match &pstate.prompt {
                         Prompt::NewAgentForm {
                             agents,
                             selected,
                             branch,
+                            existing_branches,
+                            branch_selected,
+                            use_existing_branch,
                             run_on_base,
                             ..
-                        } => (
-                            agents.get(*selected).map(|(k, _)| k.clone()),
-                            branch.trim().to_string(),
-                            *run_on_base,
-                        ),
+                        } => {
+                            let name = if *use_existing_branch {
+                                matching_branches(existing_branches, branch)
+                                    .get(*branch_selected)
+                                    .map(|branch| (*branch).clone())
+                                    .unwrap_or_default()
+                            } else {
+                                branch.trim().to_string()
+                            };
+                            (
+                                agents.get(*selected).map(|(k, _)| k.clone()),
+                                name,
+                                *use_existing_branch,
+                                *run_on_base,
+                            )
+                        }
                         _ => unreachable!(),
                     };
                     // A worktree tab needs a name; a base-branch tab does not
@@ -4545,16 +4913,27 @@ fn handle_prompt_key_project(
                     // a background worker so the UI never blocks (SPECS §16/§17).
                     // A base-branch tab has nothing to materialize.
                     ui.prompt = None;
-                    match state.begin_new_agent_tab_ex(
-                        &name,
-                        agent_key.as_deref(),
-                        run_on_base,
-                        services,
-                    ) {
+                    let result = if use_existing_branch {
+                        state.begin_new_agent_tab_for_existing_branch(
+                            &name,
+                            agent_key.as_deref(),
+                            services,
+                        )
+                    } else {
+                        state.begin_new_agent_tab_ex(
+                            &name,
+                            agent_key.as_deref(),
+                            run_on_base,
+                            services,
+                        )
+                    };
+                    match result {
                         Ok(job) => {
                             let branch = job.branch.clone();
                             let msg = if run_on_base {
                                 format!("Starting agent on base branch {branch}…")
+                            } else if use_existing_branch {
+                                format!("Creating worktree for existing branch {branch}…")
                             } else {
                                 format!("Creating worktree for {branch}…")
                             };
@@ -4570,12 +4949,14 @@ fn handle_prompt_key_project(
                 KeyCode::Backspace => {
                     if let Prompt::NewAgentForm {
                         branch,
+                        branch_selected,
                         run_on_base,
                         ..
                     } = &mut pstate.prompt
                     {
                         if !*run_on_base {
                             branch.pop();
+                            *branch_selected = 0;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
@@ -4584,12 +4965,14 @@ fn handle_prompt_key_project(
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Prompt::NewAgentForm {
                         branch,
+                        branch_selected,
                         run_on_base,
                         ..
                     } = &mut pstate.prompt
                     {
                         if !*run_on_base {
                             branch.push(c);
+                            *branch_selected = 0;
                         }
                     }
                     pstate.dialog = prompt_dialog(&pstate.prompt);
@@ -4771,7 +5154,10 @@ fn handle_prompt_key_project(
         // Workspace-level prompts are routed to their own handlers by
         // `handle_prompt_key` before reaching here; keep the prompt if one
         // slips through so it is never silently dropped.
-        Prompt::OpenProject { .. } | Prompt::CloseProjectConfirm { .. } | Prompt::UnpairConfirm => {
+        Prompt::OpenProject { .. }
+        | Prompt::ChangeProjectBase { .. }
+        | Prompt::CloseProjectConfirm { .. }
+        | Prompt::UnpairConfirm => {
             ui.prompt = Some(pstate);
         }
     }
@@ -4920,6 +5306,10 @@ fn run_palette_action(
             switch_project(workspace, env, Selector::Prev, ui);
             return Ok(());
         }
+        PaletteAction::ChangeProjectBase => {
+            start_change_project_base_flow(workspace, ui);
+            return Ok(());
+        }
         PaletteAction::OpenConfig => {
             open_config_manager(workspace, env, ui);
             return Ok(());
@@ -4945,7 +5335,7 @@ fn run_palette_action(
     match action {
         PaletteAction::Dispatch(cmd) => dispatch_command(cmd, state, &services, ui),
         PaletteAction::NewAgentTab => {
-            start_new_tab_flow(state, ui);
+            start_new_tab_flow(state, &services, ui);
             Ok(())
         }
         PaletteAction::NewAgentChild => {
@@ -4987,6 +5377,7 @@ fn run_palette_action(
         | PaletteAction::CloseProject
         | PaletteAction::SwitchProjectNext
         | PaletteAction::SwitchProjectPrev
+        | PaletteAction::ChangeProjectBase
         | PaletteAction::OpenConfig
         | PaletteAction::PairPhone
         | PaletteAction::UnpairPhone => Ok(()),
@@ -5127,8 +5518,32 @@ fn reload_all_projects_config(workspace: &mut Workspace, env: &Env) {
             Some(gp) => load_layered_config(env.fs, gp, &project_path),
             None => load_config(env.fs, &project_path),
         };
-        if let Ok(cfg) = loaded {
-            p.state.reload_config(cfg);
+        if let Ok(mut cfg) = loaded {
+            let base = cfg.project.default_base_branch.clone();
+            if p.git.branch_exists(&base).unwrap_or(false) {
+                p.state.reload_config(cfg);
+                p.state.invalid_base_branch = None;
+                p.state
+                    .warnings
+                    .retain(|warning| !warning.starts_with("Configured default base '"));
+            } else {
+                // Apply unrelated config edits while retaining the last valid
+                // runtime default. The raw file remains untouched so the user
+                // can fix the invalid branch through the picker or editor.
+                cfg.project.default_base_branch = p.state.base_branch.clone();
+                p.state.reload_config(cfg);
+                p.state.invalid_base_branch = Some(base.clone());
+                p.state
+                    .warnings
+                    .retain(|warning| !warning.starts_with("Configured default base '"));
+                let warning = format!(
+                    "Configured default base '{base}' is not a local branch; keeping '{}'.",
+                    p.state.base_branch
+                );
+                if !p.state.warnings.contains(&warning) {
+                    p.state.warnings.push(warning);
+                }
+            }
         }
     }
 }
@@ -5503,7 +5918,9 @@ fn terminate_all_sessions(state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{AgentDef, Config, StatusPatterns, UiConfig, WorktreesConfig};
+    use crate::contracts::{
+        AgentDef, Config, StatusPatterns, TabState, UiConfig, WorktreeInfo, WorktreesConfig,
+    };
     use crate::testing::{FakeClock, FakeFs, FakeGit, FakePty};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -5680,6 +6097,34 @@ mod tests {
     // --- prompt dialogs ---------------------------------------------------
 
     #[test]
+    fn project_base_picker_filters_and_marks_the_selected_branch() {
+        let branches = vec![
+            "develop".to_string(),
+            "feature/base-ui".to_string(),
+            "main".to_string(),
+        ];
+        let matches: Vec<&str> = matching_branches(&branches, "BASE")
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(matches, vec!["feature/base-ui"]);
+
+        let dialog = prompt_dialog(&Prompt::ChangeProjectBase {
+            branches,
+            filter: String::new(),
+            selected: 2,
+        });
+        assert_eq!(dialog.input.as_deref(), Some(""));
+        assert_eq!(dialog.list.len(), 3);
+        assert!(dialog.list[2].selected);
+        assert_eq!(dialog.list[2].label, "main");
+        assert!(dialog
+            .buttons
+            .iter()
+            .any(|button| button.accel == DialogAccel::Enter));
+    }
+
+    #[test]
     fn new_agent_form_shows_input_radio_and_buttons() {
         let p = Prompt::NewAgentForm {
             agents: vec![
@@ -5688,6 +6133,9 @@ mod tests {
             ],
             selected: 1,
             branch: "fix bug".to_string(),
+            existing_branches: vec!["feature/existing".to_string()],
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: false,
             base_branch: "main".to_string(),
         };
@@ -5698,7 +6146,7 @@ mod tests {
         assert_eq!(dialog.list.len(), 2);
         assert!(dialog.list[1].selected);
         assert!(dialog.list[1].label.contains("OpenCode"));
-        // Create (Enter), the base toggle (Tab), and Cancel (Esc).
+        // Create (Enter), the target toggle (Tab), and Cancel (Esc).
         assert!(dialog
             .buttons
             .iter()
@@ -5706,7 +6154,7 @@ mod tests {
         assert!(dialog
             .buttons
             .iter()
-            .any(|b| b.accel == DialogAccel::Tab && b.label.contains("off")));
+            .any(|b| b.accel == DialogAccel::Tab && b.label.contains("new branch")));
         assert!(dialog.buttons.iter().any(|b| b.accel == DialogAccel::Esc));
     }
 
@@ -5716,6 +6164,9 @@ mod tests {
             agents: vec![("claude".to_string(), "Claude Code".to_string())],
             selected: 0,
             branch: "ignored".to_string(),
+            existing_branches: Vec::new(),
+            branch_selected: 0,
+            use_existing_branch: false,
             run_on_base: true,
             base_branch: "main".to_string(),
         };
@@ -5727,6 +6178,93 @@ mod tests {
             .buttons
             .iter()
             .any(|b| b.accel == DialogAccel::Tab && b.label.contains("main")));
+    }
+
+    #[test]
+    fn new_agent_form_existing_mode_filters_local_branches() {
+        let p = Prompt::NewAgentForm {
+            agents: vec![("claude".to_string(), "Claude Code".to_string())],
+            selected: 0,
+            branch: "AUTH".to_string(),
+            existing_branches: vec!["bug/cache".to_string(), "feature/auth-refresh".to_string()],
+            branch_selected: 0,
+            use_existing_branch: true,
+            run_on_base: false,
+            base_branch: "main".to_string(),
+        };
+
+        let dialog = prompt_dialog(&p);
+        assert_eq!(dialog.input.as_deref(), Some("AUTH"));
+        assert_eq!(dialog.list.len(), 1);
+        assert_eq!(dialog.list[0].label, "feature/auth-refresh");
+        assert!(dialog.list[0].selected);
+        assert!(dialog
+            .buttons
+            .iter()
+            .any(|b| b.accel == DialogAccel::Enter && b.label == "Use branch"));
+    }
+
+    #[test]
+    fn new_agent_form_queues_selected_existing_branch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let mut state = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
+        let git = FakeGit::new().with_root("/repo").with_branches([
+            "main",
+            "bug/cache",
+            "feature/auth-refresh",
+        ]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+        let mut ui = Ui::default();
+
+        start_new_tab_flow(&state, &services, &mut ui);
+        handle_prompt_key_project(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &services,
+            &mut ui,
+            0,
+        )
+        .unwrap();
+        for c in "auth".chars() {
+            handle_prompt_key_project(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &services,
+                &mut ui,
+                0,
+            )
+            .unwrap();
+        }
+        handle_prompt_key_project(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &services,
+            &mut ui,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(ui.pending_jobs.len(), 1);
+        assert_eq!(ui.pending_jobs[0].job.branch, "feature/auth-refresh");
+        assert!(!ui.pending_jobs[0].job.create_branch);
+        assert_eq!(state.tabs[0].meta.name, "feature/auth-refresh");
+        assert!(state.tabs[0].meta.attached_existing_branch);
     }
 
     #[test]
@@ -5764,20 +6302,6 @@ mod tests {
         let mut state = AppState::new(config, default_state("main"), "/repo", "/repo/state.json");
         let mut ui = Ui::default();
 
-        // Starting the flow opens the combined form with the default preselected.
-        start_new_tab_flow(&state, &mut ui);
-        // BTreeMap key order: "claude" (idx 0) before "opencode" (idx 1).
-        match &ui.prompt.as_ref().expect("prompt active").prompt {
-            Prompt::NewAgentForm {
-                agents, selected, ..
-            } => {
-                assert_eq!(agents[0].0, "claude");
-                assert_eq!(agents[1].0, "opencode");
-                assert_eq!(*selected, 1, "default agent preselected");
-            }
-            _ => panic!("expected NewAgentForm prompt"),
-        }
-
         let git = FakeGit::new();
         let fs = FakeFs::new();
         let pty = FakePty::new();
@@ -5793,6 +6317,20 @@ mod tests {
             command: &command,
         };
 
+        // Starting the flow opens the combined form with the default preselected.
+        start_new_tab_flow(&state, &services, &mut ui);
+        // BTreeMap key order: "claude" (idx 0) before "opencode" (idx 1).
+        match &ui.prompt.as_ref().expect("prompt active").prompt {
+            Prompt::NewAgentForm {
+                agents, selected, ..
+            } => {
+                assert_eq!(agents[0].0, "claude");
+                assert_eq!(agents[1].0, "opencode");
+                assert_eq!(*selected, 1, "default agent preselected");
+            }
+            _ => panic!("expected NewAgentForm prompt"),
+        }
+
         // ↑ moves the radio selection to the first agent (claude).
         handle_prompt_key_project(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
@@ -5802,7 +6340,8 @@ mod tests {
             0,
         )
         .unwrap();
-        // Tab toggles "run from base branch" on.
+        // With no non-base branches available, Tab skips the existing-branch
+        // target and moves directly to "run from base branch".
         handle_prompt_key_project(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             &mut state,
@@ -6158,6 +6697,259 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("local merge disabled")));
+    }
+
+    #[test]
+    fn startup_migrates_the_legacy_state_base_into_project_config() {
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let config_toml = crate::config::load::serialize_config(&config).unwrap();
+        let mut legacy_state = default_state("develop");
+        legacy_state.version = 1;
+        let state_json = serde_json::to_string(&legacy_state).unwrap();
+
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", config_toml.as_str())
+            .with_file("/repo/.flightdeck/state.json", state_json.as_str());
+        let git = FakeGit::new()
+            .with_root("/repo")
+            .with_branches(["main", "develop"]);
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(&services, repo, repo, None).unwrap();
+        assert_eq!(state.base_branch, "develop");
+        assert_eq!(state.to_project_state(0).version, STATE_VERSION);
+        let saved_config = fs
+            .file_contents(Path::new("/repo/.flightdeck/config.toml"))
+            .unwrap();
+        assert!(saved_config.contains("default_base_branch = \"develop\""));
+        let saved_state = load_state(&fs, Path::new("/repo/.flightdeck/state.json")).unwrap();
+        assert_eq!(saved_state.version, STATE_VERSION);
+        assert_eq!(saved_state.base_branch, "develop");
+    }
+
+    #[test]
+    fn startup_defers_legacy_base_migration_when_project_config_is_malformed() {
+        let mut legacy_state = default_state("develop");
+        legacy_state.version = 1;
+        let repo = Path::new("/repo");
+        let state_path = repo.join(".flightdeck/state.json");
+        let fs = FakeFs::new()
+            .with_dir(repo)
+            .with_file(repo.join(".flightdeck/config.toml"), "not valid TOML ][")
+            .with_file(
+                state_path.clone(),
+                serde_json::to_string(&legacy_state).unwrap(),
+            );
+        let git = FakeGit::new()
+            .with_root(repo)
+            .with_branches(["main", "develop"])
+            .with_current_branch("main");
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(&services, repo, repo, None).unwrap();
+        assert_eq!(state.base_branch, "develop");
+        assert_eq!(state.to_project_state(0).version, 1);
+        let still_legacy = load_state(&fs, &state_path).unwrap();
+        assert_eq!(still_legacy.version, 1);
+        assert_eq!(still_legacy.base_branch, "develop");
+    }
+
+    #[test]
+    fn startup_keeps_an_invalid_configured_base_visible_and_warns() {
+        let dir = TempDir::new().unwrap();
+        let agent = make_real_agent(&dir, "opencode");
+        let mut config = config_with_agent(agent);
+        config.project.default_base_branch = "missing".to_string();
+        let config_toml = crate::config::load::serialize_config(&config).unwrap();
+
+        let repo = Path::new("/repo");
+        let fs = FakeFs::new()
+            .with_dir("/repo")
+            .with_file("/repo/.flightdeck/config.toml", config_toml.as_str());
+        let git = FakeGit::new()
+            .with_root("/repo")
+            .with_branches(["main"])
+            .with_current_branch("main");
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let services = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        let state = startup(&services, repo, repo, None).unwrap();
+        assert_eq!(state.base_branch, "missing");
+        assert!(state
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("is not a local branch")));
+    }
+
+    #[test]
+    fn project_base_picker_persists_across_restart_without_retargeting_tabs() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run_git(&["init", "--initial-branch=main"]));
+        assert!(run_git(&[
+            "-c",
+            "user.name=FlightDeck Test",
+            "-c",
+            "user.email=flightdeck@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=",
+            &["com", "mit"].concat(),
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]));
+        assert!(run_git(&["branch", "develop"]));
+
+        let agent = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+        let mut invalid_disk_config = config.clone();
+        invalid_disk_config.project.default_base_branch = "missing".to_string();
+        let config_path = root.join(".flightdeck/config.toml");
+        let state_path = root.join(".flightdeck/state.json");
+        let worktree_path = root.join(".flightdeck/worktrees/existing");
+        let fs = FakeFs::new()
+            .with_dir(root.clone())
+            .with_dir(worktree_path.clone())
+            .with_file(
+                config_path.clone(),
+                crate::config::load::serialize_config(&invalid_disk_config).unwrap(),
+            );
+        let mut project_state = default_state("main");
+        project_state.tabs.push(TabState {
+            id: "existing".to_string(),
+            name: "Existing".to_string(),
+            slug: "existing".to_string(),
+            agent: "opencode".to_string(),
+            branch: "flightdeck/existing".to_string(),
+            worktree_path_relative: ".flightdeck/worktrees/existing".to_string(),
+            base_branch: "main".to_string(),
+            base_commit_sha: "abc123".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            attached_existing_branch: false,
+            recovered: false,
+            last_known_status: "unknown".to_string(),
+            manual_status: None,
+            containerized: false,
+            container_image: None,
+            runs_on_base: false,
+            resume_args: Vec::new(),
+        });
+        let app = AppState::new(config, project_state, &root, &state_path);
+        let (create_tx, create_rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let mut workspace = Workspace {
+            projects: vec![Project {
+                name: "project".to_string(),
+                git: GitCli::new(root.clone()),
+                state: app,
+                cache: GitStatusCache::new(),
+                create_tx,
+                create_rx,
+                status_tx,
+                status_rx,
+                status_in_flight: false,
+                git_lock: Arc::new(Mutex::new(())),
+            }],
+            active: 0,
+        };
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let env = Env {
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+
+        // Selecting the retained runtime value must still repair an invalid
+        // on-disk setting rather than returning early.
+        change_project_default_base(&mut workspace, &env, "main").unwrap();
+        let repaired = crate::config::load::parse_config(
+            &fs.file_contents(&config_path).expect("repaired config"),
+        )
+        .unwrap();
+        assert_eq!(repaired.project.default_base_branch, "main");
+
+        change_project_default_base(&mut workspace, &env, "develop").unwrap();
+        assert_eq!(workspace.active_project().state.base_branch, "develop");
+        assert_eq!(
+            workspace.active_project().state.tabs[0].meta.base_branch,
+            "main"
+        );
+        let saved_state = load_state(&fs, &state_path).unwrap();
+        assert_eq!(saved_state.base_branch, "develop");
+        assert_eq!(saved_state.tabs[0].base_branch, "main");
+
+        let restart_git = FakeGit::new()
+            .with_root(root.clone())
+            .with_branches(["main", "develop", "flightdeck/existing"])
+            .with_current_branch("main");
+        restart_git.add_existing_worktree(WorktreeInfo {
+            path: worktree_path,
+            branch: Some("flightdeck/existing".to_string()),
+            head: Some("def456".to_string()),
+        });
+        let restart_services = Services {
+            git: &restart_git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+        let restarted = startup(&restart_services, &root, &root, None).unwrap();
+        assert_eq!(restarted.base_branch, "develop");
+        assert_eq!(restarted.tabs.len(), 1);
+        assert_eq!(restarted.tabs[0].meta.base_branch, "main");
     }
 
     #[test]
@@ -7873,8 +8665,22 @@ mod tests {
         fn isolated_refuses_the_new_tab_flow() {
             let ws = one_project_workspace(true);
             let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
 
-            start_new_tab_flow(&ws.active_project().state, &mut ui);
+            start_new_tab_flow(&ws.active_project().state, &services, &mut ui);
 
             let msg = overlay_message(&ui).expect("a refusal is surfaced");
             assert!(
@@ -7888,8 +8694,22 @@ mod tests {
         fn a_normal_run_still_opens_the_new_tab_prompt() {
             let ws = one_project_workspace(false);
             let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
 
-            start_new_tab_flow(&ws.active_project().state, &mut ui);
+            start_new_tab_flow(&ws.active_project().state, &services, &mut ui);
 
             assert!(ui.prompt.is_some(), "the normal flow is untouched");
         }

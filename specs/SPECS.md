@@ -90,8 +90,9 @@ Child terminals are not modeled as agents, even if the user manually launches an
 5. FlightDeck prompts for:
    - Tab/task name
    - Agent selection, defaulting to OpenCode
-6. FlightDeck generates a branch name using `flightdeck/<task-slug>`.
-7. FlightDeck creates or attaches to the branch.
+   - Target: a generated branch, an existing local branch, or the project base
+6. For a new target, FlightDeck generates a branch name using `flightdeck/<task-slug>`.
+7. FlightDeck creates the generated branch or attaches to the selected/existing branch.
 8. FlightDeck creates or attaches to the worktree.
 9. FlightDeck immediately starts the selected agent.
 10. User interacts with the agent in the primary terminal.
@@ -323,6 +324,12 @@ clears a project override so the value re-inherits, `s` saves, and `e` opens the
 raw `config.toml` in `$EDITOR` for the full surface. Saving reloads every open
 project's effective config immediately.
 
+The git info bar always shows the active `default_base_branch`. Command palette
+-> "Change Project Default Base" opens a searchable picker containing local
+branches only. Saving this choice updates the project `config.toml` and the
+running project immediately. It changes the default for new Agent Tabs; it never
+silently retargets existing tabs.
+
 Example project override (only what differs from the global base):
 
 ```toml
@@ -403,12 +410,16 @@ Top-level state:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "project_root_relative": ".",
   "base_branch": "main",
   "tabs": []
 }
 ```
+
+The top-level `base_branch` is a compatibility/runtime mirror of
+`project.default_base_branch`; the committed project config is authoritative.
+Each existing tab's own `base_branch` remains its pinned merge/rebase target.
 
 Each Agent Tab state:
 
@@ -491,6 +502,13 @@ If the generated branch already exists:
 
 FlightDeck must not silently attach to existing branches.
 
+The New Agent form also offers a searchable picker of existing local branches
+other than the project base. A selected branch is used verbatim, including
+branches outside the configured `flightdeck/` prefix; FlightDeck never creates
+or renames it. The tab is marked as attached to an existing branch and follows
+the same worktree create/reuse/refusal rules below. The project base remains a
+separate no-worktree target mode.
+
 If the branch is already checked out:
 
 - If checked out in `.flightdeck/worktrees/`, reuse that worktree.
@@ -499,23 +517,26 @@ If the branch is already checked out:
 
 Generated branches must use `flightdeck/`.
 
-Manual attach to non-prefixed branches is not part of the core MVP. If later added, such branches should be marked as external.
-
 ---
 
 ## 12. Base Branch and Drift Tracking
 
-MVP supports one base branch per project.
+Each project has one default base branch for new Agent Tabs. The committed
+`project.default_base_branch` is authoritative and is visible in the git info
+bar. Existing Agent Tabs keep the target they were created with when the
+project default changes; this avoids silently changing their rebase or merge
+destination.
 
 Each Agent Tab stores:
 
 - Base branch name
 - Base commit SHA at creation time
 
-FlightDeck should show drift information:
+FlightDeck should show target movement persistently in the sidebar and git info
+bar:
 
 ```text
-Base moved: 12 commits ahead since tab creation
+Target advanced: 12 commits since this tab last synced
 ```
 
 This should be computed by comparing the stored base commit SHA to the current base branch.

@@ -254,6 +254,6 @@ mod tests {
             .unwrap();
         let state: serde_json::Value = serde_json::from_str(&state_str).unwrap();
         assert_eq!(state["base_branch"], "develop");
-        assert_eq!(state["version"], 1);
+        assert_eq!(state["version"], crate::contracts::STATE_VERSION);
     }
 }

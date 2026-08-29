@@ -38,6 +38,8 @@ pub trait GitExecutor {
     fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>>;
     /// Whether a local branch exists.
     fn branch_exists(&self, name: &str) -> Result<bool>;
+    /// Local branch names without the `refs/heads/` prefix, sorted by refname.
+    fn list_local_branches(&self) -> Result<Vec<String>>;
     /// Create a new branch `name` starting at `from` (does not check it out).
     fn create_branch(&self, name: &str, from: &str) -> Result<()>;
     /// Resolve a refname to a commit SHA.

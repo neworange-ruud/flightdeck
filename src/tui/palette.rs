@@ -44,6 +44,9 @@ pub enum PaletteAction {
     OpenProject,
     /// T9 must confirm, then close the active project (workspace-level).
     CloseProject,
+    /// T9 must open the local-branch picker and update this project's default
+    /// base branch without retargeting existing tabs.
+    ChangeProjectBase,
     /// Switch to the next open project (workspace-level).
     SwitchProjectNext,
     /// Switch to the previous open project (workspace-level).
@@ -79,6 +82,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         group: "Projects",
         label: "Previous Project",
         action: PaletteAction::SwitchProjectPrev,
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "Change Project Default Base",
+        action: PaletteAction::ChangeProjectBase,
     },
     PaletteEntry {
         group: "Agent Session Tabs",
@@ -219,8 +227,9 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
 /// Phone") bring the total to 28, plus "About FlightDeck" makes 29, plus "Open
-/// Worktree in File Manager" makes 30.
-pub const REQUIRED_ACTION_COUNT: usize = 30;
+/// Worktree in File Manager" makes 30, plus "Change Project Default Base"
+/// makes 31.
+pub const REQUIRED_ACTION_COUNT: usize = 31;
 
 /// The command palette model (SPECS §22).
 ///
@@ -279,6 +288,7 @@ impl CommandPalette {
             | PaletteAction::CloseProject
             | PaletteAction::SwitchProjectNext
             | PaletteAction::SwitchProjectPrev
+            | PaletteAction::ChangeProjectBase
             | PaletteAction::NewAgentTab => !self.isolated,
             _ => true,
         }
@@ -403,6 +413,7 @@ mod tests {
             "Close Project",
             "Next Project",
             "Previous Project",
+            "Change Project Default Base",
             "New Agent Session Tab",
             "Rename Agent Session Tab",
             "Close Agent Session Tab",
@@ -685,6 +696,7 @@ mod tests {
             "Close Project",
             "Next Project",
             "Previous Project",
+            "Change Project Default Base",
             "New Agent Session Tab",
         ] {
             assert!(
@@ -715,6 +727,7 @@ mod tests {
         assert!(labels.contains(&"Close Project"));
         assert!(labels.contains(&"Next Project"));
         assert!(labels.contains(&"Previous Project"));
+        assert!(labels.contains(&"Change Project Default Base"));
         assert!(labels.contains(&"New Agent Session Tab"));
     }
 

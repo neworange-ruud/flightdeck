@@ -546,6 +546,19 @@ impl GitExecutor for FakeGit {
         Ok(self.inner.lock().unwrap().branches.contains(name))
     }
 
+    fn list_local_branches(&self) -> Result<Vec<String>> {
+        let mut branches: Vec<String> = self
+            .inner
+            .lock()
+            .unwrap()
+            .branches
+            .iter()
+            .cloned()
+            .collect();
+        branches.sort();
+        Ok(branches)
+    }
+
     fn create_branch(&self, name: &str, from: &str) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         st.branches.insert(name.to_string());
@@ -1196,6 +1209,10 @@ mod tests {
         let git = FakeGit::new().with_branches(["main", "flightdeck/x"]);
         assert!(git.branch_exists("flightdeck/x").unwrap());
         assert!(!git.branch_exists("nope").unwrap());
+        assert_eq!(
+            git.list_local_branches().unwrap(),
+            vec!["flightdeck/x".to_string(), "main".to_string()]
+        );
         git.set_dirty(true);
         assert!(git.is_dirty(Path::new("/repo")).unwrap());
         git.set_dirty_at("/repo/clean", false);
