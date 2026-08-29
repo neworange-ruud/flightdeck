@@ -176,6 +176,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **The web command palette shortcut now works with the terminal focused.**
+  FlightDeck captures `Ctrl-g` before xterm and browser controls can consume it,
+  so the palette opens in both Terminal and App mode across Safari and
+  Chromium-based browsers instead of sending the chord to the hosted agent or
+  silently losing it.
+
 - **Revoking a browser's access now actually disconnects it.** Pressing revoke
   withdrew the credential but never told the browser holding it, so an unwanted
   browser kept full control of every terminal until it happened to reconnect —

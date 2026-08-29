@@ -467,6 +467,41 @@ describe("the keyboard and pointer positions (§5)", () => {
       expect(event.defaultPrevented, key).toBe(false);
     }
   });
+
+  it("captures Ctrl-g before a focused terminal can consume it in either mode", () => {
+    const h = render();
+    const terminalInput = document.createElement("textarea");
+    const terminalHandler = vi.fn((event: KeyboardEvent) => {
+      event.stopPropagation();
+    });
+    terminalInput.addEventListener("keydown", terminalHandler);
+    h.q(".fd-mount").append(terminalInput);
+
+    const terminalMode = new KeyboardEvent("keydown", {
+      key: "g",
+      code: "KeyG",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    terminalInput.dispatchEvent(terminalMode);
+    expect(terminalMode.defaultPrevented).toBe(true);
+    expect(terminalHandler).not.toHaveBeenCalled();
+    expect(h.app.store.getState().palette).not.toBeNull();
+
+    h.app.store.dispatch({ type: "mode/set", mode: "app" });
+    terminalInput.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "g",
+        code: "KeyG",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(terminalHandler).not.toHaveBeenCalled();
+    expect(h.app.store.getState().palette).toBeNull();
+  });
 });
 
 /**

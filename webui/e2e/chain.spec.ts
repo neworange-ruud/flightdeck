@@ -130,6 +130,15 @@ test.describe("FlightDeck Web, end to end", () => {
      */
     const typed = marker();
     await page.locator(".fd-mount").click();
+
+    /** The palette chord is captured before xterm can consume it as terminal
+     * input. Exercise it with xterm's hidden textarea focused, in real Chromium,
+     * because a synthetic event on the app frame cannot prove that ordering. */
+    await page.keyboard.press("Control+g");
+    await expect(page.locator(".fd-palette")).toBeVisible();
+    await page.keyboard.press("Control+g");
+    await expect(page.locator(".fd-palette")).toBeHidden();
+
     await page.keyboard.type(typed);
     await page.keyboard.press("Enter");
 

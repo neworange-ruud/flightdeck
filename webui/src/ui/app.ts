@@ -363,7 +363,7 @@ export function createApp(options: AppOptions): App {
    * `attachCustomKeyEventHandler` so it stays the single authority — otherwise
    * an `Esc` would be both queued here and sent there.
    *
-   * ## Why this listens on the document and not on the frame
+   * ## Why this listens on the document, not on the frame
    *
    * `remote-control-eek.4` (§6.5 R17). It was on `frame`, and a keydown only
    * reaches a listener on an element if that element is an **ancestor of the
@@ -382,6 +382,10 @@ export function createApp(options: AppOptions): App {
    *
    * Keys have no position. Their target is wherever focus happens to be, which
    * is not this component's business, so the keyboard belongs to the document.
+   * `Ctrl-g` alone uses capture because xterm consumes terminal keys before a
+   * bubbling document listener can see them. The chord FlightDeck claims must
+   * be handled on the way down, before xterm can turn it into a BEL byte for the
+   * hosted agent; every other app key keeps the normal bubbling order.
    * The **pointer** handler below stays on the frame, because a click does have
    * a position and its target is a real element inside it.
    *
@@ -391,26 +395,13 @@ export function createApp(options: AppOptions): App {
    * without this each one's listener would outlive its DOM and keep reducing
    * into a store nobody is reading.
    */
+  document.addEventListener("keydown", handleCommandPaletteShortcut, true);
+
   document.addEventListener("keydown", (event: KeyboardEvent) => {
     if (!frame.isConnected) {
       return;
     }
     const state = store.getState();
-
-    if (event.key === "g" && event.ctrlKey) {
-      event.preventDefault();
-      /**
-       * Opening pre-session (no snapshot yet, or mid access/takeover prompt)
-       * would show a palette with nothing real to run — the chord still gets
-       * swallowed either way, which is the whole point of claiming it.
-       */
-      if (state.access === null && state.takeover === null) {
-        store.dispatch({
-          type: state.palette === null ? "palette/open" : "palette/close",
-        });
-      }
-      return;
-    }
 
     /**
      * The overlays claim the keyboard before the main screen does, in the order
@@ -612,6 +603,25 @@ export function createApp(options: AppOptions): App {
       store.dispatch({ type: "mode/set", mode: "terminal" });
     }
   });
+
+  function handleCommandPaletteShortcut(event: KeyboardEvent): void {
+    if (!frame.isConnected || !isCommandPaletteShortcut(event)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const state = store.getState();
+    /**
+     * Opening pre-session (no snapshot yet, or mid access/takeover prompt)
+     * would show a palette with nothing real to run — the chord still gets
+     * swallowed either way, which is the whole point of claiming it.
+     */
+    if (state.access === null && state.takeover === null) {
+      store.dispatch({
+        type: state.palette === null ? "palette/open" : "palette/close",
+      });
+    }
+  }
 
   /**
    * 2b's keyboard. Digits fill the four boxes, `Backspace` takes one back,
@@ -1189,6 +1199,19 @@ export function createApp(options: AppOptions): App {
    */
   function isPlain(event: KeyboardEvent): boolean {
     return !event.ctrlKey && !event.metaKey && !event.altKey;
+  }
+
+  /** `code` covers Chromium-family shells that normalize a modified key
+   * differently while still reporting the physical G key. Modifier checks keep
+   * browser-owned variants such as `Ctrl-Shift-g` out of FlightDeck's claim. */
+  function isCommandPaletteShortcut(event: KeyboardEvent): boolean {
+    return (
+      event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      (event.key.toLowerCase() === "g" || event.code === "KeyG")
+    );
   }
 
   /**
