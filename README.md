@@ -328,6 +328,68 @@ trace: one Agent Session Tab in the repo root, marked with a permanent
 `state.json` gets written. Cannot be combined with a subcommand
 (`flightdeck -I doctor` is an error). See SPECS §32 for the full contract.
 
+## FlightDeck Web (browser control surface)
+
+A web server embedded in the binary serves a full-fidelity browser remote
+control: every project, session, status and git detail the TUI sees, real
+terminals rendered by xterm.js from the actual PTY byte stream, and keystrokes
+back into the focused terminal. Use it to unblock a waiting agent from a phone,
+a tablet, or a second laptop.
+
+Start it from the command palette:
+
+| Command | What it does |
+| --- | --- |
+| `Start Web Interface` | Starts the server and opens the access panel |
+| `Stop Web Interface` | Stops the server and disconnects every browser |
+| `Show Web Access` | Brings the access panel back to get a code |
+
+Or turn it on for every launch:
+
+```toml
+[web]
+enabled = true                 # auto-start on launch (default: false)
+port = 7420                    # a configured 0 is rejected
+bind = "127.0.0.1"             # loopback only; a routable bind is an opt-in
+replay_bytes = 262144          # per-terminal replay ring buffer (256 KiB)
+```
+
+**Access.** The desktop shows a short code that lasts 120 seconds and is
+exchanged once for a per-browser cookie, which survives restarts and can be
+revoked or rotated. The code arrives in the URL *fragment*, so it never reaches a
+request line or a log, and only a hash of the credential is written to disk. The
+access panel lists every browser holding access — address, what it is, how long
+connected — so you can revoke one rather than all of them; revoking disconnects
+it immediately. `r` hides the code and QR while screen sharing.
+
+**Binding.** `127.0.0.1` by default, so out of the box only this machine can
+reach it. `n` in the access panel rebinds to `0.0.0.0` for your local network and
+spells out the consequence: anyone there with the code can read your
+repositories, type into your agents, and push branches. There is **no relay and
+no tunnel** — reaching FlightDeck from outside your network is deliberately your
+own choice of Tailscale, `ssh -L 7420:127.0.0.1:7420 you@host`, or a tunnel
+service. Do not expose it directly to the public internet.
+
+**Multiple writers.** Any number of browsers can hold a writing seat (the
+desktop is always one), arbitrated by a soft input lock: whoever types takes the
+turn and keeps it until they pause, and someone typing into another person's
+burst is told so by name rather than having keystrokes spliced in or dropped. No
+surface has priority. Every surface shows the same live seat list.
+
+**The git boundary is unchanged.** Push, finish / local merge and rebase worktree
+work from the browser and refuse in the desktop's own words. No
+browser-reachable path can rewrite history except the one sanctioned rebase, and
+none can open a pull request. Pull Base stays desktop-only. Anything destructive
+(Abandon Worktree, Rebase Worktree, Quit) requires typing the session name
+exactly — it is the remoteness that earns the second step, not the command.
+Actions that land on the host machine keep a `host only` badge rather than being
+hidden.
+
+The interface is dark-only and keyboard-first (`Ctrl-g` palette in both modes,
+`?` for help in App mode), letterboxes the host's grid rather than scaling it,
+and works down to tablet widths. See `specs/WEB_INTERFACE.md` for the full
+contract.
+
 ## Agent status indicators
 
 Every Agent Tab shows its agent's live status — a one-cell indicator next to the

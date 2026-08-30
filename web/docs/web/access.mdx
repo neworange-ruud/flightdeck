@@ -1,0 +1,107 @@
+---
+label: Access & Security
+section: FlightDeck Web
+order: 31
+---
+
+# Access & Security
+
+FlightDeck Web hands out control of your agents and your repositories, so
+getting a browser in is a deliberate act with a visible cost. This page covers
+how a browser is admitted, what is stored, and how to take access away again.
+
+## The access panel
+
+`Start Web Interface` opens the **access panel** on the desktop. It is the only
+place a code is ever shown, and `Show Web Access` in the palette brings it back
+if you dismissed it.
+
+The panel has two modes, and it starts in the safe one.
+
+### Local only (the default)
+
+FlightDeck binds `127.0.0.1`, so only this machine can reach it. The panel
+offers:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Open in browser — launches the host's default browser, already signed in |
+| `c` | Copy URL, **with a one-time code attached**, for a second browser |
+| `n` | Allow other devices on this network to connect |
+| `x` | Revoke browser access |
+
+<Callout type="info">
+  The URL printed in the panel carries **no credential** — a second browser
+  opening it would be asked for a code. `c` copies a different string, one with
+  a code attached. The panel says so rather than letting you assume otherwise.
+</Callout>
+
+### Network access (an explicit opt-in)
+
+Pressing `n` rebinds to `0.0.0.0`, asks which of your network addresses to
+publish, and issues a scannable code. The panel then shows a QR to scan from a
+phone, the code in large type with its countdown, and the list of addresses to
+choose from.
+
+<Callout type="warning">
+  Anyone on that network who has the code can read your repositories, type into
+  your agents, and push branches. FlightDeck states this on the panel itself
+  rather than burying it in documentation.
+</Callout>
+
+Press `l` to go back to local only. Press `r` at any time to hide the code and
+the QR — useful when you are screen sharing or recording.
+
+## How a browser is admitted
+
+1. The desktop shows a short **access code**. It lasts **120 seconds**.
+2. A browser presents the code **once** and exchanges it for a per-browser
+   credential stored as a cookie.
+3. That cookie survives FlightDeck restarts, so the browser does not re-pair
+   every session. It can be revoked or rotated at any time.
+
+Two details are deliberate:
+
+- **The code arrives in the URL fragment**, not the query string. Fragments are
+  never sent to the server, so the code cannot reach a request line, an access
+  log, or a proxy.
+- **Only a hash of the credential is ever written to disk.** The token itself
+  exists in the browser and nowhere else on the host.
+
+## Revoking access
+
+Press `x` in the access panel. The panel lists **every browser holding
+access** — its address, what it is, and how long it has been connected — so you
+can revoke one rather than all of them.
+
+Revoking closes those sessions **immediately**. The browser is told it lost
+access rather than silently going stale, and it is locked out on its next
+request.
+
+## Reaching it from another network
+
+FlightDeck Web does not tunnel and will not do it for you. Network mode only
+opens the port on your **local** network. To reach a running FlightDeck from
+somewhere else, use a tool built for it:
+
+- **Tailscale** (or another mesh VPN) — the address stays private and no port is
+  published to the internet.
+- **`ssh -L 7420:127.0.0.1:7420 you@host`** — forwards the loopback port over a
+  connection you already trust, and lets you leave the bind on `127.0.0.1`.
+- A tunnel service, if you accept what publishing it means.
+
+<Callout type="warning">
+  Do not put FlightDeck Web directly on the public internet. Its threat model is
+  a trusted network plus a short-lived code, not the open web.
+</Callout>
+
+## What the browser cannot do
+
+Even with full access, a browser cannot open a pull request, cannot rewrite
+history other than the one sanctioned rebase, and cannot run Pull Base. These
+are structural, not preferences — see
+[What it deliberately does not do](/web#what-it-deliberately-does-not-do).
+
+Destructive commands also take a second step from a browser: you type the
+session's name exactly. See
+[Destructive commands ask twice](/web/using#destructive-commands-ask-twice).

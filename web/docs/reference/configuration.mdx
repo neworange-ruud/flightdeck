@@ -83,6 +83,32 @@ FlightDeck Remote (phone pairing). See [FlightDeck Remote](/remote).
   manager.
 </Callout>
 
+## `[web]`
+
+FlightDeck Web (the browser control surface). See [FlightDeck Web](/web).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Auto-start the web server on launch. Off by default — starting it is otherwise an explicit palette action |
+| `port` | `7420` | TCP port the embedded server listens on. A configured `0` is rejected |
+| `bind` | `127.0.0.1` | Bind address. Loopback by default; a routable address is an explicit opt-in |
+| `replay_bytes` | `262144` | Per-terminal replay ring buffer, in bytes (256 KiB). Bytes rather than lines, because the buffer sits in front of the VT parser |
+
+<Callout type="warning">
+  Setting `bind` to a routable address (`0.0.0.0`, or a LAN interface IP) makes
+  FlightDeck reachable from your network, and anyone there holding an access
+  code can type into your agents and push branches. FlightDeck warns when the
+  server actually starts on such a bind. Never expose it directly to the public
+  internet — use Tailscale or `ssh -L` instead. See
+  [Access & Security](/web/access).
+</Callout>
+
+<Callout type="info">
+  `port` is validated rather than defaulted to "whatever is free": a server that
+  a bookmark or a QR code points at cannot have the OS pick a random port each
+  launch.
+</Callout>
+
 ## `[containers]`
 
 Run agents in Podman containers. See [Agents in Containers](/desktop/containers).

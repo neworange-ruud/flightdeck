@@ -1,0 +1,134 @@
+---
+label: Using the Browser
+section: FlightDeck Web
+order: 32
+---
+
+# Using the Browser
+
+The browser mirrors the desktop's layout and its two-mode keyboard model, so
+what you already know about FlightDeck applies. This page covers where the
+browser differs, and why.
+
+## Keyboard
+
+Like the desktop, the browser has **App mode** and **Terminal mode**. In
+Terminal mode every key belongs to the agent; in App mode plain keys drive
+FlightDeck.
+
+| Key | Mode | Action |
+| --- | --- | --- |
+| `Ctrl-g` | both | Command palette |
+| `Enter` | App | Enter the focused terminal |
+| `Esc` | Terminal | Back to App mode |
+| `↑` `↓` | App | Move between sessions |
+| `←` `→` | App | Move between split panes |
+| `a` | App | Activity feed |
+| `?` | App | Help & keybindings |
+| `s` | App | Sidebar slide-over (below 900px only) |
+| `r` | — | Reconnect, when disconnected |
+
+<Callout type="info">
+  `Ctrl-g` is captured before xterm.js and the browser's own controls can
+  consume it, so the palette opens in **both** modes across Safari and
+  Chromium-based browsers.
+
+  The desktop's `F1` / `Alt-h` are deliberately **not** claimed in the browser:
+  `F1` is the browser's own help in Chrome and Firefox, and `Alt-h` opens a
+  browser menu on Windows. `?` in App mode is the browser's help key.
+</Callout>
+
+## Why the terminal is letterboxed
+
+The host owns the PTY geometry. Rather than scaling the host's grid to fit your
+window, the browser **letterboxes** it and names the geometry in a chip in the
+git bar.
+
+This is a deliberate trade: crisp type is the one thing a browser does better
+than a terminal, and upscaling a bitmap grid would throw it away. If the host's
+grid is wider than your viewport the stage **scrolls** — it is never cropped
+silently.
+
+## Reconnecting, and missed output
+
+Each terminal keeps a replay ring buffer on the host (256 KiB by default, set by
+`replay_bytes`). A reconnecting tab resumes from a byte cursor within that
+buffer.
+
+If the session produced more output than the host kept, the browser **says so**
+rather than showing a terminal with an invisible hole in it. It also reports how
+stale the picture is and the round-trip time to the host, and shows replay
+arriving with real progress.
+
+Keystrokes you type while reconnecting are **held and delivered in order**, not
+dropped.
+
+## Sharing the terminal with other people
+
+Any number of browsers can hold a **writing seat**, and the desktop is always
+one of them. Two people typing into one terminal would otherwise interleave
+keystrokes and look like a bug in the agent, so FlightDeck arbitrates with a
+**soft input lock**:
+
+- Whoever types **takes the turn**, and keeps it until they pause.
+- Someone typing into another person's burst is **told so, by name**, instead of
+  having their keystrokes spliced in or silently dropped.
+- If you need the terminal now, **taking over is one confirmed click** — and it
+  takes nobody's seat away. The interrupted writer gets the turn back as soon as
+  you pause.
+- **No surface has priority**, the desktop included.
+
+`Take Input Lock` in the palette is the explicit override.
+
+Every surface shows the same seat list — who is connected, who may type, who is
+typing right now, and which row is you — live, as people come and go. The
+desktop's status bar carries the same information as a chip, so you can tell
+from the machine itself that a browser is mid-sentence.
+
+## Dialogs are shared
+
+A dialog opens on **both** surfaces at once, tagged with who opened it, and
+either surface can answer it. A question from an agent is not trapped on
+whichever surface happened to be in front when it arrived.
+
+## Git from the browser
+
+Push, finish / local merge and rebase worktree all work from the browser, and
+they **refuse in the same words the desktop would use** — a dirty base or a
+missing upstream reads as itself rather than as a generic failure.
+
+The read-only git panel carries the branch, base, drift, dirty state,
+ahead/behind and the GitHub compare URL. Where a fact is unknown it says so
+rather than showing a zero: no upstream means no ahead/behind row at all, and no
+compare URL means no link rather than one guessed from the branch name.
+
+<Callout type="info">
+  The compare link states plainly that FlightDeck does **not** open the pull
+  request. It never has, on any surface.
+</Callout>
+
+## Destructive commands ask twice
+
+**Abandon Worktree**, **Rebase Worktree** and **Quit** each take a second step
+from a browser: you type the session's name **exactly** — no trimming, no case
+folding.
+
+Getting it wrong refuses and changes nothing. Cancelling is never gated, at
+either step.
+
+The desktop's own dialogs are unchanged. It is the **remoteness** that earns the
+second step, not the command — a browser is not the machine the damage lands on.
+
+## Host-only commands
+
+Commands whose effect lands on the machine FlightDeck is running on — opening a
+worktree in the file manager, launching `$EDITOR` — stay visible with a
+`host only` badge rather than being hidden. A missing command is more confusing
+than an honest one. **Pull Base** is desktop-only for the same reason, and says
+so.
+
+## On a tablet
+
+Below 900px the sidebar becomes a slide-over (`s` in App mode, or the chip in
+the project row) and the git bar folds into the status bar. The terminal still
+letterboxes and is still never scaled.

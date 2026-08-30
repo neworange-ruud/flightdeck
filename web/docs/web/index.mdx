@@ -1,0 +1,93 @@
+---
+label: Web Overview
+section: FlightDeck Web
+order: 30
+---
+
+# FlightDeck Web
+
+**FlightDeck Web** is a browser control surface for a running FlightDeck. A web
+server embedded in the desktop binary serves every project, session, status and
+git detail the TUI sees — with real terminals rendered from the actual PTY byte
+stream — so an agent waiting on a question can be unblocked from a phone, a
+tablet, or a second laptop.
+
+It is not a separate app and there is no account to create. The desktop process
+*is* the server: when FlightDeck quits, the web interface goes with it.
+
+<Callout type="info">
+  FlightDeck Web involves **no relay and no cloud service**. It binds
+  `127.0.0.1` by default, so out of the box it is reachable only from the
+  machine FlightDeck is running on. Reaching it from elsewhere is deliberately
+  your own choice — see [Reaching it from another network](/web/access#reaching-it-from-another-network).
+</Callout>
+
+## What it gives you
+
+- **Real terminals.** The host forwards raw PTY bytes and the browser's
+  xterm.js parses them, so what you read is exactly what the agent wrote —
+  colour, cursor movement, progress bars and all.
+- **The command palette**, the dialog family, the configuration manager and
+  split view — each driving the same code the desktop drives, not a
+  reimplementation.
+- **Keystrokes back into the focused terminal**, so you can answer a prompt or
+  steer an agent rather than only watching one.
+- **Guarded git actions** — push, finish / local merge and rebase worktree — that
+  refuse in the same words the desktop would use.
+- **An activity feed** carrying the last 200 status transitions (or 24 hours),
+  so a freshly opened tab lands on history rather than silence.
+- **Multiple people at once.** Any number of browsers can hold a writing seat,
+  arbitrated so two people typing never splices one line into another. See
+  [Sharing the terminal](/web/using#sharing-the-terminal-with-other-people).
+
+## Starting and stopping it
+
+Open the command palette (`Ctrl-g`) on the desktop and run:
+
+| Command | What it does |
+| --- | --- |
+| `Start Web Interface` | Starts the server and opens the access panel |
+| `Stop Web Interface` | Stops the server and disconnects every browser |
+| `Show Web Access` | Brings the access panel back to get a code |
+
+Only the applicable one is offered: you will not see `Start Web Interface`
+while the server is already running.
+
+To have it on at every launch, set it in your configuration instead:
+
+```toml
+[web]
+enabled = true
+```
+
+See the [`[web]` configuration reference](/reference/configuration#web) for
+every key, and [Access & Security](/web/access) for how a browser actually gets
+in.
+
+## What it deliberately does not do
+
+- **It cannot open a pull request.** No browser-reachable path can, exactly as
+  on the desktop. The git panel offers a GitHub compare URL and says plainly
+  that FlightDeck does not open the PR for you.
+- **It cannot rewrite your history**, except the one rebase the specification
+  sanctions. This is enforced by construction rather than by a check.
+- **Pull Base stays desktop-only**, and says so.
+- **Actions that land on the host machine** — opening a worktree in the file
+  manager, launching `$EDITOR` — stay visible with a `host only` badge rather
+  than being hidden, because a missing command is more confusing than an honest
+  one.
+- **No web push notifications.** The activity feed is in-app only.
+
+## Requirements and shape
+
+- The interface is **dark-only** and **keyboard-first**.
+- It works on a tablet: below 900px the sidebar becomes a slide-over and the
+  git bar folds into the status bar.
+- The terminal is **letterboxed, never scaled** — see
+  [Why the terminal is letterboxed](/web/using#why-the-terminal-is-letterboxed).
+
+<Callout type="warning">
+  A browser tab left open across a FlightDeck update will ask to be reloaded
+  when the wire protocol has changed. Reload it rather than trusting what it
+  shows.
+</Callout>

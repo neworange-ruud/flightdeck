@@ -150,6 +150,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- **FlightDeck Web is now documented.** The documentation site gains a
+  *FlightDeck Web* section (overview, access & security, using the browser), the
+  `[web]` keys join the Configuration Reference, and the README gains a
+  FlightDeck Web section covering the palette commands, the access model, the
+  bind warning and the unchanged git boundary. The feature shipped without any
+  of it.
 - FlightDeck Web now exposes **Change Project Default Base** and follows the New
   Agent form's host-owned three-target cycle (new branch, existing branch, base)
   instead of treating `Tab` as a local boolean. The web protocol is v5, so a tab
