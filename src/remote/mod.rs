@@ -1,16 +1,19 @@
 //! FlightDeck Remote — the desktop relay client.
 //!
 //! This module owns the desktop half of the phone <-> desktop link: a single
-//! long-lived outbound WebSocket connection to the hosted relay. It mirrors the
-//! update-check thread idiom ([`crate::update::start_check`]) — a detached
-//! `std::thread` owning a **blocking** [`tungstenite`] socket — because the TUI
-//! has no async runtime and must stay single-threaded and synchronous.
+//! long-lived outbound WebSocket connection to the hosted relay. It is a
+//! [`tokio`] task on the process's one shared runtime ([`runtime`]) — the same
+//! runtime the embedded web server uses (`specs/WEB_INTERFACE.md` D6) — while the
+//! TUI event loop itself stays single-threaded and synchronous and talks to the
+//! task over `std::sync::mpsc` channels.
 //!
 //! Layers:
 //! * [`identity`] — the per-device ECDSA P-256 keypair and its wire encodings.
 //! * [`state`] — `~/.flightdeck/remote.json`: the private key, pairings, and the
 //!   per-direction sequence cursors that make `resume`/`ack`/dedup work.
-//! * [`client`] — the connection thread: connect → hello → auth → resume → pump,
+//! * [`runtime`] — the one async runtime, owned by a dedicated thread and shared
+//!   with `src/web/server.rs` so the binary never starts a second one.
+//! * [`client`] — the connection task: connect → hello → auth → resume → pump,
 //!   with exponential backoff + jitter reconnect and periodic latency pings.
 //!
 //! ## What this module does NOT do
@@ -23,11 +26,12 @@
 //!
 //! ## Threading & channels
 //!
-//! [`client::RemoteHandle::start`] takes a [`Sender<RemoteInbound>`] (thread →
-//! app) and a [`Receiver<RemoteOutbound>`] (app → thread). The app drains
-//! [`RemoteInbound`] non-blockingly each render tick and never blocks on the
-//! socket; the thread drains [`RemoteOutbound`] each ~100 ms poll. Shutdown is a
-//! shared atomic flag flipped by [`client::RemoteHandle::stop`].
+//! [`client::RemoteHandle::start`] takes a [`Sender<RemoteInbound>`] (task → app)
+//! and a [`Receiver<RemoteOutbound>`] (app → task) — plain `std::sync::mpsc`,
+//! unchanged by the move to tokio. The app drains [`RemoteInbound`]
+//! non-blockingly each render tick and never blocks on the socket; the task is
+//! woken by whichever channel or timer fires, rather than polling on a tick.
+//! Shutdown is [`client::RemoteHandle::stop`] (or simply dropping the handle).
 
 pub mod bridge;
 pub mod client;
@@ -39,11 +43,12 @@ pub mod identity;
 pub mod notifier;
 pub mod opencode;
 pub mod pairing;
+pub mod runtime;
 pub mod shell;
 pub mod state;
 pub mod transcript;
 
-pub use bridge::{ProjectView, RemoteBridge};
+pub use bridge::{PeerLiveness, ProjectView, RemoteBridge};
 pub use client::{RemoteHandle, RemoteLinkState};
 pub use identity::DeviceIdentity;
 pub use state::{Pairing, RemoteState};
@@ -156,6 +161,38 @@ pub enum RemoteInbound {
         pairing_id: PairingId,
         /// The `seq` the relay will accept next; the next envelope must use it.
         next_seq: u64,
+    },
+    /// The peer acknowledged our outbound envelopes up to `cursor` (cumulative,
+    /// spec §6.2) — the relay forwarded the phone's `ack` for **our** stream.
+    ///
+    /// This is the desktop's only *end-to-end* evidence that the phone is
+    /// actually receiving: the link indicator is driven by the relay `pong`,
+    /// which measures the desktop↔relay hop and stays healthy while the phone is
+    /// dark. The bridge feeds it into an ack-based peer-liveness deadline so a
+    /// phone that never acks stops being treated as present (remote-control-5qu).
+    ///
+    /// A `cursor` of 0 is meaningful and expected: the relay echoes the stored
+    /// ack cursor for each activated pairing right after `auth_ok`, so the very
+    /// first one may say "your peer has acked nothing". Receiving *any* of these
+    /// is what tells the desktop this relay forwards peer acks at all — a relay
+    /// built before that change never sends one, and the bridge then leaves the
+    /// guard disarmed rather than declaring every phone dark.
+    PeerAck {
+        /// Pairing whose outbound stream was acknowledged.
+        pairing_id: PairingId,
+        /// Highest contiguous outbound `seq` the peer has durably handled.
+        cursor: u64,
+    },
+    /// The relay's queue for this pairing overflowed: it shed the oldest
+    /// un-acked envelope because the peer has not drained ~1000 of them
+    /// (`rate_limited`, spec §6 amendment). Independent of [`Self::PeerAck`] —
+    /// and available from every already-deployed relay — this is proof that the
+    /// peer is not consuming what we send, so the bridge treats it as immediate
+    /// loss of peer liveness instead of ignoring the advisory and shovelling on
+    /// (remote-control-5qu).
+    PeerBacklog {
+        /// The pairing whose queue is overflowing.
+        pairing_id: PairingId,
     },
     /// The relay handshake ended before `auth_ok`, so the connection never went
     /// live: no pairing code can be minted and no envelope can flow. Carries a

@@ -1,0 +1,96 @@
+/*
+ * FlightDeck Web — named semantic palette and type scale.
+ *
+ * Source of truth: specs/design/flightdeck-web-turn2.dc.html, artboard
+ * `2g — REFERENCE SHEET`. That artboard supersedes the extracted table in
+ * specs/WEBAPP_DESIGN_BRIEFING_T2.md §7 (see specs/design/README.md).
+ *
+ * Rule: ship the designer's names, not colour literals. Every later screen
+ * (remote-control-sk4u onward) reaches for `var(--fd-*)`, never a hex code.
+ * Each token below is annotated with its documented meaning so the mapping
+ * from name to intent survives a `grep`, per the code-review rule quoted in
+ * 2g: "if deleting it would lose a fact, it cannot be `--fd-text-decor`."
+ *
+ * This app is dark-only by design decision (specs/WEB_INTERFACE.md, "Non-
+ * goals"), so these are defined on `:root` unconditionally rather than behind
+ * a `prefers-color-scheme` query — there is no light variant to fall back to.
+ */
+:root {
+  /* --- Text, ordered from brightest to most decorative ------------------ */
+  /* primary text, selected rows (contrast 17.1:1) */
+  --fd-text: #edf4ff;
+  /* terminal body, setting labels (15.4:1) */
+  --fd-text-soft: #dce7f7;
+  /* prose, inactive tab labels (9.4:1) */
+  --fd-text-muted: #a9b8cf;
+  /* secondary, connection label (6.8:1) */
+  --fd-text-second: #8a9cb8;
+  /* lifted floor for facts a user could act on wrongly: agent name,
+     no-upstream, git: ? (4.8:1) — "facts move up", not decoration */
+  --fd-text-quiet: #6d819d;
+  /* decoration only: key-hint letters, counts, the "|" separator (2.9:1).
+     If deleting it would lose a fact, it cannot be this colour. */
+  --fd-text-decor: #4d5f79;
+
+  /* --- Terminal-specific ------------------------------------------------- */
+  /* an entire asleep terminal renders in this; lifted from #5d6f8a to 5.6:1
+     because a whole screen of text was the least defensible use of the old
+     dim tier — it now reads as "not listening", not "barely there" */
+  --fd-term-asleep: #7d90ab;
+
+  /* --- Status / accent, one hue per meaning ------------------------------ */
+  /* selection, key names, agent tab, Terminal mode (13.4:1) */
+  --fd-focus: #f5d76e;
+  /* interactive, upstream, manual override, shell tab (11.7:1) */
+  --fd-accent: #61dafb;
+  /* idle, healthy, additions, connected (11.0:1) */
+  --fd-ok: #5ddc9a;
+  /* attention, error, the "x" glyph, working spinner, disconnected (6.8:1) */
+  --fd-alert: #ff6b6b;
+  /* NEW in turn 2 — stale terminal, reconnecting, revoked token: "still true
+     a moment ago" (8.6:1). Distinct from --fd-alert: stale is not broken, it
+     is unconfirmed. */
+  --fd-stale: #e0a34a;
+  /* drift, recovered, App mode, and takeover: "another actor" acted (8.0:1) */
+  --fd-elsewhere: #d68bf5;
+  /* branch glyph, (global) origin, reload-to-update (7.8:1) */
+  --fd-info: #6aa8ff;
+
+  /* --- Ground / structure ------------------------------------------------- */
+  /* frame ground */
+  --fd-ground: #07111f;
+  /* recessed chrome strips above/below the terminal */
+  --fd-chrome: #050c16;
+  /* page canvas, behind everything */
+  --fd-canvas: #04090f;
+  /* frame border */
+  --fd-rule: #16233a;
+  /* inner rule between rows within a frame */
+  --fd-rule-inner: #101d31;
+  /* the "|" glyph used as a literal separator character */
+  --fd-sep: #24374f;
+
+  /* Carried verbatim from the TUI's own ratatui theme, for the two places the
+     browser draws something that must match the desktop pixel-for-pixel. */
+  --fd-tui-select: #3a5a8a;
+  --fd-tui-tab: rgb(16, 38, 68);
+
+  /* --- Type scale: four sizes, one family --------------------------------
+   * Turn 1 shipped seven sizes inside a 3.5px spread that were three sizes
+   * pretending to be seven. Turn 2 collapsed this to four; do not add a
+   * fifth without a design turn to back it. */
+  /* eyebrows, origin tags, captions */
+  --fd-t-meta: 11px;
+  /* chrome, terminals, dialogs — everything else */
+  --fd-t-body: 12.5px;
+  /* artboard and overlay titles */
+  --fd-t-title: 14px;
+  /* the pairing code — the one place the app shouts */
+  --fd-t-code: 30px;
+
+  /* --- Type family --------------------------------------------------------
+   * See src/style/fonts.css for the @font-face rule and the offline-fallback
+   * rationale (webui/README.md "Font"). */
+  --fd-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code",
+    "DejaVu Sans Mono", monospace;
+}

@@ -1,13 +1,24 @@
-//! Client tests: pure backoff schedule plus a full client state-machine drill
-//! against an in-process **mock relay** (a `std::net::TcpListener` +
-//! `tungstenite::accept` on a worker thread — no async runtime). The mock proves
-//! protocol compliance without the real relay: it verifies the auth signature
-//! with the client's real public key, exercises resume/ack/envelope echo, and
-//! the auth-failure and reconnect-after-drop paths.
+//! Client tests: pure units (backoff, the flush gate, password precedence,
+//! pairing retirement, the async connect errors) plus a full client
+//! state-machine drill against an in-process **mock relay**.
+//!
+//! The mock is deliberately the **blocking** `tungstenite` server on a plain
+//! `std::thread` (a `std::net::TcpListener` + `tungstenite::accept`), even though
+//! the client under test is now async. Keeping the harness independent of the
+//! client's own machinery is the point: if the mock shared the runtime, the
+//! `select!` loop and the tokio channels, a bug in any of them could be masked by
+//! the harness making the same mistake. From the socket's point of view the mock
+//! is just a relay peer.
+//!
+//! The client runs on the process-wide shared runtime
+//! ([`crate::remote::runtime`]), so most tests stay plain `#[test]`s that drive
+//! it exactly as the synchronous TUI does: send on a `std::sync::mpsc` channel,
+//! block on `recv_timeout`. `#[tokio::test]` is used only where the assertion is
+//! about an async function directly.
 
 use super::*;
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream as StdTcpStream};
 use std::sync::mpsc::channel;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -16,6 +27,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
+
+use tungstenite::WebSocket;
 
 use flightdeck_remote_protocol::relay::{EncryptedEnvelope, RelayErrorCode, RelayFrame};
 use flightdeck_remote_protocol::{PairingId, Role};
@@ -180,7 +193,9 @@ impl RemoteStore for MemStore {
     }
 }
 
-type Ws = WebSocket<TcpStream>;
+/// The mock's side of the socket: the blocking `tungstenite` server over a
+/// `std::net::TcpStream` (NOT the client's `tokio::net::TcpStream`).
+type Ws = WebSocket<StdTcpStream>;
 
 /// How long a mock worker waits for the next client connection before giving up.
 /// A test that self-heals (or otherwise stops the client) connects fewer times
@@ -196,7 +211,7 @@ const MOCK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Accept one connection within [`MOCK_ACCEPT_TIMEOUT`], returning `None` if none
 /// arrives (the client has stopped reconnecting). The accepted stream is put back
 /// into blocking mode with [`MOCK_READ_TIMEOUT`] so no downstream read can hang.
-fn accept_within(listener: &TcpListener) -> Option<TcpStream> {
+fn accept_within(listener: &TcpListener) -> Option<StdTcpStream> {
     listener
         .set_nonblocking(true)
         .expect("set_nonblocking on mock listener");
@@ -228,7 +243,7 @@ fn accept_within(listener: &TcpListener) -> Option<TcpStream> {
 fn ws_recv(ws: &mut Ws) -> Option<RelayFrame> {
     loop {
         match ws.read() {
-            Ok(Message::Text(s)) => return serde_json::from_str(&s).ok(),
+            Ok(Message::Text(s)) => return serde_json::from_str(s.as_str()).ok(),
             Ok(Message::Close(_)) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -237,7 +252,7 @@ fn ws_recv(ws: &mut Ws) -> Option<RelayFrame> {
 }
 
 fn ws_send(ws: &mut Ws, frame: &RelayFrame) {
-    let _ = ws.send(Message::Text(serde_json::to_string(frame).unwrap()));
+    let _ = ws.send(Message::Text(serde_json::to_string(frame).unwrap().into()));
 }
 
 /// Run the relay side of the handshake, verifying the auth signature against
@@ -1626,8 +1641,8 @@ fn retiring_is_idempotent_and_keeps_the_claimed_pairing() {
 
 // --- wss is compiled in on every platform (remote-control-2jy) --------------
 
-#[test]
-fn wss_reaches_the_tls_handshake_on_every_platform() {
+#[tokio::test]
+async fn wss_reaches_the_tls_handshake_on_every_platform() {
     // The windows-msvc build used to ship with no TLS backend at all, so
     // `connect()` refused every `wss://` URL outright — which meant the default
     // relay (`wss://relay.flightdeckai.app/ws`) could never be reached from
@@ -1644,9 +1659,9 @@ fn wss_reaches_the_tls_handshake_on_every_platform() {
         drop(accept_within(&listener));
     });
 
-    // `RelaySocket` is deliberately not `Debug` (it owns live sockets), so unwrap
-    // the error by hand rather than via `expect_err`.
-    let err = match connect(&format!("wss://{addr}/ws")) {
+    // `RelaySocket` is deliberately not unwrapped with `expect_err`: the Ok side
+    // owns a live socket and is not `Debug`.
+    let err = match connect(&format!("wss://{addr}/ws")).await {
         Err(e) => e,
         Ok(_) => panic!("there is no TLS peer here to shake hands with"),
     };
@@ -1762,4 +1777,676 @@ fn unreachable_relay_reports_a_retryable_handshake_failure() {
         "unexpected reason: {reason}"
     );
     assert!(retrying, "a connect failure may clear on its own");
+}
+
+// --- The async connect path (tokio port) -----------------------------------
+
+/// Every connect refusal must be *classified* before it reaches the app: the
+/// blocking client separated "bad url" / "tcp connect failed" / "tls upgrade"
+/// because the pairing overlay shows the reason verbatim, and merging them into
+/// one `connect_async` call would have flattened that back into a single opaque
+/// string.
+#[tokio::test]
+async fn connect_rejects_a_malformed_relay_url_before_touching_the_network() {
+    let err = match connect("not a url at all").await {
+        Err(e) => e,
+        Ok(_) => panic!("a malformed url cannot produce a socket"),
+    };
+    assert!(
+        err.starts_with("bad relay url:"),
+        "a malformed url must be reported as such, got: {err}"
+    );
+}
+
+/// Nothing listening: the failure is the TCP phase, not the upgrade — so the app
+/// is told the relay is unreachable rather than blaming TLS.
+#[tokio::test]
+async fn connect_reports_an_unreachable_relay_as_a_tcp_failure() {
+    // Bind then drop, so the port is (almost certainly) closed but well-formed.
+    let addr = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let err = match connect(&format!("ws://{addr}/ws")).await {
+        Err(e) => e,
+        Ok(_) => panic!("nothing is listening on a closed port"),
+    };
+    assert!(
+        err.starts_with("tcp connect failed:"),
+        "an unreachable relay must be reported as a connect failure, got: {err}"
+    );
+}
+
+// --- Shutdown signalling (tokio port) --------------------------------------
+
+/// The stop signal replaced the blocking client's polled `AtomicBool`. It must
+/// fire on an explicit `stop()`, stay fired (the session awaits it from several
+/// `select!`s), and — critically — also fire when the [`RemoteHandle`] is merely
+/// *dropped*, which is how the old `Drop` impl kept the socket from outliving the
+/// app.
+#[tokio::test]
+async fn stop_signal_fires_on_request_and_on_handle_drop() {
+    let (tx, mut rx) = watch::channel(false);
+    // Nothing requested yet: the future must not resolve.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stopped(&mut rx))
+            .await
+            .is_err(),
+        "an un-signalled stop must never resolve"
+    );
+
+    let _ = tx.send(true);
+    tokio::time::timeout(Duration::from_secs(1), stopped(&mut rx))
+        .await
+        .expect("an explicit stop() must resolve the signal");
+    // Latched: every later await resolves immediately, so a session that checks
+    // it from more than one select! cannot miss it.
+    tokio::time::timeout(Duration::from_secs(1), stopped(&mut rx))
+        .await
+        .expect("the stop signal must stay latched");
+
+    // A dropped handle is also a shutdown request (the old `Drop for
+    // RemoteHandle`, which flipped the atomic without calling stop()).
+    let (drop_tx, mut drop_rx) = watch::channel(false);
+    drop(drop_tx);
+    tokio::time::timeout(Duration::from_secs(1), stopped(&mut drop_rx))
+        .await
+        .expect("dropping the handle must resolve the signal");
+}
+
+/// `stop()` must be prompt *and* graceful: the relay sees a `Bye` and a close,
+/// and the caller (the TUI thread on its way out) is not parked. The blocking
+/// client joined its thread unbounded; this waits on a plain channel with a
+/// grace period, so it also must not depend on being outside a runtime.
+#[test]
+fn stop_sends_bye_and_closes_the_socket_promptly() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["p"]));
+        // Read past the resume until the teardown arrives.
+        for _ in 0..20 {
+            match ws_recv(&mut ws) {
+                Some(RelayFrame::Bye { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+        false
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("p"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    wait_for_connected(&in_rx);
+
+    let started = Instant::now();
+    handle.stop();
+    let elapsed = started.elapsed();
+
+    assert!(
+        mock.join().unwrap(),
+        "stop() must send a Bye before closing the socket"
+    );
+    assert!(
+        elapsed < STOP_GRACE + Duration::from_secs(1),
+        "stop() must not park the caller (took {elapsed:?})"
+    );
+}
+
+// --- Junk on the wire is ignored, not fatal (tokio port) --------------------
+
+/// The blocking client folded "no data yet", "unparseable text" and "a control
+/// frame" into one idle outcome. The async read classifies them explicitly, so
+/// guard the refusal path: unparseable text and a binary frame must be dropped
+/// and the session must survive to deliver the next real envelope. A regression
+/// that treated either as fatal would reconnect-loop on a chatty relay.
+#[test]
+fn malformed_text_and_binary_frames_are_ignored_not_fatal() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        let _ = ws_recv(&mut ws); // resume
+
+        // Junk first: not JSON at all, then JSON that is not a relay frame, then
+        // a binary frame.
+        let _ = ws.send(Message::text("this is definitely not a relay frame"));
+        let _ = ws.send(Message::text("{\"type\":\"no_such_frame\"}"));
+        let _ = ws.send(Message::binary(vec![0u8, 1, 2, 3]));
+
+        // Then something real. The client must still be here to ack it.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_test"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 0,
+                nonce: "bg==".to_string(),
+                ciphertext: "aGk=".to_string(),
+            }),
+        );
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Ack { cursor, .. }) => cursor == 1,
+            _ => false,
+        }
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    wait_for_connected(&in_rx);
+    let mut delivered = false;
+    let mut disconnected = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !delivered {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::Envelope(env)) => {
+                assert_eq!(env.seq, 1);
+                delivered = true;
+            }
+            Ok(RemoteInbound::Link(RemoteLinkState::Disconnected)) => disconnected = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        mock.join().unwrap(),
+        "the real envelope must still be acked after the junk"
+    );
+    assert!(delivered, "junk must not swallow the following envelope");
+    assert!(!disconnected, "junk on the wire must not end the session");
+    handle.stop();
+}
+
+// --- A fatal relay error ends the session (failure path) --------------------
+
+/// Post-auth relay errors split two ways ([`is_fatal_error`]): an advisory is
+/// logged and the session continues, a fatal one ends the session so the
+/// supervisor reconnects. Drill the fatal side end-to-end — a regression that
+/// swallowed it would leave the client attached to a connection the relay has
+/// already given up on, with the liveness deadline (60s) as the only backstop.
+#[test]
+fn a_fatal_relay_error_ends_the_session_and_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        // conn #1: authenticate, then send an advisory (must be survived) and a
+        // fatal error (must end the session).
+        let s1 = accept_within(&listener).expect("first connect");
+        let mut ws1 = tungstenite::accept(s1).unwrap();
+        assert!(mock_authenticate(&mut ws1, &pubkey, &["p"]));
+        let _ = ws_recv(&mut ws1); // resume
+        ws_send(
+            &mut ws1,
+            &RelayFrame::Error {
+                code: RelayErrorCode::RateLimited,
+                message: "slow down".to_string(),
+                pairing_id: None,
+                expected_seq: None,
+            },
+        );
+        ws_send(
+            &mut ws1,
+            &RelayFrame::Error {
+                code: RelayErrorCode::Internal,
+                message: "relay is unwell".to_string(),
+                pairing_id: None,
+                expected_seq: None,
+            },
+        );
+
+        // conn #2: the client must come back.
+        let s2 = accept_within(&listener).expect("reconnect after a fatal error");
+        let mut ws2 = tungstenite::accept(s2).unwrap();
+        mock_authenticate(&mut ws2, &pubkey, &["p"])
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("p"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    let mut connected = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && connected < 2 {
+        if let Ok(RemoteInbound::Link(RemoteLinkState::Connected { .. })) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            connected += 1;
+        }
+    }
+
+    assert!(
+        mock.join().unwrap(),
+        "the client must re-authenticate on the second connection"
+    );
+    assert!(
+        connected >= 2,
+        "a fatal relay error must end the session and reconnect (got {connected} Connected)"
+    );
+    handle.stop();
+}
+
+/// The fatal/advisory split itself, as a unit: a mistake here is silent in
+/// production (either an endless reconnect loop or a client wedged on a dead
+/// connection), so pin the classification.
+#[test]
+fn only_unrecoverable_relay_errors_are_fatal() {
+    for fatal in [
+        RelayErrorCode::AuthFailed,
+        RelayErrorCode::UnsupportedVersion,
+        RelayErrorCode::NotAuthenticated,
+        RelayErrorCode::BadFrame,
+        RelayErrorCode::Internal,
+    ] {
+        assert!(is_fatal_error(fatal), "{fatal:?} must end the session");
+    }
+    for advisory in [
+        RelayErrorCode::RateLimited,
+        RelayErrorCode::PeerUnavailable,
+        RelayErrorCode::PairingClaimRejected,
+        RelayErrorCode::UnknownPairing,
+        RelayErrorCode::SeqViolation,
+    ] {
+        assert!(
+            !is_fatal_error(advisory),
+            "{advisory:?} is recoverable and must not end the session"
+        );
+    }
+}
+
+// --- Fresh-desktop pre-auth offer bootstrap (spec §5.2) --------------------
+
+/// A desktop the relay has never seen cannot authenticate until it has
+/// registered itself with a pre-auth `pairing_offer` (the relay rejects an
+/// unknown device with `auth_failed "unknown device"`). So on a fresh store the
+/// client must hold the `auth_challenge`, wait up to [`PENDING_OFFER_WAIT`] for
+/// the app's `RequestPairing`, offer, consume the `pairing_offer_ok` — surfacing
+/// the claim code to the overlay — and only then answer the challenge *including*
+/// the new pairing id.
+///
+/// This is the one place the session drains the outbound channel before
+/// authenticating, which the tokio port expresses as a guarded `select!` branch
+/// rather than a `try_recv` inside the read loop. The request is queued *before*
+/// the client starts so it is already waiting when the window opens.
+#[test]
+fn a_fresh_desktop_offers_a_pairing_before_it_authenticates() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || -> Vec<PairingId> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 1,
+                server_time_ms: 0,
+                connection_id: "conn".to_string(),
+            },
+        );
+        let nonce_raw = [9u8; 32];
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode(nonce_raw),
+                server_time_ms: 0,
+            },
+        );
+
+        // The OFFER must come first — an auth_response here would mean the
+        // client tried to authenticate as a device the relay does not know.
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::PairingOffer {
+                claim_token_hint,
+                device_public_key,
+                key_agreement_public_key,
+                ..
+            }) => {
+                assert_eq!(
+                    claim_token_hint.as_deref(),
+                    Some("4321"),
+                    "the app's requested claim code must be carried into the offer"
+                );
+                assert_eq!(
+                    device_public_key, key_agreement_public_key,
+                    "the desktop reuses its identity key for key agreement (spec §7.1)"
+                );
+            }
+            other => panic!("expected a pre-auth pairing_offer, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingOfferOk {
+                pairing_id: PairingId::new("pair_fresh"),
+                claim_token: "4321".to_string(),
+                expires_at_ms: 9_999,
+            },
+        );
+
+        // Only now the auth_response — and it must activate the pairing the
+        // offer just minted, or the relay would not resume it.
+        let ids = match ws_recv(&mut ws) {
+            Some(RelayFrame::AuthResponse {
+                signature,
+                pairing_ids,
+                ..
+            }) => {
+                let vk = VerifyingKey::from_sec1_bytes(&pubkey).unwrap();
+                let sig = Signature::from_slice(&STANDARD.decode(&signature).unwrap()).unwrap();
+                assert!(vk.verify(&nonce_raw, &sig).is_ok(), "signature must verify");
+                pairing_ids
+            }
+            other => panic!("expected auth_response after the offer, got {other:?}"),
+        };
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![PairingId::new("pair_fresh")],
+            },
+        );
+        ids
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let shared = std::sync::Arc::new(Mutex::new(RemoteState::default()));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    // Queued before the client starts, so it is already waiting when the
+    // pre-auth window opens — the startup race PENDING_OFFER_WAIT exists for.
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".to_string()),
+        })
+        .unwrap();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+
+    let mut offered: Option<(PairingId, String)> = None;
+    let mut connected = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !(offered.is_some() && connected) {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::PairingOffered {
+                pairing_id,
+                claim_token,
+                ..
+            }) => offered = Some((pairing_id, claim_token)),
+            Ok(RemoteInbound::Link(RemoteLinkState::Connected { .. })) => connected = true,
+            _ => {}
+        }
+    }
+
+    let activated = mock.join().unwrap();
+    assert_eq!(
+        activated,
+        vec![PairingId::new("pair_fresh")],
+        "the auth_response must activate the freshly-offered pairing"
+    );
+    let (pairing_id, claim_token) =
+        offered.expect("the claim code must reach the app so the overlay can show it");
+    assert_eq!(pairing_id.as_str(), "pair_fresh");
+    assert_eq!(claim_token, "4321");
+    assert!(connected, "the bootstrap must end in an authenticated link");
+    assert_eq!(
+        shared.lock().unwrap().pairing_ids(),
+        vec!["pair_fresh".to_string()],
+        "the offered pairing must be persisted so the next connect authenticates with it"
+    );
+
+    handle.stop();
+}
+
+// --- Peer-ack liveness plumbing (remote-control-5qu) -----------------------
+
+/// The relay forwards the phone's cumulative `ack` for OUR stream. The client
+/// must persist it as `last_acked_by_peer` **and** surface it as
+/// [`RemoteInbound::PeerAck`], because that cursor is the desktop's only
+/// end-to-end evidence that the phone is receiving anything. It used to be
+/// written and read nowhere, so a dark phone was indistinguishable from a healthy
+/// one behind a relay-`pong`-driven link indicator.
+///
+/// A `cursor: 0` ack must be surfaced too: the relay echoes each activated
+/// pairing's stored cursor right after `auth_ok`, and receiving one at all is how
+/// the bridge learns this relay forwards peer acks (and may therefore enforce an
+/// ack deadline).
+#[test]
+fn a_forwarded_peer_ack_is_persisted_and_surfaced_to_the_app() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume, got {other:?}"),
+        }
+        // The post-`auth_ok` cursor echo: nothing acked yet.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 0,
+            },
+        );
+        // Later, the phone confirms up to seq 7.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Ack {
+                pairing_id: PairingId::new("pair_test"),
+                cursor: 7,
+            },
+        );
+        // Keep the socket open so the client is not reconnecting mid-assert.
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut pairing = Pairing::new("pair_test");
+    pairing.last_sent_seq = 9;
+    seed.pairings.push(pairing);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let store = Box::new(SharedStore(shared.clone()));
+
+    let (in_tx, in_rx) = channel();
+    // Held (not dropped) so the client's app→relay channel stays open.
+    let (_out_tx, out_rx) = channel();
+    let tuning = ClientTuning {
+        cursor_flush_interval: Duration::ZERO,
+        ..ClientTuning::default()
+    };
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
+
+    wait_for_connected(&in_rx);
+
+    let mut cursors = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !cursors.contains(&7) {
+        if let Ok(RemoteInbound::PeerAck { pairing_id, cursor }) =
+            in_rx.recv_timeout(Duration::from_millis(250))
+        {
+            assert_eq!(pairing_id.as_str(), "pair_test");
+            cursors.push(cursor);
+        }
+    }
+    assert!(
+        cursors.contains(&0),
+        "the relay's post-auth cursor echo must reach the app — it is what arms \
+         the ack-liveness guard; got {cursors:?}"
+    );
+    assert!(
+        cursors.contains(&7),
+        "a real peer ack must reach the app; got {cursors:?}"
+    );
+
+    let mut acked = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        acked = shared
+            .lock()
+            .unwrap()
+            .pairing("pair_test")
+            .map(|p| p.last_acked_by_peer)
+            .unwrap_or(0);
+        if acked == 7 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(acked, 7, "the peer-ack high-water must be persisted");
+
+    handle.stop();
+    let _ = mock.join();
+}
+
+/// `rate_limited` for a pairing is the relay saying it is SHEDDING our un-acked
+/// envelopes (its queue holds ~1000), i.e. the peer has stopped draining. The
+/// client must keep the connection (nothing is wrong with the *link*) but surface
+/// it as [`RemoteInbound::PeerBacklog`] instead of swallowing it as a non-fatal
+/// advisory, which is what let the desktop shovel 33,000 envelopes into the void.
+#[test]
+fn a_queue_overflow_advisory_is_surfaced_as_a_peer_backlog() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_test"]));
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::Resume { .. }) => {}
+            other => panic!("expected resume, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::RateLimited,
+                message: "pairing queue overflow: oldest envelope dropped".to_string(),
+                pairing_id: Some(PairingId::new("pair_test")),
+                expected_seq: None,
+            },
+        );
+        // The connection must survive: a live envelope still gets through.
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_test"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 1,
+                nonce: "bg==".to_string(),
+                ciphertext: "Y2lwaGVy".to_string(),
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(SharedStore(std::sync::Arc::new(Mutex::new(seed))));
+
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle =
+        RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, ClientTuning::default());
+
+    wait_for_connected(&in_rx);
+
+    let mut backlog = false;
+    let mut envelope_after = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !envelope_after {
+        match in_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RemoteInbound::PeerBacklog { pairing_id }) => {
+                assert_eq!(pairing_id.as_str(), "pair_test");
+                backlog = true;
+            }
+            Ok(RemoteInbound::Envelope(_)) => envelope_after = true,
+            _ => {}
+        }
+    }
+    assert!(
+        backlog,
+        "a queue-overflow advisory must be surfaced as loss of peer liveness"
+    );
+    assert!(
+        envelope_after,
+        "the advisory must not tear the connection down — the link is fine"
+    );
+
+    drop(out_tx);
+    handle.stop();
+    let _ = mock.join();
 }

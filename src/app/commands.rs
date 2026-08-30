@@ -179,7 +179,18 @@ pub enum Command {
     /// Falls back to the project's repo root when no tab is selected.
     OpenWorktreeInFileManager,
     /// Quit FlightDeck (signals clean teardown to the wiring layer, SPECS §23).
-    Quit,
+    ///
+    /// With `confirm` true it quits, which is what `Ctrl-q` and the desktop's
+    /// own palette row dispatch — SPECS §23 gives the person at this keyboard no
+    /// second question, and this task did not add one. With `confirm` false the
+    /// first dispatch returns [`Effect::QuitConfirm`] instead, which is how a
+    /// *remote* surface reaches it: D16 says a `host only` badge is not enough
+    /// for quit, so the browser's row carries the unconfirmed value and lands on
+    /// the shared dialog (`specs/WEB_INTERFACE.md` §6.5 R13, artboard 1g).
+    Quit {
+        /// Whether the caller has already taken the confirmation step.
+        confirm: bool,
+    },
 }
 
 /// What the UI should surface after a [`Command`] is dispatched.
@@ -261,6 +272,11 @@ pub enum Effect {
         status: Box<WorktreeStatus>,
         pr_url: Option<String>,
     },
+    /// The UI must confirm before re-dispatching `Quit { confirm: true }` (D16,
+    /// `specs/WEB_INTERFACE.md` §6.5 R13). Only an *unconfirmed* quit returns
+    /// this, and only a browser's row carries one — the desktop's `Ctrl-q` is
+    /// unchanged, because the person pressing it is at the machine it stops.
+    QuitConfirm,
     /// The help screen should be shown (SPECS §23).
     ShowHelp,
     /// The About dialog should be shown (version + credits).

@@ -323,6 +323,13 @@ impl TestClient {
                 Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => return,
                 // Transport-level keepalives are not a teardown; keep waiting.
                 Ok(Some(Ok(WsMessage::Ping(_)))) | Ok(Some(Ok(WsMessage::Pong(_)))) => continue,
+                // Interim application frames are not a teardown either, exactly as
+                // this helper's contract says. A freshly authenticated leg now
+                // legitimately receives its own stream's ack cursor for each
+                // activated pairing (remote-control-5qu), and previously this arm
+                // panicked on it — asserting "says nothing", which was never what
+                // the callers mean. Only the close/end is the assertion.
+                Ok(Some(Ok(WsMessage::Text(_)))) | Ok(Some(Ok(WsMessage::Binary(_)))) => continue,
                 Ok(Some(Ok(other))) => {
                     panic!("expected the connection to be torn down, got frame: {other:?}")
                 }

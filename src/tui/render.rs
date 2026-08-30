@@ -36,6 +36,7 @@ use crate::tui::layout;
 use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
+use crate::web::access::{AccessMode, WebAccessView};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -74,6 +75,10 @@ pub enum UiOverlay {
     /// The desktop pairing surface (Settings → Remote): the QR + 4-digit code
     /// and pairing status (spec §5.2).
     Remote(RemotePairing),
+    /// The browser access surface (`specs/WEB_INTERFACE.md` D5, Q1; design
+    /// `2a`): how a browser gets in, in whichever of the two states the current
+    /// binding puts it.
+    WebAccess(WebAccessView),
 }
 
 /// Render-ready snapshot of a pairing attempt for [`UiOverlay::Remote`]. Rebuilt
@@ -144,6 +149,18 @@ impl DialogButton {
         }
     }
 
+    /// Whether this button **dismisses** the dialog rather than deciding it.
+    ///
+    /// The dialogs do not agree on a cancel key — `n` in the close
+    /// confirmations, `c` in the push confirmation, `Esc` in the forms — but
+    /// they all agree on the *label*, because `prompt_dialog` writes it. One
+    /// rule, read by `dialog_decision` (which key cancelled) and by
+    /// `web_dialog_view` (which button a browser should cancel with), so the
+    /// two cannot drift.
+    pub fn cancels(&self) -> bool {
+        self.label == "Cancel"
+    }
+
     /// The rendered cell text, e.g. `" [y] Close "`.
     fn cell(&self) -> String {
         format!(" [{}] {} ", self.accel.key_label(), self.label)
@@ -180,6 +197,16 @@ pub struct Dialog {
     pub buttons: Vec<DialogButton>,
     /// Border / accent colour (confirmations vs notifications).
     pub accent: Color,
+    /// **D13's origin label**, e.g. `opened from browser · 192.168.2.20`.
+    ///
+    /// `None` for a dialog the person at this keyboard opened — the normal case,
+    /// where an origin line would be noise. `Some` is the whole reason D13 is
+    /// acceptable: a dialog is app state, so a browser opening one puts a modal
+    /// on the desktop that *this* user did not ask for, and this line is the only
+    /// thing that explains it. `specs/WEB_INTERFACE.md` D13 calls it load-bearing,
+    /// not decoration, which is why it is a field on the render model rather than
+    /// something a caller remembers to prepend to the title.
+    pub origin: Option<String>,
 }
 
 impl Dialog {
@@ -191,6 +218,7 @@ impl Dialog {
             list: Vec::new(),
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -202,6 +230,7 @@ impl Dialog {
             list: Vec::new(),
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -220,6 +249,7 @@ impl Dialog {
             list,
             buttons,
             accent: Color::Cyan,
+            origin: None,
         }
     }
 
@@ -232,7 +262,16 @@ impl Dialog {
             list: Vec::new(),
             buttons: vec![DialogButton::new(DialogAccel::Enter, "OK")],
             accent: Color::Blue,
+            origin: None,
         }
+    }
+
+    /// The same dialog, tagged with where the request to open it came from
+    /// (D13). Builder-shaped because every prompt builds its dialog from the
+    /// prompt alone and only the *event loop* knows the origin.
+    pub fn from_origin(mut self, origin: impl Into<String>) -> Dialog {
+        self.origin = Some(origin.into());
+        self
     }
 }
 
@@ -326,10 +365,12 @@ pub enum HitTarget {
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
     let chrome = layout::chrome_for(area, state.mode());
+    let side = state.config.ui.agent_tab_side();
     let ml = layout::compute(
         area,
         chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        side,
     );
     if rect_contains(ml.sidebar, col, row) {
         // A click on the `✕` on a tab's name row closes it; elsewhere on a tab
@@ -338,7 +379,7 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, col, row)
+            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, side, col, row)
                 .unwrap_or(HitTarget::Sidebar),
         );
     }
@@ -397,10 +438,11 @@ fn sidebar_hit(
     area: Rect,
     tab_count: usize,
     chrome: layout::Chrome,
+    side: crate::contracts::AgentTabPosition,
     col: u16,
     row: u16,
 ) -> Option<HitTarget> {
-    let inner = Block::default().borders(Borders::RIGHT).inner(area);
+    let inner = Block::default().borders(sidebar_seam(side)).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
@@ -419,12 +461,19 @@ fn sidebar_hit(
         return None;
     }
     // Within a full tab block the rows are: divider(0), name(1), agent(2),
-    // git(3). The `✕` lives on the name row at the far right; give it a
-    // forgiving 3-column target so it stays easy to click. The collapsed strip
-    // has no close control — use APP mode to close an agent.
+    // git(3). The `✕` lives on the name row at the sidebar's outer end — the
+    // far right at `left`, the far left at `right`, mirrored with the row it
+    // is drawn in (`sidebar_name_line`). Give it a forgiving 3-column target so
+    // it stays easy to click. The collapsed strip has no close control — use
+    // APP mode to close an agent.
     if chrome == layout::Chrome::Full && rel % rows_per_tab == 1 {
-        let close_col = inner.x.saturating_add(inner.width).saturating_sub(1);
-        if col >= close_col.saturating_sub(2) {
+        let hit = match side {
+            crate::contracts::AgentTabPosition::Left => {
+                col >= inner.x.saturating_add(inner.width).saturating_sub(3)
+            }
+            crate::contracts::AgentTabPosition::Right => col < inner.x.saturating_add(3),
+        };
+        if hit {
             return Some(HitTarget::CloseAgentTab(idx));
         }
     }
@@ -550,6 +599,7 @@ pub fn draw(
     state: &AppState,
     cache: &GitStatusCache,
     overlay: &UiOverlay,
+    input_holder: Option<&str>,
     now_ms: u64,
 ) {
     let area = frame.area();
@@ -558,6 +608,7 @@ pub fn draw(
         area,
         chrome,
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
 
     draw_header(frame, ml.header);
@@ -616,11 +667,15 @@ pub fn draw(
     frame.render_widget(status_divider, ml.status_divider);
     if chrome == layout::Chrome::Collapsed {
         frame.render_widget(
-            Paragraph::new(compact_status_bar_text(state, ml.status_bar.width)),
+            Paragraph::new(compact_status_bar_text(
+                state,
+                input_holder,
+                ml.status_bar.width,
+            )),
             ml.status_bar,
         );
     } else {
-        draw_status_bar(frame, state, ml.status_bar);
+        draw_status_bar(frame, state, input_holder, ml.status_bar);
     }
 
     // Draw overlay on top if active.
@@ -640,6 +695,7 @@ pub fn draw(
         }
         UiOverlay::Config(manager) => draw_config_overlay(frame, manager, area),
         UiOverlay::Remote(pairing) => draw_remote_overlay(frame, pairing, area),
+        UiOverlay::WebAccess(access) => draw_web_access_overlay(frame, access, area),
     }
 }
 
@@ -875,12 +931,13 @@ pub fn draw_sidebar(
 
     // When the live-pane border feature is on, the focused pane's frame
     // already supplies the separating vertical line, so the sidebar's own
-    // right divider is suppressed here — otherwise two adjacent vertical
+    // seam divider is suppressed here — otherwise two adjacent vertical
     // lines would be drawn (SPECS §23).
+    let side = state.config.ui.agent_tab_side();
     let block = if mode_style::border_enabled(&state.config.ui) {
         Block::default()
     } else {
-        Block::default().borders(Borders::RIGHT)
+        Block::default().borders(sidebar_seam(side))
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -936,6 +993,7 @@ pub fn draw_sidebar(
             let spin = Style::default().fg(Color::Red);
             lines.push(sidebar_name_line(
                 width,
+                side,
                 marker,
                 name_style,
                 Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
@@ -968,6 +1026,7 @@ pub fn draw_sidebar(
         let indicator = status_indicator(ds.interpreted, now_ms);
         lines.push(sidebar_name_line(
             width,
+            side,
             marker,
             name_style,
             Span::styled(
@@ -1012,7 +1071,7 @@ pub fn draw_sidebar(
 /// Draw the collapsed agent strip: one indicator glyph per agent, no heading
 /// and no close control, for windows too small to afford the full sidebar.
 fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
-    let block = Block::default().borders(Borders::RIGHT);
+    let block = Block::default().borders(sidebar_seam(state.config.ui.agent_tab_side()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1076,6 +1135,7 @@ fn collapsed_agent_span(
 /// with an ellipsis if it would collide with the close control (SPECS §20/§23).
 fn sidebar_name_line(
     width: usize,
+    side: crate::contracts::AgentTabPosition,
     marker: &'static str,
     name_style: Style,
     lead: Span<'static>,
@@ -1083,19 +1143,48 @@ fn sidebar_name_line(
 ) -> Line<'static> {
     let marker_w = marker.chars().count();
     let lead_w = lead.content.chars().count();
-    // Reserve two columns at the far right for a padding space and the glyph.
+    // Reserve two columns at the sidebar's outer end for a padding space and
+    // the glyph.
     let name_budget = width.saturating_sub(marker_w + lead_w + 2);
     let shown = truncate_ellipsis(name, name_budget);
     let used = marker_w + lead_w + shown.chars().count();
-    // Pad so the glyph lands in the last inner column.
+    // Pad so the glyph lands in the outermost inner column.
     let pad = width.saturating_sub(used).saturating_sub(1);
-    Line::from(vec![
+    let close = Span::styled(CLOSE_GLYPH, Style::default().fg(Color::Red));
+    let name_spans = [
         Span::styled(marker, name_style),
         lead,
         Span::styled(shown, name_style),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(CLOSE_GLYPH, Style::default().fg(Color::Red)),
-    ])
+    ];
+    // The `✕` column mirrors with the sidebar: it stays on the end furthest
+    // from the terminal, so it never sits against the seam the two panes share.
+    // The name itself does not mirror — it is text, and text keeps its reading
+    // order on both settings.
+    match side {
+        crate::contracts::AgentTabPosition::Left => Line::from(
+            name_spans
+                .into_iter()
+                .chain([Span::raw(" ".repeat(pad)), close])
+                .collect::<Vec<_>>(),
+        ),
+        crate::contracts::AgentTabPosition::Right => Line::from(
+            [close, Span::raw(" ".to_string())]
+                .into_iter()
+                .chain(name_spans)
+                .chain([Span::raw(" ".repeat(pad.saturating_sub(1)))])
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// The one-cell divider the sidebar draws on the seam it shares with the main
+/// pane: its right edge at `left`, its left edge at `right`. One function so
+/// drawing and hit-testing can never disagree about which column it eats.
+fn sidebar_seam(side: crate::contracts::AgentTabPosition) -> Borders {
+    match side {
+        crate::contracts::AgentTabPosition::Left => Borders::RIGHT,
+        crate::contracts::AgentTabPosition::Right => Borders::LEFT,
+    }
 }
 
 /// Truncate `s` to at most `max` display columns, appending `…` when clipped.
@@ -1709,9 +1798,10 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
 // ---------------------------------------------------------------------------
 
 /// The global help keys, as one label. Both status-bar modes render this
-/// constant; the help panel's own Global entry repeats it as a literal because
-/// `shortcut_line` needs a `'static` str, and a test asserts the two match so
-/// they cannot drift apart.
+/// constant, and so does the help screen's own Global row
+/// ([`crate::tui::help::help_doc`]) — one constant, three renderings, so the
+/// bar and the panel cannot claim different keys. A test still asserts the
+/// panel contains it, because the panel is now built elsewhere.
 pub const HELP_KEYS: &str = "F1 / Alt-h";
 
 /// Draw the mode status bar (SPECS §23).
@@ -1727,12 +1817,18 @@ pub const HELP_KEYS: &str = "F1 / Alt-h";
 /// Both help keys are listed, and identically on every OS: unlike the
 /// leave-focus key they are the same binding everywhere, so a platform-varying
 /// label would imply a difference that does not exist.
-pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
+pub fn draw_status_bar(
+    frame: &mut Frame,
+    state: &AppState,
+    input_holder: Option<&str>,
+    area: Rect,
+) {
     let text = status_bar_text(
         state.mode(),
         &state.config.ui,
         state.update_available.as_deref(),
         state.isolated,
+        input_holder,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
@@ -1741,7 +1837,11 @@ pub fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Compact terminal-mode status used when the git info row is reclaimed. Safety
 /// and mode indicators come first, followed by bounded base context; optional
 /// shortcut hints are the first content allowed to clip.
-fn compact_status_bar_text(state: &AppState, width: u16) -> Line<'static> {
+fn compact_status_bar_text(
+    state: &AppState,
+    input_holder: Option<&str>,
+    width: u16,
+) -> Line<'static> {
     let branch_limit = match width {
         0..=49 => 4,
         50..=79 => 8,
@@ -1773,6 +1873,16 @@ fn compact_status_bar_text(state: &AppState, width: u16) -> Line<'static> {
             ))
             .add_modifier(Modifier::BOLD),
     ));
+    if let Some(holder) = input_holder {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("INPUT: {holder}"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(version) = &state.update_available {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -1831,6 +1941,7 @@ pub fn status_bar_text(
     ui: &crate::contracts::UiConfig,
     update_available: Option<&str>,
     isolated: bool,
+    input_holder: Option<&str>,
 ) -> Line<'static> {
     let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
     let use_f2 = ui.use_f2_to_leave_terminal_focus;
@@ -1873,6 +1984,26 @@ pub fn status_bar_text(
             Span::raw(": help"),
         ],
     };
+
+    // The input lock (`specs/WEB_INTERFACE.md` D14 as revised). Drawn only when
+    // a browser is seated as a writer and somebody holds the turn, because with
+    // one writer there is no contest to report.
+    //
+    // **This is not decoration and it is not a warning.** It is the only reason
+    // a desktop user has for why the keys they just pressed did not appear:
+    // the model refuses a keystroke typed into another writer's live burst
+    // rather than interleaving it, and §5.1 does not allow that to happen
+    // silently. `Take Input Lock` in the palette is the way past it.
+    if let Some(holder) = input_holder {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("INPUT: {holder}"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Isolated run (SPECS §32): nothing persists and several actions are gone,
     // so say so permanently rather than once at launch.
@@ -2126,100 +2257,55 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 // ---------------------------------------------------------------------------
 
 /// Draw the help / keybindings overlay (SPECS §23).
+///
+/// The words are not here: [`crate::tui::help::help_doc`] owns them, and the
+/// browser's help overlay is drawn from the very same value
+/// (`specs/WEB_INTERFACE.md` §6.5 R16). This function is the ratatui half of
+/// that one source — it decides indentation, colour and where the hints sit,
+/// and nothing else.
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
     let overlay_area = layout::centered_overlay(area, 64, 40);
     frame.render_widget(Clear, overlay_area);
 
-    let leave_focus_key = if use_f2 {
-        "  F2"
-    } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
-        "  Shift+Esc"
-    } else {
-        "  Alt+Esc"
-    };
+    let doc = crate::tui::help::help_doc(use_f2, isolated);
 
-    let mut help_text = vec![
-        Line::from(Span::styled(
-            "FlightDeck Keyboard Shortcuts",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("Global", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Ctrl-g", "Command palette"),
-        shortcut_line("  Ctrl-q", "Quit / close app"),
-        shortcut_line("  Ctrl-n", "New Agent Session Tab"),
-        shortcut_line("  Ctrl-p", "Push current branch"),
-        shortcut_line("  Ctrl-u", "Pull base (git pull --rebase)"),
-        shortcut_line("  Ctrl-f", "Finish current Agent Session Tab"),
-        shortcut_line("  Ctrl-k", "Close current Agent Session Tab"),
-        shortcut_line("  Alt-o", "Open worktree in file manager"),
-        shortcut_line("  F1 / Alt-h", "Help / keybindings"),
-        Line::raw(""),
-        Line::from(Span::styled("Projects", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Shift-Left / Shift-Right", "Previous / Next project"),
-        shortcut_line("  Mouse click", "Switch project (top tab row)"),
-        shortcut_line("  + project", "Open another project folder"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Agent Session Tab Navigation",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Up / Down (or Alt)", "Previous / Next Agent Session Tab"),
-        shortcut_line("  Alt-1 .. Alt-9", "Jump to Agent Session Tab by index"),
-        shortcut_line("  Mouse click", "Select Agent Session Tab"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Child Terminal Navigation",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Ctrl-t", "New child terminal"),
-        shortcut_line("  Ctrl-w", "Close active child terminal"),
-        shortcut_line(
-            "  Left / Right (or Alt)",
-            "Cycle terminal tabs (agent + shells)",
-        ),
-        shortcut_line("  Ctrl-b", "Toggle split view (terminals side by side)"),
-        shortcut_line("  Mouse click", "Select terminal tab"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Selection / Clipboard",
-            Style::default().fg(Color::Yellow),
-        )),
-        shortcut_line("  Drag", "Select terminal text (copies on release)"),
-        shortcut_line("  Drag past edge", "Auto-scrolls to reach offscreen text"),
-        shortcut_line("  Shift-drag", "Force selection over a mouse-driven app"),
-        Line::raw(""),
-        Line::from(Span::styled("Focus", Style::default().fg(Color::Yellow))),
-        shortcut_line(leave_focus_key, "Leave terminal focus / focus app"),
-        shortcut_line("  Enter", "Focus active terminal"),
-        Line::raw(""),
-        Line::from(Span::styled("Status", Style::default().fg(Color::Yellow))),
-        shortcut_line("  Ctrl-s", "Set manual status"),
-        shortcut_line("  Ctrl-r", "Restart primary agent"),
-    ];
+    let mut help_text: Vec<Line> = Vec::new();
 
-    // Isolated run (SPECS §32): nothing persists and several actions are
-    // gone, so say so here first, not buried after the shortcut list. The
-    // overlay is a fixed 64x40 box with no scroll or pagination (a known,
-    // separate defect: the base 44-line shortcut list alone already clips
-    // its own tail there). Leading with the note guarantees it survives
-    // that clip regardless of terminal height, but every line it costs is a
-    // line of the existing shortcut list pushed further into the clipped
-    // tail — so it is kept to a header plus two lines, not the four the
-    // first attempt used.
-    if isolated {
-        let mut isolated_first = vec![
-            Line::from(Span::styled(
-                "Isolated run (--isolated)",
-                Style::default().fg(Color::Magenta),
-            )),
-            Line::raw("  Nothing is saved and nothing was continued."),
-            Line::raw("  One session here; no other projects, no new session tabs."),
-        ];
-        isolated_first.append(&mut help_text);
-        help_text = isolated_first;
+    // SPECS §32: an isolated run's note leads, not trails. The overlay is a
+    // fixed 64x40 box with no scroll or pagination (a known, separate defect:
+    // the base shortcut list alone already clips its own tail there), so
+    // leading with the note guarantees it survives that clip regardless of
+    // terminal height. `help_doc` puts it first for both surfaces; this loop
+    // only draws what it was given.
+    for note in &doc.notes {
+        help_text.push(Line::from(Span::styled(
+            note.title.clone(),
+            Style::default().fg(Color::Magenta),
+        )));
+        for line in &note.lines {
+            help_text.push(Line::raw(format!("  {line}")));
+        }
+    }
+
+    help_text.push(Line::from(Span::styled(
+        doc.title.clone(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    for section in &doc.sections {
+        help_text.push(Line::raw(""));
+        help_text.push(Line::from(Span::styled(
+            section.title.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+        for row in &section.rows {
+            help_text.push(shortcut_line(
+                format!("  {}", row.keys),
+                row.description.clone(),
+            ));
+        }
     }
 
     // The hints live on the bottom border, not in the shortcut list: the list is
@@ -2286,6 +2372,20 @@ impl PairingLayout {
     }
 }
 
+/// The line both QR-bearing overlays show when the terminal cannot hold the art:
+/// the size it would need, the size there is, and what to do instead.
+///
+/// Shared by the phone pairing overlay ([`pairing_layout`]) and the browser
+/// access overlay ([`web_access_layout`]) so the two degrade with the same
+/// words. A bare "too small" leaves the user guessing which dimension to grow,
+/// which is the whole reason the numbers are in it.
+fn qr_too_small_note(needs_w: u16, needs_h: u16, area: Rect, instead: &str) -> String {
+    format!(
+        "Terminal too small for the QR (needs {}x{}, have {}x{}) — {instead}.",
+        needs_w, needs_h, area.width, area.height
+    )
+}
+
 /// Decide the pairing overlay's layout for `area`.
 ///
 /// The QR is what a phone actually scans, so it is fitted **first** and the
@@ -2334,12 +2434,11 @@ fn pairing_layout(pairing: &RemotePairing, area: Rect) -> PairingLayout {
     let status_lines = wrap_message(&pairing.status_line, content_w as usize);
     // Name the smallest terminal that would show the QR (the borderless fit) —
     // a bare "too small" leaves the user guessing which dimension to grow.
-    let note_text = format!(
-        "Terminal too small for the QR (needs {}x{}, have {}x{}) — enter the code below.",
+    let note_text = qr_too_small_note(
         qr_content_w,
         qr_h + art_required_h,
-        area.width,
-        area.height
+        area,
+        "enter the code below",
     );
 
     let mut budget = area
@@ -2487,6 +2586,558 @@ pub fn draw_remote_overlay(frame: &mut Frame, pairing: &RemotePairing, area: Rec
 
     let para = Paragraph::new(lines).alignment(Alignment::Center);
     frame.render_widget(para, inner);
+}
+
+// ---------------------------------------------------------------------------
+// The browser access overlay (D5, Q1, Q7; design `2a`)
+// ---------------------------------------------------------------------------
+
+/// The access overlay's minimum content width.
+///
+/// 76 plus the 4 columns of chrome is exactly 80, the classic terminal floor:
+/// this is the widest the overlay can ask for and still be drawn whole on the
+/// narrowest terminal anybody actually uses. It is much wider than the pairing
+/// overlay's 44 because this surface carries sentences — the address picker's
+/// descriptions, D5's warning, a six-key legend — rather than a code and a
+/// status line.
+const WEB_ACCESS_MIN_CONTENT_W: u16 = 76;
+/// Left + right border plus one column of padding on each side.
+const WEB_ACCESS_CHROME_W: u16 = 4;
+/// Top + bottom border rows.
+const WEB_ACCESS_BORDER_H: u16 = 2;
+
+/// How readily a row gives way when the terminal is short. [`REQUIRED`] rows
+/// never do; higher tiers are dropped first, and a whole tier goes before the
+/// next one is touched.
+type Tier = u8;
+
+/// A row that is the surface: dropping it would make the overlay lie by
+/// omission (the status line, the code, the selected address, the key legend).
+const REQUIRED: Tier = 0;
+/// Explanatory prose: D5's warning body, the network door's consequence. High
+/// value, but the headline above each still says what it is.
+const TIER_PROSE: Tier = 1;
+/// Rows whose information is repeated in the key legend at the foot.
+const TIER_ECHOED: Tier = 2;
+/// Blank spacers. The first thing to go and the last thing anyone misses.
+const TIER_SPACER: Tier = 3;
+
+/// Drop rows tier by tier, from the bottom of each tier upward, until the list
+/// fits `height`.
+///
+/// Bottom-upward within a tier because these overlays put the most contextual
+/// material last (the browsers-holding-access line, the second warning
+/// paragraph): when two rows are equally droppable, the later one is the one
+/// the reader has already been prepared for by everything above it.
+///
+/// Split out from the drawing so the fit is unit-testable at exact terminal
+/// sizes, exactly as [`pairing_layout`] is.
+fn fit_rows(mut rows: Vec<(Tier, Line<'static>)>, height: u16) -> Vec<Line<'static>> {
+    let height = height as usize;
+    let mut tier = Tier::MAX;
+    while rows.len() > height && tier > REQUIRED {
+        // Highest tier still present, so a lower tier is never touched while a
+        // higher one still has rows to give.
+        tier = match rows.iter().map(|(t, _)| *t).filter(|t| *t > REQUIRED).max() {
+            Some(t) => t,
+            None => break,
+        };
+        while rows.len() > height {
+            match rows.iter().rposition(|(t, _)| *t == tier) {
+                Some(idx) => {
+                    rows.remove(idx);
+                }
+                None => break,
+            }
+        }
+    }
+    // Everything left is required and still does not fit: the terminal is
+    // smaller than the smallest honest form of this overlay, so the tail is
+    // clipped rather than something load-bearing being silently reordered.
+    rows.truncate(height);
+    rows.into_iter().map(|(_, line)| line).collect()
+}
+
+/// Pad `s` to `width` cells with the remainder split either side, so a QR or a
+/// code centres inside a left-aligned paragraph. Wider-than-`width` input is
+/// returned untouched — clipping is the caller's business, not the padder's.
+fn center_pad(s: &str, width: u16) -> String {
+    let len = s.chars().count();
+    let width = width as usize;
+    if len >= width {
+        return s.to_string();
+    }
+    let left = (width - len) / 2;
+    format!("{}{}", " ".repeat(left), s)
+}
+
+/// A `key` chip followed by its label, the way every FlightDeck overlay draws
+/// one (design turn 1: "every button shows its key").
+fn key_chip(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label.to_string(), Style::default().fg(Color::Gray)),
+    ]
+}
+
+/// Draw the browser access overlay (`specs/WEB_INTERFACE.md` D5, D10, Q1, Q7;
+/// design `2a`) in whichever of its two states the current binding puts it.
+///
+/// **State A (loopback, the default) never draws a credential.** There is no
+/// code and no QR to hide, because on this machine neither buys anything: the
+/// QR would encode an address that resolves nowhere else, and the code would be
+/// a shoulder-surfing hazard bought for nothing. The credential still exists —
+/// `Enter` and `c` spend one — it simply travels in a URL fragment instead of
+/// across the room. **State B** is where the QR earns its place, and it is
+/// drawn with the same black-on-white half-block art the phone pairing overlay
+/// uses, subject to the same honest degradation: when the terminal cannot hold
+/// it, the art gives way to a note naming the size it would need
+/// ([`qr_too_small_note`]) and the code stays, because the code is the path
+/// that always works.
+pub fn draw_web_access_overlay(frame: &mut Frame, view: &WebAccessView, area: Rect) {
+    let Some(mode) = view.mode else {
+        return;
+    };
+    let l = web_access_layout(view, area);
+
+    let box_w = (l.content_w + WEB_ACCESS_CHROME_W).min(area.width);
+    let box_h = (l.rows_h + WEB_ACCESS_BORDER_H).min(area.height);
+    let overlay = layout::centered_overlay(area, box_w, box_h);
+    frame.render_widget(Clear, overlay);
+
+    let title = match mode {
+        AccessMode::LocalOnly => " Web Interface ",
+        AccessMode::Network => " Web Interface — network access ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let rows = web_access_rows(view, mode, &l);
+    let lines = fit_rows(rows, inner.height);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What the access overlay decided about its own size: the content width, the
+/// QR's fate, and how tall the surviving rows are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebAccessLayout {
+    /// Content width the prose is wrapped to and the QR is centred in.
+    content_w: u16,
+    /// Render the QR art.
+    show_qr: bool,
+    /// The "terminal too small" note, when a QR exists but has no room.
+    note: Vec<String>,
+    /// Height of the rows that will actually be drawn.
+    rows_h: u16,
+}
+
+/// Decide the access overlay's layout for `area`.
+///
+/// The QR is fitted **first and against the required rows only**: it appears
+/// when the art plus everything that can never give way still fits. That is the
+/// same priority the pairing overlay gives it — a QR nobody can scan is worth
+/// nothing — but the required set here is larger, because this overlay also
+/// carries the address it is publishing and the warning about what that means,
+/// and neither may be silently dropped to make room for art.
+fn web_access_layout(view: &WebAccessView, area: Rect) -> WebAccessLayout {
+    let qr_w = view.qr_width as u16;
+    let qr_h = view.qr_rows.len() as u16;
+    let has_qr = !view.qr_rows.is_empty();
+
+    let content_w = qr_w
+        .max(WEB_ACCESS_MIN_CONTENT_W)
+        .min(area.width.saturating_sub(WEB_ACCESS_CHROME_W))
+        .max(1);
+    let inner_h = area.height.saturating_sub(WEB_ACCESS_BORDER_H);
+
+    // Probe with no QR and no note: what the required rows alone cost.
+    let probe = WebAccessLayout {
+        content_w,
+        show_qr: false,
+        note: Vec::new(),
+        rows_h: 0,
+    };
+    let mode = view.mode.unwrap_or(AccessMode::LocalOnly);
+    let required_h = web_access_rows(view, mode, &probe)
+        .iter()
+        .filter(|(tier, _)| *tier == REQUIRED)
+        .count() as u16;
+
+    let show_qr =
+        has_qr && qr_w + WEB_ACCESS_CHROME_W <= area.width && qr_h + required_h <= inner_h;
+    let note = if has_qr && !show_qr {
+        wrap_message(
+            &qr_too_small_note(
+                qr_w + WEB_ACCESS_CHROME_W,
+                qr_h + required_h + WEB_ACCESS_BORDER_H,
+                area,
+                "type the code instead",
+            ),
+            content_w as usize,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut decided = WebAccessLayout {
+        content_w,
+        show_qr,
+        note,
+        rows_h: 0,
+    };
+    let rows = web_access_rows(view, mode, &decided);
+    decided.rows_h = (fit_rows(rows, inner_h).len() as u16).max(1);
+    decided
+}
+
+/// Build the overlay's rows, each tagged with how readily it gives way.
+///
+/// One function for both states so the two can never drift into different
+/// chrome: the state only decides *which* rows exist, never how they are drawn.
+fn web_access_rows(
+    view: &WebAccessView,
+    mode: AccessMode,
+    l: &WebAccessLayout,
+) -> Vec<(Tier, Line<'static>)> {
+    let w = l.content_w;
+    let mut rows: Vec<(Tier, Line<'static>)> = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    let body = Style::default().fg(Color::Gray);
+    let bright = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let spacer = |rows: &mut Vec<(Tier, Line<'static>)>| rows.push((TIER_SPACER, Line::raw("")));
+
+    match mode {
+        AccessMode::LocalOnly => {
+            rows.push((REQUIRED, serving_line(view, mode)));
+            for line in wrap_message(&view.exposure_line, w as usize) {
+                rows.push((REQUIRED, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            let mut action = key_chip("Enter", "Open in browser");
+            action.push(Span::raw("   "));
+            action.extend(key_chip("c", "Copy URL"));
+            rows.push((REQUIRED, Line::from(action)));
+            rows.push((
+                TIER_ECHOED,
+                Line::from(Span::styled(
+                    "  launches the host's default browser · host only".to_string(),
+                    dim,
+                )),
+            ));
+            spacer(&mut rows);
+            rows.push((
+                REQUIRED,
+                Line::from(vec![
+                    Span::styled("url  ".to_string(), dim),
+                    Span::styled(view.url.clone(), Style::default().fg(Color::White)),
+                ]),
+            ));
+            // Never "already authenticated": the URL as drawn carries no
+            // credential, and a second browser opening it would be asked for a
+            // code. What `c` puts on the clipboard is a different string, and
+            // this says so rather than letting the row imply otherwise.
+            rows.push((
+                TIER_PROSE,
+                Line::from(Span::styled(
+                    "     c copies it with a one-time code attached".to_string(),
+                    dim,
+                )),
+            ));
+            spacer(&mut rows);
+            let mut door = vec![Span::styled(
+                "▸".to_string(),
+                Style::default().fg(Color::Cyan),
+            )];
+            door.extend(key_chip(
+                "n",
+                "Allow other devices on this network to connect",
+            ));
+            rows.push((REQUIRED, Line::from(door)));
+            for line in wrap_message(
+                "Rebinds to 0.0.0.0, then asks which address to publish and issues a scannable \
+                 code. Reaching FlightDeck from outside this network is your own tunnel — this \
+                 switch does not do it.",
+                w.saturating_sub(4).max(1) as usize,
+            ) {
+                rows.push((
+                    TIER_PROSE,
+                    Line::from(Span::styled(format!("    {line}"), dim)),
+                ));
+            }
+        }
+        AccessMode::Network => {
+            if l.show_qr {
+                let art = Style::default().fg(Color::Black).bg(Color::White);
+                for row in &view.qr_rows {
+                    rows.push((REQUIRED, Line::from(Span::styled(center_pad(row, w), art))));
+                }
+            }
+            for note in &l.note {
+                rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        note.clone(),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ));
+            }
+            match (&view.code, view.code_hidden, view.code_expired) {
+                (Some(code), _, _) => {
+                    // The terminal's answer to artboard 2a's 30px letterspaced
+                    // numerals: spaced digits, centred, in the brightest tier.
+                    let spaced: String = code
+                        .chars()
+                        .flat_map(|c| [c, ' '])
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string();
+                    rows.push((
+                        REQUIRED,
+                        Line::from(Span::styled(center_pad(&spaced, w), bright)),
+                    ));
+                    if let Some(secs) = view.seconds_remaining {
+                        rows.push((
+                            REQUIRED,
+                            Line::from(Span::styled(
+                                center_pad(&format!("expires in {secs}s"), w),
+                                Style::default().fg(Color::Yellow),
+                            )),
+                        ));
+                    }
+                }
+                (None, true, _) => rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        center_pad("code and QR hidden — r to show", w),
+                        dim,
+                    )),
+                )),
+                (None, false, true) => rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        center_pad("code expired — Space for a new one", w),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                )),
+                (None, false, false) => {}
+            }
+            spacer(&mut rows);
+            rows.push((REQUIRED, serving_line(view, mode)));
+            for line in wrap_message(&view.exposure_line, w as usize) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            rows.push((
+                TIER_ECHOED,
+                Line::from(Span::styled("PUBLISH WHICH ADDRESS".to_string(), dim)),
+            ));
+            for (idx, addr) in view.addresses.iter().enumerate() {
+                let selected = view.selected_address == Some(idx);
+                // The published address is required; the alternatives are the
+                // picker, and a short terminal shows the choice it made.
+                let tier = if selected { REQUIRED } else { TIER_ECHOED };
+                let name_style = if selected {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    dim
+                };
+                let addr_style = if selected { bright } else { body };
+                let mut spans = vec![
+                    Span::styled(
+                        if selected { "▸ " } else { "  " }.to_string(),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(format!("‹{}› ", addr.name), name_style),
+                    Span::styled(format!("{} ", addr.address), addr_style),
+                ];
+                if let Some(description) = addr.description {
+                    spans.push(Span::styled(format!("· {description}"), dim));
+                }
+                rows.push((tier, Line::from(spans)));
+            }
+            if view.addresses.is_empty() {
+                rows.push((
+                    REQUIRED,
+                    Line::from(Span::styled(
+                        "  no routable interface found on this host".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ));
+            }
+            spacer(&mut rows);
+            rows.push((
+                REQUIRED,
+                Line::from(Span::styled(
+                    "WHAT YOU ARE ALLOWING".to_string(),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+            ));
+            for line in wrap_message(
+                "Anyone on this network who has the code can read your repositories, type into \
+                 your agents, and push branches.",
+                w as usize,
+            ) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, body))));
+            }
+            for line in wrap_message(
+                "The code lasts 120s and buys a cookie in one browser. Revoke it and that \
+                 browser is locked out on its next request.",
+                w as usize,
+            ) {
+                rows.push((TIER_PROSE, Line::from(Span::styled(line, dim))));
+            }
+            spacer(&mut rows);
+            let mut actions = key_chip("l", "Back to local only");
+            actions.push(Span::raw("   "));
+            actions.extend(key_chip("x", "Revoke browser access"));
+            rows.push((TIER_ECHOED, Line::from(actions)));
+            rows.push((TIER_ECHOED, browsers_line(&view.browsers)));
+            for browser in &view.browsers {
+                rows.push((TIER_ECHOED, browser_row_line(browser)));
+            }
+        }
+    }
+
+    if let Some(notice) = &view.notice {
+        spacer(&mut rows);
+        for line in wrap_message(notice, w as usize) {
+            rows.push((
+                TIER_PROSE,
+                Line::from(Span::styled(line, Style::default().fg(Color::Cyan))),
+            ));
+        }
+    }
+    spacer(&mut rows);
+    rows.push((REQUIRED, key_legend(&view.keys)));
+    rows
+}
+
+/// The `● serving │ <addr>` header, in the host's words.
+///
+/// The exposure clause the artboard puts on the same line is a row of its own
+/// here: the artboard's overlay is 780 CSS pixels wide and this one has to be
+/// legible in 80 columns, where `● serving │ 127.0.0.1:7420 │ loopback only —
+/// nothing off this machine can reach it` would be clipped mid-sentence. A
+/// clause that stops halfway is worse than a clause on the next line.
+fn serving_line(view: &WebAccessView, mode: AccessMode) -> Line<'static> {
+    let (dot, dot_style, label) = match mode {
+        AccessMode::LocalOnly => ("● ", Style::default().fg(Color::Green), "serving"),
+        // Amber, the one token turn 2 reserved for a state that must never be
+        // mistaken for the calm one.
+        AccessMode::Network => (
+            "● ",
+            Style::default().fg(Color::Yellow),
+            "serving on this network",
+        ),
+    };
+    Line::from(vec![
+        Span::styled(dot.to_string(), dot_style),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(view.bound.clone(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// How many browsers hold access, counted rather than rounded to "some" — and
+/// which digits withdraw one of them (`remote-control-gk94`, §6.5 R25).
+///
+/// The `1-n` hint lives here rather than in the footer legend because it is
+/// only true of the rows underneath it: those rows are an echoed tier that a
+/// short terminal drops, and the range names exactly the digits that are bound,
+/// so a tenth browser — listed, revocable by `x`, but past the last digit —
+/// cannot be implied to have a key it does not have.
+fn browsers_line(browsers: &[crate::web::access::BrowserRow]) -> Line<'static> {
+    let keyed = browsers.iter().filter(|b| b.key.is_some()).count();
+    let (dot_style, text) = match browsers.len() {
+        0 => (
+            Style::default().fg(Color::DarkGray),
+            "no browser holds access".to_string(),
+        ),
+        1 => (
+            Style::default().fg(Color::Green),
+            "1 browser holds access — 1 revokes it".to_string(),
+        ),
+        n => (
+            Style::default().fg(Color::Green),
+            format!("{n} browsers hold access — 1-{keyed} revokes one"),
+        ),
+    };
+    Line::from(vec![
+        Span::styled("● ".to_string(), dot_style),
+        Span::styled(text, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// One holder of access, as artboard 2a State B draws it: the digit that
+/// revokes it, then the facts that tell it from an intruder
+/// (`remote-control-gk94`, `specs/WEB_INTERFACE.md` §6.5 R25).
+///
+/// The pieces are joined with the same ` · ` the rest of the overlay uses and
+/// each is drawn only when the host actually has it — a record from before the
+/// address was stored is drawn short, never with a placeholder standing in for
+/// something nobody observed.
+fn browser_row_line(browser: &crate::web::access::BrowserRow) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::styled(
+        match browser.key {
+            // Two spaces where the digit would be, so an unkeyed tenth row
+            // still lines up under the ones above it.
+            None => "    ".to_string(),
+            Some(key) => format!("  {key} "),
+        },
+        Style::default().fg(Color::Yellow),
+    )];
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(address) = &browser.address {
+        facts.push(address.clone());
+    }
+    if let Some(label) = &browser.browser {
+        facts.push(label.clone());
+    }
+    facts.push(crate::web::access::age_label(browser.granted_secs_ago));
+    spans.push(Span::styled(facts.join(" · "), dim));
+    Line::from(spans)
+}
+
+/// The footer legend: every key the current state binds, and nothing it does
+/// not.
+fn key_legend(keys: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, (key, label)) in keys.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(
+                " · ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            (*label).to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Draw the configuration manager overlay (SPECS §8): a scope selector, the
@@ -2653,48 +3304,45 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
 /// Draw the About dialog: version, one-line description, and authorship credits.
 pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
     let accent = Color::Cyan;
-    let lines: Vec<Line> = vec![
+    let doc = crate::tui::help::about_doc();
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            format!("FlightDeck  v{}", env!("CARGO_PKG_VERSION")),
+            format!("{}  v{}", doc.name, doc.version),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "A terminal UI for orchestrating parallel AI coding agents.",
+            doc.tagline.clone(),
             Style::default().fg(Color::Gray),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("Built by ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Ruud van Falier",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("with collaboration from ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Sander Langhorst",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "https://flightdeckai.app",
-            Style::default().fg(accent),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Esc / q to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
+    for credit in &doc.credits {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", credit.role),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                credit.name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        doc.url.clone(),
+        Style::default().fg(accent),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc / q to close",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let overlay_area = layout::centered_overlay(area, 62, content_height.saturating_add(2));
@@ -2711,7 +3359,7 @@ pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
 }
 
 /// Build a shortcut description line for the help overlay.
-fn shortcut_line(keys: &'static str, desc: &'static str) -> Line<'static> {
+fn shortcut_line(keys: String, desc: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(keys, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -2732,6 +3380,8 @@ struct DialogLayout {
     inner: Rect,
     /// Title text, pre-wrapped to the content width.
     title_lines: Vec<String>,
+    /// D13's origin label, pre-wrapped. Empty when the dialog has no origin.
+    origin_lines: Vec<String>,
     /// Screen rect of each button, aligned with `Dialog::buttons`.
     button_rects: Vec<Rect>,
 }
@@ -2767,6 +3417,13 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         .map(|l| l.chars().count() as u16)
         .max()
         .unwrap_or(0);
+    // D13's origin line widens the box like any other content: truncating the
+    // one sentence that explains why this modal appeared would defeat it.
+    if let Some(origin) = &dialog.origin {
+        for line in wrap_message(origin, cap_w as usize) {
+            content_w = content_w.max(line.chars().count() as u16);
+        }
+    }
     if let Some(inp) = &dialog.input {
         // "> " prefix + text + cursor.
         content_w = content_w.max(inp.chars().count() as u16 + 4).max(24);
@@ -2788,6 +3445,10 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
     content_w = content_w.max(one_row.min(cap_w)).clamp(1, cap_w);
 
     let title_lines = wrap_message(&dialog.title, content_w as usize);
+    let origin_lines = match &dialog.origin {
+        Some(origin) => wrap_message(origin, content_w as usize),
+        None => Vec::new(),
+    };
 
     // Pack buttons greedily into rows within the content width.
     let mut rows: Vec<Vec<usize>> = Vec::new();
@@ -2807,8 +3468,12 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rows.push(cur);
     }
 
-    // Inner height: title + (blank + list) + (blank + input) + (blank + buttons).
+    // Inner height: title + (origin) + (blank + list) + (blank + input) +
+    // (blank + buttons).
     let mut inner_h = title_lines.len() as u16;
+    if !origin_lines.is_empty() {
+        inner_h += origin_lines.len() as u16;
+    }
     if !vlist.is_empty() {
         inner_h += 1 + vlist.len() as u16;
     }
@@ -2830,8 +3495,8 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rect.height.saturating_sub(4),
     );
 
-    // Button rects: below the title, list, and input, each row centered.
-    let mut y = inner.y + title_lines.len() as u16;
+    // Button rects: below the title, origin, list, and input, each row centered.
+    let mut y = inner.y + title_lines.len() as u16 + origin_lines.len() as u16;
     if !vlist.is_empty() {
         y += 1 + vlist.len() as u16;
     }
@@ -2858,6 +3523,7 @@ fn layout_dialog(area: Rect, dialog: &Dialog) -> DialogLayout {
         rect,
         inner,
         title_lines,
+        origin_lines,
         button_rects,
     }
 }
@@ -2904,6 +3570,21 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             Paragraph::new(Line::from(Span::styled(
                 line.clone(),
                 Style::default().fg(Color::White),
+            ))),
+            rect,
+        );
+        y += 1;
+    }
+    // D13's origin label, directly under the title and before everything the
+    // user might act on: they should know *why* this modal is here before they
+    // read what it is asking. Magenta is the "another actor acted" hue this
+    // codebase already uses for a remote surface having done something.
+    for line in &dl.origin_lines {
+        let rect = Rect::new(dl.inner.x, y, dl.inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                line.clone(),
+                Style::default().fg(Color::Magenta),
             ))),
             rect,
         );
@@ -3151,18 +3832,49 @@ mod tests {
         let area = Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6);
         // One row per tab, starting at the sidebar's first row — no heading offset.
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 0),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                0
+            ),
             Some(HitTarget::AgentTab(0))
         );
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 2),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                2
+            ),
             Some(HitTarget::AgentTab(2))
         );
         // Past the last agent resolves to nothing (the caller falls back to chrome).
-        assert_eq!(sidebar_hit(area, 3, layout::Chrome::Collapsed, 0, 3), None);
+        assert_eq!(
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                0,
+                3
+            ),
+            None
+        );
         // The rightmost inner column selects; it is never a close control.
         assert_eq!(
-            sidebar_hit(area, 3, layout::Chrome::Collapsed, 1, 1),
+            sidebar_hit(
+                area,
+                3,
+                layout::Chrome::Collapsed,
+                crate::contracts::AgentTabPosition::Left,
+                1,
+                1
+            ),
             Some(HitTarget::AgentTab(1))
         );
     }
@@ -3178,7 +3890,7 @@ mod tests {
         state.focus_terminal();
 
         let mut term = test_terminal(w, h);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let all: String = (0..h)
@@ -3206,7 +3918,7 @@ mod tests {
         state.focus_app();
 
         let mut term = test_terminal(w, h);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let all: String = (0..h)
@@ -3231,9 +3943,14 @@ mod tests {
         term.draw(|frame| {
             let area = frame.area();
             let chrome = layout::chrome_for(area, state.mode());
-            let ml = layout::compute(area, chrome, mode_style::border_enabled(&state.config.ui));
+            let ml = layout::compute(
+                area,
+                chrome,
+                mode_style::border_enabled(&state.config.ui),
+                state.config.ui.agent_tab_side(),
+            );
             draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
-            draw(frame, state, &empty_cache(), &UiOverlay::None, 0);
+            draw(frame, state, &empty_cache(), &UiOverlay::None, None, 0);
         })
         .unwrap();
     }
@@ -3354,7 +4071,7 @@ mod tests {
             .process_output(b"HELLO_FLIGHTDECK");
 
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -3573,7 +4290,7 @@ mod tests {
         session.child_mut(0).unwrap().process_output(b"SHELL_PANE");
 
         let mut term = test_terminal(120, 30);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -3608,7 +4325,12 @@ mod tests {
         // Two columns over the main pane (x ≥ sidebar width 28). A click on a
         // column's header row switches to that terminal: the left header lands
         // on the agent (primary) column, the right header on the shell column.
-        let region = layout::split_region(&layout::compute(area, layout::Chrome::Full, false));
+        let region = layout::split_region(&layout::compute(
+            area,
+            layout::Chrome::Full,
+            false,
+            crate::contracts::AgentTabPosition::Left,
+        ));
         let cols = layout::split_columns(region, 2);
         let left = cols[0].col.x + cols[0].col.width / 2;
         let right = cols[1].col.x + cols[1].col.width / 2;
@@ -3686,7 +4408,7 @@ mod tests {
     fn header_and_divider_render_on_top_rows() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(120, 24);
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let row0: String = (0..120)
@@ -3765,7 +4487,7 @@ mod tests {
     fn collapsed_status_keeps_default_and_target_visible_first() {
         let mut state = state_with_tabs(1);
         state.base_branch = "develop".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, 100));
+        let flat = flatten(&compact_status_bar_text(&state, None, 100));
         assert!(flat.contains("default: develop"), "got: {flat:?}");
         assert!(flat.contains("target: main"), "got: {flat:?}");
     }
@@ -3775,9 +4497,16 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.isolated = true;
         state.update_available = Some("2.0.0".to_string());
-        let flat = flatten(&compact_status_bar_text(&state, 100));
+        let flat = flatten(&compact_status_bar_text(&state, None, 100));
         assert!(flat.contains("ISOLATED"), "got: {flat:?}");
         assert!(flat.contains("v2.0.0 update"), "got: {flat:?}");
+    }
+
+    #[test]
+    fn collapsed_status_names_the_input_lock_holder() {
+        let state = state_with_tabs(1);
+        let flat = flatten(&compact_status_bar_text(&state, Some("Safari/iOS"), 100));
+        assert!(flat.contains("INPUT: Safari/iOS"), "got: {flat:?}");
     }
 
     #[test]
@@ -3787,7 +4516,7 @@ mod tests {
         state.isolated = true;
         state.update_available = Some("2.0.0".to_string());
         let mut term = test_terminal(43, 24); // 40-column main pane.
-        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
         let row = buffer_row(term.backend().buffer(), 23);
         assert!(row.contains("ISOLATED"), "row: {row:?}");
@@ -3801,7 +4530,7 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.base_branch = "feature/a-very-long-project-default-branch".to_string();
         state.tabs[0].meta.base_branch = "release/a-very-long-pinned-target-branch".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, 80));
+        let flat = flatten(&compact_status_bar_text(&state, None, 80));
         assert!(flat.contains("default: featur...-branch"), "got: {flat:?}");
         assert!(flat.contains("target: releas...-branch"), "got: {flat:?}");
         assert!(flat.contains("MODE: TERMINAL"), "got: {flat:?}");
@@ -3887,7 +4616,7 @@ mod tests {
             },
         );
         let mut term = test_terminal(80, 24);
-        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|frame| draw(frame, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         // Layout bottom rows: info_bar (y = 21), status_divider (y = 22),
@@ -3914,7 +4643,7 @@ mod tests {
     #[test]
     fn status_bar_terminal_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: TERMINAL"), "must show mode name");
         assert!(
@@ -3937,7 +4666,7 @@ mod tests {
         // difference in the binding that does not exist.
         for mode in [InputMode::Terminal, InputMode::App] {
             let ui = crate::contracts::UiConfig::default();
-            let line = status_bar_text(mode, &ui, None, false);
+            let line = status_bar_text(mode, &ui, None, false, None);
             let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(flat.contains("F1 / Alt-h"), "{mode:?} must show both keys");
         }
@@ -3954,7 +4683,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -3971,7 +4700,7 @@ mod tests {
             use_f2_to_leave_terminal_focus: true,
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("F2"));
     }
@@ -3979,7 +4708,7 @@ mod tests {
     #[test]
     fn status_bar_app_mode_text() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, false);
+        let line = status_bar_text(InputMode::App, &ui, None, false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("MODE: APP"), "must show mode name");
         assert!(flat.contains("Enter"), "must mention Enter");
@@ -3997,7 +4726,7 @@ mod tests {
     #[test]
     fn status_bar_shows_update_hint_when_available() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"), false);
+        let line = status_bar_text(InputMode::App, &ui, Some("1.0.3"), false, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             flat.contains("v1.0.3 available"),
@@ -4008,15 +4737,48 @@ mod tests {
             "must point at the update command"
         );
         // Absent the notice, the bar is unchanged.
-        let none = status_bar_text(InputMode::App, &ui, None, false);
+        let none = status_bar_text(InputMode::App, &ui, None, false, None);
         let none_flat: String = none.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!none_flat.contains("available"), "no hint when up to date");
+    }
+
+    /// `specs/WEB_INTERFACE.md` D14 as revised: the desktop is one of the
+    /// writers, so it needs the same answer to "who can type" the browser gets.
+    ///
+    /// This chip is the desktop's whole trace for a refused keystroke. Without
+    /// it, typing into another writer's live burst would look exactly like a
+    /// broken keyboard.
+    #[test]
+    fn status_bar_names_whoever_holds_the_input_lock() {
+        let ui = crate::contracts::UiConfig::default();
+        let held = status_bar_text(
+            InputMode::Terminal,
+            &ui,
+            None,
+            false,
+            Some("192.168.2.20 · Chrome on macOS"),
+        );
+        let flat: String = held.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            flat.contains("INPUT: 192.168.2.20 · Chrome on macOS"),
+            "the holder must be named, not merely reported as `busy`: {flat}"
+        );
+
+        // Nothing to contend with — the web interface is stopped, or no browser
+        // is seated as a writer — and the bar says nothing rather than
+        // reporting a contest that cannot happen.
+        let free = status_bar_text(InputMode::Terminal, &ui, None, false, None);
+        let free_flat: String = free.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !free_flat.contains("INPUT:"),
+            "one writer means no chip: {free_flat}"
+        );
     }
 
     #[test]
     fn status_bar_shows_the_isolated_badge() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, true);
+        let line = status_bar_text(InputMode::App, &ui, None, true, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("ISOLATED"),
@@ -4027,7 +4789,7 @@ mod tests {
     #[test]
     fn status_bar_has_no_badge_in_a_normal_run() {
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, None, false);
+        let line = status_bar_text(InputMode::App, &ui, None, false, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("ISOLATED"), "no badge normally: {text}");
     }
@@ -4036,7 +4798,7 @@ mod tests {
     fn status_bar_shows_both_the_badge_and_the_update_hint() {
         // The two trailing spans must coexist, not overwrite each other.
         let ui = crate::contracts::UiConfig::default();
-        let line = status_bar_text(InputMode::App, &ui, Some("9.9.9"), true);
+        let line = status_bar_text(InputMode::App, &ui, Some("9.9.9"), true, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("ISOLATED") && text.contains("9.9.9"),
@@ -4050,7 +4812,7 @@ mod tests {
             terminal_mode_color: "magenta".to_string(),
             ..crate::contracts::UiConfig::default()
         };
-        let line = status_bar_text(InputMode::Terminal, &ui, None, false);
+        let line = status_bar_text(InputMode::Terminal, &ui, None, false, None);
         let chip = line
             .spans
             .iter()
@@ -4067,7 +4829,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
     }
@@ -4092,7 +4854,7 @@ mod tests {
         state.config.ui.mode_border = "normal".to_string();
         let mut term = test_terminal(120, 40);
         let cache = GitStatusCache::new();
-        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -4130,13 +4892,14 @@ mod tests {
             area,
             layout::Chrome::Full,
             mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let sidebar_frame = ml.sidebar_frame.expect("sidebar frame reserved");
         let terminal_frame = ml.terminal_frame.expect("terminal frame reserved");
 
         let mut term = test_terminal(120, 40);
         let cache = GitStatusCache::new();
-        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &cache, &UiOverlay::None, None, 0))
             .unwrap();
         let buf = term.backend().buffer().clone();
 
@@ -4243,6 +5006,7 @@ mod tests {
                 &state,
                 &cache,
                 &UiOverlay::Dialog(Dialog::notification("Test message")),
+                None,
                 0,
             );
         })
@@ -4277,6 +5041,112 @@ mod tests {
         );
     }
 
+    /// **D13's load-bearing line.** A dialog a browser opened appears on the
+    /// desktop whether or not the person at this keyboard asked for it, and the
+    /// origin line is the only thing that explains it. It renders above the
+    /// buttons, so it is read before anything is decided.
+    #[test]
+    fn draw_dialog_renders_the_browser_origin_above_the_buttons() {
+        let mut term = test_terminal(80, 24);
+        let dialog = Dialog::confirm(
+            "Set status override",
+            vec![
+                DialogButton::new(DialogAccel::Char('d'), "Done"),
+                DialogButton::new(DialogAccel::Esc, "Cancel"),
+            ],
+        )
+        .from_origin("opened from browser · 192.168.2.20");
+
+        term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24_u16)
+            .map(|y| {
+                (0..80_u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let text = rows.join("\n");
+        assert!(
+            text.contains("opened from browser · 192.168.2.20"),
+            "the origin label must render verbatim:\n{text}"
+        );
+        let origin_row = rows
+            .iter()
+            .position(|row| row.contains("opened from browser"))
+            .expect("the origin row exists");
+        let title_row = rows
+            .iter()
+            .position(|row| row.contains("Set status override"))
+            .expect("the title row exists");
+        let button_row = rows
+            .iter()
+            .position(|row| row.contains("[d]"))
+            .expect("the button row exists");
+        assert!(
+            title_row < origin_row && origin_row < button_row,
+            "the origin must sit under the title and above the buttons: \
+             title={title_row} origin={origin_row} buttons={button_row}"
+        );
+    }
+
+    /// A dialog the desktop opened for itself renders no origin line: the person
+    /// reading it is the person who asked, and D13 is explicit that the label is
+    /// not decoration.
+    #[test]
+    fn draw_dialog_renders_no_origin_for_a_desktop_dialog() {
+        let mut term = test_terminal(80, 24);
+        let dialog = Dialog::confirm(
+            "Set status override",
+            vec![DialogButton::new(DialogAccel::Char('d'), "Done")],
+        );
+        assert!(dialog.origin.is_none());
+        term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let text: String = (0..24_u16)
+            .flat_map(|y| (0..80_u16).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!text.contains("opened from"), "no origin line: {text}");
+    }
+
+    /// The origin line is content, so it grows the box and the buttons move down
+    /// with it — the hit-test and the drawing read the same layout, and a click
+    /// that landed on a button before the line was added must still land on it.
+    #[test]
+    fn an_origin_line_grows_the_box_and_keeps_the_buttons_clickable() {
+        let area = Rect::new(0, 0, 80, 24);
+        let plain = Dialog::confirm(
+            "Close shell 2?",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Close"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        );
+        let tagged = plain
+            .clone()
+            .from_origin("opened from browser · 192.168.2.20 · Chrome on macOS");
+
+        let plain_layout = layout_dialog(area, &plain);
+        let tagged_layout = layout_dialog(area, &tagged);
+        assert!(
+            tagged_layout.rect.height > plain_layout.rect.height,
+            "the origin line needs a row of its own"
+        );
+        assert!(
+            tagged_layout.rect.width > plain_layout.rect.width,
+            "the box widens to fit the sentence rather than truncating it"
+        );
+
+        let r = tagged_layout.button_rects[0];
+        assert_eq!(
+            dialog_hit(area, &tagged, r.x + r.width / 2, r.y),
+            DialogHit::Button(0)
+        );
+    }
+
     #[test]
     fn dialog_hit_maps_click_to_button() {
         let area = Rect::new(0, 0, 80, 24);
@@ -4302,7 +5172,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Help, 0);
+            draw(frame, &state, &cache, &UiOverlay::Help, None, 0);
         })
         .unwrap();
     }
@@ -4419,7 +5289,7 @@ mod tests {
         let cache = empty_cache();
         let palette = CommandPalette::new();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Palette(palette), 0);
+            draw(frame, &state, &cache, &UiOverlay::Palette(palette), None, 0);
         })
         .unwrap();
     }
@@ -4438,7 +5308,7 @@ mod tests {
             vec!["opencode".to_string(), "claude".to_string()],
         );
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), None, 0);
         })
         .unwrap();
 
@@ -4465,7 +5335,7 @@ mod tests {
             vec!["opencode".to_string()],
         );
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::Config(manager), 0);
+            draw(frame, &state, &cache, &UiOverlay::Config(manager), None, 0);
         })
         .unwrap();
         let buffer = term.backend().buffer();
@@ -4486,7 +5356,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::About, 0);
+            draw(frame, &state, &cache, &UiOverlay::About, None, 0);
         })
         .unwrap();
         let buffer = term.backend().buffer();
@@ -4530,6 +5400,7 @@ mod tests {
                     status: ws,
                     pr_url: Some("https://github.com/owner/repo/compare/main...test".to_string()),
                 },
+                None,
                 0,
             );
         })
@@ -4542,7 +5413,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
 
@@ -4584,6 +5455,7 @@ mod tests {
                     status: ws,
                     pr_url: None,
                 },
+                None,
                 0,
             );
         })
@@ -4608,7 +5480,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         term.draw(|frame| {
-            draw(frame, &state, &cache, &UiOverlay::None, 0);
+            draw(frame, &state, &cache, &UiOverlay::None, None, 0);
         })
         .unwrap();
 
@@ -4621,6 +5493,145 @@ mod tests {
         assert!(
             all_text.contains("No tabs"),
             "sidebar should show 'No tabs' hint when empty, got: {all_text:?}"
+        );
+    }
+
+    /// `remote-control-ecsv`, `specs/WEB_INTERFACE.md` §6.5 R24.
+    ///
+    /// The front door on purpose: the only thing this test does differently
+    /// between the two runs is set the TOML key a user sets, and everything it
+    /// asserts is read back out of the drawn buffer. Nothing here calls
+    /// `compute` or hands the renderer a side — the point of the test is that
+    /// the setting *reaches* the layout, which is precisely what it did not do
+    /// before.
+    #[test]
+    fn agent_tab_position_right_mirrors_the_body_row_in_the_drawn_buffer() {
+        const W: u16 = 120;
+        const H: u16 = 40;
+
+        fn draw_buffer(state: &AppState) -> ratatui::buffer::Buffer {
+            let mut term = test_terminal(W, H);
+            let cache = empty_cache();
+            term.draw(|frame| draw(frame, state, &cache, &UiOverlay::None, None, 0))
+                .unwrap();
+            term.backend().buffer().clone()
+        }
+
+        /// The `(x, y)` of the first cell of `needle`, scanning row by row.
+        fn find(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+            let chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+            for y in 0..H {
+                for x in 0..=W.saturating_sub(chars.len() as u16) {
+                    if chars
+                        .iter()
+                        .enumerate()
+                        .all(|(i, c)| buffer[(x + i as u16, y)].symbol() == c)
+                    {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("{needle:?} is not on screen");
+        }
+
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+
+        let left = draw_buffer(&state);
+        state.config.ui.agent_tab_position = "right".to_string();
+        let right = draw_buffer(&state);
+
+        // The sidebar's heading — the column itself.
+        let (left_heading, heading_row) = find(&left, "Agents");
+        let (right_heading, _) = find(&right, "Agents");
+        assert!(
+            left_heading < layout::SIDEBAR_WIDTH,
+            "default: the sidebar is the first column"
+        );
+        assert!(
+            right_heading >= W - layout::SIDEBAR_WIDTH,
+            "right: the sidebar is the last column, got x={right_heading}"
+        );
+
+        // The `✕` column, which 1h names explicitly: at the sidebar's outer
+        // end on both settings, so it never sits on the seam. Searched on the
+        // first agent's name row, because the child tab bar draws a `✕` of its
+        // own on the same screen row.
+        let name_row = heading_row + 2;
+        let close_x = |buffer: &ratatui::buffer::Buffer| -> u16 {
+            (0..W)
+                .find(|&x| buffer[(x, name_row)].symbol() == CLOSE_GLYPH)
+                .expect("the agent row draws a close control")
+        };
+        let left_close = close_x(&left);
+        let right_close = close_x(&right);
+        assert_eq!(
+            left_close,
+            layout::SIDEBAR_WIDTH - 2,
+            "default: the last inner column, inside the sidebar's right divider"
+        );
+        assert_eq!(
+            right_close,
+            W - layout::SIDEBAR_WIDTH + 1,
+            "right: the first inner column, inside the sidebar's left divider"
+        );
+
+        // The seam between the two panes moves with them, and the top band
+        // does not move at all.
+        assert_eq!(
+            left[(layout::SIDEBAR_WIDTH - 1, heading_row)].symbol(),
+            "\u{2502}",
+            "default: the divider is the sidebar's right edge"
+        );
+        assert_eq!(
+            right[(W - layout::SIDEBAR_WIDTH, heading_row)].symbol(),
+            "\u{2502}",
+            "right: the divider is the sidebar's left edge"
+        );
+        for y in 0..layout::HEADER_HEIGHT + layout::PROJECT_TAB_BAR_HEIGHT + layout::DIVIDER_HEIGHT
+        {
+            assert_eq!(
+                buffer_row(&left, y),
+                buffer_row(&right, y),
+                "the full-width top band does not move (row {y})"
+            );
+        }
+    }
+
+    /// The click path, which is the other half of the same fact: a `✕` that is
+    /// drawn on the left and hit-tested on the right would close nothing.
+    #[test]
+    fn agent_tab_position_right_moves_the_hit_targets_with_the_sidebar() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut state = state_with_tabs(2);
+        state.selected_tab = Some(0);
+
+        // The first agent's name row, in both layouts.
+        let name_row = layout::HEADER_HEIGHT
+            + layout::PROJECT_TAB_BAR_HEIGHT
+            + layout::DIVIDER_HEIGHT
+            + SIDEBAR_HEADER_ROWS
+            + 1;
+
+        assert_eq!(
+            hit_test(area, &state, 4, name_row),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            hit_test(area, &state, layout::SIDEBAR_WIDTH - 2, name_row),
+            Some(HitTarget::CloseAgentTab(0))
+        );
+        // The same columns are the terminal once the sidebar has moved.
+        state.config.ui.agent_tab_position = "right".to_string();
+        assert_eq!(hit_test(area, &state, 4, name_row), None);
+        let sidebar_x = area.width - layout::SIDEBAR_WIDTH;
+        assert_eq!(
+            hit_test(area, &state, sidebar_x + 6, name_row),
+            Some(HitTarget::AgentTab(0))
+        );
+        assert_eq!(
+            hit_test(area, &state, sidebar_x + 1, name_row),
+            Some(HitTarget::CloseAgentTab(0))
         );
     }
 
@@ -4667,7 +5678,7 @@ mod tests {
     fn sidebar_shows_bracketed_status_without_proc_prefix() {
         let state = state_with_tabs(1);
         let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &state, &empty_cache(), &UiOverlay::None, 0))
+        term.draw(|f| draw(f, &state, &empty_cache(), &UiOverlay::None, None, 0))
             .unwrap();
 
         let buffer = term.backend().buffer().clone();
@@ -4704,6 +5715,363 @@ mod tests {
         // App mode + setting off → no dim.
         ui.dim_terminal_in_app_mode = false;
         assert!(!super::dim_terminal(false, &ui));
+    }
+
+    // --- Access overlay (D5, Q1; design `2a`, both states) -----------------
+
+    /// The base of a State B view: a QR the size `qr_art` really produces for a
+    /// `http://192.168.2.14:7420/#8412` payload, the code beside it, the three
+    /// interfaces artboard 2a draws.
+    fn network_access_view() -> WebAccessView {
+        WebAccessView {
+            mode: Some(AccessMode::Network),
+            bound: "0.0.0.0:7420".to_string(),
+            exposure_line: "reachable by anyone on this network who has the code".to_string(),
+            url: "http://192.168.2.14:7420".to_string(),
+            code: Some("8412".to_string()),
+            code_hidden: false,
+            code_expired: false,
+            qr_rows: vec!["#".repeat(33); 17],
+            qr_width: 33,
+            seconds_remaining: Some(97),
+            addresses: vec![
+                crate::web::access::AddressRow {
+                    name: "en0".to_string(),
+                    address: "192.168.2.14".to_string(),
+                    description: Some("wifi · reachable by your phone"),
+                },
+                crate::web::access::AddressRow {
+                    name: "bridge100".to_string(),
+                    address: "192.168.64.1".to_string(),
+                    description: Some("vm bridge"),
+                },
+                crate::web::access::AddressRow {
+                    name: "tailscale0".to_string(),
+                    address: "100.87.14.3".to_string(),
+                    description: Some("your own tunnel"),
+                },
+            ],
+            selected_address: Some(0),
+            browsers: vec![crate::web::access::BrowserRow {
+                key: Some('1'),
+                address: Some("192.168.2.20".to_string()),
+                browser: Some("Safari on iOS".to_string()),
+                granted_secs_ago: 14 * 60,
+            }],
+            notice: None,
+            keys: vec![
+                ("↑↓", "address"),
+                ("Space", "new code"),
+                ("r", "hide"),
+                ("x", "revoke"),
+                ("l", "local only"),
+                ("Esc", "close"),
+            ],
+        }
+    }
+
+    fn local_access_view() -> WebAccessView {
+        WebAccessView {
+            mode: Some(AccessMode::LocalOnly),
+            bound: "127.0.0.1:7420".to_string(),
+            exposure_line: "loopback only — nothing off this machine can reach it".to_string(),
+            url: "http://127.0.0.1:7420".to_string(),
+            code: None,
+            code_hidden: false,
+            code_expired: false,
+            qr_rows: Vec::new(),
+            qr_width: 0,
+            seconds_remaining: None,
+            addresses: Vec::new(),
+            selected_address: None,
+            browsers: Vec::new(),
+            notice: None,
+            keys: vec![
+                ("Enter", "open"),
+                ("c", "copy"),
+                ("n", "network access"),
+                ("s", "stop server"),
+                ("Esc", "close"),
+            ],
+        }
+    }
+
+    /// Every cell of a drawn frame, as one string.
+    fn painted(width: u16, height: u16, view: &WebAccessView) -> String {
+        let mut term = test_terminal(width, height);
+        term.draw(|f| {
+            let area = f.area();
+            draw_web_access_overlay(f, view, area);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn state_a_draws_the_open_in_browser_door_and_never_a_code() {
+        let text = painted(120, 30, &local_access_view());
+        assert!(text.contains("Web Interface"), "{text}");
+        assert!(text.contains("serving"), "{text}");
+        assert!(
+            text.contains("loopback only"),
+            "the exposure line is the host's, verbatim: {text}"
+        );
+        assert!(text.contains("Open in browser"), "{text}");
+        assert!(text.contains("Copy URL"), "{text}");
+        assert!(text.contains("http://127.0.0.1:7420"), "{text}");
+        assert!(
+            text.contains("Allow other devices on this network to connect"),
+            "the door to State B states its consequence: {text}"
+        );
+        assert!(text.contains("this switch does not do it"), "{text}");
+        // The whole point of State A.
+        assert!(
+            !text.contains("expires in"),
+            "State A shows no countdown: {text}"
+        );
+        assert!(
+            !text.contains("WHAT YOU ARE ALLOWING"),
+            "nothing is being allowed off this machine: {text}"
+        );
+    }
+
+    #[test]
+    fn state_a_never_claims_the_bare_url_is_already_authenticated() {
+        // The URL row draws a credential-free URL; only `c` attaches a code. A
+        // row reading "already authenticated" would be a claim the host never
+        // made about the string next to it.
+        let text = painted(120, 30, &local_access_view());
+        assert!(!text.contains("already authenticated"), "{text}");
+        assert!(text.contains("one-time code attached"), "{text}");
+    }
+
+    #[test]
+    fn state_b_draws_the_qr_the_code_the_picker_and_the_warning() {
+        let text = painted(120, 44, &network_access_view());
+        assert!(
+            text.contains("network access"),
+            "the title names it: {text}"
+        );
+        assert!(text.contains("#".repeat(33).as_str()), "the QR art: {text}");
+        assert!(
+            text.contains("8 4 1 2"),
+            "the code, spaced out as artboard 2a's large type: {text}"
+        );
+        assert!(text.contains("expires in 97s"), "{text}");
+        assert!(text.contains("PUBLISH WHICH ADDRESS"), "{text}");
+        assert!(text.contains("192.168.2.14"), "{text}");
+        assert!(
+            text.contains("wifi · reachable by your phone"),
+            "interfaces.rs's one-line descriptions: {text}"
+        );
+        assert!(
+            text.contains("‹bridge100›") && text.contains("vm bridge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("‹tailscale0›") && text.contains("your own tunnel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WHAT YOU ARE ALLOWING"),
+            "D5's warning: {text}"
+        );
+        assert!(text.contains("push branches"), "{text}");
+        assert!(text.contains("1 browser holds access"), "{text}");
+        assert!(text.contains("Esc close"), "the legend: {text}");
+    }
+
+    /// 2a State B's `● 1 browser holds access · 192.168.2.20 · Safari/iOS ·
+    /// 14m`, and the digit that takes it out (`remote-control-gk94`, §6.5 R25).
+    /// The count alone is what this line used to be, and it could not answer
+    /// the question it was drawn for.
+    #[test]
+    fn state_b_names_each_holder_and_the_digit_that_revokes_it() {
+        let mut view = network_access_view();
+        view.browsers.push(crate::web::access::BrowserRow {
+            key: Some('2'),
+            address: Some("192.168.2.31".to_string()),
+            browser: Some("Chrome on macOS".to_string()),
+            granted_secs_ago: 2 * 3600,
+        });
+
+        let text = painted(120, 44, &view);
+        assert!(
+            text.contains("2 browsers hold access — 1-2 revokes one"),
+            "the header counts them and names the keys: {text}"
+        );
+        assert!(
+            text.contains("1 192.168.2.20 · Safari on iOS · 14m"),
+            "the first row, with its digit: {text}"
+        );
+        assert!(
+            text.contains("2 192.168.2.31 · Chrome on macOS · 2h"),
+            "the second row: {text}"
+        );
+    }
+
+    /// A row the host knows nothing about is drawn short, never padded out with
+    /// a stand-in for a fact nobody observed.
+    #[test]
+    fn a_holder_with_no_address_and_no_claim_is_drawn_without_them() {
+        let mut view = network_access_view();
+        view.browsers = vec![crate::web::access::BrowserRow {
+            key: Some('1'),
+            address: None,
+            browser: None,
+            granted_secs_ago: 45,
+        }];
+
+        let text = painted(120, 44, &view);
+        assert!(text.contains("1 45s"), "the age is all there is: {text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("(none)"),
+            "no placeholder: {text}"
+        );
+    }
+
+    #[test]
+    fn hiding_the_code_takes_the_qr_with_it_and_says_how_to_get_it_back() {
+        // What `r` produces: the view arrives with no code and no art at all,
+        // which is what makes "hidden" impossible to half-apply.
+        let mut view = network_access_view();
+        view.code = None;
+        view.code_hidden = true;
+        view.qr_rows = Vec::new();
+        view.qr_width = 0;
+
+        let text = painted(120, 44, &view);
+        assert!(!text.contains("8 4 1 2"), "{text}");
+        assert!(!text.contains("###"), "the QR goes with the code: {text}");
+        assert!(text.contains("code and QR hidden — r to show"), "{text}");
+        // Everything that is not the credential stays: the user still needs to
+        // see what this binding allows while the code is put away.
+        assert!(text.contains("WHAT YOU ARE ALLOWING"), "{text}");
+        assert!(text.contains("192.168.2.14"), "{text}");
+    }
+
+    #[test]
+    fn an_expired_code_is_reported_with_the_way_to_replace_it() {
+        let mut view = network_access_view();
+        view.code = None;
+        view.code_expired = true;
+        view.seconds_remaining = None;
+        view.qr_rows = Vec::new();
+        view.qr_width = 0;
+
+        let text = painted(120, 44, &view);
+        assert!(
+            text.contains("code expired — Space for a new one"),
+            "{text}"
+        );
+        assert!(!text.contains("expires in"), "{text}");
+    }
+
+    #[test]
+    fn the_qr_fits_a_terminal_that_can_hold_it_alongside_the_required_rows() {
+        let view = network_access_view();
+        let l = web_access_layout(&view, Rect::new(0, 0, 120, 44));
+        assert!(l.show_qr, "a 17-row QR fits a 44-row terminal");
+        assert!(l.note.is_empty());
+        assert!(l.content_w >= view.qr_width as u16);
+    }
+
+    #[test]
+    fn a_small_terminal_drops_the_qr_and_names_the_size_it_would_need() {
+        // The same degradation the phone pairing overlay already had: the art
+        // gives way, the code does not, and the note carries both sizes so the
+        // user knows which dimension to grow.
+        let view = network_access_view();
+        let l = web_access_layout(&view, Rect::new(0, 0, 60, 18));
+        assert!(!l.show_qr);
+        let note = l.note.join(" ");
+        assert!(
+            note.contains("have 60x18"),
+            "the note names the terminal it has: {note}"
+        );
+        let text = painted(60, 18, &view);
+        assert!(
+            text.contains("8 4 1 2"),
+            "the code survives when the art cannot: {text}"
+        );
+        assert!(text.contains("Terminal too small for the QR"), "{text}");
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_published_address_and_the_key_legend() {
+        // The tiering rule, at the size where it bites: prose and echoed rows
+        // give way, but the address being published and the keys that change it
+        // are what the overlay *is*.
+        let view = network_access_view();
+        for height in 10..=44u16 {
+            let text = painted(100, height, &view);
+            assert!(
+                text.contains("192.168.2.14"),
+                "the published address survives at height {height}: {text}"
+            );
+            assert!(
+                text.contains("Esc close"),
+                "the key legend survives at height {height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_is_shown_and_never_outlives_the_frame_that_carried_it() {
+        let mut view = network_access_view();
+        view.notice = Some("1 browser revoked — new code issued.".to_string());
+        let text = painted(120, 44, &view);
+        assert!(text.contains("1 browser revoked"), "{text}");
+
+        view.notice = None;
+        let text = painted(120, 44, &view);
+        assert!(!text.contains("revoked — new code"), "{text}");
+    }
+
+    #[test]
+    fn an_overlay_with_no_mode_draws_nothing() {
+        // `WebAccessView::default()` is what a renderer would get if a snapshot
+        // were ever built without a state. It must paint nothing rather than an
+        // empty frame claiming to be the access surface.
+        let text = painted(80, 24, &WebAccessView::default());
+        assert!(!text.contains("Web Interface"), "{text}");
+    }
+
+    #[test]
+    fn fit_rows_drops_whole_tiers_from_the_bottom_before_touching_the_next() {
+        let row = |tier: Tier, text: &str| (tier, Line::raw(text.to_string()));
+        let rows = vec![
+            row(REQUIRED, "a"),
+            row(TIER_PROSE, "b"),
+            row(TIER_SPACER, "c"),
+            row(TIER_ECHOED, "d"),
+            row(TIER_SPACER, "e"),
+            row(REQUIRED, "f"),
+        ];
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.spans[0].content.to_string())
+                .collect::<String>()
+        };
+
+        assert_eq!(text(fit_rows(rows.clone(), 6)), "abcdef");
+        // Spacers first, from the bottom.
+        assert_eq!(text(fit_rows(rows.clone(), 5)), "abcdf");
+        assert_eq!(text(fit_rows(rows.clone(), 4)), "abdf");
+        // Then the echoed row, then the prose — required rows never go.
+        assert_eq!(text(fit_rows(rows.clone(), 3)), "abf");
+        assert_eq!(text(fit_rows(rows.clone(), 2)), "af");
+        // Smaller than the required set: clipped, not reordered.
+        assert_eq!(text(fit_rows(rows, 1)), "a");
     }
 
     // --- Pairing overlay layout (remote pairing on small terminals) --------

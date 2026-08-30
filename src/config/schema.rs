@@ -2,7 +2,8 @@
 
 use crate::contracts::{
     AgentDef, Config, ContainersConfig, FlightDeckError, GitConfig, NotificationsConfig,
-    ProjectConfig, RemoteConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WorktreesConfig,
+    ProjectConfig, RemoteConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WebConfig,
+    WorktreesConfig,
 };
 use std::collections::BTreeMap;
 
@@ -63,6 +64,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         notifications: NotificationsConfig::default(),
         update: UpdateConfig::default(),
         remote: RemoteConfig::default(),
+        web: WebConfig::default(),
         containers: ContainersConfig::default(),
         agents,
     }
@@ -80,6 +82,9 @@ pub fn default_global_config() -> Config {
 const MODE_COLORS: &[&str] = &["green", "cyan", "blue", "magenta", "yellow", "red", "white"];
 /// Allowed live-pane border levels (SPECS §23).
 const MODE_BORDER_LEVELS: &[&str] = &["off", "dim", "normal", "bright"];
+/// Allowed Agent Tabs sidebar positions (SPECS §8, `specs/WEB_INTERFACE.md`
+/// §6.5 R24). The same two words the configuration manager cycles.
+const AGENT_TAB_POSITIONS: &[&str] = &["left", "right"];
 
 /// Validate a parsed config, rejecting structurally invalid configs with clear
 /// errors (SPECS §8, §26 "Rejects invalid config").
@@ -124,9 +129,84 @@ pub fn validate(config: &Config) -> Result<()> {
             config.ui.mode_border
         )));
     }
+    // Checked here for the reason its neighbours are, and only since R24 made
+    // it worth checking: until the key moved the sidebar, an unexpected value
+    // and the default drew the same screen, so rejecting one would have been
+    // pedantry. Now `agent_tab_position = "rihgt"` would silently draw `left`,
+    // which is the exact class of quiet-nothing this validation exists for.
+    if !AGENT_TAB_POSITIONS.contains(&config.ui.agent_tab_position.as_str()) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.agent_tab_position '{}' is not valid (expected one of {AGENT_TAB_POSITIONS:?})",
+            config.ui.agent_tab_position
+        )));
+    }
 
     validate_containers(&config.containers)?;
+    validate_web(&config.web)?;
 
+    Ok(())
+}
+
+/// Largest sane `[web] replay_bytes` we accept: 64 MiB per terminal. There is
+/// no protocol reason to cap it lower, but an unbounded value is a config typo
+/// waiting to OOM a machine running several terminals at once (each terminal
+/// gets its own ring buffer, see `crate::web::replay::ReplayBuffer`). This is a
+/// generous multiple of the 256 KiB default, not a tuned production limit.
+const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validate the `[web]` section (`specs/WEB_INTERFACE.md` D5, D10, Q2).
+///
+/// [`crate::web::replay::ReplayBuffer::new`] deliberately accepts *any*
+/// capacity, including 0 — it is a pure data structure with no opinion on
+/// sane sizing. Turning a *configured* `replay_bytes` (or `port`) into a
+/// server that's actually usable is this config layer's job, so we reject the
+/// nonsensical values here rather than let them silently reach the server:
+///
+/// - `port == 0` is rejected. `0` means "let the OS pick an ephemeral port" in
+///   a raw bind() call, but FlightDeck Web is meant to be reachable at a
+///   stable, bookmarkable address (D10) — a port that changes every launch
+///   would break that promise silently, so we reject rather than reinterpret.
+/// - `bind` empty (or all-whitespace) is rejected: an empty string is not a
+///   valid listen address, and the correct spelling for "loopback only"
+///   (the resolved default, D5) is the explicit `"127.0.0.1"`, not "".
+/// - `replay_bytes == 0` is rejected: it would silently disable reconnect
+///   resume (Q3 depends on there being a retained window to resume from),
+///   which is exactly the kind of "quietly broken" behavior this validation
+///   exists to prevent.
+/// - `replay_bytes` above [`MAX_REPLAY_BYTES`] is rejected as a likely typo /
+///   unit confusion (e.g. mistaking the field for KiB or MiB) rather than
+///   silently accepting an allocation that could exhaust memory once
+///   multiplied across every open terminal.
+///
+/// Note this section is only meaningful when `enabled` (or the palette starts
+/// it manually), but — like `[containers]` — we validate it unconditionally:
+/// unlike containers, a malformed `[web]` section is cheap to check and there
+/// is no cost to catching the typo before the user flips `enabled` on and
+/// wonders why the server won't start.
+fn validate_web(web: &crate::contracts::WebConfig) -> Result<()> {
+    if web.port == 0 {
+        return Err(FlightDeckError::Config(
+            "web.port must not be 0 (the web interface needs a stable, bookmarkable port)"
+                .to_string(),
+        ));
+    }
+    if web.bind.trim().is_empty() {
+        return Err(FlightDeckError::Config(
+            "web.bind must not be empty (use \"127.0.0.1\" for loopback)".to_string(),
+        ));
+    }
+    if web.replay_bytes == 0 {
+        return Err(FlightDeckError::Config(
+            "web.replay_bytes must not be 0 (it would silently disable reconnect resume)"
+                .to_string(),
+        ));
+    }
+    if web.replay_bytes > MAX_REPLAY_BYTES {
+        return Err(FlightDeckError::Config(format!(
+            "web.replay_bytes {} exceeds the {}-byte sanity limit per terminal",
+            web.replay_bytes, MAX_REPLAY_BYTES
+        )));
+    }
     Ok(())
 }
 
@@ -259,6 +339,17 @@ mod tests {
         assert!(err.to_string().contains("claude"));
     }
 
+    #[test]
+    fn validate_rejects_an_unknown_agent_tab_position() {
+        let mut cfg = default_config("proj", "main");
+        assert!(validate(&cfg).is_ok(), "the default is valid");
+        cfg.ui.agent_tab_position = "right".to_string();
+        assert!(validate(&cfg).is_ok(), "1h position 4's other value");
+        cfg.ui.agent_tab_position = "rihgt".to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("ui.agent_tab_position"));
+    }
+
     // --- [containers] validation (SPECS §31) ---
 
     #[test]
@@ -304,6 +395,111 @@ mod tests {
         cfg.containers.packages = vec!["jq".to_string(), "curl".to_string()];
         cfg.containers.forward_ports = vec![3000, 8080];
         assert!(validate(&cfg).is_ok());
+    }
+
+    // --- [web] section (specs/WEB_INTERFACE.md D5, D10, Q2) ---
+
+    #[test]
+    fn default_config_web_disabled_and_loopback() {
+        let cfg = default_config("proj", "main");
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn validate_rejects_web_port_zero() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.port = 0;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("web.port"));
+    }
+
+    #[test]
+    fn validate_rejects_web_replay_bytes_zero() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.replay_bytes = 0;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("replay_bytes"));
+    }
+
+    #[test]
+    fn validate_rejects_web_replay_bytes_too_large() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.replay_bytes = MAX_REPLAY_BYTES + 1;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("replay_bytes"));
+    }
+
+    #[test]
+    fn validate_accepts_web_replay_bytes_at_max() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.replay_bytes = MAX_REPLAY_BYTES;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_web_bind() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.bind = "".to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("web.bind"));
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_web_bind() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.bind = "   ".to_string();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_routable_web_bind() {
+        // A routable bind is an explicit opt-in (D5) but is not itself
+        // rejected by validation — the warning is a UI-layer concern, not a
+        // config-validity concern.
+        let mut cfg = default_config("proj", "main");
+        cfg.web.bind = "0.0.0.0".to_string();
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_default_web_config() {
+        let cfg = default_config("proj", "main");
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn web_config_partial_table_still_resolves_loopback_default() {
+        // A config that only sets `enabled` (old/partial config, or a project
+        // override) must still resolve `bind` to loopback via the per-field
+        // default — never to an empty string / struct-level default (the
+        // regression this convention exists to prevent).
+        let cfg: Config = "[web]\nenabled = true\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn web_config_absent_section_defaults_to_disabled_loopback() {
+        // No [web] table at all (an old config predating this setting) must
+        // still parse and resolve every field to its default.
+        let cfg: Config = "[project]\nname = \"p\"\ndefault_base_branch = \"main\"\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.replay_bytes, 262_144);
     }
 
     #[test]

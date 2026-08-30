@@ -59,6 +59,34 @@ pub enum PaletteAction {
     PairPhone,
     /// Forget the paired phone (FlightDeck Remote), after a confirmation.
     UnpairPhone,
+    /// Start the embedded web interface (`specs/WEB_INTERFACE.md` D10): bind the
+    /// listener and report the address, warning when it is routable (D5).
+    /// Workspace-level — it owns a TCP listener, not `AppState`.
+    StartWebInterface,
+    /// Stop the embedded web interface: tell every attached browser why, then
+    /// release the listener (Q5).
+    StopWebInterface,
+    /// Show the access overlay for a web interface that is already running
+    /// (`specs/WEB_INTERFACE.md` D5, Q1; design `2a`).
+    ///
+    /// Separate from [`PaletteAction::StartWebInterface`], which opens it as
+    /// part of starting, because the overlay is dismissable and the server can
+    /// also come up from `[web] enabled` without anyone pressing anything. Both
+    /// paths need a way back to the code.
+    ShowWebAccess,
+    /// Take the input lock now (`specs/WEB_INTERFACE.md` D14 as revised),
+    /// interrupting whichever surface is mid-burst.
+    ///
+    /// The desktop's half of the one explicit override in the arbitration
+    /// model. The browser's half is artboard 2f's confirmed `Take over`
+    /// (`SeatRequest::TakeOver`); this row exists so the rule stays symmetric —
+    /// a desktop that could always cut in would be exactly the privilege the
+    /// model refuses, and a desktop with no way to cut in at all would be the
+    /// same asymmetry pointed the other way.
+    ///
+    /// Offered only while the web interface is running, because with no browser
+    /// attached there is one writer and nothing to interrupt.
+    TakeInputLock,
 }
 
 /// All §22 command-palette entries, in display order.
@@ -199,6 +227,26 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         action: PaletteAction::UnpairPhone,
     },
     PaletteEntry {
+        group: "Remote",
+        label: "Start Web Interface",
+        action: PaletteAction::StartWebInterface,
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Stop Web Interface",
+        action: PaletteAction::StopWebInterface,
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Show Web Access",
+        action: PaletteAction::ShowWebAccess,
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Take Input Lock",
+        action: PaletteAction::TakeInputLock,
+    },
+    PaletteEntry {
         group: "View",
         label: "Toggle Split View",
         action: PaletteAction::Dispatch(Command::ToggleSplitView),
@@ -216,7 +264,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
         group: "Global",
         label: "Quit",
-        action: PaletteAction::Dispatch(Command::Quit),
+        action: PaletteAction::Dispatch(Command::Quit { confirm: true }),
     },
 ];
 
@@ -228,8 +276,35 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
 /// Phone") bring the total to 28, plus "About FlightDeck" makes 29, plus "Open
 /// Worktree in File Manager" makes 30, plus "Change Project Default Base"
-/// makes 31.
-pub const REQUIRED_ACTION_COUNT: usize = 31;
+/// makes 31, plus the two FlightDeck Web lifecycle actions ("Start Web
+/// Interface" / "Stop Web Interface", D10) makes 33, plus
+/// "Take Input Lock" (D14 as revised — the desktop's half of the one explicit
+/// override in the input-arbitration model) makes 34, plus "Show Web Access"
+/// (D5/Q1's access overlay, reachable again after it is dismissed and for a
+/// server that came up from `[web] enabled` rather than from the palette) makes
+/// 35.
+pub const REQUIRED_ACTION_COUNT: usize = 35;
+
+/// Every §22 palette row, in display order, unfiltered and ungated.
+///
+/// The desktop reaches these through [`CommandPalette::filtered`], which hides
+/// the rows that do not apply to the current pairing / web / isolation state.
+///
+/// **This accessor exists for the tests, and that is the whole arrangement.**
+/// The browser's command surface is *not* derived from this list: it is
+/// [`crate::web::commands::INVENTORY`], a hand-maintained parallel table with
+/// its own labels, groups, annotations and routes — because a wire name, a
+/// `host only` badge and an artboard's annotation are facts about the *browser*
+/// that no `PaletteAction` carries. What keeps the two lists from drifting is
+/// `src/web/commands/tests.rs`, which walks this one and fails if a row's
+/// claimed wire name is missing from `INVENTORY`, if the two labels or groups
+/// disagree, or if either list changes length. So the coupling is real and
+/// enforced, but it is enforced by a test rather than by a function call — and
+/// nothing in `src/web/commands.rs` itself ever reads this
+/// (`specs/WEB_INTERFACE.md` §6.5 R26).
+pub fn all_entries() -> &'static [PaletteEntry] {
+    ALL_ENTRIES
+}
 
 /// The command palette model (SPECS §22).
 ///
@@ -246,6 +321,11 @@ pub struct CommandPalette {
     /// is hidden while unpaired (there is nothing to forget). Defaults to
     /// `false` (unpaired) so an un-configured palette offers pairing.
     is_paired: bool,
+    /// Whether the embedded web server is listening (`specs/WEB_INTERFACE.md`
+    /// D10). Gates the two FlightDeck Web entries exactly as `is_paired` gates
+    /// the phone ones: "Start" is hidden while it runs, "Stop" while it does
+    /// not. Defaults to `false`, so a fresh palette offers starting it.
+    web_running: bool,
     /// Whether this is an isolated run (SPECS §32), which hides the project
     /// entries and "New Agent Session Tab". Presentation only — the flows
     /// themselves refuse independently, because keybindings bypass the palette.
@@ -266,6 +346,15 @@ impl CommandPalette {
         self.selected = 0;
     }
 
+    /// Set whether the embedded web server is listening, which decides the
+    /// visibility of the two FlightDeck Web entries (see
+    /// [`CommandPalette::web_running`]). Resets the selection so it can never
+    /// point past the (possibly shorter) filtered list.
+    pub fn set_web_running(&mut self, web_running: bool) {
+        self.web_running = web_running;
+        self.selected = 0;
+    }
+
     /// Set whether this is an isolated run, which decides the visibility of the
     /// project and new-session entries. Resets the selection so it can never
     /// point past the shorter filtered list.
@@ -283,6 +372,15 @@ impl CommandPalette {
             PaletteAction::PairPhone => !self.is_paired,
             // Nothing to unpair unless a pairing exists.
             PaletteAction::UnpairPhone => self.is_paired,
+            // Exactly one of the two web lifecycle actions is ever offered.
+            PaletteAction::StartWebInterface => !self.web_running,
+            PaletteAction::StopWebInterface => self.web_running,
+            // Nothing to show until something is listening: the overlay
+            // describes a live binding, and there is no honest way to draw one
+            // that does not exist.
+            PaletteAction::ShowWebAccess => self.web_running,
+            // Nothing to interrupt while nothing else can type.
+            PaletteAction::TakeInputLock => self.web_running,
             // An isolated run has one session in one project (SPECS §32).
             PaletteAction::OpenProject
             | PaletteAction::CloseProject
@@ -435,6 +533,9 @@ mod tests {
             "Open Configuration",
             "Pair Phone",
             "Unpair Phone",
+            "Start Web Interface",
+            "Stop Web Interface",
+            "Take Input Lock",
             "Toggle Split View",
             "Show Help",
             "About FlightDeck",
@@ -494,10 +595,13 @@ mod tests {
 
     #[test]
     fn filter_empty_shows_all() {
-        // A fresh (unpaired) palette shows every action except "Unpair Phone",
-        // which is gated behind an existing pairing.
+        // A fresh palette shows every action except the four the current state
+        // has nothing to say about: "Unpair Phone" (nothing is paired), "Stop
+        // Web Interface", "Show Web Access" and "Take Input Lock" (nothing is
+        // listening, so there is no binding to describe, no code to show, one
+        // writer and nothing to interrupt).
         let palette = CommandPalette::new();
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
     }
 
     #[test]
@@ -521,8 +625,51 @@ mod tests {
             "cannot pair when already paired"
         );
         assert!(labels.contains(&"Unpair Phone"), "unpair must be offered");
-        // Exactly one of the two Remote entries is visible in either state.
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        // Exactly one of each gated pair is visible in either state; the web
+        // interface is still stopped, so its three running-only rows are hidden.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
+    }
+
+    /// D10: exactly one of the two FlightDeck Web lifecycle actions is offered
+    /// at a time, so the palette can never ask the user to start a server that
+    /// is already listening or stop one that is not.
+    #[test]
+    fn exactly_one_web_lifecycle_action_is_offered() {
+        let stopped = CommandPalette::new();
+        let labels: Vec<&str> = stopped.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Start Web Interface"));
+        assert!(
+            !labels.contains(&"Stop Web Interface"),
+            "nothing to stop while the server is not listening"
+        );
+
+        let mut running = CommandPalette::new();
+        running.set_web_running(true);
+        let labels: Vec<&str> = running.filtered().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Stop Web Interface"));
+        assert!(
+            !labels.contains(&"Start Web Interface"),
+            "cannot start a server that is already listening"
+        );
+        assert!(
+            labels.contains(&"Show Web Access"),
+            "a running server always has a way back to its code"
+        );
+        // "Start Web Interface" and "Unpair Phone" are the two hidden; "Show
+        // Web Access" is only hidden the other way round.
+        assert_eq!(running.filtered().len(), REQUIRED_ACTION_COUNT - 2);
+    }
+
+    /// The gate must reset the selection, or a shorter filtered list could be
+    /// indexed past its end — the same hazard `set_paired` guards.
+    #[test]
+    fn set_web_running_resets_selection() {
+        let mut palette = CommandPalette::new();
+        palette.select_next();
+        palette.select_next();
+        assert_eq!(palette.selected_index(), 2);
+        palette.set_web_running(true);
+        assert_eq!(palette.selected_index(), 0);
     }
 
     #[test]
@@ -586,7 +733,14 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.set_filter("quit");
         let action = palette.selected_action().expect("should match Quit");
-        assert_eq!(action, &PaletteAction::Dispatch(Command::Quit));
+        // The desktop's row carries the *confirmed* value: SPECS §23 asks the
+        // person at this keyboard nothing further. The browser's row carries
+        // `confirm: false` and lands on the shared dialog instead (D16,
+        // `specs/WEB_INTERFACE.md` §6.5 R13).
+        assert_eq!(
+            action,
+            &PaletteAction::Dispatch(Command::Quit { confirm: true })
+        );
     }
 
     #[test]
@@ -618,8 +772,10 @@ mod tests {
 
         palette.clear_filter();
         assert_eq!(palette.filter(), "");
-        // Unpaired: all actions except the pairing-gated "Unpair Phone".
-        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 1);
+        // Unpaired and not listening: all actions except "Unpair Phone" and the
+        // three rows that only mean something while the web interface is
+        // running.
+        assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
     }
 
     #[test]

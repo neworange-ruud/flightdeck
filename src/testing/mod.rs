@@ -234,6 +234,10 @@ struct FakeGitState {
     /// Per-cwd `git status --porcelain` line overrides. When absent, the
     /// porcelain output is synthesized from the dirty flag.
     porcelain: HashMap<PathBuf, Vec<String>>,
+    /// When set, [`GitExecutor::status_porcelain`] fails with this `Git`
+    /// message (e.g. a repo whose index is locked by another process, or a
+    /// worktree directory that has been removed).
+    porcelain_error: Option<String>,
     worktrees: Vec<WorktreeInfo>,
     revs: HashMap<String, String>,
     ahead_behind: HashMap<(String, String), (u32, u32)>,
@@ -253,6 +257,8 @@ struct FakeGitState {
     /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
     remove_worktree_error: Option<String>,
     // recordings
+    /// Number of [`GitExecutor::status_porcelain`] calls.
+    porcelain_calls: u32,
     created_branches: Vec<(String, String)>,
     added_worktrees: Vec<(PathBuf, String)>,
     removed_worktrees: Vec<PathBuf>,
@@ -277,6 +283,7 @@ impl Default for FakeGit {
                 dirty: HashMap::new(),
                 default_dirty: false,
                 porcelain: HashMap::new(),
+                porcelain_error: None,
                 worktrees: Vec::new(),
                 revs: HashMap::new(),
                 ahead_behind: HashMap::new(),
@@ -291,6 +298,7 @@ impl Default for FakeGit {
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
                 removed_worktrees: Vec::new(),
+                porcelain_calls: 0,
                 pruned_count: 0,
                 pushes: Vec::new(),
                 merges: Vec::new(),
@@ -369,6 +377,19 @@ impl FakeGit {
         let mut st = self.inner.lock().unwrap();
         st.dirty.insert(path.clone(), !lines.is_empty());
         st.porcelain.insert(path, lines);
+    }
+
+    /// Make [`GitExecutor::status_porcelain`] fail with `msg`, for every path.
+    /// Callers that treat "git could not answer" as a distinct outcome from
+    /// "git answered zero" need this to tell the two apart.
+    pub fn set_porcelain_error(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().porcelain_error = Some(msg.into());
+    }
+
+    /// Number of [`GitExecutor::status_porcelain`] calls made so far — the
+    /// cheapest way to assert that some code path did *no* git work at all.
+    pub fn porcelain_calls(&self) -> u32 {
+        self.inner.lock().unwrap().porcelain_calls
     }
 
     /// Map a refname to a SHA.
@@ -528,7 +549,11 @@ impl GitExecutor for FakeGit {
     }
 
     fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>> {
-        let st = self.inner.lock().unwrap();
+        let mut st = self.inner.lock().unwrap();
+        st.porcelain_calls += 1;
+        if let Some(msg) = st.porcelain_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
         // Explicit override wins; otherwise synthesize from the dirty flag so
         // callers that only set dirtiness still see a non-empty status.
         if let Some(lines) = st.porcelain.get(cwd) {

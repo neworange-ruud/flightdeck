@@ -24,6 +24,7 @@ pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
+pub mod web;
 
 // No-op stand-in when the real self-updater is not built: either the
 // `self-update` feature is off (a pure-Rust build with no C toolchain), or the
@@ -67,8 +68,8 @@ use crate::config::schema::{default_config, default_global_config};
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
-    Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor, ManualStatus,
-    Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
+    AgentDef, Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor,
+    ManualStatus, Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
@@ -1157,6 +1158,16 @@ enum Prompt {
     /// Confirm unpairing the phone (FlightDeck Remote). On confirm the event
     /// loop forgets the pairing and reverts to the passthrough sealer.
     UnpairConfirm,
+    /// Confirm quitting FlightDeck: every agent it is running is stopped.
+    ///
+    /// Only an **unconfirmed** `Command::Quit` opens this, and the only row that
+    /// carries one is the browser's (D16 — a `host only` badge is not enough for
+    /// quit). The desktop's `Ctrl-q` and its palette row dispatch the confirmed
+    /// value and never see it, which is why SPECS §23's "quit just quits" is
+    /// unchanged for the person at the keyboard. It is a D13 dialog like any
+    /// other once open: shared, origin-tagged, cancellable from either surface —
+    /// and from a browser its `y` is behind artboard 1g's typed-name step.
+    QuitConfirm,
 }
 
 /// State for the project-folder browser prompt ([`Prompt::OpenProject`]): the
@@ -1225,6 +1236,150 @@ struct Ui {
     /// gated by the actual pairing state (a `RemoteBridge` this UI cannot borrow
     /// directly). `false` whenever remote is disabled.
     remote_paired: bool,
+    /// Set by the "Start Web Interface" palette action; the event loop (which
+    /// owns the listener) starts it next tick (D10).
+    pending_web_start: bool,
+    /// Set by "Stop Web Interface"; the event loop drains the viewers and
+    /// releases the listener (Q5).
+    pending_web_stop: bool,
+    /// Set by the access overlay's `x`: credentials were withdrawn from the
+    /// store, and the sockets holding them must now be closed.
+    ///
+    /// Deferred for the same reason as the two lifecycle flags above — the
+    /// sockets live behind [`crate::web::server::WebServerHandle`], which only
+    /// the event loop holds. Deferring is safe here in a way it would not be if
+    /// this were the *only* enforcement: the store is revoked synchronously
+    /// inside the key handler, and the server refuses every frame from a
+    /// credential that store no longer honours, so nothing a revoked browser
+    /// sends in the meantime is acted on. This flag is what makes the socket
+    /// actually go away, so 2b's revoked panel appears without a reload.
+    pending_web_recheck_credentials: bool,
+    /// The access overlay's live state while it is open (D5, Q1; design `2a`).
+    ///
+    /// Held beside `overlay` rather than inside it, exactly as `config` is,
+    /// because it carries mutable state the renderer must not own: which
+    /// address is selected, whether the code is revealed. `overlay` gets a
+    /// freshly built [`crate::web::access::WebAccessView`] every tick, which is
+    /// what makes the countdown move.
+    web_access: Option<crate::web::access::WebAccess>,
+    /// The credential store, while the server is running.
+    ///
+    /// The same `Arc` the server thread verifies against — the key handler has
+    /// to mint and revoke, and those decisions cannot wait a tick without
+    /// `Enter` opening a browser against a code that expired in the meantime.
+    /// Held on the same terms as `input_lock` above: a shared handle the key
+    /// path needs, `None` whenever there is no server to share it with.
+    web_credentials: Option<Arc<Mutex<crate::web::credentials::CredentialStore>>>,
+    /// Set by "Start Web Interface" and "Show Web Access"; the event loop opens
+    /// the access overlay once it knows what the listener actually bound.
+    pending_web_access_open: bool,
+    /// A bind address the access overlay asked for (`n` → `0.0.0.0`, `l` →
+    /// `127.0.0.1`). The event loop owns the listener, so it performs the
+    /// rebind and tells the overlay how it went.
+    pending_web_rebind: Option<String>,
+    /// Set by "Take Input Lock"; the event loop interrupts whichever surface is
+    /// mid-burst and takes the input lock for this desktop (D14 as revised).
+    ///
+    /// Deferred rather than done in the palette handler for the same reason as
+    /// the two lifecycle flags above: the lock lives behind
+    /// [`crate::web::server::WebServerHandle`], which only the event loop holds.
+    pending_input_preempt: bool,
+    /// The input lock, while the web server is running (D14 as revised).
+    ///
+    /// **This is the desktop's own arbitration seam, and it is deliberately not
+    /// a privilege.** Every desktop keystroke bound for a PTY claims through it
+    /// exactly the way a browser's does, is refused by name while another writer
+    /// is mid-burst, and takes the lock back the moment they go quiet. `None`
+    /// while the server is stopped, which is the honest reading of "there is one
+    /// writer and nothing to arbitrate".
+    input_lock: Option<crate::web::arbiter::SharedInputLock>,
+    /// Who holds the input lock, as the status bar renders it, or `None` when it
+    /// is free or when there is nobody to contend with. Refreshed once per tick
+    /// from the same seat rows the browser is sent, so the two surfaces cannot
+    /// disagree about who can type.
+    input_holder: Option<String>,
+    /// Whether the embedded web server is currently listening. Refreshed each
+    /// tick and read when opening the palette, so exactly one of the two
+    /// lifecycle commands is ever offered — the same gating idiom as
+    /// [`Ui::remote_paired`].
+    web_running: bool,
+    /// What the last dispatch produced, recorded so a browser's `Command` frame
+    /// can be acked honestly instead of being told `Applied` while the desktop
+    /// showed the user a refusal.
+    ///
+    /// The desktop reads its outcome off the screen — that is what
+    /// [`Ui::message`] is for — but a browser cannot, and
+    /// `specs/WEB_INTERFACE.md` §5.1 does not allow a guess. So the classifying
+    /// sites ([`apply_effect`], [`dispatch_command`]'s error arm, and
+    /// [`switch_project`]'s isolated refusal) record what they decided here, and
+    /// [`run_web_command`] clears it before dispatching and reads it after.
+    /// Overwritten constantly by the desktop's own keypresses, which is fine:
+    /// only the value written during one web dispatch is ever read.
+    web_outcome: Option<WebDispatch>,
+    /// Which browser's frame is being applied right now, or `None` when the
+    /// dispatch came from this keyboard.
+    ///
+    /// `Some` only for the duration of one [`run_web_command`] dispatch, exactly
+    /// like [`Ui::web_outcome`]. Two things read it, both for the same reason —
+    /// *who asked* changes what the right answer is:
+    ///
+    /// * **D13** stamps it on any dialog the dispatch opens, so the desktop can
+    ///   say `opened from browser · 192.168.2.20` about a modal nobody at this
+    ///   keyboard requested. `start_prompt` is the only place a dialog is
+    ///   opened, so a dialog cannot be published without an origin.
+    /// * **§6.5 R16** uses its mere presence to decide where a read-only
+    ///   overlay lands: `show_git_status` from the desktop opens the desktop's
+    ///   panel, and the same row from a browser answers *that browser* instead
+    ///   of putting a panel in front of somebody who did not ask for one.
+    ///
+    /// Set and cleared in one place, so neither of the two dozen prompt-opening
+    /// sites nor `apply_effect`'s other arms have to know a browser exists.
+    web_origin: Option<crate::web::protocol::DialogOrigin>,
+    /// SPECS §21's panel, collected by the dispatch a browser just made, for
+    /// the browser that made it (`remote-control-ll5.8`, §6.5 R16).
+    ///
+    /// The same one-dispatch-long idiom as [`Ui::web_outcome`] and
+    /// [`Ui::web_origin`]: [`run_web_command`] clears it, dispatches,
+    /// and takes whatever [`apply_effect`] left. It exists because
+    /// `show_git_status` is the one read-only overlay whose facts are not
+    /// already on the snapshot — the upstream's name, the worktree path and
+    /// §14's compare URL are a fresh `git` read — so the answer has to travel
+    /// back to the asker rather than being drawn from state they already hold.
+    ///
+    /// **A browser's read does not open the desktop's overlay.** Nothing is
+    /// being asked (R8), so there is nothing for the person at the machine to
+    /// answer, and a panel they did not request would be the interruption 2f
+    /// declines to inflict on them for the same reason. The desktop opens its
+    /// own overlay when the desktop runs the row; see [`apply_effect`].
+    web_git_status: Option<crate::web::protocol::GitStatusView>,
+    /// Dialogs that reached a real decision this tick, oldest first.
+    ///
+    /// The published-state diff (`crate::web::stream::deltas`) can see that a
+    /// dialog *went away* but not why, so it reports [`DialogOutcome::Superseded`]
+    /// — honest for a dialog that was replaced, wrong for one somebody answered.
+    /// [`handle_prompt_key`] records the real outcome here and the event loop
+    /// upgrades the diff's frame with it (`resolve_dialog_outcomes`). Drained
+    /// every tick.
+    dialog_decisions: Vec<(
+        crate::web::protocol::DialogId,
+        crate::web::protocol::DialogOutcome,
+    )>,
+    /// Monotonic counter behind [`Ui::mint_dialog_id`]. Never reset, so an id is
+    /// never reused within a process and a stale answer cannot land on a new
+    /// dialog by matching its id.
+    dialog_seq: u64,
+}
+
+/// What one dispatch produced, in the vocabulary a
+/// [`crate::web::protocol::Ack`] needs (see [`Ui::web_outcome`]).
+#[derive(Debug, Clone)]
+enum WebDispatch {
+    /// It happened. The string is the sentence the desktop showed, if any.
+    Applied(Option<String>),
+    /// A safety guard said no, with its reason. Nothing happened.
+    Refused(String),
+    /// The dispatch itself failed, with the error. Nothing happened.
+    Failed(String),
 }
 
 /// A queued worktree-creation job plus the index of the project that owns it.
@@ -1234,9 +1389,25 @@ struct PendingJob {
 }
 
 /// A prompt plus the modal dialog rendered for it (title + buttons).
+///
+/// **This is D13's "no new state".** A dialog on the wire is this struct read
+/// out (see [`web_dialog_view`]); a browser answering one is a keypress fed into
+/// [`handle_prompt_key`]. There is deliberately no second dialog store, no
+/// browser-only dialog kind, and no path that performs a dialog's action
+/// twice — the failure mode `specs/WEB_INTERFACE.md` §1 exists to prevent.
 struct PromptState {
     prompt: Prompt,
     dialog: Dialog,
+    /// Stable identity for the life of this prompt, minted by [`start_prompt`].
+    /// The browser names it when it answers, so an answer that arrives for a
+    /// dialog that has since been replaced is refused instead of applied to
+    /// whatever is on screen now.
+    id: crate::web::protocol::DialogId,
+    /// D13: who asked for it. [`DialogOrigin::Desktop`] for the person at this
+    /// keyboard; [`DialogOrigin::Browser`] when a `Command` frame opened it, in
+    /// which case the desktop renders the origin line and the browser does not
+    /// (it already knows — it asked).
+    origin: crate::web::protocol::DialogOrigin,
 }
 
 impl Ui {
@@ -1246,7 +1417,19 @@ impl Ui {
         self.palette.is_some()
             || self.prompt.is_some()
             || self.config.is_some()
+            || self.web_access.is_some()
             || !matches!(self.overlay, UiOverlay::None)
+    }
+
+    /// A fresh dialog id (D13). Process-unique by construction.
+    fn mint_dialog_id(&mut self) -> crate::web::protocol::DialogId {
+        self.dialog_seq += 1;
+        crate::web::protocol::DialogId::new(format!("dialog-{}", self.dialog_seq))
+    }
+
+    /// The open dialog's id, if any.
+    fn dialog_id(&self) -> Option<crate::web::protocol::DialogId> {
+        self.prompt.as_ref().map(|p| p.id.clone())
     }
 
     /// Show a notification message as a centered modal dialog (SPECS §22).
@@ -1260,6 +1443,7 @@ impl Ui {
         self.palette = None;
         self.prompt = None;
         self.config = None;
+        self.web_access = None;
     }
 
     /// The overlay to render this frame: a live prompt dialog takes precedence
@@ -1321,6 +1505,405 @@ impl<'a> Env<'a> {
             container: self.container,
             command: self.command,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the embedded browser surface (`specs/WEB_INTERFACE.md`)
+// ---------------------------------------------------------------------------
+
+/// Everything the event loop needs to run the embedded web interface.
+///
+/// One of these exists for the whole process whether or not the server is
+/// running, because the pieces have different lifetimes: the credential store
+/// is shared with the server so a revocation lands on the very next connection
+/// (D5), and the inbound channel and the replay registry must survive
+/// `Stop Web Interface` followed by `Start Web Interface` — recreating the
+/// registry would throw away every terminal's scrollback on a restart.
+///
+/// **The tee only runs while the server does.** A replay ring is
+/// `[web] replay_bytes` (256 KiB by default) per live terminal, and `[web]
+/// enabled` is off by default, so a user who never opens a browser must not pay
+/// for buffers nobody will read. The accepted cost is the other way round: the
+/// first viewer after `Start Web Interface` paints from the moment the server
+/// started, not from the start of the session. That is honest on the wire — the
+/// stream really does begin there, `offset` and `replay_from` say so — and Q2
+/// already accepts one imperfect first repaint. Seeding the ring from the
+/// desktop's `vt100` grid was considered and rejected: that grid is a *parse
+/// result*, and writing it into a byte stream would be inventing bytes the PTY
+/// never emitted.
+struct WebSurface {
+    /// Shared with the server (D5): the TUI mints bootstrap codes and revokes,
+    /// the server verifies on every connection.
+    credentials: Arc<Mutex<crate::web::credentials::CredentialStore>>,
+    /// Per-terminal replay rings plus the per-viewer input watermark.
+    streams: crate::web::stream::TerminalStreams,
+    /// D11's activity feed: the browser's **entire** substitute for OS
+    /// notifications, because Web Push is structurally blocked under D1.
+    ///
+    /// Recorded into **whether or not the server is running**, unlike the replay
+    /// rings above. The two costs are not comparable: a ring is 256 KiB per live
+    /// terminal, while the feed is bounded at
+    /// [`crate::web::activity::MAX_EVENTS`] small events for the whole process
+    /// — tens of kilobytes at worst, and proportional to transitions that
+    /// actually happened rather than to bytes an agent happened to print. Paying
+    /// it always is what makes `Start Web Interface` → open a tab land on
+    /// history instead of silence, which is the requirement D11 exists for; and
+    /// it is why the feed survives a `Stop` / `Start` cycle for the same reason
+    /// the rings do.
+    activity: crate::web::activity::ActivityStore,
+    /// Finished feed rows held back while a one-shot `git status` counts the
+    /// files their session touched (`crate::web::activity`'s "the finish edge
+    /// asks git itself"). Drained by [`WebSurface::drain_finish_counts`], which
+    /// also lets go of anything that waited too long — a held row always ends
+    /// up in `activity`, with the clause or without it.
+    pending_finishes: crate::web::activity::PendingFinishes,
+    /// Handed to `server::start`; kept so a restart reuses the same channel.
+    inbound_tx: Sender<crate::web::server::WebInbound>,
+    /// Drained every tick.
+    inbound_rx: Receiver<crate::web::server::WebInbound>,
+    /// Where the finish-edge git workers report back. Kept on the surface
+    /// rather than per project because the request id, not the channel, says
+    /// which row an answer belongs to — so a background project's worker needs
+    /// no plumbing of its own.
+    count_tx: Sender<FinishCount>,
+    count_rx: Receiver<FinishCount>,
+    /// `Some` while the server is running.
+    handle: Option<crate::web::server::WebServerHandle>,
+    /// The last state published, so `publish_state` is paired with the deltas
+    /// that describe the difference rather than a server-side guess.
+    published: crate::web::server::HostState,
+}
+
+impl WebSurface {
+    /// Build the surface. Does **not** start the server — `[web] enabled` is
+    /// the TUI's decision to make (D10), and the server deliberately ignores it.
+    fn new(config: &crate::contracts::domain::WebConfig) -> WebSurface {
+        let path = crate::web::credentials::web_credentials_path()
+            // No `$HOME`: run without persistence rather than failing, the same
+            // idiom as `remote.json`. The token then lasts one session.
+            .unwrap_or_else(|| std::path::PathBuf::from("web.json"));
+        let store = crate::web::credentials::CredentialStore::open(
+            Arc::new(RealFs),
+            Arc::new(RealClock),
+            path,
+        );
+        let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        let (count_tx, count_rx) = std::sync::mpsc::channel();
+        WebSurface {
+            credentials: Arc::new(Mutex::new(store)),
+            streams: crate::web::stream::TerminalStreams::new(config.replay_bytes),
+            activity: crate::web::activity::ActivityStore::new(),
+            pending_finishes: crate::web::activity::PendingFinishes::new(),
+            inbound_tx,
+            inbound_rx,
+            count_tx,
+            count_rx,
+            handle: None,
+            published: crate::web::server::HostState::default(),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Start listening, returning the bound address and whether it is reachable
+    /// off this machine (D5 — the caller warns when it is).
+    fn start(
+        &mut self,
+        config: &crate::contracts::domain::WebConfig,
+        initial: crate::web::server::HostState,
+    ) -> std::result::Result<
+        (std::net::SocketAddr, crate::web::server::BindExposure),
+        crate::web::server::StartError,
+    > {
+        if let Some(handle) = self.handle.as_ref() {
+            return Ok((handle.bound_addr(), handle.exposure()));
+        }
+        self.published = initial.clone();
+        let handle = crate::web::server::start(
+            config,
+            Arc::clone(&self.credentials),
+            Arc::new(RealClock),
+            initial,
+            self.inbound_tx.clone(),
+        )?;
+        let reported = (handle.bound_addr(), handle.exposure());
+        self.handle = Some(handle);
+        Ok(reported)
+    }
+
+    /// Tell every viewer why the socket is closing, then release the listener
+    /// (Q5). The replay rings and watermarks survive, so a later start resumes
+    /// rather than restarts.
+    fn stop(&mut self, notice: crate::web::server::ShutdownNotice) {
+        if let Some(handle) = self.handle.take() {
+            handle.stop(notice);
+        }
+        // Nothing can be attached any more, so no viewport is current. The
+        // watermarks stay: they are keyed by viewer id and a returning browser
+        // still needs them to avoid retyping its held queue.
+        self.published = crate::web::server::HostState::default();
+    }
+
+    /// **Test-only seam (debug builds only).** Keep a *known* bootstrap code
+    /// live while the server runs, so the Playwright suite can authenticate a
+    /// real browser through the real `POST /auth/exchange` (D15).
+    ///
+    /// Called every tick and idempotent: it mints only when no code is live, so
+    /// a code that has just been spent (they are single use) or expired is
+    /// replaced and the next test in the run can authenticate too. Nothing else
+    /// changes — the exchange, the TTL and both rate limiters are the shipped
+    /// ones. See `CredentialStore::mint_fixed_bootstrap_code` for why this
+    /// cannot exist in a release binary.
+    #[cfg(debug_assertions)]
+    fn ensure_test_bootstrap_code(&self, digits: &str) {
+        if self.handle.is_none() {
+            return;
+        }
+        if let Ok(mut store) = self.credentials.lock() {
+            if store.bootstrap_code().is_none() {
+                store.mint_fixed_bootstrap_code(digits);
+            }
+        }
+    }
+
+    /// Record one desktop status change into D11's feed — the second record of
+    /// the signal `take_finish_notifications` has just turned into an OS
+    /// notification.
+    ///
+    /// The honesty policy (which reason strings are real, and §5.1's
+    /// `unknown → unknown` for an agent with no lifecycle hooks) lives in
+    /// [`crate::web::activity::observe`], and the fact it keys off is
+    /// [`crate::web::stream::lifecycle_reporting`] — the same helper
+    /// `build_web_host_state` uses for the sidebar, so a feed row and a session
+    /// row can never disagree about whether an agent reports a lifecycle.
+    ///
+    /// A *finished* row is the one case that cannot be completed here: artboard
+    /// 2e's `finished, 18 files touched` needs a number only git has, so the row
+    /// is parked (`pending_finishes`) and a [`FinishCountRequest`] is returned
+    /// for the caller to run off the event loop. Everything else — including a
+    /// finish edge whose `worktree_abs` is unknown, which is the honest-empty
+    /// path — is recorded here and now.
+    fn record_transition(
+        &mut self,
+        clock: &dyn Clock,
+        project_id: crate::web::protocol::ProjectId,
+        project_name: &str,
+        agent: Option<&AgentDef>,
+        worktree_abs: Option<PathBuf>,
+        change: crate::app::state::TabStatusChange,
+    ) -> Option<FinishCountRequest> {
+        let observed = crate::web::activity::observe(
+            change.was,
+            change.now,
+            agent
+                .map(|def| def.display_name.as_str())
+                .unwrap_or(&change.agent_key),
+            crate::web::stream::lifecycle_reporting(agent),
+        );
+        let wants_count = crate::web::activity::wants_file_count(&observed);
+        let transition = crate::web::activity::Transition {
+            project_id,
+            project_name: project_name.to_string(),
+            session_id: change.tab_id,
+            session_name: change.tab_name,
+            from: observed.from,
+            to: observed.to,
+            manual: observed.manual,
+            reason: observed.reason,
+        };
+        match worktree_abs {
+            Some(worktree_abs) if wants_count => {
+                let request = self
+                    .pending_finishes
+                    .park(clock.now_millis() as i64, transition);
+                Some(FinishCountRequest {
+                    request,
+                    worktree_abs,
+                })
+            }
+            _ => {
+                self.activity.record(clock, transition);
+                None
+            }
+        }
+    }
+
+    /// Record the parked finished rows whose git refresh has answered, then let
+    /// go of any that has waited past
+    /// [`crate::web::activity::FINISH_COUNT_DEADLINE_MS`].
+    ///
+    /// Called every tick, before anything reads the feed, so a row is at most
+    /// one tick behind the answer it was waiting for.
+    fn drain_finish_counts(&mut self, clock: &dyn Clock, now_ms: u64) {
+        while let Ok(count) = self.count_rx.try_recv() {
+            self.pending_finishes
+                .resolve(&mut self.activity, clock, count.request, count.files);
+        }
+        self.pending_finishes
+            .expire(&mut self.activity, clock, now_ms as i64);
+    }
+
+    /// The retained feed for a `HostState`, both §5.1 bounds enforced against
+    /// `clock` **first**.
+    ///
+    /// Eviction is a read-time fact by design (see `crate::web::activity`'s
+    /// module doc): no background timer exists, so an idle feed only ages itself
+    /// down to artboard 2e's "Nothing has changed in 24 hours" because the code
+    /// that builds a read view asks it to.
+    fn activity_events(&mut self, clock: &dyn Clock) -> Vec<crate::web::protocol::ActivityEvent> {
+        self.activity.evict(clock);
+        self.activity.events().cloned().collect()
+    }
+
+    /// One chunk of raw PTY output, from `drain_pty_output`'s tee.
+    fn tee(&mut self, tab_id: &str, child: Option<usize>, mint: u64, bytes: &[u8]) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let terminal_id = match child {
+            None => crate::web::stream::primary_terminal_id(tab_id),
+            Some(_) => crate::web::stream::child_terminal_id(tab_id, mint),
+        };
+        if let Some(frame) = self.streams.pty_output(&terminal_id, bytes) {
+            handle.send(crate::web::server::WebOutbound::All(
+                crate::web::protocol::ServerMsg::TermBytes(frame),
+            ));
+        }
+    }
+}
+
+/// A per-tab, one-shot git refresh the event loop still has to run: a finished
+/// session's feed row is parked until it answers (D11 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinishCountRequest {
+    /// The parked row this answer belongs to.
+    request: crate::web::activity::FinishCountId,
+    /// The worktree to ask about — that tab's, not the repository root.
+    worktree_abs: PathBuf,
+}
+
+/// One completed finish-edge count, from its worker thread.
+struct FinishCount {
+    request: crate::web::activity::FinishCountId,
+    /// `None` when git could not answer. The row is then recorded without the
+    /// clause, exactly as it was before any of this existed.
+    files: Option<u32>,
+}
+
+/// Tee one project's status transitions into D11's feed, returning the one-shot
+/// git refreshes its finished rows are waiting on.
+///
+/// **This runs for every open project, on screen or not** — the event loop
+/// calls it inside the same per-project pass that drains PTYs and fires
+/// notifications, so a session that finished in a project nobody is looking at
+/// gets its file count on exactly the same terms as the active one. That is the
+/// whole reason the count is fetched *here*, at the edge, rather than read out
+/// of the periodic git-status cache, which only ever refreshes
+/// `workspace.projects[active]` (see `GIT_REFRESH_EVERY`) and is left untouched
+/// by this: no project gains any periodic git work it did not already have.
+///
+/// The refreshes are returned rather than spawned so the whole decision — which
+/// edges want a count, and which worktree to ask about — is a pure function of
+/// the project's state, testable against a fake git with no threads in it.
+fn record_web_transitions(
+    web: &mut WebSurface,
+    project: &mut Project,
+    clock: &dyn Clock,
+    now_ms: u64,
+) -> Vec<FinishCountRequest> {
+    let changes = project.state.take_status_transitions(now_ms);
+    if changes.is_empty() {
+        // Built only when there is something to attribute, so a quiet tick
+        // costs no allocation on a loop that runs at frame rate.
+        return Vec::new();
+    }
+    let project_id = crate::web::protocol::ProjectId::new(project.git.root().display().to_string());
+    let mut requests = Vec::new();
+    for change in changes {
+        let agent = project.state.registry.get(&change.agent_key);
+        // Only a `Ready` tab has a worktree on disk to count; anything else
+        // takes the honest-empty path rather than asking git about a directory
+        // that is not there yet.
+        let worktree_abs = project
+            .state
+            .tabs
+            .iter()
+            .find(|t| t.meta.id == change.tab_id.0 && t.phase == TabPhase::Ready)
+            .map(|t| {
+                to_absolute(
+                    &project.state.repo_root,
+                    Path::new(&t.meta.worktree_path_relative),
+                )
+            });
+        if let Some(request) = web.record_transition(
+            clock,
+            project_id.clone(),
+            &project.name,
+            agent,
+            worktree_abs,
+            change,
+        ) {
+            requests.push(request);
+        }
+    }
+    requests
+}
+
+/// Run one finish-edge count off the UI thread and post the answer back.
+///
+/// A whole thread for a single `git status --porcelain` is the same trade
+/// `spawn_status_refresh` makes and for the same reason (SPECS §21): a repo
+/// another instance is holding a lock on must never freeze the loop. It costs
+/// one thread per finished session, which is rare — this is not the periodic
+/// refresh and deliberately does not become one.
+fn spawn_finish_count(git: &GitCli, tx: &Sender<FinishCount>, req: FinishCountRequest) {
+    let git = git.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let files = crate::web::activity::file_count(&git, &req.worktree_abs);
+        let _ = tx.send(FinishCount {
+            request: req.request,
+            files,
+        });
+    });
+}
+
+/// The [`TerminalHost`] the web interface writes keystrokes through: every open
+/// project's tabs, searched by wire terminal id.
+///
+/// Every project, not just the active one, because a browser can be looking at
+/// a session in a project that is not on screen and D3's shared selection moves
+/// the desktop to it — but the keystroke must land even in the tick before that
+/// happens.
+///
+/// [`TerminalHost`]: crate::web::stream::TerminalHost
+struct WorkspaceTerminals<'a> {
+    projects: &'a mut [Project],
+}
+
+impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
+    fn write_terminal_input(
+        &mut self,
+        terminal_id: &crate::web::protocol::TerminalId,
+        bytes: &[u8],
+    ) -> crate::web::stream::Written {
+        for project in self.projects.iter_mut() {
+            for tab in project.state.tabs.iter_mut() {
+                let tab_id = tab.meta.id.clone();
+                if let Some(written) = crate::web::stream::write_into_session(
+                    &mut tab.session,
+                    &tab_id,
+                    terminal_id,
+                    bytes,
+                ) {
+                    return written;
+                }
+            }
+        }
+        crate::web::stream::Written::NoSuchTerminal
     }
 }
 
@@ -1464,6 +2047,7 @@ fn resume_active_project_agents(workspace: &mut Workspace, env: &Env) {
 /// isolated run, which has exactly one project by construction (SPECS §32).
 fn switch_project(workspace: &mut Workspace, env: &Env, sel: Selector, ui: &mut Ui) {
     if workspace.active_project().state.isolated {
+        ui.web_outcome = Some(WebDispatch::Refused(ISOLATED_REFUSAL.to_string()));
         ui.message(ISOLATED_REFUSAL);
         return;
     }
@@ -1564,15 +2148,11 @@ fn event_loop(
     // finding immediately and, when due, kick off a background check. Applied to
     // every project so whichever is active shows the hint.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    // An isolated run makes no network call and writes no cache (SPECS §32).
-    let check_enabled = !workspace.active_project().state.isolated
-        && workspace.active_project().state.config.update.check;
+    let check_enabled = update_check_enabled(&workspace.active_project().state);
     if let Some(latest) =
         crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
     {
-        for p in workspace.projects.iter_mut() {
-            p.state.update_available = Some(latest.clone());
-        }
+        apply_update_notice(workspace, latest);
     }
 
     // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
@@ -1665,6 +2245,37 @@ fn event_loop(
         .map(|s| s.established.is_some())
         .unwrap_or(false);
 
+    // FlightDeck Web (optional): the embedded browser surface. Constructed
+    // always (it is cheap and holds no buffers until the server runs) and
+    // started here only when `[web] enabled` opted in — D10 makes auto-start the
+    // TUI's decision, which is why `server::start` deliberately ignores the flag.
+    let mut web_surface = WebSurface::new(&workspace.active_project().state.config.web);
+    // Q1 addition 2's address picker, behind its trait seam. One value for the
+    // process: enumeration is a syscall, not state, and the overlay re-runs it
+    // every time it opens so a cable plugged in mid-session shows up.
+    let interfaces = crate::web::interfaces::RealInterfaceEnumerator;
+    // Test / E2E seam, debug builds only (read once at startup): when
+    // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
+    // always has *that* bootstrap code live, so the Playwright suite (D15) can
+    // exchange it in a real browser instead of screen-scraping a TUI overlay for
+    // a random one. `None` in every normal run, and absent entirely from a
+    // release build — see `WebSurface::ensure_test_bootstrap_code`.
+    #[cfg(debug_assertions)]
+    let web_test_code: Option<String> = std::env::var("FLIGHTDECK_WEB_TEST_CODE")
+        .ok()
+        .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
+    if workspace.active_project().state.config.web.enabled {
+        let config = workspace.active_project().state.config.web.clone();
+        // Deliberately no access overlay here. `[web] enabled` is a user who
+        // asked for the server on every launch, not for a modal on every
+        // launch; `Show Web Access` in the palette is how they reach the code.
+        let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now0);
+        match web_surface.start(&config, initial) {
+            Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
+            Err(e) => ui.message(format!("Web interface did not start: {e}")),
+        }
+    }
+
     loop {
         let now_ms = env.clock.now_millis();
         let active = workspace.active;
@@ -1677,7 +2288,12 @@ fn event_loop(
             let is_active = idx == active;
             let p = &mut workspace.projects[idx];
 
-            drain_pty_output(&mut p.state, now_ms, |sid, which, bytes| {
+            drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
+                // FlightDeck Web (D2): the raw chunk into this terminal's replay
+                // ring, and straight out to every attached viewer. Only while the
+                // server is running — see `WebSurface` on the memory this costs
+                // and why it is not paid by a user who never starts it.
+                web_surface.tee(sid, which, mint, bytes);
                 if let Some(b) = remote_bridge.as_mut() {
                     // Primary (None) bytes no longer build the transcript — it is
                     // reconstructed from the agent's session file each tick (see
@@ -1725,13 +2341,39 @@ fn event_loop(
                 note.title = format!("{}: {}", p.name, note.title);
                 notifier.notify(&note);
             }
+
+            // FlightDeck Web (D11): the same lifecycle signal, recorded a second
+            // time for the browser's activity feed. Deliberately a *tee at the
+            // source* rather than a second read of the notifications above:
+            // `take_finish_notifications` spends each tab's arming and drops
+            // whatever `[notifications]` disabled or the startup grace window
+            // suppressed, so a feed built from its output would be missing
+            // exactly the events D11 exists to deliver. Running after it is
+            // therefore free of consequence for the desktop — the two keep
+            // separate per-tab edge memory — and this record happens whether or
+            // not the server is up, so a browser opened later lands on history
+            // rather than silence (`WebSurface::activity`).
+            //
+            // A finished session's row also wants the count artboard 2e shows
+            // (`finished, 18 files touched`), which only git knows: each
+            // returned request is one `git status --porcelain` on that tab's
+            // worktree, spawned here and answered into `count_tx`. This is the
+            // *only* git work the feed adds, it is per finished session rather
+            // than per tick, and the periodic cache above still refreshes the
+            // active project alone.
+            for request in record_web_transitions(&mut web_surface, p, env.clock, now_ms) {
+                spawn_finish_count(&p.git, &web_surface.count_tx, request);
+            }
         }
+
+        // Land the finish-edge counts that came back, and let go of any row
+        // that has waited too long for one — before anything reads the feed
+        // this tick.
+        web_surface.drain_finish_counts(env.clock, now_ms);
 
         // --- Apply a completed background update check (SPECS §30). ---
         while let Ok(latest) = update_rx.try_recv() {
-            for p in workspace.projects.iter_mut() {
-                p.state.update_available = Some(latest.clone());
-            }
+            apply_update_notice(workspace, latest);
         }
 
         // --- Drain relay-client events (link state, envelopes, presence) into
@@ -1918,10 +2560,247 @@ fn event_loop(
             );
         }
 
+        // --- FlightDeck Web: drain what the browsers said, then publish the
+        //     state and the deltas that describe how it changed.
+        //
+        //     Ordering matters and is deliberate. Inbound is drained *first*, so
+        //     a selection the browser just moved (D3) is reflected in the state
+        //     published on this same tick rather than a tick later. And publish
+        //     comes after `sync_terminal_sizes` above, so the geometry the
+        //     browser letterboxes is the grid the PTY actually has (D4). ---
+        if web_surface.running() {
+            let inbound: Vec<crate::web::server::WebInbound> =
+                web_surface.inbound_rx.try_iter().collect();
+            for event in inbound {
+                // A `Command` frame is the browser's palette pressing Enter:
+                // `run_web_command` routes it into the same `run_palette_action`
+                // the desktop's own palette calls, and answers with the ack that
+                // dispatch earned. The server has already refused an unknown
+                // name, a read-only seat's frame (D14) and every command whose
+                // effect must not land for a browser (D16, including `quit`), so
+                // reaching here means a controller sent something runnable.
+                if let crate::web::server::WebInbound::Command {
+                    viewer_id,
+                    label,
+                    command,
+                } = &event
+                {
+                    // D13: a dialog this command opens is tagged with the seat
+                    // that asked, so the desktop can say `opened from browser ·
+                    // 192.168.2.20` about a modal nobody at this keyboard
+                    // requested.
+                    let origin = crate::web::protocol::DialogOrigin::Browser {
+                        viewer_id: Some(viewer_id.clone()),
+                        label: label.clone(),
+                    };
+                    let reply = run_web_command(
+                        command,
+                        &origin,
+                        workspace,
+                        env,
+                        &mut ui,
+                        &mut web_surface.activity,
+                    );
+                    if let Some(handle) = web_surface.handle.as_ref() {
+                        handle.send(crate::web::server::WebOutbound::Viewer {
+                            viewer_id: viewer_id.clone(),
+                            msg: crate::web::protocol::ServerMsg::Ack(reply.ack),
+                        });
+                        // SPECS §21's panel, to the viewer that asked and to no
+                        // other (§6.5 R16). After the ack, so a browser that
+                        // reads frames in order learns the command landed
+                        // before it is handed what the command produced.
+                        if let Some(view) = reply.git_status {
+                            handle.send(crate::web::server::WebOutbound::Viewer {
+                                viewer_id: viewer_id.clone(),
+                                msg: crate::web::protocol::ServerMsg::GitStatus(view),
+                            });
+                        }
+                        // SPECS §8's manager, likewise to the viewer that
+                        // asked and after the ack (§6.5 R22).
+                        if let Some(view) = reply.config {
+                            handle.send(crate::web::server::WebOutbound::Viewer {
+                                viewer_id: viewer_id.clone(),
+                                msg: crate::web::protocol::ServerMsg::Configuration(view),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                let mut host = WorkspaceTerminals {
+                    projects: &mut workspace.projects,
+                };
+                let out = web_surface.streams.apply_inbound(&event, &mut host);
+                if let Some(handle) = web_surface.handle.as_ref() {
+                    for frame in out {
+                        handle.send(frame);
+                    }
+                }
+            }
+
+            let activity = web_surface.activity_events(env.clock);
+            let next = build_web_host_state(
+                workspace,
+                &web_surface.streams,
+                activity,
+                web_dialog_view(
+                    &ui,
+                    &workspace.active_project().name,
+                    &workspace.active_project().state,
+                ),
+                now_ms,
+            );
+            let decided = std::mem::take(&mut ui.dialog_decisions);
+            if next != web_surface.published {
+                // Publish, *then* the matching deltas: publishing changes what
+                // the next attach sees and notifies nobody, deliberately, so the
+                // host is the one that says what changed (see `HostState`).
+                let mut frames = crate::web::stream::deltas(&web_surface.published, &next);
+                // D13: the diff can only say `Superseded` about a dialog that is
+                // gone. Where somebody actually decided, say so.
+                resolve_dialog_outcomes(&mut frames, &decided);
+                if let Some(handle) = web_surface.handle.as_ref() {
+                    handle.publish_state(next.clone());
+                    for delta in frames {
+                        handle.send(crate::web::server::WebOutbound::All(
+                            crate::web::protocol::ServerMsg::Delta(delta),
+                        ));
+                    }
+                }
+                web_surface.published = next;
+            }
+        }
+        // Drained whether or not anyone is watching (D13). A desktop-only run
+        // still decides dialogs, and a list nobody ever reads would grow for the
+        // life of the process — so the take above is paired with a clear here
+        // rather than living inside the `running()` branch.
+        ui.dialog_decisions.clear();
+
+        // --- Start / stop the web interface, when the palette asked (D10). ---
+        if ui.pending_web_start {
+            ui.pending_web_start = false;
+            let config = workspace.active_project().state.config.web.clone();
+            let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now_ms);
+            match web_surface.start(&config, initial) {
+                // The access overlay carries the bound address *and* D5's
+                // warning in a stronger form than this one line does, so when
+                // it is about to open the line would only be overwritten by it
+                // — and a message the user never sees is worse than no message.
+                Ok((addr, exposure)) => {
+                    if !ui.pending_web_access_open {
+                        ui.message(web_started_message(addr, exposure));
+                    }
+                }
+                Err(e) => {
+                    ui.pending_web_access_open = false;
+                    ui.message(format!("Web interface did not start: {e}"));
+                }
+            }
+        }
+        if ui.pending_web_stop {
+            ui.pending_web_stop = false;
+            if web_surface.running() {
+                web_surface.stop(crate::web::server::ShutdownNotice::server_stopped());
+                ui.web_access = None;
+                ui.message("Web interface stopped.".to_string());
+            }
+        }
+        // A revocation is two halves, and this is the one the listener owns: the
+        // key handler took the credentials away, and this closes the sockets
+        // that were still using them (§6.5 R20). Nothing is reported back — the
+        // overlay's own notice already says what was revoked, and a second
+        // sentence from here would be the desktop congratulating itself.
+        if std::mem::take(&mut ui.pending_web_recheck_credentials) {
+            if let Some(handle) = web_surface.handle.as_ref() {
+                handle.recheck_credentials();
+            }
+        }
+
+        // --- The access overlay (D5, Q1; design 2a). --------------------------
+        //
+        // Everything the overlay cannot do for itself happens here, because
+        // everything it cannot do for itself needs the listener: rebinding
+        // between its two states, and knowing what address was actually bound.
+        // The store handle is republished every tick so the key handler can
+        // mint against exactly the store the server verifies against, and is
+        // withdrawn the moment there is no server — an overlay describing a
+        // binding that no longer exists is the thing this whole surface is
+        // meant to prevent.
+        ui.web_credentials = web_surface
+            .running()
+            .then(|| Arc::clone(&web_surface.credentials));
+        if let Some(bind) = ui.pending_web_rebind.take() {
+            rebind_web_interface(
+                workspace,
+                &mut web_surface,
+                &mut ui,
+                &interfaces,
+                env.clock,
+                now_ms,
+                bind,
+            );
+        }
+        if std::mem::take(&mut ui.pending_web_access_open) {
+            open_web_access_overlay(&mut web_surface, &mut ui, &interfaces);
+        }
+        #[cfg(debug_assertions)]
+        if let Some(digits) = web_test_code.as_deref() {
+            web_surface.ensure_test_bootstrap_code(digits);
+        }
+        // Rebuilt every tick, which is what makes the countdown move without the
+        // renderer touching a credential — the same contract the phone pairing
+        // overlay has with `remote_pairing_view`.
+        refresh_web_access_overlay(&mut web_surface, &mut ui);
+        ui.web_running = web_surface.running();
+
+        // --- The input lock (D14 as revised). ---------------------------------
+        //
+        // The desktop is one of the writers, so it holds the same lock every
+        // browser does and reads it from the same place. Three things happen
+        // here, all once per tick:
+        //
+        //   1. The handle is picked up (or dropped) as the server starts and
+        //      stops, so `write_active_pty` has something to claim through —
+        //      and, when the server is stopped, deliberately does not.
+        //   2. `sync_input_lock` retires a holder that has gone quiet. Nobody
+        //      *causes* an expiry, so without a tick nothing would announce it
+        //      and both surfaces would keep naming somebody who stopped typing.
+        //   3. The palette's explicit override is applied, and only here: it is
+        //      the one act that may cut into a live burst.
+        match web_surface.handle.as_ref() {
+            Some(handle) => {
+                if ui.input_lock.is_none() {
+                    ui.input_lock = Some(handle.input_lock());
+                }
+                if std::mem::take(&mut ui.pending_input_preempt) {
+                    let message = match handle.preempt_input_for_desktop(now_ms as i64) {
+                        Some(interrupted) => {
+                            format!("Input lock taken from {interrupted}.")
+                        }
+                        // Nobody was mid-burst. Say what happened rather than
+                        // implying somebody was interrupted.
+                        None => "Input lock held by this desktop.".to_string(),
+                    };
+                    ui.message(message);
+                }
+                handle.sync_input_lock(now_ms as i64);
+                // Named only while somebody else could be typing: with no
+                // browser seated as a writer the chip would be permanent noise
+                // about a contest that cannot happen.
+                ui.input_holder = web_input_holder(handle);
+            }
+            None => {
+                ui.pending_input_preempt = false;
+                ui.input_lock = None;
+                ui.input_holder = None;
+            }
+        }
+
         // --- Render: the project tab row (workspace-level) plus the active
         //     project's full UI. The project row is painted first so any
         //     centered overlay drawn by `draw` still wins on tiny screens. ---
         let overlay = ui.render_overlay();
+        let input_holder = ui.input_holder.as_deref();
         let infos = workspace.tab_infos(now_ms);
         let active_idx = workspace.active;
         let p = &workspace.projects[active_idx];
@@ -1933,9 +2812,10 @@ fn event_loop(
                     area,
                     chrome,
                     crate::tui::mode_style::border_enabled(&p.state.config.ui),
+                    p.state.config.ui.agent_tab_side(),
                 );
                 draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
-                draw(frame, &p.state, &p.cache, &overlay, now_ms);
+                draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
             })
             .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
 
@@ -2001,6 +2881,11 @@ fn event_loop(
         }
     }
 
+    // Tell any attached browser that FlightDeck itself is going away, before the
+    // listener closes (Q5), so it enters a terminal state instead of spinning in
+    // "reconnecting…" against a host that no longer exists.
+    web_surface.stop(crate::web::server::ShutdownNotice::host_quit(None));
+
     // Tear down the relay client (best-effort join). A dropped handle also
     // signals the thread, so an early `?` return above still winds it down.
     if let Some(setup) = remote_setup {
@@ -2008,6 +2893,533 @@ fn event_loop(
     }
 
     Ok(())
+}
+
+/// Whether SPECS §30's once-a-day update check may run for this project.
+///
+/// Two facts, both the project's own: the user can turn the notice off
+/// (`[update] check = false`), and an `--isolated` run makes no network call
+/// and writes no cache at all (SPECS §32). Pure and named rather than inline
+/// so the isolated rule is assertable — a run that checks nothing must also
+/// *tell* nobody, which is what keeps `Snapshot::update` honest for an
+/// isolated host.
+fn update_check_enabled(state: &crate::app::state::AppState) -> bool {
+    !state.isolated && state.config.update.check
+}
+
+/// Record a completed update check on every open project (SPECS §30).
+///
+/// Every project, not just the active one, because the hint belongs to the
+/// binary rather than to a repository: whichever project is on screen when the
+/// answer arrives is the one that must show it. Shared by the two sites that
+/// learn the version — the cached finding `start_check` returns immediately,
+/// and the background thread's later answer — so the browser's snapshot and the
+/// desktop's status bar can never be reading two different fields.
+fn apply_update_notice(workspace: &mut Workspace, latest: String) {
+    for p in workspace.projects.iter_mut() {
+        p.state.update_available = Some(latest.clone());
+    }
+}
+
+/// Build the state the browser paints from, out of every open project.
+///
+/// This is the whole desktop → wire adaptation, assembled from
+/// [`crate::web::stream`]'s per-piece converters so the interesting decisions
+/// (R2's git mapping, the lifecycle fact, a terminal's byte-stream numbers) live
+/// next to their tests rather than in the event loop.
+///
+/// Every project is included, not just the active one: a browser can be looking
+/// at a session in a background project, and D3's shared selection means
+/// clicking it moves the desktop rather than the browser being told it may not
+/// look.
+///
+/// `activity` is the retained D11 feed, already evicted against both §5.1
+/// bounds by [`WebSurface::activity_events`] — carried in whole so a freshly
+/// attached tab's `Snapshot` backfills history rather than opening on silence,
+/// and so `crate::web::stream::deltas` can spot a genuinely new event and turn
+/// it into a `Delta::Activity` without the tab reloading.
+///
+/// `dialog` is the one open dialog (D13), read off the desktop's own prompt state
+/// by [`web_dialog_view`] and passed in rather than derived here — this function
+/// takes a `&Workspace` and a dialog lives on the [`Ui`], which is the layer
+/// above. Absent rather than guessed when none is open.
+fn build_web_host_state(
+    workspace: &Workspace,
+    streams: &crate::web::stream::TerminalStreams,
+    activity: Vec<crate::web::protocol::ActivityEvent>,
+    dialog: Option<crate::web::protocol::DialogView>,
+    now_ms: u64,
+) -> crate::web::server::HostState {
+    use crate::web::protocol as wire;
+    use crate::web::stream as ws;
+
+    let active = workspace.active_project();
+    let mut projects = Vec::with_capacity(workspace.projects.len());
+    let mut selection = wire::Selection {
+        split_view: active.state.split_view,
+        ..wire::Selection::default()
+    };
+
+    for project in workspace.projects.iter() {
+        // The repository root, not the folder name: two open projects can be
+        // called `web` and the browser keys everything by this id.
+        let root = project.git.root().display().to_string();
+        let project_id = wire::ProjectId::new(root.clone());
+        let mut sessions = Vec::with_capacity(project.state.tabs.len());
+
+        for (index, tab) in project.state.tabs.iter().enumerate() {
+            let mut terminals = Vec::new();
+            if let Some(primary) = tab.session.primary() {
+                terminals.push(terminal_facts(
+                    ws::primary_terminal_id(&tab.meta.id),
+                    primary,
+                ));
+            }
+            for c in 0..tab.session.child_count() {
+                if let Some(child) = tab.session.child(c) {
+                    terminals.push(terminal_facts(
+                        ws::child_terminal_id(&tab.meta.id, child.stream_id()),
+                        child,
+                    ));
+                }
+            }
+
+            if std::ptr::eq(project, active) && project.state.selected_tab == Some(index) {
+                selection.project_id = Some(project_id.clone());
+                selection.session_id = Some(tab.id());
+                selection.terminal_id = Some(match tab.session.selected_child() {
+                    None => ws::primary_terminal_id(&tab.meta.id),
+                    Some(c) => tab
+                        .session
+                        .child(c)
+                        .map(|child| ws::child_terminal_id(&tab.meta.id, child.stream_id()))
+                        .unwrap_or_else(|| ws::primary_terminal_id(&tab.meta.id)),
+                });
+            }
+
+            sessions.push(ws::session_view(
+                &ws::SessionFacts {
+                    project_id: &project_id,
+                    tab_id: &tab.meta.id,
+                    name: &tab.meta.name,
+                    agent: &tab.meta.agent,
+                    agent_def: project.state.config.agents.get(&tab.meta.agent),
+                    phase: match tab.phase {
+                        TabPhase::Creating => wire::SessionPhase::Creating,
+                        TabPhase::Ready => wire::SessionPhase::Ready,
+                    },
+                    display: tab.display_status(now_ms),
+                    // The per-turn timer lives in the phone bridge's own turn
+                    // tracker, which this loop does not own. Reported as zero
+                    // rather than fabricated; wiring it is a follow-up.
+                    running_time_secs: 0,
+                    git: ws::GitFacts {
+                        status: project.cache.get(&tab.meta.id),
+                        fallback_branch: &tab.meta.branch,
+                    },
+                    recovered: tab.meta.recovered,
+                    attached_existing_branch: tab.meta.attached_existing_branch,
+                    terminals,
+                },
+                streams,
+            ));
+        }
+
+        projects.push(ws::project_view(
+            &project_id,
+            &project.name,
+            &root,
+            &project.state.base_branch,
+            sessions,
+        ));
+    }
+
+    crate::web::server::HostState {
+        host_version: env!("CARGO_PKG_VERSION").to_string(),
+        projects,
+        selection,
+        geometry: ws::geometry_of(active.state.pty_size),
+        replay_capacity_bytes: streams.capacity_bytes() as u64,
+        activity,
+        dialog,
+        // SPECS §23's help, built from the *active project's* config: the
+        // leave-focus binding is a `[ui]` setting and `--isolated` is a
+        // property of the run, and both are read here rather than remembered
+        // when the server started, so a config save changes what the next
+        // snapshot documents (`specs/WEB_INTERFACE.md` §6.5 R16).
+        help: crate::tui::help::help_doc(
+            active.state.config.ui.use_f2_to_leave_terminal_focus,
+            active.state.isolated,
+        ),
+        about: crate::tui::help::about_doc(),
+        // SPECS §30's notice, read from the same field the desktop's own status
+        // bar draws from rather than from a second copy — there is one update
+        // check per run and it writes exactly one place
+        // (`remote-control-gk94`, `specs/WEB_INTERFACE.md` §6.5 R25). `None`
+        // when no check has reported a newer release, which includes every
+        // reason there was no check at all; see `Snapshot::update` for why that
+        // is not the same claim as "up to date".
+        update: active.state.update_available.as_ref().map(|latest| {
+            crate::web::protocol::UpdateNotice {
+                latest_version: latest.clone(),
+            }
+        }),
+        // Artboard 1h position 4 (`specs/WEB_INTERFACE.md` §6.5 R24), read
+        // from the active project's config through the same
+        // `UiConfig::agent_tab_side` the TUI's own layout reads — so the two
+        // surfaces cannot end up mirroring on different rules.
+        sidebar_position: active.state.config.ui.agent_tab_side(),
+    }
+}
+
+/// One terminal's wire facts, read off the live [`crate::terminal::session::Terminal`].
+fn terminal_facts(
+    terminal_id: crate::web::protocol::TerminalId,
+    terminal: &crate::terminal::session::Terminal,
+) -> crate::web::stream::TerminalFacts {
+    let (rows, cols) = terminal.screen().size();
+    let state = terminal.process_state();
+    crate::web::stream::TerminalFacts {
+        terminal_id,
+        role: crate::web::protocol::TerminalRole::from(terminal.kind),
+        title: terminal.title.clone(),
+        // The grid the desktop's own parser is using, which is the grid the PTY
+        // has — D4's "the host owns this", read from the horse's mouth rather
+        // than from a remembered config value.
+        geometry: crate::web::protocol::Geometry { cols, rows },
+        alive: matches!(state, ProcessState::Running | ProcessState::Starting),
+        exit_code: match state {
+            ProcessState::Exited(code) => Some(code),
+            _ => None,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the desktop access overlay (D5, D10, Q1; design `2a`)
+// ---------------------------------------------------------------------------
+
+/// The host snapshot a freshly started (or freshly rebound) server publishes.
+///
+/// A dialog can already be open when the server starts — the palette that ran
+/// `Start Web Interface` is gone by now, but a prompt behind it is not — so the
+/// first snapshot carries it rather than lying about an empty screen.
+fn web_host_state_now(
+    workspace: &Workspace,
+    web: &mut WebSurface,
+    ui: &Ui,
+    clock: &dyn Clock,
+    now_ms: u64,
+) -> crate::web::server::HostState {
+    let activity = web.activity_events(clock);
+    build_web_host_state(
+        workspace,
+        &web.streams,
+        activity,
+        web_dialog_view(
+            ui,
+            &workspace.active_project().name,
+            &workspace.active_project().state,
+        ),
+        now_ms,
+    )
+}
+
+/// Open the access overlay against the running listener, minting the bootstrap
+/// code that D5 has always called for and nothing ever produced.
+///
+/// The address and exposure come from the **handle**, never from config: a
+/// configured port of `7420` and a bound port of `7420` are usually the same
+/// number and occasionally are not, and an overlay that publishes a URL the
+/// listener is not on is worse than no overlay.
+fn open_web_access_overlay(
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+) {
+    let bound = match web.handle.as_ref() {
+        Some(handle) => (handle.bound_addr(), handle.exposure()),
+        None => {
+            ui.message("The web interface is not running — start it first.");
+            return;
+        }
+    };
+    match web.credentials.lock() {
+        Ok(mut store) => {
+            ui.web_access = Some(crate::web::access::WebAccess::open(
+                &mut store, interfaces, bound.0, bound.1,
+            ));
+        }
+        // A poisoned store means a panic already happened behind the mutex.
+        // Say so instead of drawing an overlay whose code came from nowhere.
+        Err(_) => ui.message("The access code store is unavailable in this session."),
+    }
+}
+
+/// Rebuild the overlay's render-ready view for this frame, or take it down if
+/// the server it describes has gone.
+///
+/// The QR encoder is handed in as a closure so [`crate::web::access`] keeps no
+/// dependency on it — and so this is the one place the phone's `qr_art` and the
+/// browser's QR meet, which is what keeps the two surfaces drawing the same
+/// scannable half-block art at the same sizes.
+fn refresh_web_access_overlay(web: &mut WebSurface, ui: &mut Ui) {
+    if ui.web_access.is_none() {
+        return;
+    }
+    if !web.running() {
+        ui.web_access = None;
+        if matches!(ui.overlay, UiOverlay::WebAccess(_)) {
+            ui.overlay = UiOverlay::None;
+        }
+        return;
+    }
+    let view = match (ui.web_access.as_ref(), web.credentials.lock()) {
+        (Some(access), Ok(store)) => access.view(&store, |payload| {
+            crate::remote::pairing::qr_art(payload).map(|art| (art.rows, art.width))
+        }),
+        (None, _) | (_, Err(_)) => return,
+    };
+    ui.overlay = UiOverlay::WebAccess(view);
+}
+
+/// Move the listener between D5's two bindings while the overlay stays open
+/// (`n` → `0.0.0.0`, `l` → `127.0.0.1`).
+///
+/// This is a stop and a start, because a bound `TcpListener` cannot change its
+/// address. Two consequences are handled rather than hoped away:
+///
+/// * **Every attached browser is disconnected**, so they are told why first
+///   (Q5) instead of seeing the socket vanish.
+/// * **The new bind can fail** — the port can be taken, or the OS can refuse a
+///   routable bind under a sandbox. The previous binding is then restored from
+///   the address the handle actually held, so a failed rebind leaves the user
+///   where they started rather than with no server at all. If even that fails,
+///   the overlay comes down: there is nothing left for it to describe.
+///
+/// The config file is deliberately **not** written. This door is a session
+/// decision the user made in front of the warning; `[web] bind` stays what they
+/// typed, and D5's "explicit opt-in the user types themselves" keeps meaning
+/// what it says.
+fn rebind_web_interface(
+    workspace: &Workspace,
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+    clock: &dyn Clock,
+    now_ms: u64,
+    bind: String,
+) {
+    let (previous_bind, port) = match web.handle.as_ref() {
+        Some(handle) => (
+            handle.bound_addr().ip().to_string(),
+            handle.bound_addr().port(),
+        ),
+        None => return,
+    };
+    web.stop(crate::web::server::ShutdownNotice::server_stopped());
+
+    let mut config = workspace.active_project().state.config.web.clone();
+    config.port = port;
+    config.bind = bind.clone();
+    let initial = web_host_state_now(workspace, web, ui, clock, now_ms);
+    let outcome = match web.start(&config, initial) {
+        Ok(bound) => Ok(bound),
+        Err(first) => {
+            config.bind = previous_bind.clone();
+            let initial = web_host_state_now(workspace, web, ui, clock, now_ms);
+            match web.start(&config, initial) {
+                Ok(bound) => Err((format!("{first}"), Some(bound))),
+                Err(second) => Err((format!("{first}; {second}"), None)),
+            }
+        }
+    };
+
+    match outcome {
+        Ok((addr, exposure)) => {
+            let notice = match exposure {
+                crate::web::server::BindExposure::Loopback => {
+                    "Back to loopback — nothing off this machine can reach it. New code issued."
+                        .to_string()
+                }
+                crate::web::server::BindExposure::Routable => {
+                    "Rebound to this network. New code issued; the previous one no longer works."
+                        .to_string()
+                }
+            };
+            reopen_web_access_overlay(web, ui, interfaces, addr, exposure, Some(notice));
+        }
+        Err((reason, Some((addr, exposure)))) => {
+            let notice = format!("Could not bind {bind} ({reason}) — still on {previous_bind}.");
+            reopen_web_access_overlay(web, ui, interfaces, addr, exposure, Some(notice));
+        }
+        Err((reason, None)) => {
+            ui.web_access = None;
+            ui.message(format!(
+                "Could not bind {bind} and could not return to {previous_bind} ({reason}). \
+                 The web interface is stopped."
+            ));
+        }
+    }
+}
+
+/// Point the open overlay at a newly bound listener, re-enumerating the
+/// interfaces and minting a code for the address it is now publishing.
+fn reopen_web_access_overlay(
+    web: &mut WebSurface,
+    ui: &mut Ui,
+    interfaces: &dyn crate::web::interfaces::InterfaceEnumerator,
+    addr: std::net::SocketAddr,
+    exposure: crate::web::server::BindExposure,
+    notice: Option<String>,
+) {
+    match (ui.web_access.as_mut(), web.credentials.lock()) {
+        (Some(access), Ok(mut store)) => {
+            access.rebind(&mut store, interfaces, addr, exposure, notice)
+        }
+        (None, _) | (_, Err(_)) => {}
+    }
+}
+
+/// Lift a key press into the small alphabet the access overlay understands, or
+/// `None` for anything it does not bind.
+///
+/// A modified key is never one of the overlay's: `Ctrl-q` and friends belong to
+/// the app, and swallowing them because a modal happens to be up would make the
+/// overlay a trap.
+fn map_web_access_key(key: KeyEvent) -> Option<crate::web::access::AccessKey> {
+    use crate::web::access::AccessKey;
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Enter => Some(AccessKey::Enter),
+        KeyCode::Esc => Some(AccessKey::Esc),
+        KeyCode::Char(' ') => Some(AccessKey::Space),
+        KeyCode::Up => Some(AccessKey::Up),
+        KeyCode::Down => Some(AccessKey::Down),
+        KeyCode::Char(c) => Some(AccessKey::Char(c.to_ascii_lowercase())),
+        _ => None,
+    }
+}
+
+/// Drive the access overlay from one key press, performing the side effects it
+/// asks for.
+///
+/// The two it performs here — launching a browser and writing the clipboard —
+/// are done in the key handler rather than deferred to the event loop on
+/// purpose: both spend a bootstrap code, and a code that waits a tick can be a
+/// code that expired. The two it cannot perform (rebinding, stopping) are left
+/// as flags, because the listener is not this function's to touch.
+fn handle_web_access_key(key: KeyEvent, ui: &mut Ui) {
+    use crate::web::access::AccessOutcome;
+
+    let Some(access_key) = map_web_access_key(key) else {
+        return;
+    };
+    let Some(credentials) = ui.web_credentials.clone() else {
+        // The server went away underneath the overlay; there is nothing left to
+        // describe, so it goes with it rather than answering keys about a
+        // binding that no longer exists.
+        ui.web_access = None;
+        ui.overlay = UiOverlay::None;
+        return;
+    };
+
+    let outcome = match (ui.web_access.as_mut(), credentials.lock()) {
+        (Some(access), Ok(mut store)) => access.handle_key(access_key, &mut store),
+        (None, _) | (_, Err(_)) => return,
+    };
+
+    match outcome {
+        AccessOutcome::Ignored | AccessOutcome::Handled => {}
+        AccessOutcome::Revoked => {
+            // The overlay has already withdrawn the credentials and printed how
+            // many browsers it locked out. That sentence is only true once the
+            // event loop closes their sockets, which is what this asks for.
+            ui.pending_web_recheck_credentials = true;
+        }
+        AccessOutcome::Close => {
+            if let (Some(access), Ok(mut store)) = (ui.web_access.as_ref(), credentials.lock()) {
+                access.on_close(&mut store);
+            }
+            ui.web_access = None;
+            ui.overlay = UiOverlay::None;
+        }
+        AccessOutcome::OpenBrowser(url) => {
+            let notice = launch_access_url(&url);
+            if let Some(access) = ui.web_access.as_mut() {
+                access.set_notice(Some(notice));
+            }
+        }
+        AccessOutcome::CopyUrl(url) => {
+            crate::tui::clipboard::copy(&url);
+            if let Some(access) = ui.web_access.as_mut() {
+                // `clipboard::copy` is best effort and reports nothing, so this
+                // says what was attempted, not that it landed.
+                access.set_notice(Some(
+                    "Sent to the clipboard: a URL carrying a one-time code, good for 120s."
+                        .to_string(),
+                ));
+            }
+        }
+        AccessOutcome::EnableNetwork => ui.pending_web_rebind = Some("0.0.0.0".to_string()),
+        AccessOutcome::BackToLocalOnly => ui.pending_web_rebind = Some("127.0.0.1".to_string()),
+        AccessOutcome::StopServer => {
+            ui.pending_web_stop = true;
+            ui.web_access = None;
+            ui.overlay = UiOverlay::None;
+        }
+    }
+}
+
+/// Hand the code-bearing URL to the platform's default browser, and report what
+/// happened in the overlay's own words.
+///
+/// One cross-platform seam does this on all three OSes
+/// ([`crate::tui::opener::open_url`]): `open` on macOS, `xdg-open` on Linux,
+/// `cmd /c start ""` on Windows. That last one re-parses its argument through
+/// cmd.exe, which is why the URL is checked against
+/// [`crate::tui::opener::url_is_cmd_safe`] first. The check should never fail —
+/// the URL is `http://<ip>:<port>/#<four digits>` and every part of it is
+/// generated — but a construction bug that put a `%` or an `&` in front of
+/// cmd.exe should refuse to launch, not launch something else.
+fn launch_access_url(url: &str) -> String {
+    if !crate::tui::opener::url_is_cmd_safe(url) {
+        return "Refusing to launch: the access URL contains characters a Windows shell \
+                would reinterpret."
+            .to_string();
+    }
+    match crate::tui::opener::open_url(url) {
+        Ok(()) => "Opening your default browser — it authenticates itself and the code is spent."
+            .to_string(),
+        Err(e) => e,
+    }
+}
+
+/// The line the desktop shows when the server comes up, carrying D5's warning
+/// whenever the bound address is reachable from other machines.
+///
+/// The warning is not decoration: binding a routable address is the one web
+/// setting that changes who can reach the user's agents, and it is only ever
+/// reached because they typed it into `config.toml` themselves.
+fn web_started_message(
+    addr: std::net::SocketAddr,
+    exposure: crate::web::server::BindExposure,
+) -> String {
+    match exposure {
+        crate::web::server::BindExposure::Loopback => {
+            format!("Web interface listening on http://{addr} (this machine only).")
+        }
+        crate::web::server::BindExposure::Routable => format!(
+            "Web interface listening on http://{addr} — WARNING: reachable from your \
+             network, not just this machine. Anyone who can reach this address and \
+             holds the access code can drive your agents."
+        ),
+    }
 }
 
 /// An already-established pairing found in `remote.json` at startup: everything
@@ -3005,10 +4417,15 @@ fn restore_terminal_modes(keyboard_enhanced: bool) {
 /// columns and the hidden bars' rows to the viewport.
 fn viewport_pty_size(full: PtySize, mode: InputMode, reserve_border: bool) -> PtySize {
     let area = Rect::new(0, 0, full.cols, full.rows);
+    // `[ui] agent_tab_position` moves the sidebar without resizing it, so the
+    // viewport is the same number of cells on both settings and this function
+    // does not need to be told which one is in force. `layout.rs`'s
+    // `agent_tab_side_does_not_change_either_pane_size` holds that true.
     let ml = crate::tui::layout::compute(
         area,
         crate::tui::layout::chrome_for(area, mode),
         reserve_border,
+        crate::contracts::AgentTabPosition::default(),
     );
     PtySize {
         rows: ml.terminal.height.max(1),
@@ -3063,6 +4480,7 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
             area,
             chrome,
             crate::tui::mode_style::border_enabled(&workspace.active_project().state.config.ui),
+            workspace.active_project().state.config.ui.agent_tab_side(),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
         if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
@@ -3327,6 +4745,7 @@ fn terminal_at(area: Rect, state: &AppState, col: u16, row: u16) -> Option<(Chil
         area,
         crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
     if state.split_view {
         let region = crate::tui::layout::split_region(&ml);
@@ -3351,6 +4770,7 @@ fn viewport_for_target(area: Rect, state: &AppState, target: ChildTarget) -> Opt
         area,
         crate::tui::layout::chrome_for(area, state.mode()),
         crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
     );
     if !state.split_view {
         return Some(ml.terminal);
@@ -3557,6 +4977,193 @@ fn is_help_repo_gesture(overlay: &UiOverlay, key: KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+mod web_access_key_tests {
+    use super::*;
+    use crate::web::access::AccessKey;
+
+    fn bare(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn the_overlays_own_keys_are_lifted_out_of_crossterm() {
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Enter)),
+            Some(AccessKey::Enter)
+        );
+        assert_eq!(map_web_access_key(bare(KeyCode::Esc)), Some(AccessKey::Esc));
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Char(' '))),
+            Some(AccessKey::Space)
+        );
+        assert_eq!(map_web_access_key(bare(KeyCode::Up)), Some(AccessKey::Up));
+        assert_eq!(
+            map_web_access_key(bare(KeyCode::Down)),
+            Some(AccessKey::Down)
+        );
+        for c in ['r', 'x', 'l', 'n', 'c', 's'] {
+            assert_eq!(
+                map_web_access_key(bare(KeyCode::Char(c))),
+                Some(AccessKey::Char(c)),
+                "{c} is one of the two footers' keys"
+            );
+        }
+        // The browser list's own keys (`remote-control-gk94`): a digit that
+        // never reached the overlay would leave every numbered row inert.
+        for c in ['1', '5', '9'] {
+            assert_eq!(
+                map_web_access_key(bare(KeyCode::Char(c))),
+                Some(AccessKey::Char(c)),
+                "{c} revokes the browser on that row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shifted_letter_still_reaches_the_binding_it_names() {
+        // The footers write `r`, `x`, `l`; caps lock must not make them inert.
+        assert_eq!(
+            map_web_access_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some(AccessKey::Char('r'))
+        );
+    }
+
+    #[test]
+    fn a_modified_key_is_never_the_overlays() {
+        // `Ctrl-q` belongs to the app. An overlay that swallowed it because it
+        // happened to be open would be a trap, not a modal.
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                map_web_access_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+                None,
+                "{modifiers:?} belongs to the app"
+            );
+            assert_eq!(
+                map_web_access_key(KeyEvent::new(KeyCode::Char('r'), modifiers)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_open_overlay_captures_input_instead_of_being_dismissed_by_it() {
+        // The bug this branch exists to prevent: falling through to the
+        // "any key dismisses" branch would make `r` close the overlay rather
+        // than hide the code, and `Space` close it rather than mint.
+        let mut ui = Ui::default();
+        assert!(!ui.modal_active());
+        ui.web_access = Some(access_for_test());
+        assert!(
+            ui.modal_active(),
+            "an open access overlay captures input like the config manager does"
+        );
+
+        // With no credential store published (the server stopped underneath it)
+        // the overlay takes itself down rather than answering keys about a
+        // binding that no longer exists.
+        handle_web_access_key(bare(KeyCode::Char('r')), &mut ui);
+        assert!(ui.web_access.is_none());
+        assert!(matches!(ui.overlay, UiOverlay::None));
+    }
+
+    /// An overlay over an in-memory store, on a loopback binding.
+    fn access_for_test() -> crate::web::access::WebAccess {
+        use crate::testing::{FakeClock, FakeFs};
+        let mut store = crate::web::credentials::CredentialStore::open(
+            Arc::new(FakeFs::new()),
+            Arc::new(FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        );
+        crate::web::access::WebAccess::open(
+            &mut store,
+            &crate::web::interfaces::FakeInterfaceEnumerator::new(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 7420)),
+            crate::web::server::BindExposure::Loopback,
+        )
+    }
+
+    #[test]
+    fn stopping_from_the_overlay_defers_to_the_event_loop_and_closes() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some(access_for_test());
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        handle_web_access_key(bare(KeyCode::Char('s')), &mut ui);
+        assert!(
+            ui.pending_web_stop,
+            "the listener is the event loop's to close"
+        );
+        assert!(ui.web_access.is_none());
+    }
+
+    #[test]
+    fn the_network_door_asks_the_event_loop_for_the_wildcard_bind() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some(access_for_test());
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        handle_web_access_key(bare(KeyCode::Char('n')), &mut ui);
+        assert_eq!(ui.pending_web_rebind.as_deref(), Some("0.0.0.0"));
+        assert!(
+            ui.web_access.is_some(),
+            "the overlay stays open across the rebind it asked for"
+        );
+    }
+
+    /// §6.5 R20. `x` used to end at the credential store, which is why a
+    /// browser that was already connected kept typing after the desktop said it
+    /// had been locked out. The key handler cannot close a socket, so the one
+    /// thing it must do is *ask*.
+    #[test]
+    fn revoking_from_the_overlay_asks_the_event_loop_to_close_the_live_sockets() {
+        let mut ui = Ui::default();
+        let credentials = Arc::new(Mutex::new(crate::web::credentials::CredentialStore::open(
+            Arc::new(crate::testing::FakeFs::new()),
+            Arc::new(crate::testing::FakeClock::default()),
+            "/home/user/.flightdeck/web.json",
+        )));
+        ui.web_access = Some({
+            let mut store = credentials.lock().expect("a fresh store lock");
+            crate::web::access::WebAccess::open(
+                &mut store,
+                &crate::web::interfaces::FakeInterfaceEnumerator::new()
+                    .with_interface("en0", std::net::Ipv4Addr::new(192, 168, 2, 14)),
+                std::net::SocketAddr::from(([0, 0, 0, 0], 7420)),
+                crate::web::server::BindExposure::Routable,
+            )
+        });
+        ui.web_credentials = Some(Arc::clone(&credentials));
+
+        // Nothing has been revoked, so nothing has been asked for.
+        handle_web_access_key(bare(KeyCode::Char('r')), &mut ui);
+        assert!(
+            !ui.pending_web_recheck_credentials,
+            "hiding the code revokes nothing and must ask for nothing"
+        );
+
+        handle_web_access_key(bare(KeyCode::Char('x')), &mut ui);
+        assert!(
+            ui.pending_web_recheck_credentials,
+            "the sockets are the event loop's to close"
+        );
+        assert!(
+            ui.web_access.is_some(),
+            "the overlay stays up to show the new code it just issued"
+        );
+    }
+}
+
+#[cfg(test)]
 mod help_repo_gesture_tests {
     use super::*;
 
@@ -3644,6 +5251,16 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return handle_config_key(key, workspace, env, ui).map(|_| false);
     }
 
+    // 2b. The access overlay, if open, captures input (D5, Q1; design `2a`).
+    //     Interactive like the configuration manager, and for the same reason:
+    //     its keys mint, reveal, rebind and revoke. It must not fall through to
+    //     the "any key dismisses" branch below, which would make `r` close the
+    //     overlay instead of hiding the code.
+    if ui.web_access.is_some() {
+        handle_web_access_key(key, ui);
+        return Ok(false);
+    }
+
     // 3. The command palette, if open, captures input next (SPECS §22).
     if ui.palette.is_some() {
         return handle_palette_key(key, workspace, env, ui).map(|_| false);
@@ -3664,7 +5281,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         return Ok(false);
     }
 
-    // 4. No modal is capturing input (the three checks above are exhaustive):
+    // 4. No modal is capturing input (the four checks above are exhaustive):
     //    route through the mode-aware key map (SPECS §23).
     if ui.modal_active() {
         return Ok(false);
@@ -3689,12 +5306,21 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             switch_project(workspace, env, sel, ui);
             Ok(false)
         }
+        // D14 as revised: every byte the desktop aims at a PTY claims the input
+        // lock first, on exactly the terms a browser's does. Refused means the
+        // bytes are dropped — never queued for later, which would splice them
+        // into the middle of whatever the other writer typed — and the status
+        // bar names the holder, so nothing disappears without a trace (§5.1).
         KeyAction::Passthrough(bytes) => {
-            write_active_pty(&mut workspace.active_project_mut().state, &bytes);
+            if desktop_may_type(ui, env.clock.now_millis() as i64) {
+                write_active_pty(&mut workspace.active_project_mut().state, &bytes);
+            }
             Ok(false)
         }
         KeyAction::Paste => {
-            paste_into_active_pty(&mut workspace.active_project_mut().state);
+            if desktop_may_type(ui, env.clock.now_millis() as i64) {
+                paste_into_active_pty(&mut workspace.active_project_mut().state);
+            }
             Ok(false)
         }
         KeyAction::OpenPalette => {
@@ -3703,6 +5329,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             // Phone" when already paired and "Unpair Phone" when there is no
             // pairing to forget.
             palette.set_paired(ui.remote_paired);
+            palette.set_web_running(ui.web_running);
             // Hide the project/new-tab entries in an isolated run: one session,
             // one project (SPECS §32). The flows refuse independently; this is
             // presentation only.
@@ -3765,9 +5392,14 @@ fn handle_paste(data: String, workspace: &mut Workspace, env: &Env, ui: &mut Ui)
     }
 
     // Only a focused terminal receives pasted text; in App mode it is a no-op.
-    let state = &mut workspace.active_project_mut().state;
-    if state.mode() == InputMode::Terminal {
-        paste_text_into_active_pty(state, &data);
+    // A paste is one atomic write, but it is still this desktop's turn or
+    // somebody else's (D14 as revised) — dropping a bracketed paste into the
+    // middle of another writer's line would be the same corruption a keystroke
+    // causes, only larger.
+    if workspace.active_project().state.mode() == InputMode::Terminal
+        && desktop_may_type(ui, env.clock.now_millis() as i64)
+    {
+        paste_text_into_active_pty(&mut workspace.active_project_mut().state, &data);
     }
     Ok(())
 }
@@ -3849,19 +5481,112 @@ fn dispatch_command(
         _ => {}
     }
 
+    // Which half of a two-phase flow this is, read before `cmd` is consumed.
+    // Only used to classify the outcome for a browser (below) — the desktop's
+    // rendering is unchanged either way.
+    let unconfirmed =
+        crate::web::commands::confirmation_of(&cmd) == crate::web::commands::Confirmation::Pending;
+
     // A command that can't run (e.g. an action needing a selected tab when the
     // project has none, or a git failure) must surface as a message, never
     // crash the event loop. Errors always become a toast; only the Ok path
     // maps its effect onto the UI.
     match state.dispatch(cmd, services) {
-        Ok(effect) => apply_effect(effect, state, ui),
-        Err(e) => ui.message(format!("Error: {e}")),
+        Ok(effect) => {
+            // `Effect::Warning` is genuinely two different facts, and only the
+            // command's phase separates them. From a *confirmed* dispatch it
+            // means the operation landed and the cleanup after it did not —
+            // applied-with-caveat, which is what `apply_effect` records. From an
+            // **unconfirmed** one it means a guard stopped the flow before it
+            // ever asked: SPECS §13's dirty base is the case that matters, where
+            // nothing merged and the browser must not be told otherwise. The
+            // phone path draws exactly this line in `dispatch_remote_merge_back`
+            // ("no merge happened, so it is a rejection"); this is the same rule
+            // for the browser, stated once for every two-phase command rather
+            // than per command. The sentence is the guard's own either way.
+            let warned = matches!(effect, Effect::Warning(_));
+            apply_effect(effect, state, ui);
+            if unconfirmed && warned {
+                ui.web_outcome = match ui.web_outcome.take() {
+                    Some(WebDispatch::Applied(Some(reason))) => Some(WebDispatch::Refused(reason)),
+                    other => other,
+                };
+            }
+        }
+        Err(e) => {
+            ui.web_outcome = Some(WebDispatch::Failed(e.to_string()));
+            ui.message(format!("Error: {e}"));
+        }
     }
     Ok(())
 }
 
 /// Map a dispatch [`Effect`] onto the [`Ui`] overlays/prompts (SPECS §22).
+///
+/// Also records the outcome in [`Ui::web_outcome`], so the same dispatch can be
+/// acked to a browser without a second interpretation of what it did. A
+/// prompt-opening effect is recorded as a refusal: from a browser's point of
+/// view a modal that appeared on someone else's screen is not an application.
 fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
+    ui.web_outcome = Some(match &effect {
+        Effect::Refused(m) => WebDispatch::Refused(m.clone()),
+        // Warnings map to applied-with-caveat, exactly as `fold_remote_effect`
+        // does for the phone; a caller whose command treats a warning as
+        // "nothing happened" must intercept it before dispatching.
+        Effect::Message(m) | Effect::Warning(m) => WebDispatch::Applied(Some(m.clone())),
+        Effect::PrUrl(url) => WebDispatch::Applied(Some(url.clone())),
+        Effect::AttachedExisting { branch } => {
+            WebDispatch::Applied(Some(format!("Attached to existing branch {branch}")))
+        }
+        Effect::None | Effect::Quit => WebDispatch::Applied(None),
+        Effect::OpenInFileManager { .. } => {
+            WebDispatch::Refused(crate::web::commands::HOST_ONLY_REFUSAL.to_string())
+        }
+        // D13: a dialog is now app state on both surfaces, so opening one is
+        // not a refusal any more. The sentence the browser reads is
+        // `DIALOG_OPENED_DETAIL`, worded once in `run_web_command`, which is
+        // also the only caller that can tell a *newly* opened dialog from one
+        // that was already up.
+        Effect::CloseTabOptions(_) => WebDispatch::Applied(None),
+        // The git confirmations (`remote-control-ll5.5`). SPECS §5 gates every
+        // history-touching operation behind one of these, and D13 publishes it
+        // to both surfaces — so opening one is the *point* of the row, exactly
+        // as it is for `CloseTabOptions` above. `run_web_command` notices the
+        // newly-opened dialog and acks `DIALOG_OPENED_DETAIL`; nothing has
+        // merged, pushed or been rewritten yet, and the browser is told that by
+        // being shown the question rather than a success.
+        //
+        // The destructive pair joined them in `remote-control-ll5.4`, for the
+        // same reason and with one more step behind the question: opening
+        // §5/§15's abandon warning, or D16's quit confirmation, is what the row
+        // is *for*. Nothing has been discarded and nothing has stopped — the
+        // browser is told that by being shown the question, and its answer to it
+        // has to pass artboard 1g's typed-name gate (`browser_confirm_gate`).
+        Effect::PushWarning(_)
+        | Effect::MergeConfirm { .. }
+        | Effect::RebaseConfirm { .. }
+        | Effect::AbandonWarning { .. }
+        | Effect::QuitConfirm => WebDispatch::Applied(None),
+        // SPECS §21's panel: a read, not a state change. From a browser it is
+        // `Applied` with no sentence — the *panel* is the answer, and it
+        // travels back as `ServerMsg::GitStatus` rather than as prose crammed
+        // into an ack's `detail` (`remote-control-ll5.8`, §6.5 R16). The
+        // desktop's own run is unchanged and this value is never read for it.
+        Effect::GitStatus { .. } => WebDispatch::Applied(None),
+        // Help and About never reach here from a browser: both rows are
+        // `Route::NotSupported`, because the browser draws them from
+        // `Snapshot::help` / `Snapshot::about` and forwarding would open a
+        // panel on the desktop instead (`HELP_REFUSAL`, `ABOUT_REFUSAL`). The
+        // classification is kept honest for the day one of them is forwarded
+        // anyway: it would open a desktop panel, and that is a refusal.
+        Effect::ShowHelp | Effect::ShowAbout => WebDispatch::Refused(
+            "This opens a read-only overlay on the desktop, which is not the \
+             screen this browser is on. The browser draws its own from the \
+             snapshot; nothing is being asked, so there is nothing to answer \
+             from here."
+                .to_string(),
+        ),
+    });
     match effect {
         Effect::None => ui.clear(),
         Effect::Quit => ui.should_quit = true,
@@ -3883,6 +5608,9 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         }
         Effect::AbandonWarning { dirty } => {
             start_prompt(ui, Prompt::AbandonConfirm { dirty });
+        }
+        Effect::QuitConfirm => {
+            start_prompt(ui, Prompt::QuitConfirm);
         }
         Effect::MergeConfirm {
             agent_branch,
@@ -3922,24 +5650,261 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
                 },
             );
         }
+        // §6.5 R16: the panel goes to whoever asked for it, and only there.
+        //
+        // The desktop's run opens the desktop's overlay, exactly as before. A
+        // browser's run does *not*: R8 established that this is not one of
+        // D13's shared dialogs — nothing is being asked, so there is nothing
+        // for the person at the machine to answer — and a read-only panel they
+        // never requested is an obstruction rather than a notice, which is the
+        // same judgement 2f makes when it gives the interrupted desktop a
+        // transient strip instead of a modal. One collection, two renderings,
+        // and no arm anywhere that runs `collect_status` a second time.
         Effect::GitStatus { status, pr_url } => {
-            ui.overlay = UiOverlay::GitStatus {
-                status: *status,
-                pr_url,
-            };
+            match web_git_status_view(&status, pr_url.as_deref(), _state) {
+                Some(view) if ui.web_origin.is_some() => {
+                    ui.web_git_status = Some(view);
+                }
+                _ => {
+                    ui.overlay = UiOverlay::GitStatus {
+                        status: *status,
+                        pr_url,
+                    };
+                }
+            }
         }
         Effect::ShowHelp => ui.overlay = UiOverlay::Help,
         Effect::ShowAbout => ui.overlay = UiOverlay::About,
     }
 }
 
+/// SPECS §21's panel as the browser receives it, or `None` when the host cannot
+/// say which session it is about (`remote-control-ll5.8`, §6.5 R16).
+///
+/// `None` is not a degraded panel, it is a refusal to send one: the panel's
+/// first fact is *which* Agent Tab this is, and a panel that could not name its
+/// session would be a set of numbers about an unnamed thing. The dispatch that
+/// produced the status already required a selected tab (`cmd_show_git_status`
+/// errors without one), so this only fires if the selection moved underneath
+/// the dispatch — in which case the desktop's overlay is drawn instead and the
+/// browser's ack still tells it what happened.
+///
+/// Nothing here is computed: every field is copied from the
+/// [`crate::git::status::WorktreeStatus`] `collect_status` returned, and the
+/// upstream's counts live *inside* the optional upstream so the browser cannot
+/// be handed commits ahead of a remote that does not exist.
+fn web_git_status_view(
+    status: &crate::git::status::WorktreeStatus,
+    pr_url: Option<&str>,
+    state: &AppState,
+) -> Option<crate::web::protocol::GitStatusView> {
+    let tab = state.selected()?;
+    Some(crate::web::protocol::GitStatusView {
+        // Filled in by `run_web_command`, which is the only place that knows
+        // which frame this answers.
+        seq: 0,
+        session_id: tab.id(),
+        session_name: tab.meta.name.clone(),
+        branch: status.branch.clone(),
+        base_branch: status.base_branch.clone(),
+        base_drift: status.base_drift,
+        dirty: status.dirty,
+        changed_files: status.changes.total(),
+        upstream: status
+            .upstream
+            .as_ref()
+            .map(|name| crate::web::protocol::GitUpstream {
+                name: name.clone(),
+                ahead: status.ahead,
+                behind: status.behind,
+            }),
+        worktree_path: status.worktree_path.display().to_string(),
+        compare_url: pr_url.map(str::to_string),
+    })
+}
+
+/// SPECS §8's configuration manager as one browser receives it
+/// (`remote-control-1p22`, §6.5 R22), plus the sentence the ack carries.
+///
+/// `args`, when present, are [`crate::web::protocol::ConfigSaveRequest`]'s
+/// staged edits: they are applied to the manager this just built, through the
+/// manager's own mutators, and written with the same
+/// [`write_config_manager`] the desktop's `s` calls. Absent args are a plain
+/// read and touch nothing.
+///
+/// **Nothing is written unless every change lands.** A key this build does not
+/// have, or a value a field does not admit, returns the model's own refusal
+/// before `outputs()` is ever called — so a browser built against a different
+/// FlightDeck cannot half-save a config file.
+fn apply_web_configuration(
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+) -> std::result::Result<(crate::web::protocol::ConfigView, Option<String>), String> {
+    use crate::tui::config_manager::{ConfigScope, FieldValue};
+    use crate::web::protocol::{ConfigChange, ConfigSaveRequest, ConfigScopeName, ConfigValue};
+
+    let request: ConfigSaveRequest = match args {
+        None => ConfigSaveRequest::default(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|e| format!("`open_configuration` could not read its edits: {e}"))?,
+    };
+
+    let mut cm = build_config_manager(workspace, env);
+    for ConfigChange { scope, key, value } in &request.changes {
+        cm.set_scope(match scope {
+            ConfigScopeName::Global => ConfigScope::Global,
+            ConfigScopeName::Project => ConfigScope::Project,
+        });
+        if !cm.select_key(key) {
+            return Err(format!(
+                "`{key}` is not a setting this FlightDeck's configuration manager has. \
+                 Nothing has been saved."
+            ));
+        }
+        match value {
+            None => cm.clear_selected(),
+            Some(ConfigValue::Bool(b)) => cm.set_selected(FieldValue::Bool(*b))?,
+            Some(ConfigValue::Text(t)) => cm.set_selected(FieldValue::Text(t.clone()))?,
+        }
+    }
+
+    let detail = if cm.dirty() {
+        write_config_manager(&mut cm, env).map_err(|e| e.to_string())?;
+        // SPECS §8: a save reloads every open project's effective config
+        // immediately, whichever surface asked for it.
+        reload_all_projects_config(workspace, env);
+        // The host's own word (`"Saved."`), read before `web_config_view`
+        // moves the scope — `switch_scope` clears the status line.
+        cm.status().map(str::to_string)
+    } else {
+        None
+    };
+    Ok((web_config_view(&mut cm), detail))
+}
+
+/// One built manager, read out for the wire: both scopes, in the order the
+/// desktop draws them.
+///
+/// The `&mut` is only for [`ConfigManager::set_scope`] — this reads, it never
+/// edits — and the manager is a throwaway built for this one frame, so moving
+/// its scope has no user-visible effect.
+fn web_config_view(cm: &mut ConfigManager) -> crate::web::protocol::ConfigView {
+    use crate::tui::config_manager::ConfigScope;
+
+    cm.set_scope(ConfigScope::Global);
+    let global_path = cm.current_path().map(|p| p.display().to_string());
+    let global_rows = web_config_rows(cm);
+    cm.set_scope(ConfigScope::Project);
+    let project_path = cm
+        .current_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let project_rows = web_config_rows(cm);
+
+    crate::web::protocol::ConfigView {
+        // Filled in by `run_web_command`, the only place that knows which frame
+        // this answers — same idiom as `web_git_status_view`.
+        seq: 0,
+        project_name: cm.project_name().to_string(),
+        global_path,
+        project_path,
+        project_rows,
+        global_rows,
+    }
+}
+
+/// The curated fields for the manager's current scope, each paired with what
+/// clearing it would leave behind ([`ConfigManager::inherited_rows`]).
+///
+/// Nothing here resolves a layer: both halves are the model's own answer, read
+/// twice from the same tables, so the browser's origin tags are the desktop's.
+fn web_config_rows(cm: &ConfigManager) -> Vec<crate::web::protocol::ConfigRowView> {
+    use crate::tui::config_manager::{ConfigRow, Origin};
+    use crate::web::protocol::{ConfigFieldKind, ConfigOrigin, ConfigRowView, ConfigValue};
+
+    let value_of = |row: &ConfigRow| {
+        if row.is_bool {
+            ConfigValue::Bool(row.bool_value)
+        } else {
+            ConfigValue::Text(row.value.clone())
+        }
+    };
+    let origin_of = |origin: Origin| match origin {
+        Origin::SetHere => ConfigOrigin::SetHere,
+        Origin::Global => ConfigOrigin::Global,
+        Origin::Default => ConfigOrigin::Default,
+    };
+
+    cm.rows()
+        .into_iter()
+        .zip(cm.inherited_rows())
+        .map(|(row, fallback)| ConfigRowView {
+            key: row.key.clone(),
+            label: row.label.clone(),
+            kind: if row.is_bool {
+                ConfigFieldKind::Bool
+            } else if row.is_text {
+                ConfigFieldKind::Text
+            } else {
+                ConfigFieldKind::Choice
+            },
+            value: value_of(&row),
+            choices: row.choices.clone(),
+            origin: origin_of(row.origin),
+            inherited: value_of(&fallback),
+            inherited_origin: origin_of(fallback.origin),
+        })
+        .collect()
+}
+
 /// Begin an interactive prompt, building its modal dialog.
+///
+/// D13 lands here and nowhere else. The origin comes from
+/// [`Ui::web_origin`] — set for exactly as long as one browser frame is
+/// being applied — so every one of the two dozen call sites keeps knowing
+/// nothing about browsers, and a dialog can never be published without an
+/// origin because there is no other way to open one.
 fn start_prompt(ui: &mut Ui, prompt: Prompt) {
-    let dialog = prompt_dialog(&prompt);
+    let origin = ui
+        .web_origin
+        .clone()
+        .unwrap_or(crate::web::protocol::DialogOrigin::Desktop);
+    let mut dialog = prompt_dialog(&prompt);
+    if let Some(label) = dialog_origin_label(&origin) {
+        dialog = dialog.from_origin(label);
+    }
+    let id = ui.mint_dialog_id();
     ui.palette = None;
     ui.overlay = UiOverlay::None;
-    ui.prompt = Some(PromptState { prompt, dialog });
+    ui.prompt = Some(PromptState {
+        prompt,
+        dialog,
+        id,
+        origin,
+    });
 }
+
+/// D13's origin line, or `None` for a dialog this keyboard opened.
+///
+/// `None` for [`DialogOrigin::Desktop`] is not an omission: the person reading
+/// the modal is the person who asked for it, and a line telling them so would be
+/// the decoration D13 is explicit this is not.
+fn dialog_origin_label(origin: &crate::web::protocol::DialogOrigin) -> Option<String> {
+    match origin {
+        crate::web::protocol::DialogOrigin::Desktop => None,
+        crate::web::protocol::DialogOrigin::Browser { label, .. } => {
+            Some(format!("opened from browser · {label}"))
+        }
+    }
+}
+
+/// The ack detail for a browser command whose outcome is a dialog (D13). One
+/// sentence, so every dialog-opening row reads the same, and it says the thing
+/// the browser has to know: it is a shared question, answerable from here.
+const DIALOG_OPENED_DETAIL: &str =
+    "A dialog is open. It is on the desktop too, tagged with where it came from, \
+     and either surface can answer it.";
 
 /// Why an action is unavailable in an isolated run (SPECS §32). One string, so
 /// every refusal reads identically wherever the user meets it.
@@ -4577,6 +6542,13 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 DialogButton::new(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
+        Prompt::QuitConfirm => Dialog::confirm(
+            "Quit FlightDeck? Every agent it is running is stopped.",
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Quit"),
+                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+            ],
+        ),
         Prompt::PushConfirm => Dialog::confirm(
             "The worktree has uncommitted changes. Push the committed changes only?",
             vec![
@@ -4748,6 +6720,60 @@ fn handle_prompt_key(
     env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
+    // D13: record what this keypress decided, before anything downstream can
+    // replace the prompt. One wrapper rather than an edit at each of the dozen
+    // `ui.prompt = None` / `ui.clear()` sites, because a site that forgot would
+    // report `Superseded` to the other surface — i.e. "nobody decided" about a
+    // dialog somebody just answered, which is the one thing D13 must not say.
+    let decided = ui
+        .prompt
+        .as_ref()
+        .map(|p| (p.id.clone(), dialog_decision(&p.dialog, key)));
+    let result = handle_prompt_key_inner(key, workspace, env, ui);
+    if let Some((id, outcome)) = decided {
+        let still_open = ui.prompt.as_ref().is_some_and(|p| p.id == id);
+        if !still_open {
+            ui.dialog_decisions.push((id, outcome));
+        }
+    }
+    result
+}
+
+/// What one keypress *means* for an open dialog, read off the dialog's own
+/// buttons rather than from a table of key spellings.
+///
+/// The dialogs do not agree on a cancel key — `n` in the close confirmations,
+/// `c` in the push confirmation, `Esc` in the forms — but they all agree on the
+/// *label*, because [`prompt_dialog`] writes it, which is what
+/// [`DialogButton::cancels`] reads. So the button whose accelerator this key
+/// fires is the authority, and `Esc` is cancel everywhere by rule
+/// (`handle_prompt_key_inner` clears on it before looking at anything else).
+///
+/// Anything else that closes a dialog is a decision: `Clear` in the status menu
+/// and `Abandon` in the sidebar's close menu are choices, not dismissals.
+fn dialog_decision(dialog: &Dialog, key: KeyEvent) -> crate::web::protocol::DialogOutcome {
+    use crate::web::protocol::DialogOutcome;
+    if key.code == KeyCode::Esc {
+        return DialogOutcome::Cancelled;
+    }
+    let pressed = dialog.buttons.iter().find(|b| match b.accel {
+        DialogAccel::Char(c) => key.code == KeyCode::Char(c),
+        DialogAccel::Enter => key.code == KeyCode::Enter,
+        DialogAccel::Esc => key.code == KeyCode::Esc,
+        DialogAccel::Tab => key.code == KeyCode::Tab,
+    });
+    match pressed {
+        Some(button) if button.cancels() => DialogOutcome::Cancelled,
+        _ => DialogOutcome::Confirmed,
+    }
+}
+
+fn handle_prompt_key_inner(
+    key: KeyEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
     // Esc always cancels the prompt.
     if key.code == KeyCode::Esc {
         ui.clear();
@@ -4770,6 +6796,17 @@ fn handle_prompt_key(
             if key.code == KeyCode::Char('y') {
                 // Deferred to the event loop, which owns the relay channels.
                 ui.pending_unpair = true;
+            }
+            return Ok(());
+        }
+        // Quit belongs to no project, so it is answered here beside unpair.
+        // `y` is the same key the desktop's own dialog prints, which is what
+        // lets a browser's confirm reach it as a synthetic keypress rather
+        // than through an arm of its own (D13, R8).
+        Some(Prompt::QuitConfirm) => {
+            ui.prompt = None;
+            if key.code == KeyCode::Char('y') {
+                ui.should_quit = true;
             }
             return Ok(());
         }
@@ -5157,7 +7194,8 @@ fn handle_prompt_key_project(
         Prompt::OpenProject { .. }
         | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
-        | Prompt::UnpairConfirm => {
+        | Prompt::UnpairConfirm
+        | Prompt::QuitConfirm => {
             ui.prompt = Some(pstate);
         }
     }
@@ -5196,6 +7234,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
         }
         Effect::PushWarning(_) => start_prompt(ui, Prompt::PushConfirm),
         Effect::AbandonWarning { dirty } => start_prompt(ui, Prompt::AbandonConfirm { dirty }),
+        Effect::QuitConfirm => start_prompt(ui, Prompt::QuitConfirm),
         Effect::MergeConfirm {
             agent_branch,
             base_branch,
@@ -5324,6 +7363,35 @@ fn run_palette_action(
             start_prompt(ui, Prompt::UnpairConfirm);
             return Ok(());
         }
+        // FlightDeck Web (D10). Deferred to the event loop, which owns the
+        // listener and can report the bound address and D5's warning; a palette
+        // action cannot bind a socket from here.
+        PaletteAction::StartWebInterface => {
+            ui.pending_web_start = true;
+            // D10: "showing the QR overlay on start — mirroring the existing
+            // Pair Phone flow". Starting a server nobody can authenticate
+            // against is the bug this pairing of flags exists to prevent.
+            ui.pending_web_access_open = true;
+            return Ok(());
+        }
+        PaletteAction::StopWebInterface => {
+            ui.pending_web_stop = true;
+            return Ok(());
+        }
+        // Deferred for the same reason: the overlay describes the address the
+        // listener actually bound, and only the event loop holds the handle
+        // that knows it.
+        PaletteAction::ShowWebAccess => {
+            ui.pending_web_access_open = true;
+            return Ok(());
+        }
+        // D14 as revised: the desktop's half of the one explicit override in
+        // the input-arbitration model. Deferred like the two above, because the
+        // lock lives on the running server's side of the seam.
+        PaletteAction::TakeInputLock => {
+            ui.pending_input_preempt = true;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -5380,21 +7448,896 @@ fn run_palette_action(
         | PaletteAction::ChangeProjectBase
         | PaletteAction::OpenConfig
         | PaletteAction::PairPhone
-        | PaletteAction::UnpairPhone => Ok(()),
+        | PaletteAction::UnpairPhone
+        | PaletteAction::StartWebInterface
+        | PaletteAction::StopWebInterface
+        | PaletteAction::ShowWebAccess
+        | PaletteAction::TakeInputLock => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: the browser's command surface (specs/WEB_INTERFACE.md §1)
+// ---------------------------------------------------------------------------
+
+/// Apply one browser [`Command`](crate::web::protocol::Command) frame and return
+/// the [`Ack`](crate::web::protocol::Ack) to send back to that viewer.
+///
+/// **The browser is a second way to choose a palette row, not a second way to
+/// run one** (§1). Nothing here performs a command: a
+/// [`crate::web::commands::Route::Palette`] row carries the very
+/// [`PaletteAction`] the TUI's palette hands to [`run_palette_action`] on Enter,
+/// and this passes it into that same function. There is deliberately no arm
+/// that reimplements an effect — that drift is what the decision exists to
+/// prevent.
+///
+/// The `Ack` is derived from what the dispatch actually did
+/// ([`Ui::web_outcome`]), never assumed: a command that hit a safety guard acks
+/// `Rejected` with the guard's own sentence, so the browser shows the same
+/// refusal the desktop user would have read.
+///
+/// The refusing arms are defence in depth. [`crate::web::server`] answers them
+/// before a frame is ever forwarded — which is why a bare frame naming `quit`
+/// cannot reach a dispatch — so reaching them here would mean the table and the
+/// server had disagreed.
+/// What one browser `Command` frame produced: the [`Ack`] it always earns, and
+/// the extra per-viewer frame the one read-only overlay needs
+/// (`remote-control-ll5.8`, §6.5 R16).
+///
+/// Two fields rather than a widened [`crate::web::protocol::Ack`], because they
+/// are two different claims. The ack says *what happened to your frame*, in the
+/// vocabulary §5.1's held-keystroke queue needs; the panel is *what the command
+/// produced*, which is a fact about a worktree and has nothing to do with
+/// queueing. Folding SPECS §21's nine fields into an ack's `detail` string
+/// would make the browser parse prose to find its branch name, which is the
+/// failure R7 removed from the palette.
+///
+/// `git_status` is `None` for every other row, and for `show_git_status` itself
+/// when the dispatch was refused — a refusal produces no panel, so there is
+/// nothing to send and nothing to invent.
+struct WebCommandReply {
+    /// The answer §5.1 requires for every frame.
+    ack: crate::web::protocol::Ack,
+    /// SPECS §21's panel, for the viewer that asked and no other.
+    git_status: Option<crate::web::protocol::GitStatusView>,
+    /// SPECS §8's configuration manager, likewise for the viewer that asked
+    /// (`remote-control-1p22`, §6.5 R22). Two fields rather than one
+    /// "extra frame" slot, for the reason above: an ack, a git panel and a
+    /// config view are three different claims, and a union would let a future
+    /// row send the wrong one without the compiler noticing.
+    config: Option<crate::web::protocol::ConfigView>,
+}
+
+fn run_web_command(
+    command: &crate::web::protocol::Command,
+    origin: &crate::web::protocol::DialogOrigin,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    activity: &mut crate::web::activity::ActivityStore,
+) -> WebCommandReply {
+    use crate::web::commands::Route;
+    use crate::web::protocol::{Ack, AckOutcome};
+
+    let ack = |outcome, detail: Option<String>| WebCommandReply {
+        ack: Ack {
+            seq: command.seq,
+            outcome,
+            detail,
+        },
+        git_status: None,
+        config: None,
+    };
+
+    let Some(spec) = crate::web::commands::lookup(&command.name) else {
+        return ack(
+            AckOutcome::Rejected,
+            Some(format!(
+                "`{}` is not a command this FlightDeck has.",
+                command.name
+            )),
+        );
+    };
+
+    match &spec.route {
+        // D11: read-marking is host state, so a second tab — or the same tab
+        // tomorrow — backfills a feed that agrees about what has been seen.
+        Route::ActivityRead => WebCommandReply {
+            ack: crate::web::activity::apply_mark_read(activity, command),
+            git_status: None,
+            config: None,
+        },
+        // D3: the selection is shared, so this moves the desktop too.
+        Route::Selection(target) => {
+            match apply_web_selection(*target, command.args.as_ref(), workspace, env, ui) {
+                Ok(detail) => ack(AckOutcome::Applied, detail),
+                Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
+            }
+        }
+        Route::Palette(action) => {
+            ui.web_outcome = None;
+            ui.web_git_status = None;
+            // D13: for as long as this dispatch runs, a dialog it opens was
+            // opened *by this browser*. `start_prompt` reads it, and so does
+            // `apply_effect`'s git-status arm (§6.5 R16); nothing else has to
+            // know a browser exists.
+            let was_open = ui.dialog_id();
+            ui.web_origin = Some(origin.clone());
+            let dispatched = run_palette_action(action.clone(), workspace, env, ui);
+            ui.web_origin = None;
+            // SPECS §21's panel, if this dispatch produced one. The seq is
+            // stamped here because this is the only place that knows which
+            // frame is being answered — `apply_effect` sees an `Effect`, not a
+            // request.
+            let git_status = ui.web_git_status.take().map(|mut view| {
+                view.seq = command.seq;
+                view
+            });
+            let opened = ui.dialog_id().filter(|id| Some(id) != was_open.as_ref());
+            let reply = match (dispatched, ui.web_outcome.take(), opened) {
+                (Err(e), _, _) => ack(AckOutcome::Rejected, Some(e.to_string())),
+                (Ok(()), Some(WebDispatch::Refused(reason)), _) => {
+                    ack(AckOutcome::Rejected, Some(reason))
+                }
+                (Ok(()), Some(WebDispatch::Failed(error)), _) => {
+                    ack(AckOutcome::Rejected, Some(error))
+                }
+                // A dialog *is* the outcome (D13): the row asked a question, and
+                // the question is now open on both surfaces. Applied, because
+                // something really happened and the browser can see it — the
+                // pre-D13 `Rejected` said "a modal appeared on a screen you
+                // cannot read", which is no longer true.
+                (Ok(()), _, Some(_)) => {
+                    ack(AckOutcome::Applied, Some(DIALOG_OPENED_DETAIL.to_string()))
+                }
+                (Ok(()), Some(WebDispatch::Applied(detail)), None) => {
+                    ack(AckOutcome::Applied, detail)
+                }
+                // Nothing classified an outcome, which for the forwarded set
+                // means it did its work quietly (a selection move, a split-view
+                // toggle). Applied with no sentence rather than an invented one.
+                (Ok(()), None, None) => ack(AckOutcome::Applied, None),
+            };
+            WebCommandReply {
+                git_status,
+                ..reply
+            }
+        }
+        // D13: either surface can answer the dialog the other one opened.
+        Route::Dialog(act) => {
+            match apply_web_dialog(*act, command.args.as_ref(), workspace, env, ui) {
+                Ok(detail) => ack(AckOutcome::Applied, detail),
+                Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
+            }
+        }
+        // SPECS §8's configuration manager (§6.5 R22). The panel is the
+        // browser's own, so nothing opens on the desktop; what the host does is
+        // read the two files — and, when the frame carried staged edits, write
+        // them through the desktop's own manager first.
+        Route::Config => match apply_web_configuration(command.args.as_ref(), workspace, env) {
+            Ok((mut view, detail)) => {
+                view.seq = command.seq;
+                WebCommandReply {
+                    config: Some(view),
+                    ..ack(AckOutcome::Applied, detail)
+                }
+            }
+            // A refusal produces no panel: nothing was read that is worth
+            // rendering, and a half-built manager would be the guess §5.1 rules
+            // out.
+            Err(reason) => ack(AckOutcome::Rejected, Some(reason)),
+        },
+        Route::Server => ack(
+            AckOutcome::Ignored,
+            Some(format!(
+                "`{}` is answered by the server and should not have reached the host.",
+                spec.name
+            )),
+        ),
+        Route::Rejected(reason) | Route::NotSupported(reason) => {
+            ack(AckOutcome::Rejected, Some((*reason).to_string()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web: D13's shared dialog
+// ---------------------------------------------------------------------------
+
+/// The open dialog as the browser receives it, or `None` when none is open.
+///
+/// Read straight off [`Ui::prompt`] — the state the desktop is already rendering
+/// — which is what D13's "no new state" means concretely. `kind` is the machine
+/// name for the flow; `title` and `body` are the same words and the same buttons
+/// the desktop is showing, because both come from the one
+/// [`crate::tui::render::Dialog`] [`prompt_dialog`] built.
+///
+/// The origin line is **not** duplicated into the body: `DialogView::origin`
+/// already carries it structurally, and the browser words it itself. Only the
+/// desktop needs the sentence, which is why the sentence lives on the desktop's
+/// render model.
+fn web_dialog_view(
+    ui: &Ui,
+    project_name: &str,
+    project: &AppState,
+) -> Option<crate::web::protocol::DialogView> {
+    use crate::web::commands::BrowserConfirm;
+    use crate::web::protocol as wire;
+
+    let open = ui.prompt.as_ref()?;
+    // Artboard 1g's second step, if this dialog has one for a browser. The
+    // expected name is *published*, because 1g draws it as the field's own hint:
+    // the gate buys deliberateness, not secrecy. A gate whose subject the host
+    // can no longer name is the one case that turns into an outright refusal —
+    // see `GATE_UNRESOLVED_REFUSAL`.
+    let (confirm_gate, refusal) = match browser_confirm_gate(&open.prompt) {
+        BrowserConfirm::OneStep => (None, None),
+        BrowserConfirm::TypedName(gate) => {
+            match gate_expectation(gate.subject, project_name, project) {
+                Some(expected) => (
+                    Some(wire::ConfirmGate {
+                        key: gate.key.to_string(),
+                        expected,
+                        instruction: gate.instruction.to_string(),
+                    }),
+                    None,
+                ),
+                None => (None, Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)),
+            }
+        }
+    };
+    let body = wire::DialogBody {
+        input: open.dialog.input.clone(),
+        list: open
+            .dialog
+            .list
+            .iter()
+            .map(|item| wire::DialogChoice {
+                label: item.label.clone(),
+                selected: item.selected,
+            })
+            .collect(),
+        list_filter: matches!(
+            &open.prompt,
+            Prompt::ChangeProjectBase { .. }
+                | Prompt::NewAgentForm {
+                    use_existing_branch: true,
+                    ..
+                }
+        ),
+        buttons: open
+            .dialog
+            .buttons
+            .iter()
+            .map(|button| wire::DialogKey {
+                key: dialog_accel_key(button.accel),
+                label: button.label.clone(),
+                // Which button dismisses, said out loud rather than left to the
+                // browser to infer from the label (§6.5 R19).
+                cancels: button.cancels(),
+            })
+            .collect(),
+        confirmable: refusal.is_none(),
+        refusal: refusal.map(str::to_string),
+        confirm_gate,
+    };
+    Some(wire::DialogView {
+        dialog_id: open.id.clone(),
+        kind: dialog_kind(&open.prompt).to_string(),
+        title: open.dialog.title.clone(),
+        origin: open.origin.clone(),
+        // `serde_json::to_value` on a struct of `String`s and `bool`s cannot
+        // fail; `None` rather than an `unwrap` so a future body that could fail
+        // degrades to "no body" instead of taking the event loop with it.
+        body: serde_json::to_value(&body).ok(),
+    })
+}
+
+/// The wire `kind` for one prompt (D13). Stable strings: the browser switches on
+/// them to pick a form, and an unknown one renders the generic shell, so
+/// renaming one is a breaking change and adding one is not.
+fn dialog_kind(prompt: &Prompt) -> &'static str {
+    match prompt {
+        Prompt::NewAgentForm { .. } => "new_agent",
+        Prompt::SelectChildAgent { .. } => "new_agent_child",
+        Prompt::RenameTab { .. } => "rename_session",
+        Prompt::SetManualStatus => "set_manual_status",
+        Prompt::CloseTab { .. } => "close_session",
+        Prompt::CloseChildConfirm { .. } => "close_terminal",
+        Prompt::CloseAgentChoice { .. } => "close_session_choice",
+        Prompt::PushConfirm => "confirm_push",
+        Prompt::AbandonConfirm { .. } => "confirm_abandon",
+        Prompt::MergeConfirm { .. } => "confirm_merge",
+        Prompt::RebaseConfirm { .. } => "confirm_rebase",
+        Prompt::OpenProject { .. } => "open_project",
+        Prompt::ChangeProjectBase { .. } => "change_project_base",
+        Prompt::CloseProjectConfirm { .. } => "close_project",
+        Prompt::UnpairConfirm => "unpair_phone",
+        Prompt::QuitConfirm => "confirm_quit",
+    }
+}
+
+/// What a **browser** must do to confirm this dialog: press the button, or press
+/// it *and* type a name back (artboard 1g, `specs/WEB_INTERFACE.md` §6.5 R13).
+///
+/// **The trigger is the surface, not the command.** 1g's step 2 says so itself —
+/// *"This browser is remote. Type the session name to run the rebase on the
+/// host."* — so this function describes browsers only. The desktop's dialogs are
+/// untouched: nothing reaches step 2 there, because the person answering is at
+/// the machine the effect lands on. That is also why 1g's caption can enumerate
+/// only two dialogs while the artboard draws a third: the caption is counting
+/// the desktop's world, and this is the remote one.
+///
+/// From a browser the gate covers the three answers that destroy work or rewrite
+/// history — §5/§15's abandon, §5.1's rebase, and D16's quit. `Push Branch` and `Finish / Local Merge`
+/// deliberately stay one-step: neither rewrites history nor discards anything, a
+/// push is undone by a force-push the user still owns, and a merge-back is a
+/// commit on the base branch — so 1g's friction would be ceremony rather than
+/// protection, and ceremony teaches people to type the name without reading it.
+///
+/// Exhaustive on purpose: a prompt added later must say where it stands.
+///
+/// **Cancelling is never gated**, here or anywhere below: dismissing a
+/// confirmation cannot destroy anything, and a shared dialog a remote surface
+/// can see but not dismiss would be worse than not sharing it (R8).
+fn browser_confirm_gate(prompt: &Prompt) -> crate::web::commands::BrowserConfirm {
+    use crate::web::commands::{
+        BrowserConfirm, GateSubject, TypedNameGate, GATE_ABANDON_INSTRUCTION,
+        GATE_QUIT_INSTRUCTION, GATE_REBASE_INSTRUCTION,
+    };
+    match prompt {
+        // SPECS §5/§15: the worktree and everything uncommitted in it goes.
+        // `y` is the button `prompt_dialog` prints for both spellings of the
+        // question ("Abandon" / "Abandon (force)").
+        Prompt::AbandonConfirm { .. } => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::SelectedSession,
+            instruction: GATE_ABANDON_INSTRUCTION,
+        }),
+        // SPECS §5.1's sanctioned history rewrite, and the one artboard 1g
+        // actually draws its two steps around.
+        Prompt::RebaseConfirm { .. } => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::SelectedSession,
+            instruction: GATE_REBASE_INSTRUCTION,
+        }),
+        // D16: quit stops FlightDeck and every agent in it. Not one session's
+        // work, so not one session's name — the project the browser is looking
+        // at is what it names.
+        Prompt::QuitConfirm => BrowserConfirm::TypedName(TypedNameGate {
+            key: "y",
+            subject: GateSubject::ActiveProject,
+            instruction: GATE_QUIT_INSTRUCTION,
+        }),
+        // The rest are one step, exactly as they are on the desktop. The two git
+        // confirmations that are not a rewrite (`remote-control-ll5.5`, SPECS
+        // §14/§15) are here deliberately: these dialogs **are** §5's
+        // confirmation, a browser is a user surface, and the unconfirmed value
+        // that opened them came from `web::commands::INVENTORY` rather than from
+        // the frame. See `specs/WEB_INTERFACE.md` §6.5 R11.
+        // The sidebar's close menu (`a` Abandon / `c` Close / `n` Cancel) is
+        // **not** gated, and that is precision rather than a hole: `a` discards
+        // nothing, it dispatches `AbandonWorktree { confirm: false }`, which
+        // always asks — so the browser lands on `AbandonConfirm` above and takes
+        // step 2 there, once, in front of the button that really does it.
+        Prompt::CloseAgentChoice { .. }
+        | Prompt::PushConfirm
+        | Prompt::MergeConfirm { .. }
+        | Prompt::NewAgentForm { .. }
+        | Prompt::SelectChildAgent { .. }
+        | Prompt::RenameTab { .. }
+        | Prompt::SetManualStatus
+        | Prompt::CloseTab { .. }
+        | Prompt::CloseChildConfirm { .. }
+        | Prompt::OpenProject { .. }
+        | Prompt::ChangeProjectBase { .. }
+        | Prompt::CloseProjectConfirm { .. }
+        | Prompt::UnpairConfirm => BrowserConfirm::OneStep,
+    }
+}
+
+/// The exact name a [`crate::web::commands::TypedNameGate`] expects, read off
+/// the live workspace.
+///
+/// One function, called from **two places that must not disagree**: the dialog
+/// the browser is shown (`web_dialog_view`) and the check the confirm passes
+/// (`apply_web_dialog`). A second spelling of "which name is that" is how a gate
+/// becomes unpassable or, worse, passable with the wrong name.
+///
+/// `None` means the host cannot name the subject any more — the tab was closed
+/// while its question was on screen. The confirm is refused; see
+/// [`crate::web::commands::GATE_UNRESOLVED_REFUSAL`].
+fn gate_expectation(
+    subject: crate::web::commands::GateSubject,
+    project_name: &str,
+    project: &AppState,
+) -> Option<String> {
+    use crate::web::commands::GateSubject;
+    match subject {
+        // The session name, not the branch: 1g's field hints
+        // `fix-login-redirect` while the dialog above it names
+        // `flightdeck/fix-login-redirect`, and the name is what the sidebar
+        // shows the person typing it.
+        GateSubject::SelectedSession => {
+            let index = project.selected_tab?;
+            Some(project.tabs.get(index)?.meta.name.clone())
+        }
+        GateSubject::ActiveProject => Some(project_name.to_string()),
+    }
+}
+
+/// The key label for an accelerator, matching what the desktop prints on the
+/// button and what [`crate::web::protocol::DialogKey::key`] carries.
+fn dialog_accel_key(accel: DialogAccel) -> String {
+    match accel {
+        DialogAccel::Char(c) => c.to_string(),
+        DialogAccel::Enter => "Enter".to_string(),
+        DialogAccel::Esc => "Esc".to_string(),
+        DialogAccel::Tab => "Tab".to_string(),
+    }
+}
+
+/// The accelerator a key label names, if any.
+fn dialog_accel_from_key(key: &str) -> Option<DialogAccel> {
+    match key {
+        "Enter" => Some(DialogAccel::Enter),
+        "Esc" => Some(DialogAccel::Esc),
+        "Tab" => Some(DialogAccel::Tab),
+        other => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(DialogAccel::Char(c)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Answer the open dialog on behalf of a browser (D13).
+///
+/// **Every path here is a keypress.** The browser's confirm becomes the exact
+/// sequence of [`KeyEvent`]s the desktop's own keyboard (and its dialog buttons,
+/// via [`trigger_dialog_button`]) would produce, fed through
+/// [`handle_prompt_key`]. That is the whole reason there is no second dialog
+/// engine to keep in step: `New Agent Session Tab` confirmed from a browser runs
+/// [`AppState::begin_new_agent_tab_ex`] because a synthetic `Enter` reached the
+/// same arm a real one does.
+///
+/// It also bounds what a browser can ask for, structurally: `choice` must name a
+/// button the dialog is *currently showing*, `text` is ignored by a dialog with
+/// no input field, and `toggle` needs a `Tab` button to exist. A browser cannot
+/// press a key the person at the desktop cannot see.
+fn apply_web_dialog(
+    act: crate::web::commands::DialogAct,
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> std::result::Result<Option<String>, String> {
+    use crate::web::commands::DialogAct;
+
+    let named = web_string_arg(args, "dialog_id")?;
+    let Some(open) = ui.prompt.as_ref() else {
+        return Err(
+            "No dialog is open — it was answered on the other surface. Ask for a \
+             fresh snapshot."
+                .to_string(),
+        );
+    };
+    if open.id.as_str() != named {
+        // The dialog moved on between the browser rendering it and answering.
+        // Refused rather than applied to whatever is on screen now, which is
+        // exactly how somebody confirms something they never read.
+        return Err(format!(
+            "Dialog `{named}` is not the dialog that is open now — it was \
+             replaced. Ask for a fresh snapshot."
+        ));
+    }
+
+    if act == DialogAct::Cancel {
+        feed_dialog_key(KeyCode::Esc, workspace, env, ui);
+        return Ok(Some("Cancelled the dialog.".to_string()));
+    }
+
+    let gate = browser_confirm_gate(&open.prompt);
+    let dialog = open.dialog.clone();
+    let choice = args.and_then(|a| a.get("choice")).and_then(|c| c.as_str());
+    let text = args.and_then(|a| a.get("text")).and_then(|t| t.as_str());
+    let list_index = args
+        .and_then(|a| a.get("list_index"))
+        .and_then(|i| i.as_u64());
+
+    // The deciding key: the button `choice` names, or the primary (every
+    // `prompt_dialog` puts the affirmative action first). `Esc` is never a
+    // confirm — `dialog_cancel` is the frame for that.
+    let deciding = match choice {
+        Some(key) => {
+            let accel = dialog_accel_from_key(key)
+                .filter(|accel| dialog.buttons.iter().any(|b| b.accel == *accel))
+                .ok_or_else(|| {
+                    format!(
+                        "This dialog has no `{key}` button; it shows {}.",
+                        button_keys(&dialog)
+                    )
+                })?;
+            accel
+        }
+        None => dialog
+            .buttons
+            .first()
+            .map(|b| b.accel)
+            .ok_or_else(|| "This dialog has no buttons to press.".to_string())?,
+    };
+    if deciding == DialogAccel::Esc {
+        return Err(
+            "`Esc` cancels — send `dialog_cancel` for that, so the other surface \
+             is told the dialog was dismissed rather than confirmed."
+                .to_string(),
+        );
+    }
+
+    // **Artboard 1g's second step, before a single key is fed.** Everything
+    // below this point synthesises keypresses into the live prompt, so the gate
+    // is checked here and nowhere later: a refusal returns with the dialog
+    // untouched, which is what makes "the effect provably does not occur" a
+    // property of the control flow rather than of a rollback.
+    //
+    // Only the button the gate names is behind it — every other answer this
+    // dialog offers is one press away — and cancelling never reaches here at
+    // all, because `DialogAct::Cancel` returned above.
+    if let crate::web::commands::BrowserConfirm::TypedName(gate) = gate {
+        if dialog_accel_key(deciding) == gate.key {
+            let active = workspace.active_project();
+            let expected = gate_expectation(gate.subject, &active.name, &active.state)
+                .ok_or_else(|| crate::web::commands::GATE_UNRESOLVED_REFUSAL.to_string())?;
+            match args
+                .and_then(|a| a.get("confirm_name"))
+                .and_then(|n| n.as_str())
+            {
+                // Step 1 only: the browser pressed the button and sent no name.
+                None => {
+                    return Err(crate::web::commands::gate_step_refusal(&gate, &expected));
+                }
+                // Byte-for-byte. No trim, no case fold, no normalisation — see
+                // `gate_mismatch_refusal` for why each of those was rejected.
+                Some(typed) if typed == expected => {}
+                Some(typed) => {
+                    return Err(crate::web::commands::gate_mismatch_refusal(
+                        typed, &expected,
+                    ));
+                }
+            }
+        }
+    }
+
+    // 1. The text field. Replace the host's draft with the browser's exact
+    //    draft through ordinary keypresses. This matters now that `Tab` is a
+    //    host round-trip: a second cycle must not append the same text twice.
+    //    Text comes before list selection because searchable branch dialogs
+    //    interpret `list_index` against the filtered rows the browser showed.
+    if let Some(text) = text {
+        if dialog.input.is_none() {
+            return Err("This dialog has no text field.".to_string());
+        }
+        if text.chars().any(char::is_control) {
+            return Err("A dialog's text field takes printable characters only.".to_string());
+        }
+        for _ in dialog.input.as_deref().unwrap_or_default().chars() {
+            feed_dialog_key(KeyCode::Backspace, workspace, env, ui);
+        }
+        for c in text.chars() {
+            feed_dialog_key(KeyCode::Char(c), workspace, env, ui);
+        }
+    }
+    // 2. The choice row (1e's agent radio or a filtered branch). Driven to the
+    //    top first, so the index is absolute rather than relative to a desktop
+    //    highlight that may have moved since the browser rendered it.
+    if let Some(index) = list_index {
+        let live_list = ui
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.dialog.list.clone())
+            .unwrap_or_else(|| dialog.list.clone());
+        if live_list.is_empty() {
+            return Err("This dialog has no list to choose from.".to_string());
+        }
+        if index as usize >= live_list.len() {
+            return Err(format!(
+                "This dialog has {} choices, so `list_index: {index}` names none of them.",
+                live_list.len()
+            ));
+        }
+        for _ in 0..live_list.len() {
+            feed_dialog_key(KeyCode::Up, workspace, env, ui);
+        }
+        for _ in 0..index {
+            feed_dialog_key(KeyCode::Down, workspace, env, ui);
+        }
+    }
+    // 3. The decision.
+    let code = match deciding {
+        DialogAccel::Char(c) => KeyCode::Char(c),
+        DialogAccel::Enter => KeyCode::Enter,
+        DialogAccel::Tab => KeyCode::Tab,
+        DialogAccel::Esc => KeyCode::Esc,
+    };
+    feed_dialog_key(code, workspace, env, ui);
+
+    if deciding == DialogAccel::Tab && ui.prompt.is_some() {
+        return Ok(Some("Changed the dialog target.".to_string()));
+    }
+    if ui.prompt.is_some() {
+        // Nothing wrong happened: a form that rejects an empty branch name keeps
+        // prompting, on both surfaces. Reported as a refusal rather than as an
+        // application, because nothing was applied.
+        return Err(
+            "The dialog is still open — it needs something it did not get. It is \
+             showing why on both surfaces."
+                .to_string(),
+        );
+    }
+    // The sentence the desktop showed, if it showed one — the same rule
+    // `Ui::web_outcome` follows for a palette dispatch. Confirming a dialog and
+    // the action behind it failing are two different facts, and the browser is
+    // entitled to the second one in the host's own words rather than a cheerful
+    // "confirmed" over a red notification the desktop is reading.
+    match desktop_notification(ui) {
+        Some(sentence) if sentence.starts_with("Error:") || sentence.starts_with("Refused:") => {
+            Err(sentence)
+        }
+        Some(sentence) => Ok(Some(sentence)),
+        None => Ok(Some("Confirmed the dialog.".to_string())),
+    }
+}
+
+/// The notification dialog the desktop is showing, if any. `None` when the
+/// screen is back to the main view, which is the silent-success case.
+fn desktop_notification(ui: &Ui) -> Option<String> {
+    match &ui.overlay {
+        UiOverlay::Dialog(dialog) => Some(dialog.title.clone()),
+        _ => None,
+    }
+}
+
+/// The keys a dialog is showing, for a refusal that says what *would* work.
+fn button_keys(dialog: &Dialog) -> String {
+    let keys: Vec<String> = dialog
+        .buttons
+        .iter()
+        .map(|b| format!("`{}`", dialog_accel_key(b.accel)))
+        .collect();
+    keys.join(", ")
+}
+
+/// One synthetic keypress into the open prompt. A no-op once the prompt has
+/// closed, so a sequence that ends early (a handler that took the decision on an
+/// earlier key) cannot leak keystrokes into whatever is on screen next.
+fn feed_dialog_key(code: KeyCode, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
+    if ui.prompt.is_none() {
+        return;
+    }
+    let key = KeyEvent::new(code, KeyModifiers::NONE);
+    if let Err(e) = handle_prompt_key(key, workspace, env, ui) {
+        ui.message(format!("Error: {e}"));
+    }
+}
+
+/// Upgrade the diff's `Superseded` frames with the outcomes somebody actually
+/// decided (D13).
+///
+/// `crate::web::stream::deltas` compares two published states, so all it can
+/// honestly say about a dialog that is gone is [`DialogOutcome::Superseded`] —
+/// it did not witness a decision. [`handle_prompt_key`] did, and recorded it in
+/// [`Ui::dialog_decisions`]. This is the one place the two meet, so the browser
+/// learns `Confirmed` when the desktop pressed `y` and `Superseded` only when a
+/// dialog really was replaced without an answer.
+///
+/// A decision with no matching frame is dropped, correctly: the dialog opened
+/// and closed within one tick, so no surface was ever told it existed.
+fn resolve_dialog_outcomes(
+    frames: &mut [crate::web::protocol::Delta],
+    decided: &[(
+        crate::web::protocol::DialogId,
+        crate::web::protocol::DialogOutcome,
+    )],
+) {
+    use crate::web::protocol::Delta;
+    for frame in frames.iter_mut() {
+        if let Delta::DialogClosed { dialog_id, outcome } = frame {
+            if let Some((_, decided)) = decided.iter().find(|(id, _)| id == dialog_id) {
+                *outcome = *decided;
+            }
+        }
+    }
+}
+
+/// Move the shared selection (D3) on behalf of a browser, through the same
+/// functions the desktop's own palette and mouse clicks use: [`switch_project`]
+/// for a project, [`Command::SwitchAgentTab`] for a session, [`select_target`]
+/// for a terminal.
+///
+/// `Ok(detail)` is the sentence to ack with; `Err(reason)` is a refusal — a
+/// stale id from a browser whose snapshot has drifted, or a guard (an isolated
+/// run has one project by construction) saying no.
+fn apply_web_selection(
+    target: crate::web::commands::SelectionTarget,
+    args: Option<&serde_json::Value>,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> std::result::Result<Option<String>, String> {
+    use crate::web::commands::SelectionTarget;
+
+    match target {
+        SelectionTarget::Project => {
+            let id = web_string_arg(args, "project_id")?;
+            let index = workspace
+                .projects
+                .iter()
+                // The same id `build_web_host_state` mints: the repository root.
+                .position(|p| p.git.root().display().to_string() == id)
+                .ok_or_else(|| stale_id("project", &id))?;
+            select_web_project(workspace, env, ui, index)?;
+            Ok(Some(format!(
+                "Selected project {}",
+                workspace.active_project().name
+            )))
+        }
+        SelectionTarget::Session => {
+            let id = web_string_arg(args, "session_id")?;
+            let (project, tab) =
+                locate_web_session(workspace, &id).ok_or_else(|| stale_id("session", &id))?;
+            select_web_session(workspace, env, ui, project, tab)?;
+            Ok(Some(format!(
+                "Selected session {}",
+                workspace.projects[project].state.tabs[tab].meta.name
+            )))
+        }
+        SelectionTarget::Terminal => {
+            let id = web_string_arg(args, "terminal_id")?;
+            let (project, tab, child) =
+                locate_web_terminal(workspace, &id).ok_or_else(|| stale_id("terminal", &id))?;
+            // A terminal implies its session (D3 keeps one selection for the
+            // whole instance), so the session moves first.
+            select_web_session(workspace, env, ui, project, tab)?;
+            let p = &mut workspace.projects[project];
+            let services = env.services(&p.git);
+            select_target(&mut p.state, &services, child);
+            Ok(None)
+        }
+    }
+}
+
+/// One required string argument off a `Command` frame's `args` object.
+fn web_string_arg(
+    args: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<String, String> {
+    args.and_then(|args| args.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("This command needs a `{key}` argument."))
+}
+
+/// The refusal for an id the host does not have — almost always a browser whose
+/// snapshot predates a close (Q3), which is why it says so rather than just
+/// failing.
+fn stale_id(kind: &str, id: &str) -> String {
+    format!("No {kind} `{id}` is open — this tab's view is out of date; ask for a fresh snapshot.")
+}
+
+/// Make `index` the active project unless it already is, reusing
+/// [`switch_project`] so the isolated-run refusal (SPECS §32) and the agent
+/// resume both still happen.
+fn select_web_project(
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    index: usize,
+) -> std::result::Result<(), String> {
+    if workspace.active == index {
+        return Ok(());
+    }
+    ui.web_outcome = None;
+    switch_project(workspace, env, Selector::Index(index), ui);
+    match ui.web_outcome.take() {
+        Some(WebDispatch::Refused(reason)) | Some(WebDispatch::Failed(reason)) => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Select one session, switching project first if it lives in another one — a
+/// browser can be looking at a background project, and D3 says the desktop
+/// follows.
+fn select_web_session(
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    project: usize,
+    tab: usize,
+) -> std::result::Result<(), String> {
+    select_web_project(workspace, env, ui, project)?;
+    if workspace.projects[project].state.selected_tab == Some(tab) {
+        return Ok(());
+    }
+    let p = &mut workspace.projects[project];
+    let services = env.services(&p.git);
+    ui.web_outcome = None;
+    dispatch_command(
+        Command::SwitchAgentTab(Selector::Index(tab)),
+        &mut p.state,
+        &services,
+        ui,
+    )
+    .map_err(|e| e.to_string())?;
+    match ui.web_outcome.take() {
+        Some(WebDispatch::Refused(reason)) | Some(WebDispatch::Failed(reason)) => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Find a wire session id among every open project's tabs.
+fn locate_web_session(workspace: &Workspace, session_id: &str) -> Option<(usize, usize)> {
+    workspace.projects.iter().enumerate().find_map(|(pi, p)| {
+        p.state
+            .tabs
+            .iter()
+            .position(|tab| tab.meta.id == session_id)
+            .map(|ti| (pi, ti))
+    })
+}
+
+/// Find a wire terminal id among every open project's terminals, returning the
+/// [`ChildTarget`] that selects it.
+///
+/// The ids are rebuilt with [`crate::web::stream`]'s own minters rather than
+/// parsed, so this cannot drift from the spelling the snapshot published.
+fn locate_web_terminal(
+    workspace: &Workspace,
+    terminal_id: &str,
+) -> Option<(usize, usize, ChildTarget)> {
+    for (pi, p) in workspace.projects.iter().enumerate() {
+        for (ti, tab) in p.state.tabs.iter().enumerate() {
+            if crate::web::stream::primary_terminal_id(&tab.meta.id).as_str() == terminal_id {
+                return Some((pi, ti, ChildTarget::Primary));
+            }
+            for c in 0..tab.session.child_count() {
+                let matches = tab.session.child(c).is_some_and(|child| {
+                    crate::web::stream::child_terminal_id(&tab.meta.id, child.stream_id()).as_str()
+                        == terminal_id
+                });
+                if matches {
+                    return Some((pi, ti, ChildTarget::Child(c)));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
 // Configuration manager (SPECS §8)
 // ---------------------------------------------------------------------------
 
-/// Build and open the configuration manager for the active project, reading the
-/// global base and this project's override files into an editable model. Ensures
-/// the global base exists first so it is always editable — except in an
-/// isolated run, which must not create `~/.flightdeck/config.toml` merely by
-/// being opened (SPECS §32); the manager still opens and shows the effective
-/// settings without it.
+/// Build and open the configuration manager for the active project.
 fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    ui.config = Some(build_config_manager(workspace, env));
+}
+
+/// Build the configuration manager for the active project, reading the global
+/// base and this project's override files into an editable model. Ensures the
+/// global base exists first so it is always editable — except in an isolated
+/// run, which must not create `~/.flightdeck/config.toml` merely by being
+/// opened (SPECS §32); the manager still opens and shows the effective settings
+/// without it.
+///
+/// **The one builder both surfaces use.** The desktop's `Open Configuration`
+/// puts the result in [`Ui::config`]; a browser's `open_configuration` reads it
+/// out as a [`crate::web::protocol::ConfigView`] and throws it away
+/// (`remote-control-1p22`, `specs/WEB_INTERFACE.md` §6.5 R22). The field list,
+/// the two files and the layer walk are therefore the same on both, by
+/// construction rather than by review.
+fn build_config_manager(workspace: &Workspace, env: &Env) -> ConfigManager {
     let global_path = global_config_path();
     // An isolated run writes nothing to the user's config on its own (SPECS
     // §32): merely opening the manager to look must not create
@@ -5424,14 +8367,14 @@ fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
     let project = read_table(&project_path);
     let agent_keys: Vec<String> = p.state.config.agents.keys().cloned().collect();
 
-    ui.config = Some(ConfigManager::new(
+    ConfigManager::new(
         p.name.clone(),
         global_path,
         project_path,
         global,
         project,
         agent_keys,
-    ));
+    )
 }
 
 /// Handle a key while the configuration manager overlay is open (SPECS §8).
@@ -5487,11 +8430,25 @@ fn handle_config_key(
 /// Write the configuration manager's dirty scopes to disk, then reload the
 /// effective config for every open project (a global change affects them all).
 fn save_config_manager(workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Result<()> {
-    let outputs = match ui.config.as_ref() {
-        Some(cm) => cm.outputs()?,
-        None => return Ok(()),
+    let Some(cm) = ui.config.as_mut() else {
+        return Ok(());
     };
-    for (path, contents) in &outputs {
+    write_config_manager(cm, env)?;
+    reload_all_projects_config(workspace, env);
+    Ok(())
+}
+
+/// Write one manager's dirty scopes to disk and mark it saved.
+///
+/// Factored out of [`save_config_manager`] so a browser's save
+/// (`remote-control-1p22`) writes through the same three lines the desktop's
+/// `s` does: the same `outputs()`, the same parent-directory creation, the same
+/// `mark_saved`. The caller then reloads every project's effective config —
+/// which both callers do, because SPECS §8's "saving reloads every open
+/// project's effective config immediately" is not a property of the surface
+/// that asked.
+fn write_config_manager(cm: &mut ConfigManager, env: &Env) -> Result<()> {
+    for (path, contents) in &cm.outputs()? {
         if let Some(parent) = path.parent() {
             if !env.fs.exists(parent) {
                 env.fs.create_dir_all(parent)?;
@@ -5499,10 +8456,7 @@ fn save_config_manager(workspace: &mut Workspace, env: &Env, ui: &mut Ui) -> Res
         }
         env.fs.write(path, contents)?;
     }
-    if let Some(cm) = ui.config.as_mut() {
-        cm.mark_saved();
-    }
-    reload_all_projects_config(workspace, env);
+    cm.mark_saved();
     Ok(())
 }
 
@@ -5607,7 +8561,7 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 fn drain_pty_output(
     state: &mut AppState,
     _now_ms: u64,
-    mut tee: impl FnMut(&str, Option<usize>, &[u8]),
+    mut tee: impl FnMut(&str, Option<usize>, u64, &[u8]),
 ) {
     // Read once before the loop: auto-continuation gates resume-hint capture,
     // and the per-tab borrow below would otherwise conflict with reading config.
@@ -5623,11 +8577,16 @@ fn drain_pty_output(
                     // Unblock ConPTY / cursor-probing TUIs (Windows): reply to
                     // any `ESC[6n` so the child renders instead of stalling.
                     primary.answer_cursor_position_query(&bytes);
-                    // Tee the raw primary bytes to the remote transcript builder
-                    // (`None` = primary; a no-op when remote is disabled).
+                    // Tee the raw primary bytes to every consumer that wants
+                    // them: the remote transcript builder and the web interface's
+                    // replay ring (`None` = primary; a no-op when both are off).
+                    // This is the one place a PTY is read, so it is the only
+                    // honest place to tee from — the browser and the desktop's
+                    // own `vt100` parse see byte-for-byte the same chunk (D2).
                     // `tab.meta` is a disjoint field from `tab.session`, so this
-                    // borrows cleanly.
-                    tee(&tab.meta.id, None, &bytes);
+                    // borrows cleanly. The `0` is the primary's unused mint: a
+                    // session has at most one primary, so it needs no counter.
+                    tee(&tab.meta.id, None, 0, &bytes);
                     Some(bytes)
                 }
                 _ => None,
@@ -5644,11 +8603,15 @@ fn drain_pty_output(
         // remote shell backed by that child (`Some(index)`) streams to the phone.
         for c in 0..tab.session.child_count() {
             if let Some(child) = tab.session.child_mut(c) {
+                // The mint, not the index: a browser byte cursor keyed by
+                // position would resume the wrong stream after a child is
+                // closed (see `web::protocol::TerminalId`).
+                let stream_id = child.stream_id();
                 if let Ok(bytes) = child.session_mut().try_read_output() {
                     if !bytes.is_empty() {
                         child.process_output(&bytes);
                         child.answer_cursor_position_query(&bytes);
-                        tee(&tab.meta.id, Some(c), &bytes);
+                        tee(&tab.meta.id, Some(c), stream_id, &bytes);
                     }
                 }
             }
@@ -5656,7 +8619,64 @@ fn drain_pty_output(
     }
 }
 
+/// Who holds the input lock, as the desktop's status bar should name it, or
+/// `None` when there is nothing to say (`specs/WEB_INTERFACE.md` D14 as
+/// revised).
+///
+/// `None` in two different situations that both mean *do not draw a chip*: the
+/// lock is free, or no browser is seated as a writer, so the desktop is the only
+/// surface that can type and a "who can type" chip would be permanent noise
+/// about a contest that cannot happen. Read off the same seat rows the browser
+/// is sent, so neither surface can be told a different holder.
+fn web_input_holder(handle: &crate::web::server::WebServerHandle) -> Option<String> {
+    let holder = handle.input_holder_label()?;
+    handle.has_browser_writer().then_some(holder)
+}
+
+/// Whether this desktop may type into a PTY right now, claiming the input lock
+/// if it is free (D14 as revised).
+///
+/// **This is the desktop obeying the same rule as every browser, and it is the
+/// point of the whole model.** A surface that could always cut in would splice
+/// its bytes into somebody else's half-typed word, which reads as a bug in the
+/// agent rather than in FlightDeck. So the desktop claims, and while another
+/// writer's burst is live it is refused — the bytes are dropped, and the status
+/// bar names the holder so the refusal is never silent.
+///
+/// `true` with no server running: there is exactly one writer, and nothing to
+/// arbitrate.
+fn desktop_may_type(ui: &mut Ui, now_ms: i64) -> bool {
+    let Some(lock) = ui.input_lock.as_ref() else {
+        return true;
+    };
+    let mut lock = match lock.lock() {
+        Ok(lock) => lock,
+        // A writer panicked mid-claim. Recovering beats taking the terminal
+        // away from the person at the machine — the same reasoning the server
+        // applies to its own registry.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match lock.claim(
+        &crate::web::arbiter::Writer::Desktop,
+        crate::web::server::DESKTOP_SEAT_LABEL,
+        now_ms,
+    ) {
+        crate::web::arbiter::Claim::Granted => true,
+        crate::web::arbiter::Claim::Refused { label, .. } => {
+            // The trace §5.1 requires. The status bar is already naming the
+            // holder every frame; this makes the *next* frame name them even if
+            // the lock frees itself in between.
+            ui.input_holder = Some(label);
+            false
+        }
+    }
+}
+
 /// Write key bytes to the active terminal's PTY (Terminal-mode passthrough).
+///
+/// Callers that can be reached from a keystroke must have claimed the input lock
+/// first ([`desktop_may_type`]); this function is the write itself and does not
+/// arbitrate, because it is also the path a dialog's synthesised keypress takes.
 fn write_active_pty(state: &mut AppState, bytes: &[u8]) {
     let Some(tab) = state.selected_mut() else {
         return;
@@ -5836,6 +8856,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
             area,
             crate::tui::layout::chrome_for(area, state.mode()),
             crate::tui::mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let region = crate::tui::layout::split_region(&ml);
         let n = state.tabs[idx].session.child_count() + 1;
@@ -5872,6 +8893,7 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
             area,
             crate::tui::layout::Chrome::Full,
             crate::tui::mode_style::border_enabled(&state.config.ui),
+            state.config.ui.agent_tab_side(),
         );
         let size = PtySize {
             rows: ml.terminal.height.max(1),
@@ -5960,6 +8982,40 @@ mod tests {
     #[test]
     fn parse_isolated_refuses_a_subcommand_given_first() {
         assert!(parse_isolated(&argv(&["flightdeck", "image", "--isolated"])).is_err());
+    }
+
+    // --- FlightDeck Web lifecycle messages (D5, D10) ----------------------
+
+    /// D5: binding a routable address is the one web setting that changes who
+    /// can reach the user's agents, so the line that reports it must warn. A
+    /// loopback bind must *not* warn, or the warning becomes noise nobody reads.
+    #[test]
+    fn a_routable_bind_is_warned_about_and_a_loopback_one_is_not() {
+        use crate::web::server::BindExposure;
+
+        let loopback = web_started_message(
+            "127.0.0.1:8477".parse().expect("a valid address"),
+            BindExposure::Loopback,
+        );
+        assert!(loopback.contains("127.0.0.1:8477"));
+        assert!(
+            !loopback.to_lowercase().contains("warning"),
+            "a loopback bind is the safe default and must not cry wolf: {loopback}"
+        );
+        assert!(loopback.contains("this machine only"));
+
+        let routable = web_started_message(
+            "0.0.0.0:8477".parse().expect("a valid address"),
+            BindExposure::Routable,
+        );
+        assert!(
+            routable.contains("WARNING"),
+            "a routable bind must say so: {routable}"
+        );
+        assert!(
+            routable.contains("drive your agents"),
+            "and must say what the consequence is, not just that there is one: {routable}"
+        );
     }
 
     // --- next_loop_step: the shutdown-flag / input decision --------------
@@ -6621,7 +9677,7 @@ mod tests {
             .unwrap();
 
         handle.push_output(b"echoed user keystrokes".to_vec());
-        drain_pty_output(&mut state, 1_000, |_, _, _| {});
+        drain_pty_output(&mut state, 1_000, |_, _, _, _| {});
 
         assert_eq!(
             state.tabs[0].display_status(1_000).interpreted,
@@ -8218,7 +11274,7 @@ mod tests {
             shell_pty.push_output(b"hi\r\n".to_vec());
             {
                 let p = &mut workspace.projects[0];
-                drain_pty_output(&mut p.state, 1_000, |sid, which, bytes| {
+                drain_pty_output(&mut p.state, 1_000, |sid, which, _mint, bytes| {
                     if let Some(ci) = which {
                         bridge.shell_pump(sid, ci, bytes);
                     }
@@ -8582,7 +11638,7 @@ mod tests {
             }
         }
 
-        fn one_project_workspace(isolated: bool) -> Workspace {
+        pub(super) fn one_project_workspace(isolated: bool) -> Workspace {
             let mut config = config_with_agent(AgentDef {
                 key: "codex".to_string(),
                 display_name: "Codex".to_string(),
@@ -8613,7 +11669,7 @@ mod tests {
             }
         }
 
-        fn two_project_workspace(active_isolated: bool) -> Workspace {
+        pub(super) fn two_project_workspace(active_isolated: bool) -> Workspace {
             let mut ws = one_project_workspace(active_isolated);
             let mut other_config = config_with_agent(AgentDef {
                 key: "claude".to_string(),
@@ -8645,7 +11701,7 @@ mod tests {
             ws
         }
 
-        fn env<'a>(
+        pub(super) fn env<'a>(
             fs: &'a FakeFs,
             pty: &'a FakePty,
             clock: &'a FakeClock,
@@ -8882,7 +11938,12 @@ mod tests {
                 width: 80,
                 height: 24,
             };
-            let ml = crate::tui::layout::compute(area, crate::tui::layout::Chrome::Full, false);
+            let ml = crate::tui::layout::compute(
+                area,
+                crate::tui::layout::Chrome::Full,
+                false,
+                crate::contracts::AgentTabPosition::Left,
+            );
             let names: Vec<String> = ws.projects.iter().map(|p| p.name.clone()).collect();
             let row = crate::tui::layout::HEADER_HEIGHT;
             // Find a column that hits the second project's tab, wherever the
@@ -8959,6 +12020,2713 @@ mod tests {
                 "a normal run still creates the global base on open: {:?}",
                 fs.writes()
             );
+        }
+    }
+
+    /// The host half of the browser's command surface: `run_web_command` routes
+    /// a real wire frame into the TUI's own palette path and acks what that
+    /// dispatch actually did (`specs/WEB_INTERFACE.md` §1, D3, D16).
+    ///
+    /// The refusing cases are tested here as well as in `tests/web_server.rs`
+    /// deliberately: the server refuses them before forwarding, so these prove
+    /// the second line of defence would hold if the two ever disagreed.
+    mod web_command_surface {
+        use super::isolated_refusals::{env, one_project_workspace, two_project_workspace};
+        use super::*;
+        use crate::web::activity::ActivityStore;
+        use crate::web::protocol::{command as names, AckOutcome, Command as WireCommand};
+        use serde_json::json;
+
+        fn frame(seq: u64, name: &str, args: Option<serde_json::Value>) -> WireCommand {
+            WireCommand {
+                seq,
+                name: name.to_string(),
+                args,
+            }
+        }
+
+        /// The origin every frame in this module arrives with: one browser, at a
+        /// fixed address, so the origin label a dialog carries is checkable.
+        fn browser_origin() -> crate::web::protocol::DialogOrigin {
+            crate::web::protocol::DialogOrigin::Browser {
+                viewer_id: Some(crate::web::protocol::ViewerId::new("viewer-1")),
+                label: "192.168.2.20".to_string(),
+            }
+        }
+
+        /// A workspace whose one project has a real Agent Session Tab named
+        /// `Task`.
+        ///
+        /// Built by dispatching `NewAgentTab` against a [`FakeGit`], so the tab
+        /// is the real thing rather than a hand-assembled record — its name is
+        /// what artboard 1g's gate expects to be typed back, and a test that
+        /// invented the name would prove nothing about where the gate reads it
+        /// from. The project keeps `one_project_workspace`'s scaffolding, so the
+        /// name a browser must type for the *project* gate is still `proj`.
+        fn workspace_with_a_tab(dir: &TempDir, git: &FakeGit, pty: &FakePty) -> Workspace {
+            let agent = make_real_agent(dir, "opencode");
+            let mut config = config_with_agent(agent);
+            config.ui.default_agent = "opencode".to_string();
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &runner,
+            };
+            pty.queue_session();
+            let mut state = AppState::new(
+                config,
+                default_state("main"),
+                "/repo",
+                "/repo/.flightdeck/state.json",
+            );
+            state
+                .dispatch(
+                    Command::NewAgentTab {
+                        name: "Task".to_string(),
+                        agent_key: None,
+                    },
+                    &services,
+                )
+                .expect("the tab is created");
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state = state;
+            ws
+        }
+
+        /// Run one wire frame against `workspace`, returning the ack the browser
+        /// would receive. Builds the fake services fresh, as the event loop
+        /// builds the real ones per tick.
+        fn run(
+            workspace: &mut Workspace,
+            ui: &mut Ui,
+            command: &WireCommand,
+        ) -> crate::web::protocol::Ack {
+            reply(workspace, ui, command).ack
+        }
+
+        /// The same, keeping the whole reply — the ack *and* SPECS §21's panel,
+        /// which is the half `show_git_status` exists to deliver (§6.5 R16).
+        fn reply(workspace: &mut Workspace, ui: &mut Ui, command: &WireCommand) -> WebCommandReply {
+            reply_on(&FakeFs::new(), workspace, ui, command)
+        }
+
+        /// The same, over a caller-supplied filesystem — for the rows whose
+        /// whole point is what they read from or write to disk (SPECS §8's
+        /// configuration manager).
+        fn reply_on(
+            fs: &FakeFs,
+            workspace: &mut Workspace,
+            ui: &mut Ui,
+            command: &WireCommand,
+        ) -> WebCommandReply {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(fs, &pty, &clock, &container, &runner);
+            let mut activity = ActivityStore::new();
+            run_web_command(command, &browser_origin(), workspace, &e, ui, &mut activity)
+        }
+
+        /// D3: the selection is shared, so a browser choosing a project moves
+        /// the desktop onto it. The id is the one `build_web_host_state` mints —
+        /// the repository root — read off the workspace rather than spelled out.
+        #[test]
+        fn selecting_a_project_moves_the_desktop_too() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            let id = ws.projects[1].git.root().display().to_string();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::SELECT_PROJECT, Some(json!({ "project_id": id }))),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert_eq!(ack.seq, 1);
+            assert_eq!(ws.active, 1, "the desktop followed the browser");
+        }
+
+        /// A browser whose snapshot predates a close names an id the host does
+        /// not have. Refused with a sentence that says what to do about it, not
+        /// silently ignored.
+        #[test]
+        fn a_stale_id_is_refused_with_a_reason() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    2,
+                    names::SELECT_SESSION,
+                    Some(json!({ "session_id": "tab-that-was-closed" })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("out of date"), "{detail}");
+        }
+
+        /// A missing argument is a refusal, not a panic and not a guess.
+        #[test]
+        fn a_selection_with_no_target_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(3, names::SELECT_TERMINAL, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("terminal_id"));
+        }
+
+        /// The ack is what the dispatch earned. `toggle_split_view` goes through
+        /// `run_palette_action`, and the sentence the desktop showed is the
+        /// sentence the browser gets.
+        #[test]
+        fn a_palette_command_acks_what_the_dispatch_did() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            assert!(!ws.projects[0].state.split_view);
+
+            let ack = run(&mut ws, &mut ui, &frame(4, names::TOGGLE_SPLIT_VIEW, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(
+                ws.projects[0].state.split_view,
+                "the browser drove the real app state"
+            );
+            assert_eq!(ack.detail.as_deref(), Some("Split view on."));
+        }
+
+        /// A guard's refusal reaches the browser verbatim instead of becoming a
+        /// fake success: an isolated run has one project by construction (SPECS
+        /// §32), and says so in the same words the desktop would show.
+        #[test]
+        fn a_refused_dispatch_acks_the_guards_own_sentence() {
+            let mut ws = one_project_workspace(true);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(5, names::NEXT_PROJECT, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(ack.detail.as_deref(), Some(ISOLATED_REFUSAL));
+        }
+
+        /// **D16 + artboard 1g, end to end: quitting from a browser takes two
+        /// steps, and every way of taking only one provably does not quit.**
+        ///
+        /// `ui.should_quit` is what makes this the clearest of the destructive
+        /// tests: the effect is a boolean on the host, so "the effect did not
+        /// occur" is asserted directly rather than inferred from an absence.
+        #[test]
+        fn quitting_from_a_browser_takes_the_typed_project_name() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            // Step 1. The row asks; it does not quit. D16's `host only` badge
+            // would have been the alternative, and the spec says it is not
+            // enough — so the row dispatches, and what it dispatches can only
+            // open the question.
+            let ack = run(&mut ws, &mut ui, &frame(6, names::QUIT, None));
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(!ui.should_quit, "the row asked, it did not quit");
+            let opened = ui.dialog_id().expect("the question is open");
+
+            let view = view(&ui, &ws);
+            assert_eq!(view.kind, "confirm_quit");
+            let body = body(&view);
+            assert!(body.confirmable, "a browser may answer — through step 2");
+            assert_eq!(body.refusal, None);
+            let gate = body.confirm_gate.clone().expect("1g's step 2 is published");
+            assert_eq!(gate.key, "y", "the gate stands in front of the Quit button");
+            assert_eq!(
+                gate.expected, "proj",
+                "quit is not one session's work, so it names the project"
+            );
+            assert!(
+                gate.instruction.contains("This browser is remote"),
+                "1g's step 2 says why there is one: {}",
+                gate.instruction
+            );
+
+            // Step 1 alone: the button, no name. This is what an older browser —
+            // and a replayed frame — sends.
+            let confirm = answer(7, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(
+                ack.detail
+                    .expect("a refusal states its reason")
+                    .contains("proj"),
+                "the refusal repeats what to type"
+            );
+            assert!(!ui.should_quit, "step 1 alone must not quit");
+            assert!(
+                ui.prompt.is_some(),
+                "the question is still on both surfaces"
+            );
+
+            // Every near miss. The comparison is exact — no trimming, no case
+            // folding — so each of these is a name the host does not have.
+            for wrong in ["Proj", "PROJ", "proj ", " proj", "pro", "", "projx"] {
+                let confirm = answer(
+                    8,
+                    names::DIALOG_CONFIRM,
+                    &ui,
+                    json!({ "confirm_name": wrong }),
+                );
+                let ack = run(&mut ws, &mut ui, &confirm);
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{wrong}`");
+                assert!(!ui.should_quit, "`{wrong}` must not quit FlightDeck");
+                assert!(ui.prompt.is_some(), "`{wrong}` left the question open");
+                assert!(
+                    ui.dialog_decisions.is_empty(),
+                    "`{wrong}` was refused before any key reached the prompt"
+                );
+            }
+
+            // And the name itself, exactly. Only now is a key fed into the
+            // prompt — the same `y` the desktop's own button sends.
+            let confirm = answer(
+                9,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "proj" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.should_quit, "both steps taken: FlightDeck stops");
+            assert!(ui.prompt.is_none());
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(opened, crate::web::protocol::DialogOutcome::Confirmed)],
+                "the other surface is told it was confirmed, not superseded"
+            );
+        }
+
+        /// The desktop's half of the same dialog, which is the ruling in one
+        /// assertion: **nothing reaches step 2 there.** The person at this
+        /// keyboard is at the machine that stops, so `y` is the whole answer —
+        /// and SPECS §23's `Ctrl-q` never opens this dialog in the first place,
+        /// because the desktop's row carries `Quit { confirm: true }`.
+        #[test]
+        fn the_desktop_answers_the_quit_dialog_with_one_key() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::QUIT, None));
+            let id = ui.dialog_id().expect("open");
+
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            assert!(ui.should_quit, "one key, no name, from the desktop");
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(id, crate::web::protocol::DialogOutcome::Confirmed)]
+            );
+        }
+
+        /// The same for a desktop-only action: refused with D16's sentence, and
+        /// no file manager is spawned on the host's machine.
+        #[test]
+        fn a_desktop_only_frame_is_refused_with_the_host_only_sentence() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(7, names::OPEN_WORKTREE_IN_FILE_MANAGER, None),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::HOST_ONLY_REFUSAL)
+            );
+        }
+
+        /// A name this build does not have never reaches a dispatch, at either
+        /// layer.
+        #[test]
+        fn an_unknown_name_is_refused_by_the_applier_too() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(8, "git_force_push", None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("git_force_push"));
+        }
+
+        // ===============================================================
+        // D13: the shared dialog
+        // ===============================================================
+
+        /// The one dialog open on the host, as the browser would receive it.
+        ///
+        /// The workspace is not decoration: artboard 1g's gate names a live
+        /// session or project, so the view a browser gets is a function of both
+        /// the prompt and the state it is about (§6.5 R13).
+        fn maybe_view(ui: &Ui, ws: &Workspace) -> Option<crate::web::protocol::DialogView> {
+            web_dialog_view(ui, &ws.active_project().name, &ws.active_project().state)
+        }
+
+        fn view(ui: &Ui, ws: &Workspace) -> crate::web::protocol::DialogView {
+            web_dialog_view(ui, &ws.active_project().name, &ws.active_project().state)
+                .expect("a dialog is open")
+        }
+
+        /// The body the host serialised into `DialogView::body`.
+        fn body(view: &crate::web::protocol::DialogView) -> crate::web::protocol::DialogBody {
+            serde_json::from_value(view.body.clone().expect("the dialog carries a body"))
+                .expect("the body is a DialogBody")
+        }
+
+        fn keys(body: &crate::web::protocol::DialogBody) -> Vec<String> {
+            body.buttons.iter().map(|b| b.key.clone()).collect()
+        }
+
+        /// Open the three-target new-agent form against the git trait seam.
+        fn open_new_agent(ws: &Workspace, ui: &mut Ui, origin: crate::web::protocol::DialogOrigin) {
+            let git = FakeGit::new().with_branches(["main", "feature/existing"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            ui.web_origin = Some(origin);
+            start_new_tab_flow(&ws.active_project().state, &services, ui);
+        }
+
+        /// A `dialog_confirm` / `dialog_cancel` frame for the dialog that is
+        /// open, with whatever the browser filled in.
+        fn answer(seq: u64, name: &str, ui: &Ui, args: serde_json::Value) -> WireCommand {
+            let mut object = args;
+            object["dialog_id"] = json!(ui.dialog_id().expect("a dialog is open").as_str());
+            frame(seq, name, Some(object))
+        }
+
+        /// **D13's core claim.** A browser row whose desktop behaviour is "ask
+        /// something" opens the question instead of acting, and the dialog that
+        /// appears is tagged with the browser that asked — which is what makes
+        /// the modal the desktop user did not ask for acceptable.
+        #[test]
+        fn a_command_that_needs_a_dialog_opens_one_tagged_with_its_origin() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert_eq!(ack.detail.as_deref(), Some(DIALOG_OPENED_DETAIL));
+            let view = view(&ui, &ws);
+            assert_eq!(view.kind, "unpair_phone");
+            assert_eq!(view.origin, browser_origin(), "D13: tagged with who asked");
+            // And the desktop is rendering the origin sentence, not just holding
+            // the structured fact.
+            assert_eq!(
+                ui.prompt.as_ref().and_then(|p| p.dialog.origin.as_deref()),
+                Some("opened from browser · 192.168.2.20"),
+            );
+        }
+
+        /// A dialog the *desktop* opened carries `DialogOrigin::Desktop` and no
+        /// origin line — and still reaches the browser, because D13 makes the
+        /// dialog app state in both directions.
+        #[test]
+        fn a_desktop_dialog_reaches_the_browser_with_no_origin_line() {
+            let ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            let git = FakeGit::new().with_branches(["main"]);
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git: &git,
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+
+            start_new_tab_flow(&ws.projects[0].state, &services, &mut ui);
+
+            let view = view(&ui, &ws);
+            assert_eq!(view.origin, crate::web::protocol::DialogOrigin::Desktop);
+            assert!(ui
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.dialog.origin.is_none()));
+        }
+
+        /// Artboard 1e: the new-agent dialog reaches the browser as the same
+        /// shell the desktop is drawing — the agent radio as a list, the branch
+        /// as an input, and `Enter` / `Tab` / `Esc` as its keys.
+        #[test]
+        fn the_new_agent_dialog_carries_artboard_1es_form() {
+            let ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            open_new_agent(&ws, &mut ui, browser_origin());
+
+            let view = view(&ui, &ws);
+            let body = body(&view);
+            assert_eq!(body.input.as_deref(), Some(""), "1e's branch field");
+            assert_eq!(body.list.len(), 1, "one registered agent, one radio row");
+            assert!(body.list[0].label.contains("Codex"));
+            assert!(body.list[0].selected, "the default agent is preselected");
+            assert_eq!(keys(&body), vec!["Enter", "Tab", "Esc"]);
+            assert!(body.confirmable, "the browser may answer this one");
+            assert_eq!(body.refusal, None);
+        }
+
+        /// The browser sends `Tab` to the host, which cycles the complete form
+        /// through new, existing and base targets on both surfaces.
+        #[test]
+        fn the_browser_cycles_all_three_new_agent_targets_on_the_host() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            open_new_agent(&ws, &mut ui, browser_origin());
+            let initial = body(&view(&ui, &ws));
+            assert!(initial.input.is_some());
+            assert!(!initial.list_filter);
+
+            let cycle = |seq, args, ws: &mut Workspace, ui: &mut Ui| {
+                let command = answer(seq, names::DIALOG_CONFIRM, ui, args);
+                run(ws, ui, &command)
+            };
+
+            let ack = cycle(
+                1,
+                json!({ "choice": "Tab", "text": "existing", "list_index": 0 }),
+                &mut ws,
+                &mut ui,
+            );
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{:?}", ack.detail);
+            let existing = body(&view(&ui, &ws));
+            assert_eq!(
+                existing.input.as_deref(),
+                Some(""),
+                "the host clears the field when changing target modes"
+            );
+            assert!(existing.list_filter);
+            assert_eq!(existing.list[0].label, "feature/existing");
+            assert!(view(&ui, &ws).title.contains("existing branch"));
+
+            assert_eq!(
+                cycle(
+                    2,
+                    json!({ "choice": "Tab", "text": "existing", "list_index": 0 }),
+                    &mut ws,
+                    &mut ui,
+                )
+                .outcome,
+                AckOutcome::Applied
+            );
+            let base = body(&view(&ui, &ws));
+            assert_eq!(base.input, None);
+            assert!(!base.list_filter);
+            assert!(view(&ui, &ws).title.contains("no worktree"));
+
+            assert_eq!(
+                cycle(
+                    3,
+                    json!({ "choice": "Tab", "list_index": 0 }),
+                    &mut ws,
+                    &mut ui,
+                )
+                .outcome,
+                AckOutcome::Applied
+            );
+            let new_branch = body(&view(&ui, &ws));
+            assert_eq!(new_branch.input.as_deref(), Some(""));
+            assert!(!new_branch.list_filter);
+            assert!(new_branch.list[0].label.contains("Codex"));
+        }
+
+        /// **§6.5 R19: which button cancels is the host's word, not the SPA's.**
+        ///
+        /// The dialogs do not agree on a cancel key — `n` in the close
+        /// confirmations, `Esc` in the forms — so the browser was appending an
+        /// `Esc Cancel` of its own beside the host's, giving 1g's step 1 three
+        /// buttons, two of which cancelled. The flag is the same rule
+        /// `dialog_decision` reads, so the two cannot drift.
+        #[test]
+        fn every_dialog_names_the_button_that_cancels_it() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            // A form: the cancel is `Esc`, and nothing else claims to cancel.
+            open_new_agent(&ws, &mut ui, browser_origin());
+            let form = body(&view(&ui, &ws));
+            let cancels: Vec<&str> = form
+                .buttons
+                .iter()
+                .filter(|b| b.cancels)
+                .map(|b| b.key.as_str())
+                .collect();
+            assert_eq!(cancels, vec!["Esc"]);
+
+            // A y/n confirmation: the cancel is `n`, which is exactly the button
+            // the browser must stop drawing a second time.
+            ui.clear();
+            run(&mut ws, &mut ui, &frame(2, names::UNPAIR_PHONE, None));
+            let confirm = body(&view(&ui, &ws));
+            assert_eq!(keys(&confirm), vec!["y", "n"]);
+            assert!(!confirm.buttons[0].cancels, "`y Unpair` decides");
+            assert!(confirm.buttons[1].cancels, "`n Cancel` dismisses");
+        }
+
+        /// Either surface can confirm (D13). The browser's confirm goes through
+        /// the very keypress the desktop's own `Enter` produces, so the dialog
+        /// closes and the outcome recorded for the other surface is `Confirmed`.
+        #[test]
+        fn the_browser_can_confirm_and_the_other_surface_is_told_confirmed() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            assert_eq!(view(&ui, &ws).kind, "unpair_phone");
+            let id = ui.dialog_id().expect("open");
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none(), "the dialog closed");
+            assert!(ui.pending_unpair, "the primary action really ran");
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Confirmed)]);
+        }
+
+        /// The other direction, which is the half a browser-only implementation
+        /// would get wrong: the **desktop** answers a dialog the browser opened,
+        /// and the browser is told it was confirmed rather than replaced.
+        #[test]
+        fn the_desktop_can_confirm_a_browser_opened_dialog() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            assert!(ui.prompt.is_none());
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Confirmed)]);
+        }
+
+        /// Cancelling from either surface, and the outcome the other one reads.
+        #[test]
+        fn the_browser_can_cancel_and_the_other_surface_is_told_cancelled() {
+            use crate::web::protocol::DialogOutcome;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+
+            let ack = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none());
+            assert!(!ui.pending_unpair, "cancelling ran nothing");
+            assert_eq!(ui.dialog_decisions, vec![(id, DialogOutcome::Cancelled)]);
+        }
+
+        /// The desktop's cancel key differs per dialog (`n`, `c`, `Esc`) and the
+        /// wire outcome must not: the decision is read off the button's label,
+        /// not off a table of key spellings.
+        #[test]
+        fn a_dialogs_own_cancel_button_reports_cancelled_whatever_its_key() {
+            use crate::web::protocol::DialogOutcome;
+            let n_cancel = Dialog::confirm(
+                "Close shell 2?",
+                vec![
+                    DialogButton::new(DialogAccel::Char('y'), "Close"),
+                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                ],
+            );
+            let c_cancel = Dialog::confirm(
+                "Push the committed changes only?",
+                vec![
+                    DialogButton::new(DialogAccel::Char('p'), "Push committed"),
+                    DialogButton::new(DialogAccel::Char('c'), "Cancel"),
+                ],
+            );
+            let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(
+                dialog_decision(&n_cancel, press('n')),
+                DialogOutcome::Cancelled
+            );
+            assert_eq!(
+                dialog_decision(&n_cancel, press('y')),
+                DialogOutcome::Confirmed
+            );
+            assert_eq!(
+                dialog_decision(&c_cancel, press('c')),
+                DialogOutcome::Cancelled
+            );
+            assert_eq!(
+                dialog_decision(&c_cancel, press('p')),
+                DialogOutcome::Confirmed
+            );
+            // `Clear` in the status menu is a decision, not a dismissal.
+            let clear = Dialog::confirm(
+                "Set status override",
+                vec![DialogButton::new(DialogAccel::Char('c'), "Clear")],
+            );
+            assert_eq!(
+                dialog_decision(&clear, press('c')),
+                DialogOutcome::Confirmed
+            );
+        }
+
+        /// A browser may only press a key the dialog is showing. `choice` is the
+        /// button's own key label, so there is no way to reach an action the
+        /// person at the desktop cannot see.
+        #[test]
+        fn a_choice_the_dialog_is_not_showing_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "q" }));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("no `q` button"), "{detail}");
+            assert!(ui.prompt.is_some(), "the dialog is untouched");
+        }
+
+        /// `Esc` is a cancel, and cancelling has its own frame. Answering
+        /// `dialog_confirm` with it is refused rather than quietly treated as a
+        /// confirmation — the other surface would be told the wrong outcome.
+        #[test]
+        fn confirming_with_the_cancel_key_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            open_new_agent(&ws, &mut ui, browser_origin());
+
+            let ack = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "Esc" }));
+            let ack = run(&mut ws, &mut ui, &ack);
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("dialog_cancel"));
+            assert!(ui.prompt.is_some());
+        }
+
+        /// **The 1g ruling, as a table.** Three answers are behind step 2 from a
+        /// browser, and they are the ones that destroy work or rewrite history.
+        ///
+        /// The artboard's caption says *"Abandon and Quit are the only two that
+        /// reach step 2"* while the artboard itself **draws Rebase Worktree** as
+        /// its two-step example, and step 2's own copy reads *"This browser is
+        /// remote…"*. The drawn artboard wins, and the copy says why: the
+        /// trigger is the surface being remote, not the command being
+        /// destructive. So the caption is counting the desktop's world — where
+        /// nothing reaches step 2 at all — and this is the remote one, covering
+        /// the superset the pixels demonstrate. See `specs/WEB_INTERFACE.md`
+        /// §6.5 R13.
+        #[test]
+        fn exactly_three_answers_are_behind_step_two_from_a_browser() {
+            use crate::web::commands::BrowserConfirm;
+            let gated = |prompt: &Prompt| match browser_confirm_gate(prompt) {
+                BrowserConfirm::TypedName(gate) => {
+                    // The key it guards must be a button the dialog is really
+                    // showing, or the gate would stand in front of nothing.
+                    let dialog = prompt_dialog(prompt);
+                    assert!(
+                        dialog
+                            .buttons
+                            .iter()
+                            .any(|b| dialog_accel_key(b.accel) == gate.key),
+                        "the gate guards `{}`, which this dialog does not show: {:?}",
+                        gate.key,
+                        dialog.buttons
+                    );
+                    true
+                }
+                BrowserConfirm::OneStep => false,
+            };
+
+            for prompt in [
+                Prompt::AbandonConfirm { dirty: true },
+                Prompt::AbandonConfirm { dirty: false },
+                Prompt::RebaseConfirm {
+                    agent_branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
+                    drift: 2,
+                    primary_running: true,
+                },
+                Prompt::QuitConfirm,
+            ] {
+                assert!(
+                    gated(&prompt),
+                    "{:?} destroys work or rewrites history",
+                    dialog_kind(&prompt)
+                );
+            }
+
+            for prompt in [
+                // SPECS §14/§15: neither rewrites history nor discards work — a
+                // push is undone by a push, a merge-back is a commit on base.
+                Prompt::PushConfirm,
+                Prompt::MergeConfirm {
+                    agent_branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
+                    primary_running: false,
+                },
+                // The sidebar's close menu: `a` only dispatches the unconfirmed
+                // abandon, which asks. The gate belongs on the question it
+                // opens, and it is there.
+                Prompt::CloseAgentChoice { index: 0 },
+                Prompt::CloseTab {
+                    actions: vec![CloseAction::CtrlCPrimary],
+                },
+                Prompt::CloseChildConfirm {
+                    label: "shell 2".to_string(),
+                },
+                Prompt::RenameTab {
+                    buffer: String::new(),
+                },
+                Prompt::SetManualStatus,
+                Prompt::SelectChildAgent { agents: vec![] },
+                Prompt::CloseProjectConfirm { index: 0 },
+                Prompt::UnpairConfirm,
+            ] {
+                assert!(
+                    !gated(&prompt),
+                    "{:?} is one step, exactly as on the desktop",
+                    dialog_kind(&prompt)
+                );
+            }
+        }
+
+        /// **The destructive family (`remote-control-ll5.4`, artboard 1g): a
+        /// wrong name refuses and the worktree provably survives; cancelling is
+        /// never gated.**
+        ///
+        /// The gate is checked before a single key is fed into the prompt, so
+        /// "nothing was abandoned" is asserted three ways: the question is still
+        /// open, the tab is still in the workspace, and no decision was
+        /// witnessed for the other surface to be told about.
+        #[test]
+        fn a_destructive_confirmation_needs_the_exact_session_name() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            // The desktop opens it; D13 shares it either way.
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: true });
+
+            let view = view(&ui, &ws);
+            let body = body(&view);
+            assert_eq!(view.kind, "confirm_abandon");
+            assert!(
+                body.confirmable,
+                "ll5.4 lifts the flat refusal: a browser confirms through step 2"
+            );
+            assert_eq!(body.refusal, None);
+            let gate = body.confirm_gate.clone().expect("1g's step 2 is published");
+            assert_eq!(gate.key, "y");
+            assert_eq!(
+                gate.expected, "Task",
+                "1g hints the *session* name, not the branch it lives on"
+            );
+
+            for wrong in [
+                "",
+                "task",
+                "TASK",
+                "Task ",
+                " Task",
+                "Tas",
+                "flightdeck/Task",
+            ] {
+                let confirm = answer(
+                    1,
+                    names::DIALOG_CONFIRM,
+                    &ui,
+                    json!({ "confirm_name": wrong }),
+                );
+                let ack = run(&mut ws, &mut ui, &confirm);
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{wrong}`");
+                assert!(ui.prompt.is_some(), "`{wrong}` left the question open");
+                assert_eq!(
+                    ws.projects[0].state.tabs.len(),
+                    1,
+                    "`{wrong}` must not have abandoned anything"
+                );
+                assert!(
+                    ui.dialog_decisions.is_empty(),
+                    "`{wrong}` never reached the prompt, so nothing was decided"
+                );
+            }
+
+            // Step 1 alone: pressing the button and sending no name at all.
+            let confirm = answer(2, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("confirm_name"));
+            assert!(ui.prompt.is_some());
+            assert_eq!(ws.projects[0].state.tabs.len(), 1);
+
+            // And the half R8 insists on: cancelling is never gated. A shared
+            // dialog a remote surface can see but not dismiss would be worse
+            // than not sharing it — so no name, and it closes.
+            let cancel = answer(3, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none(), "cancelling is always allowed");
+            assert_eq!(
+                ws.projects[0].state.tabs.len(),
+                1,
+                "cancelling destroyed nothing"
+            );
+            assert_eq!(
+                ui.dialog_decisions,
+                vec![(
+                    view.dialog_id.clone(),
+                    crate::web::protocol::DialogOutcome::Cancelled
+                )]
+            );
+        }
+
+        /// 1g's own drawing is the rebase, and SPECS §5.1 is why: it is the one
+        /// sanctioned history rewrite, so from a browser it takes both steps.
+        /// The two git confirmations that rewrite nothing (§14 push, §15 merge)
+        /// stay one step — a gate there would be ceremony, and ceremony teaches
+        /// people to type the name without reading it.
+        #[test]
+        fn the_rewrite_is_gated_and_the_other_git_confirmations_are_not() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            start_prompt(
+                &mut ui,
+                Prompt::RebaseConfirm {
+                    agent_branch: "flightdeck/Task".to_string(),
+                    base_branch: "main".to_string(),
+                    drift: 4,
+                    primary_running: true,
+                },
+            );
+            // The browser reads the same question the desktop does — the
+            // branches and §12's drift — before it answers (R11).
+            let question = view(&ui, &ws);
+            assert!(
+                question.title.contains("target advanced 4 commits"),
+                "{}",
+                question.title
+            );
+            let gate = body(&question)
+                .confirm_gate
+                .expect("§5.1's rewrite takes both steps from a browser");
+            assert_eq!(gate.expected, "Task");
+            assert_eq!(
+                gate.instruction,
+                crate::web::commands::GATE_REBASE_INSTRUCTION,
+                "artboard 1g's step 2 copy, verbatim"
+            );
+
+            // A confirm with no name gets nowhere near `GitExecutor::rebase_onto`.
+            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ui.prompt.is_some(), "the question is still open");
+            assert!(
+                git.rebases().is_empty(),
+                "SPECS §5.1: nothing was rewritten"
+            );
+
+            for prompt in [
+                Prompt::PushConfirm,
+                Prompt::MergeConfirm {
+                    agent_branch: "flightdeck/Task".to_string(),
+                    base_branch: "main".to_string(),
+                    primary_running: false,
+                },
+            ] {
+                start_prompt(&mut ui, prompt);
+                let one_step = view(&ui, &ws);
+                let body = body(&one_step);
+                assert!(body.confirmable);
+                assert!(
+                    body.confirm_gate.is_none(),
+                    "§14/§15 are one step: {:?}",
+                    body.confirm_gate
+                );
+            }
+        }
+
+        /// A gate the host cannot resolve is a refusal, not a shortcut. The tab
+        /// the question was about is gone, so there is no name to check — and
+        /// confirming past that would destroy something nobody named.
+        #[test]
+        fn a_gate_with_nothing_to_name_refuses_but_still_cancels() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: false });
+
+            let body = body(&view(&ui, &ws));
+            assert!(!body.confirmable, "there is nothing to type back");
+            assert_eq!(
+                body.refusal.as_deref(),
+                Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)
+            );
+            assert!(body.confirm_gate.is_none());
+
+            let confirm = answer(
+                1,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "Task" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::GATE_UNRESOLVED_REFUSAL)
+            );
+            assert!(ui.prompt.is_some());
+
+            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+            assert_eq!(
+                ack.outcome,
+                AckOutcome::Applied,
+                "cancelling is never gated"
+            );
+            assert!(ui.prompt.is_none());
+        }
+
+        /// **The git confirmations are answerable from a browser**
+        /// (`remote-control-ll5.5`, SPECS §5.1/§14/§15). Before that task all
+        /// three refused a browser's confirm outright; that gate is gone,
+        /// because these dialogs *are* §5's confirmation and D13 already shares
+        /// them — the browser reads the same words the desktop does before it
+        /// answers.
+        ///
+        /// `remote-control-ll5.4` tightened one of the three: §5.1's rebase now
+        /// takes artboard 1g's typed name as well, and that half is pinned in
+        /// `the_rewrite_is_gated_and_the_other_git_confirmations_are_not`. This
+        /// test keeps the *un*gated half honest, on §14's push.
+        ///
+        /// The refusal the browser gets here is the **dispatch's** own (this
+        /// workspace has no tab to push), which is the whole point: the confirm
+        /// was accepted and reached the real command, and the sentence came back
+        /// from the guard rather than from a gate standing in front of it.
+        #[test]
+        fn a_git_dialog_is_confirmable_from_a_browser_and_acks_the_dispatch() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::PushConfirm);
+
+            let view = view(&ui, &ws);
+            let body = body(&view);
+            assert_eq!(view.kind, "confirm_push");
+            assert!(body.confirmable, "the git gate is lifted (ll5.5)");
+            assert_eq!(body.refusal, None);
+            assert!(
+                body.confirm_gate.is_none(),
+                "§14 rewrites nothing, so it stays one step (ll5.4)"
+            );
+
+            let confirm = answer(1, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            // Accepted, dispatched, and refused by the command's own guard —
+            // never by a gate in front of it.
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(
+                detail.contains("no tab selected"),
+                "the guard's own words, not a gate's: {detail}"
+            );
+            assert!(ui.prompt.is_none(), "the dialog was answered, not blocked");
+        }
+
+        /// D13 + SPECS §5, the other half: cancelling a git confirmation is
+        /// still always allowed, and still tells the other surface the dialog
+        /// was dismissed rather than confirmed.
+        #[test]
+        fn a_git_dialog_can_still_be_cancelled_from_a_browser() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::PushConfirm);
+
+            let cancel = answer(1, names::DIALOG_CANCEL, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &cancel);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_none());
+        }
+
+        /// **The git rows dispatch, and their refusals are the host's own.**
+        ///
+        /// This workspace has no Agent Session Tab, so every one of them hits
+        /// the same guard — which is exactly what makes the assertion useful:
+        /// the browser is handed the sentence the dispatch produced, not a
+        /// generic "that failed" and not the blanket refusal these rows carried
+        /// before this task. `pull_base` is the deliberate exception (SPECS
+        /// §5.2) and answers with the boundary decision instead.
+        #[test]
+        fn the_git_rows_reach_the_dispatch_and_ack_its_own_words() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            for (seq, name) in [
+                (10, names::REBASE_WORKTREE),
+                (11, names::PUSH_BRANCH),
+                (12, names::FINISH_LOCAL_MERGE),
+            ] {
+                let ack = run(&mut ws, &mut ui, &frame(seq, name, None));
+                assert_eq!(ack.outcome, AckOutcome::Rejected, "for `{name}`");
+                let detail = ack.detail.expect("a refusal states its reason");
+                assert!(
+                    detail.contains("no tab selected"),
+                    "`{name}` must ack the dispatch's own sentence: {detail}"
+                );
+                assert!(ui.prompt.is_none(), "`{name}` opened nothing");
+            }
+
+            let ack = run(&mut ws, &mut ui, &frame(13, names::PULL_BASE, None));
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some(crate::web::commands::PULL_BASE_REFUSAL),
+                "§5.2's row refuses with the boundary decision, not with a guard"
+            );
+        }
+
+        /// An answer for a dialog that has been replaced is refused, not applied
+        /// to whatever is on screen now. That is the mechanism behind "nobody
+        /// confirms something they never read".
+        #[test]
+        fn an_answer_for_a_replaced_dialog_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let stale = ui.dialog_id().expect("open");
+            // The desktop moves on to a different question.
+            start_prompt(&mut ui, Prompt::SetManualStatus);
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    2,
+                    names::DIALOG_CONFIRM,
+                    Some(json!({ "dialog_id": stale.as_str() })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            let detail = ack.detail.expect("a refusal states its reason");
+            assert!(detail.contains("replaced"), "{detail}");
+            assert!(ui.prompt.is_some(), "the live dialog is untouched");
+        }
+
+        /// Answering when nothing is open is refused with the reason, not
+        /// silently ignored: the browser's view is behind and needs to say so.
+        #[test]
+        fn an_answer_with_no_dialog_open_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    1,
+                    names::DIALOG_CANCEL,
+                    Some(json!({ "dialog_id": "dialog-9" })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("No dialog is open"));
+        }
+
+        /// An answer with no `dialog_id` is a refusal, not a guess at whichever
+        /// dialog happens to be open.
+        #[test]
+        fn an_answer_that_names_no_dialog_is_refused() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+
+            let ack = run(&mut ws, &mut ui, &frame(2, names::DIALOG_CONFIRM, None));
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack
+                .detail
+                .expect("a refusal states its reason")
+                .contains("dialog_id"));
+            assert!(ui.prompt.is_some());
+        }
+
+        /// **The `Superseded` policy.** A second dialog arriving while one is
+        /// open replaces it, and the browser is told the first one was
+        /// `Superseded` — never left holding a modal it can still answer, and
+        /// never told a decision was made. The diff is what says it, because the
+        /// diff is the only thing that witnessed a dialog vanish without one.
+        #[test]
+        fn a_replaced_dialog_is_reported_superseded_and_the_new_one_opened() {
+            use crate::web::protocol::{Delta, DialogOutcome};
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let first = ui.dialog_id().expect("open");
+            let published = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+
+            start_prompt(&mut ui, Prompt::SetManualStatus);
+            let next = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+            let second = ui.dialog_id().expect("open");
+            assert_ne!(first, second, "a replacement gets its own id");
+
+            let mut frames = crate::web::stream::deltas(&published, &next);
+            resolve_dialog_outcomes(&mut frames, &ui.dialog_decisions);
+
+            assert!(
+                matches!(
+                    frames.as_slice(),
+                    [
+                        Delta::DialogClosed {
+                            outcome: DialogOutcome::Superseded,
+                            ..
+                        },
+                        Delta::DialogOpened(_),
+                    ]
+                ),
+                "{frames:?}"
+            );
+            let Delta::DialogClosed { dialog_id, .. } = &frames[0] else {
+                unreachable!()
+            };
+            assert_eq!(dialog_id, &first);
+        }
+
+        /// The other side of the same coin: where somebody *did* decide, the
+        /// diff's `Superseded` is upgraded to the real outcome. Without this the
+        /// browser would be told "replaced" about a dialog the desktop answered.
+        #[test]
+        fn a_decided_dialog_is_reported_with_the_decision_not_superseded() {
+            use crate::web::protocol::{Delta, DialogOutcome};
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            run(&mut ws, &mut ui, &frame(1, names::UNPAIR_PHONE, None));
+            let id = ui.dialog_id().expect("open");
+            let published = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+
+            let cancel = answer(2, names::DIALOG_CANCEL, &ui, json!({}));
+            run(&mut ws, &mut ui, &cancel);
+            let next = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+
+            let mut frames = crate::web::stream::deltas(&published, &next);
+            assert!(
+                matches!(
+                    frames.as_slice(),
+                    [Delta::DialogClosed {
+                        outcome: DialogOutcome::Superseded,
+                        ..
+                    }]
+                ),
+                "the diff alone can only say Superseded: {frames:?}"
+            );
+            resolve_dialog_outcomes(&mut frames, &ui.dialog_decisions);
+            assert_eq!(
+                frames,
+                vec![Delta::DialogClosed {
+                    dialog_id: id,
+                    outcome: DialogOutcome::Cancelled,
+                }]
+            );
+        }
+
+        /// D14: a read-only observer has no input, so it cannot answer a dialog
+        /// either. The check is the table's, one step before the host — an
+        /// observer is told `read_only` rather than being handed the reason a
+        /// command it may not send would have failed.
+        #[test]
+        fn an_observer_cannot_answer_a_dialog() {
+            for name in [names::DIALOG_CONFIRM, names::DIALOG_CANCEL] {
+                let spec = crate::web::commands::lookup(name).expect("in the inventory");
+                assert!(
+                    spec.requires_control(),
+                    "`{name}` must be a controller's frame (D14)"
+                );
+            }
+        }
+
+        /// A dialog id is never reused, so a stale answer cannot land on a new
+        /// dialog by matching its id.
+        #[test]
+        fn dialog_ids_are_never_reused() {
+            let mut ui = Ui::default();
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..5 {
+                start_prompt(&mut ui, Prompt::SetManualStatus);
+                assert!(seen.insert(ui.dialog_id().expect("open")));
+            }
+        }
+
+        /// D11: read-marking still works through the unified applier — the frame
+        /// that used to be special-cased in the drain now routes off the same
+        /// table as everything else.
+        #[test]
+        fn marking_activity_read_still_routes_through_the_table() {
+            let spec = crate::web::commands::lookup(names::MARK_ACTIVITY_READ)
+                .expect("the feed command is in the inventory");
+            assert_eq!(spec.route, crate::web::commands::Route::ActivityRead);
+        }
+
+        // -------------------------------------------------------------------
+        // SPECS §21's panel (`remote-control-ll5.8`, §6.5 R16)
+        // -------------------------------------------------------------------
+
+        /// A worktree status with an upstream, a compare URL and dirt — the
+        /// fullest panel there is, so a test asserting a field is absent has
+        /// something to have removed it from.
+        fn full_status() -> crate::git::status::WorktreeStatus {
+            crate::git::status::WorktreeStatus {
+                branch: "flightdeck/fix-login-redirect".to_string(),
+                base_branch: "main".to_string(),
+                dirty: true,
+                changes: crate::git::status::WorktreeChanges {
+                    added: 3,
+                    modified: 2,
+                    deleted: 1,
+                },
+                ahead: 4,
+                behind: 1,
+                upstream: Some("origin/flightdeck/fix-login-redirect".to_string()),
+                base_drift: 7,
+                worktree_path: PathBuf::from("/repo/../worktrees/fix-login-redirect"),
+            }
+        }
+
+        /// Apply one `Effect::GitStatus` as if it came from `origin`, and hand
+        /// back what the desktop and the browser each ended up with.
+        fn apply_git_status(
+            ws: &Workspace,
+            ui: &mut Ui,
+            status: crate::git::status::WorktreeStatus,
+            pr_url: Option<&str>,
+            from_browser: bool,
+        ) {
+            ui.web_origin = from_browser.then(browser_origin);
+            apply_effect(
+                Effect::GitStatus {
+                    status: Box::new(status),
+                    pr_url: pr_url.map(str::to_string),
+                },
+                &ws.projects[0].state,
+                ui,
+            );
+            ui.web_origin = None;
+        }
+
+        /// The routing decision R16 makes, both ways round, in one test —
+        /// because it is one rule and a test per direction would let half of it
+        /// rot.
+        ///
+        /// A browser's read is answered *to that browser* and leaves the
+        /// desktop alone: R8 established this is not one of D13's shared
+        /// dialogs, so there is nothing for the person at the machine to
+        /// answer, and a panel they never asked for is an obstruction. The
+        /// desktop's own read is unchanged and opens the desktop's overlay.
+        #[test]
+        fn a_browsers_git_status_answers_the_browser_and_never_the_desktop() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+
+            let mut browser = Ui::default();
+            apply_git_status(&ws, &mut browser, full_status(), None, true);
+            assert!(
+                matches!(browser.overlay, UiOverlay::None),
+                "a browser's read must not put a panel on the desktop"
+            );
+            let view = browser.web_git_status.expect("the browser is answered");
+            assert_eq!(view.branch, "flightdeck/fix-login-redirect");
+            assert_eq!(view.session_name, "Task");
+
+            let mut desktop = Ui::default();
+            apply_git_status(&ws, &mut desktop, full_status(), None, false);
+            assert!(
+                matches!(desktop.overlay, UiOverlay::GitStatus { .. }),
+                "the desktop's own read still opens the desktop's overlay"
+            );
+            assert!(
+                desktop.web_git_status.is_none(),
+                "and sends nothing to a browser that did not ask"
+            );
+        }
+
+        /// Every field is the status's, and SPECS §21's facts all survive the
+        /// crossing. The counts live *inside* the upstream, so the panel cannot
+        /// carry commits ahead of a remote that does not exist.
+        #[test]
+        fn the_panel_carries_specs_21s_facts_verbatim() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            apply_git_status(
+                &ws,
+                &mut ui,
+                full_status(),
+                Some("https://github.com/o/r/compare/main...flightdeck/fix-login-redirect"),
+                true,
+            );
+            let view = ui.web_git_status.expect("the browser is answered");
+
+            assert_eq!(view.base_branch, "main");
+            assert_eq!(view.base_drift, 7);
+            assert!(view.dirty);
+            assert_eq!(view.changed_files, 6);
+            let upstream = view.upstream.expect("the branch has been pushed");
+            assert_eq!(upstream.name, "origin/flightdeck/fix-login-redirect");
+            assert_eq!((upstream.ahead, upstream.behind), (4, 1));
+            assert_eq!(
+                view.compare_url.as_deref(),
+                Some("https://github.com/o/r/compare/main...flightdeck/fix-login-redirect")
+            );
+        }
+
+        /// The unknowns, and the shape of "unknown" the wire uses for each.
+        ///
+        /// A branch with no upstream has no ahead/behind — not `0`/`0`, which
+        /// is what the underlying `WorktreeStatus` happens to hold and what a
+        /// less careful mapping would forward as a fact. And an unpushed branch
+        /// has no compare URL, which is absence rather than an empty string:
+        /// §5 forbids FlightDeck from creating a pull request, so a fabricated
+        /// compare link would be an invitation to one that does not exist.
+        #[test]
+        fn an_unpushed_branch_carries_no_upstream_and_no_compare_url() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            let mut status = full_status();
+            status.upstream = None;
+            // Exactly the numbers `collect_status` leaves behind when it never
+            // looked: they must not reach the browser.
+            status.ahead = 0;
+            status.behind = 0;
+            apply_git_status(&ws, &mut ui, status, None, true);
+
+            let view = ui.web_git_status.expect("the browser is answered");
+            assert!(view.upstream.is_none());
+            assert!(view.compare_url.is_none());
+        }
+
+        /// A refused dispatch produces no panel at all.
+        ///
+        /// `show_git_status` needs a selected tab; a project with none makes
+        /// the dispatch fail, and the browser is told so in the host's own
+        /// words. What it is *not* handed is an empty panel — nothing was
+        /// collected, so there is nothing to render, and a panel of blanks
+        /// would be the guess §5.1 rules out.
+        #[test]
+        fn a_refused_git_status_sends_no_panel() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply(&mut ws, &mut ui, &frame(9, names::SHOW_GIT_STATUS, None));
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            assert!(reply.git_status.is_none());
+            // Nor a panel on the desktop. (The desktop does get the refusal as
+            // its usual toast — that is `ui.message`'s job for every refused
+            // command and predates this task — but no git-status overlay.)
+            assert!(!matches!(ui.overlay, UiOverlay::GitStatus { .. }));
+        }
+
+        /// The row is forwarded now, and the frame it answers is named on the
+        /// panel — so a browser can tell its own request apart from one it no
+        /// longer has an overlay for.
+        #[test]
+        fn the_panel_names_the_frame_it_answers() {
+            let dir = TempDir::new().expect("tmp");
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_a_tab(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            apply_git_status(&ws, &mut ui, full_status(), None, true);
+            // `apply_effect` cannot know the seq; `run_web_command` stamps it.
+            assert_eq!(ui.web_git_status.expect("answered").seq, 0);
+
+            let spec =
+                crate::web::commands::lookup(names::SHOW_GIT_STATUS).expect("the row is offered");
+            assert!(
+                matches!(spec.route, crate::web::commands::Route::Palette(_)),
+                "the row dispatches as of ll5.8"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // SPECS §8's configuration manager (`remote-control-1p22`, §6.5 R22)
+        // -------------------------------------------------------------------
+
+        /// A FakeFs holding the two config files this project layers, so a test
+        /// can assert an origin tag against a file it wrote itself.
+        ///
+        /// `global` is seeded rather than left to `ensure_global_config`
+        /// precisely so the layering under test is the test's, not the shipped
+        /// template's.
+        fn seeded_config_fs(global: &str, project: &str) -> (FakeFs, PathBuf, PathBuf) {
+            let fs = FakeFs::new();
+            let global_path = global_config_path().expect("HOME must be set for this test to run");
+            let project_path = PathBuf::from("/repo/.flightdeck/config.toml");
+            fs.write(&global_path, global)
+                .expect("seed the global base");
+            fs.write(&project_path, project)
+                .expect("seed the project override");
+            (fs, global_path, project_path)
+        }
+
+        /// A frame naming `open_configuration`, with or without staged edits.
+        fn config_frame(seq: u64, changes: serde_json::Value) -> WireCommand {
+            let args = if changes.as_array().is_some_and(|a| a.is_empty()) {
+                None
+            } else {
+                Some(json!({ "changes": changes }))
+            };
+            frame(seq, names::OPEN_CONFIGURATION, args)
+        }
+
+        fn row<'a>(
+            rows: &'a [crate::web::protocol::ConfigRowView],
+            key: &str,
+        ) -> &'a crate::web::protocol::ConfigRowView {
+            rows.iter()
+                .find(|r| r.key == key)
+                .unwrap_or_else(|| panic!("no `{key}` row: {:?}", rows.iter().map(|r| &r.key)))
+        }
+
+        /// The row forwards now, and what comes back is the host's own layering
+        /// — read off the two files on the host's disk, with the host's own
+        /// keys and the host's own three origin tags.
+        ///
+        /// It is also the R16 routing rule, applied a second time: a browser's
+        /// read answers *that browser* and leaves the desktop alone. Nothing
+        /// opens in `Ui::config`, because a configuration modal the person at
+        /// the keyboard never asked for is an obstruction.
+        #[test]
+        fn a_browsers_open_configuration_is_answered_with_the_hosts_own_layering() {
+            let (fs, _, _) = seeded_config_fs("[notifications]\nenabled = false\n", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(&fs, &mut ws, &mut ui, &config_frame(4, json!([])));
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let view = reply.config.expect("the browser is answered");
+            assert_eq!(view.seq, 4, "`run_web_command` stamps the frame it answers");
+            assert!(
+                ui.config.is_none(),
+                "a browser's read must not open the desktop's overlay"
+            );
+
+            // The keys are the host's real ones. A browser that shipped
+            // `notifications.on_finished` or `updates.check_for_updates` would
+            // be writing rows this FlightDeck never reads.
+            let keys: Vec<&str> = view.project_rows.iter().map(|r| r.key.as_str()).collect();
+            assert!(keys.contains(&"notifications.on_finish"));
+            assert!(keys.contains(&"update.check"));
+            assert!(!keys.contains(&"notifications.on_finished"));
+            assert!(!keys.contains(&"updates.check_for_updates"));
+            // And the two the manager deliberately does not curate stay out of
+            // the browser too, because there is one field list (`:485-494`).
+            assert!(!keys.contains(&"web.port"));
+            assert!(!keys.contains(&"web.replay_bytes"));
+
+            // The tag column, both ways round, from the one file that set it.
+            let project = row(&view.project_rows, "notifications.enabled");
+            assert_eq!(project.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(
+                project.value,
+                crate::web::protocol::ConfigValue::Bool(false)
+            );
+            let global = row(&view.global_rows, "notifications.enabled");
+            assert_eq!(global.origin, crate::web::protocol::ConfigOrigin::SetHere);
+            // Clearing it in Global scope falls all the way to the shipped
+            // default, and the host says so rather than leaving the browser to
+            // work it out.
+            assert_eq!(
+                global.inherited,
+                crate::web::protocol::ConfigValue::Bool(true)
+            );
+            assert_eq!(
+                global.inherited_origin,
+                crate::web::protocol::ConfigOrigin::Default
+            );
+
+            // A choice row carries the host's own options, agents included.
+            assert_eq!(
+                row(&view.project_rows, "ui.mode_border").choices,
+                vec!["off", "dim", "normal", "bright"]
+            );
+            assert_eq!(view.project_name, "proj");
+        }
+
+        /// A staged edit lands in the file the desktop's `s` would have written,
+        /// through the same `outputs()` — and the answer is the re-resolved
+        /// layering, so the browser repaints from the host rather than from its
+        /// own optimism.
+        #[test]
+        fn a_browsers_save_writes_the_file_the_desktop_writes() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    5,
+                    json!([{ "scope": "project", "key": "ui.mode_border", "value": "bright" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            // The host's own word for what happened — not one the browser made
+            // up while waiting.
+            assert_eq!(reply.ack.detail.as_deref(), Some("Saved."));
+            let body = fs.file_contents(&project_path).expect("the project file");
+            assert!(body.contains("[ui]"), "{body}");
+            assert!(body.contains("mode_border = \"bright\""), "{body}");
+            // A project override still stores only what it overrides (SPECS §8).
+            assert!(!body.contains("[containers]"), "{body}");
+
+            let view = reply.config.expect("a save answers with the new manager");
+            let border = row(&view.project_rows, "ui.mode_border");
+            assert_eq!(
+                border.value,
+                crate::web::protocol::ConfigValue::Text("bright".into())
+            );
+            assert_eq!(border.origin, crate::web::protocol::ConfigOrigin::SetHere);
+        }
+
+        /// `c` from a browser is the same clear the desktop makes: the override
+        /// leaves the file and the value re-inherits — to exactly what the row
+        /// said it would (`inherited` / `inherited_origin`).
+        #[test]
+        fn a_browsers_clear_removes_the_override_and_re_inherits() {
+            let (fs, _, project_path) = seeded_config_fs(
+                "[notifications]\nenabled = false\n",
+                "[notifications]\nenabled = true\n",
+            );
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            // What the row promised before the clear.
+            let before = reply_on(&fs, &mut ws, &mut ui, &config_frame(6, json!([])))
+                .config
+                .expect("answered");
+            let promised = row(&before.project_rows, "notifications.enabled");
+            assert_eq!(promised.origin, crate::web::protocol::ConfigOrigin::SetHere);
+            assert_eq!(
+                promised.inherited,
+                crate::web::protocol::ConfigValue::Bool(false)
+            );
+            assert_eq!(
+                promised.inherited_origin,
+                crate::web::protocol::ConfigOrigin::Global
+            );
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    7,
+                    json!([{ "scope": "project", "key": "notifications.enabled" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let body = fs.file_contents(&project_path).expect("the project file");
+            assert!(!body.contains("enabled"), "the override is gone: {body}");
+            let view = reply.config.expect("answered");
+            let after = row(&view.project_rows, "notifications.enabled");
+            assert_eq!(after.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(after.value, crate::web::protocol::ConfigValue::Bool(false));
+        }
+
+        /// A value the field does not admit is refused **before** anything is
+        /// written, in the model's own words — so a browser built against a
+        /// different FlightDeck cannot leave a config file the desktop then
+        /// fails to load.
+        #[test]
+        fn a_value_a_field_does_not_admit_is_refused_and_nothing_is_written() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    8,
+                    json!([
+                        { "scope": "project", "key": "notifications.enabled", "value": false },
+                        { "scope": "project", "key": "ui.mode_border", "value": "purple" },
+                    ]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            let detail = reply.ack.detail.unwrap_or_default();
+            assert!(detail.contains("off, dim, normal, bright"), "{detail}");
+            assert!(reply.config.is_none(), "a refusal produces no panel");
+            // Including the change *before* the bad one: the write happens once,
+            // after every change has landed in the model.
+            assert!(
+                fs.file_contents(&project_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "nothing may be written when a change is refused"
+            );
+        }
+
+        /// A key this build does not have is refused by name rather than
+        /// written blind — the same posture the palette takes for a command
+        /// name it does not know (R7).
+        #[test]
+        fn a_key_this_build_does_not_have_is_refused_by_name() {
+            let (fs, _, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    9,
+                    json!([{ "scope": "project", "key": "web.port", "value": "7421" }]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Rejected);
+            let detail = reply.ack.detail.unwrap_or_default();
+            assert!(detail.contains("web.port"), "{detail}");
+            assert!(
+                fs.file_contents(&project_path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "the excluded numeric fields stay unwritable from a browser"
+            );
+        }
+
+        /// The desktop's `s` saves **both** dirty scopes, and so does a
+        /// browser's: the changes carry their own scope, one per edit.
+        #[test]
+        fn one_save_can_touch_both_files() {
+            let (fs, global_path, project_path) = seeded_config_fs("", "");
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+
+            let reply = reply_on(
+                &fs,
+                &mut ws,
+                &mut ui,
+                &config_frame(
+                    10,
+                    json!([
+                        { "scope": "global", "key": "notifications.sound", "value": true },
+                        { "scope": "project", "key": "remote.enabled", "value": true },
+                    ]),
+                ),
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied);
+            let global = fs.file_contents(&global_path).unwrap_or_default();
+            assert!(global.contains("sound = true"), "{global}");
+            let project = fs.file_contents(&project_path).unwrap_or_default();
+            assert!(project.contains("[remote]"), "{project}");
+            assert!(project.contains("enabled = true"), "{project}");
+
+            // And the project scope now reads the global one as inherited.
+            let view = reply.config.expect("answered");
+            let sound = row(&view.project_rows, "notifications.sound");
+            assert_eq!(sound.origin, crate::web::protocol::ConfigOrigin::Global);
+            assert_eq!(sound.value, crate::web::protocol::ConfigValue::Bool(true));
+        }
+
+        /// Help and About are **not** forwarded, and the refusal says why
+        /// rather than pleading not-implemented. Both are drawn by the browser
+        /// from `Snapshot::help` / `Snapshot::about`, so forwarding would open
+        /// a panel on the desktop that the asker cannot read.
+        #[test]
+        fn help_and_about_are_browser_surfaces_and_say_so() {
+            for (name, refusal) in [
+                (names::SHOW_HELP, crate::web::commands::HELP_REFUSAL),
+                (names::ABOUT_FLIGHTDECK, crate::web::commands::ABOUT_REFUSAL),
+            ] {
+                let spec = crate::web::commands::lookup(name).expect("the row is offered");
+                assert_eq!(
+                    spec.route,
+                    crate::web::commands::Route::NotSupported(refusal),
+                    "'{name}' must refuse with its own sentence"
+                );
+                assert!(
+                    !refusal.contains("not implemented") && !refusal.contains("no design"),
+                    "'{name}' refuses because of where the panel would land, not because it is missing"
+                );
+            }
+        }
+    }
+
+    /// **The git surface's refusal paths** (`remote-control-ll5.5`; SPECS §5,
+    /// §5.1, §12, §13, §14, §15, §26).
+    ///
+    /// `web_command_surface` above proves the *routing* — a git row reaches the
+    /// dispatch and is acked with whatever that dispatch reported. This module
+    /// proves the sentences it reports, against a `FakeGit` that can be made
+    /// dirty, moved, or left without a branch, because that is where the guards
+    /// actually live. Every test drives `dispatch_command`, which is the exact
+    /// function `run_web_command` reaches through `run_palette_action`, and
+    /// reads [`Ui::web_outcome`], which is the exact value the `Ack` is built
+    /// from — so a sentence asserted here is a sentence the browser receives.
+    ///
+    /// SPECS §26 asks for the refusal paths and not only the happy ones. The
+    /// four that matter for a remote surface are here: §13's dirty base, §5.1's
+    /// rebase preconditions, §14's uncommitted-changes warning, and git itself
+    /// failing outright.
+    /// SPECS §30's update notice, from the field the host keeps it in to the
+    /// frame the browser paints (`remote-control-gk94`, §6.5 R25).
+    ///
+    /// `AppState::update_available` is the one place the check writes — both
+    /// `crate::update::start_check`'s cached finding and the background
+    /// thread's later answer land there through `apply_update_notice` — so
+    /// driving that field is driving the production path, not a stand-in for
+    /// it. What was missing was everything downstream: `HostState` had no such
+    /// field and `Snapshot` had no such field, so the chip could not appear.
+    mod web_update_notice {
+        use super::isolated_refusals::one_project_workspace;
+        use super::*;
+
+        fn host_state(workspace: &Workspace) -> crate::web::server::HostState {
+            build_web_host_state(
+                workspace,
+                &crate::web::stream::TerminalStreams::new(4096),
+                Vec::new(),
+                None,
+                0,
+            )
+        }
+
+        #[test]
+        fn a_newer_release_reaches_the_snapshot_the_browser_paints_from() {
+            let mut workspace = one_project_workspace(false);
+            apply_update_notice(&mut workspace, "1.17.0".to_string());
+
+            assert_eq!(
+                host_state(&workspace).update,
+                Some(crate::web::protocol::UpdateNotice {
+                    latest_version: "1.17.0".to_string(),
+                }),
+                "1a's chip renders this, and nothing else on the wire carries it"
+            );
+        }
+
+        /// Every open project, because the hint belongs to the binary: a browser
+        /// looking at the background project must see the same chip.
+        #[test]
+        fn the_notice_is_recorded_on_every_open_project() {
+            let mut workspace = super::isolated_refusals::two_project_workspace(false);
+            apply_update_notice(&mut workspace, "1.17.0".to_string());
+
+            for project in workspace.projects.iter() {
+                assert_eq!(
+                    project.state.update_available.as_deref(),
+                    Some("1.17.0"),
+                    "whichever project is active when the answer lands shows it"
+                );
+            }
+        }
+
+        /// A host that has learnt nothing sends nothing. `None` is not the same
+        /// claim as "you are up to date", and neither surface makes that one.
+        #[test]
+        fn a_host_with_no_finding_sends_no_notice() {
+            let workspace = one_project_workspace(false);
+            assert_eq!(host_state(&workspace).update, None);
+        }
+
+        /// SPECS §32: an isolated run makes no network call and writes no
+        /// cache, so it has nothing to report and must not report anything.
+        #[test]
+        fn an_isolated_run_never_checks_and_so_never_has_a_notice_to_send() {
+            let workspace = one_project_workspace(true);
+            assert!(
+                !update_check_enabled(&workspace.active_project().state),
+                "no check runs at all in an isolated session"
+            );
+            assert_eq!(
+                host_state(&workspace).update,
+                None,
+                "and with no check there is nothing honest to send"
+            );
+        }
+
+        /// The other way to have no notice: the user turned it off.
+        #[test]
+        fn the_check_can_be_switched_off_in_config() {
+            let mut workspace = one_project_workspace(false);
+            assert!(
+                update_check_enabled(&workspace.active_project().state),
+                "SPECS §30 is on by default"
+            );
+            workspace.projects[0].state.config.update.check = false;
+            assert!(!update_check_enabled(&workspace.projects[0].state));
+        }
+    }
+
+    /// `[ui] agent_tab_position` from the config file to the frame the browser
+    /// lays out from (`remote-control-ecsv`, `specs/WEB_INTERFACE.md` §6.5
+    /// R24).
+    ///
+    /// The desktop half is proved in `tui::render` against a drawn buffer; this
+    /// is the other surface's half, and it is the link that did not exist: the
+    /// key was read by nothing, so nothing carried it. Driving
+    /// `build_web_host_state` is driving the production path — it is the one
+    /// function the event loop publishes from.
+    mod web_sidebar_position {
+        use super::isolated_refusals::one_project_workspace;
+        use super::*;
+
+        fn host_state(workspace: &Workspace) -> crate::web::server::HostState {
+            build_web_host_state(
+                workspace,
+                &crate::web::stream::TerminalStreams::new(4096),
+                Vec::new(),
+                None,
+                0,
+            )
+        }
+
+        #[test]
+        fn the_setting_reaches_the_snapshot_the_browser_lays_out_from() {
+            let mut workspace = one_project_workspace(false);
+            assert_eq!(
+                host_state(&workspace).sidebar_position,
+                crate::contracts::AgentTabPosition::Left,
+                "the default the setting itself has"
+            );
+
+            workspace.projects[0].state.config.ui.agent_tab_position = "right".to_string();
+            assert_eq!(
+                host_state(&workspace).sidebar_position,
+                crate::contracts::AgentTabPosition::Right,
+                "1h position 4 mirrors the browser's body row on this word"
+            );
+        }
+    }
+
+    mod web_git_guards {
+        use super::*;
+        use crate::web::commands::{confirmation_of, Confirmation};
+
+        const REPO: &str = "/repo";
+
+        /// A project with one Agent Session Tab, on a `FakeGit` whose dirtiness,
+        /// branches and drift the test drives. The agent worktree is left with
+        /// its own branch checked out, which is what the §5.1 preconditions
+        /// require (FakeGit's `current_branch` is one global, so it is set once
+        /// the created branch name is known).
+        fn one_tab(git: &FakeGit, pty: &FakePty, dir: &TempDir) -> AppState {
+            let agent = make_real_agent(dir, "opencode");
+            let mut config = config_with_agent(agent);
+            config.ui.default_agent = "opencode".to_string();
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            pty.queue_session();
+            let mut state = AppState::new(
+                config,
+                crate::persistence::project_state::default_state("main"),
+                REPO,
+                "/repo/.flightdeck/state.json",
+            );
+            state
+                .dispatch(
+                    Command::NewAgentTab {
+                        name: "Task".to_string(),
+                        agent_key: None,
+                    },
+                    &services,
+                )
+                .expect("the tab is created");
+            git.set_current_branch(state.tabs[0].meta.branch.clone());
+            state
+        }
+
+        /// The absolute path of the one tab's worktree, as the guards see it.
+        fn worktree(state: &AppState) -> PathBuf {
+            to_absolute(
+                Path::new(REPO),
+                Path::new(&state.tabs[0].meta.worktree_path_relative),
+            )
+        }
+
+        /// One browser dispatch: the command the table would forward, run
+        /// through the very function `run_palette_action` calls, with a dialog
+        /// origin set for exactly its duration the way `run_web_command` sets
+        /// one. Returns what the `Ack` would be built from.
+        fn dispatch(
+            cmd: Command,
+            state: &mut AppState,
+            git: &FakeGit,
+            pty: &FakePty,
+            ui: &mut Ui,
+        ) -> Option<WebDispatch> {
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            ui.web_outcome = None;
+            ui.web_origin = Some(crate::web::protocol::DialogOrigin::Browser {
+                viewer_id: Some(crate::web::protocol::ViewerId::new("viewer-1")),
+                label: "192.168.2.20".to_string(),
+            });
+            let result = dispatch_command(cmd, state, &services, ui);
+            ui.web_origin = None;
+            result.expect("a guard is a refusal, never an event-loop error");
+            ui.web_outcome.take()
+        }
+
+        /// The key the desktop's own dialog button would send, fed into the open
+        /// prompt exactly as `apply_web_dialog` feeds a browser's confirm.
+        fn press(c: char, state: &mut AppState, git: &FakeGit, pty: &FakePty, ui: &mut Ui) {
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+            };
+            handle_prompt_key_project(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                state,
+                &services,
+                ui,
+                0,
+            )
+            .expect("a prompt key is never an event-loop error");
+        }
+
+        fn refusal(outcome: Option<WebDispatch>) -> String {
+            match outcome {
+                Some(WebDispatch::Refused(reason)) => reason,
+                other => panic!("expected a refusal the browser can read, got {other:?}"),
+            }
+        }
+
+        /// **SPECS §5.1, the carve-out in one test.** The row a browser sends
+        /// carries `confirm: false`, so the first dispatch *asks*: nothing is
+        /// rebased, a shared dialog opens carrying the origin that raised it and
+        /// §12's drift, and only the answer to that dialog rewrites anything.
+        ///
+        /// This is the property the whole boundary rests on. If it ever fails,
+        /// the browser can rewrite history without anybody reading a question,
+        /// and the module doc's exception clause is void.
+        #[test]
+        fn a_browsers_rebase_asks_before_it_rewrites_and_only_then_rebases() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+
+            // SPECS §12: the base has moved seven commits since this tab was cut.
+            git.set_ahead_behind(state.tabs[0].meta.base_commit_sha.clone(), "main", 7, 0);
+
+            // The value the table forwards — and nothing else can be forwarded,
+            // because `INVENTORY` carries this one.
+            let cmd = Command::RebaseWorktree { confirm: false };
+            assert_eq!(confirmation_of(&cmd), Confirmation::Pending);
+            let outcome = dispatch(cmd, &mut state, &git, &pty, &mut ui);
+
+            // Nothing was rewritten, and the browser is told a question opened
+            // rather than that something was done.
+            assert!(git.rebases().is_empty(), "SPECS §5.1: it asks first");
+            assert!(
+                matches!(outcome, Some(WebDispatch::Applied(None))),
+                "a question opened, and nothing else is claimed: {outcome:?}"
+            );
+
+            // The question is on both surfaces, answerable from either, and it
+            // names what it will do — including the drift it will pull in.
+            let view = web_dialog_view(&ui, "proj", &state).expect("the dialog is published");
+            let body: crate::web::protocol::DialogBody =
+                serde_json::from_value(view.body.clone().expect("a body")).expect("a DialogBody");
+            assert_eq!(view.kind, "confirm_rebase");
+            assert!(body.confirmable, "the browser may answer its own question");
+            assert_eq!(body.refusal, None);
+            assert!(
+                view.title.contains("target advanced 7 commits"),
+                "{}",
+                view.title
+            );
+            assert!(view.title.contains("Rewrites history"), "{}", view.title);
+            assert!(
+                matches!(
+                    view.origin,
+                    crate::web::protocol::DialogOrigin::Browser { .. }
+                ),
+                "the desktop must read who asked"
+            );
+
+            // Answering it — the same keypress `apply_web_dialog` synthesises —
+            // is what reaches `GitExecutor::rebase_onto`, once.
+            press('y', &mut state, &git, &pty, &mut ui);
+            assert_eq!(
+                git.rebases(),
+                vec![("main".to_string(), worktree(&state))],
+                "the confirmation is what rebases, and it rebases once"
+            );
+        }
+
+        /// **SPECS §5.1's preconditions, in the guard's own words.** A dirty
+        /// agent worktree is refused before anything is asked — FlightDeck never
+        /// stashes or discards — and the browser gets the sentence naming the
+        /// worktree, not a generic failure.
+        #[test]
+        fn a_failed_rebase_precondition_reaches_the_browser_verbatim() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::RebaseWorktree { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("has uncommitted changes") && reason.contains("before rebasing"),
+                "the precondition's own sentence: {reason}"
+            );
+            assert!(git.rebases().is_empty());
+            assert!(ui.prompt.is_none(), "a refusal asks nothing");
+        }
+
+        /// **SPECS §13: a dirty base disables local merge**, and the browser is
+        /// told so as a *refusal*.
+        ///
+        /// The dispatch reports this as `Effect::Warning`, which
+        /// `apply_effect` records as applied-with-caveat — correct for a
+        /// confirmed merge whose cleanup failed, and wrong here, where nothing
+        /// merged at all. `dispatch_command` separates the two by the command's
+        /// phase, the same line the phone's `dispatch_remote_merge_back` draws.
+        /// A browser told `Applied` over §13's sentence would be a surface
+        /// claiming something the host did not say.
+        #[test]
+        fn a_dirty_base_refuses_the_merge_rather_than_applying_a_warning() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(Path::new(REPO), true);
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("Local merge is disabled"),
+                "SPECS §13's own words: {reason}"
+            );
+            assert!(
+                reason.contains("push this branch and create a PR instead"),
+                "including what to do instead: {reason}"
+            );
+            assert!(git.merges().is_empty(), "nothing merged");
+            assert!(ui.prompt.is_none(), "and nothing was asked");
+        }
+
+        /// **SPECS §15's technical preconditions.** A dirty *agent* worktree is
+        /// a different refusal from §13's, and the browser gets that one instead
+        /// — the point of forwarding the guard's sentence rather than wording
+        /// one here.
+        #[test]
+        fn a_dirty_agent_worktree_refuses_the_merge_with_its_own_reason() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            let reason = refusal(outcome);
+            assert!(
+                reason.contains("before merging"),
+                "§15's precondition, not §13's: {reason}"
+            );
+            assert!(!reason.contains("Local merge is disabled"), "{reason}");
+            assert!(git.merges().is_empty());
+        }
+
+        /// **SPECS §14.** A worktree with uncommitted changes gets the warning
+        /// and the three-way choice first; the push happens only when that
+        /// dialog is answered. `confirm: None` in the table is what makes the
+        /// warning unskippable from a frame.
+        #[test]
+        fn a_push_over_uncommitted_changes_warns_before_it_pushes() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+            git.set_dirty_at(worktree(&state), true);
+
+            let outcome = dispatch(
+                Command::PushBranch { confirm: None },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            assert!(git.pushes().is_empty(), "SPECS §14: it warns first");
+            assert!(
+                matches!(outcome, Some(WebDispatch::Applied(None))),
+                "a question opened, and nothing else is claimed: {outcome:?}"
+            );
+            let view = web_dialog_view(&ui, "proj", &state).expect("the warning is published");
+            assert_eq!(view.kind, "confirm_push");
+            assert!(
+                view.title.contains("committed changes only"),
+                "{}",
+                view.title
+            );
+
+            // `p` is `Push committed` — the same key the desktop's button fires.
+            press('p', &mut state, &git, &pty, &mut ui);
+            assert_eq!(git.pushes().len(), 1, "the answer is what pushes");
+        }
+
+        /// **Git failing outright is not a guard, and must not be dressed as
+        /// one.** An executor error becomes `WebDispatch::Failed`, and the
+        /// browser is handed git's own message — a `Rejected` ack with the real
+        /// reason rather than "that did not work".
+        #[test]
+        fn a_git_error_reaches_the_browser_as_gits_own_message() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new()
+                .with_root(REPO)
+                .with_branches(["main"])
+                .with_current_branch_error("fatal: not a git repository");
+            let pty = FakePty::new();
+            let mut state = one_tab(&git, &pty, &dir);
+            let mut ui = Ui::default();
+
+            let outcome = dispatch(
+                Command::FinishLocalMerge { confirm: false },
+                &mut state,
+                &git,
+                &pty,
+                &mut ui,
+            );
+
+            match outcome {
+                Some(WebDispatch::Failed(message)) => assert!(
+                    message.contains("not a git repository"),
+                    "git's own words: {message}"
+                ),
+                other => panic!("expected the failure to reach the browser, got {other:?}"),
+            }
+            assert!(git.merges().is_empty());
+        }
+    }
+
+    /// D11 §5.1's `finished, 18 files touched`: the per-tab, one-shot git
+    /// refresh that makes the clause literal, and the honest-empty paths that
+    /// keep it from ever becoming a guess.
+    ///
+    /// Everything here runs the real `record_web_transitions` /
+    /// `WebSurface::record_transition` / `PendingFinishes` path. The only piece
+    /// standing in for production is the worker thread: `spawn_finish_count`
+    /// does nothing but call `activity::file_count` and post the answer back,
+    /// so `answer_with` below does exactly that, synchronously, against a
+    /// `FakeGit`.
+    mod web_finish_counts {
+        use super::*;
+        use crate::contracts::{
+            AgentDef, InterpretedStatus, ProjectState as CoreProjectState, StatusPatterns,
+            TabState, STATE_VERSION,
+        };
+        use crate::testing::FakeGit;
+
+        /// An agent whose command basename `status_backend` recognises, so
+        /// `lifecycle_reporting` is true and `observe` may report a real
+        /// `working → idle` pair rather than §5.1's `unknown → unknown`.
+        fn claude() -> AgentDef {
+            AgentDef {
+                key: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                command: "claude".to_string(),
+                args: vec![],
+                status_patterns: StatusPatterns::default(),
+            }
+        }
+
+        fn tab_state(id: &str, slug: &str) -> TabState {
+            TabState {
+                id: id.to_string(),
+                name: slug.to_string(),
+                slug: slug.to_string(),
+                agent: "claude".to_string(),
+                branch: format!("{slug}-branch"),
+                worktree_path_relative: format!("worktrees/{slug}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: false,
+                resume_args: Vec::new(),
+            }
+        }
+
+        /// A project with one `Ready` tab whose primary is running, so its
+        /// display status is driven by the cached lifecycle signal alone and a
+        /// test can move it by hand.
+        fn project(name: &str, root: &str, slug: &str, pty: &FakePty) -> Project {
+            let mut config = Config::default();
+            config.ui.default_agent = "claude".to_string();
+            config.agents.insert("claude".to_string(), claude());
+            let state = CoreProjectState {
+                version: STATE_VERSION,
+                project_root_relative: ".".to_string(),
+                base_branch: "main".to_string(),
+                tabs: vec![tab_state(&format!("{name}-t1"), slug)],
+            };
+            let mut app = AppState::new(
+                config,
+                state,
+                root,
+                format!("{root}/.flightdeck/state.json"),
+            );
+            pty.queue_session();
+            app.tabs[0]
+                .session
+                .spawn_primary(pty, "agent", &[], Path::new(root), PtySize::default())
+                .unwrap();
+            let (create_tx, create_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            Project {
+                name: name.to_string(),
+                git: GitCli::new(PathBuf::from(root)),
+                state: app,
+                cache: GitStatusCache::new(),
+                create_tx,
+                create_rx,
+                status_tx,
+                status_rx,
+                status_in_flight: false,
+                git_lock: Arc::new(Mutex::new(())),
+            }
+        }
+
+        /// A surface with no server and no real credential file behind it —
+        /// only the feed and the pending-finish queue are under test.
+        fn web_surface() -> WebSurface {
+            let store = crate::web::credentials::CredentialStore::open(
+                Arc::new(FakeFs::new()),
+                Arc::new(FakeClock::default()),
+                PathBuf::from("/web.json"),
+            );
+            let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+            let (count_tx, count_rx) = std::sync::mpsc::channel();
+            WebSurface {
+                credentials: Arc::new(Mutex::new(store)),
+                streams: crate::web::stream::TerminalStreams::new(1024),
+                activity: crate::web::activity::ActivityStore::new(),
+                pending_finishes: crate::web::activity::PendingFinishes::new(),
+                inbound_tx,
+                inbound_rx,
+                count_tx,
+                count_rx,
+                handle: None,
+                published: crate::web::server::HostState::default(),
+            }
+        }
+
+        /// Move a tab's lifecycle signal, the way `poll_status_files` does when
+        /// an agent's status hook writes to its status file.
+        fn set_interpreted(project: &mut Project, status: InterpretedStatus) {
+            project.state.tabs[0].interpreted = Some(status);
+        }
+
+        /// What `spawn_finish_count` does, minus the thread: ask `git`, post the
+        /// answer back, and let the surface drain it.
+        fn answer_with(
+            web: &mut WebSurface,
+            git: &FakeGit,
+            clock: &FakeClock,
+            now_ms: u64,
+            requests: Vec<FinishCountRequest>,
+        ) {
+            for req in requests {
+                let files = crate::web::activity::file_count(git, &req.worktree_abs);
+                web.count_tx
+                    .send(FinishCount {
+                        request: req.request,
+                        files,
+                    })
+                    .unwrap();
+            }
+            web.drain_finish_counts(clock, now_ms);
+        }
+
+        /// Drive one project from `working` to `idle`, returning the refreshes
+        /// the finish edge asked for. The first pass only arms the edge memory —
+        /// `take_status_transitions` never reports a first sighting.
+        fn finish(
+            web: &mut WebSurface,
+            project: &mut Project,
+            clock: &FakeClock,
+        ) -> Vec<FinishCountRequest> {
+            set_interpreted(project, InterpretedStatus::Working);
+            assert!(
+                record_web_transitions(web, project, clock, 1_000).is_empty(),
+                "first sighting is not a transition"
+            );
+            set_interpreted(project, InterpretedStatus::Idle);
+            record_web_transitions(web, project, clock, 1_100)
+        }
+
+        fn reasons(web: &WebSurface) -> Vec<String> {
+            web.activity.events().map(|e| e.reason.clone()).collect()
+        }
+
+        /// The row on screen: the count is what git reports for *that* tab's
+        /// worktree at the finish edge, not what some cache last happened to see.
+        #[test]
+        fn the_active_project_s_finished_row_carries_the_count_git_reports() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_at(
+                "/repo0/worktrees/add-tests-api",
+                (0..18)
+                    .map(|i| format!(" M src/file-{i}.rs"))
+                    .collect::<Vec<_>>(),
+            );
+            let mut web = web_surface();
+            let mut active = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut active, &clock);
+            assert_eq!(requests.len(), 1, "the finish edge asked git once");
+            assert_eq!(
+                requests[0].worktree_abs,
+                PathBuf::from("/repo0/worktrees/add-tests-api"),
+                "the tab's own worktree, not the repository root"
+            );
+            assert!(
+                web.activity.is_empty(),
+                "nothing is published while the count is outstanding"
+            );
+
+            answer_with(&mut web, &git, &clock, 1_100, requests);
+            assert_eq!(reasons(&web), vec!["finished, 18 files touched"]);
+        }
+
+        /// **The acceptance criterion.** `record_web_transitions` runs inside the
+        /// loop's per-project pass, which visits every open project — so a
+        /// session that finished in a project nobody is looking at gets the same
+        /// literal count, from its own repo and its own worktree. The active
+        /// project finishes in the same test with a *different* number, so a
+        /// count leaking between projects fails here rather than passing by
+        /// coincidence.
+        #[test]
+        fn a_background_project_s_finished_row_carries_the_count_too() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let active_git = FakeGit::new();
+            active_git.set_porcelain_at("/repo0/worktrees/on-screen", [" M a.rs", " M b.rs"]);
+            let background_git = FakeGit::new();
+            background_git.set_porcelain_at(
+                "/repo1/worktrees/off-screen",
+                (0..18)
+                    .map(|i| format!(" M src/file-{i}.rs"))
+                    .collect::<Vec<_>>(),
+            );
+
+            let mut web = web_surface();
+            let mut active = project("proj0", "/repo0", "on-screen", &pty);
+            let mut background = project("proj1", "/repo1", "off-screen", &pty);
+
+            let active_requests = finish(&mut web, &mut active, &clock);
+            let background_requests = finish(&mut web, &mut background, &clock);
+            assert_eq!(background_requests.len(), 1);
+            assert_eq!(
+                background_requests[0].worktree_abs,
+                PathBuf::from("/repo1/worktrees/off-screen"),
+            );
+
+            answer_with(&mut web, &active_git, &clock, 1_100, active_requests);
+            answer_with(
+                &mut web,
+                &background_git,
+                &clock,
+                1_100,
+                background_requests,
+            );
+
+            let rows: Vec<(String, String)> = web
+                .activity
+                .events()
+                .map(|e| (e.project_name.clone(), e.reason.clone()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("proj0".to_string(), "finished, 2 files touched".to_string()),
+                    (
+                        "proj1".to_string(),
+                        "finished, 18 files touched".to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// **No new periodic git work.** The count is bought at the edge, so a
+        /// project whose sessions are not moving — the normal state of every
+        /// background project — asks git nothing at all, however many ticks go
+        /// by. The `GIT_REFRESH_EVERY` cache is untouched and still refreshes
+        /// `workspace.projects[active]` alone.
+        #[test]
+        fn a_project_nobody_is_looking_at_asks_git_nothing_per_tick() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_at("/repo1/worktrees/off-screen", [" M src/lib.rs"]);
+            let mut web = web_surface();
+            let mut background = project("proj1", "/repo1", "off-screen", &pty);
+            set_interpreted(&mut background, InterpretedStatus::Working);
+
+            for t in 0..(GIT_REFRESH_EVERY * 3) {
+                let requests = record_web_transitions(&mut web, &mut background, &clock, 1_000 + t);
+                assert!(
+                    requests.is_empty(),
+                    "a session that has not moved is not a finish edge"
+                );
+                answer_with(&mut web, &git, &clock, 1_000 + t, requests);
+            }
+
+            assert_eq!(
+                git.porcelain_calls(),
+                0,
+                "the feed must not turn every open project into periodic git work"
+            );
+            assert!(web.activity.is_empty(), "and nothing happened to report");
+        }
+
+        /// Only the finish edge pays for a refresh. A session that stopped to
+        /// ask a question, or one the user set by hand, is a row the host can
+        /// already explain — git is never asked about either.
+        #[test]
+        fn only_the_finish_edge_asks_git_anything() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            set_interpreted(&mut p, InterpretedStatus::Working);
+            assert!(record_web_transitions(&mut web, &mut p, &clock, 1_000).is_empty());
+
+            set_interpreted(&mut p, InterpretedStatus::WaitingForInput);
+            assert!(
+                record_web_transitions(&mut web, &mut p, &clock, 1_100).is_empty(),
+                "a question is not a finish"
+            );
+
+            p.state.tabs[0].meta.manual_status = Some(ManualStatus::Done.as_str().to_string());
+            assert!(
+                record_web_transitions(&mut web, &mut p, &clock, 1_200).is_empty(),
+                "the user's own words outrank a file count"
+            );
+
+            assert_eq!(git.porcelain_calls(), 0);
+            assert_eq!(
+                reasons(&web),
+                vec!["".to_string(), "set by hand on the desktop".to_string()],
+                "both rows are recorded straight away; neither waits on git"
+            );
+        }
+
+        /// **The honest-empty path.** Git could not answer — a locked index, a
+        /// worktree that has been removed — so the row arrives without the
+        /// clause, exactly as it did before this mechanism existed.
+        #[test]
+        fn a_finish_git_cannot_count_still_produces_its_row() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let git = FakeGit::new();
+            git.set_porcelain_error("fatal: unable to read index");
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut p, &clock);
+            assert_eq!(requests.len(), 1);
+            answer_with(&mut web, &git, &clock, 1_100, requests);
+
+            let event = web.activity.events().next().expect("the row still lands");
+            assert_eq!(event.reason, "");
+            assert_eq!(event.tier, crate::web::protocol::ActivityTier::Finished);
+            assert_eq!(event.to, InterpretedStatus::Idle);
+        }
+
+        /// A worker that never comes back — killed, or blocked on a repo lock
+        /// nobody releases — costs the clause, never the row. The deadline is
+        /// enforced by the same per-tick drain the answers arrive on.
+        #[test]
+        fn a_finish_nobody_ever_answers_for_lands_after_the_deadline() {
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let mut web = web_surface();
+            let mut p = project("proj0", "/repo0", "add-tests-api", &pty);
+
+            let requests = finish(&mut web, &mut p, &clock);
+            assert_eq!(requests.len(), 1);
+            // The answer is simply dropped, as a panicking worker's would be.
+            drop(requests);
+
+            web.drain_finish_counts(&clock, 1_100);
+            assert!(web.activity.is_empty(), "still waiting, still unpublished");
+
+            let deadline = 1_100 + crate::web::activity::FINISH_COUNT_DEADLINE_MS as u64;
+            web.drain_finish_counts(&clock, deadline);
+            assert_eq!(reasons(&web), vec!["".to_string()]);
         }
     }
 }

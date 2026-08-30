@@ -1,0 +1,1774 @@
+/*
+ * FlightDeck Web — the states artboards 2b/2c/2d/2e/2f draw
+ * (remote-control-l7ya).
+ *
+ * Under the same two rules as main.css, both enforced by
+ * src/ui/tokens.guard.test.ts:
+ *
+ *   1. No colour literal. Every colour is `var(--fd-*)` from tokens.css, or a
+ *      `color-mix()` OF those tokens where an artboard used a wash, a tint or a
+ *      dimmed fill the palette does not name. A mix still says which token it
+ *      means; a hex value says nothing and drifts silently when 2g moves.
+ *   2. Four type sizes only, from `--fd-t-meta | -body | -title | -code`.
+ *
+ * Every layer below is toggled with the `hidden` property by its component,
+ * and every one of them sets `display: flex`. That combination used to need a
+ * `.fd-x[hidden] { display: none }` beside each — nine of them, five elements
+ * that never got one, and one live bug (`remote-control-eek.4`). It is now a
+ * single document-level rule in `app.css`; do not add per-layer ones back.
+ *
+ * Turn 2 named exactly one new colour, `--fd-stale`, and left the *surfaces*
+ * built from it unnamed — every dimmed chip fill, every 8%-wash panel ground,
+ * every dark frame border. Those are expressed below as mixes with the token
+ * they are made of, and every one of them is listed as a token-turn candidate
+ * in the task report. The percentages land on the artboards' values; the point
+ * is that the token remains the subject of the sentence.
+ */
+
+/* ══ 2c — the connection strip ═════════════════════════════════════════════
+ * Rule 3 of 2c: the whole bar takes the state's frame colour, and it is the
+ * only chrome in the app that ever changes hue. One attribute does it. */
+.fd-statusbar[data-frame="neutral"] {
+  border-top-color: var(--fd-rule);
+}
+/* "still true a moment ago": the amber sunk into the canvas until it reads as
+ * a border rather than a line of text. Same recipe for the panel borders
+ * below, which is why they look like one family. */
+.fd-statusbar[data-frame="stale"] {
+  border-top-color: color-mix(in srgb, var(--fd-stale) 32%, var(--fd-canvas));
+}
+.fd-statusbar[data-frame="alert"] {
+  border-top-color: color-mix(in srgb, var(--fd-alert) 28%, var(--fd-canvas));
+}
+.fd-statusbar[data-frame="info"] {
+  border-top-color: color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+}
+/* A host that exited on purpose gets the separator grey: no hue at all, which
+ * is the point — nothing is wrong, there is simply nothing there. */
+.fd-statusbar[data-frame="stopped"] {
+  border-top-color: var(--fd-sep);
+}
+
+/* Q5: not drained but *replaced*. "No mode" understates a host that has
+ * exited — there is nothing left to have a mode in. */
+.fd-mode[data-tone="stopped"] {
+  background: var(--fd-sep);
+  color: var(--fd-text-muted);
+}
+/* 2c draws the drained chip as a dimmed fill, not a full-strength amber block:
+ * a chip that shouts MODE: — in the same weight as MODE: TERMINAL would read
+ * as a mode rather than the absence of one. */
+.fd-mode[data-tone="drained"] {
+  background: color-mix(in srgb, var(--fd-stale) 22%, var(--fd-canvas));
+  color: color-mix(in srgb, var(--fd-stale) 55%, var(--fd-text-quiet));
+}
+.fd-statusbar[data-frame="alert"] .fd-mode[data-tone="drained"] {
+  background: color-mix(in srgb, var(--fd-alert) 20%, var(--fd-canvas));
+  color: color-mix(in srgb, var(--fd-alert) 45%, var(--fd-text-quiet));
+}
+
+/* The sentence that replaces the key hints in every state that has something
+ * to say about the user's keystrokes. A fact, so never --fd-text-decor. */
+.fd-statusbar__message {
+  color: var(--fd-text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-statusbar[data-frame="alert"] .fd-statusbar__message,
+.fd-statusbar[data-frame="stale"] .fd-statusbar__message {
+  color: var(--fd-text-soft);
+}
+.fd-statusbar__note {
+  color: var(--fd-text-quiet);
+}
+
+/* 2c's amber `terminal stale 34s` chip, at the bar's right edge. */
+.fd-stalechip {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--fd-stale);
+  /* The darkest ground the palette names, so amber-on-dark stays readable
+   * without inventing a second brown. */
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+
+/* The one keyed button a state offers: `r Retry now`, `Enter Reload for …`. */
+.fd-stripaction {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  font-weight: 700;
+}
+.fd-stripaction[data-tone="alert"] {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+}
+.fd-stripaction[data-tone="info"] {
+  background: var(--fd-info);
+  color: color-mix(in srgb, var(--fd-info) 10%, var(--fd-canvas));
+}
+.fd-stripaction[data-tone="stale"] {
+  background: var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+}
+/* The key's own box: the button's ground, lifted just enough to read as a
+ * key cap on top of a bright fill. */
+.fd-stripaction__key,
+.fd-key-box {
+  padding: 1px 6px;
+  background: color-mix(in srgb, var(--fd-canvas) 25%, transparent);
+}
+.fd-stripaction:focus-visible,
+.fd-unread:focus-visible,
+.fd-feed__row:focus-visible,
+.fd-feed__close:focus-visible,
+.fd-access__primary:focus-visible,
+.fd-access__secondary:focus-visible,
+.fd-code__key:focus-visible,
+.fd-takeover__action:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+
+/* ══ 2e — the unread chip, in its four renderings ══════════════════════════
+ * It takes the colour of the most urgent unread event, and states what it is:
+ * attention beats finished beats quiet. */
+.fd-unread {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  font-weight: 700;
+}
+.fd-unread[data-tier="attention"] {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+  /* 2e: red breathes once every 2.4s. Slow on purpose — this is the only
+   * moving thing in the chrome, and a fast pulse would be a nag. */
+  animation: fd-breathe 2.4s ease-in-out infinite;
+}
+.fd-unread[data-tier="finished"] {
+  background: var(--fd-ok);
+  color: var(--fd-ground);
+}
+/* The quiet tier and the all-read state look the same on purpose: the feed
+ * has to stay reachable, so the chip never disappears — it just stops
+ * claiming anything. */
+.fd-unread[data-tier="quiet"],
+.fd-unread[data-tier="read"] {
+  background: none;
+  color: var(--fd-text-quiet);
+  font-weight: 400;
+}
+.fd-unread[data-tier="quiet"] .fd-key,
+.fd-unread[data-tier="read"] .fd-key {
+  color: var(--fd-text-decor);
+}
+@keyframes fd-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.72;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-unread[data-tier="attention"] {
+    animation: none;
+  }
+}
+
+/* ══ 2d — stale, asleep-and-stale, catching up ═════════════════════════════
+ * The distinction this section exists to protect: asleep means "your
+ * keystrokes are going somewhere else" and the picture is still true; stale
+ * means "this is a photograph". They must never look like each other. */
+.fd-pane {
+  position: relative;
+}
+/* Amber cast. A hue-preserving tint over the whole grid rather than a colour
+ * on the text, because xterm.js writes per-cell colours inline and there is
+ * nothing to recolour from out here. */
+.fd-pane[data-tone="stale"] .fd-letterbox {
+  color: color-mix(in srgb, var(--fd-stale) 62%, var(--fd-text-soft));
+  filter: sepia(0.35) saturate(0.7);
+}
+/* Both at once, and legible as a third state: desaturated cool *and* cast
+ * amber. The two treatments cancel toward grey, which is exactly why the
+ * scanlines — not the colour — are what carry this state. */
+.fd-pane[data-tone="asleep_stale"] .fd-letterbox {
+  color: color-mix(in srgb, var(--fd-stale) 40%, var(--fd-term-asleep));
+  filter: saturate(0.2) sepia(0.25);
+}
+.fd-pane[data-tone="asleep_stale"] .xterm-bold {
+  font-weight: 400;
+}
+/* 2d: the caret is *removed* on a photograph, not stopped. A blinking caret is
+ * the strongest "I am listening" signal a terminal has. */
+.fd-pane[data-caret="off"] .xterm-cursor,
+.fd-pane[data-caret="off"] .xterm-cursor-layer {
+  display: none;
+}
+/* The carrier of both frozen states. `pointer-events: none` is load-bearing:
+ * this lies over the terminal, and swallowing clicks would break
+ * click-to-focus in the state where a user is most likely to click. */
+.fd-pane__scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    color-mix(in srgb, var(--fd-stale) 11%, transparent) 0 1px,
+    transparent 1px 4px
+  );
+}
+.fd-pane[data-tone="asleep_stale"] .fd-pane__scanlines {
+  background: repeating-linear-gradient(
+    0deg,
+    color-mix(in srgb, var(--fd-stale) 9%, transparent) 0 1px,
+    transparent 1px 4px
+  );
+}
+/* The banner both frozen states and the replay share. */
+.fd-pane__banner {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  font-size: var(--fd-t-meta);
+  line-height: 1.55;
+  background: color-mix(in srgb, var(--fd-canvas) 92%, transparent);
+  box-shadow: inset 0 0 0 1px var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 20%, var(--fd-text-soft));
+}
+.fd-pane[data-tone="catching_up"] .fd-pane__banner {
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  color: var(--fd-text-soft);
+}
+.fd-pane[data-tone="asleep_stale"] .fd-pane__banner {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-stale) 55%, var(--fd-term-asleep));
+}
+/* The frozen clock. A wall-clock time, not a duration: it is checkable
+ * against the user's own memory of when they last looked. */
+.fd-pane__clock {
+  color: var(--fd-stale);
+  font-weight: 700;
+}
+.fd-pane__banner-text {
+  flex: 1;
+  min-width: 0;
+}
+/* §5.1's promise with a number on it — a promise a user can check. */
+.fd-pane__held {
+  color: var(--fd-text-quiet);
+}
+/* A real <progress>: a styled div would need an inline width, which is both
+ * forbidden in ui/ and the wrong element for a screen reader. */
+.fd-replay {
+  appearance: none;
+  width: 120px;
+  height: 2px;
+  border: 0;
+  background: var(--fd-rule-inner);
+}
+.fd-replay::-webkit-progress-bar {
+  background: var(--fd-rule-inner);
+}
+.fd-replay::-webkit-progress-value {
+  background: var(--fd-accent);
+}
+.fd-replay::-moz-progress-bar {
+  background: var(--fd-accent);
+}
+
+/* ══ 2b — the access layer ═════════════════════════════════════════════════
+ * A layer inside the frame, not a screen of its own: 2b draws all three panels
+ * with the logo band above them and a footer strip below, and the revoked one
+ * has a running agent visible behind it. */
+.fd-access {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  /* The scrim 2b puts over the frame. Dark enough that the panel is
+   * unambiguous, sheer enough that "everything below this dialog is a
+   * photograph" is a statement the user can verify by looking. */
+  background: color-mix(in srgb, var(--fd-canvas) 74%, transparent);
+}
+.fd-frame {
+  position: relative;
+}
+/* With no session there is nothing honest for either strip to say, and 2b
+ * replaces both with its own footer. */
+.fd-frame[data-access="true"] .fd-gitbar,
+.fd-frame[data-access="true"] .fd-statusbar {
+  display: none;
+}
+.fd-access__panel {
+  width: min(560px, calc(100% - 40px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 0 16px;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-access__panel {
+  /* 2b's rejected panel sits on a red-tinted ground, so the frame reads as one
+   * object rather than a red border around a neutral box. */
+  background: color-mix(in srgb, var(--fd-alert) 9%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-alert);
+}
+.fd-access[data-tone="stale"] .fd-access__panel {
+  background: color-mix(in srgb, var(--fd-stale) 9%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-stale);
+}
+.fd-access__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-access[data-tone="alert"] .fd-access__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-alert) 28%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-alert) 10%, transparent);
+}
+.fd-access[data-tone="stale"] .fd-access__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-stale) 28%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-stale) 12%, transparent);
+}
+.fd-access__title {
+  font-weight: 700;
+  color: var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-access__title {
+  color: var(--fd-alert);
+}
+.fd-access[data-tone="stale"] .fd-access__title {
+  color: var(--fd-stale);
+}
+/* "from the desktop" / "this address" — who or what did this. A fact. */
+.fd-access__eyebrow {
+  color: var(--fd-text-quiet);
+}
+.fd-access__body,
+.fd-access__detail,
+.fd-access__refused {
+  margin: 0;
+  padding: 0 12px;
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-access__body {
+  color: var(--fd-text-soft);
+}
+.fd-access__detail {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-access__refused {
+  color: var(--fd-alert);
+  letter-spacing: 0.3em;
+}
+/* 2b's numbered recovery steps. Both of them are on the *other* machine,
+ * which is the fact the user needs first. */
+.fd-access__steps {
+  margin: 0 12px;
+  padding: 10px 12px 10px 30px;
+  color: var(--fd-text-muted);
+  background: color-mix(in srgb, var(--fd-alert) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-alert);
+  line-height: 1.7;
+}
+.fd-access__actions,
+.fd-takeover__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding: 0 12px;
+}
+.fd-access__primary,
+.fd-access__secondary,
+.fd-takeover__action {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+}
+.fd-access__primary {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-access[data-tone="alert"] .fd-access__primary {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 14%, var(--fd-canvas));
+}
+.fd-access[data-tone="stale"] .fd-access__primary {
+  background: var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 12%, var(--fd-canvas));
+}
+.fd-access__secondary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+
+/* The four boxes, and the pairing code's own type size — the one place in the
+ * app that shouts (2g reserves --fd-t-code for exactly this). */
+.fd-code__wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 12px 0;
+}
+.fd-code {
+  display: flex;
+  gap: 8px;
+}
+.fd-code__box {
+  width: 46px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fd-t-code);
+  color: var(--fd-text);
+  background: var(--fd-canvas);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-code__box[data-caret="true"] {
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-access[data-tone="alert"] .fd-code__box {
+  box-shadow: inset 0 0 0 1px var(--fd-alert);
+}
+.fd-code__caret {
+  width: 0.6em;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@keyframes fd-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-code__caret {
+    animation: none;
+  }
+}
+/* A keypad, because a phone is the device this screen exists for — 2a's QR
+ * points a phone here, and a phone has no keyboard to catch keydown from. */
+.fd-code__pad {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  max-width: 320px;
+}
+.fd-code__key {
+  padding: 8px 0;
+  font: inherit;
+  border: 0;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--fd-accent) 12%, var(--fd-canvas));
+  color: var(--fd-text-soft);
+}
+.fd-access__foot {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+  font-size: var(--fd-t-meta);
+}
+/* The address is the one string on this screen a user might check, so it is a
+ * fact on the lifted floor — never decoration, and never invented. */
+.fd-access__host {
+  color: var(--fd-text-quiet);
+}
+.fd-access__attempts {
+  color: var(--fd-stale);
+}
+
+/* ══ 2f — takeover ═════════════════════════════════════════════════════════
+ * Magenta, because nothing here is broken: --fd-elsewhere is "another actor
+ * acted". D14 makes this courtesy, not a permission check. */
+.fd-takeover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 76%, transparent);
+}
+.fd-takeover__panel {
+  width: min(600px, calc(100% - 36px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 14px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 8%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-elsewhere);
+}
+.fd-takeover__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-elsewhere) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-elsewhere) 10%, transparent);
+}
+.fd-takeover__title {
+  color: var(--fd-elsewhere);
+  font-weight: 700;
+}
+.fd-takeover__eyebrow {
+  color: color-mix(in srgb, var(--fd-elsewhere) 55%, var(--fd-text-quiet));
+}
+.fd-takeover__body {
+  margin: 0;
+  padding: 0 12px;
+  color: var(--fd-text-soft);
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-takeover__who {
+  color: var(--fd-elsewhere);
+}
+.fd-takeover__detail {
+  margin: 0;
+  padding: 0 12px;
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  color: color-mix(in srgb, var(--fd-elsewhere) 45%, var(--fd-text-muted));
+  text-wrap: pretty;
+}
+/* Two different facts — someone else is driving; what you see is old — kept in
+ * two colours, because merged into one they stop being distinguishable. */
+.fd-takeover__stale {
+  margin: 0 12px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--fd-stale) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 22%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__facts {
+  margin: 0 12px;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__facts dt {
+  color: color-mix(in srgb, var(--fd-elsewhere) 50%, var(--fd-text-quiet));
+}
+.fd-takeover__facts dd {
+  margin: 0;
+  color: var(--fd-text-soft);
+}
+/* ── 2f, widened for M3: the same panel, with one row per seat ──────────────
+ * The fact list above describes one writer; this describes everyone. Same
+ * inset rule, same magenta, same meta size — it is not a second component,
+ * which is what "M3's multi-viewer list is the same panel with rows" means.
+ *
+ * The grid is fixed at five columns so the marks line up down the list: a turn
+ * column that is empty on every row but one, the name, the reader's own marker,
+ * the role, and the joined-at pushed to the right. `max-content` on the name
+ * lets a long label take the room it needs before `connected` gives way. */
+.fd-takeover__seats {
+  margin: 0 12px;
+  padding: 8px 12px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+}
+.fd-takeover__seat {
+  display: grid;
+  grid-template-columns: 1ch max-content max-content 1fr max-content;
+  align-items: baseline;
+  gap: 0 8px;
+}
+/* Every cell is placed by name rather than by source order, so a row missing
+ * its `this tab` marker or its `connected` line keeps the same columns as the
+ * rows around it. Auto-placement would slide the rest of that row left, and the
+ * list would stop lining up in exactly the place it is being compared. */
+.fd-takeover__seat-mark {
+  grid-column: 1;
+  color: var(--fd-elsewhere);
+}
+.fd-takeover__seat-label {
+  grid-column: 2;
+  color: var(--fd-text-soft);
+}
+/* The reader's own row, in the app's interactive hue rather than the panel's
+ * magenta: `this tab` is not another actor, it is the one reading. */
+.fd-takeover__seat-you {
+  grid-column: 3;
+  color: var(--fd-accent);
+}
+.fd-takeover__seat-role {
+  grid-column: 4;
+  color: var(--fd-text-quiet);
+}
+/* The turn is a fact somebody may act on — it is the answer to "why did my keys
+ * stop working" — so the row holding it reads in the panel's own hue while the
+ * rest stay at 2g's lifted floor for facts. */
+.fd-takeover__seat[data-holds-input="true"] .fd-takeover__seat-role {
+  color: var(--fd-elsewhere);
+}
+/* How long a seat has been there is identifying detail, which 2g puts at the
+ * lifted floor and not at the decor tier: deleting it would lose a fact. */
+.fd-takeover__seat-since {
+  grid-column: 5;
+  justify-self: end;
+  color: var(--fd-text-quiet);
+}
+.fd-takeover__action--primary {
+  background: var(--fd-elsewhere);
+  color: color-mix(in srgb, var(--fd-elsewhere) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+.fd-takeover__action--secondary {
+  background: none;
+  color: color-mix(in srgb, var(--fd-elsewhere) 35%, var(--fd-text-muted));
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-elsewhere) 30%, var(--fd-canvas));
+}
+.fd-takeover__action--tertiary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-takeover__action--secondary .fd-key-box,
+.fd-takeover__action--tertiary .fd-key-box,
+.fd-access__secondary .fd-key-box {
+  background: color-mix(in srgb, var(--fd-accent) 10%, var(--fd-canvas));
+  color: var(--fd-focus);
+}
+
+/* ══ 2e — the feed slide-over ══════════════════════════════════════════════
+ * A right-edge slide-over over the viewport, never a modal: D11 makes this the
+ * only notification channel there is, and a channel that blocked the screen
+ * would interrupt the terminal you are reading to tell you about one you are
+ * not. No aria-modal, no focus trap, no click-swallowing scrim. */
+.fd-feed {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(470px, 100%);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow:
+    inset 1px 0 0 var(--fd-accent),
+    -18px 0 44px -12px color-mix(in srgb, var(--fd-canvas) 70%, transparent);
+}
+.fd-feed__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-feed__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+/* D11: global across projects, which is the whole reason it is useful. */
+.fd-feed__scope {
+  color: var(--fd-text-quiet);
+}
+.fd-feed__close {
+  font: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-feed__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.fd-feed__row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--fd-rule-inner);
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 9px 12px;
+}
+/* The chip's precedence, on the rows themselves: attention, then finished,
+ * then nothing at all. An unread row is washed and barred; a read one is not,
+ * so "what is new" survives scrolling. */
+.fd-feed__row[data-tier="attention"][data-read="false"] {
+  background: color-mix(in srgb, var(--fd-alert) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-alert);
+}
+.fd-feed__row[data-tier="finished"][data-read="false"] {
+  background: color-mix(in srgb, var(--fd-ok) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-ok);
+}
+.fd-feed__line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.fd-feed__session {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-feed__row[data-read="true"] .fd-feed__session {
+  color: var(--fd-text-soft);
+  font-weight: 400;
+}
+/* Project attribution is a fact: the session that needs you is usually in a
+ * project you are not looking at. */
+.fd-feed__project {
+  color: var(--fd-text-quiet);
+}
+.fd-feed__when {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-feed__transition {
+  padding-left: 20px;
+  color: var(--fd-text-muted);
+}
+/* D3, said out loud. Visible on hover and on keyboard focus — a title alone is
+ * invisible on a phone, which is the device this shape exists for. */
+.fd-feed__jump {
+  padding-left: 20px;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  visibility: hidden;
+}
+.fd-feed__row:hover .fd-feed__jump,
+.fd-feed__row:focus-visible .fd-feed__jump {
+  visibility: visible;
+}
+.fd-feed__empty {
+  padding: 22px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  text-align: center;
+}
+.fd-feed__empty-title {
+  margin: 0;
+  color: var(--fd-text-quiet);
+}
+.fd-feed__empty-body {
+  margin: 0;
+  max-width: 44ch;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.fd-feed__foot {
+  flex: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--fd-rule-inner);
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  line-height: 1.6;
+}
+/* The retention window is a fact about what you can and cannot expect to
+ * find here, so it sits on the lifted floor. */
+.fd-feed__retention {
+  color: var(--fd-text-quiet);
+}
+
+/* The asleep footer ("keystrokes go to FlightDeck · Enter to wake it") is true
+ * only while the picture is current. On a photograph, waking the terminal does
+ * nothing — the banner is what has something to say — and on a replay the
+ * bar is. Anything else would be an instruction that does not work. */
+.fd-pane[data-tone="stale"] .fd-pane__foot,
+.fd-pane[data-tone="asleep_stale"] .fd-pane__foot,
+.fd-pane[data-tone="catching_up"] .fd-pane__foot {
+  display: none;
+}
+
+/* The two overlay layers are absolutely positioned inside these, so both need
+ * to be containing blocks. `.fd-frame` gets its own rule above. */
+.fd-main {
+  position: relative;
+}
+
+/* ══ 1d — the command palette ═══════════════════════════════════════════════
+ * §5: palette-primary, `Ctrl-g` the only chord claimed. A layer on `.fd-frame`
+ * like 2b/2f, not a separate screen — same reasoning: a dialog over a live
+ * terminal, not instead of one. */
+.fd-palette {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-palette__panel {
+  width: min(900px, calc(100% - 80px));
+  height: min(620px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-palette__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-palette__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-palette__hint {
+  color: var(--fd-text-decor);
+}
+.fd-palette__filter {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-title);
+}
+.fd-palette__prompt {
+  color: var(--fd-accent);
+}
+.fd-palette__text {
+  color: var(--fd-text);
+}
+/* The block caret 1d draws: an accent-filled cell, not a thin blinking bar —
+ * `--fd-code__caret` (2b) is the same idea at a different width, so the timing
+ * is shared rather than re-invented. */
+.fd-palette__caret {
+  width: 0.6em;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-palette__caret {
+    animation: none;
+  }
+}
+.fd-palette__count {
+  font-size: var(--fd-t-meta);
+  /* A match count is a count: 2g lists counts as decoration. */
+  color: var(--fd-text-decor);
+}
+.fd-palette__status {
+  flex: none;
+  padding: 6px 14px;
+  font-size: var(--fd-t-meta);
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+}
+.fd-palette__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-palette__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-palette__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-palette__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: read-only is "still true, not broken" (2g's `--fd-stale` note), not an
+ * error — the command did nothing *because* this tab cannot drive, which is a
+ * fact about the seat, not a failure of the command. */
+.fd-palette__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-palette__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 1px;
+  /* The 1px gap between columns 1d draws as a hairline: the parent shows
+   * through it, each column paints its own ground over the rest. */
+  background: color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  overflow: auto;
+}
+.fd-palette__column {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fd-t-body);
+}
+.fd-palette__group {
+  color: var(--fd-focus);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: var(--fd-t-meta);
+  padding-bottom: 4px;
+}
+.fd-palette__group:not(:first-child) {
+  margin-top: 10px;
+}
+.fd-palette__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px;
+  color: var(--fd-text-soft);
+  background: none;
+  border: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fd-palette__row[data-selected="true"] {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-palette__match {
+  color: var(--fd-focus);
+}
+/* The selected row's own colour already reads against the accent fill, so the
+ * matched substring does not also need to stand out inside it. */
+.fd-palette__row[data-selected="true"] .fd-palette__match {
+  color: inherit;
+}
+.fd-palette__key {
+  font-weight: 700;
+}
+.fd-palette__annotation {
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+.fd-palette__row:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+.fd-palette__foot {
+  flex: none;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+.fd-palette__tagline {
+  color: var(--fd-text-decor);
+}
+
+/* ══ 1f — the configuration manager (remote-control-ll5.6) ═══════════════
+ * Same posture as 1d: a layer on `.fd-frame`, opened by the palette's "Open
+ * Configuration" row and never open at the same time as the palette
+ * (`ui/app.ts`'s `runCommand` closes one before opening the other), so the
+ * two share a z-index rather than needing to be ordered against each other. */
+.fd-config {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-config__panel {
+  width: min(1040px, calc(100% - 80px));
+  height: min(640px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  font-size: var(--fd-t-body);
+}
+.fd-config__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-config__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-config__hint {
+  color: var(--fd-text-decor);
+}
+.fd-config__scope {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__scopes {
+  display: flex;
+  gap: 1px;
+  background: var(--fd-rule);
+}
+.fd-config__scope-tab {
+  padding: 4px 14px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  color: var(--fd-text-muted);
+  background: var(--fd-ground);
+  cursor: pointer;
+}
+.fd-config__scope-tab[data-active="true"] {
+  background: var(--fd-accent);
+  color: var(--fd-ground);
+  font-weight: 700;
+}
+.fd-config__path-label {
+  color: var(--fd-text-decor);
+}
+.fd-config__path {
+  color: var(--fd-text-muted);
+}
+.fd-config__unsaved {
+  color: var(--fd-focus);
+}
+.fd-config__status {
+  flex: none;
+  padding: 6px 14px;
+  font-size: var(--fd-t-meta);
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-config__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-config__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-config__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: a refused save because this tab is read-only is "still true, not
+ * broken" (2g's `--fd-stale` note), same reasoning as the palette's own
+ * `read_only` status. */
+.fd-config__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-config__columns {
+  flex: none;
+  display: grid;
+  grid-template-columns: 22px 124px 1fr 150px;
+  gap: 12px;
+  padding: 5px 14px;
+  color: var(--fd-text-decor);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-config__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.fd-config__row {
+  display: grid;
+  grid-template-columns: 22px 124px 1fr 150px;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 14px;
+  color: var(--fd-text-soft);
+  cursor: pointer;
+}
+/* A row with a staged, unsaved edit. The same `--fd-focus` the "Unsaved
+ * changes" chip and the note bars use, so "not written yet" reads as one
+ * colour across the panel rather than three. `remote-control-1p22` replaced
+ * the old `[data-host-only]` rule here: the host's field list has no host-only
+ * setting in it, and the browser no longer invents one. */
+.fd-config__row[data-staged="true"] .fd-config__value {
+  color: var(--fd-focus);
+}
+/* The selected row's wash + left rule, same recipe 1d's selected row and the
+ * main pane's focus glow both use for "this is the one the accent points
+ * at" — a mix of the token, not a new literal. */
+.fd-config__row[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-accent) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-accent);
+}
+.fd-config__row[data-selected="true"] .fd-config__label {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-config__cursor {
+  color: var(--fd-accent);
+}
+/* The value column's colour says what *kind* of value it is, not an
+ * arbitrary swatch per choice — see the ll5.6 task report for why per-choice
+ * colour-matching (1f's mock renders each colour option in the colour it
+ * names) was not reproduced: it would need a name→token table repurposing
+ * status tokens for a second, unrelated meaning, which is exactly what 2g's
+ * "if deleting it would lose a fact" rule warns against. */
+.fd-config__value {
+  color: var(--fd-text-decor);
+}
+.fd-config__value[data-kind="toggle"][data-checked="true"] {
+  color: var(--fd-ok);
+}
+.fd-config__value[data-kind="choice"] {
+  color: var(--fd-accent);
+}
+.fd-config__value[data-kind="text"] {
+  color: var(--fd-text-muted);
+}
+/* An open inline text edit, drawn the way the desktop's overlay draws one: the
+ * value highlighted, with the block cursor the component appends to the
+ * string. Wins over the per-kind colours above, and over the staged colour, by
+ * coming last — an edit in progress is the most specific thing a row can be. */
+.fd-config__row .fd-config__value[data-editing="true"] {
+  color: var(--fd-canvas);
+  background: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-config__origin[data-origin="set_here"] {
+  color: var(--fd-ok);
+}
+.fd-config__origin[data-origin="global"] {
+  color: var(--fd-info);
+}
+.fd-config__origin[data-origin="default"] {
+  color: var(--fd-text-decor);
+}
+/* Shared by the panel's static relay note and a field's D5 routable-bind
+ * warning — both are a caution, not an error (2g's `--fd-focus` family, the
+ * same one 1f's own mock uses for its note bar). */
+.fd-config__note {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 9px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--fd-focus) 25%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-focus) 5%, transparent);
+  color: color-mix(in srgb, var(--fd-focus) 55%, var(--fd-text-muted));
+  font-size: var(--fd-t-meta);
+}
+.fd-config__note-label {
+  color: var(--fd-focus);
+  font-weight: 700;
+}
+/* A per-field warning sits inline in the row list rather than pinned to the
+ * panel's edge, so it drops the border and indents under the setting label. */
+.fd-config__note--inline {
+  border-top: 0;
+  padding: 4px 14px 8px 158px;
+}
+.fd-config__foot {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid var(--fd-rule-inner);
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+/* `e edit in $EDITOR` (D16): visible, badged, never hidden — same posture as
+ * 1d's host-only rows, just spelled as a footer hint instead of a row tag. */
+.fd-config__editor-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.7;
+}
+
+/* ══ 1e — D13's shared dialog (remote-control-ll5.3) ══════════════════════
+ *
+ * Artboard `1e — NEW AGENT DIALOG, BOTH STATES`, and through it every dialog:
+ * 1d's own note is that there is one shell for all of them — titled accent
+ * frame, keyed buttons, consequences before the verb.
+ *
+ * Highest z-index of the four overlays. A dialog is a question somebody asked
+ * that has to be answered before the keyboard means anything, and unlike the
+ * palette and the configuration manager it is not this browser's to dismiss —
+ * so it must never end up *under* an overlay a local keypress opened. */
+.fd-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-dialog__panel {
+  width: min(720px, calc(100% - 80px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  font-size: var(--fd-t-body);
+}
+/* 1e's right-hand state: run-from-base recolours the whole frame to
+ * `--fd-focus`, because the dialog now describes something materially
+ * different — an agent editing the repository you are standing in, with no
+ * worktree between it and your work. */
+.fd-dialog__panel[data-toggled="true"] {
+  box-shadow: inset 0 0 0 1px var(--fd-focus);
+}
+.fd-dialog__head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 7px 14px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-accent) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__head {
+  border-bottom-color: color-mix(in srgb, var(--fd-focus) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-focus) 9%, transparent);
+}
+.fd-dialog__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__title {
+  color: var(--fd-focus);
+}
+.fd-dialog__kind {
+  color: var(--fd-text-decor);
+}
+.fd-dialog__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+}
+/* D13's origin line: `--fd-elsewhere` is 2g's "another actor acted" hue, the
+ * same one drift, App mode and the takeover panel use — which is exactly the
+ * fact being reported. It is a fact, not decoration: deleting it loses the only
+ * explanation for a modal the reader did not open. */
+.fd-dialog__origin {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  color: color-mix(in srgb, var(--fd-elsewhere) 35%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+/* The host's sentence for a dialog this build will not confirm from a browser
+ * (`remote-control-ll5.4` / `.5`). Amber, not red: nothing is broken, the
+ * confirmation simply lives on the other surface. */
+.fd-dialog__refusal {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-stale) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-stale);
+  color: color-mix(in srgb, var(--fd-stale) 30%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+/* Artboard 1g's step 2. The frame stays the dialog's own accent rather than
+ * turning red on its own: the *host* wrote the sentence above the field, and a
+ * colour this file chose would be the browser adding a claim of its own. */
+.fd-dialog__gate {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fd-dialog__gate-instruction {
+  color: var(--fd-text-soft);
+  line-height: 1.65;
+}
+/* Pushes 1g's hint to the right-hand edge of the field, where the artboard
+ * draws it. */
+.fd-dialog__gate-spacer {
+  flex: 1;
+}
+/* The name the host is waiting for, shown verbatim — 1g draws it as the
+ * field's own hint, because the gate buys deliberateness rather than secrecy. */
+.fd-dialog__gate-hint {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fd-dialog__choice {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 10px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  text-align: left;
+  color: var(--fd-text-muted);
+  background: none;
+  cursor: pointer;
+}
+.fd-dialog__choice[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-accent) 12%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-accent);
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__choice[data-selected="true"] {
+  background: color-mix(in srgb, var(--fd-focus) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-focus);
+}
+.fd-dialog__radio {
+  color: var(--fd-text-decor);
+}
+.fd-dialog__choice[data-selected="true"] .fd-dialog__radio {
+  color: var(--fd-accent);
+}
+.fd-dialog__panel[data-toggled="true"]
+  .fd-dialog__choice[data-selected="true"]
+  .fd-dialog__radio {
+  color: var(--fd-focus);
+}
+.fd-dialog__field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.fd-dialog__field-label {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.fd-dialog__input {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 7px 10px;
+  background: var(--fd-canvas);
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+.fd-dialog__typed {
+  color: var(--fd-text);
+}
+/* 1e's blinking caret. A real element rather than a CSS `content:` so the
+ * markup a test reads matches what the eye sees, the same rule
+ * `dom.ts`'s `spinnerGlyph` follows. */
+.fd-dialog__caret {
+  width: 7px;
+  align-self: stretch;
+  background: var(--fd-accent);
+  animation: fd-caret 1.05s steps(1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-dialog__caret {
+    animation: none;
+  }
+}
+/* 1e's right-hand replacement for the branch field: the sentence, not a
+ * disabled input, so nobody wonders whether what they typed is still in play. */
+.fd-dialog__note {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--fd-focus) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-focus);
+  color: color-mix(in srgb, var(--fd-focus) 30%, var(--fd-text-soft));
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__status {
+  font-size: var(--fd-t-meta);
+}
+.fd-dialog__status[data-outcome="pending"] {
+  color: var(--fd-text-muted);
+}
+.fd-dialog__status[data-outcome="applied"] {
+  color: var(--fd-ok);
+}
+.fd-dialog__status[data-outcome="rejected"] {
+  color: var(--fd-alert);
+}
+.fd-dialog__status[data-outcome="ignored"] {
+  color: var(--fd-text-muted);
+}
+/* D14: refused because this tab is read-only is "still true, not broken" —
+ * the same reading `.fd-config__status` and the palette give it. */
+.fd-dialog__status[data-outcome="read_only"] {
+  color: var(--fd-stale);
+}
+.fd-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.fd-dialog__action {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 0;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  cursor: pointer;
+}
+.fd-dialog__action--primary {
+  background: var(--fd-accent);
+  color: color-mix(in srgb, var(--fd-accent) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+.fd-dialog__panel[data-toggled="true"] .fd-dialog__action--primary {
+  background: var(--fd-focus);
+  color: color-mix(in srgb, var(--fd-focus) 12%, var(--fd-canvas));
+}
+/* 1g draws the destructive verb red and the cancel beside it plain, and the
+ * two must not look alike. `danger` is worn only by the button the **host**
+ * gated (`ConfirmGate::key`) — nothing here decides what is dangerous. */
+.fd-dialog__action--danger {
+  background: var(--fd-alert);
+  color: color-mix(in srgb, var(--fd-alert) 12%, var(--fd-canvas));
+  font-weight: 700;
+}
+.fd-dialog__action--secondary,
+.fd-dialog__action--tertiary {
+  background: none;
+  color: var(--fd-text-muted);
+  box-shadow: inset 0 0 0 1px var(--fd-sep);
+}
+.fd-dialog__action--secondary[data-on="true"] {
+  color: color-mix(in srgb, var(--fd-focus) 40%, var(--fd-text));
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fd-focus) 40%, var(--fd-canvas));
+}
+.fd-dialog__action--secondary .fd-key-box,
+.fd-dialog__action--tertiary .fd-key-box {
+  background: color-mix(in srgb, var(--fd-accent) 10%, var(--fd-canvas));
+  color: var(--fd-focus);
+}
+/* A confirm this build will not send from a browser (`ll5.4` / `.5`). Dimmed
+ * *and* explained — the sentence above it is the host's own — because a
+ * disabled button with no reason is the thing this replaces. */
+.fd-dialog__action[disabled] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.fd-dialog__choice:focus-visible,
+.fd-dialog__action:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
+}
+
+/* ══ The read-only panels — help, About, git status ══════════════════════════
+ * `remote-control-ll5.8`, `specs/WEB_INTERFACE.md` §6.5 R16.
+ *
+ * Same posture as 1d and 1f: a layer on `.fd-frame`, over a dimmed frame, at
+ * the same z-index — `AppState.readOnly` holds one panel and the reducer closes
+ * the palette when one opens, so none of them can be up at the same time as
+ * another and there is nothing to order.
+ *
+ * The frame colour is the one difference, and it is 1g's legend rather than a
+ * new idea: *"Cyan frame = confirm/select, blue = notification, red =
+ * destructive."* These three ask nothing, so they take the blue nothing else
+ * has claimed (`--fd-info`). The panel's colour says what R8 says in prose. */
+.fd-info {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-info__panel {
+  width: min(760px, calc(100% - 80px));
+  max-height: min(620px, calc(100% - 108px));
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-info);
+}
+/* Help is the long one — the host's whole §23 list — so it gets 1d's width and
+ * height. The other two are a dozen lines and would be a mostly-empty box at
+ * that size. */
+.fd-info__panel[data-kind="help"] {
+  width: min(900px, calc(100% - 80px));
+  height: min(620px, calc(100% - 108px));
+}
+.fd-info__head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 14px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+  background: color-mix(in srgb, var(--fd-info) 7%, transparent);
+}
+.fd-info__title {
+  color: var(--fd-info);
+  font-weight: 700;
+}
+/* Which Agent Tab the git panel is about (SPECS §21). A fact, so it sits in
+ * the lifted tier and not with the key hints. */
+.fd-info__subtitle {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-info__close {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--fd-text-decor);
+  cursor: pointer;
+}
+.fd-info__close:focus-visible {
+  outline: 1px solid var(--fd-info);
+  outline-offset: 2px;
+}
+.fd-info__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: var(--fd-t-body);
+  color: var(--fd-text-soft);
+}
+.fd-info__foot {
+  flex: none;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 14px;
+  border-top: 1px solid
+    color-mix(in srgb, var(--fd-info) 30%, var(--fd-canvas));
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-decor);
+}
+
+/* --- Help: two halves, one list shape ------------------------------------ */
+.fd-info__group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* 1d's group eyebrow, reused verbatim so the browser's keys and the host's
+ * read as the same kind of list. */
+.fd-info__group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 4px;
+}
+.fd-info__group-title {
+  color: var(--fd-focus);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: var(--fd-t-meta);
+}
+.fd-info__key-row {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  gap: 12px;
+  align-items: baseline;
+  padding: 2px 8px;
+}
+/* The description is the fact; the key is the instruction. Both are above the
+ * decoration tier, per 2g's rule — deleting either loses something. */
+.fd-info__key-desc {
+  color: var(--fd-text-muted);
+}
+/* The sentence between the two halves: prose, so `--fd-text-second`. */
+.fd-info__note {
+  margin: 0;
+  color: var(--fd-text-second);
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  max-width: 72ch;
+}
+/* The host's own title for its list. */
+.fd-info__host-title {
+  margin: 0;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+/* SPECS §32's isolated-run note, in the "another actor / another situation"
+ * hue 2f and the dialog origin already use, with 2e's left rule. */
+.fd-info__hostnote {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--fd-elsewhere) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--fd-elsewhere);
+  font-size: var(--fd-t-meta);
+  line-height: 1.6;
+}
+.fd-info__hostnote-title {
+  color: var(--fd-elsewhere);
+  font-weight: 700;
+}
+.fd-info__hostnote-line {
+  color: var(--fd-text-muted);
+}
+/* What the panel says when the host sent nothing. A fact about the host, so it
+ * sits in the lifted tier rather than being whispered. */
+.fd-info__absent {
+  margin: 0;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  line-height: 1.65;
+  max-width: 72ch;
+}
+
+/* --- About --------------------------------------------------------------- */
+.fd-info__about-name {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.fd-info__about-product {
+  color: var(--fd-text);
+  font-weight: 700;
+  font-size: var(--fd-t-title);
+}
+.fd-info__about-version {
+  color: var(--fd-text-quiet);
+}
+.fd-info__about-tagline {
+  margin: 0;
+  color: var(--fd-text-muted);
+  line-height: 1.7;
+  max-width: 64ch;
+}
+.fd-info__about-credits {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fd-info__about-credit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.fd-info__about-role {
+  color: var(--fd-text-second);
+}
+.fd-info__about-person {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+.fd-info__about-url,
+.fd-info__link {
+  /* 2g: `--fd-accent` is "interactive". A link is the most interactive thing
+   * on a panel that otherwise only states facts. */
+  color: var(--fd-accent);
+  overflow-wrap: anywhere;
+}
+.fd-info__about-url:focus-visible,
+.fd-info__link:focus-visible {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: 2px;
+}
+
+/* --- Git status (SPECS §21) ---------------------------------------------- */
+/* 2f's fact-list shape: a quiet label, the value at full contrast beside it. */
+.fd-info__fact {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 12px;
+  align-items: baseline;
+}
+.fd-info__fact-label {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fd-info__fact-value {
+  color: var(--fd-text-soft);
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.fd-info__strong {
+  color: var(--fd-text);
+  font-weight: 700;
+}
+/* A path on the host's filesystem: a fact, and often long. */
+.fd-info__path {
+  color: var(--fd-text-muted);
+  overflow-wrap: anywhere;
+}

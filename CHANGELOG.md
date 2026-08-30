@@ -50,8 +50,110 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   Ctrl-q. See SPECS §32.
 - **F1 (or Alt-h) opens help, anywhere.** Both open the help / keybindings panel in App and Terminal focus, so help is reachable without leaving the terminal first. Pressing the same key again while the panel is open opens the FlightDeck repository on GitHub in your browser; the panel stays up. Only bare F1 and Alt-h are claimed — modified F1 and a bare `h` still reach the agent. Two keys because Apple keyboards reserve F1 as a brightness key unless standard function keys are enabled, while `Alt-h` needs "Use Option as Meta key" on macOS — the same requirement `Alt-o` already carries. `Ctrl-g` → *Show Help* works unconditionally on every platform.
 
+- **FlightDeck Web: a browser control surface for the running instance.** A web
+  server embedded in the desktop binary serves a full-fidelity browser remote
+  control — every project, session, status and git bar the TUI sees, real
+  terminals rendered by xterm.js from the actual PTY byte stream, and keystrokes
+  back into the focused terminal, so a waiting agent can be unblocked from a
+  phone or a second laptop. Start it from the palette (`Start Web Interface` /
+  `Stop Web Interface`) or set `[web] enabled = true` to have it on every launch.
+  It binds `127.0.0.1` by default; a routable bind is an explicit opt-in that
+  says so when the server starts. Access is a short code shown on the desktop,
+  exchanged once for a per-browser cookie that survives restarts and can be
+  revoked or rotated — the code arrives in the URL fragment, so it never reaches
+  a request line or a log, and only a hash of the token is ever written to disk.
+  One browser drives at a time; a second is offered a takeover or can watch
+  read-only, and both surfaces show which seats are taken. The browser
+  letterboxes the host's terminal grid rather than scaling it, with a chip in the
+  git bar naming the geometry, because crisp type is the one thing a browser does
+  better than a terminal and upscaling a bitmap grid would throw it away. A
+  reconnecting tab resumes from a byte cursor and says plainly when it missed
+  output rather than pretending continuity, keystrokes typed while reconnecting
+  are held and delivered in order instead of being dropped, and an activity feed
+  keeps the last 200 status transitions (or 24 hours) so a freshly opened tab
+  lands on history rather than silence. Dark-only, keyboard-first, and no relay
+  involved: reaching it from outside your network is deliberately your own choice
+  of Tailscale, `ssh -L` or a tunnel.
+
+- **FlightDeck Web can now drive FlightDeck, not just watch it.** The browser
+  gets the command palette, the dialog family, the configuration manager and
+  split view — every one of them driving the same code the desktop drives, so
+  there is no second implementation to drift. The palette is the host's own
+  command list sent over the wire rather than a copy maintained in the browser:
+  if the desktop cannot run a command, the browser does not offer it, and when a
+  command is offered but would be refused, the row carries the host's own
+  sentence explaining why instead of failing on click. Actions whose effect
+  lands on the machine FlightDeck is running on — opening a worktree in the file
+  manager, `$EDITOR` — stay visible with a `host only` badge rather than being
+  hidden, because a missing command is more confusing than an honest one.
+  Dialogs are shared state: one opens on both surfaces at once, tagged with who
+  opened it, and either surface can answer it.
+
+  **Git commands work from the browser** — push, finish / local merge and rebase
+  worktree — and they refuse in the same words the desktop would use, so a dirty
+  base or a missing upstream reads as itself rather than as a generic failure.
+  What FlightDeck will not do to your history is unchanged and is enforced by
+  construction rather than by a check: no browser-reachable path can rewrite
+  history except the one rebase the specification sanctions, and none can open a
+  pull request. Pull Base deliberately stays desktop-only, and says so.
+
+  **Anything destructive asks twice from a browser and makes you type the name.**
+  Abandon Worktree, Rebase Worktree and Quit all take a second step in which you
+  type the session's name exactly — no trimming, no case folding — because a
+  browser is not the machine the damage lands on. Getting it wrong refuses and
+  changes nothing; cancelling is never gated, at either step. The desktop's own
+  dialogs are unchanged: it is the remoteness that earns the second step, not
+  the command.
+
+  Smaller things you will notice: a finished session's activity row now says how
+  many files it touched, counted by asking git at the moment it finished rather
+  than reusing a cached number that would be stale or missing; and when a viewer
+  takes a seat, its address, browser and how long it has been connected are three
+  separate facts rather than one string, with every time it prints dated against
+  the host's clock instead of the browser's.
+
+- **More than one person can now type into the same FlightDeck.** The browser
+  used to allow exactly one driver plus any number of read-only watchers,
+  because two people typing into one terminal produces interleaved keystrokes
+  that look like a bug in the agent rather than in FlightDeck. Now any number of
+  browsers can take a writing seat — the desktop is always one of them — and
+  FlightDeck arbitrates between them with a soft input lock: whoever types takes
+  the turn, and keeps it until they pause. Someone typing into another person's
+  burst is told so, naming who is currently typing, instead of having their
+  keystrokes spliced into the other person's line or silently dropped. If you
+  need the terminal now rather than in a moment, taking over is one confirmed
+  click, and it takes nobody's seat away — the interrupted writer gets the turn
+  back as soon as you pause. No surface has priority, the desktop included.
+
+  Every surface shows the same seat list: who is connected, who may type, who is
+  typing right now, and which row is you — live, as people come and go. The
+  desktop's status bar carries the same information as a chip, so you can see
+  from the machine itself that a browser is mid-sentence.
+
+  Note that a browser tab left open across a FlightDeck update will ask to be
+  reloaded: the wire protocol changed to carry the new seat model.
+
+- **Help, About and git status in the browser, and a layout that works on a
+  tablet.** The browser gets the same help and keybindings the desktop shows —
+  from the desktop's own text, so the two cannot drift — plus About FlightDeck
+  and a read-only git status panel carrying the branch, base, drift, dirty state,
+  ahead/behind and the GitHub compare URL for the branch. The compare link says
+  plainly that FlightDeck does not open the pull request; it never has and still
+  does not. Where a fact is unknown it says so rather than showing a zero: no
+  upstream means no ahead/behind row at all, and no compare URL means no link
+  rather than one guessed from the branch name.
+
+  Below 900px the sidebar becomes a slide-over and the git bar folds into the
+  status bar, so FlightDeck Web is usable on a tablet. The terminal still
+  letterboxes and is never scaled — if the host's grid is wider than your
+  viewport the stage scrolls, and the geometry chip says so.
+
 ### Improvements
 
+- FlightDeck Web now exposes **Change Project Default Base** and follows the New
+  Agent form's host-owned three-target cycle (new branch, existing branch, base)
+  instead of treating `Tab` as a local boolean. The web protocol is v5, so a tab
+  from before this change is told to reload rather than rendering the wrong form.
 - The help panel's hints ("Press the help key again: open on GitHub", "Esc / q: close") moved to its bottom border, so they stay visible instead of being truncated away with the rest of the shortcut list on an ordinary-sized terminal.
 - The status bar now advertises the help keys in **both** modes, not just App mode — help is global, so terminal focus should say so. To pay for the extra text, `Ctrl-g: command palette` is shortened to `Ctrl-g: palette` and `app commands` to `app mode`, keeping the bar within roughly the width it already required.
 - Collapse FlightDeck's chrome in small windows while in terminal focus: the
@@ -68,7 +170,87 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   aside in that order, which lands a full QR in a 30-row window. When it truly
   cannot fit, the note names the size the QR needs and the size you have.
 
+- **Both remote transports now share one async runtime.** The relay client that
+  drives the iOS companion moved from a blocking socket to `tokio-tungstenite` on
+  the same runtime the web server uses, so the desktop has one async world
+  instead of two. Its public behaviour is unchanged — the same backoff, pings,
+  liveness deadline and resume-from-cursor — but it stops waking roughly ten
+  times a second on an idle link. Windows keeps its own TLS path, and the
+  released Windows binary stays free of a C toolchain.
+
 ### Bug fixes
+
+- **The web command palette shortcut now works with the terminal focused.**
+  FlightDeck captures `Ctrl-g` before xterm and browser controls can consume it,
+  so the palette opens in both Terminal and App mode across Safari and
+  Chromium-based browsers instead of sending the chord to the hosted agent or
+  silently losing it.
+
+- **Revoking a browser's access now actually disconnects it.** Pressing revoke
+  withdrew the credential but never told the browser holding it, so an unwanted
+  browser kept full control of every terminal until it happened to reconnect —
+  while the desktop reported the eviction as done. Revoking now closes those
+  sessions immediately, and the browser says it lost access instead of silently
+  going stale. The access panel also lists each browser that holds access, with
+  its address, what it is, and how long it has been connected, so you can revoke
+  one rather than all of them.
+
+- **FlightDeck Web now tells you when output was lost.** Reconnecting to a
+  session that produced more than the host kept, the browser silently showed a
+  terminal with a hole in it. It now says so, shows the replay arriving with real
+  progress, and reports how stale the picture is and the round-trip time to the
+  host — three things the interface was built to display and never did.
+
+- **The browser's Configuration panel showed made-up values.** It rendered a
+  built-in list of settings with invented per-layer origins and names that did
+  not match FlightDeck's real ones, and saving silently did nothing. It now shows
+  your actual configuration, and edits are applied by the same code the desktop
+  uses.
+
+- **`ui.agent_tab_position = "right"` now moves the sidebar.** The setting has
+  always validated and appeared in the configuration manager, and never did
+  anything on either surface.
+
+- **Every iPhone was labelled "Safari on macOS"** in the viewer list and the
+  access panel, because iOS browsers describe themselves as "like Mac OS X".
+
+- **Smaller browser fixes:** the git bar no longer prints "↑0 ↓0" for a branch
+  with no upstream while the sidebar beside it correctly says there is none; the
+  New Agent form's "run from base" button no longer reads "off" while the form
+  shows it on; a destructive confirmation no longer offers two Cancel buttons;
+  arrow keys now move between sessions and split panes as the status bar has
+  always claimed; and the split view no longer insists it has three terminals
+  regardless of how many it has.
+
+- **FlightDeck Web could not be opened at all.** Starting the web interface
+  printed a URL and stopped there: no access code was ever created, and nothing
+  on the desktop showed one, so there was no way to get a browser in. Starting it
+  now opens an access panel. On the default loopback binding it offers **Open in
+  browser**, which launches your browser already signed in, and a URL that copies
+  with a one-time code attached for a second browser. Turning on network access
+  shows a QR to scan from a phone, the code in large type with its countdown, and
+  a list of your network addresses to choose which one to publish — with the
+  consequence spelled out, because anyone on that network holding the code can
+  drive your agents. `r` hides the code and QR at any time, and `Show Web Access`
+  in the palette brings the panel back.
+
+- **FlightDeck Web: keyboard shortcuts did nothing on a freshly opened tab.**
+  The global key handler was attached below the element the browser actually
+  focuses, so `Ctrl-g`, `Esc Esc`, and the activity-feed and help keys all did
+  nothing until you first clicked inside the terminal — and clicking anything
+  else took it away again. On a tablet, where there is no terminal click to
+  spare, that was the entire keyboard.
+- **FlightDeck Web: a closed panel could still cover the terminal.** The
+  activity feed kept intercepting clicks over the right-hand side of the
+  terminal while shut, an opaque strip sat across the bottom of every live
+  terminal, and split view drew its single pane and its split at the same time.
+  All four were one cause — a closed element being given a layout that outranked
+  its own hidden state — now fixed in one place rather than defended
+  component by component.
+- **FlightDeck Web: a terminal wider than your window was silently cropped.**
+  The stage clipped the host's grid at both edges instead of letting it scroll,
+  so roughly ten columns each side simply were not there on a narrow window,
+  with nothing to indicate it.
 
 - A base-branch Agent Session Tab now records the branch actually checked out
   rather than the configured base, so Push Branch pushes the right ref. A
@@ -104,6 +286,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 - A crash no longer leaves your shell printing mouse movement as escape
   sequences: mouse capture, bracketed paste, and keyboard flags are restored on
   the panic path as well as on a clean exit.
+
+- **The desktop no longer feeds a phone that is not listening.** "Phone
+  connected" was asserted once by the relay and never re-checked, so a link that
+  died half-open — the normal case when iOS suspends the app — left the desktop
+  shipping updates into the void indefinitely while showing no problem at all. In
+  one observed case that ran for 17 days and 33,000 messages. Presence is now
+  earned from the phone's own acknowledgements: silence counts only while
+  something is actually owed, so a connected phone with nothing to acknowledge is
+  never wrongly written off, and a phone whose messages the relay is rejecting is
+  told apart from one that is gone. Fixing it required the relay to start
+  forwarding those acknowledgements at all, which it never had — so the relay
+  must be updated alongside this release for the check to arm. Against an older
+  relay the desktop behaves exactly as before rather than declaring every phone
+  dark.
+- **A first `wss://` connection could crash the desktop.** A dependency change
+  left the TLS stack with no crypto provider selected, which would have panicked
+  on the first secure relay connection on macOS and Linux. Found while porting
+  the transport; fixed before it shipped.
 
 ### Breaking changes
 

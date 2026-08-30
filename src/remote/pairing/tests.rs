@@ -52,7 +52,6 @@ fn happy_path_transitions_idle_offering_displaying_established() {
     let peer_ka = STANDARD.encode(public_x963(&PHONE_SCALAR));
     let became = s.on_claimed(pairing.clone(), Some(peer_ka));
     assert!(became, "claim with a peer KA key establishes the pairing");
-    assert!(s.is_established());
     assert!(matches!(s.phase(), PairingPhase::Established { .. }));
 }
 
@@ -288,7 +287,7 @@ fn a_late_failure_never_wipes_a_live_code_or_a_finished_pairing() {
         PairingId::new("pair_b".to_string()),
         Some(STANDARD.encode(public_x963(&PHONE_SCALAR))),
     );
-    assert!(s2.is_established());
+    assert!(matches!(s2.phase(), PairingPhase::Established { .. }));
     s2.on_handshake_failed("cannot reach the relay: gone", true);
-    assert!(s2.is_established());
+    assert!(matches!(s2.phase(), PairingPhase::Established { .. }));
 }

@@ -290,6 +290,23 @@ pub struct RuntimeTab {
     /// single OS notification fires and this is cleared, so a quiet agent never
     /// re-notifies until it resumes working (SPECS §24).
     pub notify_armed: bool,
+    /// The last [`DisplayStatus`] this tab was seen in by
+    /// [`AppState::take_status_transitions`] — the activity feed's **own** edge
+    /// memory (`specs/WEB_INTERFACE.md` D11).
+    ///
+    /// Deliberately a second field rather than a reuse of `notify_armed`: the
+    /// feed is a second record of the same lifecycle signal, not a replacement
+    /// for the OS notifications, so the two consumers must not share mutable
+    /// state. `take_finish_notifications` consumes `notify_armed` destructively
+    /// (it clears the arming on every settled edge); if the feed read the same
+    /// field, whichever ran second would see an already-spent edge and one of
+    /// the two records would silently lose events.
+    ///
+    /// `None` until the tab is first observed, and **the first observation
+    /// records nothing** — a first sighting is not a transition, and recording
+    /// one per tab at launch would fill the feed with noise on every start
+    /// (the same problem `notify_grace_until_ms` solves for notifications).
+    activity_seen: Option<DisplayStatus>,
     /// Rolling tail of recent primary output (ANSI-stripped, bounded) scanned for
     /// the agent's on-exit resume hint. Runtime-only; the captured result lives
     /// in `meta.resume_args`.
@@ -314,6 +331,7 @@ impl RuntimeTab {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            activity_seen: None,
             resume_scan: String::new(),
             session_snapshot: None,
         }
@@ -506,6 +524,30 @@ fn notify_phase(status: InterpretedStatus) -> NotifyPhase {
     }
 }
 
+/// One observed move in a tab's display status, as returned by
+/// [`AppState::take_status_transitions`].
+///
+/// Carries the raw facts only — both [`DisplayStatus`] ends plus the agent key
+/// — and takes **no** view on what the browser should render. Turning these into
+/// honest wire values (including §5.1's "unknown stays unknown" for an agent
+/// with no lifecycle hooks) is [`crate::web::activity::observe`]'s job, so the
+/// design's vocabulary lives next to the design's tests rather than in this
+/// layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStatusChange {
+    /// The tab that changed.
+    pub tab_id: TabId,
+    /// Its display name, denormalised for the caller's convenience.
+    pub tab_name: String,
+    /// The configured agent key, so the caller can look the definition up and
+    /// decide whether this agent reports a lifecycle at all.
+    pub agent_key: String,
+    /// The status before the move.
+    pub was: DisplayStatus,
+    /// The status after it.
+    pub now: DisplayStatus,
+}
+
 /// The headless application state (SPECS §3).
 pub struct AppState {
     /// The parsed, committed configuration (SPECS §8).
@@ -680,11 +722,6 @@ impl AppState {
         }
     }
 
-    /// Index of the tab with the given id, if present.
-    pub fn tab_index(&self, id: &TabId) -> Option<usize> {
-        self.tabs.iter().position(|t| t.meta.id == id.0)
-    }
-
     /// Resolve a [`Selector`] against `len` and the current index.
     fn resolve_selector(sel: Selector, current: Option<usize>, len: usize) -> Option<usize> {
         if len == 0 {
@@ -802,6 +839,63 @@ impl AppState {
         out
     }
 
+    /// Detect tabs whose display status has moved since the last call and
+    /// return one change per tab, **without touching the OS-notification
+    /// state** (`specs/WEB_INTERFACE.md` D11).
+    ///
+    /// This is the activity feed's half of the very signal
+    /// [`AppState::take_finish_notifications`] turns into an OS notification:
+    /// both read `RuntimeTab::display_status`, the same value `notify_phase`
+    /// classifies. It is a **tee at the source**, not a second consumer of the
+    /// notifications themselves — the notification path is destructive (it
+    /// spends `notify_armed` on every settled edge) and it drops everything the
+    /// user disabled in config or that the startup grace window suppressed, so
+    /// reading its *output* would give the browser a feed with holes in it. The
+    /// feed instead keeps its own `activity_seen` memory, which is why calling
+    /// this before or after `take_finish_notifications` cannot change what the
+    /// desktop posts.
+    ///
+    /// **It reports every move, not just the notifiable edges.** §5.1's feed has
+    /// a `quiet` tier for transitions that would never earn an alert (a manual
+    /// override, `unknown → unknown`), and D11 makes the feed the entire
+    /// substitute for OS notifications in the browser, so a transition the
+    /// desktop chose not to interrupt anyone about still has to be *recorded*.
+    ///
+    /// A change is a move in `interpreted` **or** in the manual override — the
+    /// two halves a feed row shows. A process-state change that moves neither
+    /// (say `Running` → `Exited(0)` while a manual `done` pins the display) is
+    /// remembered but not reported, so the *next* real transition still gets to
+    /// explain itself with the freshest process facts.
+    ///
+    /// Sampling is per tick, so a turn that starts and settles between two calls
+    /// is reported as the single net transition that was actually observed —
+    /// honest about what was seen rather than reconstructing an intermediate
+    /// state nobody witnessed. Pure of I/O; the caller maps these onto
+    /// [`crate::web::activity::Transition`]s (see
+    /// [`crate::web::activity::observe`] for the reason-string policy).
+    pub fn take_status_transitions(&mut self, now_ms: u64) -> Vec<TabStatusChange> {
+        let mut out = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            let now = tab.display_status(now_ms);
+            let previous = tab.activity_seen.replace(now);
+            let Some(was) = previous else {
+                // First sighting: not a transition. See `activity_seen`.
+                continue;
+            };
+            if was.interpreted == now.interpreted && was.manual == now.manual {
+                continue;
+            }
+            out.push(TabStatusChange {
+                tab_id: tab.id(),
+                tab_name: tab.meta.name.clone(),
+                agent_key: tab.meta.agent.clone(),
+                was,
+                now,
+            });
+        }
+        out
+    }
+
     /// Update the persisted PTY size used for future spawns (SPECS §23 resize).
     pub fn set_pty_size(&mut self, size: PtySize) {
         self.pty_size = size;
@@ -903,7 +997,16 @@ impl AppState {
                 let label = if self.split_view { "on" } else { "off" };
                 Ok(Effect::Message(format!("Split view {label}.")))
             }
-            Command::Quit => Ok(Effect::Quit),
+            // SPECS §23 gives the desktop's quit no second question, so a
+            // confirmed value quits outright. An unconfirmed one asks — the
+            // shape §5.1's rebase and §5/§15's abandon already have, reused so
+            // D16's "a badge is not enough for quit" needs no browser-only flow
+            // (`specs/WEB_INTERFACE.md` §6.5 R13).
+            Command::Quit { confirm } => Ok(if confirm {
+                Effect::Quit
+            } else {
+                Effect::QuitConfirm
+            }),
         }
     }
 
@@ -1146,6 +1249,7 @@ impl AppState {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            activity_seen: None,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -1247,6 +1351,7 @@ impl AppState {
             status_file: None,
             status_file_seen: None,
             notify_armed: false,
+            activity_seen: None,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -4039,6 +4144,152 @@ mod tests {
         assert!(app.take_finish_notifications(1_300).is_empty());
         write_status(&mut app, &fs, &git, &pty, &clock, "idle", 1_400);
         assert_eq!(app.take_finish_notifications(1_400).len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The activity feed's tee (`specs/WEB_INTERFACE.md` D11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_first_sighting_of_a_tab_is_not_a_transition() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        assert!(
+            app.take_status_transitions(1_000).is_empty(),
+            "a tab that has only just been observed has not moved yet — recording \
+             one row per tab at launch would fill the feed with noise on every start"
+        );
+    }
+
+    #[test]
+    fn a_status_transition_is_reported_with_both_ends() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, id) = app_with_running_tab(config_notify_on(&dir));
+
+        // Arm the memory on the settled state a fresh supported agent reports.
+        assert!(app.take_status_transitions(1_000).is_empty());
+
+        write_status(&mut app, &fs, &git, &pty, &clock, "waiting", 1_100);
+        let changes = app.take_status_transitions(1_100);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].tab_id, id);
+        assert_eq!(changes[0].tab_name, "Task");
+        assert_eq!(changes[0].was.interpreted, InterpretedStatus::Idle);
+        assert_eq!(
+            changes[0].now.interpreted,
+            InterpretedStatus::WaitingForInput
+        );
+
+        // Staying put is not a transition.
+        assert!(app.take_status_transitions(1_200).is_empty());
+    }
+
+    #[test]
+    fn a_manual_override_moves_the_feed_even_when_the_agent_did_not() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, _git, _fs, _pty, _clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        assert!(app.take_status_transitions(1_000).is_empty());
+
+        app.tabs[0].meta.manual_status = Some(ManualStatus::Blocked.as_str().to_string());
+        let changes = app.take_status_transitions(1_100);
+        assert_eq!(
+            changes.len(),
+            1,
+            "§5.1's quiet tier exists for exactly this: a move the desktop would \
+             never post an alert about still has to reach a browser tab"
+        );
+        assert_eq!(changes[0].was.manual, None);
+        assert_eq!(changes[0].now.manual, Some(ManualStatus::Blocked));
+        assert_eq!(
+            changes[0].was.interpreted, changes[0].now.interpreted,
+            "the agent itself did not move"
+        );
+    }
+
+    /// **The regression that matters.** D11 makes the feed a *second* record, so
+    /// wiring it must leave the desktop's own OS notifications byte-for-byte as
+    /// they were. This replays `notifies_when_agent_finishes_turn` with the feed's
+    /// drain interleaved on every tick, before *and* after, and asserts the same
+    /// notifications still come out.
+    #[test]
+    fn the_activity_tee_leaves_the_desktops_notifications_untouched() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+
+        let _ = app.take_status_transitions(1_000);
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_000);
+        let _ = app.take_status_transitions(1_100);
+        assert!(app.take_finish_notifications(1_100).is_empty());
+        let _ = app.take_status_transitions(1_100);
+
+        write_status(&mut app, &fs, &git, &pty, &clock, "idle", 1_200);
+        let _ = app.take_status_transitions(1_200);
+        let notes = app.take_finish_notifications(1_200);
+        assert_eq!(notes.len(), 1, "the finish notification still fires");
+        assert_eq!(notes[0].title, "Task");
+        assert!(notes[0].body.contains("finished"), "got: {}", notes[0].body);
+        assert_eq!(notes[0].sound, NotificationSound::Completion);
+
+        // Staying idle must still not re-notify: the tee must not have re-armed
+        // `notify_armed` behind the notifier's back.
+        let _ = app.take_status_transitions(1_201);
+        assert!(app.take_finish_notifications(1_201).is_empty());
+
+        // And resuming work still re-arms, so the next finish still alerts.
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_300);
+        let _ = app.take_status_transitions(1_300);
+        assert!(app.take_finish_notifications(1_300).is_empty());
+        write_status(&mut app, &fs, &git, &pty, &clock, "idle", 1_400);
+        let _ = app.take_status_transitions(1_400);
+        assert_eq!(app.take_finish_notifications(1_400).len(), 1);
+    }
+
+    /// The other half of the same claim: the feed must **not** be built from the
+    /// notifications' output, because that output is empty whenever the user
+    /// turned notifications off — and a browser tab has nothing else to learn a
+    /// transition from (D11).
+    #[test]
+    fn transitions_still_reach_the_feed_when_notifications_are_disabled() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_notify_on(&dir);
+        config.notifications.enabled = false;
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config);
+
+        let _ = app.take_status_transitions(1_000);
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_000);
+        write_status(&mut app, &fs, &git, &pty, &clock, "waiting", 1_100);
+
+        assert!(
+            app.take_finish_notifications(1_100).is_empty(),
+            "the desktop posts nothing, as configured"
+        );
+        assert_eq!(
+            app.take_status_transitions(1_100).len(),
+            1,
+            "but the browser's only notification channel still records it"
+        );
+    }
+
+    /// Same argument for the startup grace window: it exists so a burst of
+    /// resumed agents does not fire a burst of alerts, not to hide history from a
+    /// browser that opens afterwards.
+    #[test]
+    fn transitions_still_reach_the_feed_inside_the_startup_grace_window() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        app.begin_notification_grace(1_000);
+
+        let _ = app.take_status_transitions(1_000);
+        write_status(&mut app, &fs, &git, &pty, &clock, "working", 1_000);
+        write_status(&mut app, &fs, &git, &pty, &clock, "failed", 1_100);
+
+        assert!(
+            app.take_finish_notifications(1_100).is_empty(),
+            "suppressed by the grace window"
+        );
+        let changes = app.take_status_transitions(1_100);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].now.interpreted, InterpretedStatus::Failed);
     }
 
     #[test]

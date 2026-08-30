@@ -1,0 +1,158 @@
+name: Web UI
+
+# The browser control surface (specs/WEB_INTERFACE.md D9) is a Vite +
+# TypeScript SPA with its own npm toolchain — a THIRD build surface beside the
+# root `flightdeck` crate and the `remote/` workspace (see
+# .agents/skills/shipping-flightdeck-changes).
+#
+# It needs its own job because the Rust gate cannot catch its failures: a clean
+# checkout carries only the tracked `webui/dist/.gitkeep`, and
+# src/web/assets.rs deliberately degrades to an explanatory page when the SPA
+# is absent. So `cargo test` passes happily against a `webui/` that does not
+# typecheck or whose tests fail, and the breakage would only surface at release
+# time — in a released binary. This job is what closes that gap.
+#
+# Push on main only (post-merge); PRs own feature-branch CI. Running push on
+# `flightdeck/**` too would double every run (push ref vs pull_request ref never
+# share a concurrency group). Same rationale as ci.yml and relay.yml.
+#
+# The `e2e` job below also depends on the HOST half of the browser surface, so
+# `src/web/**` and the shared E2E fixtures are trigger paths too: a change to the
+# server or the protocol can break the browser without touching a single file
+# under `webui/`, and that is precisely the breakage the end-to-end job exists to
+# catch.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "webui/**"
+      - "src/web/**"
+      - "scripts/e2e/**"
+      - ".github/workflows/webui.yml"
+  pull_request:
+    paths:
+      - "webui/**"
+      - "src/web/**"
+      - "scripts/e2e/**"
+      - ".github/workflows/webui.yml"
+
+concurrency:
+  group: webui-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: webui
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      # `npm ci` (not `install`) so the lockfile is authoritative here exactly
+      # as it is on the release runners — a job that silently resolved
+      # different versions than the release build would be worse than no job.
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Test
+        run: npm run test
+      # Last, because the Rust build embeds this output: if `npm run build`
+      # cannot produce assets, no released binary can serve the app.
+      - name: Build
+        run: npm run build
+
+  # One OS is enough: this toolchain is Node and TypeScript, with no
+  # OS-specific behaviour. The cross-platform parity requirement in
+  # .agents/skills/flightdeck-cross-platform-parity binds the Rust host code
+  # (paths, PTYs, interface enumeration), not the SPA, which runs in a browser.
+  # The release pipeline does build webui/ on all three runners
+  # (.github/workflows/build-setup.steps), so a genuinely platform-specific npm
+  # failure would still be caught before a release ships.
+
+  # ---------------------------------------------------------------------------
+  # The Playwright end-to-end job (specs/WEB_INTERFACE.md D15).
+  #
+  # Launches a REAL FlightDeck on a real PTY with a real agent process, opens the
+  # page in a real Chromium, types into the terminal and asserts what xterm.js
+  # rendered. It is the only test that proves the whole chain — PTY bytes →
+  # replay ring → protocol frame → WebSocket → rendered DOM, and a keystroke back
+  # the other way. Everything else in this repository tests one link of it.
+  #
+  # NON-BLOCKING UNTIL 2026-09-10, THEN REQUIRED.
+  #   Registered non-blocking on 2026-08-27 with `continue-on-error: true`, per
+  #   Q6's two-week grace period: a brand-new browser-in-CI job has to earn trust
+  #   on real runners before it can block a merge. On 2026-09-10 remove the
+  #   `continue-on-error` line below and add the check — it appears as
+  #   `Web UI / e2e (browser)` — to the branch protection required checks.
+  #   Tracked by remote-control-nfrm.
+  #
+  # Q6's flake policy, in full:
+  #   - retries: 2 here (CI), 0 locally — set in webui/playwright.config.ts from
+  #     $CI, which GitHub Actions sets. Flake must be visible while developing.
+  #   - A test failing twice consecutively on `main` is QUARANTINED the same
+  #     working day: `test.fixme` with a filed bd issue naming an owner (the exact
+  #     form is documented at the bottom of webui/e2e/chain.spec.ts).
+  #   - Raising `retries` to silence this job is not an option. This repo already
+  #     carries three iOS flake issues (remote-control-7lo, ba5, 7lr); the policy
+  #     exists so the browser suite does not become a fourth.
+  #
+  # Ubuntu only, and for the same reason tests/remote_e2e.rs is
+  # `#![cfg(not(windows))]`: the launcher needs a PTY, and the Windows runners
+  # have neither that nor bash. The SPA runs in a browser, so it carries no
+  # OS-specific behaviour of its own for the parity requirement to bind
+  # (.agents/skills/flightdeck-cross-platform-parity binds the Rust host code).
+  e2e:
+    name: e2e (browser)
+    runs-on: ubuntu-latest
+    # Q6: remove this line on 2026-09-10 and make the check required.
+    continue-on-error: true
+    # A wedged PTY or a socket that never opens should cost minutes, not the
+    # 360-minute GitHub default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      # Before the Rust build on purpose: the page under test has to be the one
+      # src/web/assets.rs serves out of `webui/dist`, and the suite fails loudly
+      # rather than testing the "webui was not built" page.
+      - name: Build the SPA
+        run: npm run build
+      - name: Build the desktop binary
+        run: cargo build --locked
+        working-directory: .
+      # `--with-deps` installs the shared libraries a headless Chromium needs on
+      # a bare runner; without it the browser launch fails with a missing .so.
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Playwright
+        # The binary is already built above; building it again from inside the
+        # global setup would double the cold-cache cost of this job.
+        env:
+          FD_E2E_SKIP_BUILD: "1"
+        run: npx playwright test
+      # The report carries the trace and the failure screenshot, and the suite
+      # attaches the desktop's PTY transcript to every failure message — so a red
+      # run can be diagnosed without reproducing it locally.
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: webui/playwright-report/
+          retention-days: 7

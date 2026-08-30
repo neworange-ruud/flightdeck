@@ -10,7 +10,7 @@
 
 use crate::contracts::{
     AgentDef, Config, ContainersConfig, GitConfig, NotificationsConfig, RemoteConfig, UiConfig,
-    UpdateConfig, WorktreesConfig,
+    UpdateConfig, WebConfig, WorktreesConfig,
 };
 use crate::contracts::{FileSystem, FlightDeckError, Result};
 use serde::Serialize;
@@ -84,6 +84,7 @@ struct GlobalConfigView<'a> {
     notifications: &'a NotificationsConfig,
     update: &'a UpdateConfig,
     remote: &'a RemoteConfig,
+    web: &'a WebConfig,
     containers: &'a ContainersConfig,
     agents: &'a BTreeMap<String, AgentDef>,
 }
@@ -107,17 +108,43 @@ const REMOTE_SECTION_COMMENT: &str = "\
 # The FLIGHTDECK_RELAY_PASSWORD environment variable overrides this value.
 ";
 
-/// Insert [`REMOTE_SECTION_COMMENT`] directly above the `[remote]` table header
-/// in a serialized TOML body. The `toml` crate drops comments on serialization,
-/// so we re-attach this one every time we write the global file. A no-op if the
-/// body has no `[remote]` section.
-fn annotate_remote_section(body: &str) -> String {
-    match body.lines().position(|l| l.trim() == "[remote]") {
+/// The explanatory comment injected above the `[web]` section of any global
+/// `config.toml` we write (`specs/WEB_INTERFACE.md` D5, D10, Q2). Documents why
+/// each field exists so a user editing this file by hand understands the
+/// consequence of changing it, not just its type.
+const WEB_SECTION_COMMENT: &str = "\
+# FlightDeck Web (embedded browser access to your terminals). Off by default.
+#
+# enabled: auto-start the web interface on launch. Leave false to start it only
+# on demand via the \"Start Web Interface\" command palette action.
+# port: TCP port the embedded server listens on. Kept stable across restarts so
+# a bookmarked URL / saved QR code keeps working.
+# bind: address the server listens on. 127.0.0.1 (loopback) by default, so
+# nothing outside this machine can reach it. Binding a routable address (e.g.
+# 0.0.0.0 or a LAN IP) is a deliberate opt-in you type yourself, and the app
+# warns when it actually does so — see the docs before changing this.
+# replay_bytes: per-terminal replay buffer, in bytes, replayed to a browser tab
+# that joins or reconnects so it can repaint recent history.
+";
+
+/// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]` and [`WEB_SECTION_COMMENT`]
+/// above `[web]` in a serialized TOML body. The `toml` crate drops comments on
+/// serialization, so we re-attach these every time we write the global file. A
+/// no-op for any section the body does not contain.
+fn annotate_sections(body: &str) -> String {
+    let with_remote = insert_section_comment(body, "[remote]", REMOTE_SECTION_COMMENT);
+    insert_section_comment(&with_remote, "[web]", WEB_SECTION_COMMENT)
+}
+
+/// Insert `comment` directly above the first line matching `header` (trimmed)
+/// in `body`. A no-op if `header` is not found.
+fn insert_section_comment(body: &str, header: &str, comment: &str) -> String {
+    match body.lines().position(|l| l.trim() == header) {
         Some(idx) => {
-            let mut out = String::with_capacity(body.len() + REMOTE_SECTION_COMMENT.len());
+            let mut out = String::with_capacity(body.len() + comment.len());
             for (i, line) in body.lines().enumerate() {
                 if i == idx {
-                    out.push_str(REMOTE_SECTION_COMMENT);
+                    out.push_str(comment);
                 }
                 out.push_str(line);
                 out.push('\n');
@@ -138,6 +165,7 @@ pub fn serialize_global_config(config: &Config) -> Result<String> {
         notifications: &config.notifications,
         update: &config.update,
         remote: &config.remote,
+        web: &config.web,
         containers: &config.containers,
         agents: &config.agents,
     };
@@ -145,7 +173,7 @@ pub fn serialize_global_config(config: &Config) -> Result<String> {
         .map_err(|e| FlightDeckError::Config(format!("failed to serialize global config: {e}")))?;
     Ok(format!(
         "{GLOBAL_CONFIG_HEADER}{}",
-        annotate_remote_section(&body)
+        annotate_sections(&body)
     ))
 }
 
@@ -170,7 +198,7 @@ pub fn serialize_global_table(table: &toml::Table) -> Result<String> {
         .map_err(|e| FlightDeckError::Config(format!("failed to serialize global config: {e}")))?;
     Ok(format!(
         "{GLOBAL_CONFIG_HEADER}{}",
-        annotate_remote_section(&body)
+        annotate_sections(&body)
     ))
 }
 
@@ -402,6 +430,126 @@ mod tests {
         let comment_idx = out.find("# FlightDeck Remote").unwrap();
         let header_idx = out.find("[remote]").unwrap();
         assert!(comment_idx < header_idx, "comment must precede header");
+    }
+
+    // --- [web] section (specs/WEB_INTERFACE.md D5, D10, Q2) ---
+
+    #[test]
+    fn global_config_documents_web_section_disabled_and_loopback() {
+        let toml = serialize_global_config(&default_config("x", "main")).unwrap();
+        assert!(toml.contains("[web]"), "global: {toml}");
+        assert!(
+            toml.contains("127.0.0.1") && toml.contains("7420") && toml.contains("262144"),
+            "global: {toml}"
+        );
+        // Explanatory comment sits above the section header.
+        let comment_idx = toml.find("# FlightDeck Web").unwrap();
+        let header_idx = toml.find("[web]").unwrap();
+        assert!(
+            comment_idx < header_idx,
+            "comment must precede [web] header"
+        );
+        // Round-trips back into a config with the web section disabled/loopback.
+        let cfg = parse_config(&toml).unwrap();
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn global_table_save_reattaches_web_comment() {
+        let table: toml::Table =
+            "[web]\nenabled = true\nport = 9000\nbind = \"127.0.0.1\"\nreplay_bytes = 262144\n"
+                .parse()
+                .unwrap();
+        let out = serialize_global_table(&table).unwrap();
+        let comment_idx = out.find("# FlightDeck Web").unwrap();
+        let header_idx = out.find("[web]").unwrap();
+        assert!(comment_idx < header_idx, "comment must precede header");
+    }
+
+    #[test]
+    fn global_table_save_reattaches_both_remote_and_web_comments() {
+        // Both sections annotated in the same save, in the order they appear.
+        let table: toml::Table = "[remote]\nenabled = false\n\n[web]\nenabled = false\n"
+            .parse()
+            .unwrap();
+        let out = serialize_global_table(&table).unwrap();
+        assert!(out.contains("# FlightDeck Remote"), "out: {out}");
+        assert!(out.contains("# FlightDeck Web"), "out: {out}");
+    }
+
+    #[test]
+    fn project_overrides_one_web_field_leaving_siblings_at_global() {
+        // The per-field-default regression this convention guards against:
+        // overriding only `web.port` at the project layer must not wipe
+        // `enabled`/`bind`/`replay_bytes` back to Rust zero values.
+        let global = global_base();
+        let project: toml::Table = "[web]\nport = 9000\n".parse().unwrap();
+        let cfg = effective_config(global, project).unwrap();
+        assert_eq!(cfg.web.port, 9000);
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn project_web_enabled_override_keeps_global_port_and_bind() {
+        let global = global_base();
+        let project: toml::Table = "[web]\nenabled = true\n".parse().unwrap();
+        let cfg = effective_config(global, project).unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn missing_web_section_anywhere_still_loads_loopback_defaults() {
+        // Old config predating [web] entirely: neither the global base (as it
+        // existed before this setting) nor the minimal project mentions it.
+        let mut global = global_base();
+        global.remove("web");
+        let project = minimal_project_config("p", "main").parse().unwrap();
+        let cfg = effective_config(global, project).unwrap();
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.port, 7420);
+        assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn a_routable_bind_is_never_the_resolved_default() {
+        // However a config is assembled (global-only, a project that sets an
+        // unrelated web field, or a fully self-sufficient project with no
+        // global layer at all), the resolved bind must be loopback unless a
+        // human explicitly wrote a different bind value somewhere.
+        let self_sufficient_project: toml::Table = serialize_config(&default_config("p", "main"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let cases: Vec<(toml::Table, toml::Table)> = vec![
+            (global_base(), toml::Table::new()),
+            (global_base(), "[web]\nenabled = true\n".parse().unwrap()),
+            (global_base(), "[web]\nport = 8080\n".parse().unwrap()),
+            (toml::Table::new(), self_sufficient_project),
+        ];
+        for (global, project) in cases {
+            let cfg = effective_config(global, project).unwrap();
+            assert_eq!(cfg.web.bind, "127.0.0.1");
+        }
+    }
+
+    #[test]
+    fn web_config_round_trips_through_toml() {
+        let mut cfg = default_config("proj", "main");
+        cfg.web.enabled = true;
+        cfg.web.port = 8123;
+        cfg.web.bind = "0.0.0.0".to_string();
+        cfg.web.replay_bytes = 131_072;
+        let toml_str = serialize_config(&cfg).unwrap();
+        let parsed = parse_config(&toml_str).unwrap();
+        assert_eq!(parsed.web, cfg.web);
     }
 
     #[test]
