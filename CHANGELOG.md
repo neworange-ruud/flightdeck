@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.17.0] - 2026-08-30
+
+### New features
+
 - **Start a session on any existing local branch.** The New Agent form's `Tab`
   target control now cycles between creating a generated branch, selecting an
   existing local branch from a searchable picker, and running in the project
