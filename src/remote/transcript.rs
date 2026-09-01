@@ -32,7 +32,7 @@
 //! whose preview is the agent's last prose (OpenCode passes a captured
 //! structured prompt through the same edge via [`TranscriptBuilder::set_structured_prompt`]).
 //!
-//! Three agents are supported, resolved by [`resolve_source`]:
+//! Three agents have a readable conversation, resolved by [`resolve_source`]:
 //! * **Claude Code** — JSONL file, `type=user|assistant`, `message.content`
 //!   blocks (tailed by byte offset, [`SessionFormat::Claude`]).
 //! * **Codex** — JSONL file, `event_msg` prose + `response_item` tool activity
@@ -42,6 +42,12 @@
 //!   streams, so a part is emitted only once final. The DB layer is compiled off
 //!   Windows only, so on Windows an OpenCode chat shows no reconstructed
 //!   transcript (as before).
+//!
+//! **Cursor** is the one built-in backend with no transcript at all: it keeps
+//! each chat in a SQLite blob table (`store.db`'s `blobs(id, data)`) whose
+//! record schema is undocumented, so there is nothing to parse. A Cursor tab
+//! behaves like an OpenCode tab on Windows — live status and control, but an
+//! empty reconstructed transcript.
 //!
 //! Memory is capped to [`MAX_ITEMS`] most-recent items (a ring); pagination
 //! honours the protocol's `from_index`.
