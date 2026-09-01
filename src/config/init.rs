@@ -7,7 +7,7 @@
 
 use crate::config::load::{minimal_project_config, serialize_global_config, GLOBAL_CONFIG_HEADER};
 use crate::config::schema::default_global_config;
-use crate::contracts::{FileSystem, Result};
+use crate::contracts::{AgentDef, FileSystem, Result};
 use std::path::Path;
 
 /// What first-run init created (each `true` only if it was missing before).
@@ -100,11 +100,136 @@ pub fn ensure_global_config(fs: &dyn FileSystem, global_path: &Path) -> Result<b
     Ok(true)
 }
 
+/// Add any **built-in** agent that a pre-existing global `config.toml` does not
+/// have yet, preserving the file's comments, ordering and every other value.
+/// Returns the keys that were added (empty when nothing changed).
+///
+/// [`ensure_global_config`] only ever writes the file when it is missing, so an
+/// install that predates a newly shipped backend would otherwise never see it:
+/// the effective `[agents]` map comes from the user's own file, and a project
+/// config either inherits it or replaces it wholesale (SPECS §8). The global
+/// base exists precisely to list everything available for a project to
+/// override, so keeping that list complete is the file's job.
+///
+/// Deliberately additive only: an agent the user renamed, retargeted or
+/// reconfigured is left untouched, because the key is what is matched. Removing
+/// an agent from the global file will bring it back on the next launch — the
+/// supported way to narrow the picker for a project is that project's own
+/// `[agents]` table, which replaces the global set entirely.
+pub fn backfill_builtin_agents(fs: &dyn FileSystem, global_path: &Path) -> Result<Vec<String>> {
+    if !fs.exists(global_path) {
+        return Ok(Vec::new());
+    }
+    let contents = fs.read_to_string(global_path)?;
+    // A global file we cannot parse is not ours to rewrite: startup surfaces
+    // the parse error on its own, and silently reformatting a broken file
+    // would destroy the very text the user needs to fix.
+    let Ok(mut document) = contents.parse::<toml_edit::DocumentMut>() else {
+        return Ok(Vec::new());
+    };
+    let defaults = default_global_config();
+    let agents = document
+        .entry("agents")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(agents) = agents.as_table_like_mut() else {
+        return Ok(Vec::new());
+    };
+
+    let mut added = Vec::new();
+    for (key, def) in &defaults.agents {
+        if agents.get(key).is_some() {
+            continue;
+        }
+        let Some(item) = agent_def_item(def) else {
+            continue;
+        };
+        agents.insert(key, item);
+        added.push(key.clone());
+    }
+    if added.is_empty() {
+        return Ok(Vec::new());
+    }
+    fs.write(global_path, &document.to_string())?;
+    Ok(added)
+}
+
+/// Render one [`AgentDef`] as a `toml_edit` table item, by serializing it with
+/// `toml` (the same writer every other config path uses) and re-parsing. `None`
+/// only if serialization fails, which for this fixed struct it cannot.
+fn agent_def_item(def: &AgentDef) -> Option<toml_edit::Item> {
+    let body = toml::to_string_pretty(def).ok()?;
+    let parsed = body.parse::<toml_edit::DocumentMut>().ok()?;
+    Some(toml_edit::Item::Table(parsed.as_table().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::FakeFs;
     use std::path::Path;
+
+    #[test]
+    fn backfill_adds_only_missing_builtins_and_keeps_the_file_intact() {
+        let fs = FakeFs::new();
+        let path = Path::new("/home/u/.flightdeck/config.toml");
+        // An older global file: three built-ins, a user tweak, and comments.
+        fs.write(
+            path,
+            "# my notes\n\
+             [ui]\n\
+             default_agent = \"claude\"\n\n\
+             [agents.claude]\n\
+             display_name = \"Claude Code\"\n\
+             command = \"claude\"\n\
+             args = [\"--verbose\"]\n\n\
+             [agents.codex]\n\
+             display_name = \"Codex CLI\"\n\
+             command = \"codex\"\n\n\
+             [agents.opencode]\n\
+             display_name = \"OpenCode\"\n\
+             command = \"opencode\"\n",
+        )
+        .unwrap();
+
+        let added = backfill_builtin_agents(&fs, path).unwrap();
+        assert_eq!(added, vec!["cursor".to_string()]);
+
+        let after = fs.file_contents(path).unwrap();
+        assert!(after.starts_with("# my notes"), "comments are preserved");
+        assert!(
+            after.contains("args = [\"--verbose\"]"),
+            "an existing agent is never rewritten"
+        );
+        let table = crate::config::load::parse_table(&after).unwrap();
+        let agents = table["agents"].as_table().unwrap();
+        assert_eq!(agents["cursor"]["command"].as_str(), Some("cursor-agent"));
+        assert_eq!(
+            agents["cursor"]["display_name"].as_str(),
+            Some("Cursor CLI")
+        );
+        assert_eq!(table["ui"]["default_agent"].as_str(), Some("claude"));
+        assert_eq!(agents.len(), 4);
+
+        // Idempotent: a second pass has nothing to add and does not rewrite.
+        assert!(backfill_builtin_agents(&fs, path).unwrap().is_empty());
+        assert_eq!(fs.file_contents(path).unwrap(), after);
+    }
+
+    #[test]
+    fn backfill_is_a_no_op_without_a_global_file_or_on_an_unparseable_one() {
+        let fs = FakeFs::new();
+        let path = Path::new("/home/u/.flightdeck/config.toml");
+        assert!(backfill_builtin_agents(&fs, path).unwrap().is_empty());
+
+        // A broken file is the user's to fix; silently reformatting it would
+        // destroy the text they need to see.
+        fs.write(path, "[agents.claude\ncommand = ").unwrap();
+        assert!(backfill_builtin_agents(&fs, path).unwrap().is_empty());
+        assert_eq!(
+            fs.file_contents(path).unwrap(),
+            "[agents.claude\ncommand = "
+        );
+    }
 
     #[test]
     fn init_creates_all_artifacts_on_fresh_fs() {

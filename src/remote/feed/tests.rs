@@ -18,6 +18,8 @@ fn agent_type_maps_known_backends() {
     assert_eq!(agent_type_of("codex"), AgentType::Codex);
     assert_eq!(agent_type_of("my-codex-cli"), AgentType::Codex);
     assert_eq!(agent_type_of("opencode"), AgentType::Opencode);
+    assert_eq!(agent_type_of("cursor"), AgentType::Cursor);
+    assert_eq!(agent_type_of("Cursor CLI"), AgentType::Cursor);
     // Unknown keys default to Claude Code.
     assert_eq!(agent_type_of("something-else"), AgentType::ClaudeCode);
 }

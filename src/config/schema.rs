@@ -8,7 +8,8 @@ use crate::contracts::{
 use std::collections::BTreeMap;
 
 /// Build the default `config.toml` contents for a project (SPECS §8), including
-/// the three initial agents (OpenCode default, Claude Code, Codex CLI).
+/// the four initial agents (OpenCode default, Claude Code, Codex CLI, Cursor
+/// CLI).
 pub fn default_config(project_name: &str, base_branch: &str) -> Config {
     let mut agents: BTreeMap<String, AgentDef> = BTreeMap::new();
 
@@ -43,6 +44,19 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
             key: "codex".to_string(),
             display_name: "Codex CLI".to_string(),
             command: "codex".to_string(),
+            args: vec![],
+            status_patterns: StatusPatterns::default(),
+        },
+    );
+
+    // cursor — the binary is `cursor-agent`, not `cursor` (which launches the
+    // Cursor editor).
+    agents.insert(
+        "cursor".to_string(),
+        AgentDef {
+            key: "cursor".to_string(),
+            display_name: "Cursor CLI".to_string(),
+            command: "cursor-agent".to_string(),
             args: vec![],
             status_patterns: StatusPatterns::default(),
         },
@@ -251,12 +265,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_three_agents() {
+    fn default_config_has_the_four_builtin_agents() {
         let cfg = default_config("my-project", "main");
-        assert_eq!(cfg.agents.len(), 3);
+        assert_eq!(cfg.agents.len(), 4);
         assert!(cfg.agents.contains_key("opencode"));
         assert!(cfg.agents.contains_key("claude"));
         assert!(cfg.agents.contains_key("codex"));
+        assert!(cfg.agents.contains_key("cursor"));
+    }
+
+    #[test]
+    fn default_cursor_agent_launches_the_cli_not_the_editor() {
+        // `cursor` is the Cursor editor launcher; the CLI agent is a separate
+        // binary, and only that one is a recognised status backend.
+        let cfg = default_config("my-project", "main");
+        let cursor = cfg.agents.get("cursor").expect("cursor agent");
+        assert_eq!(cursor.command, "cursor-agent");
+        assert_eq!(cursor.display_name, "Cursor CLI");
     }
 
     #[test]

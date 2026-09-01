@@ -42,6 +42,10 @@ env_allow = ["ANTHROPIC_API_KEY"]
 # writable = false
 ```
 
+Per-agent credentials: Claude Code reads `~/.claude`, Codex `~/.codex`,
+OpenCode `~/.local/share/opencode`, and the Cursor CLI `~/.cursor` — or, for
+Cursor, `env_allow = ["CURSOR_API_KEY"]` instead of a mount.
+
 ## 2. Build the image and check readiness
 
 ```bash

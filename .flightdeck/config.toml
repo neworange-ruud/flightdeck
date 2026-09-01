@@ -23,6 +23,16 @@ completed = []
 error = []
 waiting = []
 
+[agents.cursor]
+args = []
+command = "cursor-agent"
+display_name = "Cursor CLI"
+
+[agents.cursor.status_patterns]
+completed = []
+error = []
+waiting = []
+
 [agents.opencode]
 args = []
 command = "opencode"

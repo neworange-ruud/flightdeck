@@ -383,6 +383,7 @@ fn agent_key_for(agent_type: AgentType) -> &'static str {
         AgentType::ClaudeCode => "claude",
         AgentType::Codex => "codex",
         AgentType::Opencode => "opencode",
+        AgentType::Cursor => "cursor",
     }
 }
 
@@ -404,6 +405,12 @@ fn agent_key_for(agent_type: AgentType) -> &'static str {
 ///   `a` = accept always, Esc = reject. Enter is the documented accept-once
 ///   key (a fixed binding, not a focus-dependent default), so allow-once is
 ///   a carriage return.
+/// * **Cursor CLI**'s "Run this command?" prompt labels its rows with their
+///   keys — `Run (once) (y)` and `Skip & tell the agent what to do instead
+///   (esc or n)` — so allow-once is `y` and deny is Esc. In practice a Cursor
+///   tab never reaches a needs-input edge (Cursor exposes no approval hook, so
+///   FlightDeck never learns it is asking — see `agents::setup::cursor_hooks`);
+///   the mapping is here so the backend is not a hole if that changes.
 ///
 /// Custom/unknown backends never reach this function — [`translate`] rejects
 /// them honestly instead of guessing bytes at a prompt we cannot classify.
@@ -416,6 +423,8 @@ pub fn permission_keystroke(backend: StatusBackend, choice: PermissionChoice) ->
         (StatusBackend::Codex, PermissionChoice::Deny) => ESC,
         (StatusBackend::OpenCode, PermissionChoice::AllowOnce) => b"\r",
         (StatusBackend::OpenCode, PermissionChoice::Deny) => ESC,
+        (StatusBackend::Cursor, PermissionChoice::AllowOnce) => b"y",
+        (StatusBackend::Cursor, PermissionChoice::Deny) => ESC,
     }
 }
 
@@ -454,8 +463,9 @@ pub fn option_keystroke(backend: StatusBackend, option_index: u32) -> Option<Vec
             bytes.push(b'\r');
             Some(bytes)
         }
-        // Codex has no multi-option prompt; refuse rather than guess.
-        StatusBackend::Codex => None,
+        // Neither Codex nor Cursor has a multi-option prompt; refuse rather
+        // than guess.
+        StatusBackend::Codex | StatusBackend::Cursor => None,
     }
 }
 
@@ -557,8 +567,9 @@ pub fn multi_option_keystroke(backend: StatusBackend, option_indices: &[u32]) ->
         StatusBackend::Claude | StatusBackend::OpenCode => {
             Some(multi_question_chunks(std::slice::from_ref(&indices)).concat())
         }
-        // Codex has no multi-option prompt; refuse rather than guess.
-        StatusBackend::Codex => None,
+        // Neither Codex nor Cursor has a multi-option prompt; refuse rather
+        // than guess.
+        StatusBackend::Codex | StatusBackend::Cursor => None,
     }
 }
 
@@ -575,7 +586,7 @@ pub fn multi_question_keystroke(
         StatusBackend::Claude | StatusBackend::OpenCode => {
             Some(multi_question_chunks(&normalize_selections(selections)).concat())
         }
-        StatusBackend::Codex => None,
+        StatusBackend::Codex | StatusBackend::Cursor => None,
     }
 }
 

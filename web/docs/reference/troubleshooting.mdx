@@ -23,7 +23,10 @@ left behind. Install the agent's CLI (or fix `command` in
 Status comes from lifecycle events, not terminal output. For **Codex**, you must
 review its hooks once: run `/hooks` inside Codex and trust the FlightDeck
 lifecycle hooks. Until then FlightDeck stays idle and emits no completion alert.
-Custom/unknown agents intentionally stay neutral. See
+For **Cursor**, check whether the worktree already has its own
+`.cursor/hooks.json` — FlightDeck never overwrites one, and without its own
+hooks file Cursor reports nothing, so the tab stays neutral. Custom/unknown
+agents intentionally stay neutral. See
 [Working with Agents](/desktop/agents).
 
 ### No OS notifications on macOS

@@ -433,6 +433,7 @@ fn run_setup_status() -> Result<()> {
     println!("  Claude Code → merge claude-code.settings.json into ~/.claude/settings.json");
     println!("  Codex CLI   → append codex-config.toml to ~/.codex/config.toml");
     println!("  OpenCode    → copy opencode-flightdeck.js to ~/.config/opencode/plugin/");
+    println!("  Cursor CLI  → merge cursor-hooks.json into ~/.cursor/hooks.json");
     Ok(())
 }
 
@@ -801,7 +802,22 @@ fn startup(
     let global_path = global_config_path();
     let loaded_config = if isolated.is_none() {
         if let Some(gp) = &global_path {
-            let _ = ensure_global_config(services.fs, gp);
+            let created = ensure_global_config(services.fs, gp).unwrap_or(false);
+            // Only worth doing for a file that already existed: a freshly
+            // created one carries every built-in already. Announced rather
+            // than silent, for the same reason the .gitignore update below is.
+            if !created {
+                if let Ok(added) = crate::config::init::backfill_builtin_agents(services.fs, gp) {
+                    if !added.is_empty() {
+                        eprintln!(
+                            "FlightDeck: added built-in agent{} {} to {}",
+                            if added.len() == 1 { "" } else { "s" },
+                            added.join(", "),
+                            gp.display()
+                        );
+                    }
+                }
+            }
         }
         match &global_path {
             Some(gp) => load_layered_config(services.fs, gp, &config_path),

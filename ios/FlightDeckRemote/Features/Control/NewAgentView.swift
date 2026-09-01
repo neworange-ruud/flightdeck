@@ -411,7 +411,7 @@ struct NewAgentView: View {
 
     private var agentTypePicker: some View {
         HStack(spacing: Theme.Spacing.sm) {
-            ForEach([Wire.AgentType.claudeCode, .opencode, .codex], id: \.self) { type in
+            ForEach([Wire.AgentType.claudeCode, .opencode, .codex, .cursor], id: \.self) { type in
                 let selected = model.agentType == type
                 Button {
                     model.agentType = type

@@ -210,12 +210,32 @@ fn reply_to_stopped_agent_still_rejects() {
     ));
 }
 
+#[test]
+fn every_protocol_agent_type_maps_back_to_its_registry_key() {
+    // `agent_key_for` is the inverse of `feed::agent_type_of` for the
+    // built-ins; a round trip that does not close would launch the wrong CLI
+    // from the phone's new-agent form.
+    for agent_type in [
+        AgentType::ClaudeCode,
+        AgentType::Codex,
+        AgentType::Opencode,
+        AgentType::Cursor,
+    ] {
+        let key = super::agent_key_for(agent_type);
+        assert_eq!(
+            crate::remote::feed::agent_type_of(key),
+            agent_type,
+            "{agent_type:?} -> {key}"
+        );
+    }
+}
+
 // --- permission decisions ------------------------------------------------------
 
 #[test]
 fn permission_keystroke_map_per_backend() {
     use PermissionChoice::{AllowOnce, Deny};
-    use StatusBackend::{Claude, Codex, OpenCode};
+    use StatusBackend::{Claude, Codex, Cursor, OpenCode};
     // Claude Code: numbered options — "1" = allow once; Esc rejects. Never
     // Enter (it would take the focused option, which may not be allow-once).
     assert_eq!(permission_keystroke(Claude, AllowOnce), b"1");
@@ -226,8 +246,12 @@ fn permission_keystroke_map_per_backend() {
     // OpenCode: Enter is the fixed accept-once binding; Esc rejects.
     assert_eq!(permission_keystroke(OpenCode, AllowOnce), b"\r");
     assert_eq!(permission_keystroke(OpenCode, Deny), b"\x1b");
+    // Cursor: its "Run this command?" prompt labels the rows with their keys —
+    // "Run (once) (y)" and "Skip … (esc or n)".
+    assert_eq!(permission_keystroke(Cursor, AllowOnce), b"y");
+    assert_eq!(permission_keystroke(Cursor, Deny), b"\x1b");
     // No mapping may ever be empty (a decision must move the prompt).
-    for backend in [Claude, Codex, OpenCode] {
+    for backend in [Claude, Codex, OpenCode, Cursor] {
         for choice in [AllowOnce, Deny] {
             assert!(!permission_keystroke(backend, choice).is_empty());
         }
@@ -832,10 +856,11 @@ fn new_agent_routes_to_main_loop_with_registry_key() {
         })
     );
 
-    // The other two built-ins map to their registry keys.
+    // The other built-ins map to their registry keys.
     for (ty, key) in [
         (AgentType::Codex, "codex"),
         (AgentType::Opencode, "opencode"),
+        (AgentType::Cursor, "cursor"),
     ] {
         let t = translate(
             &CommandBody::NewAgent {
