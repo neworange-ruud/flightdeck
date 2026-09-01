@@ -278,12 +278,14 @@ fn install_cursor_hooks(
     }
     let dir = worktree.join(".cursor");
     let hooks = dir.join("hooks.json");
-    let ours = match fs.read_to_string(&hooks) {
+    // Ours to write when there is no file there yet, or when the one there
+    // carries our marker (a bridge an earlier launch generated).
+    let ours_to_write = match fs.read_to_string(&hooks) {
         Ok(existing) => existing.contains(CURSOR_HOOKS_MARKER),
         // Unreadable also covers "absent", which is the common case.
         Err(_) => !fs.exists(&hooks),
     };
-    if !ours {
+    if !ours_to_write {
         return Ok(false);
     }
     fs.create_dir_all(&dir)?;
@@ -1388,9 +1390,14 @@ mod tests {
         assert!(commands["beforeSubmitPrompt"].contains("printf 'working"));
         assert!(commands["postToolUse"].contains("printf 'working"));
         assert!(commands["stop"].contains("printf 'idle"));
+        // Built with `join`, not a literal: the hook body carries whatever
+        // `Path` renders on this host, so a hard-coded `/`-separated string
+        // would only ever match off Windows.
+        let status_file = Path::new(REPO).join(".flightdeck").join("agent-status");
+        let status_file = status_file.to_string_lossy();
         for command in commands.values() {
             assert!(
-                command.contains("/repo/.flightdeck/agent-status"),
+                command.contains(status_file.as_ref()),
                 "hook must target the seeded status file: {command}"
             );
             assert!(
@@ -1433,7 +1440,7 @@ mod tests {
             "containerized Cursor hooks must target the bind-mounted path: {hooks}"
         );
         assert!(
-            !hooks.contains(&format!("{REPO}/.flightdeck")),
+            !hooks.contains(REPO),
             "containerized Cursor hooks must never carry the host status root: {hooks}"
         );
     }
@@ -1453,7 +1460,7 @@ mod tests {
             .file_contents(Path::new("/repo/.cursor/hooks.json"))
             .unwrap();
         assert!(hooks.contains("/workspace/.flightdeck/agent-status"));
-        assert!(!hooks.contains(&format!("{REPO}/.flightdeck")));
+        assert!(!hooks.contains(REPO));
     }
 
     #[test]
