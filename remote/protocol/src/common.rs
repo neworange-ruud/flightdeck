@@ -52,6 +52,8 @@ pub enum AgentType {
     Opencode,
     /// Codex CLI. Wire value: `codex`.
     Codex,
+    /// Cursor CLI (`cursor-agent`). Wire value: `cursor`.
+    Cursor,
 }
 
 /// FlightDeck's four agent states. `Manual` carries the user-set label and is
@@ -164,4 +166,24 @@ pub struct GitStatusDetail {
     pub drift: u32,
     /// The changed files.
     pub files: Vec<GitFileChange>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentType;
+
+    #[test]
+    fn agent_type_wire_values_are_stable() {
+        // These strings are the wire contract with the iOS app, which mirrors
+        // the enum in Swift. Renaming one silently breaks every paired phone.
+        for (ty, wire) in [
+            (AgentType::ClaudeCode, "\"claude_code\""),
+            (AgentType::Opencode, "\"opencode\""),
+            (AgentType::Codex, "\"codex\""),
+            (AgentType::Cursor, "\"cursor\""),
+        ] {
+            assert_eq!(serde_json::to_string(&ty).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<AgentType>(wire).unwrap(), ty);
+        }
+    }
 }

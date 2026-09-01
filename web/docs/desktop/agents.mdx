@@ -11,13 +11,14 @@ built-in backends, how to add your own, the live status system, and restarting.
 
 ## Built-in agents
 
-Three agents ship pre-configured, and **OpenCode** is the default:
+Four agents ship pre-configured, and **OpenCode** is the default:
 
-| Agent | Config key |
-| --- | --- |
-| OpenCode | `opencode` |
-| Claude Code | `claude` |
-| Codex CLI | `codex` |
+| Agent | Config key | Command |
+| --- | --- | --- |
+| OpenCode | `opencode` | `opencode` |
+| Claude Code | `claude` | `claude` |
+| Codex CLI | `codex` | `codex` |
+| Cursor CLI | `cursor` | `cursor-agent` |
 
 When you create a tab you pick which agent runs in it, so you can mix agents —
 Claude Code in one tab, OpenCode in another. If only one agent is configured,
@@ -75,11 +76,31 @@ file in the worktree:
 
 - **Claude Code** — prompt/stop hooks via a launch-scoped plugin,
 - **Codex CLI** — prompt/stop hooks,
-- **OpenCode** — its native `session.status` events.
+- **OpenCode** — its native `session.status` events,
+- **Cursor CLI** — `beforeSubmitPrompt` / `stop` hooks.
 
 Generated bridge files live under the ignored `.flightdeck/runtime/` directory.
 Unsupported custom agents stay **neutral** rather than being guessed — they
 never show a false status.
+
+<Callout type="note">
+  **Cursor** only runs turn-level hooks that its *user* or *project* config
+  declares, so its bridge is the one that cannot live under
+  `.flightdeck/runtime/`: FlightDeck writes `<worktree>/.cursor/hooks.json`
+  plus a self-ignoring `.cursor/.gitignore`, which keeps both files out of `git
+  status`. A repo that already ships its own `.cursor/hooks.json` is never
+  overwritten — that tab stays neutral instead.
+
+  Cursor also has no **waiting** state: it exposes no approval-request event,
+  and the shell hook that fires before an approval fires just the same before
+  an auto-approved command, so a Cursor tab shows `working` while Cursor asks
+  to run something.
+
+  Finally, Cursor asks you to trust each workspace the first time it sees one,
+  and a FlightDeck worktree is a new path every time — so a fresh Cursor tab
+  opens on its trust prompt (press `a`). Add `args = ["--trust"]` to
+  `[agents.cursor]` if you would rather grant it up front.
+</Callout>
 
 <Callout type="warning">
   **Codex** requires you to review and trust its non-managed hooks once. If you
@@ -98,8 +119,8 @@ flightdeck setup-status
 ```
 
 This writes ready-to-wire artifacts to `.flightdeck/integrations/` (with a
-`README.md` explaining how to merge each into your Claude Code, Codex, or
-OpenCode config). The hooks are gated on `.flightdeck/` existing, so they're a
+`README.md` explaining how to merge each into your Claude Code, Codex,
+OpenCode or Cursor config). The hooks are gated on `.flightdeck/` existing, so they're a
 no-op outside FlightDeck worktrees.
 
 ## Manual status

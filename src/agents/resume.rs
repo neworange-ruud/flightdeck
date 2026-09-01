@@ -6,6 +6,8 @@
 //!   claude: `~/.claude/projects/<cwd with '/', '\', '.' and ':' → '-'>/<uuid>.jsonl`
 //!   codex:  `~/.codex/sessions/**/rollout-*.jsonl`, each starting with a
 //!           `session_meta` line carrying `payload.session_id` + `payload.cwd`.
+//!   cursor: `~/.cursor/chats/<project hash>/<chat id>/meta.json`, carrying the
+//!           chat's `cwd` and whether it holds a conversation at all.
 //!
 //! To support multiple agents sharing one worktree, the caller snapshots the
 //! store's session ids at launch and later pins the id that newly appeared as
@@ -37,6 +39,7 @@ pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(Strin
     match agent_key {
         "claude" => claude_session_ids(cwd, home),
         "codex" => codex_session_ids(cwd, home),
+        "cursor" => cursor_session_ids(cwd, home),
         _ => Vec::new(),
     }
 }
@@ -51,7 +54,11 @@ pub fn store_session_ids(agent_key: &str, cwd: &Path, home: &Path) -> Vec<(Strin
 /// Understands **Claude Code** and **Codex**, both of which append a JSONL
 /// file. OpenCode keeps its conversation in a live SQLite DB (no tailable file),
 /// so it returns `None` here and is resolved separately by
-/// [`crate::remote::transcript::resolve_source`].
+/// [`crate::remote::transcript::resolve_source`]. **Cursor** also returns
+/// `None`: its chat store is a SQLite blob table (`store.db`'s `blobs(id, data)`)
+/// with no documented record schema, so there is nothing to parse — a Cursor
+/// tab shows no reconstructed transcript on the phone, exactly as an OpenCode
+/// tab does on Windows.
 pub fn newest_session_path(
     agent_key: &str,
     cwd: &Path,
@@ -81,6 +88,7 @@ pub fn resume_args_for(agent_key: &str, id: &str) -> Option<Vec<String>> {
     match agent_key {
         "claude" => Some(vec!["--resume".to_string(), id.to_string()]),
         "codex" => Some(vec!["resume".to_string(), id.to_string()]),
+        "cursor" => Some(vec!["--resume".to_string(), id.to_string()]),
         _ => None,
     }
 }
@@ -213,6 +221,60 @@ fn codex_session_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, SystemTime)> {
         }
     }
     out
+}
+
+/// Every Cursor chat whose `meta.json` records `cwd` and actually holds a
+/// conversation, as `(chat id, meta.json mtime)`.
+///
+/// Cursor nests chats two levels deep — `~/.cursor/chats/<project hash>/<chat
+/// id>/` — and the directory name is the chat id `--resume` takes. The project
+/// hash is an opaque digest we deliberately do not try to reproduce; walking
+/// the two levels and reading each `meta.json` is both simpler and immune to
+/// the hash changing.
+///
+/// Chats with `hasConversation: false` are skipped: Cursor creates a chat
+/// directory the moment the CLI starts, so an aborted launch leaves an empty
+/// one behind, and resuming it would silently drop the user into a blank
+/// session instead of their work.
+fn cursor_session_ids(cwd: &Path, home: &Path) -> Vec<(String, SystemTime)> {
+    let root = home.join(".cursor").join("chats");
+    let target = cwd.to_string_lossy();
+    let mut out = Vec::new();
+    let Ok(projects) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let Ok(chats) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for chat in chats.flatten() {
+            let Some(id) = chat.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let meta_path = chat.path().join("meta.json");
+            let Ok(meta) = std::fs::metadata(&meta_path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            let Some(chat_cwd) = cursor_chat_meta(&meta_path) else {
+                continue;
+            };
+            if chat_cwd == target {
+                out.push((id, meta));
+            }
+        }
+    }
+    out
+}
+
+/// Read a Cursor chat's `meta.json`, returning its `cwd` only when the chat
+/// holds a conversation worth resuming.
+fn cursor_chat_meta(path: &Path) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    if value.get("hasConversation")?.as_bool() != Some(true) {
+        return None;
+    }
+    Some(value.get("cwd")?.as_str()?.to_string())
 }
 
 /// Read a codex session file's leading `session_meta` line, returning
@@ -423,6 +485,54 @@ mod tests {
     }
 
     #[test]
+    fn cursor_store_matches_chats_by_cwd_and_skips_empty_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/home/u/Repos/proj/wt");
+        let chats = home.path().join(".cursor/chats/9f2ab1");
+        touch(
+            &chats.join("11111111-1111-1111-1111-111111111111/meta.json"),
+            r#"{"schemaVersion":1,"hasConversation":true,"title":"Fix login","cwd":"/home/u/Repos/proj/wt"}"#,
+        );
+        // A chat Cursor opened but never used: resuming it would drop the user
+        // into a blank session instead of their work.
+        touch(
+            &chats.join("22222222-2222-2222-2222-222222222222/meta.json"),
+            r#"{"schemaVersion":1,"hasConversation":false,"cwd":"/home/u/Repos/proj/wt"}"#,
+        );
+        // Another worktree, under a different project hash.
+        touch(
+            &home
+                .path()
+                .join(".cursor/chats/aa77cc/33333333-3333-3333-3333-333333333333/meta.json"),
+            r#"{"schemaVersion":1,"hasConversation":true,"cwd":"/somewhere/else"}"#,
+        );
+
+        let ids: Vec<String> = store_session_ids("cursor", cwd, home.path())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["11111111-1111-1111-1111-111111111111".to_string()]
+        );
+    }
+
+    #[test]
+    fn cursor_has_no_tailable_session_file() {
+        // Cursor keeps each chat in a SQLite blob table, so there is nothing to
+        // tail — the phone shows no reconstructed transcript for a Cursor tab.
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/home/u/Repos/proj/wt");
+        touch(
+            &home
+                .path()
+                .join(".cursor/chats/9f2ab1/11111111-1111-1111-1111-111111111111/meta.json"),
+            r#"{"hasConversation":true,"cwd":"/home/u/Repos/proj/wt"}"#,
+        );
+        assert!(newest_session_path("cursor", cwd, home.path()).is_none());
+    }
+
+    #[test]
     fn codex_store_matches_session_by_cwd() {
         let home = tempfile::tempdir().unwrap();
         let cwd = std::path::Path::new("/home/u/Repos/proj/wt");
@@ -558,6 +668,10 @@ mod tests {
         assert_eq!(
             resume_args_for("codex", "abc"),
             Some(vec!["resume".to_string(), "abc".to_string()])
+        );
+        assert_eq!(
+            resume_args_for("cursor", "abc"),
+            Some(vec!["--resume".to_string(), "abc".to_string()])
         );
         assert_eq!(resume_args_for("opencode", "abc"), None);
     }

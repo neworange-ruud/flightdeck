@@ -92,9 +92,9 @@ content is preserved):
 .flightdeck/hooks.toml
 ```
 
-Configured agents live in the config (OpenCode is the default; Claude Code and
-Codex CLI are pre-configured). Agent definitions are config-driven — edit the
-`command` and `args` there. When you create a tab you pick which agent it runs
+Configured agents live in the config (OpenCode is the default; Claude Code,
+Codex CLI and Cursor CLI are pre-configured). Agent definitions are
+config-driven — edit the `command` and `args` there. When you create a tab you pick which agent it runs
 from a quick menu, so you can mix agents (e.g. Claude Code in one tab, OpenCode
 in another); the menu is skipped when only one agent is configured.
 
@@ -395,23 +395,38 @@ contract.
 Every Agent Tab shows its agent's live status — a one-cell indicator next to the
 tab name plus a simplified status line in the sidebar. The same indicator is
 summarized on Project tabs. The minimum signal is **idle vs in progress**, and
-it works for every built-in backend (OpenCode, Claude Code, Codex CLI) through
-automatically injected integrations:
+it works for every built-in backend (OpenCode, Claude Code, Codex CLI, Cursor
+CLI) through automatically injected integrations:
 
 - 🔴 **working** — a red animated Braille spinner while the backend reports an active turn.
 - 🟢 **idle** — a green dot while the backend waits for a prompt.
 - 🔵 manual override (`Ctrl-s`) — shown in cyan, never hides the process state.
 
 FlightDeck injects a launch-scoped lifecycle bridge for each built-in backend:
-Claude Code prompt/stop hooks, Codex prompt/stop hooks, and OpenCode's explicit
-`session.status` events. Generated bridge files live below the ignored
-`.flightdeck/runtime/` directory. Terminal output is never used as activity, so
-typing into a prompt cannot mark an agent working or arm a false notification.
-Unsupported custom agents stay neutral instead of being guessed from output.
+Claude Code prompt/stop hooks, Codex prompt/stop hooks, Cursor prompt/stop
+hooks, and OpenCode's explicit `session.status` events. Generated bridge files
+live below the ignored `.flightdeck/runtime/` directory. Terminal output is
+never used as activity, so typing into a prompt cannot mark an agent working or
+arm a false notification. Unsupported custom agents stay neutral instead of
+being guessed from output.
 
 Codex requires non-managed hooks to be reviewed once. If Codex shows a hook
 warning, open `/hooks`, review the FlightDeck lifecycle hooks, and trust them;
 until then FlightDeck deliberately remains idle and emits no completion alert.
+
+Cursor is the one backend whose hooks cannot live outside the workspace, so its
+bridge is written to `<worktree>/.cursor/hooks.json` alongside a self-ignoring
+`.cursor/.gitignore` that keeps both files out of `git status`. A repo that
+already has its own `.cursor/hooks.json` is never overwritten — that tab simply
+stays neutral. Cursor also reports no **waiting** state: it exposes no
+approval-request event, and the shell hook that fires before an approval fires
+just the same before an auto-approved command, so a Cursor tab shows `working`
+while Cursor asks to run something.
+
+Cursor also asks you to trust each workspace the first time it sees one, and a
+FlightDeck worktree is a new path every time — so a fresh Cursor tab opens on
+its trust prompt (press `a`). Add `args = ["--trust"]` to `[agents.cursor]` if
+you would rather grant it up front.
 
 ### Optional: reusable global status integrations
 
@@ -436,6 +451,8 @@ generated `README.md`:
   (`UserPromptSubmit`→working, `Stop`→idle; `notify` fallback for older builds).
 - **OpenCode** — copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/`
   (`session.status` busy/idle→working/idle, permission and question prompts→waiting).
+- **Cursor CLI** — merge `cursor-hooks.json` into `~/.cursor/hooks.json`
+  (`beforeSubmitPrompt`/`postToolUse`→working, `stop`→idle).
 
 ### OS notifications (macOS and Linux)
 

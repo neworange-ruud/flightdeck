@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
+use crate::agents::setup::{status_backend, StatusBackend};
 use crate::app::state::AppState;
+use crate::contracts::AgentDef;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
 use crate::remote::notifier::{build_event, EventArming, EventClass, EventContext};
 use crate::remote::shell::ShellManager;
@@ -843,10 +845,23 @@ impl RemoteBridge {
                 let was_needs = matches!(self.prev_status.get(&sid), Some(AgentStatus::NeedsInput));
                 let now_needs = matches!(status, AgentStatus::NeedsInput);
                 // Claude asks questions via an AskUserQuestion tool_use in the
-                // JSONL (ingested above); OpenCode/Codex do not, so only Claude
-                // can race a status flip against its own transcript record.
-                let is_opencode = tab.meta.agent.eq_ignore_ascii_case("opencode");
-                let is_claude = !is_opencode && !tab.meta.agent.eq_ignore_ascii_case("codex");
+                // JSONL (ingested above); the other backends do not, so only
+                // Claude can race a status flip against its own transcript
+                // record. Identified by backend rather than by "not the ones we
+                // know", so a newly added backend is never silently read as
+                // Claude and handed Claude's sidecar.
+                let backend = match pv.state.registry.get(&tab.meta.agent) {
+                    Some(def) => status_backend(def),
+                    // No registry entry (a tab restored before the config is
+                    // loaded): the key itself is the command name for every
+                    // built-in whose key and binary match.
+                    None => status_backend(&AgentDef {
+                        command: tab.meta.agent.clone(),
+                        ..AgentDef::default()
+                    }),
+                };
+                let is_opencode = matches!(backend, Some(StatusBackend::OpenCode));
+                let is_claude = matches!(backend, Some(StatusBackend::Claude));
                 if now_needs && !was_needs {
                     // Read the agent's prompt sidecar BEFORE `on_needs_input` so a
                     // captured structured prompt supplants the binary fallback:

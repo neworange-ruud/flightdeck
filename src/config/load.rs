@@ -628,7 +628,7 @@ file_manager = "nautilus"
         let fs = FakeFs::new().with_file("/repo/.flightdeck/config.toml", toml_str);
         let loaded = load_config(&fs, Path::new("/repo/.flightdeck/config.toml")).unwrap();
         assert_eq!(loaded.project.name, "fakefs-proj");
-        assert_eq!(loaded.agents.len(), 3);
+        assert_eq!(loaded.agents.len(), 4);
     }
 
     #[test]
@@ -686,7 +686,7 @@ default_agent = "opencode"
     #[test]
     fn missing_project_inherits_global_wholesale() {
         let cfg = effective_config(global_base(), toml::Table::new()).unwrap();
-        assert_eq!(cfg.agents.len(), 3);
+        assert_eq!(cfg.agents.len(), 4);
         assert_eq!(cfg.ui.default_agent, "opencode");
         assert!(cfg.notifications.enabled);
     }
@@ -737,7 +737,7 @@ command = \"mytool\"
         // ...the ui override applies...
         assert_eq!(cfg.ui.agent_tab_position, "right");
         // ...and everything else is inherited from the global base.
-        assert_eq!(cfg.agents.len(), 3);
+        assert_eq!(cfg.agents.len(), 4);
         assert!(cfg.notifications.enabled);
     }
 
@@ -757,7 +757,7 @@ command = \"mytool\"
         )
         .unwrap();
         assert_eq!(cfg.project.name, "p");
-        assert_eq!(cfg.agents.len(), 3);
+        assert_eq!(cfg.agents.len(), 4);
     }
 
     #[test]

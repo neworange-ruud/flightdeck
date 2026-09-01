@@ -173,6 +173,18 @@ What became path-aware:
 - `remote::bridge::agent_question_path` — so remote question-answering keeps
   working
 
+Cursor CLI, added after this design shipped, is the one backend the redirect
+cannot serve. Cursor only runs its turn-level hooks when its *user* or
+*project* config declares them, so FlightDeck's bridge has to be written to
+`<worktree>/.cursor/hooks.json` — inside the project, which §2's "no
+FlightDeck-initiated writes" rule forbids for an isolated run. There is no
+temp directory Cursor would read instead. `install_cursor_hooks` therefore
+writes nothing when the status root differs from the worktree and returns
+`explicit: false`, so an isolated Cursor tab shows neutral status rather than
+sticking on `working`. A containerized isolated run is unaffected: §8.2's
+exception already puts the status root back in the bind-mounted worktree, so
+the hooks file lands there like any normal run.
+
 `RuntimeTab::status_file` is already an absolute `PathBuf`, so polling itself
 needs no change; only the two sites that construct it do.
 

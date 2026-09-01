@@ -39,10 +39,24 @@ extension Wire {
     }
 
     /// Which agent CLI backs a session.
+    ///
+    /// Decoding is lenient: an unrecognised wire value becomes `.unknown`
+    /// rather than throwing. A desktop newer than this app can report a
+    /// backend that did not exist when the app shipped, and a throw there
+    /// would fail the whole snapshot — every session would disappear over one
+    /// unfamiliar string. `.unknown` is display-only; it is never offered in
+    /// the new-agent form.
     enum AgentType: String, Codable, Hashable, Sendable {
         case claudeCode = "claude_code"
         case opencode
         case codex
+        case cursor
+        case unknown
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = AgentType(rawValue: raw) ?? .unknown
+        }
     }
 
     // MARK: - Agent status

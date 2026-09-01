@@ -8,11 +8,51 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Cursor CLI is a fourth built-in agent backend.** `[agents.cursor]` ships
+  pre-configured alongside OpenCode, Claude Code and Codex CLI, running the
+  `cursor-agent` binary (not `cursor`, which launches the Cursor editor). It
+  gets the same treatment as the other built-ins: launch-scoped lifecycle
+  status, session resume (`--resume <chat id>`, matched to the worktree through
+  Cursor's `~/.cursor/chats/**/meta.json` store), a container image recipe
+  (`flightdeck image build cursor`), the container credential defaults
+  (`~/.cursor` + `CURSOR_API_KEY`, the same mount its chat store lives in, so
+  resume works inside a container too), its own entry in the phone's New Agent
+  form and session rows, and a standalone `cursor-hooks.json` from
+  `flightdeck setup-status`.
+
+  Two things differ from the other backends, both forced by Cursor's own
+  behavior:
+
+  - Cursor only runs the turn-level hooks (`beforeSubmitPrompt`, `stop`) that
+    its *user* or *project* config declares — hooks loaded from a plugin
+    directory are merged in but do not arm those steps — and it offers no
+    environment variable that relocates the user-level file. FlightDeck
+    therefore writes the bridge to `<worktree>/.cursor/hooks.json`, next to a
+    self-ignoring `.cursor/.gitignore` so neither generated file appears in
+    `git status`. A `.cursor/hooks.json` the repo already owns is never
+    overwritten, and nothing is written under the project during a
+    `--isolated` run; in both cases the tab stays neutral rather than
+    half-reporting.
+  - Cursor reports **working** and **idle** but never **waiting**: it has no
+    approval-request event, and the shell hook that fires before an approval
+    fires just the same before an auto-approved command, so using it would
+    mislabel every long allowed command as blocked on the human.
+
+  Cursor also asks you to trust each workspace the first time it sees one, and
+  a FlightDeck worktree is a new path every time, so a fresh Cursor tab opens
+  on its trust prompt (press `a`) — or set `args = ["--trust"]` on
+  `[agents.cursor]` to grant it up front.
 
 ### Improvements
 
-- None yet.
+- A `~/.flightdeck/config.toml` written by an earlier version now gains any
+  built-in agent it is missing on the next launch (announced on stderr, and
+  additive only — comments, ordering and every existing value are preserved).
+  Without this, an existing install would never see a newly shipped backend,
+  since the effective `[agents]` map comes from the user's own file.
+- The iOS app no longer fails to decode a whole state snapshot when the desktop
+  reports an agent type it does not know by name; the unfamiliar backend shows
+  as a generic "Agent" row instead.
 
 ### Bug fixes
 

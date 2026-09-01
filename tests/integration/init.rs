@@ -201,10 +201,11 @@ fn layered_config_reads_back_global_plus_project() {
     // Project identity from the project file...
     assert_eq!(cfg.project.name, "round-trip-project");
     assert_eq!(cfg.project.default_base_branch, "develop");
-    // ...and the three known agents inherited from the global base.
+    // ...and the four built-in agents inherited from the global base.
     assert!(cfg.agents.contains_key("opencode"));
     assert!(cfg.agents.contains_key("claude"));
     assert!(cfg.agents.contains_key("codex"));
+    assert!(cfg.agents.contains_key("cursor"));
     // Notifications are on by default.
     assert!(cfg.notifications.enabled);
 }

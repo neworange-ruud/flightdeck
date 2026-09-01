@@ -377,6 +377,11 @@ display_name = "Codex CLI"
 command = "codex"
 args = []
 
+[agents.cursor]
+display_name = "Cursor CLI"
+command = "cursor-agent"
+args = []
+
 ```
 
 `ui.file_manager` overrides the command used to open a worktree in the OS file
@@ -389,6 +394,7 @@ Supported initial agents:
 - OpenCode
 - Claude Code
 - Codex CLI
+- Cursor CLI (the `cursor-agent` binary; `cursor` is the editor launcher)
 
 Agent definitions must be config-driven.
 
@@ -994,11 +1000,16 @@ FlightDeck combines:
 2. Explicit backend lifecycle events
 3. Manual status override
 
-For Claude Code, Codex CLI, and OpenCode, FlightDeck injects a launch-scoped
-hook/plugin that reports `working`, `idle`, and `waiting` events. PTY output and
+For Claude Code, Codex CLI, OpenCode, and Cursor CLI, FlightDeck injects a
+launch-scoped hook/plugin that reports `working`, `idle`, and (except for
+Cursor, which exposes no approval event) `waiting` events. PTY output and
 silence are not lifecycle signals: echoed prompt input must never mark an agent
 working or arm a completion notification. Unknown/custom agents fail closed in
-a neutral state when they do not provide an explicit integration.
+a neutral state when they do not provide an explicit integration — as does
+Cursor when its hooks cannot be installed, since its integration has to live in
+the workspace (`<worktree>/.cursor/hooks.json`) and FlightDeck never overwrites
+a `.cursor/hooks.json` the repo already owns, nor writes one during an isolated
+run.
 
 Agent and Project tabs show a one-cell red animated Braille spinner while
 working and a stable green dot while idle. The active Project tab uses a white

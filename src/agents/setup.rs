@@ -1,8 +1,8 @@
 //! Explicit lifecycle integrations for built-in agent backends, plus the
 //! `flightdeck setup-status` command's reusable global artifacts (SPECS §24).
 //!
-//! FlightDeck injects launch-scoped Claude Code/Codex hooks or an OpenCode
-//! plugin automatically. They append explicit lifecycle events to each
+//! FlightDeck injects launch-scoped Claude Code/Codex/Cursor hooks or an
+//! OpenCode plugin automatically. They append explicit lifecycle events to each
 //! worktree's [`agent_status_file`]; PTY traffic is never interpreted as work.
 //!
 //! [`agent_status_file`]: crate::app::state::agent_status_file
@@ -36,6 +36,7 @@ pub enum StatusBackend {
     Claude,
     Codex,
     OpenCode,
+    Cursor,
 }
 
 /// Agent arguments and environment after adding FlightDeck's lifecycle bridge.
@@ -67,6 +68,10 @@ pub fn status_backend(agent: &AgentDef) -> Option<StatusBackend> {
             "claude" => Some(StatusBackend::Claude),
             "codex" => Some(StatusBackend::Codex),
             "opencode" => Some(StatusBackend::OpenCode),
+            // Only the agent binary, never the bare `cursor` editor launcher:
+            // `cursor` opens the Cursor IDE and would silently receive flags
+            // meant for the CLI.
+            "cursor-agent" => Some(StatusBackend::Cursor),
             _ => None,
         }
     }
@@ -173,6 +178,9 @@ pub fn prepare_status_launch(
     };
     let mut args = agent.args.clone();
     let mut env = Vec::new();
+    // Every backend below installs a working integration; only Cursor can fail
+    // to (see `install_cursor_hooks`), and it lowers this itself.
+    let mut explicit = true;
 
     match backend {
         StatusBackend::Claude => {
@@ -217,13 +225,80 @@ pub fn prepare_status_launch(
                 format!("{agent_runtime}/opencode"),
             ));
         }
+        StatusBackend::Cursor => {
+            explicit = install_cursor_hooks(fs, worktree, status_root, &agent_status_file)?;
+        }
     }
 
     Ok(StatusLaunch {
         args,
         env,
-        explicit: true,
+        explicit,
     })
+}
+
+/// Install Cursor CLI's launch-scoped lifecycle hooks into
+/// `<worktree>/.cursor/hooks.json`, returning whether the tab now has explicit
+/// status.
+///
+/// **Why a file in the worktree and not a `--plugin-dir` like Claude's.**
+/// Cursor does load hooks from a plugin directory, but it gates the two events
+/// FlightDeck actually needs — `beforeSubmitPrompt` (turn start) and `stop`
+/// (turn end) — on the *user* (`~/.cursor/hooks.json`) or *project*
+/// (`<workspace>/.cursor/hooks.json`) config declaring them: the plugin's own
+/// entries are merged into the executed set but are not consulted by the
+/// "should we run this step at all" check (verified against cursor-agent
+/// 2026.08.31 — a plugin-only install fires `sessionStart`/`preToolUse`/
+/// `postToolUse`/`beforeShellExecution` and nothing else, so a tab would go to
+/// `working` and never come back). Cursor offers no environment variable that
+/// relocates the user-level file, so the project-level file inside the
+/// FlightDeck-managed worktree is the only launch-scoped place left.
+///
+/// Nothing the user owns is ever overwritten:
+///
+/// * A pre-existing `.cursor/hooks.json` that is not FlightDeck's (no
+///   [`CURSOR_HOOKS_MARKER`]) is left exactly as it is, and the tab falls back
+///   to neutral status rather than half-working status.
+/// * When FlightDeck does write the file, it also drops a self-ignoring
+///   `.cursor/.gitignore` (if there is none) so neither generated file shows up
+///   in `git status` — the worktree diff stays the agent's work alone.
+/// * `status_root != worktree` means an isolated, non-containerized run, whose
+///   contract is that FlightDeck writes nothing under the project
+///   (`specs/ISOLATED_MODE.md` §2). Cursor's hooks have to live under the
+///   agent's own workspace, so there is nowhere legal to put them: the run
+///   simply gets neutral status.
+fn install_cursor_hooks(
+    fs: &dyn FileSystem,
+    worktree: &Path,
+    status_root: &Path,
+    agent_status_file: &str,
+) -> Result<bool> {
+    if status_root != worktree {
+        return Ok(false);
+    }
+    let dir = worktree.join(".cursor");
+    let hooks = dir.join("hooks.json");
+    // Ours to write when there is no file there yet, or when the one there
+    // carries our marker (a bridge an earlier launch generated).
+    let ours_to_write = match fs.read_to_string(&hooks) {
+        Ok(existing) => existing.contains(CURSOR_HOOKS_MARKER),
+        // Unreadable also covers "absent", which is the common case.
+        Err(_) => !fs.exists(&hooks),
+    };
+    if !ours_to_write {
+        return Ok(false);
+    }
+    fs.create_dir_all(&dir)?;
+    // Rewritten every launch rather than only when absent: the status path
+    // baked into the bodies differs between a local run (an absolute host
+    // path) and a containerized one (`/workspace/...`), so a file left behind
+    // by the other mode would point somewhere that does not exist.
+    fs.write(&hooks, &cursor_hooks(agent_status_file))?;
+    let ignore = dir.join(".gitignore");
+    if !fs.exists(&ignore) {
+        fs.write(&ignore, CURSOR_GITIGNORE)?;
+    }
+    Ok(true)
 }
 
 /// Single-quote a path for a POSIX shell, escaping embedded single quotes by
@@ -310,6 +385,73 @@ fn claude_plugin_hooks(status_file: &str, question_file: &str) -> String {
                 serde_json::json!({"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": write("waiting")}]}),
                 serde_json::json!({"matcher": "idle_prompt", "hooks": [{"type": "command", "command": write("idle")}]}),
             ],
+        }
+    })
+    .to_string()
+}
+
+/// Marker embedded in every generated Cursor hook body (as a trailing shell
+/// comment, so it never affects execution). It is how
+/// [`install_cursor_hooks`] recognises a `.cursor/hooks.json` as FlightDeck's
+/// own — and therefore safe to rewrite — versus one the user or their repo
+/// owns, which is never touched.
+const CURSOR_HOOKS_MARKER: &str = "flightdeck-agent-status";
+
+/// The self-ignoring `.gitignore` FlightDeck drops next to a generated
+/// `.cursor/hooks.json`. Ignoring itself as well as the hooks file means the
+/// whole generated directory is invisible to `git status`, so the worktree
+/// diff stays the agent's work alone. Only ever written when it is absent, so
+/// a repo that ships its own `.cursor/.gitignore` keeps it.
+const CURSOR_GITIGNORE: &str = "\
+# Written by FlightDeck: the launch-scoped Cursor CLI lifecycle hooks that
+# report this agent's status. Both entries (this file included) are ignored so
+# the generated files never show up in `git status`. Safe to delete —
+# FlightDeck writes it again on the next launch.
+/hooks.json
+/.gitignore
+";
+
+/// Cursor CLI's `hooks.json`, targeting the absolute `status_file`.
+///
+/// Built with `serde_json::json!` and rendered with `to_string()` for the same
+/// reason [`claude_plugin_hooks`] is: every string — the shell-quoted path
+/// included — is escaped by the serializer rather than by hand, which also
+/// makes a Windows path's backslashes safe.
+///
+/// Three events, chosen deliberately from Cursor's larger set:
+///
+/// * `beforeSubmitPrompt` → `working` (the turn starts),
+/// * `postToolUse` → `working` (still the agent's turn after a tool call),
+/// * `stop` → `idle` (the turn ended).
+///
+/// Three near-neighbours are deliberately **not** wired:
+///
+/// * `sessionStart` (→ `idle` for the other backends) races
+///   `beforeSubmitPrompt` when a prompt is supplied at launch and can land
+///   after it, parking a busy agent on `idle`. It is also redundant:
+///   [`prepare_status_launch`] seeds `idle` into the status file before spawn.
+/// * `afterAgentResponse` fires *after* `stop`, so wiring it to anything would
+///   overwrite the `idle` that just landed.
+/// * There is no `waiting` state. Cursor exposes no approval-request event;
+///   `beforeShellExecution` fires before the approval *decision*, so it fires
+///   just the same for a command that is auto-approved and runs for ten
+///   minutes. Reporting `waiting` from it would mislabel every long allowed
+///   command as blocked-on-the-human, which is worse than not reporting it —
+///   so a Cursor tab shows `working` while Cursor asks to run something.
+fn cursor_hooks(status_file: &str) -> String {
+    let sf = shell_quote(status_file);
+    let write = |state: &str| -> serde_json::Value {
+        serde_json::json!([{
+            "type": "command",
+            "command": format!("printf '{state}\\n' >> {sf}; exit 0 # {CURSOR_HOOKS_MARKER}"),
+        }])
+    };
+    serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "beforeSubmitPrompt": write("working"),
+            "postToolUse": write("working"),
+            "stop": write("idle"),
         }
     })
     .to_string()
@@ -448,6 +590,7 @@ pub fn write_status_integrations(fs: &dyn FileSystem, repo_root: &Path) -> Resul
         ("claude-code.settings.json", CLAUDE_SETTINGS),
         ("codex-config.toml", CODEX_CONFIG),
         ("opencode-flightdeck.js", OPENCODE_PLUGIN),
+        ("cursor-hooks.json", CURSOR_HOOKS),
     ];
 
     let mut written = Vec::with_capacity(files.len());
@@ -514,6 +657,17 @@ fallback (idle-only, for older Codex) is included as a comment.
 Copy `opencode-flightdeck.js` to `~/.config/opencode/plugin/flightdeck.js`
 (global) — or to `.opencode/plugin/` in your project. It maps `session.status`
 busy/idle → `working`/`idle`, and permission or question prompts → `waiting`.
+
+## Cursor CLI
+
+Merge `cursor-hooks.json` into your **user** hooks at `~/.cursor/hooks.json`
+(or this project's `.cursor/hooks.json`). It wires `beforeSubmitPrompt` and
+`postToolUse` → `working` and `stop` → `idle`.
+
+Cursor reports no `waiting`: it has no approval-request event, and the shell
+hook that fires before an approval also fires before every auto-approved
+command, so using it would mark long allowed commands as blocked on you. A
+Cursor tab therefore stays `working` while Cursor asks to run something.
 
 ---
 
@@ -639,6 +793,34 @@ command = "r=\"$PWD\"; [ -d \"$r/.flightdeck\" ] && printf 'idle\\n' >> \"$r/.fl
 # Fallback for older Codex without lifecycle hooks (idle only, fires on
 # agent-turn-complete). `notify` is honoured ONLY in the user-level config.
 # notify = ["sh", "-c", "r=\"$PWD\"; [ -d \"$r/.flightdeck\" ] && printf 'idle\\n' >> \"$r/.flightdeck/agent-status\"; exit 0", "flightdeck-notify"]
+"##;
+
+/// Cursor CLI `~/.cursor/hooks.json` lifecycle hooks. Cursor exports
+/// `CURSOR_PROJECT_DIR` (the workspace root) to every hook command, with
+/// `$PWD` as the fallback for an older build that does not.
+const CURSOR_HOOKS: &str = r##"{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "type": "command",
+        "command": "r=\"${CURSOR_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'working\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "command": "r=\"${CURSOR_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'working\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+      }
+    ],
+    "stop": [
+      {
+        "type": "command",
+        "command": "r=\"${CURSOR_PROJECT_DIR:-$PWD}\"; [ -d \"$r/.flightdeck\" ] && printf 'idle\\n' >> \"$r/.flightdeck/agent-status\" 2>/dev/null; exit 0"
+      }
+    ]
+  }
+}
 "##;
 
 /// OpenCode plugin (plain JS, no type imports so it works as a global plugin).
@@ -1127,12 +1309,225 @@ mod tests {
         assert!(!fs.exists(Path::new("/repo/.flightdeck/agent-status")));
     }
 
+    // -------------------------------------------------------------------------
+    // Cursor CLI
+    // -------------------------------------------------------------------------
+
+    /// Parse a generated `.cursor/hooks.json` and return each event's single
+    /// command body, keyed by event name.
+    fn cursor_commands(json: &str) -> std::collections::BTreeMap<String, String> {
+        let value: serde_json::Value = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("invalid hooks.json: {e}\n{json}"));
+        assert_eq!(value["version"], 1, "Cursor's hooks file is schema v1");
+        value["hooks"]
+            .as_object()
+            .expect("hooks object")
+            .iter()
+            .map(|(event, entries)| {
+                let entries = entries.as_array().expect("hook entries are an array");
+                assert_eq!(entries.len(), 1, "one command per event");
+                assert_eq!(entries[0]["type"], "command");
+                (
+                    event.clone(),
+                    entries[0]["command"].as_str().expect("command").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_backend_recognises_the_cursor_cli_but_not_the_editor_launcher() {
+        assert_eq!(
+            status_backend(&agent("cursor", "cursor-agent")),
+            Some(StatusBackend::Cursor)
+        );
+        assert_eq!(
+            status_backend(&agent("cursor", "/opt/cursor/bin/cursor-agent")),
+            Some(StatusBackend::Cursor)
+        );
+        assert_eq!(
+            status_backend(&agent("cursor", "C:\\tools\\cursor-agent.cmd")),
+            if cfg!(windows) {
+                Some(StatusBackend::Cursor)
+            } else {
+                None
+            }
+        );
+        // `cursor` launches the Cursor editor, not the CLI agent: passing it
+        // agent flags would be wrong, so it stays unrecognised.
+        assert_eq!(status_backend(&agent("cursor", "cursor")), None);
+    }
+
+    #[test]
+    fn prepares_cursor_project_hooks_and_hides_them_from_git() {
+        let fs = FakeFs::new();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("cursor", "cursor-agent"),
+            Path::new(REPO),
+            Path::new(REPO),
+            false,
+        )
+        .unwrap();
+        assert!(launch.explicit);
+        // Cursor needs no extra flags or environment — the hooks file is the
+        // whole integration.
+        assert_eq!(launch.args, vec!["--existing".to_string()]);
+        assert!(launch.env.is_empty());
+
+        let hooks = fs
+            .file_contents(Path::new("/repo/.cursor/hooks.json"))
+            .expect("cursor hooks written into the worktree");
+        let commands = cursor_commands(&hooks);
+        assert_eq!(
+            commands.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "beforeSubmitPrompt".to_string(),
+                "postToolUse".to_string(),
+                "stop".to_string()
+            ]
+        );
+        assert!(commands["beforeSubmitPrompt"].contains("printf 'working"));
+        assert!(commands["postToolUse"].contains("printf 'working"));
+        assert!(commands["stop"].contains("printf 'idle"));
+        // Built with `join`, not a literal: the hook body carries whatever
+        // `Path` renders on this host, so a hard-coded `/`-separated string
+        // would only ever match off Windows.
+        let status_file = Path::new(REPO).join(".flightdeck").join("agent-status");
+        let status_file = status_file.to_string_lossy();
+        for command in commands.values() {
+            assert!(
+                command.contains(status_file.as_ref()),
+                "hook must target the seeded status file: {command}"
+            );
+            assert!(
+                command.contains(CURSOR_HOOKS_MARKER),
+                "hook must carry the ownership marker: {command}"
+            );
+        }
+        // `sessionStart` races `beforeSubmitPrompt` and `afterAgentResponse`
+        // fires after `stop`; wiring either would park a busy agent on the
+        // wrong state.
+        assert!(!hooks.contains("sessionStart"));
+        assert!(!hooks.contains("afterAgentResponse"));
+
+        let ignore = fs
+            .file_contents(Path::new("/repo/.cursor/.gitignore"))
+            .expect("self-ignoring .gitignore written alongside");
+        assert!(ignore.lines().any(|l| l.trim() == "/hooks.json"));
+        assert!(
+            ignore.lines().any(|l| l.trim() == "/.gitignore"),
+            "the ignore file must ignore itself, or it shows up in git status"
+        );
+    }
+
+    #[test]
+    fn cursor_hooks_use_the_container_path_when_containerized() {
+        let fs = FakeFs::new();
+        prepare_status_launch(
+            &fs,
+            &agent("cursor", "cursor-agent"),
+            Path::new(REPO),
+            Path::new(REPO),
+            true,
+        )
+        .unwrap();
+        let hooks = fs
+            .file_contents(Path::new("/repo/.cursor/hooks.json"))
+            .unwrap();
+        assert!(
+            hooks.contains("/workspace/.flightdeck/agent-status"),
+            "containerized Cursor hooks must target the bind-mounted path: {hooks}"
+        );
+        assert!(
+            !hooks.contains(REPO),
+            "containerized Cursor hooks must never carry the host status root: {hooks}"
+        );
+    }
+
+    #[test]
+    fn cursor_hooks_are_rewritten_when_the_status_path_changes() {
+        // Switching a worktree between local and containerized execution moves
+        // the status file the bodies must target. FlightDeck owns the file (it
+        // carries the marker), so it is rewritten rather than left stale.
+        let fs = FakeFs::new();
+        let a = agent("cursor", "cursor-agent");
+        prepare_status_launch(&fs, &a, Path::new(REPO), Path::new(REPO), false).unwrap();
+        let launch =
+            prepare_status_launch(&fs, &a, Path::new(REPO), Path::new(REPO), true).unwrap();
+        assert!(launch.explicit);
+        let hooks = fs
+            .file_contents(Path::new("/repo/.cursor/hooks.json"))
+            .unwrap();
+        assert!(hooks.contains("/workspace/.flightdeck/agent-status"));
+        assert!(!hooks.contains(REPO));
+    }
+
+    #[test]
+    fn cursor_never_overwrites_a_hooks_file_it_does_not_own() {
+        let fs = FakeFs::new();
+        let theirs = r#"{"version":1,"hooks":{"stop":[{"type":"command","command":"make lint"}]}}"#;
+        fs.write(Path::new("/repo/.cursor/hooks.json"), theirs)
+            .unwrap();
+
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("cursor", "cursor-agent"),
+            Path::new(REPO),
+            Path::new(REPO),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.file_contents(Path::new("/repo/.cursor/hooks.json"))
+                .unwrap(),
+            theirs,
+            "a repo's own Cursor hooks are never rewritten"
+        );
+        assert!(
+            fs.file_contents(Path::new("/repo/.cursor/.gitignore"))
+                .is_none(),
+            "no .gitignore is planted next to a file FlightDeck did not write — \
+             it would quietly hide the user's own tracked hooks"
+        );
+        assert!(
+            !launch.explicit,
+            "without its own hooks Cursor never reports the end of a turn, so \
+             the tab must fall back to neutral rather than stick on 'working'"
+        );
+    }
+
+    #[test]
+    fn cursor_writes_nothing_under_the_project_on_an_isolated_run() {
+        // An isolated run redirects the status root out of the project and
+        // promises no FlightDeck-initiated writes under it. Cursor's hooks can
+        // only live in the agent's own workspace, so there is nowhere legal to
+        // put them: the run gets neutral status instead.
+        let fs = FakeFs::new();
+        let launch = prepare_status_launch(
+            &fs,
+            &agent("cursor", "cursor-agent"),
+            Path::new(REPO),
+            Path::new("/tmp/flightdeck-isolated-1"),
+            false,
+        )
+        .unwrap();
+        assert!(!launch.explicit);
+        assert!(fs
+            .file_contents(Path::new("/repo/.cursor/hooks.json"))
+            .is_none());
+        assert!(fs
+            .file_contents(Path::new("/repo/.cursor/.gitignore"))
+            .is_none());
+    }
+
     #[test]
     fn writes_all_artifacts_and_gitignore_entry() {
         let fs = FakeFs::new();
         let report = write_status_integrations(&fs, Path::new(REPO)).unwrap();
 
-        assert_eq!(report.written.len(), 4);
+        assert_eq!(report.written.len(), 5);
         assert!(report.gitignore_added);
 
         for name in [
@@ -1140,6 +1535,7 @@ mod tests {
             "claude-code.settings.json",
             "codex-config.toml",
             "opencode-flightdeck.js",
+            "cursor-hooks.json",
         ] {
             let p = Path::new(REPO).join(INTEGRATIONS_DIR).join(name);
             assert!(fs.file_contents(&p).is_some(), "missing artifact {name}");

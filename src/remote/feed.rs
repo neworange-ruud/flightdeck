@@ -39,14 +39,16 @@ use flightdeck_remote_protocol::{ProjectId, SessionId};
 
 /// Map a FlightDeck agent key to the protocol's agent-CLI enum. The key is
 /// config-driven and free-form, so this is a name heuristic: anything that is
-/// not recognisably Codex or OpenCode is reported as Claude Code (the default
-/// backend). This never panics and has no I/O.
+/// not recognisably Codex, OpenCode or Cursor is reported as Claude Code (the
+/// default backend). This never panics and has no I/O.
 pub fn agent_type_of(agent_key: &str) -> AgentType {
     let k = agent_key.to_ascii_lowercase();
     if k.contains("codex") {
         AgentType::Codex
     } else if k.contains("opencode") {
         AgentType::Opencode
+    } else if k.contains("cursor") {
+        AgentType::Cursor
     } else {
         AgentType::ClaudeCode
     }

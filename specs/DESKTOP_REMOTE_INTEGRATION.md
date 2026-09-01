@@ -59,8 +59,9 @@ non-Windows self-update feature). No websocket/QR/relay/pairing code exists yet.
   semantics) or snapshot `Terminal::screen()` (rendered-screen semantics).
   `AppEvent::PtyOutput` exists (`src/app/events.rs:36`) but is not produced today.
 - Prompt/permission detection is via agent hooks (`src/agents/setup.rs`):
-  `StatusBackend {Claude, Codex, OpenCode}` (:35), `prepare_status_launch` (:84),
-  Claude plugin hooks (:175), Codex overrides (:159), OpenCode plugin (:192).
+  `StatusBackend {Claude, Codex, OpenCode, Cursor}`, `prepare_status_launch`,
+  Claude plugin hooks, Codex overrides, OpenCode plugin, Cursor `hooks.json`
+  (Cursor never reaches a needs-input edge — it has no approval event).
 - Injecting phone replies: `write_active_pty(state, bytes)` (`src/lib.rs:3419`) or
   per-tab via `Session::active_mut`; bracketed paste `handle_paste`
   (`src/lib.rs:2050`) / `Terminal::bracketed_paste()` (`session.rs:115`).

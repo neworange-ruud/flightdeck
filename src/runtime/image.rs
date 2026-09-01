@@ -28,6 +28,16 @@ pub fn agent_install_command(agent: &str) -> Option<&'static str> {
         "claude" => Some("npm install -g @anthropic-ai/claude-code"),
         "codex" => Some("npm install -g @openai/codex"),
         "opencode" => Some("npm install -g opencode-ai"),
+        // Cursor ships no npm package: the official installer downloads a
+        // release tarball into `$HOME/.local`. This layer runs as root, long
+        // before the `agent` user exists, so it is pointed at a neutral prefix
+        // and symlinked onto the PATH every user shares.
+        "cursor" => Some(
+            "mkdir -p /opt/cursor \
+                 && curl -fsS https://cursor.com/install | HOME=/opt/cursor bash \
+                 && ln -sf /opt/cursor/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
+                 && chmod -R a+rX /opt/cursor",
+        ),
         _ => None,
     }
 }
@@ -332,6 +342,26 @@ mod tests {
         assert!(cf.contains("apt-get install -y --no-install-recommends postgresql-client jq"));
         assert!(cf.contains("COPY .flightdeck/setup.sh /tmp/flightdeck-setup"));
         assert!(cf.contains("USER agent"));
+    }
+
+    #[test]
+    fn cursor_containerfile_installs_the_cli_onto_a_shared_path() {
+        // Cursor ships no npm package: its installer drops a release tarball
+        // into `$HOME/.local`. That layer runs as root, before the `agent` user
+        // exists, so the recipe must not leave the binary in root's home.
+        let cf = generate_containerfile("cursor", None, &[], None).unwrap();
+        assert!(cf.contains("https://cursor.com/install"));
+        assert!(
+            cf.contains("HOME=/opt/cursor"),
+            "the installer must not write into root's home: {cf}"
+        );
+        assert!(
+            cf.contains("/usr/local/bin/cursor-agent"),
+            "the CLI must land on a PATH the agent user shares: {cf}"
+        );
+        // The recipe needs curl, which the shared package layer installs.
+        let curl = cf.find("curl").expect("curl installed");
+        assert!(curl < cf.find("cursor.com/install").unwrap());
     }
 
     #[test]
