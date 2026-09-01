@@ -14,7 +14,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   gets the same treatment as the other built-ins: launch-scoped lifecycle
   status, session resume (`--resume <chat id>`, matched to the worktree through
   Cursor's `~/.cursor/chats/**/meta.json` store), a container image recipe
-  (`flightdeck image build cursor`), its own entry in the phone's New Agent
+  (`flightdeck image build cursor`), the container credential defaults
+  (`~/.cursor` + `CURSOR_API_KEY`, the same mount its chat store lives in, so
+  resume works inside a container too), its own entry in the phone's New Agent
   form and session rows, and a standalone `cursor-hooks.json` from
   `flightdeck setup-status`.
 

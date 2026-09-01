@@ -178,6 +178,9 @@ fn default_auth_mounts(agent: &str) -> Vec<(&'static str, &'static str)> {
             ("~/.claude.json", "/home/agent/.claude.json"),
         ],
         "codex" => vec![("~/.codex", "/home/agent/.codex")],
+        // `~/.cursor` holds the CLI's login as well as its chat store, so the
+        // mount is what makes `--resume` work inside the container too.
+        "cursor" => vec![("~/.cursor", "/home/agent/.cursor")],
         "opencode" => vec![
             (
                 "~/.local/share/opencode",
@@ -195,6 +198,7 @@ fn default_env_allow(agent: &str) -> Vec<&'static str> {
     match agent {
         "claude" => vec!["ANTHROPIC_API_KEY"],
         "codex" => vec!["OPENAI_API_KEY"],
+        "cursor" => vec!["CURSOR_API_KEY"],
         "opencode" => vec!["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
         _ => vec![],
     }
@@ -5780,6 +5784,51 @@ mod tests {
             args.iter().any(|a| a == "--plugin-dir"),
             "status-integration flags must survive a resume, got: {args:?}"
         );
+    }
+
+    #[test]
+    fn every_builtin_agent_has_container_credentials() {
+        // A containerized agent with no credential default silently starts
+        // logged out — the failure surfaces as the agent asking to sign in
+        // inside a throwaway container, which is easy to misread as a bug in
+        // the image. Every backend FlightDeck ships a container recipe for
+        // must therefore carry both a mount and an API-key variable.
+        for agent in ["claude", "codex", "opencode", "cursor"] {
+            assert!(
+                crate::runtime::image::agent_install_command(agent).is_some(),
+                "{agent} has no built-in container recipe"
+            );
+            let mounts = default_auth_mounts(agent);
+            assert!(
+                !mounts.is_empty(),
+                "{agent} has no default credential mount"
+            );
+            for (host, container) in &mounts {
+                assert!(
+                    host.starts_with("~/"),
+                    "{agent} mount {host} is not under $HOME"
+                );
+                assert!(
+                    container.starts_with(AGENT_HOME),
+                    "{agent} mount {container} is not under the agent user's home"
+                );
+            }
+            assert!(
+                !default_env_allow(agent).is_empty(),
+                "{agent} has no default API-key environment variable"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_container_credentials_cover_login_and_chat_store() {
+        // Both live under ~/.cursor, so the one mount is also what lets
+        // `--resume` find the chat store from inside the container.
+        assert_eq!(
+            default_auth_mounts("cursor"),
+            vec![("~/.cursor", "/home/agent/.cursor")]
+        );
+        assert_eq!(default_env_allow("cursor"), vec!["CURSOR_API_KEY"]);
     }
 
     #[test]

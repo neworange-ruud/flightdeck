@@ -42,9 +42,15 @@ env_allow = ["ANTHROPIC_API_KEY"]
 # writable = false
 ```
 
-Per-agent credentials: Claude Code reads `~/.claude`, Codex `~/.codex`,
-OpenCode `~/.local/share/opencode`, and the Cursor CLI `~/.cursor` — or, for
-Cursor, `env_allow = ["CURSOR_API_KEY"]` instead of a mount.
+Leave `[containers.auth]` out entirely and FlightDeck applies a per-agent
+default so the host login carries in: `~/.claude` + `ANTHROPIC_API_KEY` for
+Claude Code, `~/.codex` + `OPENAI_API_KEY` for Codex, `~/.local/share/opencode`
+and `~/.config/opencode` for OpenCode, and `~/.cursor` + `CURSOR_API_KEY` for
+the Cursor CLI. Configuring the section replaces those defaults with exactly
+what you list.
+
+Cursor keeps its chat store in `~/.cursor` alongside its login, so that one
+mount is also what lets a containerized Cursor tab resume a session.
 
 ## 2. Build the image and check readiness
 
