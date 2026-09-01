@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.18.0] - 2026-09-01
+
+### New features
+
 - **Cursor CLI is a fourth built-in agent backend.** `[agents.cursor]` ships
   pre-configured alongside OpenCode, Claude Code and Codex CLI, running the
   `cursor-agent` binary (not `cursor`, which launches the Cursor editor). It

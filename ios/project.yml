@@ -56,7 +56,7 @@ targets:
         # `version`); `scripts/release` rewrites both together so the phone and
         # the desktop never claim different versions. Surfaced in Settings →
         # About.
-        CFBundleShortVersionString: "1.17.0"
+        CFBundleShortVersionString: "1.18.0"
         # Build number. Must strictly increase on EVERY App Store Connect
         # upload, independently of the marketing version — reusing one is
         # rejected.
