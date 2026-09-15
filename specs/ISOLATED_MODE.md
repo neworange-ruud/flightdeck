@@ -68,6 +68,7 @@ nothing.
 | initial tabs | recovered | **exactly one**, created fresh |
 
 A git repository is still required, and base-branch detection is unchanged.
+Which branch that detection lands on, however, does not gate the run — see §5.
 
 `auto_continue` is forced off so that even an in-session **Restart Agent** starts
 a fresh session instead of replaying a captured resume command. Without this,
@@ -88,11 +89,25 @@ Created through the existing `begin_base_agent_tab`:
 
 **Branch label fix.** A base tab used to label itself with the *base* branch,
 which was wrong whenever HEAD was on something else. The fix landed in the
-shared `begin_base_agent_tab` (`src/app/state.rs:1111-1115`), so it is not
-isolated-mode-specific: every base tab, in every run, is now labelled with
-the branch actually checked out (falling back to the base branch on a
-detached HEAD or a git failure — see SPECS §32). This is the same fix the
-CHANGELOG's `Bug fixes` entry announces.
+shared `begin_base_agent_tab`, so it is not isolated-mode-specific: every base
+tab, in every run, is now labelled with the branch actually checked out
+(falling back to the base branch on a detached HEAD or a git failure — see
+SPECS §32). This is the same fix the CHANGELOG's `Bug fixes` entry announces.
+
+**The branch guard does not apply.** `begin_base_agent_tab` otherwise refuses
+when HEAD is not the configured default base, or is detached. That guard is
+there for the normal base-tab flow — never check out a branch underneath the
+user, never record `base` as a tab's target while running somewhere else — and
+an isolated run triggers neither: no worktree, no git mutation, and the tab is
+gone at exit. The third hazard, a tab mislabelled `base`, is already closed by
+the label fix above. So the guard is skipped when `state.isolated` is set, and
+an unreadable HEAD becomes a label fallback rather than an abort.
+
+Without this exemption, `flightdeck -I` refused to start in any directory whose
+effective config named a base other than the checked-out branch — which is
+every managed worktree under `.flightdeck/worktrees/`, since a normal run there
+writes a `config.toml` with `default_base_branch = "main"` while HEAD is the
+feature branch. That was the reported bug.
 
 ## 6. Blocked actions
 
@@ -297,6 +312,14 @@ Then:
   since these actions never reach `AppState::dispatch`
 - palette test: the blocked entries are absent from the palette in isolated mode
   and present in a normal one
+- branch-guard tests (§5): `isolated_base_tab_accepts_any_checked_out_branch`,
+  `isolated_base_tab_accepts_detached_head`,
+  `isolated_base_tab_survives_a_current_branch_error` and
+  `isolated_base_tab_keeps_an_explicit_name` assert the exemption, while the
+  four normal-mode refusals (`base_tab_refuses_when_the_project_root_is_on_another_branch`,
+  `base_tab_refuses_detached_head`, `base_tab_propagates_current_branch_errors`,
+  `base_branch_tab_runs_in_project_root_without_a_worktree`) assert the guard
+  still holds where it belongs
 - `prepare_status_launch` with a root outside the worktree writes nothing under
   the worktree, and the absolute status path appears in the generated hooks
 - a normal-mode regression test that the status plumbing paths are unchanged
