@@ -96,9 +96,10 @@ use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key_with_f2, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
-    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
-    status_bar_hit, ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem,
-    GitStatusCache, HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, StatusAction, UiOverlay,
+    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, palette_hit,
+    project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel, DialogButton,
+    DialogHit, DialogListItem, GitStatusCache, HitTarget, PaletteHit, ProjectHit, ProjectTabInfo,
+    RemotePairing, StatusAction, UiOverlay,
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
@@ -4496,6 +4497,34 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
                 }
                 DialogHit::Outside if ui.prompt.is_none() => ui.clear(),
                 _ => {}
+            }
+        }
+        return;
+    }
+
+    // The palette's entries are controls too (SPECS §22): a click runs one,
+    // exactly as confirming it with Enter would, and a click beside the box
+    // closes it. A click that lands on the palette but on nothing that acts —
+    // the border, the filter row, a group header — leaves it open, because the
+    // user plainly aimed at it.
+    //
+    // This sits above the modal guard on purpose: that guard exists to stop
+    // clicks reaching the app *underneath* a modal, and the palette is the
+    // modal here, not the app.
+    if let Some(palette) = ui.palette.as_ref() {
+        if me.kind == MouseEventKind::Down(MouseButton::Left) {
+            match palette_hit(area, palette, me.column, me.row) {
+                Some(PaletteHit::Entry(i)) => {
+                    let action = palette.filtered().get(i).map(|e| e.action.clone());
+                    ui.palette = None;
+                    if let Some(action) = action {
+                        if let Err(e) = run_palette_action(action, workspace, env, ui) {
+                            ui.message(format!("Error: {e}"));
+                        }
+                    }
+                }
+                Some(PaletteHit::Dismiss) => ui.palette = None,
+                None => {}
             }
         }
         return;
@@ -11659,6 +11688,138 @@ mod tests {
                 workspace.projects[1].state.tabs[0].session.active().is_some(),
                 "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
             );
+        }
+    }
+
+    /// The palette's entries are controls too (SPECS §22): a click runs one, a
+    /// click beside the box closes it.
+    mod palette_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+        use crate::tui::render::PaletteHit;
+
+        fn roomy_area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 40,
+            }
+        }
+
+        /// The first cell that resolves to the entry labelled `label`. Found by
+        /// asking the hit test, so the test survives the list being respaced.
+        fn cell_of(area: Rect, palette: &CommandPalette, label: &str) -> (u16, u16) {
+            let index = palette
+                .filtered()
+                .iter()
+                .position(|e| e.label == label)
+                .unwrap_or_else(|| panic!("the palette has no {label:?} entry"));
+            for row in area.y..area.y + area.height {
+                for col in area.x..area.x + area.width {
+                    if crate::tui::render::palette_hit(area, palette, col, row)
+                        == Some(PaletteHit::Entry(index))
+                    {
+                        return (col, row);
+                    }
+                }
+            }
+            panic!("no cell resolves to {label:?}");
+        }
+
+        /// Open the palette, click `(column, row)`, and hand back the workspace
+        /// and ui for inspection.
+        fn click_with_palette_open(column: u16, row: u16) -> (Workspace, Ui) {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                palette: Some(CommandPalette::new()),
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, roomy_area(), &mut ws, &e, &mut ui);
+            (ws, ui)
+        }
+
+        #[test]
+        fn clicking_an_entry_runs_it_and_closes_the_palette() {
+            let palette = CommandPalette::new();
+            let (column, row) = cell_of(roomy_area(), &palette, "Show Help");
+            let (_ws, ui) = click_with_palette_open(column, row);
+            assert!(ui.palette.is_none(), "running an entry closes the palette");
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "clicking `Show Help` must do what confirming it with Enter does"
+            );
+        }
+
+        #[test]
+        fn clicking_beside_the_box_closes_the_palette_without_running_anything() {
+            let (_ws, ui) = click_with_palette_open(0, 0);
+            assert!(ui.palette.is_none(), "an outside click closes the palette");
+            assert!(
+                matches!(ui.overlay, UiOverlay::None),
+                "and runs nothing on the way out"
+            );
+        }
+
+        #[test]
+        fn clicking_a_group_header_leaves_the_palette_open() {
+            // A click the user plainly aimed at the box must not close it.
+            let palette = CommandPalette::new();
+            let area = roomy_area();
+            let (entry_col, entry_row) = cell_of(area, &palette, "Show Help");
+            // The rows above every entry include its group header; walk up to
+            // the first row in that column that resolves to nothing.
+            let header_row = (area.y..entry_row)
+                .rev()
+                .find(|&r| crate::tui::render::palette_hit(area, &palette, entry_col, r).is_none())
+                .expect("a header or spacer sits above the entry");
+            let (_ws, ui) = click_with_palette_open(entry_col, header_row);
+            assert!(ui.palette.is_some(), "the palette stays open");
+            assert!(matches!(ui.overlay, UiOverlay::None), "and nothing ran");
+        }
+
+        #[test]
+        fn a_click_on_the_palette_never_reaches_the_app_underneath() {
+            // The overlay covers the terminal viewport and part of the sidebar.
+            // Without the palette taking the click first, this one would focus
+            // the app or start a selection in the pane behind it.
+            let palette = CommandPalette::new();
+            let area = roomy_area();
+            let (entry_col, entry_row) = cell_of(area, &palette, "Show Help");
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_terminal();
+            let mut ui = Ui {
+                palette: Some(palette),
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            // A cell on the overlay's border: inside the box, on nothing.
+            let border = (entry_col, entry_row);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: border.0,
+                row: border.1,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area, &mut ws, &e, &mut ui);
+            assert!(ui.drag.is_none(), "no text selection may start under it");
         }
     }
 

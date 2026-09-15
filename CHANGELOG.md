@@ -16,6 +16,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   report state (`ISOLATED`, the input lock, the update notice) stay inert, so a
   stray click cannot start an update, and a click on the `|` between two hints
   does nothing rather than firing a neighbour.
+- **The command palette's entries are clickable.** Clicking one runs it, exactly
+  as confirming it with `Enter` does — an entry that asks before it acts still
+  asks. Clicking beside the box closes it; clicking a group header, the filter
+  row or the border leaves it open, because the click was plainly aimed at the
+  palette.
 
 ### Improvements
 

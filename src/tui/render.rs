@@ -2342,25 +2342,147 @@ pub fn draw_git_status_overlay(
 // Command palette overlay (SPECS §22)
 // ---------------------------------------------------------------------------
 
+/// Where the palette overlay's parts land for a given `area` (SPECS §22).
+///
+/// Shared by [`draw_palette_overlay`] and [`palette_hit`], so a click can never
+/// land on a row the drawing put somewhere else.
+struct PaletteLayout {
+    /// The whole bordered box.
+    overlay: Rect,
+    /// The filter input row, just inside the top border.
+    filter: Rect,
+    /// The whole entry-list region below the filter row.
+    list: Rect,
+    /// The left half of the entry list.
+    left: Rect,
+    /// The right half of the entry list.
+    right: Rect,
+}
+
+fn palette_layout(area: Rect) -> PaletteLayout {
+    let overlay = layout::centered_overlay(area, 90, 32);
+    let inner = Block::default().borders(Borders::ALL).inner(overlay);
+    let [filter, list] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let [left, right] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(50),
+        ratatui::layout::Constraint::Percentage(50),
+    ])
+    .areas(list);
+    PaletteLayout {
+        overlay,
+        filter,
+        list,
+        left,
+        right,
+    }
+}
+
+/// One drawn row of a palette column: the line, plus the filtered-entry index
+/// when the row *is* an entry. Group headers and the blank rows between groups
+/// carry none, so a click on them does nothing.
+struct PaletteRow {
+    line: Line<'static>,
+    entry: Option<usize>,
+}
+
+/// The rows one column draws, in order. `base` is the flat index of the first
+/// entry, so selection highlighting and hit-testing stay aligned with
+/// `selected_index` across both columns.
+fn palette_column_rows(entries: &[&PaletteEntry], base: usize, selected: usize) -> Vec<PaletteRow> {
+    let mut last_group: Option<&str> = None;
+    let mut rows: Vec<PaletteRow> = Vec::new();
+    for (offset, entry) in entries.iter().enumerate() {
+        let i = base + offset;
+        if last_group != Some(entry.group) {
+            // Blank line above each group header (except the first) for breathing room.
+            if last_group.is_some() {
+                rows.push(PaletteRow {
+                    line: Line::raw(""),
+                    entry: None,
+                });
+            }
+            last_group = Some(entry.group);
+            rows.push(PaletteRow {
+                line: Line::from(Span::styled(
+                    format!("  {}", entry.group),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                entry: None,
+            });
+        }
+
+        rows.push(PaletteRow {
+            line: Line::from(Span::styled(
+                format!("  {} ", entry.label),
+                if i == selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )),
+            entry: Some(i),
+        });
+    }
+    rows
+}
+
+/// What a click inside the palette overlay resolved to (SPECS §22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteHit {
+    /// The entry at this index into the *filtered* list — run it.
+    Entry(usize),
+    /// A click outside the box: close the palette.
+    Dismiss,
+}
+
+/// Resolve a click at `(col, row)` against the palette overlay drawn for `area`.
+///
+/// Returns `None` for a click that lands on the palette but on nothing that
+/// acts — the border, the filter row, a group header, a blank row — so the box
+/// stays open under a click the user clearly aimed at it.
+pub fn palette_hit(area: Rect, palette: &CommandPalette, col: u16, row: u16) -> Option<PaletteHit> {
+    let pl = palette_layout(area);
+    if !rect_contains(pl.overlay, col, row) {
+        return Some(PaletteHit::Dismiss);
+    }
+    let filtered = palette.filtered();
+    if filtered.is_empty() {
+        return None;
+    }
+    let split = filtered.len().div_ceil(2);
+    let (entries, base, column) = if rect_contains(pl.left, col, row) {
+        (&filtered[..split], 0, pl.left)
+    } else if rect_contains(pl.right, col, row) {
+        (&filtered[split..], split, pl.right)
+    } else {
+        return None;
+    };
+    let rows = palette_column_rows(entries, base, palette.selected_index());
+    let index = row.checked_sub(column.y)? as usize;
+    rows.get(index).and_then(|r| r.entry).map(PaletteHit::Entry)
+}
+
 /// Draw the command palette as a centered overlay (SPECS §22).
 pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: Rect) {
-    let overlay_area = layout::centered_overlay(area, 90, 32);
-    frame.render_widget(Clear, overlay_area);
+    // The same geometry the hit test measures, so a click lands on the row it
+    // is pointing at.
+    let pl = palette_layout(area);
+    frame.render_widget(Clear, pl.overlay);
 
     let block = Block::default()
         .title(" Command Palette  (Esc to close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-
-    let inner = block.inner(overlay_area);
-    frame.render_widget(block, overlay_area);
-
-    // Split inner: one row for filter input, rest for filtered list.
-    let [filter_area, list_area] = ratatui::layout::Layout::vertical([
-        ratatui::layout::Constraint::Length(1),
-        ratatui::layout::Constraint::Fill(1),
-    ])
-    .areas(inner);
+    frame.render_widget(block, pl.overlay);
 
     // Filter input line.
     let filter_line = Line::from(vec![
@@ -2368,7 +2490,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
         Span::raw(palette.filter().to_string()),
         Span::styled("_", Style::default().fg(Color::Cyan)), // cursor
     ]);
-    frame.render_widget(Paragraph::new(filter_line), filter_area);
+    frame.render_widget(Paragraph::new(filter_line), pl.filter);
 
     // Filtered list.
     let filtered = palette.filtered();
@@ -2377,7 +2499,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     if filtered.is_empty() {
         frame.render_widget(
             Paragraph::new("  (no matches)").style(Style::default().fg(Color::DarkGray)),
-            list_area,
+            pl.list,
         );
         return;
     }
@@ -2386,57 +2508,20 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     // first half; the right column the remainder. Each column renders its own
     // group headers so groups read correctly even when split at the boundary.
     let split = filtered.len().div_ceil(2);
-    let [left_area, right_area] = ratatui::layout::Layout::horizontal([
-        ratatui::layout::Constraint::Percentage(50),
-        ratatui::layout::Constraint::Percentage(50),
-    ])
-    .areas(list_area);
 
-    // Build the `ListItem`s for one column from a slice of the filtered
-    // entries. `base` is the flat index of the first entry so selection
-    // highlighting stays aligned with `selected_index`.
-    let build_column = |entries: &[&PaletteEntry], base: usize| -> Vec<ListItem<'static>> {
-        let mut last_group: Option<&str> = None;
-        let mut items: Vec<ListItem> = Vec::new();
-        for (offset, entry) in entries.iter().enumerate() {
-            let i = base + offset;
-            if last_group != Some(entry.group) {
-                // Blank line above each group header (except the first) for breathing room.
-                if last_group.is_some() {
-                    items.push(ListItem::new(Line::raw("")));
-                }
-                last_group = Some(entry.group);
-                items.push(ListItem::new(Line::from(Span::styled(
-                    format!("  {}", entry.group),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))));
-            }
-
-            items.push(if i == selected_idx {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )))
-            } else {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default().fg(Color::White),
-                )))
-            });
-        }
-        items
+    // One builder feeds the drawing and the hit test, so a click lands on the
+    // row the user is looking at.
+    let column = |entries: &[&PaletteEntry], base: usize| -> List<'static> {
+        List::new(
+            palette_column_rows(entries, base, selected_idx)
+                .into_iter()
+                .map(|r| ListItem::new(r.line))
+                .collect::<Vec<_>>(),
+        )
     };
 
-    frame.render_widget(List::new(build_column(&filtered[..split], 0)), left_area);
-    frame.render_widget(
-        List::new(build_column(&filtered[split..], split)),
-        right_area,
-    );
+    frame.render_widget(column(&filtered[..split], 0), pl.left);
+    frame.render_widget(column(&filtered[split..], split), pl.right);
 }
 
 // ---------------------------------------------------------------------------
@@ -5364,6 +5449,188 @@ mod tests {
                 "last column of {label:?}"
             );
         }
+    }
+
+    // --- Clickable command palette (SPECS §22) ----------------------------
+
+    /// A terminal roomy enough for the palette's full 90x32 overlay.
+    const PALETTE_W: u16 = 120;
+    const PALETTE_H: u16 = 40;
+
+    /// Draw `palette` over an empty app and hand back the rendered buffer.
+    fn drawn_palette(palette: &CommandPalette) -> ratatui::buffer::Buffer {
+        let mut term = test_terminal(PALETTE_W, PALETTE_H);
+        let state = empty_state();
+        term.draw(|frame| {
+            draw(
+                frame,
+                &state,
+                &empty_cache(),
+                &UiOverlay::Palette(palette.clone()),
+                None,
+                0,
+            );
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The text drawn on `row` within `area`'s columns.
+    fn row_in(buf: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.x.saturating_add(area.width))
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    /// The `(col, row)` at which `text` is drawn inside `area`.
+    fn drawn_at(buf: &ratatui::buffer::Buffer, area: Rect, text: &str) -> (u16, u16) {
+        for row in area.y..area.y.saturating_add(area.height) {
+            let line = row_in(buf, area, row);
+            if let Some(byte) = line.find(text) {
+                let col = area.x + line[..byte].chars().count() as u16;
+                return (col, row);
+            }
+        }
+        panic!("{text:?} is not drawn in {area:?}");
+    }
+
+    #[test]
+    fn every_palette_entry_is_clickable_where_it_was_drawn() {
+        // The anti-drift sweep: both columns, every entry, headers and blank
+        // spacers included in the row arithmetic. A renderer that respaces the
+        // list without respacing the hit test fails here.
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let filtered = palette.filtered();
+        let split = filtered.len().div_ceil(2);
+        for (i, entry) in filtered.iter().enumerate() {
+            let column = if i < split { pl.left } else { pl.right };
+            let (col, row) = drawn_at(&buf, column, entry.label);
+            assert_eq!(
+                palette_hit(area, &palette, col, row),
+                Some(PaletteHit::Entry(i)),
+                "entry {i} ({:?}) must be clickable where it is drawn",
+                entry.label
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_a_group_header_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let group = palette.filtered()[0].group;
+        let (col, row) = drawn_at(&buf, pl.left, group);
+        assert_eq!(
+            palette_hit(area, &palette, col, row),
+            None,
+            "a group header names entries; it is not one"
+        );
+    }
+
+    #[test]
+    fn clicking_the_blank_row_between_two_groups_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        // The first blank row inside the left column sits between two groups.
+        let blank = (pl.left.y..pl.left.y + pl.left.height)
+            .find(|&row| row_in(&buf, pl.left, row).trim().is_empty())
+            .expect("the list has a spacer row between groups");
+        assert_eq!(palette_hit(area, &palette, pl.left.x + 2, blank), None);
+    }
+
+    #[test]
+    fn clicking_the_filter_row_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, pl.filter.x + 1, pl.filter.y),
+            None
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_overlay_dismisses_the_palette() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, 0, 0),
+            Some(PaletteHit::Dismiss),
+            "the corner of the screen is outside the box"
+        );
+        assert_eq!(
+            palette_hit(
+                area,
+                &palette,
+                pl.overlay.x.saturating_sub(1),
+                pl.overlay.y + 2
+            ),
+            Some(PaletteHit::Dismiss),
+            "one column left of the border is outside"
+        );
+    }
+
+    #[test]
+    fn clicking_the_overlay_border_neither_acts_nor_dismisses() {
+        // The border belongs to the palette, so a click that grazes it must not
+        // close the box the user is aiming at.
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, pl.overlay.x, pl.overlay.y + 2),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_result_list_has_nothing_to_click() {
+        let mut palette = CommandPalette::new();
+        palette.set_filter("zzzzz-no-such-command");
+        assert!(
+            palette.filtered().is_empty(),
+            "the filter must match nothing"
+        );
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        for row in pl.left.y..pl.left.y + pl.left.height {
+            assert_eq!(
+                palette_hit(area, &palette, pl.left.x + 2, row),
+                None,
+                "row {row} of an empty list must do nothing"
+            );
+        }
+        assert_eq!(
+            palette_hit(area, &palette, 0, 0),
+            Some(PaletteHit::Dismiss),
+            "an empty list still closes on an outside click"
+        );
+    }
+
+    #[test]
+    fn a_filtered_list_maps_clicks_to_the_entries_that_survived() {
+        // Indices are into the *filtered* list, not the full one, so a filtered
+        // palette must not hand back the index of the unfiltered entry.
+        let mut palette = CommandPalette::new();
+        palette.set_filter("project");
+        let filtered = palette.filtered();
+        assert!(filtered.len() >= 2, "the filter must leave several entries");
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let (col, row) = drawn_at(&buf, pl.left, filtered[0].label);
+        assert_eq!(
+            palette_hit(area, &palette, col, row),
+            Some(PaletteHit::Entry(0))
+        );
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------
