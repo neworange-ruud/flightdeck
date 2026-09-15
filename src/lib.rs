@@ -96,10 +96,10 @@ use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key_with_f2, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
-    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, palette_hit,
-    project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel, DialogButton,
-    DialogHit, DialogListItem, GitStatusCache, HitTarget, PaletteHit, ProjectHit, ProjectTabInfo,
-    RemotePairing, StatusAction, UiOverlay,
+    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, overlay_dismissed_by_click,
+    palette_hit, project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel,
+    DialogButton, DialogHit, DialogListItem, GitStatusCache, HitTarget, PaletteHit, ProjectHit,
+    ProjectTabInfo, RemotePairing, StatusAction, UiOverlay,
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
@@ -4527,6 +4527,16 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
                 None => {}
             }
         }
+        return;
+    }
+
+    // A read-only overlay — help, about, git status — closes on a click beside
+    // it. These already close on any key; the pointer gets the same way out.
+    // A click *on* the window changes nothing: it is what the user is reading.
+    if me.kind == MouseEventKind::Down(MouseButton::Left)
+        && overlay_dismissed_by_click(&ui.overlay, area, me.column, me.row)
+    {
+        ui.clear();
         return;
     }
 
@@ -11688,6 +11698,71 @@ mod tests {
                 workspace.projects[1].state.tabs[0].session.active().is_some(),
                 "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
             );
+        }
+    }
+
+    /// A read-only overlay closes on a click beside it (SPECS §23) — the
+    /// pointer's version of the "any key dismisses" it already answers to.
+    mod overlay_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+
+        fn area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 40,
+            }
+        }
+
+        fn click_with_overlay(overlay: UiOverlay, column: u16, row: u16) -> Ui {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                overlay,
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area(), &mut ws, &e, &mut ui);
+            ui
+        }
+
+        #[test]
+        fn clicking_beside_the_help_window_closes_it() {
+            let ui = click_with_overlay(UiOverlay::Help, 0, 0);
+            assert!(
+                matches!(ui.overlay, UiOverlay::None),
+                "a click beside the help window closes it"
+            );
+        }
+
+        #[test]
+        fn clicking_inside_the_help_window_leaves_it_open() {
+            let ui = click_with_overlay(UiOverlay::Help, 60, 20);
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "the window is what the user is reading"
+            );
+        }
+
+        #[test]
+        fn a_click_that_closes_the_help_window_does_nothing_else() {
+            // The click that dismisses must not also act on whatever the
+            // overlay was covering.
+            let ui = click_with_overlay(UiOverlay::Help, 0, 0);
+            assert!(ui.palette.is_none(), "nothing else may open");
+            assert!(ui.drag.is_none(), "no selection may start underneath");
         }
     }
 

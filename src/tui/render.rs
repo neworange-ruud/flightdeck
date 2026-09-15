@@ -422,6 +422,32 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
     None
 }
 
+/// The box the git status panel draws in `area`.
+fn git_status_overlay_rect(area: Rect) -> Rect {
+    layout::centered_overlay(area, 70, 18)
+}
+
+/// Whether a click at `(col, row)` closes the overlay drawn in `area`.
+///
+/// True only for the read-only overlays — help, about, git status — and only
+/// for a click that lands beside the box they draw: the pointer's version of
+/// the "any key dismisses" they already answer to. A click on the window is a
+/// click on what the user is reading, so it keeps it open.
+///
+/// The live surfaces are deliberately absent. The pairing overlay shows a code
+/// that expires and the browser access overlay holds a live binding; losing
+/// either to a misplaced click costs real work, so they keep their keyboard
+/// dismissal alone.
+pub fn overlay_dismissed_by_click(overlay: &UiOverlay, area: Rect, col: u16, row: u16) -> bool {
+    let rect = match overlay {
+        UiOverlay::Help => help_overlay_rect(area),
+        UiOverlay::About => about_overlay_rect(area),
+        UiOverlay::GitStatus { .. } => git_status_overlay_rect(area),
+        _ => return false,
+    };
+    !rect_contains(rect, col, row)
+}
+
 /// Whether `(col, row)` is inside `r`.
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x
@@ -2238,7 +2264,7 @@ pub fn draw_git_status_overlay(
     pr_url: Option<&str>,
     area: Rect,
 ) {
-    let overlay_area = layout::centered_overlay(area, 70, 18);
+    let overlay_area = git_status_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -2535,8 +2561,13 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 /// (`specs/WEB_INTERFACE.md` §6.5 R16). This function is the ratatui half of
 /// that one source — it decides indentation, colour and where the hints sit,
 /// and nothing else.
+/// The box the help overlay draws in `area`.
+fn help_overlay_rect(area: Rect) -> Rect {
+    layout::centered_overlay(area, 64, 40)
+}
+
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
-    let overlay_area = layout::centered_overlay(area, 64, 40);
+    let overlay_area = help_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let doc = crate::tui::help::help_doc(use_f2, isolated);
@@ -3574,7 +3605,9 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
 }
 
 /// Draw the About dialog: version, one-line description, and authorship credits.
-pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
+/// The lines the About overlay draws. Its box is sized from them, so the two
+/// cannot disagree about how tall the window is.
+fn about_lines() -> Vec<Line<'static>> {
     let accent = Color::Cyan;
     let doc = crate::tui::help::about_doc();
     let mut lines: Vec<Line> = vec![
@@ -3616,8 +3649,19 @@ pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )));
 
-    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let overlay_area = layout::centered_overlay(area, 62, content_height.saturating_add(2));
+    lines
+}
+
+/// The box the About overlay draws in `area`.
+fn about_overlay_rect(area: Rect) -> Rect {
+    let content_height = u16::try_from(about_lines().len()).unwrap_or(u16::MAX);
+    layout::centered_overlay(area, 62, content_height.saturating_add(2))
+}
+
+pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
+    let accent = Color::Cyan;
+    let lines = about_lines();
+    let overlay_area = about_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
@@ -5631,6 +5675,104 @@ mod tests {
             palette_hit(area, &palette, col, row),
             Some(PaletteHit::Entry(0))
         );
+    }
+
+    // --- Dismissing a read-only overlay with the mouse (SPECS §23) --------
+
+    /// The three read-only overlays, each in a state a click can dismiss.
+    fn read_only_overlays() -> Vec<UiOverlay> {
+        vec![
+            UiOverlay::Help,
+            UiOverlay::About,
+            UiOverlay::GitStatus {
+                status: WorktreeStatus {
+                    branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
+                    dirty: false,
+                    changes: crate::git::status::WorktreeChanges::default(),
+                    ahead: 0,
+                    behind: 0,
+                    upstream: None,
+                    base_drift: 0,
+                    worktree_path: PathBuf::from("/repo"),
+                },
+                pr_url: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_click_beside_a_read_only_overlay_dismisses_it() {
+        let area = Rect::new(0, 0, 130, 44);
+        for overlay in read_only_overlays() {
+            assert!(
+                overlay_dismissed_by_click(&overlay, area, 0, 0),
+                "the screen's corner is beside {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_inside_a_read_only_overlay_keeps_it_open() {
+        // The window is what the user is reading; clicking it must not close it.
+        let area = Rect::new(0, 0, 130, 44);
+        for overlay in read_only_overlays() {
+            let centre_col = area.width / 2;
+            let centre_row = area.height / 2;
+            assert!(
+                !overlay_dismissed_by_click(&overlay, area, centre_col, centre_row),
+                "the centre of the screen is inside {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dismiss_edge_is_the_border_the_overlay_draws() {
+        // Anti-drift: the boundary a click is measured against must be the box
+        // the user can see, not a second guess at its size.
+        let area = Rect::new(0, 0, 130, 44);
+        let mut term = test_terminal(130, 44);
+        // Drawn on its own, so the app chrome behind it cannot be mistaken for
+        // the box's edge.
+        term.draw(|frame| {
+            draw_help_overlay(frame, area, false, false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mid = area.height / 2;
+        // The leftmost column of the drawn box on a middle row.
+        let left_edge = (0..area.width)
+            .find(|&x| buf[(x, mid)].symbol() != " ")
+            .expect("the help box is drawn");
+        assert!(
+            !overlay_dismissed_by_click(&UiOverlay::Help, area, left_edge, mid),
+            "the border belongs to the window"
+        );
+        assert!(
+            overlay_dismissed_by_click(&UiOverlay::Help, area, left_edge - 1, mid),
+            "one column further out is beside it"
+        );
+    }
+
+    #[test]
+    fn a_live_overlay_is_never_dismissed_by_a_stray_click() {
+        // The pairing surface shows a code that expires and the browser access
+        // surface holds a live binding: losing either to a misplaced click
+        // costs the user real work. They keep their keyboard dismissal only.
+        let area = Rect::new(0, 0, 130, 44);
+        let live = [
+            UiOverlay::None,
+            UiOverlay::Remote(RemotePairing::default()),
+            UiOverlay::Palette(CommandPalette::new()),
+        ];
+        for overlay in live {
+            for (col, row) in [(0, 0), (area.width - 1, area.height - 1)] {
+                assert!(
+                    !overlay_dismissed_by_click(&overlay, area, col, row),
+                    "{overlay:?} must not vanish on a click"
+                );
+            }
+        }
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------

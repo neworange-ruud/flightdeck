@@ -21,6 +21,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   asks. Clicking beside the box closes it; clicking a group header, the filter
   row or the border leaves it open, because the click was plainly aimed at the
   palette.
+- **The help, about and git status windows close on a click beside them.** They
+  already closed on any key; the pointer now has the same way out. A click on
+  the window itself changes nothing — it is what you are reading. The pairing
+  and browser-access surfaces keep their keyboard dismissal alone, since a
+  misplaced click there would cost a live code or binding.
 
 ### Improvements
 
