@@ -33,7 +33,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **The `✕` on a sidebar agent row now closes it when `mode_border` is on.**
+  With a live-pane border the sidebar reserves no seam column of its own — the
+  pane's frame already draws that line — so its `✕` sits in the content's last
+  column, but the hit test subtracted a seam column regardless. The close zone
+  landed one column to the left: clicking the glyph did nothing at all, while
+  the columns beside it worked. Drawing and hit-testing now ask one function
+  where the sidebar's content starts and ends.
 
 ## [1.18.0] - 2026-09-01
 

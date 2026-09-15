@@ -379,8 +379,16 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, side, col, row)
-                .unwrap_or(HitTarget::Sidebar),
+            sidebar_hit(
+                ml.sidebar,
+                state.tabs.len(),
+                chrome,
+                side,
+                crate::tui::mode_style::border_enabled(&state.config.ui),
+                col,
+                row,
+            )
+            .unwrap_or(HitTarget::Sidebar),
         );
     }
     if state.split_view {
@@ -465,10 +473,11 @@ fn sidebar_hit(
     tab_count: usize,
     chrome: layout::Chrome,
     side: crate::contracts::AgentTabPosition,
+    seam_drawn_by_pane_border: bool,
     col: u16,
     row: u16,
 ) -> Option<HitTarget> {
-    let inner = Block::default().borders(sidebar_seam(side)).inner(area);
+    let inner = sidebar_block(seam_drawn_by_pane_border, side).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
@@ -955,16 +964,8 @@ pub fn draw_sidebar(
         return;
     }
 
-    // When the live-pane border feature is on, the focused pane's frame
-    // already supplies the separating vertical line, so the sidebar's own
-    // seam divider is suppressed here — otherwise two adjacent vertical
-    // lines would be drawn (SPECS §23).
     let side = state.config.ui.agent_tab_side();
-    let block = if mode_style::border_enabled(&state.config.ui) {
-        Block::default()
-    } else {
-        Block::default().borders(sidebar_seam(side))
-    };
+    let block = sidebar_block(mode_style::border_enabled(&state.config.ui), side);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1097,7 +1098,10 @@ pub fn draw_sidebar(
 /// Draw the collapsed agent strip: one indicator glyph per agent, no heading
 /// and no close control, for windows too small to afford the full sidebar.
 fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
-    let block = Block::default().borders(sidebar_seam(state.config.ui.agent_tab_side()));
+    let block = sidebar_block(
+        mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1200,6 +1204,28 @@ fn sidebar_name_line(
                 .chain([Span::raw(" ".repeat(pad.saturating_sub(1)))])
                 .collect::<Vec<_>>(),
         ),
+    }
+}
+
+/// The block the sidebar draws its content inside.
+///
+/// When the live-pane border feature is on, the focused pane's frame already
+/// supplies the vertical line between the panes, so the sidebar reserves no
+/// seam column of its own — otherwise two adjacent lines would be drawn (SPECS
+/// §23) — and its content then fills the rect right up to the `✕` in the last
+/// column.
+///
+/// Drawing and hit-testing both ask this one function. When they disagreed, the
+/// `✕` sat one column outside the area the hit test measured, and clicking the
+/// glyph did nothing at all while the three columns to its left closed the tab.
+fn sidebar_block(
+    seam_drawn_by_pane_border: bool,
+    side: crate::contracts::AgentTabPosition,
+) -> Block<'static> {
+    if seam_drawn_by_pane_border {
+        Block::default()
+    } else {
+        Block::default().borders(sidebar_seam(side))
     }
 }
 
@@ -4092,6 +4118,55 @@ mod tests {
         assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::Sidebar));
     }
 
+    #[test]
+    fn the_sidebar_close_control_answers_where_it_is_drawn() {
+        // Regression: with `mode_border` on, the sidebar reserves no seam
+        // column of its own — the live-pane frame already draws that line — so
+        // the `✕` sits in the content's last column. A hit test that reserved
+        // the seam regardless put the close zone one column to its left, and
+        // the glyph itself answered `Sidebar`: a click on it did nothing at all.
+        for mode_border in ["off", "dim"] {
+            for side in [
+                crate::contracts::AgentTabPosition::Left,
+                crate::contracts::AgentTabPosition::Right,
+            ] {
+                let mut state = state_with_tabs(1);
+                state.config.ui.mode_border = mode_border.to_string();
+                state.config.ui.agent_tab_position = match side {
+                    crate::contracts::AgentTabPosition::Left => "left".to_string(),
+                    crate::contracts::AgentTabPosition::Right => "right".to_string(),
+                };
+                let area = Rect::new(0, 0, 130, 34);
+                let mut term = test_terminal(130, 34);
+                term.draw(|frame| {
+                    draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0);
+                })
+                .unwrap();
+                let buf = term.backend().buffer().clone();
+                // Only the sidebar's own ✕ — the terminal tab bar draws one too.
+                let ml = layout::compute(
+                    area,
+                    layout::Chrome::Full,
+                    crate::tui::mode_style::border_enabled(&state.config.ui),
+                    side,
+                );
+                let panel = ml.sidebar_frame.unwrap_or(ml.sidebar);
+                let (col, row) = (panel.y..panel.y + panel.height)
+                    .find_map(|row| {
+                        (panel.x..panel.x + panel.width)
+                            .find(|&col| buf[(col, row)].symbol() == CLOSE_GLYPH)
+                            .map(|col| (col, row))
+                    })
+                    .unwrap_or_else(|| panic!("no ✕ drawn ({mode_border}, {side:?})"));
+                assert_eq!(
+                    hit_test(area, &state, col, row),
+                    Some(HitTarget::CloseAgentTab(0)),
+                    "the ✕ at ({col}, {row}) must close ({mode_border}, {side:?})"
+                );
+            }
+        }
+    }
+
     // --- Collapsed chrome (small windows in terminal mode) -----------------
 
     /// Read the glyph in the first column of `row` from a rendered buffer.
@@ -4153,6 +4228,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 0
             ),
@@ -4164,6 +4240,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 2
             ),
@@ -4176,6 +4253,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 3
             ),
@@ -4188,6 +4266,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 1,
                 1
             ),
