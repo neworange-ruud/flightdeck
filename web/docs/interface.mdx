@@ -46,6 +46,7 @@ the [Keyboard Shortcuts reference](/reference/keyboard).
   change counts, ahead/behind, base drift, and base branch. See
   [Git Workflow](/desktop/git).
 - **Status bar** — the current input mode and the most useful shortcuts for it.
+  Every shortcut on it is also a button: see [Mouse support](#mouse-support).
 
 ## Two input modes
 
@@ -102,6 +103,13 @@ FlightDeck also responds to the mouse: click a project tab to switch (or its
 `✕` to close), click an agent in the sidebar to select it, click a terminal tab
 to switch terminals, and use the `+ project` / `+ agent` / `+ shell` buttons.
 You can select text in the viewport and scroll with the wheel.
+
+The status bar is clickable too. Each label does exactly what the key printed
+beside it does: the mode chip and the hint next to it switch modes, `Ctrl-g:
+palette` opens the command palette, and `F1 / Alt-h: help` opens the help
+screen. The parts that only report state — `ISOLATED`, the input lock, and the
+update notice — are deliberately inert, so a stray click cannot start an
+update.
 
 ## The most useful shortcuts
 

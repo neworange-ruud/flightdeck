@@ -1834,6 +1834,117 @@ pub fn draw_status_bar(
     frame.render_widget(para, area);
 }
 
+/// What a click on a status-bar label does. Every variant is exactly what the
+/// label's own shortcut does, so the bar never grows an action the keyboard
+/// cannot reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAction {
+    /// Leave terminal focus for the app chrome (Terminal mode's mode chip and
+    /// its leave-focus hint).
+    FocusApp,
+    /// Give focus back to the terminal (App mode's mode chip and `Enter` hint).
+    FocusTerminal,
+    /// Open the command palette.
+    OpenPalette,
+    /// Open the help screen.
+    OpenHelp,
+}
+
+/// One run of status-bar spans that a click resolves as a unit. Separators and
+/// read-out badges carry no action, so a click between two hints — or on a
+/// badge that merely reports state — fires nothing rather than a neighbour.
+///
+/// Both status bars are built out of these, and [`status_bar_hit`] measures the
+/// very same list the renderer flattens, so a label cannot move out from under
+/// the pointer without taking its clickable region with it.
+pub struct StatusSegment {
+    spans: Vec<Span<'static>>,
+    action: Option<StatusAction>,
+}
+
+/// A segment nothing happens on: separators, badges, branch context.
+fn inert(spans: Vec<Span<'static>>) -> StatusSegment {
+    StatusSegment {
+        spans,
+        action: None,
+    }
+}
+
+/// A segment a click acts on — the whole phrase, key and label alike.
+fn clickable(spans: Vec<Span<'static>>, action: StatusAction) -> StatusSegment {
+    StatusSegment {
+        spans,
+        action: Some(action),
+    }
+}
+
+/// The ` | ` between two hints. Its own segment, so it belongs to neither.
+fn status_sep() -> StatusSegment {
+    inert(vec![Span::raw(" | ")])
+}
+
+/// Flatten segments into the [`Line`] the bar draws.
+fn status_line(segments: Vec<StatusSegment>) -> Line<'static> {
+    Line::from(
+        segments
+            .into_iter()
+            .flat_map(|s| s.spans)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The action of the segment covering `col`, laying `segments` out from `x`
+/// exactly as the Paragraph draws them.
+fn segment_at(x: u16, segments: &[StatusSegment], col: u16) -> Option<StatusAction> {
+    let mut cursor = x;
+    for seg in segments {
+        let width: u16 = seg.spans.iter().map(|s| s.width() as u16).sum();
+        if col >= cursor && col < cursor.saturating_add(width) {
+            return seg.action;
+        }
+        cursor = cursor.saturating_add(width);
+    }
+    None
+}
+
+/// Resolve a click at `(col, row)` against whichever status bar `area` draws
+/// (SPECS §23). Returns the action its label advertises, or `None` for a click
+/// on a separator, a read-out badge, or anywhere outside the bar.
+///
+/// `input_holder` is the same value passed to [`draw_status_bar`]: the compact
+/// bar draws that badge *before* its hints, so it shifts them, and a hit test
+/// built from different inputs would land one badge off.
+pub fn status_bar_hit(
+    area: Rect,
+    state: &AppState,
+    input_holder: Option<&str>,
+    col: u16,
+    row: u16,
+) -> Option<StatusAction> {
+    let chrome = layout::chrome_for(area, state.mode());
+    let ml = layout::compute(
+        area,
+        chrome,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
+    );
+    if !rect_contains(ml.status_bar, col, row) {
+        return None;
+    }
+    let segments = if chrome == layout::Chrome::Collapsed {
+        compact_status_bar_segments(state, input_holder, ml.status_bar.width)
+    } else {
+        status_bar_segments(
+            state.mode(),
+            &state.config.ui,
+            state.update_available.as_deref(),
+            state.isolated,
+            input_holder,
+        )
+    };
+    segment_at(ml.status_bar.x, &segments, col)
+}
+
 /// Compact terminal-mode status used when the git info row is reclaimed. Safety
 /// and mode indicators come first, followed by bounded base context; optional
 /// shortcut hints are the first content allowed to clip.
@@ -1842,6 +1953,17 @@ fn compact_status_bar_text(
     input_holder: Option<&str>,
     width: u16,
 ) -> Line<'static> {
+    status_line(compact_status_bar_segments(state, input_holder, width))
+}
+
+/// The compact bar as clickable segments. The mode chip acts at every width;
+/// the shortcut hints exist only from 100 columns on, so below that there is
+/// nothing to click but the chip.
+fn compact_status_bar_segments(
+    state: &AppState,
+    input_holder: Option<&str>,
+    width: u16,
+) -> Vec<StatusSegment> {
     let branch_limit = match width {
         0..=49 => 4,
         50..=79 => 8,
@@ -1852,84 +1974,108 @@ fn compact_status_bar_text(
         .as_deref()
         .unwrap_or(&state.base_branch);
     let configured_default = shorten_branch(configured_default, branch_limit);
-    let mut spans = Vec::new();
+    let mut segs: Vec<StatusSegment> = Vec::new();
     if state.isolated {
-        spans.push(Span::styled(
+        segs.push(inert(vec![Span::styled(
             " ISOLATED",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(info_sep());
+        )]));
+        segs.push(inert(vec![info_sep()]));
     }
-    spans.push(Span::styled(
-        if width < 80 { "TERM" } else { "MODE: TERMINAL" },
-        Style::default()
-            .fg(Color::Black)
-            .bg(crate::tui::mode_style::chip_color(
-                &state.config.ui,
-                InputMode::Terminal,
-            ))
-            .add_modifier(Modifier::BOLD),
-    ));
-    if let Some(holder) = input_holder {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("INPUT: {holder}"),
+    segs.push(clickable(
+        vec![Span::styled(
+            if width < 80 { "TERM" } else { "MODE: TERMINAL" },
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Magenta)
+                .bg(crate::tui::mode_style::chip_color(
+                    &state.config.ui,
+                    InputMode::Terminal,
+                ))
                 .add_modifier(Modifier::BOLD),
-        ));
+        )],
+        StatusAction::FocusApp,
+    ));
+    if let Some(holder) = input_holder {
+        segs.push(inert(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("INPUT: {holder}"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
     if let Some(version) = &state.update_available {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            if width < 80 {
-                "UPDATE".to_string()
-            } else {
-                format!("v{version} update")
-            },
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        ));
+        segs.push(inert(vec![
+            Span::raw(" "),
+            Span::styled(
+                if width < 80 {
+                    "UPDATE".to_string()
+                } else {
+                    format!("v{version} update")
+                },
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+        ]));
     }
-    spans.push(info_sep());
-    spans.push(Span::styled(
-        if state.invalid_base_branch.is_some() {
-            format!("default: !{configured_default}")
-        } else {
-            format!("default: {configured_default}")
-        },
-        if state.invalid_base_branch.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    ));
+    segs.push(inert(vec![
+        info_sep(),
+        Span::styled(
+            if state.invalid_base_branch.is_some() {
+                format!("default: !{configured_default}")
+            } else {
+                format!("default: {configured_default}")
+            },
+            if state.invalid_base_branch.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ),
+    ]));
     if width >= 50 {
         if let Some(tab) = state.selected() {
-            spans.push(info_sep());
-            spans.push(Span::styled(
-                format!(
-                    "target: {}",
-                    shorten_branch(&tab.meta.base_branch, branch_limit)
+            segs.push(inert(vec![
+                info_sep(),
+                Span::styled(
+                    format!(
+                        "target: {}",
+                        shorten_branch(&tab.meta.base_branch, branch_limit)
+                    ),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Style::default().fg(Color::DarkGray),
-            ));
+            ]));
         }
     }
     if width >= 100 {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            crate::tui::platform::leave_focus_key(state.config.ui.use_f2_to_leave_terminal_focus),
-            Style::default().fg(Color::Yellow),
+        segs.push(status_sep());
+        segs.push(clickable(
+            vec![
+                Span::styled(
+                    crate::tui::platform::leave_focus_key(
+                        state.config.ui.use_f2_to_leave_terminal_focus,
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(": app"),
+            ],
+            StatusAction::FocusApp,
         ));
-        spans.push(Span::raw(": app | "));
-        spans.push(Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(": palette"));
+        segs.push(status_sep());
+        segs.push(clickable(
+            vec![
+                Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
+                Span::raw(": palette"),
+            ],
+            StatusAction::OpenPalette,
+        ));
     }
-    Line::from(spans)
+    segs
 }
 
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
@@ -1943,47 +2089,81 @@ pub fn status_bar_text(
     isolated: bool,
     input_holder: Option<&str>,
 ) -> Line<'static> {
+    status_line(status_bar_segments(
+        mode,
+        ui,
+        update_available,
+        isolated,
+        input_holder,
+    ))
+}
+
+/// The full bar as clickable segments (SPECS §23).
+///
+/// The mode chip resolves to the same action as the hint beside it: in Terminal
+/// mode both say "leave terminal focus", in App mode both say "go back to the
+/// terminal". So the chip needs no action of its own — it is the shortest way
+/// to say what the hint spells out.
+fn status_bar_segments(
+    mode: InputMode,
+    ui: &crate::contracts::UiConfig,
+    update_available: Option<&str>,
+    isolated: bool,
+    input_holder: Option<&str>,
+) -> Vec<StatusSegment> {
     let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
+    let chip_style = Style::default()
+        .fg(Color::Black)
+        .bg(chip_bg)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(Color::Yellow);
     let use_f2 = ui.use_f2_to_leave_terminal_focus;
-    let mut spans = match mode {
-        InputMode::Terminal => vec![
-            Span::raw(" "),
-            Span::styled(
-                "MODE: TERMINAL",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(chip_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | "),
-            Span::styled(
-                crate::tui::platform::leave_focus_key(use_f2),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(": app mode | "),
-            Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": palette | "),
-            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
-            Span::raw(": help"),
-        ],
-        InputMode::App => vec![
-            Span::raw(" "),
-            Span::styled(
-                "MODE: APP",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(chip_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(": focus terminal | "),
-            Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": palette | "),
-            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
-            Span::raw(": help"),
-        ],
+    // Leaving the mode you are in: what the chip and the first hint both mean.
+    let leave = match mode {
+        InputMode::Terminal => StatusAction::FocusApp,
+        InputMode::App => StatusAction::FocusTerminal,
     };
+    let mut segs = vec![inert(vec![Span::raw(" ")])];
+    match mode {
+        InputMode::Terminal => {
+            segs.push(clickable(
+                vec![Span::styled("MODE: TERMINAL", chip_style)],
+                leave,
+            ));
+            segs.push(status_sep());
+            segs.push(clickable(
+                vec![
+                    Span::styled(crate::tui::platform::leave_focus_key(use_f2), key_style),
+                    Span::raw(": app mode"),
+                ],
+                leave,
+            ));
+        }
+        InputMode::App => {
+            segs.push(clickable(
+                vec![Span::styled("MODE: APP", chip_style)],
+                leave,
+            ));
+            segs.push(status_sep());
+            segs.push(clickable(
+                vec![
+                    Span::styled("Enter", key_style),
+                    Span::raw(": focus terminal"),
+                ],
+                leave,
+            ));
+        }
+    }
+    segs.push(status_sep());
+    segs.push(clickable(
+        vec![Span::styled("Ctrl-g", key_style), Span::raw(": palette")],
+        StatusAction::OpenPalette,
+    ));
+    segs.push(status_sep());
+    segs.push(clickable(
+        vec![Span::styled(HELP_KEYS, key_style), Span::raw(": help")],
+        StatusAction::OpenHelp,
+    ));
 
     // The input lock (`specs/WEB_INTERFACE.md` D14 as revised). Drawn only when
     // a browser is seated as a writer and somebody holds the turn, because with
@@ -1995,45 +2175,52 @@ pub fn status_bar_text(
     // rather than interleaving it, and §5.1 does not allow that to happen
     // silently. `Take Input Lock` in the palette is the way past it.
     if let Some(holder) = input_holder {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("INPUT: {holder}"),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("INPUT: {holder}"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     // Isolated run (SPECS §32): nothing persists and several actions are gone,
     // so say so permanently rather than once at launch.
     if isolated {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            "ISOLATED",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                "ISOLATED",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     // Update notice (SPECS §30): a non-intrusive hint, never a modal. It points
     // at `flightdeck update`, which itself routes Homebrew installs to
     // `brew update && brew upgrade`, so a single message is correct for every
-    // install method.
+    // install method. Deliberately inert: a stray click must never start an
+    // update.
     if let Some(version) = update_available {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("● v{version} available — run `flightdeck update`"),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("● v{version} available — run `flightdeck update`"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
-    Line::from(spans)
+    segs
 }
 
 // ---------------------------------------------------------------------------
@@ -4819,6 +5006,364 @@ mod tests {
             .find(|s| s.content.contains("MODE: TERMINAL"))
             .expect("chip span present");
         assert_eq!(chip.style.bg, Some(ratatui::style::Color::Magenta));
+    }
+
+    // --- Clickable status bar --------------------------------------------
+
+    /// Terminal geometry that keeps the chrome full (>= MIN_FULL_COLS/ROWS), so
+    /// the normal status bar is drawn rather than the compact one.
+    const FULL_W: u16 = 130;
+    const FULL_H: u16 = 34;
+
+    /// The column — not the byte offset — at which `needle` is rendered in a
+    /// buffer row. The bar contains multi-byte glyphs (`│`, `●`), so a byte
+    /// offset is not a column.
+    fn col_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not rendered in {row:?}"));
+        row[..byte].chars().count() as u16
+    }
+
+    /// Draw `state` into a `w`x`h` terminal and return its status bar row (the
+    /// bottom row) plus that row's `y`. Hit tests are asserted against the text
+    /// that was actually drawn, so a label that moves takes its test with it.
+    fn drawn_status_row(
+        state: &AppState,
+        input_holder: Option<&str>,
+        w: u16,
+        h: u16,
+    ) -> (String, u16) {
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| {
+            draw(
+                frame,
+                state,
+                &empty_cache(),
+                &UiOverlay::None,
+                input_holder,
+                0,
+            )
+        })
+        .unwrap();
+        (buffer_row(term.backend().buffer(), h - 1), h - 1)
+    }
+
+    #[test]
+    fn clicking_the_terminal_mode_chip_focuses_the_app() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "MODE: TERMINAL");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            Some(StatusAction::FocusApp),
+            "the chip means the same as the hint beside it"
+        );
+    }
+
+    #[test]
+    fn clicking_the_leave_focus_hint_focuses_the_app() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        // The whole phrase acts, key and label alike.
+        for needle in [crate::tui::platform::leave_focus_key(false), "app mode"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, None, col, y),
+                Some(StatusAction::FocusApp),
+                "clicking {needle:?} must leave terminal focus"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_palette_hint_opens_the_palette() {
+        for mode_is_terminal in [true, false] {
+            let mut state = state_with_tabs(1);
+            if mode_is_terminal {
+                state.focus_terminal();
+            } else {
+                state.focus_app();
+            }
+            let area = Rect::new(0, 0, FULL_W, FULL_H);
+            let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+            for needle in ["Ctrl-g", "palette"] {
+                let col = col_of(&row, needle);
+                assert_eq!(
+                    status_bar_hit(area, &state, None, col, y),
+                    Some(StatusAction::OpenPalette),
+                    "clicking {needle:?} must open the palette"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_help_hint_opens_help() {
+        for mode_is_terminal in [true, false] {
+            let mut state = state_with_tabs(1);
+            if mode_is_terminal {
+                state.focus_terminal();
+            } else {
+                state.focus_app();
+            }
+            let area = Rect::new(0, 0, FULL_W, FULL_H);
+            let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+            for needle in [HELP_KEYS, "help"] {
+                let col = col_of(&row, needle);
+                assert_eq!(
+                    status_bar_hit(area, &state, None, col, y),
+                    Some(StatusAction::OpenHelp),
+                    "clicking {needle:?} must open help"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_app_mode_chip_focuses_the_terminal() {
+        let mut state = state_with_tabs(1);
+        state.focus_app();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "MODE: APP");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            Some(StatusAction::FocusTerminal)
+        );
+    }
+
+    #[test]
+    fn clicking_the_focus_terminal_hint_focuses_the_terminal() {
+        let mut state = state_with_tabs(1);
+        state.focus_app();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        for needle in ["Enter", "focus terminal"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, None, col, y),
+                Some(StatusAction::FocusTerminal),
+                "clicking {needle:?} must focus the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_gap_between_two_hints_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        // The `|` separating two hints belongs to neither, so a click that
+        // lands between them fires nothing rather than the wrong neighbour.
+        let palette = col_of(&row, "Ctrl-g");
+        let gap = palette - 2; // the `|` in " | " before the palette hint
+        assert_eq!(&row[..].chars().nth(gap as usize).unwrap().to_string(), "|");
+        assert_eq!(status_bar_hit(area, &state, None, gap, y), None);
+    }
+
+    #[test]
+    fn clicking_the_update_notice_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.update_available = Some("9.9.9".to_string());
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "v9.9.9 available");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            None,
+            "a stray click must never start an update"
+        );
+    }
+
+    #[test]
+    fn clicking_the_isolated_and_input_badges_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        // Wide enough that both badges are drawn whole rather than clipped.
+        let w = 170;
+        let area = Rect::new(0, 0, w, FULL_H);
+        let holder = Some("Safari/iOS");
+        let (row, y) = drawn_status_row(&state, holder, w, FULL_H);
+        for needle in ["ISOLATED", "INPUT: Safari/iOS"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, holder, col, y),
+                None,
+                "{needle:?} reports state; it is not a button"
+            );
+        }
+    }
+
+    #[test]
+    fn the_badges_do_not_move_the_hints_out_from_under_the_pointer() {
+        // ISOLATED and INPUT are appended after the hints, so they must not
+        // shift them — and the hit test must agree with what was drawn.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        state.update_available = Some("9.9.9".to_string());
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let holder = Some("Safari/iOS");
+        let (row, y) = drawn_status_row(&state, holder, FULL_W, FULL_H);
+        let col = col_of(&row, "palette");
+        assert_eq!(
+            status_bar_hit(area, &state, holder, col, y),
+            Some(StatusAction::OpenPalette)
+        );
+    }
+
+    #[test]
+    fn a_click_above_the_status_row_is_not_a_status_hit() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "Ctrl-g");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y - 1),
+            None,
+            "the row above the bar is the divider, not the bar"
+        );
+    }
+
+    #[test]
+    fn a_click_left_of_the_bar_is_not_a_status_hit() {
+        // The bar lives in the main pane; the sidebar occupies the columns to
+        // its left and has its own hit test.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (_, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        assert_eq!(status_bar_hit(area, &state, None, 0, y), None);
+    }
+
+    #[test]
+    fn the_compact_bar_hints_are_clickable_too() {
+        // Collapsed chrome (terminal mode, small window) draws its own bar. Its
+        // hints appear only from 100 columns of pane width on.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 103 + layout::COLLAPSED_SIDEBAR_WIDTH; // pane >= 100 columns
+        let h = layout::MIN_FULL_ROWS - 1; // short enough to collapse
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        assert!(
+            row.contains("default:"),
+            "expected the compact bar: {row:?}"
+        );
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "Ctrl-g"), y),
+            Some(StatusAction::OpenPalette)
+        );
+        assert_eq!(
+            status_bar_hit(
+                area,
+                &state,
+                None,
+                col_of(&row, crate::tui::platform::leave_focus_key(false)),
+                y
+            ),
+            Some(StatusAction::FocusApp)
+        );
+    }
+
+    #[test]
+    fn the_compact_bar_branch_context_is_not_clickable() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 103 + layout::COLLAPSED_SIDEBAR_WIDTH;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        for needle in ["default:", "target:"] {
+            assert_eq!(
+                status_bar_hit(area, &state, None, col_of(&row, needle), y),
+                None,
+                "{needle:?} is context, not a control"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_compact_bar_keeps_its_chip_clickable_after_the_hints_are_gone() {
+        // Below 100 columns the compact bar drops its hints, but the mode chip
+        // is drawn at every width — so it stays the way back to app mode when
+        // there is no room to say so in words.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 60;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        assert!(!row.contains("palette"), "no hints at this width: {row:?}");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "TERM"), y),
+            Some(StatusAction::FocusApp)
+        );
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "default:"), y),
+            None
+        );
+    }
+
+    #[test]
+    fn the_compact_bar_hits_follow_the_badges_that_shift_them() {
+        // ISOLATED, INPUT and UPDATE are drawn *before* the hints in the
+        // compact bar, so they push them right. The hit test must be built from
+        // the same inputs as the drawing, or the pointer lands one badge off.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        state.update_available = Some("9.9.9".to_string());
+        let holder = Some("Safari/iOS");
+        let w = 130;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, holder, w, h);
+        assert!(row.contains("ISOLATED"), "expected the badges: {row:?}");
+        assert_eq!(
+            status_bar_hit(area, &state, holder, col_of(&row, "Ctrl-g"), y),
+            Some(StatusAction::OpenPalette)
+        );
+    }
+
+    #[test]
+    fn every_clickable_label_acts_across_its_whole_width() {
+        // Anti-drift: each label is one region, so its first and last column
+        // resolve alike. A renderer change that moves a label without moving
+        // its segment breaks this.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let cases = [
+            ("MODE: TERMINAL", StatusAction::FocusApp),
+            ("app mode", StatusAction::FocusApp),
+            ("palette", StatusAction::OpenPalette),
+            ("help", StatusAction::OpenHelp),
+        ];
+        for (label, action) in cases {
+            let first = col_of(&row, label);
+            let last = first + label.chars().count() as u16 - 1;
+            assert_eq!(
+                status_bar_hit(area, &state, None, first, y),
+                Some(action),
+                "first column of {label:?}"
+            );
+            assert_eq!(
+                status_bar_hit(area, &state, None, last, y),
+                Some(action),
+                "last column of {label:?}"
+            );
+        }
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------

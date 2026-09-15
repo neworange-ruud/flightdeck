@@ -8,7 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **The status bar is clickable.** Every label on it does exactly what the key
+  printed beside it does: the mode chip and the hint next to it switch modes,
+  `Ctrl-g: palette` opens the command palette, and `F1 / Alt-h: help` opens the
+  help screen. Both bars act — the compact one a small window draws keeps its
+  mode chip clickable even after the hints no longer fit. The labels that only
+  report state (`ISOLATED`, the input lock, the update notice) stay inert, so a
+  stray click cannot start an update, and a click on the `|` between two hints
+  does nothing rather than firing a neighbour.
 
 ### Improvements
 

@@ -97,8 +97,8 @@ use crate::tui::input::{map_key_with_f2, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
     child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
-    ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
-    HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, UiOverlay,
+    status_bar_hit, ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem,
+    GitStatusCache, HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, StatusAction, UiOverlay,
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
@@ -4456,6 +4456,24 @@ const MOUSE_WHEEL_UP: u8 = 64;
 /// xterm protocol button code for a wheel-down event.
 const MOUSE_WHEEL_DOWN: u8 = 65;
 
+/// Open the command palette with every entry gated by the live state.
+///
+/// Shared by `Ctrl-g` and by the status bar's palette label, so the two paths
+/// cannot end up showing different entries:
+/// - the Remote entries follow the pairing state — "Pair Phone" is hidden once
+///   a phone is paired, "Unpair Phone" while there is nothing to forget;
+/// - the web entries follow whether the web interface is running;
+/// - the project/new-tab entries are hidden in an isolated run: one session,
+///   one project (SPECS §32). The flows refuse independently; this is
+///   presentation only.
+fn open_palette(isolated: bool, ui: &mut Ui) {
+    let mut palette = CommandPalette::new();
+    palette.set_paired(ui.remote_paired);
+    palette.set_web_running(ui.web_running);
+    palette.set_isolated(isolated);
+    ui.palette = Some(palette);
+}
+
 /// Handle a mouse event (SPECS §20, §22 — keyboard-first, but mouse-assisted):
 /// a left click selects the clicked Agent Tab or child-terminal tab, the wheel
 /// scrolls the active terminal, and a left-button drag over the terminal
@@ -4582,6 +4600,23 @@ fn handle_mouse_project(
                             ui.message(format!("Error: {e}"));
                         }
                     }
+                }
+                return;
+            }
+            // The status bar's labels are controls, not a legend: each one does
+            // exactly what the shortcut printed beside it does (SPECS §23). The
+            // badges that merely report state — ISOLATED, the input lock, the
+            // update notice — resolve to nothing, so a stray click there is
+            // harmless.
+            if let Some(action) =
+                status_bar_hit(area, state, ui.input_holder.as_deref(), me.column, me.row)
+            {
+                ui.drag = None;
+                match action {
+                    StatusAction::FocusApp => state.focus_app(),
+                    StatusAction::FocusTerminal => state.focus_terminal(),
+                    StatusAction::OpenPalette => open_palette(state.isolated, ui),
+                    StatusAction::OpenHelp => ui.overlay = UiOverlay::Help,
                 }
                 return;
             }
@@ -5340,17 +5375,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             Ok(false)
         }
         KeyAction::OpenPalette => {
-            let mut palette = CommandPalette::new();
-            // Gate the Remote entries by the live pairing state: hide "Pair
-            // Phone" when already paired and "Unpair Phone" when there is no
-            // pairing to forget.
-            palette.set_paired(ui.remote_paired);
-            palette.set_web_running(ui.web_running);
-            // Hide the project/new-tab entries in an isolated run: one session,
-            // one project (SPECS §32). The flows refuse independently; this is
-            // presentation only.
-            palette.set_isolated(workspace.active_project().state.isolated);
-            ui.palette = Some(palette);
+            open_palette(workspace.active_project().state.isolated, ui);
             Ok(false)
         }
         KeyAction::OpenHelp => {
@@ -11633,6 +11658,146 @@ mod tests {
             assert!(
                 workspace.projects[1].state.tabs[0].session.active().is_some(),
                 "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
+            );
+        }
+    }
+
+    /// The status bar's labels are controls (SPECS §23): clicking one does what
+    /// the shortcut printed beside it does.
+    mod status_bar_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+
+        /// The `(column, row)` at which the status bar drawn for `area`
+        /// resolves to `action`. Found by asking the hit test, so these tests
+        /// keep working when a label moves or is renamed.
+        fn status_bar_target(
+            area: Rect,
+            ws: &Workspace,
+            action: crate::tui::render::StatusAction,
+        ) -> (u16, u16) {
+            let state = &ws.projects[ws.active].state;
+            let ml = crate::tui::layout::compute(
+                area,
+                crate::tui::layout::chrome_for(area, state.mode()),
+                crate::tui::mode_style::border_enabled(&state.config.ui),
+                state.config.ui.agent_tab_side(),
+            );
+            let row = ml.status_bar.y;
+            let column = (0..area.width)
+                .find(|&col| {
+                    crate::tui::render::status_bar_hit(area, state, None, col, row) == Some(action)
+                })
+                .unwrap_or_else(|| panic!("no column of the status bar means {action:?}"));
+            (column, row)
+        }
+
+        /// A wide, tall area so the full status bar is drawn rather than the
+        /// compact one.
+        fn roomy_area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 140,
+                height: 40,
+            }
+        }
+
+        fn status_click(ws: &mut Workspace, ui: &mut Ui, action: crate::tui::render::StatusAction) {
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let area = roomy_area();
+            let (column, row) = status_bar_target(area, ws, action);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area, ws, &e, ui);
+        }
+
+        #[test]
+        fn clicking_the_palette_hint_opens_the_command_palette() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::OpenPalette,
+            );
+            assert!(
+                ui.palette.is_some(),
+                "the bar says Ctrl-g opens the palette; clicking it must too"
+            );
+        }
+
+        #[test]
+        fn clicking_the_help_hint_opens_help() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            status_click(&mut ws, &mut ui, crate::tui::render::StatusAction::OpenHelp);
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "clicking the help hint must open the help screen"
+            );
+        }
+
+        #[test]
+        fn clicking_the_app_mode_hint_leaves_terminal_focus() {
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_terminal();
+            let mut ui = Ui::default();
+            status_click(&mut ws, &mut ui, crate::tui::render::StatusAction::FocusApp);
+            assert_eq!(
+                ws.projects[0].state.mode(),
+                crate::app::modes::InputMode::App,
+                "clicking `app mode` must do what the key beside it does"
+            );
+        }
+
+        #[test]
+        fn clicking_the_focus_terminal_hint_returns_focus_to_the_terminal() {
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_app();
+            let mut ui = Ui::default();
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::FocusTerminal,
+            );
+            assert_eq!(
+                ws.projects[0].state.mode(),
+                crate::app::modes::InputMode::Terminal
+            );
+        }
+
+        #[test]
+        fn the_palette_opened_by_a_click_gates_remote_entries_like_the_keyboard() {
+            // The keyboard path calls `set_paired` before showing the palette,
+            // so "Pair Phone" is hidden once a phone is paired. A second,
+            // hand-rolled palette in the mouse path would drift from that.
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                remote_paired: true,
+                ..Ui::default()
+            };
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::OpenPalette,
+            );
+            let palette = ui.palette.as_ref().expect("palette opened");
+            assert!(
+                !palette
+                    .filtered()
+                    .iter()
+                    .any(|e| e.label.contains("Pair Phone")),
+                "a paired phone must hide Pair Phone, however the palette was opened"
             );
         }
     }
