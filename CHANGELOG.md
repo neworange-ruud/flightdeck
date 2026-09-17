@@ -26,6 +26,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   and Cursor tabs were never affected: they match on a directory listing and a
   small `meta.json`.
 
+- **The scan behind that stall no longer repeats every frame.** Pinning a
+  freshly-launched agent's session re-read the store on every render tick for as
+  long as a tab was waiting for its session file — and an agent nobody has
+  prompted yet writes no such file, so the wait lasted the rest of the run. It
+  now scans at most once a second, and not at all while no tab is waiting.
+
 - **A panic or a startup error no longer aborts the process when the terminal
   has closed.** Konsole closes stderr with its tab, and `eprintln!` turns that
   write failure into a second panic — a panicking panic hook is an abort
