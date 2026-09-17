@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.20.0] - 2026-09-17
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - **Project tabs no longer fall off the tab bar.** Once the open projects
   overflowed the row, the ones on the right were simply clipped out of view and
   the `+ project` button painted over whatever was underneath it. The row now
