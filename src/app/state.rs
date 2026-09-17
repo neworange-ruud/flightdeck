@@ -1309,17 +1309,37 @@ impl AppState {
         // A root-running agent must really be on the displayed default. Never
         // check out a branch underneath the user, and never launch on another
         // branch while recording `base` as its target.
-        let head = services.git.current_branch(&self.repo_root)?;
-        if head == "HEAD" {
-            return Err(FlightDeckError::Refused(format!(
-                "the project root is in detached HEAD state; check out '{base}' first"
-            )));
-        }
-        if head != base {
-            return Err(FlightDeckError::Refused(format!(
-                "the project root is on '{head}', not the default base '{base}'; check out '{base}' first"
-            )));
-        }
+        //
+        // An isolated run is exempt (SPECS §32). It creates no worktree,
+        // mutates no git state and discards the tab at exit, so neither
+        // hazard the guard covers can arise, and the third — a tab mislabelled
+        // with `base` while HEAD is elsewhere — is already handled by
+        // labelling from `head` below. Which branch happens to be checked out
+        // must therefore not decide whether the run starts: a managed
+        // worktree carries a `.flightdeck/config.toml` naming `main` as its
+        // base while its HEAD is the feature branch, and `flightdeck -I` there
+        // used to refuse outright. Here the branch is only a label, so an
+        // unreadable HEAD (detached, or a `current_branch` that failed) falls
+        // back to the base name instead of aborting.
+        let head = if self.isolated {
+            match services.git.current_branch(&self.repo_root) {
+                Ok(head) if head != "HEAD" => head,
+                _ => base.clone(),
+            }
+        } else {
+            let head = services.git.current_branch(&self.repo_root)?;
+            if head == "HEAD" {
+                return Err(FlightDeckError::Refused(format!(
+                    "the project root is in detached HEAD state; check out '{base}' first"
+                )));
+            }
+            if head != base {
+                return Err(FlightDeckError::Refused(format!(
+                    "the project root is on '{head}', not the default base '{base}'; check out '{base}' first"
+                )));
+            }
+            head
+        };
 
         // The tab name falls back to the checked-out branch when the field was
         // left blank (the branch textbox is disabled in base mode).
@@ -3292,6 +3312,127 @@ mod tests {
 
         assert!(err.to_string().contains("fatal: not a git repository"));
         assert!(app.tabs.is_empty());
+    }
+
+    /// SPECS §32: an isolated run creates no worktree, mutates no git state and
+    /// throws its tab away at exit, so the base-tab branch guard has nothing
+    /// left to protect. Which branch happens to be checked out must not decide
+    /// whether `flightdeck -I` starts — the very case this exempts is a
+    /// managed worktree, whose `.flightdeck/config.toml` names `main` as the
+    /// base while its HEAD is the feature branch.
+    #[test]
+    fn isolated_base_tab_accepts_any_checked_out_branch() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.set_isolated(None);
+        let job = app
+            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].meta.runs_on_base);
+        // Labelled with the branch actually checked out, not the base.
+        assert_eq!(app.tabs[0].meta.branch, "spike");
+        assert_eq!(app.tabs[0].meta.name, "spike");
+        assert_eq!(app.tabs[0].meta.base_branch, "main");
+        assert_eq!(app.tabs[0].meta.worktree_path_relative, ".");
+        assert!(!job.needs_create);
+        assert!(!job.create_branch);
+
+        // Still not one git mutation.
+        materialize_worktree(&git, &FakeCommandRunner::new(), &job).unwrap();
+        assert!(git.added_worktrees().is_empty());
+        assert!(git.created_branches().is_empty());
+    }
+
+    /// A detached HEAD reads back as the literal "HEAD", which is no branch and
+    /// makes a poor tab label, so an isolated run falls back to the base name.
+    #[test]
+    fn isolated_base_tab_accepts_detached_head() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("HEAD");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.set_isolated(None);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].meta.runs_on_base);
+        assert_eq!(app.tabs[0].meta.branch, "main");
+    }
+
+    /// Nor may a `current_branch` that fails outright stop an isolated run: the
+    /// branch is a label here, not a decision, so the base name stands in.
+    #[test]
+    fn isolated_base_tab_survives_a_current_branch_error() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch_error("fatal: not a git repository");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.set_isolated(None);
+        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].meta.branch, "main");
+    }
+
+    /// An explicit name still wins over the checked-out branch in isolated mode.
+    #[test]
+    fn isolated_base_tab_keeps_an_explicit_name() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new()
+            .with_root(REPO)
+            .with_branches(["main"])
+            .with_current_branch("spike");
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+
+        let mut app = fresh_state(config);
+        app.set_isolated(None);
+        app.begin_new_agent_tab_ex("poke", None, true, &services(&git, &fs, &pty, &clock))
+            .unwrap();
+
+        assert_eq!(app.tabs[0].meta.name, "poke");
+        assert_eq!(app.tabs[0].meta.branch, "spike");
     }
 
     #[test]

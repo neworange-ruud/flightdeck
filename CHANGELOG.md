@@ -8,7 +8,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **The status bar is clickable.** Every label on it does exactly what the key
+  printed beside it does: the mode chip and the hint next to it switch modes,
+  `Ctrl-g: palette` opens the command palette, and `F1 / Alt-h: help` opens the
+  help screen. Both bars act — the compact one a small window draws keeps its
+  mode chip clickable even after the hints no longer fit. The labels that only
+  report state (`ISOLATED`, the input lock, the update notice) stay inert, so a
+  stray click cannot start an update, and a click on the `|` between two hints
+  does nothing rather than firing a neighbour.
+- **The command palette's entries are clickable.** Clicking one runs it, exactly
+  as confirming it with `Enter` does — an entry that asks before it acts still
+  asks. Clicking beside the box closes it; clicking a group header, the filter
+  row or the border leaves it open, because the click was plainly aimed at the
+  palette.
+- **The help, about and git status windows close on a click beside them.** They
+  already closed on any key; the pointer now has the same way out. A click on
+  the window itself changes nothing — it is what you are reading. The pairing
+  and browser-access surfaces keep their keyboard dismissal alone, since a
+  misplaced click there would cost a live code or binding.
 
 ### Improvements
 
@@ -37,6 +54,33 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   write failure into a second panic — a panicking panic hook is an abort
   (SIGABRT). Both the error path in `main` and the TUI panic hook now write
   best-effort and keep the terminal restoration they were there to do.
+- **The `✕` on a sidebar agent row now closes it when `mode_border` is on.**
+  With a live-pane border the sidebar reserves no seam column of its own — the
+  pane's frame already draws that line — so its `✕` sits in the content's last
+  column, but the hit test subtracted a seam column regardless. The close zone
+  landed one column to the left: clicking the glyph did nothing at all, while
+  the columns beside it worked. Drawing and hit-testing now ask one function
+  where the sidebar's content starts and ends.
+- **`flightdeck --isolated` (`-I`) no longer refuses to start on a branch other
+  than the default base.** An isolated run reused the normal base-tab flow,
+  which requires HEAD to be on the configured `default_base_branch` and refuses
+  a detached HEAD. That guard exists to stop the normal flow checking out a
+  branch underneath you or recording the wrong target, and an isolated run does
+  neither — it creates no worktree, mutates no git state, and discards its tab
+  at exit. It bit hardest in the one place `-I` is most useful: any managed
+  worktree under `.flightdeck/worktrees/`, where a previous normal run left a
+  `config.toml` naming `main` as the base while HEAD sits on the feature branch,
+  so `-I` died with `the project root is on '<branch>', not the default base
+  'main'`. An isolated run now takes whatever branch is checked out and labels
+  the tab with it; a detached HEAD or an unreadable HEAD falls back to the base
+  name instead of aborting. Normal runs keep the guard unchanged.
+- **A collapsed sidebar now actually widens the agent.** When the chrome
+  collapses — terminal mode in a window too small for the full layout — the
+  sidebar shrinks to a strip and FlightDeck draws a wider viewport, but the
+  agent's PTY was still sized from the full-chrome layout. The agent kept
+  wrapping at the old, narrow width, so long paragraphs stayed narrow and a band
+  of the pane was left empty. The PTY is now sized from the chrome that is
+  actually drawn, as the split-view path already did.
 
 ## [1.18.0] - 2026-09-01
 
