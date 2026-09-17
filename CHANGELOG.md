@@ -8,7 +8,24 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **The status bar is clickable.** Every label on it does exactly what the key
+  printed beside it does: the mode chip and the hint next to it switch modes,
+  `Ctrl-g: palette` opens the command palette, and `F1 / Alt-h: help` opens the
+  help screen. Both bars act — the compact one a small window draws keeps its
+  mode chip clickable even after the hints no longer fit. The labels that only
+  report state (`ISOLATED`, the input lock, the update notice) stay inert, so a
+  stray click cannot start an update, and a click on the `|` between two hints
+  does nothing rather than firing a neighbour.
+- **The command palette's entries are clickable.** Clicking one runs it, exactly
+  as confirming it with `Enter` does — an entry that asks before it acts still
+  asks. Clicking beside the box closes it; clicking a group header, the filter
+  row or the border leaves it open, because the click was plainly aimed at the
+  palette.
+- **The help, about and git status windows close on a click beside them.** They
+  already closed on any key; the pointer now has the same way out. A click on
+  the window itself changes nothing — it is what you are reading. The pairing
+  and browser-access surfaces keep their keyboard dismissal alone, since a
+  misplaced click there would cost a live code or binding.
 
 ### Improvements
 
@@ -16,6 +33,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **The `✕` on a sidebar agent row now closes it when `mode_border` is on.**
+  With a live-pane border the sidebar reserves no seam column of its own — the
+  pane's frame already draws that line — so its `✕` sits in the content's last
+  column, but the hit test subtracted a seam column regardless. The close zone
+  landed one column to the left: clicking the glyph did nothing at all, while
+  the columns beside it worked. Drawing and hit-testing now ask one function
+  where the sidebar's content starts and ends.
 - **`flightdeck --isolated` (`-I`) no longer refuses to start on a branch other
   than the default base.** An isolated run reused the normal base-tab flow,
   which requires HEAD to be on the configured `default_base_branch` and refuses

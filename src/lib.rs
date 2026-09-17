@@ -96,9 +96,10 @@ use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key_with_f2, KeyAction};
 use crate::tui::palette::{CommandPalette, PaletteAction};
 use crate::tui::render::{
-    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, project_tab_hit_test,
-    ChildTarget, Dialog, DialogAccel, DialogButton, DialogHit, DialogListItem, GitStatusCache,
-    HitTarget, ProjectHit, ProjectTabInfo, RemotePairing, UiOverlay,
+    child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, overlay_dismissed_by_click,
+    palette_hit, project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel,
+    DialogButton, DialogHit, DialogListItem, GitStatusCache, HitTarget, PaletteHit, ProjectHit,
+    ProjectTabInfo, RemotePairing, StatusAction, UiOverlay,
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
@@ -4456,6 +4457,24 @@ const MOUSE_WHEEL_UP: u8 = 64;
 /// xterm protocol button code for a wheel-down event.
 const MOUSE_WHEEL_DOWN: u8 = 65;
 
+/// Open the command palette with every entry gated by the live state.
+///
+/// Shared by `Ctrl-g` and by the status bar's palette label, so the two paths
+/// cannot end up showing different entries:
+/// - the Remote entries follow the pairing state — "Pair Phone" is hidden once
+///   a phone is paired, "Unpair Phone" while there is nothing to forget;
+/// - the web entries follow whether the web interface is running;
+/// - the project/new-tab entries are hidden in an isolated run: one session,
+///   one project (SPECS §32). The flows refuse independently; this is
+///   presentation only.
+fn open_palette(isolated: bool, ui: &mut Ui) {
+    let mut palette = CommandPalette::new();
+    palette.set_paired(ui.remote_paired);
+    palette.set_web_running(ui.web_running);
+    palette.set_isolated(isolated);
+    ui.palette = Some(palette);
+}
+
 /// Handle a mouse event (SPECS §20, §22 — keyboard-first, but mouse-assisted):
 /// a left click selects the clicked Agent Tab or child-terminal tab, the wheel
 /// scrolls the active terminal, and a left-button drag over the terminal
@@ -4480,6 +4499,44 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
                 _ => {}
             }
         }
+        return;
+    }
+
+    // The palette's entries are controls too (SPECS §22): a click runs one,
+    // exactly as confirming it with Enter would, and a click beside the box
+    // closes it. A click that lands on the palette but on nothing that acts —
+    // the border, the filter row, a group header — leaves it open, because the
+    // user plainly aimed at it.
+    //
+    // This sits above the modal guard on purpose: that guard exists to stop
+    // clicks reaching the app *underneath* a modal, and the palette is the
+    // modal here, not the app.
+    if let Some(palette) = ui.palette.as_ref() {
+        if me.kind == MouseEventKind::Down(MouseButton::Left) {
+            match palette_hit(area, palette, me.column, me.row) {
+                Some(PaletteHit::Entry(i)) => {
+                    let action = palette.filtered().get(i).map(|e| e.action.clone());
+                    ui.palette = None;
+                    if let Some(action) = action {
+                        if let Err(e) = run_palette_action(action, workspace, env, ui) {
+                            ui.message(format!("Error: {e}"));
+                        }
+                    }
+                }
+                Some(PaletteHit::Dismiss) => ui.palette = None,
+                None => {}
+            }
+        }
+        return;
+    }
+
+    // A read-only overlay — help, about, git status — closes on a click beside
+    // it. These already close on any key; the pointer gets the same way out.
+    // A click *on* the window changes nothing: it is what the user is reading.
+    if me.kind == MouseEventKind::Down(MouseButton::Left)
+        && overlay_dismissed_by_click(&ui.overlay, area, me.column, me.row)
+    {
+        ui.clear();
         return;
     }
 
@@ -4582,6 +4639,23 @@ fn handle_mouse_project(
                             ui.message(format!("Error: {e}"));
                         }
                     }
+                }
+                return;
+            }
+            // The status bar's labels are controls, not a legend: each one does
+            // exactly what the shortcut printed beside it does (SPECS §23). The
+            // badges that merely report state — ISOLATED, the input lock, the
+            // update notice — resolve to nothing, so a stray click there is
+            // harmless.
+            if let Some(action) =
+                status_bar_hit(area, state, ui.input_holder.as_deref(), me.column, me.row)
+            {
+                ui.drag = None;
+                match action {
+                    StatusAction::FocusApp => state.focus_app(),
+                    StatusAction::FocusTerminal => state.focus_terminal(),
+                    StatusAction::OpenPalette => open_palette(state.isolated, ui),
+                    StatusAction::OpenHelp => ui.overlay = UiOverlay::Help,
                 }
                 return;
             }
@@ -5340,17 +5414,7 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
             Ok(false)
         }
         KeyAction::OpenPalette => {
-            let mut palette = CommandPalette::new();
-            // Gate the Remote entries by the live pairing state: hide "Pair
-            // Phone" when already paired and "Unpair Phone" when there is no
-            // pairing to forget.
-            palette.set_paired(ui.remote_paired);
-            palette.set_web_running(ui.web_running);
-            // Hide the project/new-tab entries in an isolated run: one session,
-            // one project (SPECS §32). The flows refuse independently; this is
-            // presentation only.
-            palette.set_isolated(workspace.active_project().state.isolated);
-            ui.palette = Some(palette);
+            open_palette(workspace.active_project().state.isolated, ui);
             Ok(false)
         }
         KeyAction::OpenHelp => {
@@ -11731,6 +11795,343 @@ mod tests {
             assert!(
                 workspace.projects[1].state.tabs[0].session.active().is_some(),
                 "switching must resume the background project's primary (was hanging on '(terminal starting…)')",
+            );
+        }
+    }
+
+    /// A read-only overlay closes on a click beside it (SPECS §23) — the
+    /// pointer's version of the "any key dismisses" it already answers to.
+    mod overlay_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+
+        fn area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 40,
+            }
+        }
+
+        fn click_with_overlay(overlay: UiOverlay, column: u16, row: u16) -> Ui {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                overlay,
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area(), &mut ws, &e, &mut ui);
+            ui
+        }
+
+        #[test]
+        fn clicking_beside_the_help_window_closes_it() {
+            let ui = click_with_overlay(UiOverlay::Help, 0, 0);
+            assert!(
+                matches!(ui.overlay, UiOverlay::None),
+                "a click beside the help window closes it"
+            );
+        }
+
+        #[test]
+        fn clicking_inside_the_help_window_leaves_it_open() {
+            let ui = click_with_overlay(UiOverlay::Help, 60, 20);
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "the window is what the user is reading"
+            );
+        }
+
+        #[test]
+        fn a_click_that_closes_the_help_window_does_nothing_else() {
+            // The click that dismisses must not also act on whatever the
+            // overlay was covering.
+            let ui = click_with_overlay(UiOverlay::Help, 0, 0);
+            assert!(ui.palette.is_none(), "nothing else may open");
+            assert!(ui.drag.is_none(), "no selection may start underneath");
+        }
+    }
+
+    /// The palette's entries are controls too (SPECS §22): a click runs one, a
+    /// click beside the box closes it.
+    mod palette_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+        use crate::tui::render::PaletteHit;
+
+        fn roomy_area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 40,
+            }
+        }
+
+        /// The first cell that resolves to the entry labelled `label`. Found by
+        /// asking the hit test, so the test survives the list being respaced.
+        fn cell_of(area: Rect, palette: &CommandPalette, label: &str) -> (u16, u16) {
+            let index = palette
+                .filtered()
+                .iter()
+                .position(|e| e.label == label)
+                .unwrap_or_else(|| panic!("the palette has no {label:?} entry"));
+            for row in area.y..area.y + area.height {
+                for col in area.x..area.x + area.width {
+                    if crate::tui::render::palette_hit(area, palette, col, row)
+                        == Some(PaletteHit::Entry(index))
+                    {
+                        return (col, row);
+                    }
+                }
+            }
+            panic!("no cell resolves to {label:?}");
+        }
+
+        /// Open the palette, click `(column, row)`, and hand back the workspace
+        /// and ui for inspection.
+        fn click_with_palette_open(column: u16, row: u16) -> (Workspace, Ui) {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                palette: Some(CommandPalette::new()),
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, roomy_area(), &mut ws, &e, &mut ui);
+            (ws, ui)
+        }
+
+        #[test]
+        fn clicking_an_entry_runs_it_and_closes_the_palette() {
+            let palette = CommandPalette::new();
+            let (column, row) = cell_of(roomy_area(), &palette, "Show Help");
+            let (_ws, ui) = click_with_palette_open(column, row);
+            assert!(ui.palette.is_none(), "running an entry closes the palette");
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "clicking `Show Help` must do what confirming it with Enter does"
+            );
+        }
+
+        #[test]
+        fn clicking_beside_the_box_closes_the_palette_without_running_anything() {
+            let (_ws, ui) = click_with_palette_open(0, 0);
+            assert!(ui.palette.is_none(), "an outside click closes the palette");
+            assert!(
+                matches!(ui.overlay, UiOverlay::None),
+                "and runs nothing on the way out"
+            );
+        }
+
+        #[test]
+        fn clicking_a_group_header_leaves_the_palette_open() {
+            // A click the user plainly aimed at the box must not close it.
+            let palette = CommandPalette::new();
+            let area = roomy_area();
+            let (entry_col, entry_row) = cell_of(area, &palette, "Show Help");
+            // The rows above every entry include its group header; walk up to
+            // the first row in that column that resolves to nothing.
+            let header_row = (area.y..entry_row)
+                .rev()
+                .find(|&r| crate::tui::render::palette_hit(area, &palette, entry_col, r).is_none())
+                .expect("a header or spacer sits above the entry");
+            let (_ws, ui) = click_with_palette_open(entry_col, header_row);
+            assert!(ui.palette.is_some(), "the palette stays open");
+            assert!(matches!(ui.overlay, UiOverlay::None), "and nothing ran");
+        }
+
+        #[test]
+        fn a_click_on_the_palette_never_reaches_the_app_underneath() {
+            // The overlay covers the terminal viewport and part of the sidebar.
+            // Without the palette taking the click first, this one would focus
+            // the app or start a selection in the pane behind it.
+            let palette = CommandPalette::new();
+            let area = roomy_area();
+            let (entry_col, entry_row) = cell_of(area, &palette, "Show Help");
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_terminal();
+            let mut ui = Ui {
+                palette: Some(palette),
+                ..Ui::default()
+            };
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            // A cell on the overlay's border: inside the box, on nothing.
+            let border = (entry_col, entry_row);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: border.0,
+                row: border.1,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area, &mut ws, &e, &mut ui);
+            assert!(ui.drag.is_none(), "no text selection may start under it");
+        }
+    }
+
+    /// The status bar's labels are controls (SPECS §23): clicking one does what
+    /// the shortcut printed beside it does.
+    mod status_bar_clicks {
+        use super::isolated_refusals::{env, one_project_workspace};
+        use super::*;
+
+        /// The `(column, row)` at which the status bar drawn for `area`
+        /// resolves to `action`. Found by asking the hit test, so these tests
+        /// keep working when a label moves or is renamed.
+        fn status_bar_target(
+            area: Rect,
+            ws: &Workspace,
+            action: crate::tui::render::StatusAction,
+        ) -> (u16, u16) {
+            let state = &ws.projects[ws.active].state;
+            let ml = crate::tui::layout::compute(
+                area,
+                crate::tui::layout::chrome_for(area, state.mode()),
+                crate::tui::mode_style::border_enabled(&state.config.ui),
+                state.config.ui.agent_tab_side(),
+            );
+            let row = ml.status_bar.y;
+            let column = (0..area.width)
+                .find(|&col| {
+                    crate::tui::render::status_bar_hit(area, state, None, col, row) == Some(action)
+                })
+                .unwrap_or_else(|| panic!("no column of the status bar means {action:?}"));
+            (column, row)
+        }
+
+        /// A wide, tall area so the full status bar is drawn rather than the
+        /// compact one.
+        fn roomy_area() -> Rect {
+            Rect {
+                x: 0,
+                y: 0,
+                width: 140,
+                height: 40,
+            }
+        }
+
+        fn status_click(ws: &mut Workspace, ui: &mut Ui, action: crate::tui::render::StatusAction) {
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &command);
+            let area = roomy_area();
+            let (column, row) = status_bar_target(area, ws, action);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area, ws, &e, ui);
+        }
+
+        #[test]
+        fn clicking_the_palette_hint_opens_the_command_palette() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::OpenPalette,
+            );
+            assert!(
+                ui.palette.is_some(),
+                "the bar says Ctrl-g opens the palette; clicking it must too"
+            );
+        }
+
+        #[test]
+        fn clicking_the_help_hint_opens_help() {
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            status_click(&mut ws, &mut ui, crate::tui::render::StatusAction::OpenHelp);
+            assert!(
+                matches!(ui.overlay, UiOverlay::Help),
+                "clicking the help hint must open the help screen"
+            );
+        }
+
+        #[test]
+        fn clicking_the_app_mode_hint_leaves_terminal_focus() {
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_terminal();
+            let mut ui = Ui::default();
+            status_click(&mut ws, &mut ui, crate::tui::render::StatusAction::FocusApp);
+            assert_eq!(
+                ws.projects[0].state.mode(),
+                crate::app::modes::InputMode::App,
+                "clicking `app mode` must do what the key beside it does"
+            );
+        }
+
+        #[test]
+        fn clicking_the_focus_terminal_hint_returns_focus_to_the_terminal() {
+            let mut ws = one_project_workspace(false);
+            ws.projects[0].state.focus_app();
+            let mut ui = Ui::default();
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::FocusTerminal,
+            );
+            assert_eq!(
+                ws.projects[0].state.mode(),
+                crate::app::modes::InputMode::Terminal
+            );
+        }
+
+        #[test]
+        fn the_palette_opened_by_a_click_gates_remote_entries_like_the_keyboard() {
+            // The keyboard path calls `set_paired` before showing the palette,
+            // so "Pair Phone" is hidden once a phone is paired. A second,
+            // hand-rolled palette in the mouse path would drift from that.
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui {
+                remote_paired: true,
+                ..Ui::default()
+            };
+            status_click(
+                &mut ws,
+                &mut ui,
+                crate::tui::render::StatusAction::OpenPalette,
+            );
+            let palette = ui.palette.as_ref().expect("palette opened");
+            assert!(
+                !palette
+                    .filtered()
+                    .iter()
+                    .any(|e| e.label.contains("Pair Phone")),
+                "a paired phone must hide Pair Phone, however the palette was opened"
             );
         }
     }

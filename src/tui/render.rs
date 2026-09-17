@@ -379,8 +379,16 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // sidebar chrome so the click still focuses the app — even with no
         // agents or just one (SPECS §23).
         return Some(
-            sidebar_hit(ml.sidebar, state.tabs.len(), chrome, side, col, row)
-                .unwrap_or(HitTarget::Sidebar),
+            sidebar_hit(
+                ml.sidebar,
+                state.tabs.len(),
+                chrome,
+                side,
+                crate::tui::mode_style::border_enabled(&state.config.ui),
+                col,
+                row,
+            )
+            .unwrap_or(HitTarget::Sidebar),
         );
     }
     if state.split_view {
@@ -422,6 +430,32 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
     None
 }
 
+/// The box the git status panel draws in `area`.
+fn git_status_overlay_rect(area: Rect) -> Rect {
+    layout::centered_overlay(area, 70, 18)
+}
+
+/// Whether a click at `(col, row)` closes the overlay drawn in `area`.
+///
+/// True only for the read-only overlays — help, about, git status — and only
+/// for a click that lands beside the box they draw: the pointer's version of
+/// the "any key dismisses" they already answer to. A click on the window is a
+/// click on what the user is reading, so it keeps it open.
+///
+/// The live surfaces are deliberately absent. The pairing overlay shows a code
+/// that expires and the browser access overlay holds a live binding; losing
+/// either to a misplaced click costs real work, so they keep their keyboard
+/// dismissal alone.
+pub fn overlay_dismissed_by_click(overlay: &UiOverlay, area: Rect, col: u16, row: u16) -> bool {
+    let rect = match overlay {
+        UiOverlay::Help => help_overlay_rect(area),
+        UiOverlay::About => about_overlay_rect(area),
+        UiOverlay::GitStatus { .. } => git_status_overlay_rect(area),
+        _ => return false,
+    };
+    !rect_contains(rect, col, row)
+}
+
 /// Whether `(col, row)` is inside `r`.
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x
@@ -439,10 +473,11 @@ fn sidebar_hit(
     tab_count: usize,
     chrome: layout::Chrome,
     side: crate::contracts::AgentTabPosition,
+    seam_drawn_by_pane_border: bool,
     col: u16,
     row: u16,
 ) -> Option<HitTarget> {
-    let inner = Block::default().borders(sidebar_seam(side)).inner(area);
+    let inner = sidebar_block(seam_drawn_by_pane_border, side).inner(area);
     if col < inner.x || col >= inner.x.saturating_add(inner.width) {
         return None;
     }
@@ -929,16 +964,8 @@ pub fn draw_sidebar(
         return;
     }
 
-    // When the live-pane border feature is on, the focused pane's frame
-    // already supplies the separating vertical line, so the sidebar's own
-    // seam divider is suppressed here — otherwise two adjacent vertical
-    // lines would be drawn (SPECS §23).
     let side = state.config.ui.agent_tab_side();
-    let block = if mode_style::border_enabled(&state.config.ui) {
-        Block::default()
-    } else {
-        Block::default().borders(sidebar_seam(side))
-    };
+    let block = sidebar_block(mode_style::border_enabled(&state.config.ui), side);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1071,7 +1098,10 @@ pub fn draw_sidebar(
 /// Draw the collapsed agent strip: one indicator glyph per agent, no heading
 /// and no close control, for windows too small to afford the full sidebar.
 fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
-    let block = Block::default().borders(sidebar_seam(state.config.ui.agent_tab_side()));
+    let block = sidebar_block(
+        mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1174,6 +1204,28 @@ fn sidebar_name_line(
                 .chain([Span::raw(" ".repeat(pad.saturating_sub(1)))])
                 .collect::<Vec<_>>(),
         ),
+    }
+}
+
+/// The block the sidebar draws its content inside.
+///
+/// When the live-pane border feature is on, the focused pane's frame already
+/// supplies the vertical line between the panes, so the sidebar reserves no
+/// seam column of its own — otherwise two adjacent lines would be drawn (SPECS
+/// §23) — and its content then fills the rect right up to the `✕` in the last
+/// column.
+///
+/// Drawing and hit-testing both ask this one function. When they disagreed, the
+/// `✕` sat one column outside the area the hit test measured, and clicking the
+/// glyph did nothing at all while the three columns to its left closed the tab.
+fn sidebar_block(
+    seam_drawn_by_pane_border: bool,
+    side: crate::contracts::AgentTabPosition,
+) -> Block<'static> {
+    if seam_drawn_by_pane_border {
+        Block::default()
+    } else {
+        Block::default().borders(sidebar_seam(side))
     }
 }
 
@@ -1834,6 +1886,117 @@ pub fn draw_status_bar(
     frame.render_widget(para, area);
 }
 
+/// What a click on a status-bar label does. Every variant is exactly what the
+/// label's own shortcut does, so the bar never grows an action the keyboard
+/// cannot reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAction {
+    /// Leave terminal focus for the app chrome (Terminal mode's mode chip and
+    /// its leave-focus hint).
+    FocusApp,
+    /// Give focus back to the terminal (App mode's mode chip and `Enter` hint).
+    FocusTerminal,
+    /// Open the command palette.
+    OpenPalette,
+    /// Open the help screen.
+    OpenHelp,
+}
+
+/// One run of status-bar spans that a click resolves as a unit. Separators and
+/// read-out badges carry no action, so a click between two hints — or on a
+/// badge that merely reports state — fires nothing rather than a neighbour.
+///
+/// Both status bars are built out of these, and [`status_bar_hit`] measures the
+/// very same list the renderer flattens, so a label cannot move out from under
+/// the pointer without taking its clickable region with it.
+pub struct StatusSegment {
+    spans: Vec<Span<'static>>,
+    action: Option<StatusAction>,
+}
+
+/// A segment nothing happens on: separators, badges, branch context.
+fn inert(spans: Vec<Span<'static>>) -> StatusSegment {
+    StatusSegment {
+        spans,
+        action: None,
+    }
+}
+
+/// A segment a click acts on — the whole phrase, key and label alike.
+fn clickable(spans: Vec<Span<'static>>, action: StatusAction) -> StatusSegment {
+    StatusSegment {
+        spans,
+        action: Some(action),
+    }
+}
+
+/// The ` | ` between two hints. Its own segment, so it belongs to neither.
+fn status_sep() -> StatusSegment {
+    inert(vec![Span::raw(" | ")])
+}
+
+/// Flatten segments into the [`Line`] the bar draws.
+fn status_line(segments: Vec<StatusSegment>) -> Line<'static> {
+    Line::from(
+        segments
+            .into_iter()
+            .flat_map(|s| s.spans)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The action of the segment covering `col`, laying `segments` out from `x`
+/// exactly as the Paragraph draws them.
+fn segment_at(x: u16, segments: &[StatusSegment], col: u16) -> Option<StatusAction> {
+    let mut cursor = x;
+    for seg in segments {
+        let width: u16 = seg.spans.iter().map(|s| s.width() as u16).sum();
+        if col >= cursor && col < cursor.saturating_add(width) {
+            return seg.action;
+        }
+        cursor = cursor.saturating_add(width);
+    }
+    None
+}
+
+/// Resolve a click at `(col, row)` against whichever status bar `area` draws
+/// (SPECS §23). Returns the action its label advertises, or `None` for a click
+/// on a separator, a read-out badge, or anywhere outside the bar.
+///
+/// `input_holder` is the same value passed to [`draw_status_bar`]: the compact
+/// bar draws that badge *before* its hints, so it shifts them, and a hit test
+/// built from different inputs would land one badge off.
+pub fn status_bar_hit(
+    area: Rect,
+    state: &AppState,
+    input_holder: Option<&str>,
+    col: u16,
+    row: u16,
+) -> Option<StatusAction> {
+    let chrome = layout::chrome_for(area, state.mode());
+    let ml = layout::compute(
+        area,
+        chrome,
+        crate::tui::mode_style::border_enabled(&state.config.ui),
+        state.config.ui.agent_tab_side(),
+    );
+    if !rect_contains(ml.status_bar, col, row) {
+        return None;
+    }
+    let segments = if chrome == layout::Chrome::Collapsed {
+        compact_status_bar_segments(state, input_holder, ml.status_bar.width)
+    } else {
+        status_bar_segments(
+            state.mode(),
+            &state.config.ui,
+            state.update_available.as_deref(),
+            state.isolated,
+            input_holder,
+        )
+    };
+    segment_at(ml.status_bar.x, &segments, col)
+}
+
 /// Compact terminal-mode status used when the git info row is reclaimed. Safety
 /// and mode indicators come first, followed by bounded base context; optional
 /// shortcut hints are the first content allowed to clip.
@@ -1842,6 +2005,17 @@ fn compact_status_bar_text(
     input_holder: Option<&str>,
     width: u16,
 ) -> Line<'static> {
+    status_line(compact_status_bar_segments(state, input_holder, width))
+}
+
+/// The compact bar as clickable segments. The mode chip acts at every width;
+/// the shortcut hints exist only from 100 columns on, so below that there is
+/// nothing to click but the chip.
+fn compact_status_bar_segments(
+    state: &AppState,
+    input_holder: Option<&str>,
+    width: u16,
+) -> Vec<StatusSegment> {
     let branch_limit = match width {
         0..=49 => 4,
         50..=79 => 8,
@@ -1852,84 +2026,108 @@ fn compact_status_bar_text(
         .as_deref()
         .unwrap_or(&state.base_branch);
     let configured_default = shorten_branch(configured_default, branch_limit);
-    let mut spans = Vec::new();
+    let mut segs: Vec<StatusSegment> = Vec::new();
     if state.isolated {
-        spans.push(Span::styled(
+        segs.push(inert(vec![Span::styled(
             " ISOLATED",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(info_sep());
+        )]));
+        segs.push(inert(vec![info_sep()]));
     }
-    spans.push(Span::styled(
-        if width < 80 { "TERM" } else { "MODE: TERMINAL" },
-        Style::default()
-            .fg(Color::Black)
-            .bg(crate::tui::mode_style::chip_color(
-                &state.config.ui,
-                InputMode::Terminal,
-            ))
-            .add_modifier(Modifier::BOLD),
-    ));
-    if let Some(holder) = input_holder {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("INPUT: {holder}"),
+    segs.push(clickable(
+        vec![Span::styled(
+            if width < 80 { "TERM" } else { "MODE: TERMINAL" },
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Magenta)
+                .bg(crate::tui::mode_style::chip_color(
+                    &state.config.ui,
+                    InputMode::Terminal,
+                ))
                 .add_modifier(Modifier::BOLD),
-        ));
+        )],
+        StatusAction::FocusApp,
+    ));
+    if let Some(holder) = input_holder {
+        segs.push(inert(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("INPUT: {holder}"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
     if let Some(version) = &state.update_available {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            if width < 80 {
-                "UPDATE".to_string()
-            } else {
-                format!("v{version} update")
-            },
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        ));
+        segs.push(inert(vec![
+            Span::raw(" "),
+            Span::styled(
+                if width < 80 {
+                    "UPDATE".to_string()
+                } else {
+                    format!("v{version} update")
+                },
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+        ]));
     }
-    spans.push(info_sep());
-    spans.push(Span::styled(
-        if state.invalid_base_branch.is_some() {
-            format!("default: !{configured_default}")
-        } else {
-            format!("default: {configured_default}")
-        },
-        if state.invalid_base_branch.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    ));
+    segs.push(inert(vec![
+        info_sep(),
+        Span::styled(
+            if state.invalid_base_branch.is_some() {
+                format!("default: !{configured_default}")
+            } else {
+                format!("default: {configured_default}")
+            },
+            if state.invalid_base_branch.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ),
+    ]));
     if width >= 50 {
         if let Some(tab) = state.selected() {
-            spans.push(info_sep());
-            spans.push(Span::styled(
-                format!(
-                    "target: {}",
-                    shorten_branch(&tab.meta.base_branch, branch_limit)
+            segs.push(inert(vec![
+                info_sep(),
+                Span::styled(
+                    format!(
+                        "target: {}",
+                        shorten_branch(&tab.meta.base_branch, branch_limit)
+                    ),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Style::default().fg(Color::DarkGray),
-            ));
+            ]));
         }
     }
     if width >= 100 {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            crate::tui::platform::leave_focus_key(state.config.ui.use_f2_to_leave_terminal_focus),
-            Style::default().fg(Color::Yellow),
+        segs.push(status_sep());
+        segs.push(clickable(
+            vec![
+                Span::styled(
+                    crate::tui::platform::leave_focus_key(
+                        state.config.ui.use_f2_to_leave_terminal_focus,
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(": app"),
+            ],
+            StatusAction::FocusApp,
         ));
-        spans.push(Span::raw(": app | "));
-        spans.push(Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)));
-        spans.push(Span::raw(": palette"));
+        segs.push(status_sep());
+        segs.push(clickable(
+            vec![
+                Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
+                Span::raw(": palette"),
+            ],
+            StatusAction::OpenPalette,
+        ));
     }
-    Line::from(spans)
+    segs
 }
 
 /// Build the status bar [`Line`] for the given mode (SPECS §23), with an
@@ -1943,47 +2141,81 @@ pub fn status_bar_text(
     isolated: bool,
     input_holder: Option<&str>,
 ) -> Line<'static> {
+    status_line(status_bar_segments(
+        mode,
+        ui,
+        update_available,
+        isolated,
+        input_holder,
+    ))
+}
+
+/// The full bar as clickable segments (SPECS §23).
+///
+/// The mode chip resolves to the same action as the hint beside it: in Terminal
+/// mode both say "leave terminal focus", in App mode both say "go back to the
+/// terminal". So the chip needs no action of its own — it is the shortest way
+/// to say what the hint spells out.
+fn status_bar_segments(
+    mode: InputMode,
+    ui: &crate::contracts::UiConfig,
+    update_available: Option<&str>,
+    isolated: bool,
+    input_holder: Option<&str>,
+) -> Vec<StatusSegment> {
     let chip_bg = crate::tui::mode_style::chip_color(ui, mode);
+    let chip_style = Style::default()
+        .fg(Color::Black)
+        .bg(chip_bg)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(Color::Yellow);
     let use_f2 = ui.use_f2_to_leave_terminal_focus;
-    let mut spans = match mode {
-        InputMode::Terminal => vec![
-            Span::raw(" "),
-            Span::styled(
-                "MODE: TERMINAL",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(chip_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | "),
-            Span::styled(
-                crate::tui::platform::leave_focus_key(use_f2),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(": app mode | "),
-            Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": palette | "),
-            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
-            Span::raw(": help"),
-        ],
-        InputMode::App => vec![
-            Span::raw(" "),
-            Span::styled(
-                "MODE: APP",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(chip_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(": focus terminal | "),
-            Span::styled("Ctrl-g", Style::default().fg(Color::Yellow)),
-            Span::raw(": palette | "),
-            Span::styled(HELP_KEYS, Style::default().fg(Color::Yellow)),
-            Span::raw(": help"),
-        ],
+    // Leaving the mode you are in: what the chip and the first hint both mean.
+    let leave = match mode {
+        InputMode::Terminal => StatusAction::FocusApp,
+        InputMode::App => StatusAction::FocusTerminal,
     };
+    let mut segs = vec![inert(vec![Span::raw(" ")])];
+    match mode {
+        InputMode::Terminal => {
+            segs.push(clickable(
+                vec![Span::styled("MODE: TERMINAL", chip_style)],
+                leave,
+            ));
+            segs.push(status_sep());
+            segs.push(clickable(
+                vec![
+                    Span::styled(crate::tui::platform::leave_focus_key(use_f2), key_style),
+                    Span::raw(": app mode"),
+                ],
+                leave,
+            ));
+        }
+        InputMode::App => {
+            segs.push(clickable(
+                vec![Span::styled("MODE: APP", chip_style)],
+                leave,
+            ));
+            segs.push(status_sep());
+            segs.push(clickable(
+                vec![
+                    Span::styled("Enter", key_style),
+                    Span::raw(": focus terminal"),
+                ],
+                leave,
+            ));
+        }
+    }
+    segs.push(status_sep());
+    segs.push(clickable(
+        vec![Span::styled("Ctrl-g", key_style), Span::raw(": palette")],
+        StatusAction::OpenPalette,
+    ));
+    segs.push(status_sep());
+    segs.push(clickable(
+        vec![Span::styled(HELP_KEYS, key_style), Span::raw(": help")],
+        StatusAction::OpenHelp,
+    ));
 
     // The input lock (`specs/WEB_INTERFACE.md` D14 as revised). Drawn only when
     // a browser is seated as a writer and somebody holds the turn, because with
@@ -1995,45 +2227,52 @@ pub fn status_bar_text(
     // rather than interleaving it, and §5.1 does not allow that to happen
     // silently. `Take Input Lock` in the palette is the way past it.
     if let Some(holder) = input_holder {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("INPUT: {holder}"),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("INPUT: {holder}"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     // Isolated run (SPECS §32): nothing persists and several actions are gone,
     // so say so permanently rather than once at launch.
     if isolated {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            "ISOLATED",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                "ISOLATED",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     // Update notice (SPECS §30): a non-intrusive hint, never a modal. It points
     // at `flightdeck update`, which itself routes Homebrew installs to
     // `brew update && brew upgrade`, so a single message is correct for every
-    // install method.
+    // install method. Deliberately inert: a stray click must never start an
+    // update.
     if let Some(version) = update_available {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("● v{version} available — run `flightdeck update`"),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        segs.push(inert(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("● v{version} available — run `flightdeck update`"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
-    Line::from(spans)
+    segs
 }
 
 // ---------------------------------------------------------------------------
@@ -2051,7 +2290,7 @@ pub fn draw_git_status_overlay(
     pr_url: Option<&str>,
     area: Rect,
 ) {
-    let overlay_area = layout::centered_overlay(area, 70, 18);
+    let overlay_area = git_status_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -2155,25 +2394,147 @@ pub fn draw_git_status_overlay(
 // Command palette overlay (SPECS §22)
 // ---------------------------------------------------------------------------
 
+/// Where the palette overlay's parts land for a given `area` (SPECS §22).
+///
+/// Shared by [`draw_palette_overlay`] and [`palette_hit`], so a click can never
+/// land on a row the drawing put somewhere else.
+struct PaletteLayout {
+    /// The whole bordered box.
+    overlay: Rect,
+    /// The filter input row, just inside the top border.
+    filter: Rect,
+    /// The whole entry-list region below the filter row.
+    list: Rect,
+    /// The left half of the entry list.
+    left: Rect,
+    /// The right half of the entry list.
+    right: Rect,
+}
+
+fn palette_layout(area: Rect) -> PaletteLayout {
+    let overlay = layout::centered_overlay(area, 90, 32);
+    let inner = Block::default().borders(Borders::ALL).inner(overlay);
+    let [filter, list] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let [left, right] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(50),
+        ratatui::layout::Constraint::Percentage(50),
+    ])
+    .areas(list);
+    PaletteLayout {
+        overlay,
+        filter,
+        list,
+        left,
+        right,
+    }
+}
+
+/// One drawn row of a palette column: the line, plus the filtered-entry index
+/// when the row *is* an entry. Group headers and the blank rows between groups
+/// carry none, so a click on them does nothing.
+struct PaletteRow {
+    line: Line<'static>,
+    entry: Option<usize>,
+}
+
+/// The rows one column draws, in order. `base` is the flat index of the first
+/// entry, so selection highlighting and hit-testing stay aligned with
+/// `selected_index` across both columns.
+fn palette_column_rows(entries: &[&PaletteEntry], base: usize, selected: usize) -> Vec<PaletteRow> {
+    let mut last_group: Option<&str> = None;
+    let mut rows: Vec<PaletteRow> = Vec::new();
+    for (offset, entry) in entries.iter().enumerate() {
+        let i = base + offset;
+        if last_group != Some(entry.group) {
+            // Blank line above each group header (except the first) for breathing room.
+            if last_group.is_some() {
+                rows.push(PaletteRow {
+                    line: Line::raw(""),
+                    entry: None,
+                });
+            }
+            last_group = Some(entry.group);
+            rows.push(PaletteRow {
+                line: Line::from(Span::styled(
+                    format!("  {}", entry.group),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                entry: None,
+            });
+        }
+
+        rows.push(PaletteRow {
+            line: Line::from(Span::styled(
+                format!("  {} ", entry.label),
+                if i == selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )),
+            entry: Some(i),
+        });
+    }
+    rows
+}
+
+/// What a click inside the palette overlay resolved to (SPECS §22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteHit {
+    /// The entry at this index into the *filtered* list — run it.
+    Entry(usize),
+    /// A click outside the box: close the palette.
+    Dismiss,
+}
+
+/// Resolve a click at `(col, row)` against the palette overlay drawn for `area`.
+///
+/// Returns `None` for a click that lands on the palette but on nothing that
+/// acts — the border, the filter row, a group header, a blank row — so the box
+/// stays open under a click the user clearly aimed at it.
+pub fn palette_hit(area: Rect, palette: &CommandPalette, col: u16, row: u16) -> Option<PaletteHit> {
+    let pl = palette_layout(area);
+    if !rect_contains(pl.overlay, col, row) {
+        return Some(PaletteHit::Dismiss);
+    }
+    let filtered = palette.filtered();
+    if filtered.is_empty() {
+        return None;
+    }
+    let split = filtered.len().div_ceil(2);
+    let (entries, base, column) = if rect_contains(pl.left, col, row) {
+        (&filtered[..split], 0, pl.left)
+    } else if rect_contains(pl.right, col, row) {
+        (&filtered[split..], split, pl.right)
+    } else {
+        return None;
+    };
+    let rows = palette_column_rows(entries, base, palette.selected_index());
+    let index = row.checked_sub(column.y)? as usize;
+    rows.get(index).and_then(|r| r.entry).map(PaletteHit::Entry)
+}
+
 /// Draw the command palette as a centered overlay (SPECS §22).
 pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: Rect) {
-    let overlay_area = layout::centered_overlay(area, 90, 32);
-    frame.render_widget(Clear, overlay_area);
+    // The same geometry the hit test measures, so a click lands on the row it
+    // is pointing at.
+    let pl = palette_layout(area);
+    frame.render_widget(Clear, pl.overlay);
 
     let block = Block::default()
         .title(" Command Palette  (Esc to close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-
-    let inner = block.inner(overlay_area);
-    frame.render_widget(block, overlay_area);
-
-    // Split inner: one row for filter input, rest for filtered list.
-    let [filter_area, list_area] = ratatui::layout::Layout::vertical([
-        ratatui::layout::Constraint::Length(1),
-        ratatui::layout::Constraint::Fill(1),
-    ])
-    .areas(inner);
+    frame.render_widget(block, pl.overlay);
 
     // Filter input line.
     let filter_line = Line::from(vec![
@@ -2181,7 +2542,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
         Span::raw(palette.filter().to_string()),
         Span::styled("_", Style::default().fg(Color::Cyan)), // cursor
     ]);
-    frame.render_widget(Paragraph::new(filter_line), filter_area);
+    frame.render_widget(Paragraph::new(filter_line), pl.filter);
 
     // Filtered list.
     let filtered = palette.filtered();
@@ -2190,7 +2551,7 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     if filtered.is_empty() {
         frame.render_widget(
             Paragraph::new("  (no matches)").style(Style::default().fg(Color::DarkGray)),
-            list_area,
+            pl.list,
         );
         return;
     }
@@ -2199,57 +2560,20 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     // first half; the right column the remainder. Each column renders its own
     // group headers so groups read correctly even when split at the boundary.
     let split = filtered.len().div_ceil(2);
-    let [left_area, right_area] = ratatui::layout::Layout::horizontal([
-        ratatui::layout::Constraint::Percentage(50),
-        ratatui::layout::Constraint::Percentage(50),
-    ])
-    .areas(list_area);
 
-    // Build the `ListItem`s for one column from a slice of the filtered
-    // entries. `base` is the flat index of the first entry so selection
-    // highlighting stays aligned with `selected_index`.
-    let build_column = |entries: &[&PaletteEntry], base: usize| -> Vec<ListItem<'static>> {
-        let mut last_group: Option<&str> = None;
-        let mut items: Vec<ListItem> = Vec::new();
-        for (offset, entry) in entries.iter().enumerate() {
-            let i = base + offset;
-            if last_group != Some(entry.group) {
-                // Blank line above each group header (except the first) for breathing room.
-                if last_group.is_some() {
-                    items.push(ListItem::new(Line::raw("")));
-                }
-                last_group = Some(entry.group);
-                items.push(ListItem::new(Line::from(Span::styled(
-                    format!("  {}", entry.group),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))));
-            }
-
-            items.push(if i == selected_idx {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )))
-            } else {
-                ListItem::new(Line::from(Span::styled(
-                    format!("  {} ", entry.label),
-                    Style::default().fg(Color::White),
-                )))
-            });
-        }
-        items
+    // One builder feeds the drawing and the hit test, so a click lands on the
+    // row the user is looking at.
+    let column = |entries: &[&PaletteEntry], base: usize| -> List<'static> {
+        List::new(
+            palette_column_rows(entries, base, selected_idx)
+                .into_iter()
+                .map(|r| ListItem::new(r.line))
+                .collect::<Vec<_>>(),
+        )
     };
 
-    frame.render_widget(List::new(build_column(&filtered[..split], 0)), left_area);
-    frame.render_widget(
-        List::new(build_column(&filtered[split..], split)),
-        right_area,
-    );
+    frame.render_widget(column(&filtered[..split], 0), pl.left);
+    frame.render_widget(column(&filtered[split..], split), pl.right);
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,8 +2587,13 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
 /// (`specs/WEB_INTERFACE.md` §6.5 R16). This function is the ratatui half of
 /// that one source — it decides indentation, colour and where the hints sit,
 /// and nothing else.
+/// The box the help overlay draws in `area`.
+fn help_overlay_rect(area: Rect) -> Rect {
+    layout::centered_overlay(area, 64, 40)
+}
+
 pub fn draw_help_overlay(frame: &mut Frame, area: Rect, use_f2: bool, isolated: bool) {
-    let overlay_area = layout::centered_overlay(area, 64, 40);
+    let overlay_area = help_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let doc = crate::tui::help::help_doc(use_f2, isolated);
@@ -3302,7 +3631,9 @@ pub fn draw_config_overlay(frame: &mut Frame, manager: &ConfigManager, area: Rec
 }
 
 /// Draw the About dialog: version, one-line description, and authorship credits.
-pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
+/// The lines the About overlay draws. Its box is sized from them, so the two
+/// cannot disagree about how tall the window is.
+fn about_lines() -> Vec<Line<'static>> {
     let accent = Color::Cyan;
     let doc = crate::tui::help::about_doc();
     let mut lines: Vec<Line> = vec![
@@ -3344,8 +3675,19 @@ pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )));
 
-    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let overlay_area = layout::centered_overlay(area, 62, content_height.saturating_add(2));
+    lines
+}
+
+/// The box the About overlay draws in `area`.
+fn about_overlay_rect(area: Rect) -> Rect {
+    let content_height = u16::try_from(about_lines().len()).unwrap_or(u16::MAX);
+    layout::centered_overlay(area, 62, content_height.saturating_add(2))
+}
+
+pub fn draw_about_overlay(frame: &mut Frame, area: Rect) {
+    let accent = Color::Cyan;
+    let lines = about_lines();
+    let overlay_area = about_overlay_rect(area);
     frame.render_widget(Clear, overlay_area);
 
     let block = Block::default()
@@ -3776,6 +4118,55 @@ mod tests {
         assert_eq!(hit_test(area, &state, 2, 6), Some(HitTarget::Sidebar));
     }
 
+    #[test]
+    fn the_sidebar_close_control_answers_where_it_is_drawn() {
+        // Regression: with `mode_border` on, the sidebar reserves no seam
+        // column of its own — the live-pane frame already draws that line — so
+        // the `✕` sits in the content's last column. A hit test that reserved
+        // the seam regardless put the close zone one column to its left, and
+        // the glyph itself answered `Sidebar`: a click on it did nothing at all.
+        for mode_border in ["off", "dim"] {
+            for side in [
+                crate::contracts::AgentTabPosition::Left,
+                crate::contracts::AgentTabPosition::Right,
+            ] {
+                let mut state = state_with_tabs(1);
+                state.config.ui.mode_border = mode_border.to_string();
+                state.config.ui.agent_tab_position = match side {
+                    crate::contracts::AgentTabPosition::Left => "left".to_string(),
+                    crate::contracts::AgentTabPosition::Right => "right".to_string(),
+                };
+                let area = Rect::new(0, 0, 130, 34);
+                let mut term = test_terminal(130, 34);
+                term.draw(|frame| {
+                    draw(frame, &state, &empty_cache(), &UiOverlay::None, None, 0);
+                })
+                .unwrap();
+                let buf = term.backend().buffer().clone();
+                // Only the sidebar's own ✕ — the terminal tab bar draws one too.
+                let ml = layout::compute(
+                    area,
+                    layout::Chrome::Full,
+                    crate::tui::mode_style::border_enabled(&state.config.ui),
+                    side,
+                );
+                let panel = ml.sidebar_frame.unwrap_or(ml.sidebar);
+                let (col, row) = (panel.y..panel.y + panel.height)
+                    .find_map(|row| {
+                        (panel.x..panel.x + panel.width)
+                            .find(|&col| buf[(col, row)].symbol() == CLOSE_GLYPH)
+                            .map(|col| (col, row))
+                    })
+                    .unwrap_or_else(|| panic!("no ✕ drawn ({mode_border}, {side:?})"));
+                assert_eq!(
+                    hit_test(area, &state, col, row),
+                    Some(HitTarget::CloseAgentTab(0)),
+                    "the ✕ at ({col}, {row}) must close ({mode_border}, {side:?})"
+                );
+            }
+        }
+    }
+
     // --- Collapsed chrome (small windows in terminal mode) -----------------
 
     /// Read the glyph in the first column of `row` from a rendered buffer.
@@ -3837,6 +4228,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 0
             ),
@@ -3848,6 +4240,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 2
             ),
@@ -3860,6 +4253,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 0,
                 3
             ),
@@ -3872,6 +4266,7 @@ mod tests {
                 3,
                 layout::Chrome::Collapsed,
                 crate::contracts::AgentTabPosition::Left,
+                false,
                 1,
                 1
             ),
@@ -4819,6 +5214,644 @@ mod tests {
             .find(|s| s.content.contains("MODE: TERMINAL"))
             .expect("chip span present");
         assert_eq!(chip.style.bg, Some(ratatui::style::Color::Magenta));
+    }
+
+    // --- Clickable status bar --------------------------------------------
+
+    /// Terminal geometry that keeps the chrome full (>= MIN_FULL_COLS/ROWS), so
+    /// the normal status bar is drawn rather than the compact one.
+    const FULL_W: u16 = 130;
+    const FULL_H: u16 = 34;
+
+    /// The column — not the byte offset — at which `needle` is rendered in a
+    /// buffer row. The bar contains multi-byte glyphs (`│`, `●`), so a byte
+    /// offset is not a column.
+    fn col_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not rendered in {row:?}"));
+        row[..byte].chars().count() as u16
+    }
+
+    /// Draw `state` into a `w`x`h` terminal and return its status bar row (the
+    /// bottom row) plus that row's `y`. Hit tests are asserted against the text
+    /// that was actually drawn, so a label that moves takes its test with it.
+    fn drawn_status_row(
+        state: &AppState,
+        input_holder: Option<&str>,
+        w: u16,
+        h: u16,
+    ) -> (String, u16) {
+        let mut term = test_terminal(w, h);
+        term.draw(|frame| {
+            draw(
+                frame,
+                state,
+                &empty_cache(),
+                &UiOverlay::None,
+                input_holder,
+                0,
+            )
+        })
+        .unwrap();
+        (buffer_row(term.backend().buffer(), h - 1), h - 1)
+    }
+
+    #[test]
+    fn clicking_the_terminal_mode_chip_focuses_the_app() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "MODE: TERMINAL");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            Some(StatusAction::FocusApp),
+            "the chip means the same as the hint beside it"
+        );
+    }
+
+    #[test]
+    fn clicking_the_leave_focus_hint_focuses_the_app() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        // The whole phrase acts, key and label alike.
+        for needle in [crate::tui::platform::leave_focus_key(false), "app mode"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, None, col, y),
+                Some(StatusAction::FocusApp),
+                "clicking {needle:?} must leave terminal focus"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_palette_hint_opens_the_palette() {
+        for mode_is_terminal in [true, false] {
+            let mut state = state_with_tabs(1);
+            if mode_is_terminal {
+                state.focus_terminal();
+            } else {
+                state.focus_app();
+            }
+            let area = Rect::new(0, 0, FULL_W, FULL_H);
+            let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+            for needle in ["Ctrl-g", "palette"] {
+                let col = col_of(&row, needle);
+                assert_eq!(
+                    status_bar_hit(area, &state, None, col, y),
+                    Some(StatusAction::OpenPalette),
+                    "clicking {needle:?} must open the palette"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_help_hint_opens_help() {
+        for mode_is_terminal in [true, false] {
+            let mut state = state_with_tabs(1);
+            if mode_is_terminal {
+                state.focus_terminal();
+            } else {
+                state.focus_app();
+            }
+            let area = Rect::new(0, 0, FULL_W, FULL_H);
+            let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+            for needle in [HELP_KEYS, "help"] {
+                let col = col_of(&row, needle);
+                assert_eq!(
+                    status_bar_hit(area, &state, None, col, y),
+                    Some(StatusAction::OpenHelp),
+                    "clicking {needle:?} must open help"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_app_mode_chip_focuses_the_terminal() {
+        let mut state = state_with_tabs(1);
+        state.focus_app();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "MODE: APP");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            Some(StatusAction::FocusTerminal)
+        );
+    }
+
+    #[test]
+    fn clicking_the_focus_terminal_hint_focuses_the_terminal() {
+        let mut state = state_with_tabs(1);
+        state.focus_app();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        for needle in ["Enter", "focus terminal"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, None, col, y),
+                Some(StatusAction::FocusTerminal),
+                "clicking {needle:?} must focus the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_gap_between_two_hints_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        // The `|` separating two hints belongs to neither, so a click that
+        // lands between them fires nothing rather than the wrong neighbour.
+        let palette = col_of(&row, "Ctrl-g");
+        let gap = palette - 2; // the `|` in " | " before the palette hint
+        assert_eq!(&row[..].chars().nth(gap as usize).unwrap().to_string(), "|");
+        assert_eq!(status_bar_hit(area, &state, None, gap, y), None);
+    }
+
+    #[test]
+    fn clicking_the_update_notice_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.update_available = Some("9.9.9".to_string());
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "v9.9.9 available");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y),
+            None,
+            "a stray click must never start an update"
+        );
+    }
+
+    #[test]
+    fn clicking_the_isolated_and_input_badges_does_nothing() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        // Wide enough that both badges are drawn whole rather than clipped.
+        let w = 170;
+        let area = Rect::new(0, 0, w, FULL_H);
+        let holder = Some("Safari/iOS");
+        let (row, y) = drawn_status_row(&state, holder, w, FULL_H);
+        for needle in ["ISOLATED", "INPUT: Safari/iOS"] {
+            let col = col_of(&row, needle);
+            assert_eq!(
+                status_bar_hit(area, &state, holder, col, y),
+                None,
+                "{needle:?} reports state; it is not a button"
+            );
+        }
+    }
+
+    #[test]
+    fn the_badges_do_not_move_the_hints_out_from_under_the_pointer() {
+        // ISOLATED and INPUT are appended after the hints, so they must not
+        // shift them — and the hit test must agree with what was drawn.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        state.update_available = Some("9.9.9".to_string());
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let holder = Some("Safari/iOS");
+        let (row, y) = drawn_status_row(&state, holder, FULL_W, FULL_H);
+        let col = col_of(&row, "palette");
+        assert_eq!(
+            status_bar_hit(area, &state, holder, col, y),
+            Some(StatusAction::OpenPalette)
+        );
+    }
+
+    #[test]
+    fn a_click_above_the_status_row_is_not_a_status_hit() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let col = col_of(&row, "Ctrl-g");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col, y - 1),
+            None,
+            "the row above the bar is the divider, not the bar"
+        );
+    }
+
+    #[test]
+    fn a_click_left_of_the_bar_is_not_a_status_hit() {
+        // The bar lives in the main pane; the sidebar occupies the columns to
+        // its left and has its own hit test.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (_, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        assert_eq!(status_bar_hit(area, &state, None, 0, y), None);
+    }
+
+    #[test]
+    fn the_compact_bar_hints_are_clickable_too() {
+        // Collapsed chrome (terminal mode, small window) draws its own bar. Its
+        // hints appear only from 100 columns of pane width on.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 103 + layout::COLLAPSED_SIDEBAR_WIDTH; // pane >= 100 columns
+        let h = layout::MIN_FULL_ROWS - 1; // short enough to collapse
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        assert!(
+            row.contains("default:"),
+            "expected the compact bar: {row:?}"
+        );
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "Ctrl-g"), y),
+            Some(StatusAction::OpenPalette)
+        );
+        assert_eq!(
+            status_bar_hit(
+                area,
+                &state,
+                None,
+                col_of(&row, crate::tui::platform::leave_focus_key(false)),
+                y
+            ),
+            Some(StatusAction::FocusApp)
+        );
+    }
+
+    #[test]
+    fn the_compact_bar_branch_context_is_not_clickable() {
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 103 + layout::COLLAPSED_SIDEBAR_WIDTH;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        for needle in ["default:", "target:"] {
+            assert_eq!(
+                status_bar_hit(area, &state, None, col_of(&row, needle), y),
+                None,
+                "{needle:?} is context, not a control"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_compact_bar_keeps_its_chip_clickable_after_the_hints_are_gone() {
+        // Below 100 columns the compact bar drops its hints, but the mode chip
+        // is drawn at every width — so it stays the way back to app mode when
+        // there is no room to say so in words.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let w = 60;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, None, w, h);
+        assert!(!row.contains("palette"), "no hints at this width: {row:?}");
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "TERM"), y),
+            Some(StatusAction::FocusApp)
+        );
+        assert_eq!(
+            status_bar_hit(area, &state, None, col_of(&row, "default:"), y),
+            None
+        );
+    }
+
+    #[test]
+    fn the_compact_bar_hits_follow_the_badges_that_shift_them() {
+        // ISOLATED, INPUT and UPDATE are drawn *before* the hints in the
+        // compact bar, so they push them right. The hit test must be built from
+        // the same inputs as the drawing, or the pointer lands one badge off.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        state.isolated = true;
+        state.update_available = Some("9.9.9".to_string());
+        let holder = Some("Safari/iOS");
+        let w = 130;
+        let h = layout::MIN_FULL_ROWS - 1;
+        let area = Rect::new(0, 0, w, h);
+        let (row, y) = drawn_status_row(&state, holder, w, h);
+        assert!(row.contains("ISOLATED"), "expected the badges: {row:?}");
+        assert_eq!(
+            status_bar_hit(area, &state, holder, col_of(&row, "Ctrl-g"), y),
+            Some(StatusAction::OpenPalette)
+        );
+    }
+
+    #[test]
+    fn every_clickable_label_acts_across_its_whole_width() {
+        // Anti-drift: each label is one region, so its first and last column
+        // resolve alike. A renderer change that moves a label without moving
+        // its segment breaks this.
+        let mut state = state_with_tabs(1);
+        state.focus_terminal();
+        let area = Rect::new(0, 0, FULL_W, FULL_H);
+        let (row, y) = drawn_status_row(&state, None, FULL_W, FULL_H);
+        let cases = [
+            ("MODE: TERMINAL", StatusAction::FocusApp),
+            ("app mode", StatusAction::FocusApp),
+            ("palette", StatusAction::OpenPalette),
+            ("help", StatusAction::OpenHelp),
+        ];
+        for (label, action) in cases {
+            let first = col_of(&row, label);
+            let last = first + label.chars().count() as u16 - 1;
+            assert_eq!(
+                status_bar_hit(area, &state, None, first, y),
+                Some(action),
+                "first column of {label:?}"
+            );
+            assert_eq!(
+                status_bar_hit(area, &state, None, last, y),
+                Some(action),
+                "last column of {label:?}"
+            );
+        }
+    }
+
+    // --- Clickable command palette (SPECS §22) ----------------------------
+
+    /// A terminal roomy enough for the palette's full 90x32 overlay.
+    const PALETTE_W: u16 = 120;
+    const PALETTE_H: u16 = 40;
+
+    /// Draw `palette` over an empty app and hand back the rendered buffer.
+    fn drawn_palette(palette: &CommandPalette) -> ratatui::buffer::Buffer {
+        let mut term = test_terminal(PALETTE_W, PALETTE_H);
+        let state = empty_state();
+        term.draw(|frame| {
+            draw(
+                frame,
+                &state,
+                &empty_cache(),
+                &UiOverlay::Palette(palette.clone()),
+                None,
+                0,
+            );
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The text drawn on `row` within `area`'s columns.
+    fn row_in(buf: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.x.saturating_add(area.width))
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    /// The `(col, row)` at which `text` is drawn inside `area`.
+    fn drawn_at(buf: &ratatui::buffer::Buffer, area: Rect, text: &str) -> (u16, u16) {
+        for row in area.y..area.y.saturating_add(area.height) {
+            let line = row_in(buf, area, row);
+            if let Some(byte) = line.find(text) {
+                let col = area.x + line[..byte].chars().count() as u16;
+                return (col, row);
+            }
+        }
+        panic!("{text:?} is not drawn in {area:?}");
+    }
+
+    #[test]
+    fn every_palette_entry_is_clickable_where_it_was_drawn() {
+        // The anti-drift sweep: both columns, every entry, headers and blank
+        // spacers included in the row arithmetic. A renderer that respaces the
+        // list without respacing the hit test fails here.
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let filtered = palette.filtered();
+        let split = filtered.len().div_ceil(2);
+        for (i, entry) in filtered.iter().enumerate() {
+            let column = if i < split { pl.left } else { pl.right };
+            let (col, row) = drawn_at(&buf, column, entry.label);
+            assert_eq!(
+                palette_hit(area, &palette, col, row),
+                Some(PaletteHit::Entry(i)),
+                "entry {i} ({:?}) must be clickable where it is drawn",
+                entry.label
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_a_group_header_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let group = palette.filtered()[0].group;
+        let (col, row) = drawn_at(&buf, pl.left, group);
+        assert_eq!(
+            palette_hit(area, &palette, col, row),
+            None,
+            "a group header names entries; it is not one"
+        );
+    }
+
+    #[test]
+    fn clicking_the_blank_row_between_two_groups_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        // The first blank row inside the left column sits between two groups.
+        let blank = (pl.left.y..pl.left.y + pl.left.height)
+            .find(|&row| row_in(&buf, pl.left, row).trim().is_empty())
+            .expect("the list has a spacer row between groups");
+        assert_eq!(palette_hit(area, &palette, pl.left.x + 2, blank), None);
+    }
+
+    #[test]
+    fn clicking_the_filter_row_does_nothing() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, pl.filter.x + 1, pl.filter.y),
+            None
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_overlay_dismisses_the_palette() {
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, 0, 0),
+            Some(PaletteHit::Dismiss),
+            "the corner of the screen is outside the box"
+        );
+        assert_eq!(
+            palette_hit(
+                area,
+                &palette,
+                pl.overlay.x.saturating_sub(1),
+                pl.overlay.y + 2
+            ),
+            Some(PaletteHit::Dismiss),
+            "one column left of the border is outside"
+        );
+    }
+
+    #[test]
+    fn clicking_the_overlay_border_neither_acts_nor_dismisses() {
+        // The border belongs to the palette, so a click that grazes it must not
+        // close the box the user is aiming at.
+        let palette = CommandPalette::new();
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        assert_eq!(
+            palette_hit(area, &palette, pl.overlay.x, pl.overlay.y + 2),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_result_list_has_nothing_to_click() {
+        let mut palette = CommandPalette::new();
+        palette.set_filter("zzzzz-no-such-command");
+        assert!(
+            palette.filtered().is_empty(),
+            "the filter must match nothing"
+        );
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let pl = palette_layout(area);
+        for row in pl.left.y..pl.left.y + pl.left.height {
+            assert_eq!(
+                palette_hit(area, &palette, pl.left.x + 2, row),
+                None,
+                "row {row} of an empty list must do nothing"
+            );
+        }
+        assert_eq!(
+            palette_hit(area, &palette, 0, 0),
+            Some(PaletteHit::Dismiss),
+            "an empty list still closes on an outside click"
+        );
+    }
+
+    #[test]
+    fn a_filtered_list_maps_clicks_to_the_entries_that_survived() {
+        // Indices are into the *filtered* list, not the full one, so a filtered
+        // palette must not hand back the index of the unfiltered entry.
+        let mut palette = CommandPalette::new();
+        palette.set_filter("project");
+        let filtered = palette.filtered();
+        assert!(filtered.len() >= 2, "the filter must leave several entries");
+        let area = Rect::new(0, 0, PALETTE_W, PALETTE_H);
+        let buf = drawn_palette(&palette);
+        let pl = palette_layout(area);
+        let (col, row) = drawn_at(&buf, pl.left, filtered[0].label);
+        assert_eq!(
+            palette_hit(area, &palette, col, row),
+            Some(PaletteHit::Entry(0))
+        );
+    }
+
+    // --- Dismissing a read-only overlay with the mouse (SPECS §23) --------
+
+    /// The three read-only overlays, each in a state a click can dismiss.
+    fn read_only_overlays() -> Vec<UiOverlay> {
+        vec![
+            UiOverlay::Help,
+            UiOverlay::About,
+            UiOverlay::GitStatus {
+                status: WorktreeStatus {
+                    branch: "flightdeck/x".to_string(),
+                    base_branch: "main".to_string(),
+                    dirty: false,
+                    changes: crate::git::status::WorktreeChanges::default(),
+                    ahead: 0,
+                    behind: 0,
+                    upstream: None,
+                    base_drift: 0,
+                    worktree_path: PathBuf::from("/repo"),
+                },
+                pr_url: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_click_beside_a_read_only_overlay_dismisses_it() {
+        let area = Rect::new(0, 0, 130, 44);
+        for overlay in read_only_overlays() {
+            assert!(
+                overlay_dismissed_by_click(&overlay, area, 0, 0),
+                "the screen's corner is beside {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_inside_a_read_only_overlay_keeps_it_open() {
+        // The window is what the user is reading; clicking it must not close it.
+        let area = Rect::new(0, 0, 130, 44);
+        for overlay in read_only_overlays() {
+            let centre_col = area.width / 2;
+            let centre_row = area.height / 2;
+            assert!(
+                !overlay_dismissed_by_click(&overlay, area, centre_col, centre_row),
+                "the centre of the screen is inside {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dismiss_edge_is_the_border_the_overlay_draws() {
+        // Anti-drift: the boundary a click is measured against must be the box
+        // the user can see, not a second guess at its size.
+        let area = Rect::new(0, 0, 130, 44);
+        let mut term = test_terminal(130, 44);
+        // Drawn on its own, so the app chrome behind it cannot be mistaken for
+        // the box's edge.
+        term.draw(|frame| {
+            draw_help_overlay(frame, area, false, false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mid = area.height / 2;
+        // The leftmost column of the drawn box on a middle row.
+        let left_edge = (0..area.width)
+            .find(|&x| buf[(x, mid)].symbol() != " ")
+            .expect("the help box is drawn");
+        assert!(
+            !overlay_dismissed_by_click(&UiOverlay::Help, area, left_edge, mid),
+            "the border belongs to the window"
+        );
+        assert!(
+            overlay_dismissed_by_click(&UiOverlay::Help, area, left_edge - 1, mid),
+            "one column further out is beside it"
+        );
+    }
+
+    #[test]
+    fn a_live_overlay_is_never_dismissed_by_a_stray_click() {
+        // The pairing surface shows a code that expires and the browser access
+        // surface holds a live binding: losing either to a misplaced click
+        // costs the user real work. They keep their keyboard dismissal only.
+        let area = Rect::new(0, 0, 130, 44);
+        let live = [
+            UiOverlay::None,
+            UiOverlay::Remote(RemotePairing::default()),
+            UiOverlay::Palette(CommandPalette::new()),
+        ];
+        for overlay in live {
+            for (col, row) in [(0, 0), (area.width - 1, area.height - 1)] {
+                assert!(
+                    !overlay_dismissed_by_click(&overlay, area, col, row),
+                    "{overlay:?} must not vanish on a click"
+                );
+            }
+        }
     }
 
     // --- Render smoke tests (TestBackend) ---------------------------------

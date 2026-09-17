@@ -46,6 +46,7 @@ the [Keyboard Shortcuts reference](/reference/keyboard).
   change counts, ahead/behind, base drift, and base branch. See
   [Git Workflow](/desktop/git).
 - **Status bar** — the current input mode and the most useful shortcuts for it.
+  Every shortcut on it is also a button: see [Mouse support](#mouse-support).
 
 ## Two input modes
 
@@ -96,12 +97,29 @@ Anything you can do with a shortcut, you can also do from the palette — and a
 few actions (Rebase Worktree, Show Git Status, Open Configuration, Pair Phone)
 live *only* there.
 
+Type to filter, move with the arrow keys, and confirm with `Enter` — or click an
+entry to run it straight away. Clicking beside the box closes it; clicking a
+group header or the box's own border leaves it open. An entry that asks before
+it acts still asks, however you chose it.
+
 ## Mouse support
 
 FlightDeck also responds to the mouse: click a project tab to switch (or its
 `✕` to close), click an agent in the sidebar to select it, click a terminal tab
 to switch terminals, and use the `+ project` / `+ agent` / `+ shell` buttons.
 You can select text in the viewport and scroll with the wheel.
+
+The command palette and the status bar are clickable too. Each label does exactly what the key printed
+beside it does: the mode chip and the hint next to it switch modes, `Ctrl-g:
+palette` opens the command palette, and `F1 / Alt-h: help` opens the help
+screen. The parts that only report state — `ISOLATED`, the input lock, and the
+update notice — are deliberately inert, so a stray click cannot start an
+update.
+
+The help, about and git status windows close on a click beside them, as well as
+on any key. A click on the window itself leaves it open. The pairing and browser
+access screens are the exception: they hold a code or a live binding, so only the
+keyboard closes them.
 
 ## The most useful shortcuts
 
