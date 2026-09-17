@@ -2350,10 +2350,12 @@ fn event_loop(
             {
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
-                // Pin each freshly-launched agent's session id for later resume
-                // (cheap unless a tab is still awaiting its session file).
+                // Pin each freshly-launched agent's session id for later
+                // resume. A no-op unless a tab is awaiting its session file, and
+                // rate-limited to `SESSION_SCAN_INTERVAL_MS` when one is, since
+                // that wait has no deadline.
                 if let Some(home) = &store_home {
-                    p.state.pin_resumable_sessions(home, &services);
+                    p.state.pin_resumable_sessions(home, &services, now_ms);
                 }
             }
 
