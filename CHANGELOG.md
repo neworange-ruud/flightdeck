@@ -29,6 +29,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   'main'`. An isolated run now takes whatever branch is checked out and labels
   the tab with it; a detached HEAD or an unreadable HEAD falls back to the base
   name instead of aborting. Normal runs keep the guard unchanged.
+- **A collapsed sidebar now actually widens the agent.** When the chrome
+  collapses — terminal mode in a window too small for the full layout — the
+  sidebar shrinks to a strip and FlightDeck draws a wider viewport, but the
+  agent's PTY was still sized from the full-chrome layout. The agent kept
+  wrapping at the old, narrow width, so long paragraphs stayed narrow and a band
+  of the pane was left empty. The PTY is now sized from the chrome that is
+  actually drawn, as the split-view path already did.
 
 ## [1.18.0] - 2026-09-01
 
