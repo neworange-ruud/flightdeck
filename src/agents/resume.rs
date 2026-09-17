@@ -277,12 +277,27 @@ fn cursor_chat_meta(path: &Path) -> Option<String> {
     Some(value.get("cwd")?.as_str()?.to_string())
 }
 
+/// The most a `session_meta` line may plausibly occupy. Caps the read so a
+/// rollout written as one enormous line cannot pull the whole file in through
+/// the back door.
+const CODEX_META_LINE_LIMIT: u64 = 64 * 1024;
+
 /// Read a codex session file's leading `session_meta` line, returning
 /// `(session_id, cwd)` if present.
+///
+/// Reads **only that first line**, never the whole file. The scan calling this
+/// runs from the render loop for every rollout in the store, and those files
+/// reach gigabytes: slurping each one costs seconds per frame and pegs a core
+/// on nothing but memcpy.
 fn codex_session_meta(path: &Path) -> Option<(String, String)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let first = content.lines().next()?;
-    let value: serde_json::Value = serde_json::from_str(first).ok()?;
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file)
+        .take(CODEX_META_LINE_LIMIT)
+        .read_line(&mut first)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(first.trim_end()).ok()?;
     let payload = value.get("payload")?;
     let id = payload.get("session_id")?.as_str()?.to_string();
     let cwd = payload.get("cwd")?.as_str()?.to_string();
@@ -554,6 +569,36 @@ mod tests {
         assert_eq!(
             ids,
             vec!["019f378e-76e9-7de3-a1db-41a027b7b719".to_string()]
+        );
+    }
+
+    /// A rollout is matched on its leading `session_meta` line alone, so the
+    /// rest of the file is never read. Guards the cost: these files grow to
+    /// gigabytes, and the scan runs from the render loop while a tab still
+    /// awaits its session (remote-control: slow TUI with a large Codex store).
+    ///
+    /// Invalid UTF-8 after the first line stands in for "the tail was read":
+    /// reading the whole file fails on it, reading one line does not.
+    #[test]
+    fn codex_store_reads_only_the_leading_meta_line() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/home/u/Repos/proj/wt");
+        let path = home.path().join(
+            ".codex/sessions/2026/07/06/rollout-c-019f378e-76e9-7de3-a1db-41a027b7b719.jsonl",
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = b"{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"019f378e-76e9-7de3-a1db-41a027b7b719\",\"cwd\":\"/home/u/Repos/proj/wt\"}}\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0xff, b'\n']);
+        std::fs::write(&path, bytes).unwrap();
+
+        let ids: Vec<String> = store_session_ids("codex", cwd, home.path())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["019f378e-76e9-7de3-a1db-41a027b7b719".to_string()],
+            "the leading line alone decides the match; the tail is never read"
         );
     }
 
