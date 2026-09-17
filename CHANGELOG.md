@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.19.0] - 2026-09-17
+
+### New features
+
 - **The status bar is clickable.** Every label on it does exactly what the key
   printed beside it does: the mode chip and the hint next to it switch modes,
   `Ctrl-g: palette` opens the command palette, and `F1 / Alt-h: help` opens the
