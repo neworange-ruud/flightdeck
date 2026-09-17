@@ -1416,11 +1416,17 @@ An isolated run:
 - never reads `state.json` and never runs recovery, so no tab is reconstructed
 - creates exactly one Agent Session Tab, running the configured default agent in
   the repository root, with no dedicated worktree and no git mutation of any
-  kind. The tab is labelled with the branch actually checked out, not the
-  configured base branch: `git rev-parse --abbrev-ref HEAD` reporting the
-  literal string `"HEAD"` (a detached checkout) or failing outright both fall
-  back to the base branch instead. This session failing to start is fatal —
-  the run exits with a message rather than showing an empty TUI.
+  kind. Whichever branch is checked out, the run starts: unlike the normal
+  base-tab flow it does **not** require HEAD to be on the configured default
+  base, because it creates no worktree, mutates no git state and discards the
+  tab at exit, so none of the hazards that guard covers can arise. This
+  matters most in a managed worktree, whose `.flightdeck/config.toml` names
+  `main` as the base while its HEAD is the feature branch. The tab is labelled
+  with the branch actually checked out, not the configured base branch: `git
+  rev-parse --abbrev-ref HEAD` reporting the literal string `"HEAD"` (a
+  detached checkout) or failing outright both fall back to the base branch
+  instead. This session failing to start is fatal — the run exits with a
+  message rather than showing an empty TUI.
 - forces `ui.auto_continue` off, so even Restart Agent starts a fresh session
 - disables the update check (it makes a network call and writes a cache file)
 - keeps its agent status plumbing in a per-process temp directory outside the

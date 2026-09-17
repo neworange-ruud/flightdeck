@@ -8965,13 +8965,14 @@ fn sync_terminal_sizes(state: &mut AppState, full: PtySize) {
     } else {
         // Normal view: every terminal of the selected tab fills the viewport.
         // Derive the size from the current terminal size AND this project's
-        // border setting (mirroring the split branch) so enabling/disabling the
-        // border — or switching to a project with a different mode_border —
+        // border setting AND the chrome that is actually drawn (mirroring the
+        // split branch) so enabling/disabling the border, switching to a
+        // project with a different mode_border, or collapsing the chrome
         // reflows immediately instead of waiting for the next window resize.
         let area = Rect::new(0, 0, full.cols, full.rows);
         let ml = crate::tui::layout::compute(
             area,
-            crate::tui::layout::Chrome::Full,
+            crate::tui::layout::chrome_for(area, state.mode()),
             crate::tui::mode_style::border_enabled(&state.config.ui),
             state.config.ui.agent_tab_side(),
         );
@@ -10598,6 +10599,103 @@ mod tests {
             off_rows - on_rows,
             2,
             "border on should be exactly 2 rows shorter than border off"
+        );
+    }
+
+    /// Regression test for the collapsed-chrome resize bug: when the chrome
+    /// collapses (terminal mode in a window too small for full chrome), the
+    /// non-split branch of `sync_terminal_sizes` must size the PTY from the
+    /// *collapsed* layout, like the split branch already does. Hardcoding
+    /// `Chrome::Full` there left the agent wrapping at the full-chrome width
+    /// while FlightDeck drew the wider collapsed viewport, so long paragraphs
+    /// kept their old, narrow wrap and a band of the pane stayed empty.
+    #[test]
+    fn sync_terminal_sizes_follows_the_collapsed_chrome() {
+        use crate::contracts::TabState;
+
+        fn build_state() -> AppState {
+            let mut project_state = default_state("main");
+            project_state.tabs.push(TabState {
+                id: "tab-1".to_string(),
+                name: "Task".to_string(),
+                slug: "task".to_string(),
+                agent: "opencode".to_string(),
+                branch: "flightdeck/task".to_string(),
+                worktree_path_relative: ".flightdeck/worktrees/task".to_string(),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "running".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: false,
+                resume_args: Vec::new(),
+            });
+            let mut state = AppState::new(
+                Config::default(),
+                project_state,
+                "/repo",
+                "/repo/state.json",
+            );
+            let pty = FakePty::new();
+            let _handle = pty.queue_session();
+            state.tabs[0]
+                .session
+                .spawn_primary(
+                    &pty,
+                    "opencode",
+                    &[],
+                    Path::new("/repo/.flightdeck/worktrees/task"),
+                    PtySize { rows: 24, cols: 80 },
+                )
+                .expect("spawn_primary should succeed against FakePty");
+            state
+        }
+
+        // Below both collapse thresholds (108 cols, 32 rows).
+        let full = PtySize {
+            rows: 24,
+            cols: 100,
+        };
+
+        let mut app = build_state();
+        app.focus_app();
+        sync_terminal_sizes(&mut app, full);
+        let (app_rows, app_cols) = app.tabs[0]
+            .session
+            .primary()
+            .expect("primary terminal spawned")
+            .screen()
+            .size();
+
+        let mut terminal = build_state();
+        terminal.focus_terminal();
+        sync_terminal_sizes(&mut terminal, full);
+        let (term_rows, term_cols) = terminal.tabs[0]
+            .session
+            .primary()
+            .expect("primary terminal spawned")
+            .screen()
+            .size();
+
+        assert!(
+            term_cols > app_cols,
+            "collapsed chrome hands the sidebar columns to the PTY \
+             (collapsed {term_cols} vs full {app_cols})"
+        );
+        assert!(
+            term_rows > app_rows,
+            "collapsed chrome hands the hidden bars' rows to the PTY \
+             (collapsed {term_rows} vs full {app_rows})"
+        );
+        // The grid the agent wraps at must match the viewport FlightDeck draws.
+        assert_eq!(
+            (term_rows, term_cols),
+            (terminal.pty_size.rows, terminal.pty_size.cols),
+            "PTY grid must match the collapsed viewport FlightDeck reports"
         );
     }
 

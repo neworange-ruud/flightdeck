@@ -40,6 +40,26 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   landed one column to the left: clicking the glyph did nothing at all, while
   the columns beside it worked. Drawing and hit-testing now ask one function
   where the sidebar's content starts and ends.
+- **`flightdeck --isolated` (`-I`) no longer refuses to start on a branch other
+  than the default base.** An isolated run reused the normal base-tab flow,
+  which requires HEAD to be on the configured `default_base_branch` and refuses
+  a detached HEAD. That guard exists to stop the normal flow checking out a
+  branch underneath you or recording the wrong target, and an isolated run does
+  neither — it creates no worktree, mutates no git state, and discards its tab
+  at exit. It bit hardest in the one place `-I` is most useful: any managed
+  worktree under `.flightdeck/worktrees/`, where a previous normal run left a
+  `config.toml` naming `main` as the base while HEAD sits on the feature branch,
+  so `-I` died with `the project root is on '<branch>', not the default base
+  'main'`. An isolated run now takes whatever branch is checked out and labels
+  the tab with it; a detached HEAD or an unreadable HEAD falls back to the base
+  name instead of aborting. Normal runs keep the guard unchanged.
+- **A collapsed sidebar now actually widens the agent.** When the chrome
+  collapses — terminal mode in a window too small for the full layout — the
+  sidebar shrinks to a strip and FlightDeck draws a wider viewport, but the
+  agent's PTY was still sized from the full-chrome layout. The agent kept
+  wrapping at the old, narrow width, so long paragraphs stayed narrow and a band
+  of the pane was left empty. The PTY is now sized from the chrome that is
+  actually drawn, as the split-view path already did.
 
 ## [1.18.0] - 2026-09-01
 
