@@ -4578,7 +4578,9 @@ fn handle_mouse(me: MouseEvent, area: Rect, workspace: &mut Workspace, env: &Env
             workspace.active_project().state.config.ui.agent_tab_side(),
         );
         let names: Vec<String> = workspace.projects.iter().map(|p| p.name.clone()).collect();
-        if let Some(hit) = project_tab_hit_test(ml.project_tabs, &names, me.column, me.row) {
+        if let Some(hit) =
+            project_tab_hit_test(ml.project_tabs, &names, workspace.active, me.column, me.row)
+        {
             ui.drag = None;
             match hit {
                 ProjectHit::Tab(i) => {
@@ -12516,7 +12518,13 @@ mod tests {
             let column = (0..area.width)
                 .find(|&col| {
                     matches!(
-                        crate::tui::render::project_tab_hit_test(ml.project_tabs, &names, col, row),
+                        crate::tui::render::project_tab_hit_test(
+                            ml.project_tabs,
+                            &names,
+                            ws.active,
+                            col,
+                            row
+                        ),
                         Some(ProjectHit::Tab(1))
                     )
                 })

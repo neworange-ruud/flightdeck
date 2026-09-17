@@ -302,6 +302,19 @@ const NEW_AGENT_LABEL: &str = "+ agent";
 const NEW_SHELL_LABEL: &str = "+ shell";
 /// The right-aligned "open another project" button on the project tab row.
 const NEW_PROJECT_LABEL: &str = "+ project";
+/// Columns a project tab draws before its name: the leading space, the status
+/// indicator and the space after it.
+const PROJECT_TAB_PREFIX: u16 = 3;
+/// Columns a project tab draws after its name: the space before the `✕`, the
+/// `✕` itself and the trailing space.
+const PROJECT_TAB_SUFFIX: u16 = 3;
+/// Columns a project tab spends on chrome, whatever its name is.
+const PROJECT_TAB_CHROME: u16 = PROJECT_TAB_PREFIX + PROJECT_TAB_SUFFIX;
+/// Columns the `" | "` separator between two project tabs occupies.
+const PROJECT_TAB_SEPARATOR: u16 = 3;
+/// The narrowest a shortened project name may get: the first letter plus the
+/// `…` that marks the cut.
+const PROJECT_NAME_FLOOR: u16 = 2;
 /// Dark navy used for the active project tab and its row-level action.
 const PROJECT_TAB_ACTIVE_BG: Color = Color::Rgb(16, 38, 68);
 
@@ -800,9 +813,13 @@ pub fn header_line(width: usize) -> Line<'static> {
 // Project tab row (SPECS: multi-project)
 // ---------------------------------------------------------------------------
 
-/// The screen geometry of one project tab segment on the project tab row.
+/// The screen geometry of one project tab segment on the project tab row,
+/// together with the name as it is actually drawn.
 struct ProjectTabSeg {
     index: usize,
+    /// The project name as it appears on the row: the full name, or a
+    /// `…`-terminated prefix when the row is too narrow to show all of it.
+    name: String,
     /// First column of the segment.
     start: u16,
     /// Total width, including the `✕` close control.
@@ -811,31 +828,100 @@ struct ProjectTabSeg {
     close_col: u16,
 }
 
-/// The display label for a project tab (a leading one-cell status indicator +
-/// the name). The indicator width stays fixed while its glyph animates, so
-/// hit-testing and rendering agree.
-fn project_tab_label(name: &str) -> String {
-    format!("● {name}")
+/// Split `budget` columns between names of length `lens`, so that the row shows
+/// as much of every name as it can. Names that fit keep all of their characters
+/// and the rest share what is left evenly (a common cap, raised as high as the
+/// budget allows), which spends the whole budget without letting one long name
+/// starve the others.
+fn share_name_budget(lens: &[usize], budget: usize) -> Vec<usize> {
+    if lens.iter().sum::<usize>() <= budget {
+        return lens.to_vec();
+    }
+    // Raise a common cap while the resulting allocation still fits. Every name
+    // shorter than the cap keeps its full length, so the cap only bites on the
+    // names that are actually too long.
+    let longest = lens.iter().copied().max().unwrap_or(0);
+    let mut cap = 0usize;
+    while cap < longest {
+        let used: usize = lens.iter().map(|&l| l.min(cap + 1)).sum();
+        if used > budget {
+            break;
+        }
+        cap += 1;
+    }
+    let mut alloc: Vec<usize> = lens.iter().map(|&l| l.min(cap)).collect();
+    // The cap lands just below the budget, so hand the columns it left over to
+    // the leftmost names that can still use one — an extra character each,
+    // rather than columns left blank. Fewer are left over than there are names
+    // over the cap, so no name gets more than one.
+    let mut spare = budget.saturating_sub(alloc.iter().sum::<usize>());
+    for (a, &l) in alloc.iter_mut().zip(lens) {
+        if spare == 0 {
+            break;
+        }
+        if *a < l {
+            *a += 1;
+            spare -= 1;
+        }
+    }
+    alloc
 }
 
-/// Compute the geometry of each project tab segment, matching exactly how
-/// [`draw_project_tab_bar`] lays them out. Each renders as `" {label} ✕ "`, so
-/// its width is `label.len() + 4` and the `✕` sits at `start + label.len() + 2`.
-/// Mirrors [`child_tab_positions`] so mouse hit-testing and drawing never drift.
-fn project_tab_positions(area: Rect, names: &[String]) -> Vec<ProjectTabSeg> {
+/// Lay the project tab row out inside `area`, shortening names so the tabs fit
+/// the width instead of falling off the right-hand edge. The strip stops short
+/// of the right-aligned `+ project` button, and when even the shortest possible
+/// tabs cannot all fit, the row shows the widest run that ends at the `active`
+/// project, so the project in view is always on the row.
+///
+/// The single source of truth for the row: [`draw_project_tab_bar`] renders
+/// these segments and [`project_tab_hit_test`] resolves clicks against them, so
+/// what is drawn and what is clickable cannot drift apart.
+fn project_tab_layout(area: Rect, names: &[String], active: usize) -> Vec<ProjectTabSeg> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    // Everything left of the `+ project` button belongs to the tabs.
+    let (btn_start, _) = project_new_button(area);
+    let avail = btn_start.saturating_sub(area.x);
+
+    // How many tabs can be shown at all: each needs its chrome plus at least a
+    // letter and an ellipsis, and every tab after the first needs a separator.
+    let per_tab = PROJECT_TAB_CHROME + PROJECT_NAME_FLOOR + PROJECT_TAB_SEPARATOR;
+    let fits = (avail.saturating_add(PROJECT_TAB_SEPARATOR) / per_tab).max(1) as usize;
+    let shown = fits.min(names.len());
+    // Scroll only once the row overflows, and only far enough to keep the
+    // active project on screen, as the rightmost tab.
+    let first = active
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(names.len() - shown);
+    let window = &names[first..first + shown];
+
+    let chrome =
+        PROJECT_TAB_CHROME * shown as u16 + PROJECT_TAB_SEPARATOR * shown.saturating_sub(1) as u16;
+    let budget = avail.saturating_sub(chrome) as usize;
+    let lens: Vec<usize> = window.iter().map(|n| n.chars().count()).collect();
+    let alloc = share_name_budget(&lens, budget);
+
     let mut out = Vec::new();
     let mut x = area.x;
-    for (i, name) in names.iter().enumerate() {
+    for (i, (name, &room)) in window.iter().zip(&alloc).enumerate() {
         if i > 0 {
-            x = x.saturating_add(3); // " | " separator
+            x = x.saturating_add(PROJECT_TAB_SEPARATOR);
         }
-        let label_len = project_tab_label(name).chars().count() as u16;
-        let w = label_len + 4; // " label ✕ "
+        let shown_name = truncate_ellipsis(name, room);
+        let name_len = shown_name.chars().count() as u16;
+        // " ● {name} ✕ "
+        let w = name_len + PROJECT_TAB_CHROME;
         out.push(ProjectTabSeg {
-            index: i,
+            index: first + i,
+            name: shown_name,
             start: x,
             width: w,
-            close_col: x.saturating_add(label_len).saturating_add(2),
+            close_col: x
+                .saturating_add(PROJECT_TAB_PREFIX)
+                .saturating_add(name_len)
+                .saturating_add(1),
         });
         x = x.saturating_add(w);
     }
@@ -850,12 +936,14 @@ fn project_new_button(area: Rect) -> (u16, u16) {
 }
 
 /// Resolve a click at `(col, row)` on the project tab row `area` to a
-/// [`ProjectHit`]. `names` are the project display names in tab order. The
-/// right-aligned "+ project" button is checked first so it wins where it
-/// overlaps a long tab strip.
+/// [`ProjectHit`]. `names` are the project display names in tab order and
+/// `active` is the project in view, which decides what the row shows when it is
+/// too narrow for every tab. The right-aligned "+ project" button is checked
+/// first so it wins where it overlaps the tab strip.
 pub fn project_tab_hit_test(
     area: Rect,
     names: &[String],
+    active: usize,
     col: u16,
     row: u16,
 ) -> Option<ProjectHit> {
@@ -866,7 +954,7 @@ pub fn project_tab_hit_test(
     if col >= btn_start && col < btn_start.saturating_add(btn_w) {
         return Some(ProjectHit::NewButton);
     }
-    for seg in project_tab_positions(area, names) {
+    for seg in project_tab_layout(area, names, active) {
         if col >= seg.start && col < seg.start.saturating_add(seg.width) {
             if col == seg.close_col {
                 return Some(ProjectHit::Close(seg.index));
@@ -895,12 +983,17 @@ pub fn draw_project_tab_bar(
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in projects.iter().enumerate() {
+    for (i, seg) in project_tab_layout(area, &names, active)
+        .into_iter()
+        .enumerate()
+    {
         if i > 0 {
             spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
         }
-        let is_active = i == active;
+        let p = &projects[seg.index];
+        let is_active = seg.index == active;
         let tab_style = if is_active {
             Style::default()
                 .fg(PROJECT_TAB_ACTIVE_BG)
@@ -923,7 +1016,7 @@ pub fn draw_project_tab_bar(
             indicator.to_string(),
             tab_style.fg(indicator_color),
         ));
-        spans.push(Span::styled(format!(" {} ", p.name), tab_style));
+        spans.push(Span::styled(format!(" {} ", seg.name), tab_style));
         spans.push(Span::styled(CLOSE_GLYPH, tab_style.fg(Color::Red)));
         spans.push(Span::styled(" ", tab_style));
     }
@@ -4572,20 +4665,20 @@ mod tests {
         let names = vec!["alpha".to_string(), "beta".to_string()];
         // "● alpha" is 7 cols; segment " label ✕ " spans cols 0..11, ✕ at col 9.
         assert_eq!(
-            project_tab_hit_test(area, &names, 2, 1),
+            project_tab_hit_test(area, &names, 0, 2, 1),
             Some(ProjectHit::Tab(0))
         );
         assert_eq!(
-            project_tab_hit_test(area, &names, 9, 1),
+            project_tab_hit_test(area, &names, 0, 9, 1),
             Some(ProjectHit::Close(0))
         );
         // The "+ project" button is flush right.
         assert_eq!(
-            project_tab_hit_test(area, &names, 79, 1),
+            project_tab_hit_test(area, &names, 0, 79, 1),
             Some(ProjectHit::NewButton)
         );
         // A row outside the project tab row resolves to nothing.
-        assert_eq!(project_tab_hit_test(area, &names, 2, 0), None);
+        assert_eq!(project_tab_hit_test(area, &names, 0, 2, 0), None);
     }
 
     #[test]
@@ -4612,6 +4705,146 @@ mod tests {
         assert!(row.contains("alpha"), "first project name: {row:?}");
         assert!(row.contains("beta"), "second project name: {row:?}");
         assert!(row.contains("+ project"), "new-project button: {row:?}");
+    }
+
+    /// Render the project tab row at `width` and return it as a string.
+    fn rendered_project_row(width: u16, names: &[&str], active: usize) -> String {
+        let mut term = test_terminal(width, 1);
+        let projects: Vec<ProjectTabInfo> = names
+            .iter()
+            .map(|n| ProjectTabInfo {
+                name: (*n).to_string(),
+                attention: false,
+                busy: false,
+            })
+            .collect();
+        term.draw(|frame| {
+            draw_project_tab_bar(frame, Rect::new(0, 0, width, 1), &projects, active, 0)
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn project_tab_names_shorten_instead_of_falling_off_the_row() {
+        let names = ["my-project-name", "flightdeck", "beads", "orange-site"];
+        // Wide enough for every name in full.
+        let wide = rendered_project_row(120, &names, 0);
+        assert!(wide.contains("my-project-name"), "{wide:?}");
+        assert!(wide.contains("orange-site"), "{wide:?}");
+
+        // Narrower: the names are cut with an ellipsis, but every project is
+        // still on the row rather than clipped out of view.
+        let narrow = rendered_project_row(80, &names, 0);
+        assert!(narrow.contains("my-project…"), "{narrow:?}");
+        assert!(narrow.contains("orange-si…"), "{narrow:?}");
+        assert!(
+            narrow.contains("beads"),
+            "short names stay whole: {narrow:?}"
+        );
+        assert!(narrow.contains("+ project"), "{narrow:?}");
+    }
+
+    #[test]
+    fn project_tab_row_fits_every_width_it_is_given() {
+        let names = owned(&["my-project-name", "flightdeck", "beads", "orange-site"]);
+        // 17 columns is where one tab's chrome and the "+ project" button stop
+        // fitting side by side; below that there is no layout to get right.
+        for width in 17..=200u16 {
+            let area = Rect::new(0, 0, width, 1);
+            let (btn_start, _) = project_new_button(area);
+            let segs = project_tab_layout(area, &names, 0);
+            let end = segs
+                .last()
+                .map(|s| s.start.saturating_add(s.width))
+                .unwrap_or(0);
+            // The strip stops short of the "+ project" button, so no tab is
+            // painted over by it and none runs off the right-hand edge.
+            assert!(
+                end <= btn_start,
+                "width {width}: tabs end at {end}, button starts at {btn_start}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_tab_names_shrink_to_a_letter_and_an_ellipsis_at_the_narrowest() {
+        // Two projects on a row with barely room for them: each keeps its first
+        // letter plus the `…` that marks the cut — the floor.
+        let row = rendered_project_row(30, &["my-project-name", "another-one"], 0);
+        assert!(row.contains("● m… ✕"), "{row:?}");
+        assert!(row.contains("● a… ✕"), "{row:?}");
+    }
+
+    #[test]
+    fn project_tab_hit_test_follows_the_shortened_labels() {
+        // The drift guard: whatever the row draws is what clicks resolve
+        // against. Find every `✕` the renderer painted and check that clicking
+        // it closes the project whose tab it belongs to.
+        let names = ["my-project-name", "flightdeck", "beads", "orange-site"];
+        let width = 70;
+        let row = rendered_project_row(width, &names, 0);
+        let area = Rect::new(0, 0, width, 1);
+        let closes: Vec<u16> = row
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '✕')
+            .map(|(i, _)| i as u16)
+            .collect();
+        assert_eq!(closes.len(), names.len(), "one ✕ per tab: {row:?}");
+        for (i, col) in closes.iter().enumerate() {
+            assert_eq!(
+                project_tab_hit_test(area, &owned(&names), 0, *col, 0),
+                Some(ProjectHit::Close(i)),
+                "the ✕ at column {col} closes project {i}: {row:?}"
+            );
+            // One column left of the ✕ is still the tab itself.
+            assert_eq!(
+                project_tab_hit_test(area, &owned(&names), 0, col - 1, 0),
+                Some(ProjectHit::Tab(i)),
+                "column {} selects project {i}: {row:?}",
+                col - 1
+            );
+        }
+    }
+
+    #[test]
+    fn project_tab_row_keeps_the_active_project_in_view() {
+        // Too narrow for four tabs even at the floor: the row shows the run
+        // that ends at the active project rather than dropping it off-screen.
+        let names = ["alpha", "bravo", "charlie", "delta"];
+        let row = rendered_project_row(50, &names, 3);
+        assert!(
+            row.contains("delta"),
+            "the active project is on the row: {row:?}"
+        );
+        assert!(!row.contains("alpha"), "the overflow is dropped: {row:?}");
+
+        // Switching back to the first project brings it back into view.
+        let row = rendered_project_row(50, &names, 0);
+        assert!(row.contains("alpha"), "{row:?}");
+    }
+
+    #[test]
+    fn share_name_budget_keeps_short_names_whole_and_spends_the_budget() {
+        // Everything fits: nothing is cut.
+        assert_eq!(share_name_budget(&[5, 4], 20), vec![5, 4]);
+        // Over budget: the short name survives intact, the long one absorbs the
+        // loss, and every column of the budget is used.
+        let alloc = share_name_budget(&[20, 3], 12);
+        assert_eq!(alloc[1], 3, "the short name is untouched: {alloc:?}");
+        assert_eq!(alloc.iter().sum::<usize>(), 12, "{alloc:?}");
+        // Two equally long names share what is left evenly.
+        let alloc = share_name_budget(&[20, 20], 11);
+        assert_eq!(alloc.iter().sum::<usize>(), 11, "{alloc:?}");
+        assert!(alloc[0].abs_diff(alloc[1]) <= 1, "{alloc:?}");
     }
 
     #[test]

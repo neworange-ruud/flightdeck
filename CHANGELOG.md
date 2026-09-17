@@ -16,7 +16,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Project tabs no longer fall off the tab bar.** Once the open projects
+  overflowed the row, the ones on the right were simply clipped out of view and
+  the `+ project` button painted over whatever was underneath it. The row now
+  shortens the names to fit — `my-project-name` becomes `my-proj…` — sharing the
+  available columns so short names stay whole and the long ones give up only as
+  much as they must. It re-fits as you resize, down to a first letter and an
+  ellipsis per tab; narrower still than that, the row keeps the run of tabs
+  ending at the project you are in, so the active project is always visible.
 
 ## [1.19.0] - 2026-09-17
 
