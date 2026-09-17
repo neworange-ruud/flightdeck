@@ -467,6 +467,14 @@ fn initial_status_snapshot(
 /// without firing a "finished" alert.
 pub const NOTIFY_STARTUP_GRACE_MS: u64 = 4000;
 
+/// Shortest gap between two session-store scans by
+/// [`AppState::pin_resumable_sessions`]. The scan reads the agent's whole
+/// session store to spot a newly-written session, and it repeats for as long as
+/// a tab is still waiting for one — which, for an agent the user has not yet
+/// prompted, is the rest of the run. One second keeps the pin prompt while
+/// bounding that to a rounding error; the render loop ticks far faster.
+pub const SESSION_SCAN_INTERVAL_MS: u64 = 1000;
+
 /// Which OS-notification category a settled status belongs to (SPECS §24), used
 /// to gate it against the per-category config toggles and to phrase the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +614,10 @@ pub struct AppState {
     /// project directory (SPECS §32). `None` means the tab's own worktree,
     /// which is the normal behavior.
     pub isolated_status_root: Option<PathBuf>,
+    /// Clock-millis of the last session-store scan by
+    /// [`Self::pin_resumable_sessions`], rate-limiting it to
+    /// [`SESSION_SCAN_INTERVAL_MS`]. `None` until the first scan. Runtime-only.
+    last_session_scan_ms: Option<u64>,
 }
 
 impl AppState {
@@ -641,6 +653,7 @@ impl AppState {
             update_available: None,
             isolated: false,
             isolated_status_root: None,
+            last_session_scan_ms: None,
         }
     }
 
@@ -2541,10 +2554,25 @@ impl AppState {
     /// snapshot. Persists if anything was pinned. Cheap when nothing is pending
     /// (only tabs with a live snapshot read the store). No-op when
     /// auto-continuation is off or in container mode.
-    pub fn pin_resumable_sessions(&mut self, home: &Path, services: &Services) {
+    pub fn pin_resumable_sessions(&mut self, home: &Path, services: &Services, now_ms: u64) {
         if !self.config.ui.auto_continue || self.config.containers.enabled {
             return;
         }
+        // Nothing is waiting: no scan, and the interval stays untouched so the
+        // next tab to launch is picked up on its very first tick.
+        if !self.tabs.iter().any(|t| t.session_snapshot.is_some()) {
+            return;
+        }
+        // A scan walks the agent's whole session store, and the wait has no
+        // deadline — an agent the user never prompts keeps its snapshot for the
+        // lifetime of the run. Unthrottled that is a full store walk every
+        // render tick, which is unbounded work for an unbounded time.
+        if let Some(last) = self.last_session_scan_ms {
+            if now_ms.saturating_sub(last) < SESSION_SCAN_INTERVAL_MS {
+                return;
+            }
+        }
+        self.last_session_scan_ms = Some(now_ms);
         let mut changed = false;
         for idx in 0..self.tabs.len() {
             let Some(snapshot) = self.tabs[idx].session_snapshot.clone() else {
@@ -5865,7 +5893,7 @@ mod tests {
         let fs = FakeFs::new();
         let pty = FakePty::new();
         let clock = FakeClock::default();
-        app.pin_resumable_sessions(home.path(), &services(&git, &fs, &pty, &clock));
+        app.pin_resumable_sessions(home.path(), &services(&git, &fs, &pty, &clock), 0);
 
         assert_eq!(
             app.tabs[0].meta.resume_args,
@@ -5878,6 +5906,76 @@ mod tests {
         assert!(
             app.tabs[0].session_snapshot.is_none(),
             "snapshot is cleared once pinned"
+        );
+    }
+
+    /// The scan walks the agent's entire session store, and a tab whose agent
+    /// never writes a session file stays snapshotted indefinitely — so the scan
+    /// must not run every render tick. Re-scanning is rate-limited to
+    /// [`SESSION_SCAN_INTERVAL_MS`].
+    ///
+    /// Observed through the pin: a session file that appears between two calls
+    /// inside one interval cannot be picked up by the second call, because that
+    /// call does not look.
+    #[cfg(unix)]
+    #[test]
+    fn pin_resumable_sessions_rate_limits_the_store_scan() {
+        let dir = TempDir::new().unwrap();
+        let (agent, _) = make_real_agent(&dir, "claude");
+        let config = config_with_agent(agent);
+
+        let mut ps = default_state("main");
+        let mut tab = recovered_tab("r");
+        tab.agent = "claude".to_string();
+        ps.tabs.push(tab);
+        let mut app = AppState::new(config, ps, REPO, STATE);
+        app.tabs[0].session_snapshot = Some(std::collections::HashSet::new());
+
+        let home = TempDir::new().unwrap();
+        let store = home
+            .path()
+            .join(".claude/projects/-repo--flightdeck-worktrees-r");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let git = FakeGit::new().with_root(REPO);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let services = services(&git, &fs, &pty, &clock);
+
+        // First tick: the store is empty, nothing to pin. This is the scan that
+        // starts the interval.
+        app.pin_resumable_sessions(home.path(), &services, 10_000);
+        assert!(app.tabs[0].meta.resume_args.is_empty());
+
+        // The agent writes its session file immediately afterwards.
+        std::fs::write(
+            store.join("3d74d44d-e9e7-407f-9938-c59ef4045e3f.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        // A tick inside the interval must not scan, so it cannot pin.
+        app.pin_resumable_sessions(
+            home.path(),
+            &services,
+            10_000 + SESSION_SCAN_INTERVAL_MS - 1,
+        );
+        assert!(
+            app.tabs[0].meta.resume_args.is_empty(),
+            "a tick inside the interval must not re-scan the store"
+        );
+        assert!(app.tabs[0].session_snapshot.is_some());
+
+        // The first tick at or past the interval scans again and pins.
+        app.pin_resumable_sessions(home.path(), &services, 10_000 + SESSION_SCAN_INTERVAL_MS);
+        assert_eq!(
+            app.tabs[0].meta.resume_args,
+            vec![
+                "--resume".to_string(),
+                "3d74d44d-e9e7-407f-9938-c59ef4045e3f".to_string()
+            ],
+            "the scan resumes once the interval has passed"
         );
     }
 

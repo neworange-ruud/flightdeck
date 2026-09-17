@@ -33,6 +33,27 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **A Codex tab no longer pegs a core and stalls the interface.** Matching a
+  rollout to its worktree reads the leading `session_meta` line, as it always
+  meant to; it had been slurping each whole file to look at that first line.
+  The scan runs from the render loop for every rollout in `~/.codex/sessions`
+  while a tab still awaits its session file, so the cost was the size of the
+  entire Codex history, every frame — a 3.4 GB store took 0.38 s per tick and
+  read over a terabyte in nine minutes. Reading one line takes 0.006 s. Claude
+  and Cursor tabs were never affected: they match on a directory listing and a
+  small `meta.json`.
+
+- **The scan behind that stall no longer repeats every frame.** Pinning a
+  freshly-launched agent's session re-read the store on every render tick for as
+  long as a tab was waiting for its session file — and an agent nobody has
+  prompted yet writes no such file, so the wait lasted the rest of the run. It
+  now scans at most once a second, and not at all while no tab is waiting.
+
+- **A panic or a startup error no longer aborts the process when the terminal
+  has closed.** Konsole closes stderr with its tab, and `eprintln!` turns that
+  write failure into a second panic — a panicking panic hook is an abort
+  (SIGABRT). Both the error path in `main` and the TUI panic hook now write
+  best-effort and keep the terminal restoration they were there to do.
 - **The `✕` on a sidebar agent row now closes it when `mode_border` is on.**
   With a live-pane border the sidebar reserves no seam column of its own — the
   pane's frame already draws that line — so its `✕` sits in the content's last

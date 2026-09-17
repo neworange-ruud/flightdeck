@@ -276,10 +276,11 @@ pub fn run() -> Result<()> {
     // mouse capture, bracketed paste, keyboard flags, or title we enabled after
     // it — and the teardown below is unwound straight past. Without this, a panic
     // drops the user at a shell whose every mouse movement arrives as escape
-    // sequences printed as text. Chained ahead of ratatui's hook, which still
-    // restores the screen and prints the panic afterwards.
+    // sequences printed as text. Do not delegate to Ratatui's hook: it calls
+    // `ratatui::restore`, whose `eprintln!` on a failed terminal restore panics
+    // when Konsole has already closed stderr. A panic hook panicking turns a
+    // recoverable process error into an abort (SIGABRT).
     {
-        let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // A panic from inside the VT parser is caught and handled by
             // `Terminal::process_output`, which rebuilds the parser and carries
@@ -290,7 +291,12 @@ pub fn run() -> Result<()> {
                 return;
             }
             restore_terminal_modes(keyboard_enhanced);
-            previous(info);
+            let _ = ratatui::try_restore();
+
+            // Unlike `eprintln!`, writing directly lets us discard an error
+            // from a terminal that disappeared with its Konsole tab. Preserve
+            // a useful panic report whenever stderr remains available.
+            best_effort_stderr_line(&format!("FlightDeck panicked: {info}"));
         }));
     }
 
@@ -2345,10 +2351,12 @@ fn event_loop(
             {
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
-                // Pin each freshly-launched agent's session id for later resume
-                // (cheap unless a tab is still awaiting its session file).
+                // Pin each freshly-launched agent's session id for later
+                // resume. A no-op unless a tab is awaiting its session file, and
+                // rate-limited to `SESSION_SCAN_INTERVAL_MS` when one is, since
+                // that wait has no deadline.
                 if let Some(home) = &store_home {
-                    p.state.pin_resumable_sessions(home, &services);
+                    p.state.pin_resumable_sessions(home, &services, now_ms);
                 }
             }
 
@@ -4426,6 +4434,20 @@ fn restore_terminal_modes(keyboard_enhanced: bool) {
     let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     let _ = restore_terminal_title();
+}
+
+/// Write an error report without allowing a broken terminal to panic again.
+///
+/// `eprintln!` treats an I/O failure as a panic. That is normally useful, but
+/// stderr is expected to be gone after a terminal emulator closes its tab.
+fn best_effort_stderr_line(message: &str) {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    best_effort_write_line(&mut stderr, message);
+}
+
+fn best_effort_write_line(writer: &mut impl std::io::Write, message: &str) {
+    let _ = writeln!(writer, "{message}");
 }
 
 /// Compute the PTY/terminal-viewport size from the full terminal size. Agents
@@ -9028,6 +9050,34 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    struct BrokenWriter;
+
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal is closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn best_effort_error_reporting_ignores_a_closed_terminal() {
+        let result = std::panic::catch_unwind(|| {
+            let mut writer = BrokenWriter;
+            best_effort_write_line(&mut writer, "flightdeck error: terminal closed");
+        });
+
+        assert!(
+            result.is_ok(),
+            "an error report must not cause a second panic"
+        );
+    }
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
