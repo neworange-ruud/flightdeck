@@ -16,6 +16,19 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **`flightdeck --isolated` (`-I`) no longer refuses to start on a branch other
+  than the default base.** An isolated run reused the normal base-tab flow,
+  which requires HEAD to be on the configured `default_base_branch` and refuses
+  a detached HEAD. That guard exists to stop the normal flow checking out a
+  branch underneath you or recording the wrong target, and an isolated run does
+  neither — it creates no worktree, mutates no git state, and discards its tab
+  at exit. It bit hardest in the one place `-I` is most useful: any managed
+  worktree under `.flightdeck/worktrees/`, where a previous normal run left a
+  `config.toml` naming `main` as the base while HEAD sits on the feature branch,
+  so `-I` died with `the project root is on '<branch>', not the default base
+  'main'`. An isolated run now takes whatever branch is checked out and labels
+  the tab with it; a detached HEAD or an unreadable HEAD falls back to the base
+  name instead of aborting. Normal runs keep the guard unchanged.
 - **A collapsed sidebar now actually widens the agent.** When the chrome
   collapses — terminal mode in a window too small for the full layout — the
   sidebar shrinks to a strip and FlightDeck draws a wider viewport, but the
