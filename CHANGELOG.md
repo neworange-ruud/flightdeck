@@ -16,7 +16,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **FlightDeck Remote no longer gets stuck on “Reconnecting” when its saved
+  pairing secrets are gone.** At launch, the iPhone app now reconciles its
+  visible paired-machine list with the Keychain records required to connect.
+  Orphaned entries return to the pairing screen instead of silently stopping
+  before any relay connection, while transient Keychain read failures leave the
+  existing pairing untouched.
 
 ## [1.20.0] - 2026-09-17
 

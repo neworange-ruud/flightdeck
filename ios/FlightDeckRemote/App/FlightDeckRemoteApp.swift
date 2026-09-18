@@ -15,7 +15,18 @@ struct FlightDeckRemoteApp: App {
     // doesn't surface (registration, wake pushes, tap handling) — see
     // `AppDelegate` / `PushCoordinator`.
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var router = AppRouter(pairingStore: PairingStore())
+    @State private var router: AppRouter
+
+    init() {
+        let pairingStore = PairingStore()
+        let isUITestLaunch = ProcessInfo.processInfo.arguments.contains {
+            $0.hasPrefix("-uitest")
+        }
+        if !isUITestLaunch {
+            TransportStoreFactory.reconcilePersistedPairings(in: pairingStore)
+        }
+        _router = State(initialValue: AppRouter(pairingStore: pairingStore))
+    }
 
     var body: some Scene {
         WindowGroup {

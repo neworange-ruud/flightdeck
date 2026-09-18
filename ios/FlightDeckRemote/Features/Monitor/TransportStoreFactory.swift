@@ -66,13 +66,13 @@ enum TransportStoreFactory {
     /// `PairingRecordStore`. Each client owns a fresh `URLSessionWebSocketConnection`
     /// and a per-pairing `SnapshotCache` file.
     ///
-    /// Legacy bridge: a device paired before multi-pairing has a `PairingRecord`
-    /// but no `PairedInstance` — synthesized here so the coordinator connects it
-    /// like any other. The DEBUG `-uitest-fixture-snapshot[-stale]` seams seed the
-    /// (recordless) transitional `primaryStore` so the Projects/Sessions screens
-    /// render deterministically without a live desktop, matching the pre-multi-
-    /// pairing `makeDefault` behavior. Real on-disk caches are skipped for any
-    /// `-uitest*` launch (hermeticity).
+    /// `FlightDeckRemoteApp` reconciles the Keychain records and non-secret
+    /// pairing metadata before constructing the router. The DEBUG
+    /// `-uitest-fixture-snapshot[-stale]` seams seed the (recordless)
+    /// transitional `primaryStore` so the Projects/Sessions screens render
+    /// deterministically without a live desktop, matching the pre-multi-pairing
+    /// `makeDefault` behavior. Real on-disk caches are skipped for any `-uitest*`
+    /// launch (hermeticity).
     static func makeCoordinator(
         pairingStore: PairingStore,
         arguments: [String] = ProcessInfo.processInfo.arguments
@@ -100,9 +100,6 @@ enum TransportStoreFactory {
             // `-uitest*` so tests never depend on the simulator's live path.
             networkMonitor: isUITestLaunch ? NoopNetworkPathMonitor() : NetworkPathMonitor()
         )
-        if !isUITestLaunch {
-            seedLegacyInstanceIfNeeded(into: pairingStore, recordStore: recordStore)
-        }
         coordinator.installInitialInstances(pairingStore.list)
         #if DEBUG
         if arguments.contains("-uitest-fixture-snapshot") {
@@ -115,24 +112,37 @@ enum TransportStoreFactory {
         return coordinator
     }
 
-    /// One-time legacy migration: if the device is paired (a `PairingRecord`
-    /// exists) but has no `PairedInstance` metadata yet (paired before
-    /// remote-control-b8d.4), synthesize the instance from the record so the
-    /// coordinator treats it as a first-class pairing. Idempotent — a no-op once
-    /// an instance list exists.
-    private static func seedLegacyInstanceIfNeeded(
-        into pairingStore: PairingStore,
-        recordStore: PairingRecordStore
+    /// Reconcile the non-secret UserDefaults metadata with the Keychain-backed
+    /// transport records before SwiftUI chooses the root route. A missing record
+    /// cannot reconnect: `TransportClient` stops before opening a socket, so
+    /// retaining its metadata would strand the app on "Reconnecting" forever.
+    ///
+    /// Only a successful Keychain enumeration may prune metadata. Any Keychain
+    /// or decoding error leaves the existing state untouched rather than turning
+    /// a potentially transient read failure into an unpair operation.
+    static func reconcilePersistedPairings(
+        in pairingStore: PairingStore,
+        recordStore: PairingRecordStore = PairingRecordStore()
     ) {
-        guard pairingStore.list.isEmpty,
-              let records = try? recordStore.loadAll(), !records.isEmpty else { return }
-        for record in records {
+        guard let records = try? recordStore.loadAll() else { return }
+        let recordIds = Set(records.map(\.pairingId))
+
+        for instance in pairingStore.list where !recordIds.contains(instance.pairingId) {
+            pairingStore.remove(pairingId: instance.pairingId)
+        }
+
+        let instanceIds = Set(pairingStore.list.map(\.pairingId))
+        for record in records where !instanceIds.contains(record.pairingId) {
             guard let url = URL(string: record.relayURL) else { continue }
             pairingStore.add(PairedInstance(
                 pairingId: record.pairingId,
                 relayURL: url,
                 pairedAt: record.pairedAt
             ))
+        }
+
+        if records.isEmpty {
+            pairingStore.unpair()
         }
     }
 
