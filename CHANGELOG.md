@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.21.0] - 2026-09-20
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - **FlightDeck Remote no longer gets stuck on “Reconnecting” when its saved
   pairing secrets are gone.** At launch, the iPhone app now reconciles its
   visible paired-machine list with the Keychain records required to connect.
