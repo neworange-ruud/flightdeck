@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.22.0] - 2026-09-21
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - **Long OpenCode conversations no longer keep FlightDeck near 100% CPU.** The
   phone transcript bridge used to reread and parse every historical part from
   OpenCode's SQLite database on each 50 ms UI tick. It now advances an
