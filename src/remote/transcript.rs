@@ -168,6 +168,10 @@ pub struct TranscriptBuilder {
     /// For OpenCode sessions (DB-backed, no tailable file): the session id
     /// currently being polled, so a new conversation in the worktree resets.
     oc_session: Option<String>,
+    /// Newest OpenCode `part.time_updated` consumed. Polls use this as an
+    /// inclusive cursor so historical payloads are not reparsed every tick while
+    /// the latest streaming part is still revisited until final.
+    oc_updated_at_ms: Option<i64>,
     /// Byte offset up to which `source` has been consumed (only whole lines).
     read_offset: u64,
     /// Record uuids already ingested, so a re-read never double-appends.
@@ -202,6 +206,7 @@ impl TranscriptBuilder {
             format: SessionFormat::Claude,
             source: None,
             oc_session: None,
+            oc_updated_at_ms: None,
             read_offset: 0,
             seen: HashSet::new(),
             last_agent_text: None,
@@ -283,7 +288,11 @@ impl TranscriptBuilder {
             self.oc_session = Some(sid.clone());
             self.reset();
         }
-        for part in crate::remote::opencode::fetch_parts(db, &sid) {
+        for part in crate::remote::opencode::fetch_parts(db, &sid, self.oc_updated_at_ms) {
+            self.oc_updated_at_ms = Some(
+                self.oc_updated_at_ms
+                    .map_or(part.updated_at_ms, |cursor| cursor.max(part.updated_at_ms)),
+            );
             if self.seen.contains(&part.id) {
                 continue;
             }
@@ -344,6 +353,7 @@ impl TranscriptBuilder {
     /// Clear all accumulated transcript state (on a session-file switch/rotate).
     fn reset(&mut self) {
         self.read_offset = 0;
+        self.oc_updated_at_ms = None;
         self.seen.clear();
         self.last_agent_text = None;
         self.items.clear();

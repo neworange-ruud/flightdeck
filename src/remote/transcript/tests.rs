@@ -668,6 +668,7 @@ fn oc(id: &str, role: &str, json: &str) -> Part {
         id: id.to_string(),
         role: role.to_string(),
         at_ms: 1000,
+        updated_at_ms: 1000,
         data: serde_json::from_str(json).unwrap(),
     }
 }
@@ -822,22 +823,42 @@ fn opencode_sync_reads_db_and_resets_on_session_switch() {
         "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
          CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
          CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
-                            time_created INTEGER, data TEXT);
+                            time_created INTEGER, time_updated INTEGER, data TEXT);
          INSERT INTO session VALUES ('ses_a','/repo/wt',100);
          INSERT INTO message VALUES ('ma','ses_a','{\"role\":\"user\"}');
-         INSERT INTO part VALUES ('pa','ma','ses_a',10,'{\"type\":\"text\",\"text\":\"first\"}');",
+         INSERT INTO part VALUES ('pa','ma','ses_a',10,100,'{\"type\":\"text\",\"text\":\"first\"}');",
     )
     .unwrap();
 
     let mut b = builder();
     b.sync_opencode(&db, "/repo/wt", 0);
     assert_eq!(labels(&b.load(None)), vec!["user:first"]);
+    assert_eq!(b.oc_updated_at_ms, Some(100));
+
+    // A streaming part at a newer update boundary remains eligible until a
+    // later mutation marks it final, without forcing the old part to be read.
+    conn.execute_batch(
+        "INSERT INTO message VALUES ('stream','ses_a','{\"role\":\"assistant\"}');
+         INSERT INTO part VALUES ('stream','stream','ses_a',20,200,
+           '{\"type\":\"text\",\"text\":\"partial\",\"time\":{\"start\":1}}');",
+    )
+    .unwrap();
+    b.sync_opencode(&db, "/repo/wt", 0);
+    assert_eq!(labels(&b.load(None)), vec!["user:first"]);
+    assert_eq!(b.oc_updated_at_ms, Some(200));
+    conn.execute(
+        "UPDATE part SET time_updated = 300, data = ?1 WHERE id = 'stream'",
+        [r#"{"type":"text","text":"finished","time":{"start":1,"end":2}}"#],
+    )
+    .unwrap();
+    b.sync_opencode(&db, "/repo/wt", 0);
+    assert_eq!(labels(&b.load(None)), vec!["user:first", "agent:finished"]);
 
     // A newer session in the same worktree replaces the transcript.
     conn.execute_batch(
         "INSERT INTO session VALUES ('ses_b','/repo/wt',200);
          INSERT INTO message VALUES ('mb','ses_b','{\"role\":\"user\"}');
-         INSERT INTO part VALUES ('pb','mb','ses_b',10,'{\"type\":\"text\",\"text\":\"second\"}');",
+         INSERT INTO part VALUES ('pb','mb','ses_b',10,400,'{\"type\":\"text\",\"text\":\"second\"}');",
     )
     .unwrap();
     b.sync_opencode(&db, "/repo/wt", 0);

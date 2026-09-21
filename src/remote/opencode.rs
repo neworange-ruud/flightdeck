@@ -47,6 +47,8 @@ pub struct Part {
     pub role: String,
     /// The part row's creation time in unix ms (its transcript timestamp).
     pub at_ms: i64,
+    /// The part row's last update time in unix ms (the incremental poll cursor).
+    pub updated_at_ms: i64,
     /// The parsed `part.data` JSON (`type`, and per-type fields).
     pub data: Value,
 }
@@ -81,41 +83,46 @@ mod imp {
         .ok()
     }
 
-    /// Every `part` of `session_id`, joined to its message role and ordered as it
-    /// was written (`time_created`, then rowid to break ties within a message).
-    /// Returns empty on any read error.
-    pub fn fetch_parts(db: &Path, session_id: &str) -> Vec<Part> {
+    /// Every `part` of `session_id` updated at or after `updated_since`, joined to
+    /// its message role and ordered as it was written (`time_created`, then rowid
+    /// to break ties within a message). The inclusive boundary deliberately
+    /// revisits the newest row so an in-flight part remains observable until it
+    /// finalizes. Returns empty on any read error.
+    pub fn fetch_parts(db: &Path, session_id: &str, updated_since: Option<i64>) -> Vec<Part> {
         let Some(conn) = open_ro(db) else {
             return Vec::new();
         };
         // `json_extract` is available because the bundled SQLite ships JSON1.
         let mut stmt = match conn.prepare(
-            "SELECT p.id, json_extract(m.data, '$.role'), p.time_created, p.data \
+            "SELECT p.id, json_extract(m.data, '$.role'), p.time_created, \
+                    p.time_updated, p.data \
              FROM part p JOIN message m ON p.message_id = m.id \
-             WHERE p.session_id = ?1 \
+             WHERE p.session_id = ?1 AND (?2 IS NULL OR p.time_updated >= ?2) \
              ORDER BY p.time_created ASC, p.rowid ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = stmt.query_map([session_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![session_id, updated_since], |row| {
             let id: String = row.get(0)?;
             let role: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
             let at_ms: i64 = row.get(2)?;
-            let data: String = row.get(3)?;
-            Ok((id, role, at_ms, data))
+            let updated_at_ms: i64 = row.get(3)?;
+            let data: String = row.get(4)?;
+            Ok((id, role, at_ms, updated_at_ms, data))
         });
         let Ok(rows) = rows else {
             return Vec::new();
         };
         rows.flatten()
-            .filter_map(|(id, role, at_ms, data)| {
+            .filter_map(|(id, role, at_ms, updated_at_ms, data)| {
                 serde_json::from_str::<serde_json::Value>(&data)
                     .ok()
                     .map(|data| Part {
                         id,
                         role,
                         at_ms,
+                        updated_at_ms,
                         data,
                     })
             })
@@ -134,7 +141,7 @@ mod imp {
     pub fn latest_session_id(_db: &Path, _directory: &str) -> Option<String> {
         None
     }
-    pub fn fetch_parts(_db: &Path, _session_id: &str) -> Vec<Part> {
+    pub fn fetch_parts(_db: &Path, _session_id: &str, _updated_since: Option<i64>) -> Vec<Part> {
         Vec::new()
     }
 }
@@ -160,18 +167,18 @@ mod tests {
             "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
              CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
              CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
-                                time_created INTEGER, data TEXT);
+                                 time_created INTEGER, time_updated INTEGER, data TEXT);
              INSERT INTO session VALUES ('ses_old','/repo/wt',100);
              INSERT INTO session VALUES ('ses_new','/repo/wt',200);
              INSERT INTO session VALUES ('ses_other','/elsewhere',300);
              INSERT INTO message VALUES ('m1','ses_new','{\"role\":\"user\"}');
              INSERT INTO message VALUES ('m2','ses_new','{\"role\":\"assistant\"}');
              -- Inserted out of time order to prove the query sorts by time_created.
-             INSERT INTO part VALUES ('p2','m2','ses_new',20,'{\"type\":\"text\",\"text\":\"hi back\"}');
-             INSERT INTO part VALUES ('p1','m1','ses_new',10,'{\"type\":\"text\",\"text\":\"hi\"}');
+             INSERT INTO part VALUES ('p2','m2','ses_new',20,200,'{\"type\":\"text\",\"text\":\"hi back\"}');
+             INSERT INTO part VALUES ('p1','m1','ses_new',10,100,'{\"type\":\"text\",\"text\":\"hi\"}');
              -- A part in another session must never be returned.
              INSERT INTO message VALUES ('m3','ses_other','{\"role\":\"user\"}');
-             INSERT INTO part VALUES ('p3','m3','ses_other',10,'{\"type\":\"text\",\"text\":\"nope\"}');",
+             INSERT INTO part VALUES ('p3','m3','ses_other',10,300,'{\"type\":\"text\",\"text\":\"nope\"}');",
         )
         .unwrap();
     }
@@ -194,7 +201,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("opencode.db");
         seed(&db);
-        let parts = fetch_parts(&db, "ses_new");
+        let parts = fetch_parts(&db, "ses_new", None);
         let got: Vec<(&str, &str, &str)> = parts
             .iter()
             .map(|p| {
@@ -213,9 +220,23 @@ mod tests {
     }
 
     #[test]
+    fn fetch_parts_filters_on_inclusive_update_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        seed(&db);
+
+        let parts = fetch_parts(&db, "ses_new", Some(200));
+        assert_eq!(
+            parts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["p2"],
+            "the newest update boundary is revisited without rereading history"
+        );
+    }
+
+    #[test]
     fn missing_db_is_a_safe_empty() {
         let db = Path::new("/no/such/opencode.db");
         assert_eq!(latest_session_id(db, "/repo/wt"), None);
-        assert!(fetch_parts(db, "ses_new").is_empty());
+        assert!(fetch_parts(db, "ses_new", None).is_empty());
     }
 }
