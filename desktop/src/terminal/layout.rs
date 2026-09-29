@@ -22,6 +22,15 @@ pub struct TermPalette {
     pub cursor: Hex,
     pub cursor_ink: Hex,
     pub selection: Hex,
+    /// The one ink every glyph takes while [`TermPalette::dimmed`].
+    pub dim_ink: Hex,
+    /// The scrollback scrollbar's thumb.
+    pub scrollbar: Hex,
+    /// Draw the terminal as "not listening" (the TUI's `[ui]
+    /// dim_terminal_in_app_mode`): every glyph in [`TermPalette::dim_ink`], no
+    /// bold. Part of the palette so a row cache lays everything out again when
+    /// it flips, exactly as for a palette change.
+    pub dimmed: bool,
 }
 
 impl TermPalette {
@@ -33,7 +42,15 @@ impl TermPalette {
             cursor: p.terminal_cursor,
             cursor_ink: p.terminal_cursor_ink,
             selection: p.terminal_selection,
+            dim_ink: p.faint,
+            scrollbar: p.separator,
+            dimmed: false,
         }
+    }
+
+    /// This palette, dimmed or not.
+    pub fn with_dimmed(self, dimmed: bool) -> Self {
+        Self { dimmed, ..self }
     }
 
     /// The colour a cell colour paints as. `Default` is the theme's
@@ -288,6 +305,13 @@ pub fn layout_row(
         if attrs.dim {
             fg = mix(fg, bg, 0.5);
         }
+        // The TUI's gray-out: one muted ink and no bold, whatever the program
+        // asked for, so a terminal that is not listening reads as asleep.
+        // Backgrounds and the selection overlay keep their colours.
+        let bold = attrs.bold && !palette.dimmed;
+        if palette.dimmed {
+            fg = palette.dim_ink;
+        }
         let under_cursor = cursor.filter(|c| c.col == col);
         if let Some(c) = under_cursor {
             if c.filled {
@@ -341,7 +365,7 @@ pub fn layout_row(
 
         let style = SpanStyle {
             fg,
-            bold: attrs.bold,
+            bold,
             italic: attrs.italic,
             underline: attrs.underline,
             strikethrough: attrs.strikethrough,
@@ -364,7 +388,7 @@ pub fn layout_row(
             col,
             text: text.to_string(),
             fg,
-            bold: attrs.bold,
+            bold,
             italic: attrs.italic,
             underline: attrs.underline,
             strikethrough: attrs.strikethrough,
@@ -501,6 +525,22 @@ mod tests {
             .map(|s| (s.row, s.col, s.cols))
             .collect();
         assert_eq!(spans, vec![(0, 1, 9), (1, 0, 2)]);
+    }
+
+    #[test]
+    fn a_dimmed_palette_grays_every_glyph_and_drops_bold() {
+        let mut grid = Emulator::Alacritty.build(2, 20);
+        grid.process("\x1b[1;31mred\x1b[0m \x1b[42mbg\x1b[0m ┌".as_bytes());
+        let p = palette().with_dimmed(true);
+        let frame = layout(grid.as_ref(), None, &p, false);
+        assert!(frame.texts.iter().all(|t| t.fg == p.dim_ink && !t.bold));
+        assert!(frame.boxes.iter().all(|b| b.fg == p.dim_ink));
+        // Backgrounds keep their colour: only the ink sleeps.
+        assert_eq!(frame.backgrounds[0].color, p.ansi[2]);
+        // Undimmed, the same cells keep their own colours.
+        let lit = layout(grid.as_ref(), None, &palette(), false);
+        assert_eq!(lit.texts[0].fg, p.ansi[1]);
+        assert!(lit.texts[0].bold);
     }
 
     #[test]

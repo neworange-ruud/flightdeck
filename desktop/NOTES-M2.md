@@ -230,3 +230,59 @@ release builds, the key window, M2 Pro, other builds running, load ~30):
 
 The arcs now cost about 1.2–1.4 % of a core on top of the waiting case. In a
 background or hidden window they cost nothing.
+
+## Terminal element (production) (`remote-control-bmej.3.2`)
+
+The element and view in `desktop/src/terminal/` now carry the whole mouse,
+cursor and sizing behaviour, for the app's host terminal and the spike alike.
+The reference for every rule is the TUI (`handle_mouse_project`,
+`autoscroll_drag`, `handle_scroll` in `src/lib.rs`, `dim_terminal` in
+`src/tui/render.rs`).
+
+| Area | What it does | vs the TUI |
+| --- | --- | --- |
+| Selection | Left drag selects; release copies (`cx.write_to_clipboard`, the system clipboard) and leaves it highlighted; a click that selected nothing clears it. The drag follows the pointer outside the element and window (window-level listeners registered in `paint`). Cmd-C (macOS) copies too. | Same rule. The TUI copies with `tui::clipboard::copy` (pbcopy / clip / wl-copy, OSC 52 fallback); the GUI owns a clipboard. No double/triple click: the TUI has none. |
+| Auto-scroll | A drag past the top or bottom edge scrolls one line every 50 ms, pointer held still or not, and pins the selection head to the edge row. | Same step and rate as `autoscroll_drag` (1 line per 50 ms loop tick). The GUI triggers past the grid edge, the TUI on the edge row (a TUI pointer cannot leave the window). |
+| Shift | Shift-drag selects over a program that reports the mouse. | Same. |
+| Mouse reporting | Presses, releases and the motion the mode asks for: X10 `?9` presses only (no modifier bits), `?1000` press/release, `?1002` + drag motion, `?1003` + hover motion over the grid. Left, middle, right. Encodings: default, UTF-8 `?1005`, SGR `?1006`, all through the core's `encode_mouse_button` / `encode_mouse_report`. | Same encoders, byte for byte. The TUI forwards left-button presses/releases and a drag motion in any mode; the GUI follows the mode exactly, and adds middle/right buttons and modifier bits (xterm's). URXVT `?1015` is not reported by either emulator, so neither front-end has it. |
+| UTF-8 encoding | `?1005` is now real UTF-8 in the core encoder (coordinates past 95 take two bytes, up to 2015). | A core fix: before, UTF-8 was sent as the legacy bytes, wrong past column 95, in both front-ends. |
+| Wheel | With mouse reporting, one wheel report per notch goes to the program (Shift does not override). Otherwise it scrolls history, 3 lines a notch; trackpad pixels accumulate into whole lines. On an alternate screen without reporting it does nothing. | Same routing and 3 lines (`SCROLL_LINES`). The spike's "arrow keys on the alternate screen" is gone: the TUI does not do it. |
+| Scrollbar | A 4 px thumb at the grid's right edge (token `separator`), only while scrolled into history. No track, no dragging, no fade timer. | The TUI has none. |
+| Input | A key or paste drops the selection and returns to the live screen: the host does it for the app (`write_active_pty`), the view for the spike. | Same (the same code, for the app). |
+| Paste | The app's paste is the host's (`encode_paste`, bracketed under `?2004`); the spike now uses the same encoder. | Byte for byte. See the follow-up below. |
+| Cursor | DECSCUSR block / underline / bar; a hollow block when the terminal lacks key focus or the window is inactive. Blinks only when the program asks for a blinking cursor, the terminal is focused and the window active: 500 ms phases, so at most 2 frames/s, and none otherwise. Typing shows it and restarts the phase. | The TUI hands the cursor to its host terminal and never blinks it. A steady cursor (every shell's default, `CSI 0 SP q` in alacritty) costs no frames. |
+| Font size | `[ui] desktop_terminal_font_size`, default 13, 8–32, validated at load, layered like every `[ui]` key, a configuration-manager row (a new `FieldKind::IntegerChoice`, written as a TOML integer), read each frame so a save applies at once. macOS: Cmd-= / Cmd-+ / Cmd-- zoom a point, Cmd-0 resets; the zoom is a GPUI global (every terminal in the window follows) and not saved. | TUI ignores it. No zoom on Linux/Windows: Ctrl-= / Ctrl-- / Ctrl-0 belong to the terminal (Ctrl-- is readline's undo, 0x1f) and the keymap table has no such chord. |
+| Dimming | In APP mode with `[ui] dim_terminal_in_app_mode` on (default), every glyph takes the `faint` token and loses bold; backgrounds and the selection keep their colours. | The TUI's rule (`!focused && dim_terminal_in_app_mode`), which keys on the mode only. An inactive window hollows the cursor but does not dim: the TUI setting is about App mode, and dimming whenever another window has focus would grey out an agent you are watching. |
+| Resize | The element's cell count is the host's viewport (`HostModel::set_viewport`), applied to every project's PTYs on the next turn; FlightDeck Web's `HostState.geometry` and each terminal's `geometry` are the grid the PTY then has. | D4, unchanged. |
+
+**Tests** (`desktop/src/terminal/tests.rs`, GPUI's test platform; the fake
+PTY's input is compared with bytes built by the core encoders): copy on
+release, and nothing before it; a drag that leaves the window; auto-scroll past
+the top edge (3 ticks, 3 lines, the copy starts three lines higher) and the
+bottom; Shift-drag over `?1000`; Cmd-C; every mouse mode × encoding (press,
+drag, hover, release, right button; X10 on vt100, which is the only emulator
+with `?9`); wheel to history (notches, trackpad pixels), to the program, and on
+an alternate screen; bracketed paste; DECSCUSR shapes, hollow when blurred and
+when the window is inactive; blink phases, restart on typing and stop when
+inactive; font size from config and Cmd zoom; dimming in APP mode and with the
+setting off; a window resize reaching the PTY and `AppHost::web_host_state`
+(new, `testing` feature). Plus layout (dimmed palette), row cache (a blink
+phase relays one row), scrollbar geometry, zoom rules, the UTF-8 encoder, config
+validation, layering and the manager row.
+
+**Looked at** (`--features spike-snapshot`, with a new `--spike-mouse "down:X,Y
+move:X,Y up:X,Y wheel:N blur"` flag): a three-line selection ending mid-row;
+the scrollbar after 20 wheel notches over `seq 1 300`; the underline and bar
+cursors; the filled block; the hollow block after `blur`.
+
+**Not done / follow-ups**
+
+- Selection by word or line (double/triple click), and dragging the scrollbar:
+  the TUI has neither.
+- A zoom chord off macOS, and zoom in App mode (the chord is handled by the
+  focused terminal).
+- `encode_paste` does not strip an embedded `ESC[201~` from bracketed text (the
+  old spike encoder did). Changing it changes the TUI, the app and the phone
+  relay together, so it is filed rather than done here.
+- The help screen does not list Cmd-C / Cmd zoom (help is shared with the TUI
+  and the web).

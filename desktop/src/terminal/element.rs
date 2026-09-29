@@ -1,12 +1,19 @@
 //! The GPUI element that paints a terminal's cell grid.
 //!
-//! Each frame: measure the monospace cell, size the grid (and so the PTY) to
-//! the bounds, bring the view's [`RowCache`] up to date (only rows the
-//! emulator reports damaged are laid out and shaped again, see
-//! [`super::rowcache`]), then paint it back to front — backgrounds, selection,
-//! a filled cursor, text, box geometry, and the outline/bar/underline cursors.
-//! Colours were resolved by the layout; this file only turns cells into
-//! pixels.
+//! Each frame: measure the monospace cell at the view's font size (the
+//! `[ui] desktop_terminal_font_size` setting plus any zoom, see
+//! [`super::zoom`]), size the grid (and so the PTY) to the bounds, bring the
+//! view's [`RowCache`] up to date (only rows the emulator reports damaged are
+//! laid out and shaped again, see [`super::rowcache`]), then paint it back to
+//! front — backgrounds, selection, a filled cursor, text, box geometry, the
+//! outline/bar/underline cursors, and the scrollbar while the view is scrolled
+//! into history. Colours were resolved by the layout; this file only turns
+//! cells into pixels.
+//!
+//! Paint also registers the window-level mouse listeners a drag needs: a
+//! selection or a forwarded button keeps following the pointer after it leaves
+//! the element (and the window), which the view's hover-bound listeners cannot
+//! do.
 //!
 //! Text is shaped per span. An ASCII span is shaped with GPUI's forced
 //! per-glyph advance set to the cell width, so every glyph lands on its column
@@ -15,10 +22,10 @@
 //! their column, so a glyph with a foreign advance cannot shift its neighbours.
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, Element, ElementId, ElementInputHandler, Entity,
-    Font, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PathBuilder, Pixels,
-    Point, ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
-    Window,
+    fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
+    ElementInputHandler, Entity, Font, GlobalElementId, Hsla, InspectorElementId, IntoElement,
+    LayoutId, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ShapedLine, SharedString,
+    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
 };
 
 use super::boxdraw::{BoxGlyph, Corner, Weight};
@@ -33,8 +40,6 @@ use flightdeck::terminal::grid::CursorShape;
 /// (`crate::fonts`), the same on every OS.
 const MONO_FAMILY: &str = crate::fonts::MONO_FAMILY;
 
-/// Terminal text size.
-const FONT_SIZE: f32 = 13.0;
 /// Line height as a multiple of the font size, when the font's own
 /// ascent + descent is tighter than this.
 const MIN_LINE_HEIGHT: f32 = 1.25;
@@ -76,18 +81,61 @@ pub fn mono_font() -> Font {
     gpui::font(MONO_FAMILY)
 }
 
-/// Measure the cell for the mono font at [`FONT_SIZE`].
-pub fn measure_cell(window: &Window) -> (Pixels, Pixels) {
-    let font_size = px(FONT_SIZE);
+/// Measure the cell for the mono font at `points`.
+pub fn measure_cell(window: &Window, points: f32) -> (Pixels, Pixels) {
+    let font_size = px(points);
     let text_system = window.text_system();
     let font_id = text_system.resolve_font(&mono_font());
     let width = text_system
         .advance(font_id, font_size, 'm')
         .map(|s| s.width)
-        .unwrap_or(px(FONT_SIZE * 0.6));
+        .unwrap_or(px(points * 0.6));
     let natural = text_system.ascent(font_id, font_size) + text_system.descent(font_id, font_size);
-    let height = natural.max(px(FONT_SIZE * MIN_LINE_HEIGHT)).ceil();
+    let height = natural.max(px(points * MIN_LINE_HEIGHT)).ceil();
     (width, height)
+}
+
+/// The scrollbar's thumb width and its gap from the element's right edge.
+const SCROLLBAR_WIDTH: f32 = 4.0;
+const SCROLLBAR_INSET: f32 = 2.0;
+/// The thumb never shrinks below this, however long the history.
+const SCROLLBAR_MIN_THUMB: f32 = 16.0;
+
+/// The scrollbar thumb for a view `offset` rows up into `history` rows, over
+/// a `rows`-row grid drawn in `track` (the grid's own height; the thumb sits
+/// at its right edge, over the last column like a macOS overlay scrollbar).
+/// Its length is the share of the content on screen; its position is how far
+/// through the content the viewport's top row is.
+///
+/// `None` on the live screen: the bar shows only while scrolled into history,
+/// so a live terminal never carries it, nor does an alternate screen (which
+/// has no history). Drawn from the grid's own numbers each frame, so it costs
+/// no timer and no frame of its own.
+pub fn scrollbar_thumb(
+    track: Bounds<Pixels>,
+    rows: u16,
+    offset: usize,
+    history: usize,
+) -> Option<Bounds<Pixels>> {
+    if offset == 0 || history == 0 {
+        return None;
+    }
+    let rows_f = f32::from(rows.max(1));
+    let total = history as f32 + rows_f;
+    let height = track.size.height;
+    let length = (height * (rows_f / total))
+        .max(px(SCROLLBAR_MIN_THUMB))
+        .min(height);
+    // 0.0 at the oldest history row, 1.0 at the live screen.
+    let through = (history - offset.min(history)) as f32 / history as f32;
+    let top = track.origin.y + (height - length) * through;
+    Some(Bounds::new(
+        point(
+            track.origin.x + track.size.width - px(SCROLLBAR_WIDTH + SCROLLBAR_INSET),
+            top,
+        ),
+        size(px(SCROLLBAR_WIDTH), length),
+    ))
 }
 
 /// Paints the grid of the [`TerminalView`] it is given.
@@ -120,8 +168,12 @@ pub struct Prepared {
     cache: RowCache<Vec<ShapedLine>>,
     selection: Vec<CellSpan>,
     metrics: CellMetrics,
+    /// The grid's own bounds (whole cells), for the mouse listeners.
+    grid: Bounds<Pixels>,
     background: Hex,
     cursor_colour: Hex,
+    /// The scrollbar thumb and its colour, while scrolled into history.
+    scrollbar: Option<(Bounds<Pixels>, Hex)>,
 }
 
 impl Element for TerminalElement {
@@ -161,7 +213,8 @@ impl Element for TerminalElement {
         if let Some(probe) = self.view.read(cx).probe() {
             probe.borrow_mut().prepaint_started();
         }
-        let (width, height) = measure_cell(window);
+        let points = self.view.read(cx).font_size(cx);
+        let (width, height) = measure_cell(window, points);
         let metrics = CellMetrics {
             origin: bounds.origin,
             width,
@@ -170,25 +223,46 @@ impl Element for TerminalElement {
         // The grid follows the element: as many whole cells as fit.
         let cols = (bounds.size.width / width).floor().max(1.0) as u16;
         let rows = (bounds.size.height / height).floor().max(1.0) as u16;
-        let focused = self.view.read(cx).focus_handle().is_focused(window);
+        // Focused, for the cursor: this terminal has key focus AND its window
+        // is the active one. Otherwise the block is hollow and nothing blinks.
+        let window_active = window.is_window_active();
+        let focused = self.view.read(cx).focus_handle().is_focused(window) && window_active;
 
-        let (mut cache, selection, palette) = self.view.update(cx, |view, cx| {
-            // Shaped text is only valid for the cell size it was forced to.
+        let (mut cache, selection, palette, scroll) = self.view.update(cx, |view, cx| {
+            // Shaped text is only valid for the font size and the cell width
+            // it was shaped and forced to.
             let resized_cells = view
                 .metrics()
                 .is_none_or(|old| (old.width, old.height) != (width, height));
+            let reshape = view.take_font_change(points) || resized_cells;
             view.set_metrics(metrics);
             view.resize(PtySize { rows, cols }, cx);
+            view.set_window_active(window_active);
             let (mut cache, selection) = view.prepare_rows(focused, cx);
-            if resized_cells {
+            if reshape {
                 cache.invalidate_derived();
             }
-            (cache, selection, *view.palette())
+            (
+                cache,
+                selection,
+                view.frame_palette(cx),
+                view.scroll_position(cx),
+            )
         });
+        let grid = Bounds::new(
+            bounds.origin,
+            size(width * f32::from(cols), height * f32::from(rows)),
+        );
+        let scrollbar = scroll
+            .and_then(|(offset, history)| {
+                let track = Bounds::new(bounds.origin, size(bounds.size.width, grid.size.height));
+                scrollbar_thumb(track, rows, offset, history)
+            })
+            .map(|thumb| (thumb, palette.scrollbar));
 
-        // Shape what the update re-laid (and everything after a cell resize);
-        // every other row paints the lines shaped on an earlier frame.
-        let font_size = px(FONT_SIZE);
+        // Shape what the update re-laid (and everything after a font or cell
+        // change); every other row paints the lines shaped on an earlier frame.
+        let font_size = px(points);
         for row in cache.rows_mut() {
             if row.derived.is_none() {
                 let lines = row
@@ -204,8 +278,10 @@ impl Element for TerminalElement {
             cache,
             selection,
             metrics,
+            grid,
             background: palette.bg,
             cursor_colour: palette.cursor,
+            scrollbar,
         }
     }
 
@@ -294,6 +370,28 @@ impl Element for TerminalElement {
                 CursorShape::Block => paint_outline(cell, px(1.), cursor_colour, window),
             }
         }
+
+        if let Some((thumb, colour)) = prepared.scrollbar {
+            window.paint_quad(fill(thumb, colour.hsla()).corner_radii(thumb.size.width / 2.));
+        }
+
+        // A drag keeps following the pointer outside the element: these hear
+        // every move and release in the window, and the view ignores them
+        // unless a selection drag or a forwarded button is in progress, or
+        // (any-motion reporting) the pointer is over this grid.
+        let grid = prepared.grid;
+        let view = self.view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                view.update(cx, |view, cx| view.window_mouse_move(event, grid, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                view.update(cx, |view, cx| view.window_mouse_up(event, cx));
+            }
+        });
         super::bench::PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cache = std::mem::take(&mut prepared.cache);
         self.view.update(cx, |view, _| {

@@ -66,6 +66,12 @@ pub(crate) struct SnapshotOptions {
     keys: Vec<String>,
     /// `--spike-wait-ms N`: how long after opening to take the snapshot.
     wait: Option<Duration>,
+    /// `--spike-mouse "down:X,Y move:X,Y up:X,Y wheel:N blur"`: pointer
+    /// events dispatched after the keys, at window coordinates in pixels
+    /// (`down`/`move`/`up` with the left button; `wheel:N` is N notches up,
+    /// negative for down; `blur` takes key focus away), for render checks of a
+    /// selection, the scrollbar and the unfocused cursor.
+    pointer: Vec<String>,
 }
 
 impl SnapshotOptions {
@@ -102,6 +108,11 @@ pub(crate) fn split_snapshot(
                     .and_then(|v| v.parse::<u64>().ok())
                     .ok_or("--spike-wait-ms: expected milliseconds")?;
                 opts.wait = Some(Duration::from_millis(ms));
+            }
+            "--spike-mouse" => {
+                it.next();
+                let events = it.next().ok_or("--spike-mouse: expected pointer events")?;
+                opts.pointer = events.split_whitespace().map(str::to_string).collect();
             }
             _ => break,
         }
@@ -187,7 +198,7 @@ pub fn run_window(argv: Vec<String>) {
         cx.activate(true);
 
         #[cfg(feature = "spike-snapshot")]
-        if snapshot.path.is_some() || !snapshot.keys.is_empty() {
+        if snapshot.is_requested() {
             snapshot::schedule(handle.into(), snapshot, cx);
         }
         #[cfg(not(feature = "spike-snapshot"))]
@@ -202,7 +213,10 @@ pub(crate) mod snapshot {
     use std::io::Write as _;
     use std::time::Duration;
 
-    use gpui::{AnyWindowHandle, App, Keystroke};
+    use gpui::{
+        point, px, AnyWindowHandle, App, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+        MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+    };
 
     use super::SnapshotOptions;
 
@@ -231,6 +245,24 @@ pub(crate) mod snapshot {
                     elapsed += Duration::from_millis(15);
                 }
             }
+            if !opts.pointer.is_empty() {
+                executor.timer(KEYS_AFTER.saturating_sub(elapsed)).await;
+                elapsed = elapsed.max(KEYS_AFTER);
+                for event in &opts.pointer {
+                    let Some(input) = pointer_event(event) else {
+                        eprintln!("spike-mouse: cannot parse {event:?}");
+                        continue;
+                    };
+                    let _ = window.update(cx, |_, window, cx| match input {
+                        Some(input) => {
+                            window.dispatch_event(input, cx);
+                        }
+                        None => window.blur(cx),
+                    });
+                    executor.timer(Duration::from_millis(15)).await;
+                    elapsed += Duration::from_millis(15);
+                }
+            }
             executor.timer(wait.saturating_sub(elapsed)).await;
             if let Some(path) = &opts.path {
                 let image = window.update(cx, |_, window, _| window.render_to_image());
@@ -253,6 +285,49 @@ pub(crate) mod snapshot {
             cx.update(|cx| cx.quit());
         })
         .detach();
+    }
+
+    /// One `--spike-mouse` event: `Some(Some(input))` to dispatch,
+    /// `Some(None)` for `blur`, `None` when it does not parse.
+    fn pointer_event(spec: &str) -> Option<Option<PlatformInput>> {
+        if spec == "blur" {
+            return Some(None);
+        }
+        let (kind, arg) = spec.split_once(':')?;
+        if kind == "wheel" {
+            let notches: f32 = arg.parse().ok()?;
+            return Some(Some(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position: point(px(200.), px(200.)),
+                delta: ScrollDelta::Lines(point(0., notches)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            })));
+        }
+        let (x, y) = arg.split_once(',')?;
+        let position = point(px(x.parse().ok()?), px(y.parse().ok()?));
+        let modifiers = Modifiers::default();
+        let button = MouseButton::Left;
+        Some(Some(match kind {
+            "down" => PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            "move" => PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: Some(button),
+                modifiers,
+            }),
+            "up" => PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+            _ => return None,
+        }))
     }
 
     /// Binary PPM (P6): RGB, no alpha. Trivial to write, and `sips` /

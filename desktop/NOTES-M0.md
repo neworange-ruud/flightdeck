@@ -547,7 +547,9 @@ How the element draws:
   bracketed paste.
 - Mouse events are forwarded when the program asked for them (Shift overrides).
   Otherwise the mouse drives local selection (copied on release) and scrollback.
-  On the alt screen without mouse reporting, the wheel sends arrow keys.
+  (The spike sent arrow keys for the wheel on an alternate screen without mouse
+  reporting; the production element dropped that for parity with the TUI, see
+  NOTES-M2, "Terminal element (production)".)
 
 ### Verified, and how
 

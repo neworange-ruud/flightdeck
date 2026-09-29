@@ -80,6 +80,21 @@ impl<S> RowCache<S> {
         palette: &TermPalette,
         focused: bool,
     ) -> usize {
+        let cursor = layout::cursor_placement(grid, focused);
+        self.update_with_cursor(source, grid, damage, palette, cursor)
+    }
+
+    /// [`RowCache::update`] with the cursor already placed (`None`: draw no
+    /// cursor, as during a blink's off phase). The cursor still counts as row
+    /// content: a row it enters or leaves is laid out again.
+    pub fn update_with_cursor(
+        &mut self,
+        source: usize,
+        grid: &dyn GridView,
+        damage: GridDamage,
+        palette: &TermPalette,
+        cursor: Option<(u16, RowCursor)>,
+    ) -> usize {
         let size = grid.size();
         let (rows, _) = size;
         let everything = damage == GridDamage::Full
@@ -103,7 +118,6 @@ impl<S> RowCache<S> {
             GridDamage::Rows(rows) => rows.as_slice(),
             GridDamage::Full => &[],
         };
-        let cursor = layout::cursor_placement(grid, focused);
         let mut laid_out = 0;
         for (row, cached) in (0..rows).zip(self.rows.iter_mut()) {
             let on_row = cursor.filter(|(r, _)| *r == row).map(|(_, c)| c);
@@ -121,7 +135,7 @@ impl<S> RowCache<S> {
     }
 
     /// [`RowCache::update`] with the damage read from `grid` itself, moving
-    /// [`RowCache::seen`] on. What the element and the tiles call.
+    /// [`RowCache::seen`] on. What the Mission control tiles call.
     pub fn refresh(
         &mut self,
         source: usize,
@@ -131,6 +145,21 @@ impl<S> RowCache<S> {
     ) -> usize {
         let (damage, now) = grid.damage_since(self.seen);
         let laid_out = self.update(source, grid, damage, palette, focused);
+        self.seen = now;
+        laid_out
+    }
+
+    /// [`RowCache::refresh`] with the cursor already placed (see
+    /// [`RowCache::update_with_cursor`]). What the terminal element calls.
+    pub fn refresh_with_cursor(
+        &mut self,
+        source: usize,
+        grid: &dyn TerminalGrid,
+        palette: &TermPalette,
+        cursor: Option<(u16, RowCursor)>,
+    ) -> usize {
+        let (damage, now) = grid.damage_since(self.seen);
+        let laid_out = self.update_with_cursor(source, grid, damage, palette, cursor);
         self.seen = now;
         laid_out
     }
@@ -279,6 +308,34 @@ mod tests {
             Some(false)
         );
         h.assert_matches_fresh_layout(false);
+    }
+
+    #[test]
+    fn a_blink_phase_relays_only_the_cursor_row() {
+        let mut h = Harness::new(5, 20);
+        h.grid.process(b"one\r\ntwo");
+        h.frame(true);
+        let placed = layout::cursor_placement(h.grid.as_ref(), true);
+        // The off phase: no cursor drawn, one row laid out again.
+        let laid = h.cache.update_with_cursor(
+            1,
+            h.grid.as_ref(),
+            GridDamage::Rows(Vec::new()),
+            &h.palette,
+            None,
+        );
+        assert_eq!(laid, 1);
+        assert!(h.cache.rows().iter().all(|r| r.layout.cursor.is_none()));
+        // And back on.
+        let laid = h.cache.update_with_cursor(
+            1,
+            h.grid.as_ref(),
+            GridDamage::Rows(Vec::new()),
+            &h.palette,
+            placed,
+        );
+        assert_eq!(laid, 1);
+        h.assert_matches_fresh_layout(true);
     }
 
     #[test]

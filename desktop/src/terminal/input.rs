@@ -1,10 +1,13 @@
-//! Keyboard, paste and mouse input for the spike terminal, as PTY bytes.
+//! Keyboard input for the spike terminal and mouse reports for every desktop
+//! terminal, as PTY bytes.
 //!
 //! Deliberately small: keys are lifted into the core's front-end-neutral
 //! [`Chord`] and encoded by [`encode_pty`], the one encoder every FlightDeck
 //! front-end types through (arrows are always CSI). The full desktop keymap —
 //! bindings, leave-focus chords, IME — is wired elsewhere (`keys.rs`); this only
-//! makes the spike window usable.
+//! makes the spike window usable. Mouse reports are the core's
+//! `encode_mouse_button` / `encode_mouse_report`, the TUI's own encoders, and a
+//! paste is the core's `encode_paste`.
 
 use flightdeck::app::keymap::{encode_pty, Chord, Key, Mods};
 use flightdeck::terminal::grid::{encode_mouse_button, encode_mouse_report, MouseEncoding};
@@ -85,22 +88,6 @@ fn single_char(s: &str) -> Option<char> {
 
 fn non_empty(bytes: Vec<u8>) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
-}
-
-/// The bytes a paste of `text` sends. Line endings become CR (what Enter
-/// sends). With bracketed paste on, the text is wrapped in `ESC[200~` …
-/// `ESC[201~`, and any end marker inside it is removed so pasted text cannot
-/// end the paste early and have the rest run as typed input.
-pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-    if !bracketed {
-        return normalized.into_bytes();
-    }
-    let body = normalized.replace("\x1b[201~", "");
-    let mut out = b"\x1b[200~".to_vec();
-    out.extend_from_slice(body.as_bytes());
-    out.extend_from_slice(b"\x1b[201~");
-    out
 }
 
 /// The xterm button code for `button`, with the modifier bits a report
@@ -248,19 +235,6 @@ mod tests {
             ..Modifiers::default()
         };
         assert_eq!(encode_keystroke(&ks("q", Some("q"), cmd)), None);
-    }
-
-    #[test]
-    fn paste_is_bracketed_only_when_asked_and_cannot_escape() {
-        assert_eq!(paste_bytes("a\nb", false), b"a\rb".to_vec());
-        assert_eq!(
-            paste_bytes("a\r\nb", true),
-            b"\x1b[200~a\rb\x1b[201~".to_vec()
-        );
-        assert_eq!(
-            paste_bytes("x\x1b[201~rm -rf", true),
-            b"\x1b[200~xrm -rf\x1b[201~".to_vec()
-        );
     }
 
     #[test]

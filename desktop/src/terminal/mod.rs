@@ -14,7 +14,8 @@
 //! - [`element`] measures, shapes and paints it,
 //! - [`view`] owns the terminal, polls the PTY and routes input,
 //! - [`cadence`] decides how often the view polls and when it repaints,
-//! - [`input`] is the spike's small keyboard/paste/mouse encoder,
+//! - [`input`] is the spike's small keyboard encoder and the mouse reports,
+//! - [`zoom`] is the text size: the `[ui]` setting plus Cmd +/-/0 on macOS,
 //! - [`spike`] is the `--spike-terminal` window and the `--dump-grid` probe,
 //! - [`bench`] is `--bench`, the latency/throughput/idle/scroll measurements.
 
@@ -27,6 +28,7 @@ pub mod layout;
 pub mod rowcache;
 pub mod spike;
 pub mod view;
+pub mod zoom;
 
 use flightdeck::terminal::grid::Emulator;
 use flightdeck::terminal::session::{Terminal, TerminalProfile};

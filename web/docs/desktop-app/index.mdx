@@ -66,6 +66,24 @@ Every chord is the same as in the terminal UI. The differences:
 - On macOS, Option works as Alt for every FlightDeck chord, with no "Use Option
   as Meta" setting.
 - On macOS, Cmd is left to the system. FlightDeck binds only `Cmd-V` (paste)
-  and the menu-bar conventions `Cmd-,`, `Cmd-O` and `Cmd-Q`.
+  and the menu-bar conventions `Cmd-,`, `Cmd-O` and `Cmd-Q`. In a focused
+  terminal, `Cmd-C` also copies the selection, and `Cmd-=` / `Cmd--` / `Cmd-0`
+  zoom the text for the session. The size itself is the
+  `ui.desktop_terminal_font_size` setting (default 13) on every OS.
 
 See [Keyboard reference](/reference/keyboard) for the full table.
+
+## The terminal
+
+The mouse works as in the terminal UI. Drag to select; the selection is copied
+when you let go. Drag past the top or bottom edge to scroll while selecting.
+Shift-drag selects even when the program uses the mouse itself. The wheel
+scrolls the history, three lines a notch, unless the program uses the mouse, in
+which case the wheel goes to the program. A thin scrollbar shows while you are
+scrolled back. Typing returns to the live screen.
+
+The cursor takes the shape the program asks for (block, underline or bar). It is
+hollow when the terminal is not focused or the window is in the background, and
+it blinks only when the program asks, and only in the focused window. With
+`ui.dim_terminal_in_app_mode` on (the default), the terminal dims in App mode,
+as in the terminal UI.
