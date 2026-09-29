@@ -10,6 +10,35 @@ license = "MIT"
 keywords = ["ai", "agents", "git", "tui", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
+# The root is also a cargo workspace so the native desktop front-end
+# (`desktop/`, package `flightdeck-desktop`, GPUI) can share this Cargo.lock and
+# depend on the `flightdeck` library by path. `default-members` keeps every
+# root command (`cargo test -p flightdeck --lib`, `cargo clippy --all-targets`,
+# `cargo build`, cargo-dist) scoped to the TUI package alone, so the GUI's large
+# GPUI graph never enters the TUI's gate or its pure-Rust Windows build. Build
+# the GUI explicitly with `-p flightdeck-desktop`. `remote/` is its own,
+# separate workspace (protocol + relay) and is excluded so cargo does not try to
+# fold it into this one.
+[workspace]
+members = [".", "desktop"]
+default-members = ["."]
+exclude = ["remote"]
+resolver = "2"
+
+# Not used by any member of THIS workspace. It exists because of a cargo quirk
+# with nested workspaces: `remote/protocol` (a path dependency of the root
+# package) inherits `edition`/`license`/`repository` from `remote/Cargo.toml`
+# via `*.workspace = true`, but once the root is itself a workspace, cargo
+# resolves that inheritance against the already-loaded OUTER workspace (its
+# workspace-root cache is consulted before the nearer, unloaded `remote/`
+# manifest) and fails with "`workspace.package.edition` was not defined". These
+# values mirror `remote/Cargo.toml`'s `[workspace.package]` exactly so the
+# protocol crate builds identically from either workspace. Keep the two in sync.
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/neworange-ruud/flightdeck"
+
 [lib]
 name = "flightdeck"
 path = "src/lib.rs"

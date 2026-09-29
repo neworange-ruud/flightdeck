@@ -1,0 +1,65 @@
+[package]
+name = "flightdeck-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Native desktop front-end for FlightDeck, built on GPUI."
+repository = "https://github.com/neworange-ruud/flightdeck"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "flightdeck-desktop"
+path = "src/main.rs"
+
+# Not a release artifact yet: cargo-dist reads every member of the root
+# workspace (dist-workspace.toml has `members = ["cargo:."]`), and without this
+# it would start building installers for the GUI next to the TUI.
+[package.metadata.dist]
+dist = false
+
+[features]
+# Compile GPUI's Metal shaders when the app starts instead of at build time.
+# On by default because the build-time path shells out to Apple's `metal`
+# compiler, which since Xcode 26 is a separate download
+# (`xcodebuild -downloadComponent MetalToolchain`) that most machines — and CI
+# runners — do not have; without it `cargo build` fails in gpui-pre-apple's
+# build script. The run-time cost is a one-off shader compile at each launch.
+# Release packaging should build with `--no-default-features`
+# on a machine that has the Metal Toolchain, to ship precompiled shaders.
+# No effect on Windows or Linux.
+default = ["runtime-shaders"]
+runtime-shaders = ["gpui_platform/runtime_shaders"]
+
+[dependencies]
+# The TUI's library crate: config, git/worktree plumbing and the agent model the
+# GUI will drive. The M0 scaffold does not call into it yet; the dependency is
+# here now so the workspace/lock layout is settled from the first commit and
+# the GUI build proves the library links on its own.
+flightdeck = { path = ".." }
+
+# --- GPUI -------------------------------------------------------------------
+# GPUI is consumed through `gpui-pre`, the crates.io snapshot of Zed's `gpui`
+# that the Zed team republishes roughly weekly (same repo, same Apache-2.0
+# licence). It is pinned EXACTLY because gpui-component pins it exactly
+# (`=0.3.7`): a looser requirement here could only ever resolve to that one
+# version anyway, and saying so makes an upgrade a deliberate, reviewed edit.
+# Renamed to `gpui` so code reads like every GPUI example, and so the rename is
+# the only line that changes if we ever move to the upstream `gpui` crate name.
+# See desktop/NOTES-M0.md for the rejected candidates (crates.io `gpui` 0.2.x,
+# `gpui-ce`, a zed git rev) and the upgrade policy.
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+# Since Zed's platform split, `gpui` itself holds no windowing backend; this
+# crate selects the per-OS one (Cocoa+Metal, Win32+DirectX, X11/Wayland+wgpu)
+# and exposes `application()`. Its default feature set is empty, so we name:
+#   font-kit     — CoreText font loading on macOS,
+#   wayland, x11 — both Linux display servers; GPUI picks one at run time.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = [
+    "font-kit",
+    "wayland",
+    "x11",
+] }
+# The widget/theme layer on top of GPUI (buttons, lists, inputs, dock, and the
+# `Root` view that hosts dialogs and notifications). It pins gpui-pre `=0.3.7`,
+# which is what fixes the GPUI version above. Default features only: the
+# tree-sitter grammars are opt-in and each one is a C build.
+gpui-component = "0.7.0"
