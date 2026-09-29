@@ -1,0 +1,188 @@
+name: Desktop
+
+# Build, lint and test the native GPUI desktop app (crate `flightdeck-desktop`).
+# The root CI workflow (ci.yml) deliberately covers only the TUI: the root
+# workspace has `default-members = ["."]`, so its `cargo clippy/test` never touch
+# the GUI's ~1000-crate GPUI graph. This workflow is the GUI's gate.
+#
+# `cargo fmt --all --check` in ci.yml already formats `desktop/` too (--all walks
+# every workspace member), so there is no separate fmt job here.
+#
+# The `package` job (manual workflow_dispatch only, never on PRs) produces the
+# UNSIGNED per-OS artifacts; see desktop/PACKAGING.md.
+on:
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/desktop/**"
+      - ".github/workflows/desktop.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Also build unsigned installers/bundles for each OS"
+        type: boolean
+        default: true
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # GPUI + gpui-component is a cold ~5-10 minute build per OS.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GUI, unlike the TUI, is not pure Rust. Linux needs the display-server,
+      # font and Vulkan dev libraries plus cmake/clang (list from desktop/NOTES-M0.md);
+      # macOS uses the crate's default `runtime-shaders` feature so no Metal Toolchain
+      # is needed; the Windows runner image already carries MSVC + the Windows SDK
+      # (fxc.exe, rc.exe) that gpui-pre-windows' build script needs.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan1 mesa-vulkan-drivers xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the GUI's large target dir apart from ci.yml's caches.
+          prefix-key: desktop-v1
+
+      - name: Clippy
+        run: cargo clippy -p flightdeck-desktop --all-targets --locked -- -D warnings
+
+      # GPUI tests run on its headless TestPlatform and open no real window, so they
+      # should not need a display. The Linux run is wrapped in xvfb-run anyway as
+      # cheap insurance (an X server is only touched if some test path initialises the
+      # real platform); drop the wrapper once a green run proves it unnecessary.
+      - name: Test (Linux, under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test -p flightdeck-desktop --locked
+      - name: Test
+        if: runner.os != 'Linux'
+        run: cargo test -p flightdeck-desktop --locked
+
+      # The debug snapshot feature pulls in gpui's test-support in the real binary;
+      # one OS is enough to prove it still compiles.
+      - name: Build with spike-snapshot (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo build -p flightdeck-desktop --features spike-snapshot --locked
+
+      - name: Release build
+        if: runner.os == 'macOS'
+        run: cargo build -p flightdeck-desktop --release --locked
+
+  # Manual only: unsigned artifacts per OS. Signing/notarization inputs are
+  # intentionally not wired here; add secrets as env on the relevant step when the
+  # owner has the identities (see desktop/PACKAGING.md).
+  package:
+    name: package (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.package
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan1 mesa-vulkan-drivers file
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: desktop-v1
+
+      # --- macOS: unsigned FlightDeck.app + zip ---
+      - name: Bundle macOS app (unsigned)
+        if: runner.os == 'macOS'
+        run: scripts/desktop/macos-bundle.sh
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: flightdeck-desktop-macos-unsigned
+          path: target/desktop-dist/*.zip
+
+      # --- Linux: .deb, .rpm, AppImage ---
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+          curl -fsSL -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+      - name: Build release binary (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build -p flightdeck-desktop --release --locked
+      - name: Package .deb / .rpm / AppImage (unsigned)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          SKIP_BUILD: "1"
+        run: |
+          mkdir -p target/desktop-dist
+          cargo deb -p flightdeck-desktop --no-build --output target/desktop-dist/
+          cargo generate-rpm -p desktop --target-dir target --output target/desktop-dist/
+          LINUXDEPLOY="$PWD/linuxdeploy" scripts/desktop/linux-appimage.sh
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: flightdeck-desktop-linux-unsigned
+          path: |
+            target/desktop-dist/*.deb
+            target/desktop-dist/*.rpm
+            target/desktop-dist/*.AppImage
+
+      # --- Windows: MSI via WiX v3 ---
+      - name: Install cargo-wix
+        if: runner.os == 'Windows'
+        run: cargo install cargo-wix --locked
+      - name: Package MSI (unsigned)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/desktop/windows-package.ps1
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: flightdeck-desktop-windows-unsigned
+          path: target/desktop-dist/*.msi

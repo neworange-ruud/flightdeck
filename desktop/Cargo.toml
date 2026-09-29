@@ -97,3 +97,58 @@ flightdeck = { path = "..", features = ["testing"] }
 # A folder that is no git repository, for the Open Project refusal test.
 # Already in the lock through the root crate's dev-dependencies.
 tempfile = "3.27.0"
+
+# --- Packaging metadata (see desktop/PACKAGING.md) ---------------------------
+# Linux .deb: `cargo install cargo-deb && cargo deb -p flightdeck-desktop --no-build`
+# after a release build. Asset sources are relative to this crate (desktop/), except
+# the binary, which lives in the workspace target dir.
+[package.metadata.deb]
+name = "flightdeck-desktop"
+maintainer = "New Orange <ruud.vanfalier@neworange.agency>"
+copyright = "New Orange"
+license-file = ["../LICENSE", "0"]
+section = "devel"
+priority = "optional"
+extended-description = "Native desktop front-end for FlightDeck: orchestrate AI coding agents across git worktrees."
+# Runtime deps: input/windowing libs for X11 and Wayland, fonts, and a Vulkan loader
+# (wgpu renders through Vulkan; mesa-vulkan-drivers or a vendor driver supplies the ICD).
+depends = "libc6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libxcb1, libfontconfig1, libfreetype6, libvulkan1, mesa-vulkan-drivers | vulkan-icd"
+assets = [
+    ["../target/release/flightdeck-desktop", "usr/bin/", "755"],
+    ["packaging/linux/flightdeck-desktop.desktop", "usr/share/applications/", "644"],
+    ["packaging/icons/flightdeck-16.png", "usr/share/icons/hicolor/16x16/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-32.png", "usr/share/icons/hicolor/32x32/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-48.png", "usr/share/icons/hicolor/48x48/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-64.png", "usr/share/icons/hicolor/64x64/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-128.png", "usr/share/icons/hicolor/128x128/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-256.png", "usr/share/icons/hicolor/256x256/apps/flightdeck-desktop.png", "644"],
+    ["packaging/icons/flightdeck-512.png", "usr/share/icons/hicolor/512x512/apps/flightdeck-desktop.png", "644"],
+]
+
+# Linux .rpm: `cargo install cargo-generate-rpm && cargo generate-rpm -p desktop`
+# after a release build, run from the repo root (asset sources are relative to it).
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/flightdeck-desktop", dest = "/usr/bin/flightdeck-desktop", mode = "755" },
+    { source = "desktop/packaging/linux/flightdeck-desktop.desktop", dest = "/usr/share/applications/flightdeck-desktop.desktop", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/flightdeck-desktop.png", mode = "644" },
+    { source = "desktop/packaging/icons/flightdeck-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/flightdeck-desktop.png", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
+libxkbcommon-x11 = "*"
+fontconfig = "*"
+freetype = "*"
+vulkan-loader = "*"
+
+# Windows .msi: `cargo wix -p flightdeck-desktop` (WiX v3 + cargo-wix). Template: wix/main.wxs.
+[package.metadata.wix]
+upgrade-guid = "6D0B5A57-6B0C-4F3E-9C55-2E1F3A6B7D10"
+path-guid = "0E8C2C4B-58D2-4D6B-8F7A-4B7E1F9A3C21"
+license = false
+eula = false
