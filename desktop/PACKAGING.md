@@ -12,8 +12,10 @@ change with it; nothing here depends on the CLI being installed.
 
 | Piece | Status |
 | --- | --- |
-| `.github/workflows/desktop.yml` | Passes `actionlint`. **Never run**: CI cannot be run from this environment. |
-| macOS `.app` (`scripts/desktop/macos-bundle.sh`) | **Built and launched locally, unsigned** (see below). |
+| `.github/workflows/desktop.yml` | Passes `actionlint`. **Never run**: CI cannot be run from this environment. The release jobs (`build-release`, `publish`) have never created a real release. |
+| macOS `.app` (`scripts/desktop/macos-bundle.sh`) | **Built and launched locally, unsigned** (see below). Zip name, `.sha256` and zip layout verified locally (aarch64). |
+| `scripts/desktop/check-asset-names.sh` | Run locally against the macOS output (pass) and a misnamed file (fail). |
+| Linux AppImage `.sha256`, Windows portable zip | Written, **not run** (no Linux/Windows machine). |
 | Codesign / notarize steps | Written, **not run** (no Developer ID identity here). |
 | Homebrew cask template | Not audited or published. |
 | Linux `.deb` / `.rpm` / AppImage | **Not run** (no Linux machine). Config only. |
@@ -21,7 +23,7 @@ change with it; nothing here depends on the CLI being installed.
 
 ## CI (`.github/workflows/desktop.yml`)
 
-Triggers: pull requests that touch `desktop/**`, `src/**`, `Cargo.toml`, `Cargo.lock`,
+Triggers: `desktop-v*` tag pushes (release, below); pull requests that touch `desktop/**`, `src/**`, `Cargo.toml`, `Cargo.lock`,
 `scripts/desktop/**` or the workflow itself; pushes to `main` touching the same code
 paths; and manual `workflow_dispatch`.
 
@@ -60,17 +62,55 @@ after `check` passes. It builds **unsigned** artifacts and uploads them:
 
 | OS | Artifact | Built with |
 | --- | --- | --- |
-| macOS | `FlightDeck-<ver>-macos.zip` | `scripts/desktop/macos-bundle.sh` |
-| Linux | `.deb`, `.rpm`, `.AppImage` | `cargo-deb`, `cargo-generate-rpm`, `scripts/desktop/linux-appimage.sh` |
-| Windows | `FlightDeck-windows-x64.msi` | `cargo-wix` via `scripts/desktop/windows-package.ps1` |
+| macOS | `FlightDeck-<ver>-macos-<arch>.zip` + `.sha256` | `scripts/desktop/macos-bundle.sh` |
+| Linux | `.deb`, `.rpm`, `FlightDeck-<ver>-linux-<arch>.AppImage` + `.sha256` | `cargo-deb`, `cargo-generate-rpm`, `scripts/desktop/linux-appimage.sh` |
+| Windows | `FlightDeck-windows-x64.msi`, `FlightDeck-<ver>-windows-<arch>-portable.zip` + `.sha256` | `cargo-wix` and the zip step of `scripts/desktop/windows-package.ps1` |
 
-Signing secrets are not wired into the workflow. Add them as step `env:` when the
-owner has the identities (below).
+This manual job is unsigned. Signing runs only in the release job (below).
+
+### Release job (`desktop-v*` tags)
+
+Pushing a tag `desktop-v<x.y.z>` (or running the workflow manually with the `tag` input set
+to an existing tag) runs `check`, then `build-release` on macOS arm64 (`macos-latest`),
+macOS x86_64 (`macos-15-intel`), Ubuntu x86_64 and Windows x86_64, then `publish`:
+
+1. `build-release` fails unless the tag equals `desktop-v` + the `desktop/Cargo.toml`
+   version. It runs the packaging scripts, then
+   `scripts/desktop/check-asset-names.sh --os <os> --version <v>`, then uploads the files.
+2. `publish` (the only job with `contents: write`) downloads all artifacts, creates the
+   GitHub Release for the tag if it does not exist (not a draft or pre-release; the updater
+   ignores both) and uploads everything with `gh release upload --clobber`, so a re-run
+   replaces assets. `.msi`, `.deb` and `.rpm` are attached too but never fetched by the app.
+
+Not built: Linux aarch64 (the AppImage job downloads the x86_64 `linuxdeploy`) and Windows
+aarch64. The updater refuses, rather than guesses, on those machines.
+
+Signing is optional and gated on repository secrets; unset secrets are empty strings and
+the steps or script branches are skipped:
+
+| Secret | Effect |
+| --- | --- |
+| `APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD` | imports the Developer ID cert into a temporary keychain |
+| `APPLE_SIGNING_IDENTITY` | `macos-bundle.sh` codesigns (hardened runtime) |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | notarizes and staples (needs the identity too) |
+| `WINDOWS_SIGN_PFX_BASE64`, `WINDOWS_SIGN_PFX_PASSWORD` | decoded to a temp `.pfx`; `windows-package.ps1` signs the MSI and the portable `.exe` |
+
+To cut a release: bump the version in `desktop/Cargo.toml`, merge, then create and push the
+tag `desktop-v<x.y.z>` on the merge commit.
+
+### Asset name check
+
+`scripts/desktop/check-asset-names.sh [--os macos|linux|windows] [--version X.Y.Z] [DIR]`
+(default dir `target/desktop-dist`) asserts every zip/AppImage there matches the regex
+copied from the `asset_name` format strings in `release.rs`, that each has a `.sha256` in
+`sha256sum` format naming it, and that the hash matches. It fails on a misnamed asset or when
+none is found for `--os`. If `release.rs` changes its names, change the regex in both places.
 
 ## macOS (`scripts/desktop/macos-bundle.sh`)
 
-Builds `target/desktop-dist/FlightDeck.app` and `FlightDeck-<ver>-macos.zip` and prints
-the zip's sha256 (for the cask).
+Builds `target/desktop-dist/FlightDeck.app`, `FlightDeck-<ver>-macos-<arch>.zip` (arch
+from `TARGET`, else `uname -m`; `FlightDeck.app` at the zip root) and
+`FlightDeck-<ver>-macos-<arch>.zip.sha256`, and prints the zip's sha256 (for the cask).
 
 - Info.plist: bundle id `agency.neworange.flightdeck.desktop` (the iOS app uses the
   prefix `agency.neworange.flightdeck`, `ios/project.yml`), `LSMinimumSystemVersion`
@@ -96,7 +136,7 @@ the zip's sha256 (for the cask).
   `@VERSION@`, `@SHA256@`). The existing TUI formula is published by cargo-dist to
   `neworange-ruud/homebrew-tap`; the cask would go into `Casks/` of the same tap.
   cargo-dist does not know the GUI (`dist = false` in `desktop/Cargo.toml`), so the
-  release job for the zip and the cask update is still to be written.
+  GUI has its own release job (above); the cask update is still to be written.
 
 Local verification (2026-09-29, Darwin 27, Apple silicon, unsigned): the script built
 the bundle and `plutil -lint` passed. Executing the bundle's binary from inside a git
@@ -120,7 +160,8 @@ and `scripts/desktop/linux-appimage.sh`.
 - `.deb`: `cargo deb -p flightdeck-desktop --no-build` after a release build.
 - `.rpm`: `cargo generate-rpm -p desktop` from the repo root after a release build.
   Auto-detected library requirements are used besides the explicit ones.
-- AppImage: `scripts/desktop/linux-appimage.sh` uses `linuxdeploy` (path via
+- AppImage: `scripts/desktop/linux-appimage.sh` writes `FlightDeck-<ver>-linux-<arch>.AppImage`
+  plus its `.sha256` and uses `linuxdeploy` (path via
   `$LINUXDEPLOY`). It deliberately does **not** bundle `libvulkan`/GPU drivers, because
   they must match the host. Set `APPIMAGE_EXTRACT_AND_RUN=1` where FUSE is missing.
 - Untested guesses to check on first run: the deb `depends` names on Debian vs Ubuntu,
@@ -137,7 +178,10 @@ Files: `desktop/wix/main.wxs`, `[package.metadata.wix]` in `desktop/Cargo.toml`,
   Add/Remove Programs entry with the icon, in-place major upgrades. No PATH entry.
   The `upgrade-guid` identifies the product line and must never change.
   MSIX was not chosen because it needs a signing certificate to install at all.
-- Signing hook: `scripts/desktop/windows-package.ps1` runs `signtool` on the MSI when
+- Portable zip: the same script also writes `FlightDeck-<ver>-windows-<arch>-portable.zip`
+  (`flightdeck-desktop.exe` at the zip root) and its `.sha256` (LF, no BOM), which the
+  self-updater installs from.
+- Signing hook: `scripts/desktop/windows-package.ps1` runs `signtool` on the MSI (and the portable `.exe`) when
   `WINDOWS_SIGN_PFX_PATH` (and `WINDOWS_SIGN_PFX_PASSWORD`, optional
   `WINDOWS_SIGN_TIMESTAMP_URL`) are set, and skips it otherwise. Neither the `.exe`
   inside the MSI nor the MSI itself is signed by default, so SmartScreen will warn.
@@ -196,11 +240,9 @@ Windows   FlightDeck-<version>-windows-<arch>-portable.zip   flightdeck-desktop.
 checksum  <asset name>.sha256                        `sha256sum` format: <64 hex>  <asset name>
 ```
 
-`<arch>` is `x86_64` or `aarch64`. Drafts and pre-releases are ignored. **Gap to close in
-the pipeline:** `scripts/desktop/macos-bundle.sh` currently names the zip
-`FlightDeck-<ver>-macos.zip` (no arch) and no script writes `.sha256` files or builds the
-portable Windows zip; those need aligning with the names above when the release job is
-written. The `.msi`, `.deb`, `.rpm` and the cask are for package managers and are never
+`<arch>` is `x86_64` or `aarch64`. Drafts and pre-releases are ignored. The packaging
+scripts and the release job emit exactly these names (see "Release job" and "Asset name
+check" above). The `.msi`, `.deb`, `.rpm` and the cask are for package managers and are never
 downloaded by the app.
 
 **Downloads and unzip** use `curl` (HTTPS only, `--fail`), `ditto` (macOS), `tar` (Windows

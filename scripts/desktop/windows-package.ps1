@@ -31,3 +31,30 @@ if ($env:WINDOWS_SIGN_PFX_PATH) {
     Write-Host 'signing: skipped (WINDOWS_SIGN_PFX_PATH unset)'
 }
 Write-Host "msi: $msi"
+
+# --- portable zip (what the self-updater installs from) ---------------------
+# Contract with desktop/src/selfupdate/release.rs:
+#   FlightDeck-<version>-windows-<arch>-portable.zip, flightdeck-desktop.exe at the zip root,
+#   plus <asset>.sha256 in `sha256sum` format ("<64 hex>  <name>").
+$version = (Select-String -Path desktop\Cargo.toml -Pattern '^version\s*=\s*"(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+$osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$arch = switch ($osArch) {
+    'X64'   { 'x86_64' }
+    'Arm64' { 'aarch64' }
+    default { throw "unsupported architecture: $osArch" }
+}
+$zipName = "FlightDeck-$version-windows-$arch-portable.zip"
+$zip = Join-Path target\desktop-dist $zipName
+$stage = Join-Path target\desktop-dist\portable
+Remove-Item -Recurse -Force $stage, $zip -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $stage | Out-Null
+Copy-Item target\release\flightdeck-desktop.exe $stage
+if ($env:WINDOWS_SIGN_PFX_PATH) {
+    signtool sign /fd SHA256 /f $env:WINDOWS_SIGN_PFX_PATH /p $env:WINDOWS_SIGN_PFX_PASSWORD /tr $ts /td SHA256 (Join-Path $stage flightdeck-desktop.exe)
+    if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
+}
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+$hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+# sha256sum format, LF line ending, no BOM.
+[System.IO.File]::WriteAllText("$((Resolve-Path target\desktop-dist).Path)\$zipName.sha256", "$hash  $zipName`n")
+Write-Host "portable zip: $zip"

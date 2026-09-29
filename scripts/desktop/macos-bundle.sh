@@ -89,7 +89,14 @@ else
   echo "codesign: skipped (APPLE_SIGNING_IDENTITY unset)"
 fi
 
-ZIP="$OUT/$APP_NAME-$VERSION-macos.zip"
+# Asset name is a contract with the self-updater (desktop/src/selfupdate/release.rs):
+#   FlightDeck-<version>-macos-<arch>.zip, FlightDeck.app at the zip root.
+case "${TARGET:-$(uname -m)}" in
+  aarch64*|arm64*) ARCH="aarch64" ;;
+  x86_64*) ARCH="x86_64" ;;
+  *) echo "unsupported architecture: ${TARGET:-$(uname -m)}" >&2; exit 1 ;;
+esac
+ZIP="$OUT/$APP_NAME-$VERSION-macos-$ARCH.zip"
 make_zip() { rm -f "$ZIP"; ditto -c -k --keepParent "$APP" "$ZIP"; }
 make_zip
 
@@ -109,6 +116,10 @@ else
   echo "notarize: skipped (needs APPLE_SIGNING_IDENTITY plus NOTARY_KEYCHAIN_PROFILE or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD)"
 fi
 
+# <asset>.sha256 in `sha256sum` format ("<64 hex>  <name>"), made from inside $OUT so
+# the file name carries no directory.
+(cd "$OUT" && shasum -a 256 "$(basename "$ZIP")" > "$(basename "$ZIP").sha256")
+
 echo "app:  $APP"
 echo "zip:  $ZIP"
-echo "sha256: $(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+echo "sha256: $(cut -d' ' -f1 "$ZIP.sha256")"

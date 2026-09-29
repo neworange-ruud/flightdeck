@@ -17,6 +17,8 @@ cd "$ROOT"
 
 VERSION="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' desktop/Cargo.toml | head -1)"
 ARCH="${ARCH:-$(uname -m)}"
+[[ "$ARCH" == arm64 ]] && ARCH=aarch64 # asset names use x86_64 / aarch64 only
+case "$ARCH" in x86_64|aarch64) ;; *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;; esac
 LINUXDEPLOY="${LINUXDEPLOY:-linuxdeploy-$ARCH.AppImage}"
 OUT="$ROOT/target/desktop-dist"
 APPDIR="$OUT/AppDir"
@@ -46,4 +48,8 @@ VERSION="$VERSION" "$LINUXDEPLOY" \
 
 mv FlightDeck*-"$ARCH".AppImage "$OUT/FlightDeck-$VERSION-linux-$ARCH.AppImage" 2>/dev/null \
   || mv ./*.AppImage "$OUT/FlightDeck-$VERSION-linux-$ARCH.AppImage"
-echo "appimage: $OUT/FlightDeck-$VERSION-linux-$ARCH.AppImage"
+ASSET="FlightDeck-$VERSION-linux-$ARCH.AppImage"
+# <asset>.sha256 in `sha256sum` format; asset name is a contract with the self-updater
+# (desktop/src/selfupdate/release.rs).
+(cd "$OUT" && sha256sum "$ASSET" > "$ASSET.sha256")
+echo "appimage: $OUT/$ASSET"
