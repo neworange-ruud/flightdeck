@@ -948,7 +948,7 @@ const SUBCOMMANDS: &[&str] = &[
 /// it cannot be combined with a subcommand — that combination is a hard error
 /// rather than a silent ignore, because silently dropping the flag would let a
 /// user believe a run was isolated when it was not.
-fn parse_isolated(args: &[String]) -> Result<bool> {
+pub fn parse_isolated(args: &[String]) -> Result<bool> {
     let isolated = args.iter().any(|a| a == "--isolated" || a == "-I");
     if !isolated {
         return Ok(false);
@@ -4722,6 +4722,16 @@ fn apply_host_event(
         HostEvent::RunPaletteAction(action) => {
             run_offered_palette_action(action, workspace, env, ui)?
         }
+        // A native folder picker's answer. The same guard the palette's Open
+        // Project applies first (an isolated run opens nothing else), then the
+        // folder browser's own open path.
+        HostEvent::OpenProject(path) => {
+            if workspace.active_project().state.isolated {
+                ui.message(ISOLATED_REFUSAL);
+            } else {
+                open_project_path(&path, workspace, env, ui);
+            }
+        }
         HostEvent::Overlay(input) => {
             crate::tui::overlay_bridge::apply_overlay_input(input, workspace, env, ui)?
         }
@@ -5645,6 +5655,41 @@ fn resolve_browse_target(browse: &BrowseState) -> PathBuf {
     browse.dir.clone()
 }
 
+/// Open the project at `target` (or switch to it when it is already open),
+/// reporting the outcome as a notification: the folder browser's Enter, and
+/// [`HostEvent::OpenProject`] from a front-end with its own (native) folder
+/// picker. `open_project` does the validation — a folder that is not inside a
+/// git repository is refused with its message, exactly as in the browser.
+fn open_project_path(target: &Path, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
+    match open_project(env, target, None) {
+        Ok(mut proj) => {
+            if workspace.contains_root(proj.git.root()) {
+                let root = proj.git.root().to_path_buf();
+                if let Some(i) = workspace.projects.iter().position(|p| p.git.root() == root) {
+                    workspace.set_active(i);
+                    resume_active_project_agents(workspace, env);
+                }
+                ui.message("Project already open — switched to it.");
+            } else {
+                // Seed the new project's PTY size from the active one and
+                // resume its recovered agents (never auto-relaunched beyond
+                // this explicit open), matching startup behaviour.
+                let sz = workspace.active_project().state.pty_size;
+                {
+                    let services = env.services(&proj.git);
+                    proj.state.set_pty_size(sz);
+                    let _ = proj.state.resume_agents(&services);
+                }
+                let name = proj.name.clone();
+                workspace.projects.push(proj);
+                workspace.active = workspace.projects.len() - 1;
+                ui.message(format!("Opened project '{name}'."));
+            }
+        }
+        Err(e) => ui.message(format!("Could not open project: {e}")),
+    }
+}
+
 /// Handle a key for the [`Prompt::OpenProject`] folder browser.
 fn handle_open_project_key(
     key: KeyEvent,
@@ -5665,33 +5710,7 @@ fn handle_open_project_key(
                 return Ok(());
             }
         };
-        match open_project(env, &target, None) {
-            Ok(mut proj) => {
-                if workspace.contains_root(proj.git.root()) {
-                    let root = proj.git.root().to_path_buf();
-                    if let Some(i) = workspace.projects.iter().position(|p| p.git.root() == root) {
-                        workspace.set_active(i);
-                        resume_active_project_agents(workspace, env);
-                    }
-                    ui.message("Project already open — switched to it.");
-                } else {
-                    // Seed the new project's PTY size from the active one and
-                    // resume its recovered agents (never auto-relaunched beyond
-                    // this explicit open), matching startup behaviour.
-                    let sz = workspace.active_project().state.pty_size;
-                    {
-                        let services = env.services(&proj.git);
-                        proj.state.set_pty_size(sz);
-                        let _ = proj.state.resume_agents(&services);
-                    }
-                    let name = proj.name.clone();
-                    workspace.projects.push(proj);
-                    workspace.active = workspace.projects.len() - 1;
-                    ui.message(format!("Opened project '{name}'."));
-                }
-            }
-            Err(e) => ui.message(format!("Could not open project: {e}")),
-        }
+        open_project_path(&target, workspace, env, ui);
         return Ok(());
     }
 

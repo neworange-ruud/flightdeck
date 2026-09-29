@@ -61,6 +61,10 @@ default = ["self-update"]
 # non-optional dependency on every target, so `--no-default-features` still
 # builds a working relay client — it only drops the updater.
 self-update = ["dep:axoupdater"]
+# Off by default: `flightdeck::host::testing`, which builds an `AppHost` over
+# the fakes in `flightdeck::testing` for another front-end's tests. Only the
+# desktop app's dev-dependencies turn it on, so no shipped binary carries it.
+testing = []
 
 [dependencies]
 crossterm = "0.29.0"

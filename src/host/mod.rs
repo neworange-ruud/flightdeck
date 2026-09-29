@@ -68,6 +68,12 @@ pub use overlay::{
     OverlayKey, OverlayView, PairingView, PaletteRow, PaletteView, RemoteStatus, WebAccessOverlay,
 };
 
+/// Building an [`AppHost`] over fakes, for this crate's tests and — behind the
+/// off-by-default `testing` feature — for another front-end's (the desktop
+/// app's GPUI tests).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 #[cfg(test)]
 mod tests;
 
@@ -119,6 +125,12 @@ pub enum HostEvent {
     RunPaletteAction(crate::tui::palette::PaletteAction),
     /// Answer the overlay on screen (see [`AppHost::overlay`]).
     Overlay(OverlayInput),
+    /// Open the project containing this folder, or switch to it when it is
+    /// already open: the answer from a front-end's own (native) folder picker.
+    /// Validated exactly as the TUI's folder browser validates its Enter — a
+    /// folder outside any git repository is refused with a notification — and
+    /// refused outright in an isolated run, like the palette's Open Project.
+    OpenProject(PathBuf),
 }
 
 /// The UI-agnostic application host. See the module docs.
@@ -1224,6 +1236,49 @@ impl<'a> AppHost<'a> {
             &self.workspace,
             self.pairing_session.as_ref(),
             &self.web_surface.credentials,
+        )
+    }
+
+    /// Unix seconds now, from the host's clock: the `now_secs` the view
+    /// models' elapsed-status times are measured against (the tabs record
+    /// status changes in unix seconds, while [`AppHost::now_ms`] is the
+    /// clock's millisecond reading).
+    pub fn now_unix_secs(&self) -> u64 {
+        self.env.clock.now_unix_secs()
+    }
+
+    /// The project tab row: one view per open project, in workspace order —
+    /// the same views the TUI's tab row draws.
+    pub fn project_tabs(&self) -> Vec<crate::view::ProjectTabView> {
+        self.workspace.tab_infos(self.now_ms)
+    }
+
+    /// The active project's Agent Tab list, one row per agent, with git facts
+    /// from its status cache and elapsed times against the host clock.
+    pub fn agent_rows(&self) -> Vec<crate::view::AgentRowView> {
+        let p = self.workspace.active_project();
+        crate::view::agent_row_views(&p.state, &p.cache, self.now_ms, self.now_unix_secs())
+    }
+
+    /// The active project's git strip (the selected agent's branch, target
+    /// and which git actions are available).
+    pub fn git_strip(&self) -> crate::view::GitStripView {
+        let p = self.workspace.active_project();
+        crate::view::git_strip_view(&p.state, &p.cache)
+    }
+
+    /// The mode bar for the active project: its input mode, plus the update,
+    /// isolated and input-lock badges the host knows about. `leave_key` and
+    /// `help_keys` are the front-end's own labels for those keys.
+    pub fn mode_bar(&self, leave_key: &str, help_keys: &str) -> crate::view::ModeBarView {
+        let notices = self.notices();
+        crate::view::mode_bar_view(
+            self.active_state().mode(),
+            leave_key,
+            help_keys,
+            notices.update.as_ref().map(|u| u.latest_version.as_str()),
+            notices.isolated,
+            self.input_holder(),
         )
     }
 

@@ -2,6 +2,7 @@
 //! and [`HostEvent`]s — against the fakes in `crate::testing`, with no terminal
 //! anywhere. Each test asserts the state change a front-end would render.
 
+use super::testing::web_surface;
 use super::*;
 use crate::app::state::{AppState, Services};
 use crate::contracts::{AgentDef, Config, FileSystem, InterpretedStatus, StatusPatterns};
@@ -10,9 +11,8 @@ use crate::testing::{
     FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeGit, FakeNotifier, FakePty,
     FakePtyHandle,
 };
-use crate::{Project, WebSurface};
+use crate::Project;
 use flightdeck_remote_protocol::SessionId;
-use std::sync::Mutex;
 use tempfile::TempDir;
 
 /// Every service the host borrows, as fakes. Built first and kept alive for
@@ -136,43 +136,7 @@ impl Fakes {
 
 /// A [`Project`] with fresh worker channels, as `open_project` builds one.
 fn project(name: &str, root: &str, state: AppState, git: Arc<FakeGit>) -> Project {
-    let (create_tx, create_rx) = std::sync::mpsc::channel();
-    let (status_tx, status_rx) = std::sync::mpsc::channel();
-    Project {
-        name: name.to_string(),
-        git: crate::git::repo::ProjectGit::new(PathBuf::from(root), git),
-        state,
-        cache: HashMap::new(),
-        create_tx,
-        create_rx,
-        status_tx,
-        status_rx,
-        status_in_flight: false,
-        git_lock: Arc::new(Mutex::new(())),
-    }
-}
-
-/// A web surface with no server and no real credential file behind it.
-fn web_surface() -> WebSurface {
-    let store = crate::web::credentials::CredentialStore::open(
-        Arc::new(FakeFs::new()),
-        Arc::new(FakeClock::default()),
-        PathBuf::from("/web.json"),
-    );
-    let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
-    let (count_tx, count_rx) = std::sync::mpsc::channel();
-    WebSurface {
-        credentials: Arc::new(Mutex::new(store)),
-        streams: crate::web::stream::TerminalStreams::new(1024),
-        activity: crate::web::activity::ActivityStore::new(),
-        pending_finishes: crate::web::activity::PendingFinishes::new(),
-        inbound_tx,
-        inbound_rx,
-        count_tx,
-        count_rx,
-        handle: None,
-        published: crate::web::server::HostState::default(),
-    }
+    super::testing::project(name, PathBuf::from(root), state, git)
 }
 
 /// The text on the active tab's primary terminal screen.
@@ -1426,6 +1390,7 @@ mod overlays {
         for (file, source) in [
             ("overlay.rs", include_str!("overlay.rs")),
             ("mod.rs", include_str!("mod.rs")),
+            ("testing.rs", include_str!("testing.rs")),
         ] {
             for library in ["ratatui", "crossterm"] {
                 assert!(
@@ -1434,5 +1399,120 @@ mod overlays {
                 );
             }
         }
+    }
+}
+
+/// The accessors a GUI front-end renders from, and the native folder picker's
+/// `OpenProject` event.
+mod front_end_reads {
+    use super::*;
+    use crate::host::testing::{self, TestProject};
+    use crate::view::{AgentBadge, ProjectStatus};
+
+    fn host_over<'a>(fakes: &'a Fakes, projects: Vec<TestProject>) -> AppHost<'a> {
+        testing::host(fakes.env(), &fakes.notifier, projects, 0)
+    }
+
+    fn message(host: &AppHost) -> String {
+        match host.overlay() {
+            Some(OverlayView::Message(m)) => m.text,
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_tabs_are_one_view_per_project_with_the_active_one_marked() {
+        let fakes = Fakes::new();
+        let mut host = host_over(
+            &fakes,
+            vec![
+                TestProject::new("alpha", &["a1", "a2"]),
+                TestProject::new("beta", &[]),
+            ],
+        );
+        let tabs = host.project_tabs();
+        assert_eq!(
+            tabs.iter()
+                .map(|t| (t.name.as_str(), t.agent_count, t.active))
+                .collect::<Vec<_>>(),
+            vec![("alpha", 2, true), ("beta", 0, false)]
+        );
+        assert_eq!(tabs[1].status, ProjectStatus::Idle);
+
+        host.handle(HostEvent::SwitchProject(Selector::Next))
+            .unwrap();
+        assert!(host.project_tabs()[1].active, "the switch shows on the row");
+    }
+
+    #[test]
+    fn agent_rows_and_git_strip_read_the_active_project() {
+        let fakes = Fakes::new();
+        let mut host = host_over(&fakes, vec![TestProject::new("alpha", &["a1", "a2"])]);
+        let status = WorktreeStatus {
+            branch: "flightdeck/a1".into(),
+            base_branch: "main".into(),
+            dirty: false,
+            changes: crate::git::status::WorktreeChanges::default(),
+            lines: crate::git::status::LineStats::default(),
+            ahead: 2,
+            behind: 0,
+            upstream: Some("origin/flightdeck/a1".into()),
+            base_drift: 0,
+            worktree_path: PathBuf::from("/alpha/.flightdeck/worktrees/a1"),
+        };
+        testing::set_git_status(&mut host, 0, "t0", status);
+
+        let rows = host.agent_rows();
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["a1", "a2"]
+        );
+        assert!(rows[0].selected);
+        assert_eq!(rows[0].badge, AgentBadge::Idle);
+        assert_eq!(rows[0].alt_index, Some(1));
+
+        let strip = host.git_strip();
+        let agent = strip.agent.expect("the first agent is selected");
+        assert_eq!(agent.name, "a1");
+        assert_eq!(agent.target_branch, "main");
+        assert!(agent.actions.push && agent.actions.finish);
+    }
+
+    #[test]
+    fn mode_bar_follows_the_active_input_mode() {
+        let fakes = Fakes::new();
+        let mut host = host_over(&fakes, vec![TestProject::new("alpha", &["a1"])]);
+        host.handle(HostEvent::FocusTerminal).unwrap();
+        assert_eq!(host.mode_bar("Alt+Esc", "F1").pill, "MODE: TERMINAL");
+        host.handle(HostEvent::FocusApp).unwrap();
+        let bar = host.mode_bar("Alt+Esc", "F1");
+        assert_eq!(bar.pill, "MODE: APP");
+        assert!(!bar.isolated);
+    }
+
+    #[test]
+    fn open_project_refuses_a_folder_outside_any_git_repository() {
+        let fakes = Fakes::new();
+        let mut host = host_over(&fakes, vec![TestProject::new("alpha", &[])]);
+        let not_a_repo = TempDir::new().unwrap();
+        host.handle(HostEvent::OpenProject(not_a_repo.path().to_path_buf()))
+            .unwrap();
+        assert!(
+            message(&host).starts_with("Could not open project"),
+            "the folder browser's own refusal"
+        );
+        assert_eq!(host.project_count(), 1, "nothing was opened");
+    }
+
+    #[test]
+    fn open_project_is_refused_in_an_isolated_run() {
+        let fakes = Fakes::new();
+        let mut project = TestProject::new("alpha", &[]);
+        project.state.isolated = true;
+        let mut host = host_over(&fakes, vec![project]);
+        host.handle(HostEvent::OpenProject(fakes.dir.path().to_path_buf()))
+            .unwrap();
+        assert!(message(&host).contains("isolated"));
+        assert_eq!(host.project_count(), 1);
     }
 }
