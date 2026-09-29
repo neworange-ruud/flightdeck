@@ -10,7 +10,7 @@
 //! +--------------+-----------------------------------------------+
 //! | status bar (30px)                                            |
 //! +--------------------------------------------------------------+
-//!   + the modal layer while the host has an overlay on screen
+//!   + the overlay layer (flightdeck_desktop::overlays), the root's last child
 //! ```
 //!
 //! ## Keys and focus
@@ -19,10 +19,10 @@
 //! `on_action::<KeymapAction>` handler; the sidebar carries `"App"` and the
 //! terminal `"Terminal"` — siblings, never nested (see `flightdeck_desktop::
 //! keys`). GPUI focus follows the host's input mode each frame: TERMINAL mode
-//! focuses the terminal, APP mode the sidebar, and an open overlay its modal,
-//! whose own key handler answers it. While an overlay is up, a table chord is
-//! handed on to that key handler instead of performed, as the TUI's modal
-//! swallows every key.
+//! focuses the terminal, APP mode the sidebar. An overlay is the overlay
+//! layer's: each render hands it `AppHost::overlay()`, it takes the keyboard
+//! while one is up (its "Overlay" context disables every Global chord, as the
+//! TUI's modal swallows every key) and gives focus back when it closes.
 
 use flightdeck::app::modes::InputMode;
 use flightdeck::contracts::PtySize;
@@ -36,13 +36,13 @@ use gpui_component::{h_flex, v_flex};
 use std::rc::Rc;
 
 use flightdeck_desktop::overlays::update::{update_banner, OnDismiss};
+use flightdeck_desktop::overlays::{Emit, OverlayContext, OverlayLayer};
 
 use crate::commands::{keymap, perform_entry};
 use crate::host::HostModel;
 use crate::terminal::view::TerminalView;
 use crate::theme::Palette;
 use crate::views::git_strip::git_strip;
-use crate::views::modal::modal;
 use crate::views::sidebar::{sidebar, SidebarData};
 use crate::views::status_bar::status_bar;
 use crate::views::titlebar::TitleBar;
@@ -61,7 +61,8 @@ pub struct FlightDeckWindow {
     titlebar: Entity<TitleBar>,
     terminal: Entity<TerminalView>,
     app_focus: FocusHandle,
-    modal_focus: FocusHandle,
+    /// Draws the host's overlay and answers it through `emit`.
+    layer: Entity<OverlayLayer>,
     /// The update banner was dismissed for this session.
     update_dismissed: bool,
 }
@@ -69,20 +70,28 @@ pub struct FlightDeckWindow {
 impl FlightDeckWindow {
     pub fn new(host: Entity<HostModel>, cx: &mut Context<Self>) -> Self {
         cx.observe(&host, |_, _, cx| cx.notify()).detach();
-        let titlebar = cx.new(|cx| TitleBar::new(host.clone(), cx));
+        // Overlay answers go to the host; the layer is refreshed from the
+        // re-render that follows (never from inside `emit`).
+        let emit: Emit = {
+            let host = host.clone();
+            Rc::new(move |event, _, cx| host.update(cx, |model, cx| model.dispatch(event, cx)))
+        };
+        let titlebar = cx.new(|cx| TitleBar::new(host.clone(), emit.clone(), cx));
         let terminal = cx.new(|cx| TerminalView::for_host(host.clone(), cx));
+        let layer = cx.new(|cx| OverlayLayer::new(emit, cx));
         Self {
             host,
             titlebar,
             terminal,
             app_focus: cx.focus_handle(),
-            modal_focus: cx.focus_handle(),
+            layer,
             update_dismissed: false,
         }
     }
 
-    /// A table chord fired (or a menu item dispatched one): perform it — or,
-    /// with an overlay open, let the modal's key handler have the key.
+    /// A table chord fired (or a menu item dispatched one): perform it. (With
+    /// an overlay up the layer's context has already disabled the Global
+    /// chords; this guard only keeps a stray one from acting behind it.)
     fn on_keymap_action(&mut self, action: &KeymapAction, _: &mut Window, cx: &mut Context<Self>) {
         if self.host.read(cx).host().overlay().is_some() {
             cx.propagate();
@@ -122,16 +131,29 @@ impl Render for FlightDeckWindow {
             update_banner(&notices, Some(dismiss), cx)
         };
 
-        // Focus follows the host (see the module docs).
-        let want = if overlay.is_some() {
-            self.modal_focus.clone()
-        } else if mode == InputMode::Terminal && has_terminal {
-            self.terminal.read(cx).focus_handle().clone()
-        } else {
-            self.app_focus.clone()
+        let context = OverlayContext {
+            project: host
+                .project_name(host.active_project_index())
+                .map(str::to_string),
+            agent: host.active_state().selected().map(|t| t.meta.name.clone()),
         };
-        if !want.is_focused(window) {
-            window.focus(&want, cx);
+        let overlay_open = overlay.is_some();
+        // The layer takes (and later returns) the keyboard itself.
+        self.layer.update(cx, |layer, cx| {
+            layer.set_context(context, cx);
+            layer.set_view(overlay, window, cx);
+        });
+
+        // Focus follows the host (see the module docs).
+        if !overlay_open {
+            let want = if mode == InputMode::Terminal && has_terminal {
+                self.terminal.read(cx).focus_handle().clone()
+            } else {
+                self.app_focus.clone()
+            };
+            if !want.is_focused(window) {
+                window.focus(&want, cx);
+            }
         }
 
         let app_host = self.host.clone();
@@ -182,11 +204,7 @@ impl Render for FlightDeckWindow {
                     .child(main),
             )
             .child(status_bar(&bar, &remote, &notices, &self.host, &p, cx))
-            .children(
-                overlay
-                    .as_ref()
-                    .map(|o| modal(o, &self.host, &self.modal_focus, &p, cx)),
-            )
+            .child(self.layer.clone())
     }
 }
 

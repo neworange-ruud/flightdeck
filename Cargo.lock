@@ -2369,6 +2369,7 @@ dependencies = [
  "gpui-pre-platform",
  "qrcode",
  "serde_json",
+ "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]
 

@@ -4,7 +4,6 @@
 
 pub mod git_strip;
 pub mod icons;
-pub mod modal;
 pub mod sidebar;
 pub mod status_bar;
 pub mod titlebar;

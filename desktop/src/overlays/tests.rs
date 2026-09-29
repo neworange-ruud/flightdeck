@@ -22,7 +22,6 @@ use flightdeck::host::{
     DialogKind, DialogView, HostEvent, MessageView, NewAgentTarget, OverlayInput, OverlayKey,
     OverlayView,
 };
-use flightdeck::tui::palette::PaletteAction;
 use gpui::{
     div, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Keystroke, Modifiers,
     MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Render, Styled, TestAppContext,
@@ -286,17 +285,13 @@ fn titles_split_into_question_and_key_hint_verbatim() {
 }
 
 #[test]
-fn a_picked_folder_goes_through_the_open_project_prompt() {
+fn a_picked_folder_is_the_hosts_open_project_event() {
     assert_eq!(
-        folder_answer("/work/repo", true),
-        vec![
-            HostEvent::RunPaletteAction(PaletteAction::OpenProject),
-            ev(OverlayInput::SetText("/work/repo".into())),
-            ev(OverlayInput::Submit),
-        ]
+        folder_answer(PathBuf::from("/work/repo"), true),
+        vec![HostEvent::OpenProject(PathBuf::from("/work/repo"))]
     );
     assert_eq!(
-        folder_answer("/work/repo", false),
+        folder_answer(PathBuf::from("/work/repo"), false),
         vec![
             ev(OverlayInput::SetText("/work/repo".into())),
             ev(OverlayInput::Submit),
@@ -693,9 +688,7 @@ fn the_shell_entry_points_open_the_palette_and_a_picked_project(app: &mut TestAp
         recorded.borrow().clone(),
         vec![
             HostEvent::OpenPalette,
-            HostEvent::RunPaletteAction(PaletteAction::OpenProject),
-            ev(OverlayInput::SetText("/work/other".into())),
-            ev(OverlayInput::Submit),
+            HostEvent::OpenProject(PathBuf::from("/work/other")),
         ]
     );
 

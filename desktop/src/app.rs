@@ -115,6 +115,9 @@ pub fn run(args: Vec<String>) {
             }
             // Every FlightDeck chord, generated from the keymap table.
             flightdeck_desktop::keys::register(cx, crate::commands::keymap());
+            // Under an open overlay every Global chord is disabled (the modal
+            // swallows keys, as in the TUI).
+            flightdeck_desktop::overlays::register(cx, crate::commands::keymap());
 
             let model = cx.new(|cx| {
                 let mut model = HostModel::new(host);

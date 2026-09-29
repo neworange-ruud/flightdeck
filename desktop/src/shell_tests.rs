@@ -67,6 +67,9 @@ fn open(
         gpui_component::init(cx);
         crate::theme::init(cx);
         flightdeck_desktop::keys::register(cx, crate::commands::keymap());
+        // Under an open overlay every Global chord is disabled (the modal
+        // swallows keys, as in the TUI).
+        flightdeck_desktop::overlays::register(cx, crate::commands::keymap());
     });
     let model = app.new(|_| HostModel::new(host));
     let for_window = model.clone();
@@ -265,19 +268,32 @@ fn with_no_agent_every_git_button_is_disabled(app: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_generic_modal_answers_the_overlay(app: &mut TestAppContext) {
+fn the_overlay_layer_answers_the_live_host(app: &mut TestAppContext) {
     let (_f, model, cx) = open(app, two_projects());
 
-    // Esc closes the palette through the overlay API.
+    // End to end: Ctrl-g opens the palette, typing filters it in the host,
+    // Enter runs the highlighted row.
     cx.simulate_keystrokes("ctrl-g");
     assert!(matches!(
         model.read_with(cx, |m, _| m.host().overlay()),
         Some(OverlayView::Palette(_))
     ));
     assert!(
-        cx.debug_bounds("modal-card").is_some(),
-        "the modal is drawn"
+        cx.debug_bounds("palette-row-0").is_some(),
+        "the layer draws the palette"
     );
+    cx.simulate_keystrokes("a b o u t");
+    let filtered = match model.read_with(cx, |m, _| m.host().overlay()) {
+        Some(OverlayView::Palette(p)) => p,
+        other => panic!("expected the palette, got {other:?}"),
+    };
+    assert_eq!(filtered.filter, "about");
+    assert_eq!(filtered.entries[0].label, "About FlightDeck");
+    cx.simulate_keystrokes("enter");
+    assert!(matches!(
+        model.read_with(cx, |m, _| m.host().overlay()),
+        Some(OverlayView::About(_))
+    ));
     take_dispatched(&model, cx);
     cx.simulate_keystrokes("escape");
     assert_eq!(
@@ -296,7 +312,7 @@ fn the_generic_modal_answers_the_overlay(app: &mut TestAppContext) {
     assert_eq!(model.read_with(cx, |m, _| m.host().overlay()), None);
 
     // While an overlay is open a table chord is not performed: Shift-Right
-    // stays with the modal instead of switching project.
+    // stays with the overlay instead of switching project.
     cx.simulate_keystrokes("ctrl-g");
     cx.simulate_keystrokes("shift-right");
     assert_eq!(active_project(&model, cx), 0);
@@ -325,7 +341,7 @@ fn the_generic_modal_answers_the_overlay(app: &mut TestAppContext) {
     };
     assert_eq!(dialog.kind, DialogKind::SetManualStatus);
     let first = dialog.buttons[0].id.clone();
-    let selector: &'static str = Box::leak(format!("modal-button-{first}").into_boxed_str());
+    let selector: &'static str = Box::leak(format!("overlay-button-{first}").into_boxed_str());
     take_dispatched(&model, cx);
     click(cx, selector);
     assert_eq!(
@@ -353,4 +369,29 @@ fn a_turn_redraws_and_teardown_saves_once(app: &mut TestAppContext) {
         .fs
         .file_contents(std::path::Path::new("/beta/.flightdeck/state.json"))
         .is_some());
+}
+
+#[gpui::test]
+fn plus_opens_the_picked_folder_through_the_host(app: &mut TestAppContext) {
+    let (_f, model, cx) = open(app, two_projects());
+    take_dispatched(&model, cx);
+    click(cx, "open-project");
+    let picked = tempfile::TempDir::new().expect("tempdir");
+    let answer = picked.path().to_path_buf();
+    let reply = answer.clone();
+    cx.simulate_path_prompt_response(move |_| Some(vec![reply.clone()]));
+    cx.run_until_parked();
+    assert_eq!(
+        take_dispatched(&model, cx),
+        [HostEvent::OpenProject(answer)]
+    );
+    // An empty folder is no repository: the host refuses it with the TUI's
+    // folder-browser message, and nothing opens.
+    match model.read_with(cx, |m, _| m.host().overlay()) {
+        Some(OverlayView::Message(m)) => {
+            assert!(m.text.starts_with("Could not open project"), "{}", m.text)
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    assert_eq!(model.read_with(cx, |m, _| m.host().project_count()), 2);
 }

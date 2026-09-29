@@ -12,7 +12,8 @@
 //! `SwitchProject(Index)` (Shift-Left/Right cycle through the same event),
 //! `+` answers a native folder picker with `HostEvent::OpenProject` (the host
 //! validates it as the TUI's folder browser does), `×` is the palette's Close
-//! Project, and the command field is Ctrl-g.
+//! Project, and the command field is Ctrl-g's `OpenPalette`. The last two go
+//! through the overlay layer's entry points.
 
 use flightdeck::app::commands::Selector;
 use flightdeck::host::HostEvent;
@@ -22,13 +23,15 @@ use gpui::prelude::FluentBuilder;
 #[cfg(target_os = "macos")]
 use gpui::MouseButton;
 use gpui::{
-    div, px, App, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, Pixels, Render, StatefulInteractiveElement, Styled, Window,
+    div, px, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
+    Render, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::h_flex;
 
 use crate::assets::icon;
-use crate::commands::{keycap, perform_id};
+use flightdeck_desktop::overlays::{self, Emit};
+
+use crate::commands::keycap;
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
 use crate::theme::Palette;
@@ -50,6 +53,9 @@ const TAB_NAME_MAX: Pixels = px(160.);
 
 pub struct TitleBar {
     host: Entity<HostModel>,
+    /// The overlay layer's answer path: the palette and the folder picker are
+    /// its entry points.
+    emit: Emit,
     /// Set on mouse-down, consumed on the first mouse-move: a press that then
     /// moves is a window drag, one that does not is a click. Mirrors
     /// gpui-component's `TitleBar`, which we do not use because it draws its
@@ -59,10 +65,11 @@ pub struct TitleBar {
 }
 
 impl TitleBar {
-    pub fn new(host: Entity<HostModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(host: Entity<HostModel>, emit: Emit, cx: &mut Context<Self>) -> Self {
         cx.observe(&host, |_, _, cx| cx.notify()).detach();
         Self {
             host,
+            emit,
             #[cfg(target_os = "macos")]
             drag_pending: false,
         }
@@ -89,8 +96,8 @@ impl Render for TitleBar {
             .border_color(p.hairline.hsla())
             .child(view_switcher(&p, needs_you))
             .child(div().flex_none().w(px(1.)).h(px(20.)).bg(p.border.hsla()))
-            .child(project_tabs(&p, &tabs, &self.host, isolated))
-            .child(command_field(&p, &self.host));
+            .child(project_tabs(&p, &tabs, &self.host, &self.emit, isolated))
+            .child(command_field(&p, &self.emit));
 
         #[cfg(target_os = "macos")]
         let bar = bar
@@ -187,6 +194,7 @@ fn project_tabs(
     p: &Palette,
     tabs: &[ProjectTabView],
     host: &Entity<HostModel>,
+    emit: &Emit,
     isolated: bool,
 ) -> impl IntoElement {
     h_flex()
@@ -200,7 +208,7 @@ fn project_tabs(
                 .enumerate()
                 .map(|(i, tab)| project_tab(p, i, tab, host, tabs.len() > 1)),
         )
-        .when(!isolated, |row| row.child(open_project_button(p, host)))
+        .when(!isolated, |row| row.child(open_project_button(p, emit)))
 }
 
 /// One project tab: status glyph + name; the active one is raised and carries
@@ -285,9 +293,10 @@ fn project_tab(
     }
 }
 
-/// `+`: pick a folder with the OS's own dialog, then open it through the host.
-fn open_project_button(p: &Palette, host: &Entity<HostModel>) -> impl IntoElement {
-    let host = host.clone();
+/// `+`: pick a folder with the OS's own dialog, then open it through the host
+/// (`overlays::pick_project_folder` answers with `HostEvent::OpenProject`).
+fn open_project_button(p: &Palette, emit: &Emit) -> impl IntoElement {
+    let emit = emit.clone();
     div()
         .id("open-project")
         .debug_selector(|| "open-project".into())
@@ -300,33 +309,12 @@ fn open_project_button(p: &Palette, host: &Entity<HostModel>) -> impl IntoElemen
         .hover(|s| s.bg(p.surface_raised.hsla()))
         .child(icons::icon(icon::PLUS, px(14.), p.muted))
         .tooltip(icons::tooltip("Open project…"))
-        .on_click(move |_, _, cx| pick_and_open_project(host.clone(), cx))
-}
-
-/// The native folder picker, answered with `HostEvent::OpenProject`.
-pub fn pick_and_open_project(host: Entity<HostModel>, cx: &mut App) {
-    let picked = cx.prompt_for_paths(PathPromptOptions {
-        files: false,
-        directories: true,
-        multiple: false,
-        prompt: Some("Open Project".into()),
-    });
-    cx.spawn(async move |cx| {
-        let Ok(Ok(Some(paths))) = picked.await else {
-            return;
-        };
-        if let Some(path) = paths.into_iter().next() {
-            host.update(cx, |model, cx| {
-                model.dispatch(HostEvent::OpenProject(path), cx)
-            });
-        }
-    })
-    .detach();
+        .on_click(move |_, window, cx| overlays::pick_project_folder(&emit, window, cx))
 }
 
 /// The 200px "Command… ⌃G" field: opens the palette, as Ctrl-g does.
-fn command_field(p: &Palette, host: &Entity<HostModel>) -> impl IntoElement {
-    let host = host.clone();
+fn command_field(p: &Palette, emit: &Emit) -> impl IntoElement {
+    let emit = emit.clone();
     h_flex()
         .id("command-field")
         .debug_selector(|| "command-field".into())
@@ -358,5 +346,5 @@ fn command_field(p: &Palette, host: &Entity<HostModel>) -> impl IntoElement {
                     p.ink_2,
                 )),
         )
-        .on_click(move |_, _, cx| perform_id("OpenPalette", &host, cx))
+        .on_click(move |_, window, cx| overlays::open_palette(&emit, window, cx))
 }

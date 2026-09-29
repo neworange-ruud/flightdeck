@@ -77,13 +77,13 @@ use flightdeck::app::keymap::Keymap;
 use flightdeck::host::{
     ButtonRole, DialogButton, DialogKind, HostEvent, OverlayInput, OverlayKey, OverlayView,
 };
-use flightdeck::tui::palette::PaletteAction;
 use gpui::{
     div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _, Context, Div, Entity,
     FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
     Keystroke, MouseButton, NoAction, ParentElement, PathPromptOptions, Render, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
 };
+use std::path::PathBuf;
 
 use crate::keys::binding_specs;
 use crate::theme::{Palette, SCRIM_ALPHA};
@@ -508,10 +508,10 @@ pub fn open_palette(emit: &Emit, window: &mut Window, cx: &mut App) {
 }
 
 /// Pick a project folder with the platform's folder picker and open it: the
-/// titlebar `+`. The chosen path goes through the host's Open Project prompt
-/// (opened, filled with the path, confirmed), so it gets exactly the TUI's
-/// checks — outside a git repository it is refused with the TUI's
-/// `Could not open project: …` notification, an already-open project is
+/// titlebar `+`. The chosen path is `HostEvent::OpenProject`, which runs the
+/// host's Open Project path (the TUI folder browser's Enter), so it gets
+/// exactly the TUI's checks — outside a git repository it is refused with the
+/// TUI's `Could not open project: …` notification, an already-open project is
 /// switched to, and an isolated run refuses Open Project outright. A
 /// cancelled picker does nothing.
 pub fn pick_project_folder(emit: &Emit, window: &mut Window, cx: &mut App) {
@@ -534,7 +534,7 @@ fn choose_folder(emit: Emit, open_prompt_first: bool, window: &mut Window, cx: &
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let events = folder_answer(&path.to_string_lossy(), open_prompt_first);
+            let events = folder_answer(path, open_prompt_first);
             // The window may have closed while the picker was up.
             cx.update(|window, cx| emit_all(&emit, events, window, cx))
                 .ok();
@@ -542,17 +542,18 @@ fn choose_folder(emit: Emit, open_prompt_first: bool, window: &mut Window, cx: &
         .detach();
 }
 
-/// The events that open `path` through the host's folder-browser prompt: type
-/// it as the prompt's path (a typed path wins over the highlighted folder,
-/// SPECS §22) and press Open.
-fn folder_answer(path: &str, open_prompt_first: bool) -> Vec<HostEvent> {
-    let mut events = Vec::new();
+/// The events that open `path`. With no prompt open, the host's own
+/// `OpenProject` event. Answering the folder-browser prompt already on screen
+/// (its "Choose…" button), type the path as the prompt's (a typed path wins
+/// over the highlighted folder, SPECS §22) and press Open.
+fn folder_answer(path: PathBuf, open_prompt_first: bool) -> Vec<HostEvent> {
     if open_prompt_first {
-        events.push(HostEvent::RunPaletteAction(PaletteAction::OpenProject));
+        return vec![HostEvent::OpenProject(path)];
     }
-    events.push(overlay(OverlayInput::SetText(path.to_string())));
-    events.push(overlay(OverlayInput::Submit));
-    events
+    vec![
+        overlay(OverlayInput::SetText(path.to_string_lossy().into_owned())),
+        overlay(OverlayInput::Submit),
+    ]
 }
 
 // ---------------------------------------------------------------------------
