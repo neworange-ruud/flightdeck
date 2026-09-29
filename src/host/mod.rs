@@ -43,7 +43,8 @@ use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::{Notifier, PtySize};
 use crate::git::status::WorktreeStatus;
 use crate::persistence::workspace::{
-    load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
+    load_workspace, save_workspace, workspace_state_path, WorkspaceState, WorkspaceUi,
+    WORKSPACE_VERSION,
 };
 use crate::remote::commands::{CommandLedger, PendingFirstTask};
 use crate::remote::pairing::{build_channel, PairingSession};
@@ -159,6 +160,10 @@ pub struct AppHost<'a> {
     /// Where the workspace file lives, or `None` for an isolated run (which
     /// writes no workspace file at all).
     ws_path: Option<PathBuf>,
+    /// The workspace-level view state (the main view, Mission control's
+    /// scope), loaded from the workspace file and written back with it. The
+    /// host only keeps it; a front-end with such views decides what it means.
+    workspace_ui: WorkspaceUi,
     /// Loop iterations so far; drives the coarse git refresh and the one-shot
     /// first-tick autopair seam.
     tick: u64,
@@ -243,8 +248,10 @@ impl<'a> AppHost<'a> {
         } else {
             workspace_state_path()
         };
+        let mut workspace_ui = WorkspaceUi::default();
         if let Some(ref wp) = ws_path {
             if let Ok(saved) = load_workspace(env.fs, wp) {
+                workspace_ui = saved.ui.clone();
                 for p in &saved.projects {
                     let pr = Path::new(p);
                     if !env.fs.is_dir(pr) {
@@ -263,6 +270,7 @@ impl<'a> AppHost<'a> {
         let web_surface = WebSurface::new(&workspace.active_project().state.config.web);
         let mut host = AppHost::from_parts(env, notifier, workspace, web_surface, isolated);
         host.ws_path = ws_path;
+        host.workspace_ui = workspace_ui;
         host.store_home = crate::app::state::user_home();
         Ok(host)
     }
@@ -290,6 +298,7 @@ impl<'a> AppHost<'a> {
             ui: Ui::default(),
             isolated,
             ws_path: None,
+            workspace_ui: WorkspaceUi::default(),
             tick: 0,
             now_ms: 0,
             store_home: None,
@@ -496,6 +505,7 @@ impl<'a> AppHost<'a> {
                     .map(|p| p.git.root().to_string_lossy().to_string())
                     .collect(),
                 active: self.workspace.active,
+                ui: self.workspace_ui.clone(),
             };
             let _ = save_workspace(self.env.fs, wp, &ws_state);
         }
@@ -1292,6 +1302,83 @@ impl<'a> AppHost<'a> {
     pub fn git_strip(&self) -> crate::view::GitStripView {
         let p = self.workspace.active_project();
         crate::view::git_strip_view(&p.state, &p.cache)
+    }
+
+    /// Mission control (designs A2/A3) over every open project, under the
+    /// persisted scope ([`AppHost::workspace_ui`]), against the host clock.
+    pub fn mission_view(&self) -> crate::view::MissionView {
+        let sources: Vec<crate::view::MissionSource<'_>> = self
+            .workspace
+            .projects
+            .iter()
+            .map(|p| crate::view::MissionSource {
+                name: &p.name,
+                root: p.git.root(),
+                state: &p.state,
+                git: &p.cache,
+            })
+            .collect();
+        crate::view::mission_view(
+            &sources,
+            &self.workspace_ui.mission_scope,
+            self.now_ms,
+            self.now_unix_secs(),
+        )
+    }
+
+    /// The terminal Agent Tab `tab_id` of project `project` has on screen —
+    /// its agent, or the child shell / extra agent selected on its terminal
+    /// row — whether or not that project is the active one. `None` for an
+    /// unknown project or tab, or before its process is spawned.
+    ///
+    /// Read-only on purpose: a front-end drawing several sessions at once
+    /// (Mission control's tiles) only looks. Typing still goes to the active
+    /// terminal through [`HostEvent::TerminalInput`], after the front-end has
+    /// made that session the active one.
+    pub fn tab_terminal(
+        &self,
+        project: usize,
+        tab_id: &str,
+    ) -> Option<&crate::terminal::session::Terminal> {
+        self.workspace
+            .projects
+            .get(project)?
+            .state
+            .tabs
+            .iter()
+            .find(|t| t.meta.id == tab_id)?
+            .session
+            .active()
+    }
+
+    /// Start a git-status refresh of project `index` now, on its background
+    /// worker (the answer lands in a later [`AppHost::pump`]). A no-op while
+    /// one is already in flight, or for an unknown index.
+    ///
+    /// The host refreshes only the active project on its own, because only
+    /// its sidebar is on screen in the Projects view. A front-end that shows
+    /// other projects' sessions too (Mission control's tiles and cards) asks
+    /// for theirs, at a pace it chooses.
+    pub fn refresh_git_status(&mut self, index: usize) {
+        if let Some(p) = self.workspace.projects.get_mut(index) {
+            if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
+                p.status_in_flight = true;
+            }
+        }
+    }
+
+    /// The workspace-level view state a front-end persists: its main view
+    /// and Mission control's scope. Loaded from the workspace file by
+    /// [`AppHost::open`]; written back by [`AppHost::persist`].
+    pub fn workspace_ui(&self) -> &WorkspaceUi {
+        &self.workspace_ui
+    }
+
+    /// Replace the workspace-level view state. Takes effect on screen at
+    /// once and on disk at the next [`AppHost::persist`] (an isolated run
+    /// keeps it for the session only, like everything else it would save).
+    pub fn set_workspace_ui(&mut self, ui: WorkspaceUi) {
+        self.workspace_ui = ui;
     }
 
     /// The mode bar for the active project: its input mode, plus the update,

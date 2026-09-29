@@ -50,6 +50,9 @@ pub enum KeyAction {
     FocusApp,
     /// Focus the active terminal → terminal mode (`AppState::focus_terminal`).
     FocusTerminal,
+    /// Switch Projects ⇄ Mission control: a desktop-app view, which the TUI
+    /// answers by saying where to find it.
+    ToggleMissionControl,
     /// Quit FlightDeck (wiring layer cleans up).
     Quit,
     /// No action.
@@ -66,6 +69,7 @@ impl From<Action> for KeyAction {
             Action::OpenHelp => KeyAction::OpenHelp,
             Action::FocusApp => KeyAction::FocusApp,
             Action::FocusTerminal => KeyAction::FocusTerminal,
+            Action::ToggleMissionControl => KeyAction::ToggleMissionControl,
             Action::Quit => KeyAction::Quit,
         }
     }
@@ -1095,6 +1099,20 @@ mod legacy_equivalence_tests {
                 for code in codes() {
                     for mods in all_modifiers() {
                         let key = KeyEvent::new(code, mods);
+                        // The one binding added since the refactor: Alt-m,
+                        // App mode only, exact. The pre-refactor mapper had
+                        // nothing there.
+                        if mode == InputMode::App
+                            && code == KeyCode::Char('m')
+                            && mods == KeyModifiers::ALT
+                        {
+                            assert_eq!(
+                                map_key_with_f2(mode, key, use_f2),
+                                KeyAction::ToggleMissionControl
+                            );
+                            assert_eq!(legacy_map_key_with_f2(mode, key, use_f2), KeyAction::None);
+                            continue;
+                        }
                         assert_eq!(
                             map_key_with_f2(mode, key, use_f2),
                             legacy_map_key_with_f2(mode, key, use_f2),

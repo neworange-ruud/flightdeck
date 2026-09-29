@@ -220,6 +220,51 @@ fn leave_focus_binding_follows_the_options() {
     assert_eq!(leave_focus_label(f2), "F2");
 }
 
+/// Alt-m (the Projects / Mission control switch) is new, so prove it took
+/// nothing: in App mode it was unbound under every option set and every
+/// modifier combination that could reach it, and in Terminal mode it is still
+/// unbound, so the PTY keeps receiving Meta-m (`ESC m`) — zsh's
+/// copy-prev-shell-word, and Claude Code's Shift+Tab fallback on Windows.
+#[test]
+fn alt_m_switches_views_in_app_mode_and_stays_the_terminals() {
+    let alt_m = Chord::new(Key::Char('m'), Mods::ALT);
+    for options in all_options() {
+        let keymap = Keymap::new(options);
+        assert_eq!(
+            keymap.lookup(InputMode::App, alt_m).map(|e| e.id),
+            Some("ToggleMissionControl")
+        );
+        // No other entry is bound to any m chord, in any context.
+        for entry in keymap.entries() {
+            for t in &entry.triggers {
+                if t.chord.key == Key::Char('m') || t.chord.key == Key::Char('M') {
+                    assert_eq!(entry.id, "ToggleMissionControl", "{options:?}");
+                    assert_eq!(t.context, Context::App, "never Global or Terminal");
+                    assert_eq!(t.tolerate, Mods::NONE, "exact: Cmd-Alt-m is the OS's");
+                }
+            }
+        }
+        for mods in all_mods() {
+            let chord = Chord::new(Key::Char('m'), mods);
+            assert!(
+                keymap.lookup(InputMode::Terminal, chord).is_none(),
+                "{chord} must reach the PTY ({options:?})"
+            );
+            if mods != Mods::ALT {
+                assert!(
+                    keymap.lookup(InputMode::App, chord).is_none(),
+                    "{chord} is not the switch"
+                );
+            }
+        }
+    }
+    assert_eq!(encode_pty(alt_m), b"\x1bm".to_vec());
+    let keymap = Keymap::new(KeymapOptions::for_this_platform(false));
+    let entry = keymap.entry("ToggleMissionControl").unwrap();
+    assert_eq!(entry.keycap().as_deref(), Some("Alt-m"));
+    assert_eq!(entry.help_section, Some("Projects"));
+}
+
 #[test]
 fn command_v_pastes_only_when_enabled() {
     let cmd_v = Chord::new(Key::Char('v'), Mods::SUPER);

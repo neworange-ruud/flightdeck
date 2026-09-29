@@ -4666,6 +4666,13 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         KeyAction::OpenHelp => HostEvent::OpenHelp,
         KeyAction::FocusApp => HostEvent::FocusApp,
         KeyAction::FocusTerminal => HostEvent::FocusTerminal,
+        // The table binds the desktop app's view switch in every front-end
+        // (one table, one help screen); the TUI has one view, so it says
+        // where the other one lives rather than doing nothing.
+        KeyAction::ToggleMissionControl => {
+            ui.message("Mission control is a view of the FlightDeck desktop app.");
+            return Ok(false);
+        }
         // The TUI's paste key reads the system clipboard itself (and may paste
         // an image path); `HostEvent::Paste` carries text a front-end already
         // read. Same lock, different source, so it stays here.

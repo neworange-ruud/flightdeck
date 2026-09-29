@@ -188,6 +188,155 @@ fn active_terminal_is_the_selected_agents_focused_terminal() {
 }
 
 #[test]
+fn tab_terminal_reads_any_projects_tab_not_only_the_active_one() {
+    let fakes = Fakes::new();
+    let (live, pty) = fakes.state_with_a_tab();
+    let live_id = live.tabs[0].meta.id.clone();
+    // Project 0 is on screen and its one tab has no process; the live tab
+    // sits in background project 1.
+    let workspace = Workspace {
+        projects: vec![
+            project(
+                "front",
+                "/front",
+                super::testing::state_with_tabs("front", &["idle"]),
+                Arc::clone(&fakes.git),
+            ),
+            project("back", "/repo", live, Arc::clone(&fakes.git)),
+        ],
+        active: 0,
+    };
+    let mut host = AppHost::from_parts(
+        fakes.env(),
+        &fakes.notifier,
+        workspace,
+        web_surface(),
+        false,
+    );
+    host.tick = 1;
+    pty.push_output("background output");
+    host.pump();
+
+    let term = host
+        .tab_terminal(1, &live_id)
+        .expect("a background project's spawned tab has a terminal");
+    assert!(term.screen().contents().contains("background output"));
+    assert_eq!(host.active_project_index(), 0, "reading switched nothing");
+    assert!(
+        host.active_terminal().is_none(),
+        "the active project's own tab is unspawned"
+    );
+    assert!(
+        host.tab_terminal(0, "t0").is_none(),
+        "unspawned: no terminal"
+    );
+    assert!(host.tab_terminal(1, "no-such-tab").is_none());
+    assert!(host.tab_terminal(7, &live_id).is_none());
+}
+
+#[test]
+fn refresh_git_status_runs_for_a_background_project_on_request() {
+    let fakes = Fakes::new();
+    let projects = vec![
+        super::testing::TestProject::new("front", &["f1"]),
+        super::testing::TestProject::new("back", &["b1", "b2"]),
+    ];
+    let mut host = super::testing::host(fakes.env(), &fakes.notifier, projects, 0);
+    assert!(!host.workspace.projects[1].status_in_flight);
+    host.refresh_git_status(1);
+    assert!(
+        host.workspace.projects[1].status_in_flight,
+        "a worker is out"
+    );
+    assert!(
+        !host.workspace.projects[0].status_in_flight,
+        "only the one asked for"
+    );
+    host.refresh_git_status(1); // in flight: nothing more
+    host.refresh_git_status(9); // unknown: nothing at all
+                                // The worker answers into the project's channel; a later pump lands it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while host.workspace.projects[1].status_in_flight {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never answered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        host.pump();
+    }
+}
+
+#[test]
+fn mission_view_spans_every_project() {
+    let fakes = Fakes::new();
+    let (mut live, _pty) = fakes.state_with_a_tab();
+    live.tabs[0].interpreted = Some(InterpretedStatus::WaitingForInput);
+    let workspace = Workspace {
+        projects: vec![
+            project(
+                "front",
+                "/front",
+                super::testing::state_with_tabs("front", &["idle"]),
+                Arc::clone(&fakes.git),
+            ),
+            project("back", "/repo", live, Arc::clone(&fakes.git)),
+        ],
+        active: 0,
+    };
+    let host = AppHost::from_parts(
+        fakes.env(),
+        &fakes.notifier,
+        workspace,
+        web_surface(),
+        false,
+    );
+    let view = host.mission_view();
+    assert_eq!(view.tiles.len(), 1);
+    assert_eq!(view.tiles[0].key.project, 1);
+    assert_eq!(view.tiles[0].project_name, "back");
+    assert_eq!(view.needs_you_count, 1);
+    assert_eq!(view.quiet_count, 1, "the unspawned tab never did anything");
+}
+
+#[test]
+fn workspace_ui_survives_a_reopen() {
+    use crate::persistence::workspace::{MainView, MissionScope, RecentScope};
+    let fakes = Fakes::new();
+    let ws_path = PathBuf::from("/home/u/.flightdeck/workspace.json");
+    let projects = || vec![super::testing::TestProject::new("alpha", &["a1"])];
+    let mut host = super::testing::host_with_workspace_file(
+        fakes.env(),
+        &fakes.notifier,
+        projects(),
+        0,
+        ws_path.clone(),
+    );
+    assert_eq!(host.workspace_ui(), &WorkspaceUi::default(), "no file yet");
+    let chosen = WorkspaceUi {
+        view: MainView::Mission,
+        mission_scope: MissionScope {
+            window: RecentScope::Week,
+            project: Some("/alpha".to_string()),
+        },
+    };
+    host.set_workspace_ui(chosen.clone());
+    let _ = host.persist();
+    drop(host);
+
+    let reopened = super::testing::host_with_workspace_file(
+        fakes.env(),
+        &fakes.notifier,
+        projects(),
+        0,
+        ws_path.clone(),
+    );
+    assert_eq!(reopened.workspace_ui(), &chosen);
+    let saved = load_workspace(&fakes.fs, &ws_path).unwrap();
+    assert_eq!(saved.projects, ["/alpha"]);
+    assert_eq!(saved.ui, chosen);
+}
+
+#[test]
 fn pump_reads_the_clock_once_per_turn() {
     let fakes = Fakes::new();
     let (state, _pty) = fakes.state_with_a_tab();

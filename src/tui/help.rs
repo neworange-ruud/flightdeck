@@ -345,6 +345,8 @@ mod tests {
                     ("Shift-Left / Shift-Right", "Previous / Next project"),
                     ("Mouse click", "Switch project (top tab row)"),
                     ("+ project", "Open another project folder"),
+                    // Added after the refactor: the desktop app's view switch.
+                    ("Alt-m", "Projects / Mission control (desktop app)"),
                 ],
             ),
             (

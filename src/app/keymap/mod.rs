@@ -116,6 +116,9 @@ pub enum Action {
     FocusApp,
     /// Focus the active terminal (`AppState::focus_terminal`).
     FocusTerminal,
+    /// Switch between the Projects view and Mission control. A view of the
+    /// desktop app; a front-end without one says so instead.
+    ToggleMissionControl,
     /// Quit FlightDeck.
     Quit,
 }
@@ -439,6 +442,18 @@ fn build_entries(options: KeymapOptions) -> Vec<KeymapEntry> {
                 Mods::ALL.without(Mods::ALT | Mods::CTRL),
             )],
         ),
+        // App mode only, unlike Alt-o and Alt-h. Meta-m is taken inside the
+        // terminal: zsh's emacs keymap binds it to copy-prev-shell-word, and
+        // Claude Code falls back to it for cycling permission modes where
+        // Shift+Tab is unavailable (Windows). A global binding would swallow
+        // both on every OS; from a focused terminal it is Alt-Esc, then Alt-m.
+        // Exact: Cmd-Alt-m is the platform's own on macOS.
+        entry(
+            "ToggleMissionControl",
+            Action::ToggleMissionControl,
+            "Switch Projects / Mission control",
+            vec![trigger(App, Key::Char('m'), alt, exact)],
+        ),
         // Alt-arrows are global so they work with a terminal focused; the bare
         // arrows are an App-mode fallback for terminals (e.g. Warp) that
         // capture Option/Alt+arrows themselves.
@@ -685,6 +700,10 @@ fn build_help(options: KeymapOptions, entries: &[KeymapEntry]) -> Vec<HelpSectio
                 ),
                 gesture_row("Mouse click", "Switch project (top tab row)"),
                 gesture_row("+ project", "Open another project folder"),
+                row(
+                    &["ToggleMissionControl"],
+                    "Projects / Mission control (desktop app)",
+                ),
             ],
         },
         HelpSectionSpec {

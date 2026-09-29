@@ -134,6 +134,28 @@ fn build<'a>(
     host
 }
 
+/// [`host`], plus a workspace file at `ws_path` on `env.fs`, treated the way
+/// [`AppHost::open`] treats the real one: its view state
+/// ([`AppHost::workspace_ui`]) is loaded now, and [`AppHost::persist`] writes
+/// it back. Build a second host over the same fakes to see what a restart
+/// keeps. (The file's project list is not reopened: `projects` is the
+/// workspace.)
+pub fn host_with_workspace_file<'a>(
+    env: Env<'a>,
+    notifier: &'a dyn Notifier,
+    projects: Vec<TestProject>,
+    active: usize,
+    ws_path: PathBuf,
+) -> AppHost<'a> {
+    let fs = env.fs;
+    let mut host = host(env, notifier, projects, active);
+    if let Ok(saved) = crate::persistence::workspace::load_workspace(fs, &ws_path) {
+        host.workspace_ui = saved.ui;
+    }
+    host.ws_path = Some(ws_path);
+    host
+}
+
 /// Record `status` as project `project`'s latest collected git status for tab
 /// `tab_id`, as the periodic refresh would.
 pub fn set_git_status(host: &mut AppHost, project: usize, tab_id: &str, status: WorktreeStatus) {
