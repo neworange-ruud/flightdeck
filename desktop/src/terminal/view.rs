@@ -143,6 +143,8 @@ pub struct TerminalView {
     row_cache: RowCache<Vec<ShapedLine>>,
     /// The button held while forwarding a drag to a mouse-aware program.
     forwarded_button: Option<u8>,
+    /// The cell the last motion report was for (see `new_motion_cell`).
+    motion_cell: Option<(u16, u16)>,
     /// A local selection drag in progress.
     drag: Option<Drag>,
     /// The auto-scroll loop while a drag is held past an edge, and whether it
@@ -264,6 +266,7 @@ impl TerminalView {
             metrics: None,
             shaped_at: None,
             forwarded_button: None,
+            motion_cell: None,
             drag: None,
             autoscroll: None,
             autoscrolling: false,
@@ -718,6 +721,7 @@ impl TerminalView {
                     code
                 };
                 self.forwarded_button = Some(code);
+                self.motion_cell = Some((row, col));
                 self.write(
                     &input::mouse_button_bytes(encoding, code, col, row, true),
                     cx,
@@ -754,7 +758,9 @@ impl TerminalView {
             else {
                 return;
             };
-            if matches!(mode, MouseMode::ButtonMotion | MouseMode::AnyMotion) {
+            if matches!(mode, MouseMode::ButtonMotion | MouseMode::AnyMotion)
+                && self.new_motion_cell((row, col))
+            {
                 self.write(&input::mouse_motion_bytes(encoding, code, col, row), cx);
             }
             return;
@@ -787,11 +793,17 @@ impl TerminalView {
             else {
                 return;
             };
-            if mode == MouseMode::AnyMotion {
+            if mode == MouseMode::AnyMotion && self.new_motion_cell((row, col)) {
                 // Code 3 is "no button" in xterm's encoding.
                 self.write(&input::mouse_motion_bytes(encoding, 3, col, row), cx);
             }
         }
+    }
+
+    /// Whether a motion report for `cell` is due: xterm reports motion per
+    /// cell, not per pixel, so a pointer moving within one cell sends nothing.
+    fn new_motion_cell(&mut self, cell: (u16, u16)) -> bool {
+        self.motion_cell.replace(cell) != Some(cell)
     }
 
     /// Any button release in the window: ends a forwarded drag (reporting the

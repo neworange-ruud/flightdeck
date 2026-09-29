@@ -399,7 +399,14 @@ fn check_reporting(
         Vec::new()
     };
     assert_eq!(written(&pty, &mut seen), drag, "drag, ?{mode}");
+    // Motion is reported per cell: a pixel within the same cell sends nothing.
     let at = cell(&view, cx, 2, 7);
+    cx.simulate_mouse_move(
+        point(at.x + px(1.), at.y),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    assert!(written(&pty, &mut seen).is_empty(), "same cell, ?{mode}");
     cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
     let release = if press_only {
         Vec::new()
