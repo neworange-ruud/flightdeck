@@ -327,6 +327,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             });
         }
         AppState::new(Config::default(), ps, "/repo", "/repo/state.json")
