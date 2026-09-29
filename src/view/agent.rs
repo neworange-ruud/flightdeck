@@ -1,10 +1,10 @@
 //! The Agent Tab list view model (one row per agent).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::app::state::{AppState, RuntimeTab, TabPhase};
 use crate::contracts::{InterpretedStatus, ManualStatus};
-use crate::git::status::{WorktreeChanges, WorktreeStatus};
+use crate::git::status::{LineStats, WorktreeChanges, WorktreeStatus};
 use crate::terminal::session::TerminalKind;
 
 /// The glanceable state of an agent, independent of how a front-end colours it.
@@ -86,8 +86,8 @@ impl UpstreamState {
     }
 }
 
-/// Uncommitted-change counts for a worktree. File counts only: git status does
-/// not give line counts, so there is no `+lines/-lines` here.
+/// Uncommitted-change counts for a worktree: files by category, plus lines
+/// added and removed in tracked files versus `HEAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeSummary {
     /// New files (untracked or staged additions).
@@ -98,16 +98,22 @@ pub struct ChangeSummary {
     pub deleted: u32,
     /// Total changed files; zero means the worktree is clean.
     pub files: u32,
+    /// Lines added versus `HEAD` (tracked files, staged and unstaged).
+    pub lines_added: u32,
+    /// Lines removed versus `HEAD` (tracked files, staged and unstaged).
+    pub lines_removed: u32,
 }
 
 impl ChangeSummary {
-    /// Summarise a set of worktree changes.
-    pub fn of(changes: WorktreeChanges) -> Self {
+    /// Summarise a set of worktree changes and their line counts.
+    pub fn of(changes: WorktreeChanges, lines: LineStats) -> Self {
         ChangeSummary {
             added: changes.added,
             modified: changes.modified,
             deleted: changes.deleted,
             files: changes.total(),
+            lines_added: lines.added,
+            lines_removed: lines.removed,
         }
     }
 
@@ -212,16 +218,18 @@ pub struct AgentRowView {
     /// the TUI but never replaces [`AgentRowView::badge`].
     pub manual_status: Option<ManualStatus>,
     /// The status word the TUI shows: the manual override's label when set,
-    /// otherwise `in progress` / `waiting` / `error` / `idle`. There is no
-    /// elapsed-time suffix because AppState records no "since" timestamp.
+    /// otherwise `in progress` / `waiting` / `error` / `idle`. The elapsed time
+    /// is separate, in [`AgentRowView::status_since_secs`].
     pub status_text: String,
+    /// Seconds the agent has been in its current status, or `None` when no
+    /// status change has been recorded yet. Format with [`format_elapsed`].
+    pub status_since_secs: Option<u64>,
     /// Whether the worktree is still being created on a background worker.
     pub creating: bool,
     /// Whether this row is the selected Agent Tab.
     pub selected: bool,
-    /// Whether the agent has output or state the user has not looked at yet.
-    /// AppState does not track this; it comes from the `unread` set the caller
-    /// passes to [`agent_row_view`].
+    /// Whether the agent produced output while it was not on screen and the
+    /// user has not viewed it since (see [`RuntimeTab::is_unread`]).
     pub unread: bool,
     /// Uncommitted changes, or `None` when no git status is collected yet.
     pub changes: Option<ChangeSummary>,
@@ -237,17 +245,29 @@ pub struct AgentRowView {
     pub terminals: Vec<TerminalView>,
 }
 
+/// Compact elapsed-time text for a status age: `now` (under 5 seconds), then
+/// `42s`, `2m`, `3h`, `2d`, each rounded down to its largest whole unit.
+pub fn format_elapsed(secs: u64) -> String {
+    match secs {
+        0..=4 => "now".to_string(),
+        5..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 /// Build the row for the tab at `index`.
 ///
-/// `git` maps tab ids to their latest collected status; `unread` holds the ids
-/// of tabs with something the user has not seen. Returns `None` when `index` is
-/// out of range.
+/// `git` maps tab ids to their latest collected status. `now_ms` is the clock
+/// in milliseconds and `now_secs` in unix seconds; the view reads no clock
+/// itself. Returns `None` when `index` is out of range.
 pub fn agent_row_view(
     state: &AppState,
     index: usize,
     git: &HashMap<String, WorktreeStatus>,
-    unread: &HashSet<String>,
     now_ms: u64,
+    now_secs: u64,
 ) -> Option<AgentRowView> {
     let tab = state.tabs.get(index)?;
     let ds = tab.display_status(now_ms);
@@ -272,10 +292,15 @@ pub fn agent_row_view(
         badge: agent_badge(ds.interpreted),
         manual_status: ds.manual,
         status_text,
+        status_since_secs: tab
+            .meta
+            .activity
+            .last_status_change_at
+            .map(|at| now_secs.saturating_sub(at)),
         creating: tab.phase == TabPhase::Creating,
         selected: state.selected_tab == Some(index),
-        unread: unread.contains(&tab.meta.id),
-        changes: ws.map(|w| ChangeSummary::of(w.changes)),
+        unread: tab.is_unread(),
+        changes: ws.map(|w| ChangeSummary::of(w.changes, w.lines)),
         upstream: UpstreamState::of(ws),
         base_drift: ws.map(|w| w.base_drift).unwrap_or(0),
         recovered: tab.meta.recovered,
@@ -288,11 +313,11 @@ pub fn agent_row_view(
 pub fn agent_row_views(
     state: &AppState,
     git: &HashMap<String, WorktreeStatus>,
-    unread: &HashSet<String>,
     now_ms: u64,
+    now_secs: u64,
 ) -> Vec<AgentRowView> {
     (0..state.tabs.len())
-        .filter_map(|i| agent_row_view(state, i, git, unread, now_ms))
+        .filter_map(|i| agent_row_view(state, i, git, now_ms, now_secs))
         .collect()
 }
 
@@ -339,6 +364,7 @@ mod tests {
             base_branch: "main".to_string(),
             dirty: false,
             changes: WorktreeChanges::default(),
+            lines: LineStats::default(),
             ahead,
             behind,
             upstream: upstream.map(str::to_string),
@@ -348,7 +374,7 @@ mod tests {
     }
 
     fn rows(state: &AppState) -> Vec<AgentRowView> {
-        agent_row_views(state, &HashMap::new(), &HashSet::new(), 0)
+        agent_row_views(state, &HashMap::new(), 0, 0)
     }
 
     #[test]
@@ -403,12 +429,65 @@ mod tests {
     }
 
     #[test]
-    fn unread_flag_comes_from_the_supplied_set() {
-        let state = state_with_tabs(2);
-        let unread: HashSet<String> = ["t1".to_string()].into();
-        let rows = agent_row_views(&state, &HashMap::new(), &unread, 0);
+    fn unread_flag_comes_from_app_state() {
+        let mut state = state_with_tabs(2);
+        state.tabs[1].note_output();
+        state.sync_activity(10, 10_000, true);
+        let rows = rows(&state);
         assert!(!rows[0].unread);
         assert!(rows[1].unread);
+    }
+
+    #[test]
+    fn status_since_is_measured_from_the_last_status_change() {
+        let mut state = state_with_tabs(2);
+        state.tabs[0].meta.activity.last_status_change_at = Some(1_000);
+        let rows = agent_row_views(&state, &HashMap::new(), 0, 1_090);
+        assert_eq!(rows[0].status_since_secs, Some(90));
+        assert_eq!(rows[1].status_since_secs, None);
+        // A clock that reads earlier than the stamp never underflows.
+        let rows = agent_row_views(&state, &HashMap::new(), 0, 500);
+        assert_eq!(rows[0].status_since_secs, Some(0));
+    }
+
+    #[test]
+    fn format_elapsed_covers_every_unit_boundary() {
+        let cases = [
+            (0, "now"),
+            (4, "now"),
+            (5, "5s"),
+            (42, "42s"),
+            (59, "59s"),
+            (60, "1m"),
+            (119, "1m"),
+            (3_599, "59m"),
+            (3_600, "1h"),
+            (10_800, "3h"),
+            (86_399, "23h"),
+            (86_400, "1d"),
+            (172_800, "2d"),
+            (u64::MAX, "213503982334601d"),
+        ];
+        for (secs, text) in cases {
+            assert_eq!(format_elapsed(secs), text, "{secs}s");
+        }
+    }
+
+    #[test]
+    fn change_summary_carries_line_counts() {
+        let summary = ChangeSummary::of(
+            WorktreeChanges {
+                added: 1,
+                modified: 1,
+                deleted: 0,
+            },
+            LineStats {
+                added: 12,
+                removed: 3,
+            },
+        );
+        assert_eq!((summary.lines_added, summary.lines_removed), (12, 3));
+        assert_eq!(summary.files, 2);
     }
 
     #[test]
@@ -443,8 +522,12 @@ mod tests {
             deleted: 3,
         };
         status.base_drift = 4;
+        status.lines = LineStats {
+            added: 10,
+            removed: 4,
+        };
         let git = HashMap::from([("t0".to_string(), status)]);
-        let row = agent_row_view(&state, 0, &git, &HashSet::new(), 0).unwrap();
+        let row = agent_row_view(&state, 0, &git, 0, 0).unwrap();
         assert_eq!(row.branch, "flightdeck/live");
         assert_eq!(
             row.changes,
@@ -452,7 +535,9 @@ mod tests {
                 added: 1,
                 modified: 2,
                 deleted: 3,
-                files: 6
+                files: 6,
+                lines_added: 10,
+                lines_removed: 4,
             })
         );
         assert!(!row.changes.unwrap().is_clean());
@@ -463,7 +548,7 @@ mod tests {
     #[test]
     fn without_git_status_the_stored_branch_is_used() {
         let state = state_with_tabs(1);
-        let row = agent_row_view(&state, 0, &HashMap::new(), &HashSet::new(), 0).unwrap();
+        let row = agent_row_view(&state, 0, &HashMap::new(), 0, 0).unwrap();
         assert_eq!(row.branch, "flightdeck/tab0");
         assert_eq!(row.changes, None);
         assert_eq!(row.upstream, UpstreamState::Unknown);
@@ -473,7 +558,7 @@ mod tests {
     #[test]
     fn out_of_range_index_yields_none() {
         let state = state_with_tabs(1);
-        assert!(agent_row_view(&state, 1, &HashMap::new(), &HashSet::new(), 0).is_none());
+        assert!(agent_row_view(&state, 1, &HashMap::new(), 0, 0).is_none());
     }
 
     #[test]

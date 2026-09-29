@@ -87,7 +87,7 @@ pub fn git_strip_view(state: &AppState, git: &HashMap<String, WorktreeStatus>) -
                 .unwrap_or_else(|| tab.meta.branch.clone()),
             target_branch: tab.meta.base_branch.clone(),
             target_is_default: tab.meta.base_branch == state.base_branch,
-            changes: ws.map(|w| ChangeSummary::of(w.changes)),
+            changes: ws.map(|w| ChangeSummary::of(w.changes, w.lines)),
             upstream: UpstreamState::of(ws),
             base_drift: ws.map(|w| w.base_drift).unwrap_or(0),
             actions: git_actions(tab),
@@ -137,6 +137,7 @@ mod tests {
 
     fn status(upstream: Option<&str>) -> WorktreeStatus {
         WorktreeStatus {
+            lines: Default::default(),
             branch: "flightdeck/live".to_string(),
             base_branch: "main".to_string(),
             dirty: true,

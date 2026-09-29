@@ -725,6 +725,7 @@ mod r2 {
 
     fn status(upstream: Option<&str>) -> WorktreeStatus {
         WorktreeStatus {
+            lines: Default::default(),
             branch: "flightdeck/fix-login".to_string(),
             base_branch: "main".to_string(),
             dirty: true,
@@ -1096,6 +1097,7 @@ mod delta {
         let mut after = before.clone();
         after.projects[0].sessions[0].git = git_bar(GitFacts {
             status: Some(&WorktreeStatus {
+                lines: Default::default(),
                 branch: "flightdeck/fix-login".to_string(),
                 base_branch: "main".to_string(),
                 dirty: false,

@@ -93,6 +93,7 @@ fn manual_labels_match_tui_wording() {
 fn git_indicators_from_cache() {
     use crate::git::status::{WorktreeChanges, WorktreeStatus};
     let ws = WorktreeStatus {
+        lines: Default::default(),
         branch: "fix-login".to_string(),
         base_branch: "main".to_string(),
         dirty: true,
@@ -132,6 +133,7 @@ fn git_indicators_fallback_without_cache() {
 fn git_status_detail_from_cache() {
     use crate::git::status::{WorktreeChanges, WorktreeStatus};
     let ws = WorktreeStatus {
+        lines: Default::default(),
         branch: "fix-login".to_string(),
         base_branch: "main".to_string(),
         dirty: true,

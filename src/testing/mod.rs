@@ -238,6 +238,10 @@ struct FakeGitState {
     /// message (e.g. a repo whose index is locked by another process, or a
     /// worktree directory that has been removed).
     porcelain_error: Option<String>,
+    /// Per-cwd `git diff HEAD --numstat` line overrides; absent means no diff.
+    numstat: HashMap<PathBuf, Vec<String>>,
+    /// When set, [`GitExecutor::diff_numstat`] fails with this `Git` message.
+    numstat_error: Option<String>,
     worktrees: Vec<WorktreeInfo>,
     revs: HashMap<String, String>,
     ahead_behind: HashMap<(String, String), (u32, u32)>,
@@ -284,6 +288,8 @@ impl Default for FakeGit {
                 default_dirty: false,
                 porcelain: HashMap::new(),
                 porcelain_error: None,
+                numstat: HashMap::new(),
+                numstat_error: None,
                 worktrees: Vec::new(),
                 revs: HashMap::new(),
                 ahead_behind: HashMap::new(),
@@ -377,6 +383,25 @@ impl FakeGit {
         let mut st = self.inner.lock().unwrap();
         st.dirty.insert(path.clone(), !lines.is_empty());
         st.porcelain.insert(path, lines);
+    }
+
+    /// Set explicit `git diff HEAD --numstat` lines for a specific path.
+    pub fn set_numstat_at<I, S>(&self, path: impl Into<PathBuf>, lines: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let lines: Vec<String> = lines.into_iter().map(Into::into).collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .numstat
+            .insert(path.into(), lines);
+    }
+
+    /// Make [`GitExecutor::diff_numstat`] fail with `msg`, for every path.
+    pub fn set_numstat_error(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().numstat_error = Some(msg.into());
     }
 
     /// Make [`GitExecutor::status_porcelain`] fail with `msg`, for every path.
@@ -565,6 +590,14 @@ impl GitExecutor for FakeGit {
         } else {
             Vec::new()
         })
+    }
+
+    fn diff_numstat(&self, cwd: &Path) -> Result<Vec<String>> {
+        let st = self.inner.lock().unwrap();
+        if let Some(msg) = st.numstat_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
+        Ok(st.numstat.get(cwd).cloned().unwrap_or_default())
     }
 
     fn branch_exists(&self, name: &str) -> Result<bool> {

@@ -2327,7 +2327,7 @@ fn event_loop(
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
                 p.state
-                    .sync_activity(services.clock.now_unix_secs(), now_ms);
+                    .sync_activity(services.clock.now_unix_secs(), now_ms, is_active);
                 // Pin each freshly-launched agent's session id for later
                 // resume. A no-op unless a tab is awaiting its session file, and
                 // rate-limited to `SESSION_SCAN_INTERVAL_MS` when one is, since
@@ -13893,6 +13893,7 @@ mod tests {
         /// something to have removed it from.
         fn full_status() -> crate::git::status::WorktreeStatus {
             crate::git::status::WorktreeStatus {
+                lines: Default::default(),
                 branch: "flightdeck/fix-login-redirect".to_string(),
                 base_branch: "main".to_string(),
                 dirty: true,

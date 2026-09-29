@@ -112,6 +112,18 @@ impl GitExecutor for GitCli {
             .collect())
     }
 
+    fn diff_numstat(&self, cwd: &Path) -> Result<Vec<String>> {
+        // Renames are reported as one line; the parser only reads the two
+        // counts, so the path form is irrelevant.
+        let out = self.run_in(cwd, &["diff", "HEAD", "--numstat"])?;
+        require_success(&out, "diff HEAD --numstat")?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
+    }
+
     fn branch_exists(&self, name: &str) -> Result<bool> {
         let valid = self.run(&["check-ref-format", "--branch", name])?;
         if !valid.status.success() {

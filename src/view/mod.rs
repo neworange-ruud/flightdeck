@@ -10,7 +10,7 @@
 //! The rules for this module:
 //!
 //! - **Pure.** No I/O and no clock reads. Anything time-dependent (`now_ms`) or
-//!   not held by [`AppState`] (git status, unread marks) is a parameter.
+//!   not held by [`AppState`] (git status) is a parameter.
 //! - **Front-end neutral.** No `ratatui`, `crossterm` or GPUI types. Structs
 //!   carry semantics (a badge, a label, a flag), never colours or glyphs; each
 //!   renderer maps them to its own styling.
@@ -24,8 +24,9 @@ pub mod mode_bar;
 pub mod project;
 
 pub use agent::{
-    agent_badge, agent_row_view, agent_row_views, agent_status_text, terminal_views, AgentBadge,
-    AgentRowView, ChangeSummary, TerminalRef, TerminalRole, TerminalView, UpstreamState,
+    agent_badge, agent_row_view, agent_row_views, agent_status_text, format_elapsed,
+    terminal_views, AgentBadge, AgentRowView, ChangeSummary, TerminalRef, TerminalRole,
+    TerminalView, UpstreamState,
 };
 pub use git_strip::{git_actions, git_strip_view, GitActions, GitStripAgent, GitStripView};
 pub use mode_bar::{mode_bar_view, HintAction, HintView, ModeBarView};

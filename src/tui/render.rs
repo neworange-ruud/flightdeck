@@ -19,7 +19,7 @@
 //!   background task and updating the cache on completion.
 //! - Pass [`UiOverlays`] to control which (if any) overlay is visible.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1071,8 +1071,9 @@ pub fn draw_sidebar(
     // Each tab block is SIDEBAR_ROWS_PER_TAB rows: divider, name, agent, git —
     // a divider above every tab including the first (SPECS §20).
     // What each row says comes from the shared view model; the loop below only
-    // decides how it looks. The TUI tracks no unread marks, so none are passed.
-    let rows = crate::view::agent_row_views(state, cache, &HashSet::new(), now_ms);
+    // decides how it looks. The TUI shows no elapsed-status text, so the unix
+    // seconds argument is only an approximation.
+    let rows = crate::view::agent_row_views(state, cache, now_ms, now_ms / 1000);
     for row in &rows {
         let selected = row.selected;
 
@@ -1083,6 +1084,12 @@ pub fn draw_sidebar(
         let name_style = if selected {
             Style::default()
                 .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if row.unread {
+            // Output arrived while this tab was off screen: a subtle bold name,
+            // no layout change.
+            Style::default()
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
@@ -1170,7 +1177,7 @@ fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_m
     frame.render_widget(block, area);
 
     let lines: Vec<Line> =
-        crate::view::agent_row_views(state, &HashMap::new(), &HashSet::new(), now_ms)
+        crate::view::agent_row_views(state, &HashMap::new(), now_ms, now_ms / 1000)
             .iter()
             .map(|row| Line::from(collapsed_agent_span(row, now_ms)))
             .collect();
@@ -5085,6 +5092,7 @@ mod tests {
         cache.insert(
             "t0".to_string(),
             WorktreeStatus {
+                lines: Default::default(),
                 branch: "flightdeck/tab0".to_string(),
                 base_branch: "main".to_string(),
                 dirty: true,
@@ -5118,6 +5126,7 @@ mod tests {
         cache.insert(
             "t0".to_string(),
             WorktreeStatus {
+                lines: Default::default(),
                 branch: "flightdeck/tab0".to_string(),
                 base_branch: "main".to_string(),
                 dirty: false,
@@ -5142,6 +5151,7 @@ mod tests {
         cache.insert(
             "t0".to_string(),
             WorktreeStatus {
+                lines: Default::default(),
                 branch: "flightdeck/tab0".to_string(),
                 base_branch: "main".to_string(),
                 dirty: true,
@@ -5912,6 +5922,7 @@ mod tests {
             UiOverlay::About,
             UiOverlay::GitStatus {
                 status: WorktreeStatus {
+                    lines: Default::default(),
                     branch: "flightdeck/x".to_string(),
                     base_branch: "main".to_string(),
                     dirty: false,
@@ -6557,6 +6568,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         let ws = WorktreeStatus {
+            lines: Default::default(),
             branch: "flightdeck/test".to_string(),
             base_branch: "main".to_string(),
             dirty: true,
@@ -6616,6 +6628,7 @@ mod tests {
         let state = empty_state();
         let cache = empty_cache();
         let ws = WorktreeStatus {
+            lines: Default::default(),
             branch: "flightdeck/mybranch".to_string(),
             base_branch: "main".to_string(),
             dirty: false,

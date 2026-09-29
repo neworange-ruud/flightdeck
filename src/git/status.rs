@@ -66,6 +66,38 @@ pub fn parse_porcelain_changes(lines: &[String]) -> WorktreeChanges {
     changes
 }
 
+/// Lines added and removed relative to `HEAD`, summed over all tracked files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineStats {
+    /// Lines added.
+    pub added: u32,
+    /// Lines removed.
+    pub removed: u32,
+}
+
+/// Sum the lines of `git diff HEAD --numstat` into [`LineStats`].
+///
+/// Each line is `<added>\t<removed>\t<path>`. Binary files report `-\t-` and
+/// count as zero lines. A rename (`old => new` or `dir/{old => new}` in the
+/// path) carries its counts like any other line; the path is never inspected,
+/// so arrows or braces in it cannot confuse the parse. Malformed lines are
+/// skipped, and counts saturate rather than overflow.
+pub fn parse_numstat(lines: &[String]) -> LineStats {
+    let mut stats = LineStats::default();
+    for line in lines {
+        let mut fields = line.trim_end_matches(['\n', '\r']).splitn(3, '\t');
+        let (Some(added), Some(removed), Some(_path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // "-" (binary) fails to parse and counts as zero.
+        stats.added = stats.added.saturating_add(added.parse().unwrap_or(0));
+        stats.removed = stats.removed.saturating_add(removed.parse().unwrap_or(0));
+    }
+    stats
+}
+
 /// Lightweight git status for an Agent Tab's worktree (SPECS §21).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeStatus {
@@ -73,6 +105,9 @@ pub struct WorktreeStatus {
     pub base_branch: String,
     pub dirty: bool,
     pub changes: WorktreeChanges,
+    /// Lines added / removed vs `HEAD` in tracked files (staged + unstaged).
+    /// Untracked files have no diff and contribute nothing.
+    pub lines: LineStats,
     pub ahead: u32,
     pub behind: u32,
     pub upstream: Option<String>,
@@ -92,6 +127,12 @@ pub fn collect_status(
     let porcelain = git.status_porcelain(worktree_path)?;
     let changes = parse_porcelain_changes(&porcelain);
     let dirty = !changes.is_empty();
+    // Line counts are decoration on top of the file counts: if the diff cannot
+    // be read, report zero lines rather than losing the whole status.
+    let lines = git
+        .diff_numstat(worktree_path)
+        .map(|l| parse_numstat(&l))
+        .unwrap_or_default();
     let upstream = git.upstream_of(branch)?;
     // Ahead/behind vs the upstream, only meaningful when an upstream is known.
     let (ahead, behind) = match &upstream {
@@ -104,6 +145,7 @@ pub fn collect_status(
         base_branch: base_branch.to_string(),
         dirty,
         changes,
+        lines,
         ahead,
         behind,
         upstream,
@@ -306,6 +348,86 @@ mod tests {
     use super::*;
     use crate::contracts::{MergeOutcome, RebaseOutcome};
     use crate::testing::FakeGit;
+
+    fn strs(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn numstat_sums_added_and_removed_lines() {
+        let stats = parse_numstat(&strs(&[
+            "10\t2\tsrc/a.rs",
+            "3\t0\tsrc/b.rs",
+            "0\t7\tc.txt\r",
+        ]));
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 13,
+                removed: 9
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_counts_binary_files_as_zero_lines() {
+        let stats = parse_numstat(&strs(&["-\t-\timg.png", "4\t1\tsrc/a.rs"]));
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 4,
+                removed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_reads_renames_without_inspecting_the_path() {
+        let stats = parse_numstat(&strs(&[
+            "0\t0\told.rs => new.rs",
+            "5\t2\tsrc/{a => b}/lib.rs",
+        ]));
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 5,
+                removed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_empty_and_malformed_input_is_zero() {
+        assert_eq!(parse_numstat(&[]), LineStats::default());
+        assert_eq!(
+            parse_numstat(&strs(&["", "garbage", "1\t2"])),
+            LineStats::default()
+        );
+    }
+
+    #[test]
+    fn collect_status_reports_line_stats_from_the_executor() {
+        let git = FakeGit::new();
+        let wt = Path::new("/repo/wt");
+        git.set_numstat_at(wt, ["6\t1\ta.rs", "-\t-\tb.bin"]);
+        let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert_eq!(
+            status.lines,
+            LineStats {
+                added: 6,
+                removed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn collect_status_survives_an_unreadable_diff() {
+        let git = FakeGit::new();
+        let wt = Path::new("/repo/wt");
+        git.set_numstat_error("bad revision 'HEAD'");
+        let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert_eq!(status.lines, LineStats::default());
+    }
 
     fn req<'a>(
         base_branch: &'a str,

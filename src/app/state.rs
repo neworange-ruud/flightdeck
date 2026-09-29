@@ -325,6 +325,11 @@ pub struct RuntimeTab {
     /// [`crate::app::activity`]): output seen since the last sync, and the last
     /// status / git fingerprints compared against.
     probe: ActivityProbe,
+    /// Whether the primary PTY produced output while this tab was not the one
+    /// on screen. Runtime-only (never persisted); cleared when the user views
+    /// the tab. Maintained by [`AppState::sync_activity`] and
+    /// [`AppState::cmd_switch_tab`], read through [`RuntimeTab::is_unread`].
+    unread: bool,
 }
 
 impl RuntimeTab {
@@ -342,6 +347,7 @@ impl RuntimeTab {
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         }
@@ -352,6 +358,11 @@ impl RuntimeTab {
     /// stamped by [`AppState::sync_activity`].
     pub fn note_output(&mut self) {
         self.probe.note_output();
+    }
+
+    /// Whether the agent produced output the user has not looked at yet.
+    pub fn is_unread(&self) -> bool {
+        self.unread
     }
 
     /// Stable id of this tab.
@@ -934,10 +945,25 @@ impl AppState {
     /// fresh launch is not a "status change". Cheap enough for every tick; it
     /// writes nothing itself, so the values reach `state.json` on the existing
     /// save points (and at teardown), never per PTY read.
-    pub fn sync_activity(&mut self, now_secs: u64, now_ms: u64) {
-        for tab in self.tabs.iter_mut() {
+    ///
+    /// `project_viewed` is whether this project is the one on screen. It also
+    /// maintains each tab's unread flag: output on a tab that is not the
+    /// selected tab of the viewed project sets it, and the selected tab of the
+    /// viewed project is always read (so switching projects clears the newly
+    /// shown tab on the next sync). Flags are folded per sync, so output that
+    /// arrives and is followed by a selection change within one tick is judged
+    /// against the selection at sync time.
+    pub fn sync_activity(&mut self, now_secs: u64, now_ms: u64, project_viewed: bool) {
+        let selected = self.selected_tab;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
             let status = tab.display_status(now_ms).interpreted;
             let (output, status_changed) = tab.probe.take_edges(status);
+            let viewed = project_viewed && selected == Some(i);
+            if viewed {
+                tab.unread = false;
+            } else if output {
+                tab.unread = true;
+            }
             if output {
                 tab.meta.activity.note_output(now_secs);
             }
@@ -1316,6 +1342,7 @@ impl AppState {
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -1440,6 +1467,7 @@ impl AppState {
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -2107,6 +2135,9 @@ impl AppState {
         match Self::resolve_selector(sel, self.selected_tab, len) {
             Some(idx) => {
                 self.selected_tab = Some(idx);
+                // Viewing a tab reads it, straight away rather than at the
+                // next activity sync.
+                self.tabs[idx].unread = false;
                 Ok(Effect::None)
             }
             None => Ok(Effect::Refused("No such Agent Tab.".to_string())),
@@ -6664,5 +6695,94 @@ mod tests {
             vec!["attach".to_string(), name],
             "PTY attaches"
         );
+    }
+
+    // --- Unread flag ---------------------------------------------------------
+
+    /// An app with `n` tabs, none spawned, tab 0 selected.
+    fn app_with_tabs(n: usize) -> AppState {
+        let mut ps = default_state("main");
+        for i in 0..n {
+            ps.tabs.push(crate::contracts::TabState {
+                id: format!("t{i}"),
+                name: format!("tab{i}"),
+                slug: format!("tab{i}"),
+                agent: "opencode".to_string(),
+                branch: format!("flightdeck/tab{i}"),
+                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "sha".to_string(),
+                created_at: "t".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: false,
+                resume_args: Vec::new(),
+                activity: Default::default(),
+            });
+        }
+        AppState::new(Config::default(), ps, REPO, STATE)
+    }
+
+    fn unread_flags(app: &AppState) -> Vec<bool> {
+        app.tabs.iter().map(|t| t.is_unread()).collect()
+    }
+
+    #[test]
+    fn output_on_a_non_viewed_tab_sets_unread() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert_eq!(unread_flags(&app), vec![false, true]);
+    }
+
+    #[test]
+    fn output_on_the_viewed_tab_does_not_set_unread() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert_eq!(unread_flags(&app), vec![false, false]);
+    }
+
+    #[test]
+    fn selecting_a_tab_clears_its_unread_flag() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert!(app.tabs[1].is_unread());
+        app.cmd_switch_tab(Selector::Index(1)).unwrap();
+        assert_eq!(unread_flags(&app), vec![false, false]);
+    }
+
+    #[test]
+    fn output_in_a_background_project_marks_even_the_selected_tab() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.sync_activity(10, 10_000, false);
+        assert_eq!(unread_flags(&app), vec![true, false]);
+    }
+
+    #[test]
+    fn switching_to_the_project_clears_its_selected_tab() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, false);
+        assert_eq!(unread_flags(&app), vec![true, true]);
+        // The project comes on screen: only its selected tab is now viewed.
+        app.sync_activity(11, 11_000, true);
+        assert_eq!(unread_flags(&app), vec![false, true]);
+    }
+
+    #[test]
+    fn unread_persists_across_syncs_without_new_output() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        app.sync_activity(11, 11_000, true);
+        assert!(app.tabs[1].is_unread());
     }
 }
