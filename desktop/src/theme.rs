@@ -129,6 +129,31 @@ pub struct Palette {
     pub status_idle: Hex,
     /// An agent finished.
     pub status_done: Hex,
+    /// An agent failed or lost its session (drawn with a cross, never a hue
+    /// alone).
+    pub status_error: Hex,
+
+    // --- diffs -----------------------------------------------------------------
+    /// Lines added (`+214` in a sidebar row).
+    pub diff_added: Hex,
+    /// Lines removed (`−38`).
+    pub diff_removed: Hex,
+
+    // --- controls ----------------------------------------------------------------
+    /// The one primary button per surface (Push): a light fill.
+    pub button_primary_bg: Hex,
+    /// Text on [`Palette::button_primary_bg`].
+    pub button_primary_ink: Hex,
+    /// The keycap hint inside a primary button.
+    pub button_primary_hint: Hex,
+    /// Small count chips (the active project tab's agent count).
+    pub chip_bg: Hex,
+    /// An agent's monogram tile in the sidebar (unselected rows; a selected
+    /// row's tile is [`Palette::surface_raised_nested`]).
+    pub surface_tile: Hex,
+    /// Monogram ink per agent family, so rows tell Claude Code, Codex and
+    /// OpenCode apart at a glance: `[claude, codex, opencode, other]`.
+    pub monogram_ink: [Hex; 4],
 
     // --- destructive actions ---------------------------------------------------
     /// Text and glyphs of an action that destroys work, stops processes or
@@ -150,6 +175,11 @@ pub struct Palette {
     pub pill_terminal_bg: Hex,
     /// TERMINAL mode pill text.
     pub pill_terminal_ink: Hex,
+    /// APP mode pill fill: accent-tinted, so the two modes differ in hue AND
+    /// word.
+    pub pill_app_bg: Hex,
+    /// APP mode pill text.
+    pub pill_app_ink: Hex,
 }
 
 impl Palette {
@@ -203,6 +233,22 @@ impl Palette {
             status_attention_bg: Hex(0x4a3614),
             status_idle: Hex(0x8a8279),
             status_done: Hex(0x7cc47f),
+            status_error: Hex(0xf07a6a),
+
+            diff_added: Hex(0x8fcf8f),
+            diff_removed: Hex(0xef8f7e),
+
+            button_primary_bg: Hex(0xf2efe9),
+            button_primary_ink: Hex(0x1c1917),
+            button_primary_hint: Hex(0x5f5750),
+            chip_bg: Hex(0x342e2a),
+            surface_tile: Hex(0x2e2926),
+            monogram_ink: [
+                Hex(0xf0c3a8), // claude
+                Hex(0x9fc4ee), // codex
+                Hex(0xc7b4f0), // opencode
+                Hex(0xcfc7bd), // anything else
+            ],
 
             // Warm red, the diff "removed" hue, so a destructive answer reads
             // as the same family as deleted lines.
@@ -214,6 +260,8 @@ impl Palette {
 
             pill_terminal_bg: Hex(0x34402f),
             pill_terminal_ink: Hex(0xb9e2a6),
+            pill_app_bg: Hex(0x3f2b3a),
+            pill_app_ink: Hex(0xe7b3d9),
         }
     }
 
@@ -263,12 +311,13 @@ mod tests {
     const MIN_STATUS_SEPARATION: f64 = 1.1;
 
     /// The four agent status colours, named for assertion messages.
-    fn statuses(p: &Palette) -> [(&'static str, Hex); 4] {
+    fn statuses(p: &Palette) -> [(&'static str, Hex); 5] {
         [
             ("working", p.status_working),
             ("attention", p.status_attention),
             ("idle", p.status_idle),
             ("done", p.status_done),
+            ("error", p.status_error),
         ]
     }
 
@@ -366,6 +415,41 @@ mod tests {
         // The fill must stand apart from the card, or the button has no edge
         // until hovered.
         assert!(p.danger_border.contrast_ratio(p.surface_sidebar) >= 1.3);
+    }
+
+    #[test]
+    fn control_and_meta_text_reads_on_its_surface() {
+        let p = Palette::dark();
+        let pairs = [
+            ("primary button", p.button_primary_ink, p.button_primary_bg),
+            ("primary keycap", p.button_primary_hint, p.button_primary_bg),
+            ("TERMINAL pill", p.pill_terminal_ink, p.pill_terminal_bg),
+            ("APP pill", p.pill_app_ink, p.pill_app_bg),
+            ("added lines", p.diff_added, p.surface_raised),
+            ("removed lines", p.diff_removed, p.surface_raised),
+            ("added lines", p.diff_added, p.surface_sidebar),
+            ("removed lines", p.diff_removed, p.surface_sidebar),
+            ("secondary ink", p.ink_2, p.surface_raised_nested),
+            ("attention count", p.status_attention, p.status_attention_bg),
+            ("chip text", p.muted, p.chip_bg),
+            ("faint meta", p.faint, p.surface_window),
+        ];
+        for (what, ink, surface) in pairs {
+            let ratio = ink.contrast_ratio(surface);
+            assert!(ratio >= 4.5, "{what}: {ink:?} on {surface:?} is {ratio:.2}");
+        }
+        for (i, ink) in p.monogram_ink.iter().enumerate() {
+            for tile in [p.surface_tile, p.surface_raised_nested] {
+                assert!(ink.contrast_ratio(tile) >= 4.5, "monogram {i} on {tile:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_mode_pills_differ_in_lightness() {
+        let p = Palette::dark();
+        assert!(p.pill_app_bg.contrast_ratio(p.pill_terminal_bg) >= 1.05);
+        assert_ne!(p.pill_app_ink, p.pill_terminal_ink);
     }
 
     #[test]
