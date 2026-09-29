@@ -8,15 +8,44 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Native desktop app (preview): `flightdeck-desktop`.** A GPUI window around
+  real agent terminals. Project tabs sit in the titlebar, with an agent sidebar
+  showing status, diff stats and unread dots, a git strip (Push, Pull base,
+  Finish) and a mode/status bar. It has the command palette, every TUI dialog
+  and confirmation, the configuration manager, help and about, web access and
+  phone pairing (QR drawn natively), split view and child terminals, native
+  macOS menus, a dock badge, `--isolated`, and a project picker when launched
+  outside a repository. Every TUI chord works the same; Cmd on macOS is left to
+  the platform. Build from source with `cargo run -p flightdeck-desktop`; no
+  packaged builds are published yet. See `specs/DESKTOP_UI.md`.
+- **Mission control view in the desktop app (Alt-m).** Live tiles for every
+  working or waiting session across all projects, ordered needs-you first, plus
+  "earlier today" cards with a one-click Push, Pull base or Finish. A scope menu
+  selects the last 24h, 7 days or all sessions, with a project filter. Enter
+  opens a tile full size and Alt-Esc goes back. Waiting tiles offer inline
+  Approve/Deny for permission and single-select prompts, using the same answer
+  path as the phone.
+- **New settings:** `[ui] desktop_terminal_font_size` and
+  `[ui] macos_option_as_meta` (desktop app).
 
 ### Improvements
 
-- None yet.
+- **Shared core for every front-end.** The event loop now lives in a
+  UI-neutral `AppHost`, bindings and help come from one keymap table, and the
+  sidebar, tabs, git strip and status bar are built from shared view models.
+  The terminal emulator sits behind a `TerminalGrid` seam: the TUI stays on
+  vt100 and the desktop uses alacritty_terminal. TUI behaviour is unchanged.
+- **The TUI sidebar marks unread agents,** and agent rows now carry line diff
+  stats.
 
 ### Bug fixes
 
-- None yet.
+- **Pasted text can no longer end bracketed paste early.** Embedded
+  `ESC[200~`/`ESC[201~` markers are stripped, including ones split to reassemble
+  after a single pass. Before, the rest of a crafted paste could run as typed
+  input. This covers the TUI, the desktop app and phone replies.
+- **UTF-8 mouse reporting (`?1005`) now sends real UTF-8 coordinates** instead
+  of legacy bytes, which were wrong past column 95.
 
 ## [1.22.0] - 2026-09-21
 
