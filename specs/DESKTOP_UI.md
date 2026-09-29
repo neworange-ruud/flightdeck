@@ -55,7 +55,7 @@ spikes (M0), all run on one machine (macOS, Apple M2 Pro, Xcode 27, rustc
 | S1 window | Does a themed window with custom chrome build and open from crates.io alone? | Yes. 1280×800 window (minimum 900×560), 44 px titlebar, 272 px sidebar, 30 px status bar; verified by window enumeration, and later by rendered frames. Clean build 89 s debug, 206 s release; binary 79 MB debug, 17 MB release (no LTO or strip). |
 | S2 terminal element | Can GPUI draw a real terminal, including agents' TUIs? | Yes. Rendered frames were inspected for a glyph fixture (box drawing, quadrants, wide glyphs), interactive bash, vim on the alternate screen, and the first screens of opencode, claude and codex. Window resize reaches the PTY. |
 | S3 keyboard parity | Can every TUI chord work, with Option acting as Alt? | Yes. A chord matrix of every table entry was driven through GPUI's real key dispatch on its headless test platform, and passes on macOS. |
-| S4 performance | Is it fast enough? | **Not measured as numbers.** The notes record build time and binary size only. Frame time and CPU on a large, busy grid were not measured, and the terminal element re-lays out the whole grid each frame (no damage tracking). Every host notify re-renders the whole window. See Q7. |
+| S4 performance | Is it fast enough? | Yes, on macOS (release builds; method and full tables in `desktop/NOTES-M0.md` "Performance (S4)"). Key → glyph p50/p95 about 6/9.5 ms in the GUI against about 55/60 ms in the TUI, whose 50 ms poll sets its floor. `cat` of 50 MiB and `seq 1 2000000` run at the PTY ceiling in both. Idle CPU is about 0.8% with 4 live terminals and about 1% in the full app, with 0 idle frames/s. Mission control with 4 waiting tiles uses 1.7–2.5%. Open: 4 *working* tiles cost 6–21% because the spinners redraw at display rate (being throttled), and RSS is about 100 MB against the TUI's 11 MB. |
 
 > **Risk accepted:** everything above is verified on macOS only. Linux (X11 and
 > Wayland over wgpu/Vulkan) and Windows (DirectX 11) are unverified: not built,
@@ -476,9 +476,7 @@ available, neither platform has any verification (D1).
 
 ### Q7 — Performance budget · **open**
 
-S4 recorded no frame-time or CPU numbers. Decide the budget (for example, a
-busy 200×60 grid with several agents streaming) and measure before adding
-damage tracking or a terminal-only redraw path.
+S4 measured the app on macOS (see D1's table). The terminals meet "no worse than the TUI" for latency and throughput. Still to decide: the budget for animated chrome (working spinners), whether about 100 MB of RSS is acceptable, and the numbers Linux and Windows must reach once they can be measured (`desktop/benches/perf.py` and `flightdeck-desktop --bench` re-run the suite).
 
 ---
 
