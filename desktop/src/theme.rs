@@ -55,6 +55,9 @@ impl Hex {
     }
 }
 
+/// Opacity of [`Palette::scrim`] behind a modal overlay.
+pub const SCRIM_ALPHA: f32 = 0.62;
+
 impl From<Hex> for Rgba {
     fn from(hex: Hex) -> Self {
         gpui::rgb(hex.0)
@@ -127,6 +130,21 @@ pub struct Palette {
     /// An agent finished.
     pub status_done: Hex,
 
+    // --- destructive actions ---------------------------------------------------
+    /// Text and glyphs of an action that destroys work, stops processes or
+    /// rewrites history (abandon, rebase, force terminate, quit): a
+    /// destructive dialog button's label, the warning mark beside its question.
+    pub danger: Hex,
+    /// Fill behind a destructive button.
+    pub danger_bg: Hex,
+    /// Border of a destructive button.
+    pub danger_border: Hex,
+
+    // --- overlays ---------------------------------------------------------------
+    /// The backdrop dimming the window behind a modal overlay, painted at
+    /// [`SCRIM_ALPHA`] so the frame behind stays legible but out of focus.
+    pub scrim: Hex,
+
     // --- mode pill (status bar) ------------------------------------------------
     /// TERMINAL mode pill fill.
     pub pill_terminal_bg: Hex,
@@ -185,6 +203,14 @@ impl Palette {
             status_attention_bg: Hex(0x4a3614),
             status_idle: Hex(0x8a8279),
             status_done: Hex(0x7cc47f),
+
+            // Warm red, the diff "removed" hue, so a destructive answer reads
+            // as the same family as deleted lines.
+            danger: Hex(0xef8f7e),
+            danger_bg: Hex(0x4a211c),
+            danger_border: Hex(0x6e2f27),
+
+            scrim: Hex(0x0e0c0b),
 
             pill_terminal_bg: Hex(0x34402f),
             pill_terminal_ink: Hex(0xb9e2a6),
@@ -324,6 +350,22 @@ mod tests {
             p.terminal_cursor_ink.contrast_ratio(p.terminal_cursor) >= 4.5,
             "text under a block cursor"
         );
+    }
+
+    #[test]
+    fn destructive_buttons_read_as_text() {
+        // A destructive dialog button's label is body text (WCAG AA 4.5:1) on
+        // its own fill, and the warning mark beside a question is a
+        // meaningful graphic (3:1) on the overlay card.
+        let p = Palette::dark();
+        assert!(p.danger.contrast_ratio(p.danger_bg) >= 4.5, "label on fill");
+        assert!(
+            p.danger.contrast_ratio(p.surface_sidebar) >= 3.0,
+            "mark on card"
+        );
+        // The fill must stand apart from the card, or the button has no edge
+        // until hovered.
+        assert!(p.danger_border.contrast_ratio(p.surface_sidebar) >= 1.3);
     }
 
     #[test]

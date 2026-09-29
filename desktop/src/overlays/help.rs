@@ -79,11 +79,10 @@ pub(crate) fn button(
         .child(label.into())
 }
 
-/// The colour for a refusal or an error. The palette has no dedicated "danger"
-/// role yet, so this is the ANSI red the terminal already uses for errors, named
-/// once so a real token replaces it in one place.
+/// The colour for a refusal or an error: the palette's danger role, the one
+/// a destructive dialog button is drawn in.
 pub(crate) fn danger(p: &Palette) -> gpui::Hsla {
-    p.terminal_ansi[1].hsla()
+    p.danger.hsla()
 }
 
 /// A key or chord drawn as a keycap: mono, on a raised chip.
