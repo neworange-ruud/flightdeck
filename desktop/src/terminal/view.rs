@@ -2,15 +2,19 @@
 //!
 //! Where the terminal lives is the view's [`TerminalSource`]:
 //!
-//! - **Owned** (the `--spike-terminal` window): the view owns a [`Terminal`]
-//!   and polls it. A foreground task wakes every [`POLL_INTERVAL`], drains the
-//!   PTY into the grid through [`super::pump`] and asks for a frame when
-//!   anything changed. Keys go through the spike's small encoder
-//!   ([`super::input`]).
+//! - **Owned** (the `--spike-terminal` window and `--bench`): the view owns a
+//!   [`Terminal`] and polls it. A foreground task drains the PTY into the grid
+//!   through [`super::pump`] and asks for a frame only when the screen changed
+//!   (new bytes, or a synchronized update the emulator released); how often it
+//!   polls is [`super::cadence`]'s call (every millisecond just after input,
+//!   every 8 ms while output flows, every 25 ms when idle). Keys go through the
+//!   spike's small encoder ([`super::input`]).
 //! - **Host** (the app): the terminal on screen is the host's — the active
 //!   project's selected agent's focused terminal
 //!   ([`AppHost::active_terminal`](flightdeck::host::AppHost::active_terminal)).
-//!   The host's own turn drains every PTY, so the view polls nothing. Input is
+//!   The host's own turn drains every PTY, so the view polls nothing, and it
+//!   redraws when the host notifies, which the host does only when something
+//!   changed (see `crate::host`). Input is
 //!   the app's: bytes go to the host as `HostEvent::TerminalInput` (so the web
 //!   input lock applies, as for the TUI), keys through the keymap-aware
 //!   [`terminal_key_down`] (the TUI's bytes, byte for byte), and committed text
@@ -18,18 +22,26 @@
 //!   `EntityInputHandler`. The grid size is measured by the element and
 //!   handed to the host, which resizes every project's PTYs on its next turn.
 //!
+//! In both, the element redraws only the rows the emulator reports changed
+//! ([`super::rowcache`], fed by `TerminalGrid::take_damage`), and nothing
+//! repaints an idle terminal: there is no periodic repaint and the cursor does
+//! not blink. GPUI draws at most one frame per display refresh however often a
+//! view notifies, so output arriving over many polls lands in one frame.
+//!
 //! In both, mouse events are forwarded to the program when it asked for mouse
 //! reporting (Shift overrides, as in most terminals), and otherwise drive
 //! local selection (copied on release) and scrollback.
 
+use std::cell::RefCell;
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, Styled, Task,
     UTF16Selection, Window,
 };
 
@@ -40,18 +52,14 @@ use flightdeck::terminal::session::Terminal;
 use flightdeck::tui::platform;
 use flightdeck_desktop::keys::{terminal_key_down, ImeState, KeymapAction, OptionKey, TerminalKey};
 
+use super::bench::Probe;
+use super::cadence::Cadence;
 use super::element::{CellMetrics, TerminalElement};
 use super::input;
-use super::layout::{self, FrameLayout, TermPalette};
+use super::layout::{self, CellSpan, TermPalette};
+use super::rowcache::RowCache;
 use crate::host::HostModel;
 use crate::theme::{Hex, Palette};
-
-/// How often an owned terminal's PTY is polled. ~120 Hz: output shows up
-/// within a frame on a 60 Hz display without spinning.
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
-/// Repaint at least this often while nothing arrives, so an emulator timer
-/// (a synchronized update that timed out) is never left undrawn.
-const IDLE_REPAINT: Duration = Duration::from_millis(150);
 
 /// Where the terminal a [`TerminalView`] draws lives.
 pub enum TerminalSource {
@@ -67,6 +75,9 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     palette: TermPalette,
     metrics: Option<CellMetrics>,
+    /// Laid-out and shaped rows from earlier frames (see [`super::rowcache`]).
+    /// The element borrows it for each frame.
+    row_cache: RowCache<Vec<ShapedLine>>,
     /// The button held while forwarding a drag to a mouse-aware program.
     forwarded_button: Option<u8>,
     /// A local selection drag is in progress.
@@ -76,7 +87,20 @@ pub struct TerminalView {
     exited: Option<ProcessState>,
     /// The composition in progress (Host source; the spike types keys).
     ime: ImeState,
-    _poll: Option<Task<()>>,
+    /// Timestamps for `--bench` (see [`super::bench`]); `None` outside a bench
+    /// run, so the hooks cost one branch each.
+    probe: Option<Rc<RefCell<Probe>>>,
+    /// Owned source: when the view last wrote input and last saw output,
+    /// which sets the polling rate.
+    cadence: Cadence,
+    /// Owned source: PTY bytes read but not parsed yet (see
+    /// [`super::PARSE_BUDGET`]).
+    backlog: Vec<u8>,
+    /// Owned source: poll again soon regardless of the cadence (a backlog is
+    /// waiting, or the emulator holds a synchronized update).
+    busy: bool,
+    /// Owned source: the poll loop.
+    poll: Option<Task<()>>,
 }
 
 impl TerminalView {
@@ -86,32 +110,58 @@ impl TerminalView {
         terminal
             .screen_mut()
             .set_default_colors(channels(palette.fg), channels(palette.bg));
-        let poll = cx.spawn(async move |this, cx| {
-            let mut last_paint = Instant::now();
-            loop {
-                cx.background_executor().timer(POLL_INTERVAL).await;
-                let alive = this.update(cx, |view, cx| {
-                    let TerminalSource::Owned(terminal) = &mut view.source else {
-                        return false;
-                    };
-                    let changed = super::pump(terminal);
-                    let state = terminal.process_state();
-                    let ended = !matches!(state, ProcessState::Running | ProcessState::Starting);
-                    if ended && view.exited.is_none() {
-                        view.exited = Some(state);
-                    }
-                    if changed || ended || last_paint.elapsed() >= IDLE_REPAINT {
-                        last_paint = Instant::now();
-                        cx.notify();
-                    }
-                    !ended
-                });
-                if !matches!(alive, Ok(true)) {
-                    break;
-                }
+        let mut view = Self::with_source(TerminalSource::Owned(terminal), palette, cx);
+        view.poll = Some(Self::start_polling(cx));
+        view
+    }
+
+    /// The owned source's poll loop. Each turn sleeps for what
+    /// [`Cadence::next_delay`] says, then runs [`Self::poll_once`]; it ends
+    /// with the process. Restarted on input (see [`Self::write`]) so a
+    /// keystroke's echo is polled for at once rather than after the rest of
+    /// an idle sleep.
+    fn start_polling(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| loop {
+            let delay = this.update(cx, |view, _| {
+                view.cadence.next_delay(Instant::now(), view.busy)
+            });
+            let Ok(delay) = delay else {
+                break;
+            };
+            cx.background_executor().timer(delay).await;
+            if !matches!(this.update(cx, |view, cx| view.poll_once(cx)), Ok(true)) {
+                break;
             }
-        });
-        Self::with_source(TerminalSource::Owned(terminal), palette, Some(poll), cx)
+        })
+    }
+
+    /// Drain the owned PTY once and repaint if the screen changed. Returns
+    /// whether to keep polling.
+    fn poll_once(&mut self, cx: &mut Context<Self>) -> bool {
+        let TerminalSource::Owned(terminal) = &mut self.source else {
+            return false;
+        };
+        let started = Instant::now();
+        let pumped = super::pump(terminal, &mut self.backlog);
+        if let Some(probe) = &self.probe {
+            probe
+                .borrow_mut()
+                .pumped(pumped.parsed, started.elapsed(), terminal.screen());
+        }
+        if pumped.parsed > 0 {
+            self.cadence.output(Instant::now());
+        }
+        self.busy = pumped.backlog || terminal.screen().holds_output();
+        let state = terminal.process_state();
+        let ended = !matches!(state, ProcessState::Running | ProcessState::Starting);
+        let newly_ended = ended && self.exited.is_none();
+        if newly_ended {
+            self.exited = Some(state);
+        }
+        if pumped.changed() || newly_ended {
+            cx.notify();
+        }
+        !ended
     }
 
     /// A view of whatever terminal the host has on screen (the app). It
@@ -119,15 +169,10 @@ impl TerminalView {
     pub fn for_host(host: Entity<HostModel>, cx: &mut Context<Self>) -> Self {
         let palette = TermPalette::from_palette(Palette::global(cx));
         cx.observe(&host, |_, _, cx| cx.notify()).detach();
-        Self::with_source(TerminalSource::Host(host), palette, None, cx)
+        Self::with_source(TerminalSource::Host(host), palette, cx)
     }
 
-    fn with_source(
-        source: TerminalSource,
-        palette: TermPalette,
-        poll: Option<Task<()>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn with_source(source: TerminalSource, palette: TermPalette, cx: &mut Context<Self>) -> Self {
         Self {
             source,
             focus_handle: cx.focus_handle(),
@@ -138,7 +183,37 @@ impl TerminalView {
             scroll_remainder: 0.0,
             exited: None,
             ime: ImeState::default(),
-            _poll: poll,
+            row_cache: RowCache::default(),
+            probe: None,
+            cadence: Cadence::default(),
+            backlog: Vec::new(),
+            busy: false,
+            poll: None,
+        }
+    }
+
+    /// Attach a `--bench` probe (see [`super::bench`]).
+    pub fn set_probe(&mut self, probe: Rc<RefCell<Probe>>) {
+        self.probe = Some(probe);
+    }
+
+    pub fn probe(&self) -> Option<&Rc<RefCell<Probe>>> {
+        self.probe.as_ref()
+    }
+
+    /// The owned terminal (the spike and the bench); `None` for the host's.
+    pub fn owned_terminal(&self) -> Option<&Terminal> {
+        match &self.source {
+            TerminalSource::Owned(terminal) => Some(terminal),
+            TerminalSource::Host(_) => None,
+        }
+    }
+
+    /// The owned terminal, mutably, for the bench driver.
+    pub fn owned_terminal_mut(&mut self) -> Option<&mut Terminal> {
+        match &mut self.source {
+            TerminalSource::Owned(terminal) => Some(terminal),
+            TerminalSource::Host(_) => None,
         }
     }
 
@@ -165,16 +240,45 @@ impl TerminalView {
         }
     }
 
-    /// The frame to paint, or `None` when no terminal is on screen.
-    pub fn frame(&self, focused: bool, cx: &gpui::App) -> Option<FrameLayout> {
-        self.with_terminal(cx, |terminal| {
-            layout::layout(
-                terminal.screen(),
-                terminal.selection(),
-                &self.palette,
-                focused,
-            )
-        })
+    /// Bring the row cache up to date for this frame and hand it to the
+    /// element (which gives it back through [`Self::put_row_cache`]), with the
+    /// selection overlay. An empty cache when no terminal is on screen.
+    ///
+    /// The cache belongs to one grid: when the terminal on screen changes (the
+    /// host's selected agent or child shell), every row is laid out again. A
+    /// grid's first damage report is always `Full`, so a new terminal is never
+    /// drawn from another's rows either.
+    pub fn prepare_rows(
+        &mut self,
+        focused: bool,
+        cx: &mut gpui::App,
+    ) -> (RowCache<Vec<ShapedLine>>, Vec<CellSpan>) {
+        let mut cache = std::mem::take(&mut self.row_cache);
+        let palette = self.palette;
+        let prepared = self.with_terminal_mut(cx, |terminal| {
+            let identity = grid_identity(terminal);
+            let damage = terminal.screen_mut().take_damage();
+            let laid_out = cache.update(identity, terminal.screen(), damage, &palette, focused);
+            let selection =
+                layout::selection_spans(terminal.screen(), terminal.selection(), &palette);
+            (laid_out, selection)
+        });
+        let Some((laid_out, selection)) = prepared else {
+            return (RowCache::default(), Vec::new());
+        };
+        if let Some(probe) = &self.probe {
+            probe.borrow_mut().rows_laid_out += laid_out as u64;
+        }
+        (cache, selection)
+    }
+
+    /// Take back the row cache lent by [`Self::prepare_rows`].
+    pub fn put_row_cache(&mut self, cache: RowCache<Vec<ShapedLine>>) {
+        self.row_cache = cache;
+    }
+
+    pub fn metrics(&self) -> Option<CellMetrics> {
+        self.metrics
     }
 
     pub fn palette(&self) -> &TermPalette {
@@ -203,11 +307,16 @@ impl TerminalView {
         }
     }
 
-    /// Send `bytes` to the terminal's program.
-    fn write(&mut self, bytes: &[u8], cx: &mut gpui::App) {
+    /// Send `bytes` to the terminal's program. An owned terminal is then
+    /// polled fast for its answer; the host does the same for its own.
+    fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         match &mut self.source {
             TerminalSource::Owned(terminal) => {
                 let _ = terminal.session_mut().write_input(bytes);
+                self.cadence.input(Instant::now());
+                if self.exited.is_none() {
+                    self.poll = Some(Self::start_polling(cx));
+                }
             }
             TerminalSource::Host(host) => {
                 let event = HostEvent::TerminalInput(bytes.to_vec());
@@ -230,6 +339,9 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(probe) = &self.probe {
+            probe.borrow_mut().key_received();
+        }
         match &self.source {
             TerminalSource::Owned(_) => self.owned_key_down(event, cx),
             TerminalSource::Host(_) => self.host_key_down(event, window, cx),
@@ -272,12 +384,12 @@ impl TerminalView {
         };
         if clipboard_chord && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let bracketed = terminal.bracketed_paste();
-                let _ = terminal
-                    .session_mut()
-                    .write_input(&input::paste_bytes(&text, bracketed));
+                let bytes = input::paste_bytes(&text, terminal.bracketed_paste());
                 terminal.scroll_to_bottom();
+                self.write(&bytes, cx);
                 cx.stop_propagation();
+                // The jump back to the live screen shows before any echo does.
+                cx.notify();
             }
             return;
         }
@@ -289,11 +401,19 @@ impl TerminalView {
             return;
         }
         if let Some(bytes) = input::encode_keystroke(ks) {
+            // Repaint now only if the key itself changes what is shown; the
+            // echo repaints when the poll parses it.
+            let moved = terminal.has_selection() || terminal.screen().scrollback() > 0;
             terminal.clear_selection();
             terminal.scroll_to_bottom();
-            let _ = terminal.session_mut().write_input(&bytes);
+            self.write(&bytes, cx);
+            if let Some(probe) = &self.probe {
+                probe.borrow_mut().key_written();
+            }
             cx.stop_propagation();
-            cx.notify();
+            if moved {
+                cx.notify();
+            }
         }
     }
 
@@ -428,7 +548,14 @@ impl TerminalView {
     }
 }
 
-fn channels(hex: Hex) -> (u8, u8, u8) {
+/// Which grid a row cache was built from: the address of the terminal's
+/// boxed grid, stable for the terminal's life. See [`TerminalView::prepare_rows`]
+/// for why an address reused by a later terminal is still safe.
+fn grid_identity(terminal: &Terminal) -> usize {
+    terminal.screen() as *const dyn flightdeck::terminal::grid::TerminalGrid as *const () as usize
+}
+
+pub(crate) fn channels(hex: Hex) -> (u8, u8, u8) {
     ((hex.0 >> 16) as u8, (hex.0 >> 8) as u8, hex.0 as u8)
 }
 

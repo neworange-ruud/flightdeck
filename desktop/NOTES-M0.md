@@ -574,7 +574,181 @@ How the element draws:
   `selection_becomes_one_span_per_row`, plus the grid fixtures), mouse-report
   bytes, paste bracketing, the unfocused and bar/underline cursors, and scrollback
   scrolling in the window.
-- **Not verified:** Linux and Windows builds or runs of the desktop element; how
-  the element performs on a large, busy grid (it re-lays out the whole grid each
-  frame and has no damage tracking yet); IME / dead keys (the spike reads
-  `key_char` only).
+- **Not verified:** Linux and Windows builds or runs of the desktop element;
+  IME / dead keys (the spike reads `key_char` only). Performance on a large,
+  busy grid is measured in "Performance (S4)" below.
+
+## Performance (S4, `remote-control-bmej.1.4`; damage tracking `remote-control-bmej.3.9`)
+
+Measured 2026-09-29 on the M2 Pro (10 cores, macOS 27.0, 120 Hz display), release
+builds. **Linux and Windows were not measured**: no machine was available. The
+procedure below should run unchanged on Linux. On Windows `perf.py` does not
+run (it drives PTYs with Python's Unix-only `os.openpty`), but `flightdeck-desktop
+--bench …` does, and the TUI side has to be timed by hand.
+
+Other agents' builds were running on the machine at the same time (load average
+between 5 and 135 on 10 cores). Throughput swings with that load by up to 3x
+between runs, and it swings for both front-ends and for the raw PTY alike. So
+every throughput number below sits next to a "PTY ceiling" taken right before
+it, and the before and after GUI builds were run interleaved. Latency and idle
+numbers stayed within about 10 % across runs.
+
+### How to re-run
+
+```sh
+cargo build --release -p flightdeck --bin flightdeck
+cargo build --release -p flightdeck-desktop
+python3 desktop/benches/perf.py all               # ~12 minutes
+python3 desktop/benches/perf.py gui-latency tui-latency --keys 300
+python3 desktop/benches/perf.py gui-throughput --rounds 3 --gui path/to/other/flightdeck-desktop
+target/release/flightdeck-desktop --bench idle --ticker --fill --terminals 4 --seconds 15
+```
+
+`flightdeck-desktop --bench SCENARIO` (desktop/src/terminal/bench.rs) opens a
+real 1040x700 window, runs `/bin/sh` on real PTYs, drives the scenario and
+prints its numbers. The window holds a 40x130 grid of Menlo 13, close to the
+42x130 terminal pane the TUI gets in a 160x50 host. A `Probe` on the view and
+the element records the timestamps. With no probe attached (every normal run)
+each hook is one `None` check. `perf.py` runs the same workloads against the
+real TUI binary: `flightdeck -I` in a 160x50 PTY, with a throwaway HOME and git
+repo and an agent whose command is `/bin/sh`. It samples CPU and RSS of both
+front-ends with `ps`.
+
+### What each number is
+
+- **Keystroke → glyph, GUI:** from GPUI's key-down dispatch reaching the view's
+  handler, to `write_input` returning, to the first PTY poll that parses the
+  echo, to the end of `paint` in the first frame whose prepaint began after
+  that parse. GPUI hands the scene to Metal in the same call, so this is "frame
+  ready to present". The display's scan-out (up to 8.3 ms at 120 Hz) is not
+  included. The key goes into `cat > /dev/null`, so the tty echoes it, and keys
+  are 30–70 ms apart at random so nothing phase-locks with the poll or the
+  display.
+- **Keystroke → glyph, TUI:** `perf.py` writes `ж` to the TUI's PTY and times how
+  long until TUI output containing it arrives. That covers key read → PTY
+  write → echo parsed → frame flushed, plus two PTY hops (tens of µs). The host
+  terminal's own drawing is not included, just as scan-out is not included for
+  the GUI.
+- **Throughput:** from pressing Enter on `CMD; printf '%s-%s\n' FD DONE` in an
+  idle shell to the painted (GUI) or flushed (TUI) frame that shows `FD-DONE`.
+  `CMD` is `cat` of a 50 MiB log-like file (100-column lines, every fifth with
+  an SGR colour), or `seq 1 2000000` (20 MB, one `write` per line because stdout
+  is a tty). "PTY ceiling" is a tight Python `os.read` loop on the same command,
+  with no parsing and no drawing.
+- **Idle CPU:** cumulative CPU time of the app process (`ps -o time`) over 30 s,
+  after 5 s of warm-up, as a % of one core. Child shells are not counted. RSS
+  is the mean of 1 s samples. "Ticker" means `while true; do date; sleep 1; done`
+  in every terminal. With 4 terminals the GUI shows all four (2x2). The TUI's
+  four are the agent plus three child shells (Ctrl-T), and only one is visible.
+- **Scroll:** with 3000 coloured lines in the scrollback, scroll three lines per
+  frame (driven from `on_next_frame`) for 10 s. Element CPU is prepaint start
+  → paint end. The interval is from one paint end to the next.
+
+### Results
+
+Each cell gives the runs taken, separated by `·`.
+
+| | GUI before | GUI after | TUI |
+| --- | --- | --- | --- |
+| Key → glyph p50 / p95 (4 runs) | 6.8–8.5 / 13.7–15.5 ms | **6.0–6.6 / 9.5–9.9 ms** | 54.7–58.6 / 58.4–65.8 ms (3 runs) |
+| … write → echo parsed, p50 / p95 | 4.2–4.4 / 8.5–8.9 ms | 1.8–2.0 / 2.1–2.6 ms | n/a |
+| … parsed → painted, p50 / p95 | 1.2–3.0 / 7.9–9.1 ms | 4.3–4.6 / 8.0–8.3 ms | n/a |
+| `cat` 50 MiB, total (PTY ceiling) | 0.91 s (0.87) · 1.21 s (0.97) | 0.68 s (0.53) · 0.59 s (0.67) | 1.14 s (0.53) · 0.89 s (0.67) |
+| `seq 1 2000000`, total (PTY ceiling) | 3.5 s (3.9) · 3.2 s (3.6) | 3.2 s (3.9) · 3.5 s (4.1) | 3.5 s (3.9) · 3.3 s (earlier run, no ceiling taken) |
+| Idle CPU, 1 terminal | 1.55 · 1.78 % | **0.66 · 0.66 %** | 1.25 · 0.89 % |
+| Idle CPU, 1 terminal + ticker | 1.29 · 1.49 % | **0.89 · 0.79 %** | 1.02 · 0.96 % |
+| Idle CPU, 4 terminals | 2.28 · 3.10 % | **0.83 · 0.83 %** | 0.96 · 0.96 % |
+| Idle CPU, 4 terminals + tickers | 2.32 · 3.01 % | **1.06 · 1.16 %** | 0.93 · 0.93 % |
+| RSS, 1 terminal / 4 terminals with tickers | 89–102 / 106–107 MB | 100–103 / 106 MB | 9–10 / 11 MB |
+| Frames/s while idle, 1 / 4 terminals | 5–6.5 / 18.5–19.2 | **0 / 0** | the TUI redraws every 50 ms |
+| PTY polls/s per idle terminal | 117 | 38 (57 with a ticker) | 20 (one loop for all) |
+| Scroll: element CPU p50 / p95 per frame | 0.60–0.61 / 0.64–0.66 ms | 0.66 / 0.71–0.73 ms | n/a |
+| Scroll: frame interval p50 / p95 / max | 8.3 / 10.1–13.2 / 25–29 ms | 8.3 / 9.3 / 25 ms | n/a |
+| One row changing on a full screen (`--fill`): element CPU p50 | 0.60 ms (re-lays all 40 rows; the scroll figure) | 0.45 ms (re-lays 1 row) | n/a |
+
+Left out as outliers: one before-run of `cat` whose typed command was lost
+(5.3 s, 429 bytes), and one TUI `seq` run caught by a load spike (13.1 s).
+
+What the numbers say:
+
+1. **Throughput is bounded by the PTY, not by either front-end.** Both finish
+   within noise of the raw read loop. The GUI's parse (alacritty, about 150 MB/s:
+   350 ms of UI-thread time for the 50 MiB) and its element (70–140 ms over
+   60–120 frames) leave the UI thread idle most of the time. `seq` is bounded
+   by `seq` itself (2 M tiny writes). Nothing needed changing here except
+   bounding the worst case (see below).
+2. **Latency was the poll interval.** Before, the echo waited half of the fixed
+   8 ms poll on average, and a whole one at p95. Now the view polls every
+   millisecond for 40 ms after input and reads the echo within about 2 ms
+   (GPUI's timer granularity). The rest is waiting for the next display
+   refresh, which no element can avoid. The TUI's 55 ms comes from its main
+   loop: it reads the PTY, draws, then waits up to 50 ms for input
+   (`POLL_TIMEOUT`), and the echo nearly always lands just after the read that
+   follows the key.
+3. **Idle cost was the repaint timer and the fixed poll rate.** The spike
+   repainted every 150 ms in case a synchronized update had timed out, and each
+   repaint redrew the whole window, so 4 idle terminals drew 18.5 frames/s. The
+   cursor does not blink, so it was never the cause. Now an idle terminal draws
+   no frames at all and polls 38 times a second. 4 terminals with tickers use
+   1.2 % of one core, under the 2 % target and level with the TUI.
+4. **The row cache helps less than dropping the idle frames.** GPUI already
+   keeps last frame's shaped lines, so re-shaping an unchanged row was mostly a
+   hash lookup. What remains per frame is submitting every glyph. On a full
+   screen where one row changes, a frame costs 0.45 ms instead of 0.60 ms. When
+   everything changes (scrolling, a flood), the cache's bookkeeping adds about
+   0.05 ms per frame. Both are far inside an 8.3 ms frame.
+5. **Memory:** the GUI's ~100 MB RSS is GPUI and Metal. It is about the same
+   with one terminal or four, so the grids are a small part of it. The TUI's
+   10 MB is low because the host terminal does the drawing for it.
+
+### What changed in the element (`remote-control-bmej.3.9`)
+
+- **Damage tracking.** `TerminalGrid::take_damage` (new, in the core seam)
+  returns the rows that changed since the last call. The alacritty backend
+  forwards `Term::damage`, which also covers the old and new cursor rows and
+  reports scrolls, resizes and full-screen changes as `Full`. vt100 always says
+  `Full`. `desktop/src/terminal/rowcache.rs` keeps each row's layout and shaped
+  lines, and redoes a row only when:
+  - it is damaged,
+  - the cursor entered it, left it or changed shape on it (checked there as
+    well, so correctness does not rest on the emulator's cursor bookkeeping),
+  - or the size or palette changed (then every row).
+
+  The selection is an overlay rebuilt each frame. `layout::layout_row` is the
+  per-row half of the old whole-frame `layout`, which `--dump-grid` and the
+  tests still use. The cache tests assert that the cached rows always equal a
+  fresh whole-frame layout.
+- **Repaint only on change.** The view notifies GPUI when:
+  - a poll parsed bytes,
+  - the emulator released a held synchronized update
+    (`TerminalGrid::holds_output`, new),
+  - or the process ended.
+
+  The 150 ms repaint timer is gone. A key no longer repaints by itself unless
+  it cleared a selection or jumped back from scrollback; its echo does the
+  repainting.
+- **Adaptive polling** (`desktop/src/terminal/cadence.rs`): every 1 ms for 40 ms
+  after input, every 8 ms while output flows or a synchronized update is held,
+  and every 25 ms when idle. So output a program starts on its own waits at most
+  25 ms, half the TUI's loop. Input restarts the poll task, so fast polling
+  starts at the keystroke rather than after the rest of an idle sleep.
+- **At most one frame per refresh, and bounded work per poll.** GPUI already
+  coalesces any number of notifies into one frame per display refresh, so a
+  flood is laid out once per frame, not once per read. The parse was what had
+  no bound. A poll now parses at most 1 MiB (`PARSE_BUDGET`, a few ms) and keeps
+  the rest in a backlog, which is polled again after 1 ms. Output that piled up
+  while the UI thread was busy is worked off with frames in between instead of
+  in one long stall.
+
+Not done, because the numbers do not call for it:
+
+- skipping frames during a flood (the element takes about 1 ms of an 8.3 ms
+  frame),
+- reusing rows across a scroll (0.66 ms a frame),
+- an event-driven PTY wakeup instead of polling. It would need a change to
+  `PtySession` in the core, and at 25 ms the idle poll costs less than the
+  TUI's own loop.
+
+With several terminals in one window, GPUI redraws every element when any one
+of them notifies. The others then only repaint cached rows. If that ever shows
+up in a profile, the app shell can wrap each terminal in a cached view.

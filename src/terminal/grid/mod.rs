@@ -197,6 +197,18 @@ impl TerminalModes {
     }
 }
 
+/// Which visible rows may have changed since the last
+/// [`TerminalGrid::take_damage`], so a front-end that caches per-row layout can
+/// redo only those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GridDamage {
+    /// Treat every row as changed: a resize, a scrollback move, a whole-screen
+    /// change, or an emulator that does not track damage.
+    Full,
+    /// Only these viewport rows (ascending, no duplicates), possibly none.
+    Rows(Vec<u16>),
+}
+
 /// A read-only view of a terminal emulator's visible screen: everything a
 /// front-end needs to paint one frame.
 ///
@@ -301,6 +313,27 @@ pub trait TerminalGrid: GridView + Send {
     /// Agents use the answer to choose a light or dark theme. A no-op for an
     /// emulator that does not answer those queries.
     fn set_default_colors(&mut self, _fg: (u8, u8, u8), _bg: (u8, u8, u8)) {}
+
+    /// The rows that may have changed since the previous call, which starts a
+    /// new tracking interval. Covers everything a [`GridView`] reports except
+    /// the selection, which a front-end draws from [`TerminalGrid::selection`]
+    /// on its own. The first call after creation reports [`GridDamage::Full`].
+    ///
+    /// Always `Full` unless an emulator overrides it, which is correct, only
+    /// slower: vt100 keeps no damage information.
+    fn take_damage(&mut self) -> GridDamage {
+        GridDamage::Full
+    }
+
+    /// Whether the emulator is holding parsed output back until a later
+    /// [`TerminalGrid::tick`] or more input releases it (a synchronized
+    /// update, `?2026`, still waiting for its end or its timeout). A front-end
+    /// that only repaints on change keeps ticking while this is true and
+    /// repaints once it turns false. Always `false` for an emulator that never
+    /// buffers.
+    fn holds_output(&self) -> bool {
+        false
+    }
 
     // --- provided -----------------------------------------------------------
 

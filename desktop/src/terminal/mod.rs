@@ -9,15 +9,22 @@
 //! alacritty_terminal while the TUI stays on vt100.
 //!
 //! - [`layout`] decides what a frame shows (pure, tested headlessly),
+//! - [`rowcache`] keeps each row's layout between frames and redoes only the
+//!   rows the emulator reports changed (damage tracking),
 //! - [`element`] measures, shapes and paints it,
 //! - [`view`] owns the terminal, polls the PTY and routes input,
+//! - [`cadence`] decides how often the view polls and when it repaints,
 //! - [`input`] is the spike's small keyboard/paste/mouse encoder,
-//! - [`spike`] is the `--spike-terminal` window and the `--dump-grid` probe.
+//! - [`spike`] is the `--spike-terminal` window and the `--dump-grid` probe,
+//! - [`bench`] is `--bench`, the latency/throughput/idle/scroll measurements.
 
+pub mod bench;
 pub mod boxdraw;
+pub mod cadence;
 pub mod element;
 pub mod input;
 pub mod layout;
+pub mod rowcache;
 pub mod spike;
 pub mod view;
 
@@ -27,28 +34,63 @@ use flightdeck::terminal::session::Terminal;
 /// The emulator every desktop terminal is built on.
 pub const EMULATOR: Emulator = Emulator::Alacritty;
 
-/// The most PTY reads one [`pump`] folds in, so a program flooding output
-/// cannot starve the UI thread of frames.
-const MAX_READS_PER_PUMP: usize = 64;
+/// The most bytes one [`pump`] parses. alacritty_terminal parses roughly
+/// 150 MB/s on an M2 Pro, so this is a few milliseconds of UI-thread time:
+/// output that piled up while the thread was busy (a window resize, a slow
+/// frame) is worked off over several polls with frames in between, instead of
+/// in one long stall.
+pub const PARSE_BUDGET: usize = 1 << 20;
 
-/// Move whatever the PTY has produced into the grid and answer the queries it
-/// raised; then advance the emulator's timers. Returns whether any output was
-/// parsed. Shared by the window's poll loop and the headless `--dump-grid`
-/// probe, so the probe exercises exactly what the window draws.
-pub fn pump(terminal: &mut Terminal) -> bool {
-    let mut parsed = false;
-    for _ in 0..MAX_READS_PER_PUMP {
-        match terminal.session_mut().try_read_output() {
-            Ok(bytes) if !bytes.is_empty() => {
-                terminal.process_output(&bytes);
-                terminal.answer_cursor_position_query(&bytes);
-                parsed = true;
-            }
-            _ => break,
-        }
+/// What one [`pump`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pumped {
+    /// Bytes fed to the emulator.
+    pub parsed: usize,
+    /// The emulator released output it had been holding (a synchronized
+    /// update that ended or timed out): the screen changed without new bytes.
+    pub released: bool,
+    /// Bytes read but not yet parsed are waiting in the backlog.
+    pub backlog: bool,
+}
+
+impl Pumped {
+    /// Whether the screen may look different now.
+    pub fn changed(&self) -> bool {
+        self.parsed > 0 || self.released
     }
+}
+
+/// Move what the PTY has produced into the grid, at most [`PARSE_BUDGET`]
+/// bytes of it (the rest waits in `backlog` for the next call), answer the
+/// queries it raised, then advance the emulator's timers. Shared by the
+/// window's poll loop and the headless `--dump-grid` probe, so the probe
+/// exercises exactly what the window draws.
+pub fn pump(terminal: &mut Terminal, backlog: &mut Vec<u8>) -> Pumped {
+    let held = terminal.screen().holds_output();
+    let fresh = terminal.session_mut().try_read_output().unwrap_or_default();
+    let parsed = if backlog.is_empty() && fresh.len() <= PARSE_BUDGET {
+        // The usual case: parse the read as is, no copy.
+        feed(terminal, &fresh);
+        fresh.len()
+    } else {
+        backlog.extend_from_slice(&fresh);
+        let chunk: Vec<u8> = backlog.drain(..backlog.len().min(PARSE_BUDGET)).collect();
+        feed(terminal, &chunk);
+        chunk.len()
+    };
     terminal.tick();
-    parsed
+    Pumped {
+        parsed,
+        released: held && !terminal.screen().holds_output(),
+        backlog: !backlog.is_empty(),
+    }
+}
+
+fn feed(terminal: &mut Terminal, bytes: &[u8]) {
+    if !bytes.is_empty() {
+        terminal.process_output(bytes);
+        terminal.answer_cursor_position_query(bytes);
+    }
 }
 
 /// Environment a desktop terminal's process starts with. A GUI app launched
@@ -61,4 +103,61 @@ pub fn terminal_env() -> Vec<(String, String)> {
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flightdeck::contracts::PtySize;
+    use flightdeck::testing::{FakePty, FakePtyHandle};
+
+    fn fake_terminal() -> (Terminal, FakePtyHandle) {
+        let backend = FakePty::new();
+        let handle = backend.queue_session();
+        let terminal = Terminal::spawn(
+            &backend,
+            EMULATOR,
+            "sh",
+            &[],
+            &[],
+            std::path::Path::new("."),
+            PtySize { rows: 5, cols: 20 },
+        )
+        .expect("fake spawn");
+        (terminal, handle)
+    }
+
+    #[test]
+    fn a_pump_parses_at_most_the_budget_and_keeps_the_rest() {
+        let (mut terminal, pty) = fake_terminal();
+        let mut backlog = Vec::new();
+        let mut flood = vec![b'x'; PARSE_BUDGET + 10];
+        flood.extend_from_slice(b"\r\nend");
+        pty.push_output(flood);
+
+        let first = pump(&mut terminal, &mut backlog);
+        assert_eq!(first.parsed, PARSE_BUDGET);
+        assert!(first.backlog && first.changed());
+        let second = pump(&mut terminal, &mut backlog);
+        assert_eq!(second.parsed, 15);
+        assert!(!second.backlog);
+        assert!(terminal.screen().contents().contains("end"));
+        // Nothing new: nothing parsed, nothing to repaint.
+        assert_eq!(pump(&mut terminal, &mut backlog), Pumped::default());
+    }
+
+    #[test]
+    fn a_pump_reports_a_released_synchronized_update() {
+        let (mut terminal, pty) = fake_terminal();
+        let mut backlog = Vec::new();
+        pty.push_output(b"\x1b[?2026hframe".to_vec());
+        let held = pump(&mut terminal, &mut backlog);
+        assert!(held.parsed > 0 && !held.released);
+        assert!(terminal.screen().holds_output());
+        pty.push_output(b"\x1b[?2026l".to_vec());
+        let done = pump(&mut terminal, &mut backlog);
+        assert!(!terminal.screen().holds_output());
+        assert!(done.changed());
+        assert!(terminal.screen().contents().contains("frame"));
+    }
 }

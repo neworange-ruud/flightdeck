@@ -28,6 +28,8 @@ fn main() {
         // M0 spike S2: one window with one live terminal (see terminal::spike).
         Some(flag) if flag == "--spike-terminal" => terminal::spike::run_window(args.collect()),
         // The same pipeline headless, printing the grid instead of drawing it.
+        // M0 spike S4: latency / throughput / idle / scroll measurements.
+        Some(flag) if flag == "--bench" => std::process::exit(terminal::bench::run(args.collect())),
         Some(flag) if flag == "--dump-grid" => {
             std::process::exit(terminal::spike::dump(args.collect()))
         }

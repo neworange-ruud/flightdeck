@@ -358,9 +358,10 @@ pub fn dump(args: Vec<String>) -> i32 {
     // arrived so the dump says whether the screen had settled.
     let started = Instant::now();
     let mut bytes_seen = false;
+    let mut backlog = Vec::new();
     let mut last_output = started;
     while started.elapsed() < opts.wait {
-        if super::pump(&mut terminal) {
+        if super::pump(&mut terminal, &mut backlog).changed() {
             bytes_seen = true;
             last_output = Instant::now();
         }
@@ -464,8 +465,9 @@ mod tests {
         )
         .expect("spawn /bin/sh");
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut backlog = Vec::new();
         while Instant::now() < deadline && !terminal.screen().contents().contains("wide:") {
-            super::super::pump(&mut terminal);
+            super::super::pump(&mut terminal, &mut backlog);
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = terminal.session_mut().terminate_tree();

@@ -171,13 +171,72 @@ struct SpanStyle {
     strikethrough: bool,
 }
 
-/// Lay out one frame of `grid`.
-///
-/// ASCII runs of one style become one span (the element shapes it with a
-/// forced per-glyph advance, so it lands on the grid). Anything else that is
-/// narrow gets its own span, so a fallback-font glyph with a different advance
-/// cannot push its neighbours off their cells; wide graphemes get their own
-/// two-cell span; blanks produce no span at all.
+/// Where the cursor is drawn on one row, if it is on that row. Part of a
+/// row's layout: the glyph under a filled block cursor is inked differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowCursor {
+    pub col: u16,
+    pub shape: CursorShape,
+    pub filled: bool,
+}
+
+/// One row's share of a frame: everything but the selection, which is an
+/// overlay drawn from [`selection_spans`] every frame.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowLayout {
+    pub backgrounds: Vec<CellSpan>,
+    pub texts: Vec<TextSpan>,
+    pub boxes: Vec<BoxCell>,
+    pub cursor: Option<CursorPaint>,
+}
+
+/// Where the cursor is drawn this frame, as `(row, cursor)`: `None` when it is
+/// hidden, off the grid, or the viewport is scrolled into history (history
+/// has no cursor).
+pub fn cursor_placement(grid: &dyn GridView, focused: bool) -> Option<(u16, RowCursor)> {
+    let (rows, cols) = grid.size();
+    let cursor = grid.cursor();
+    (cursor.visible && grid.scrollback() == 0 && cursor.row < rows && cursor.col < cols).then_some(
+        (
+            cursor.row,
+            RowCursor {
+                col: cursor.col,
+                shape: cursor.shape,
+                filled: focused && cursor.shape == CursorShape::Block,
+            },
+        ),
+    )
+}
+
+/// The selection highlight, one span per selected row.
+pub fn selection_spans(
+    grid: &dyn GridView,
+    selection: Option<&Selection>,
+    palette: &TermPalette,
+) -> Vec<CellSpan> {
+    let Some(selection) = selection else {
+        return Vec::new();
+    };
+    let (rows, cols) = grid.size();
+    let offset = grid.scrollback();
+    (0..rows)
+        .filter_map(|row| {
+            selection
+                .row_selection(row, rows, cols, offset)
+                .map(|(c0, c1)| CellSpan {
+                    row,
+                    col: c0,
+                    cols: c1 - c0 + 1,
+                    color: palette.selection,
+                })
+        })
+        .collect()
+}
+
+/// Lay out one frame of `grid`: every row through [`layout_row`], plus the
+/// selection. The element does the same row by row through its cache
+/// ([`super::rowcache`]); this whole-frame form is what `--dump-grid` prints
+/// and what the layout tests pin.
 pub fn layout(
     grid: &dyn GridView,
     selection: Option<&Selection>,
@@ -185,134 +244,140 @@ pub fn layout(
     focused: bool,
 ) -> FrameLayout {
     let (rows, cols) = grid.size();
-    let offset = grid.scrollback();
-    let cursor = grid.cursor();
-    // History has no cursor: only draw it on the live screen.
-    let cursor_cell = (cursor.visible && offset == 0 && cursor.row < rows && cursor.col < cols)
-        .then_some((cursor.row, cursor.col));
-    let filled_cursor = focused && cursor.shape == CursorShape::Block;
-
+    let cursor = cursor_placement(grid, focused);
     let mut out = FrameLayout {
         rows,
         cols,
+        selection: selection_spans(grid, selection, palette),
         ..FrameLayout::default()
     };
-
     for row in 0..rows {
-        if let Some((c0, c1)) = selection.and_then(|s| s.row_selection(row, rows, cols, offset)) {
-            out.selection.push(CellSpan {
+        let on_row = cursor.filter(|(r, _)| *r == row).map(|(_, c)| c);
+        let laid = layout_row(grid, row, on_row, palette);
+        out.backgrounds.extend(laid.backgrounds);
+        out.texts.extend(laid.texts);
+        out.boxes.extend(laid.boxes);
+        out.cursor = out.cursor.or(laid.cursor);
+    }
+    out
+}
+
+/// Lay out visible `row` of `grid`, with the cursor on it if `cursor` is set.
+///
+/// ASCII runs of one style become one span (the element shapes it with a
+/// forced per-glyph advance, so it lands on the grid). Anything else that is
+/// narrow gets its own span, so a fallback-font glyph with a different advance
+/// cannot push its neighbours off their cells; wide graphemes get their own
+/// two-cell span; blanks produce no span at all.
+pub fn layout_row(
+    grid: &dyn GridView,
+    row: u16,
+    cursor: Option<RowCursor>,
+    palette: &TermPalette,
+) -> RowLayout {
+    let mut out = RowLayout::default();
+    // The span being extended, if the next cell may join it.
+    let mut open: Option<(TextSpan, SpanStyle)> = None;
+    grid.visit_row(row, &mut |col, cell| {
+        let attrs = cell.attrs;
+        let mut fg = palette.resolve(cell.fg, true);
+        let mut bg = palette.resolve(cell.bg, false);
+        if attrs.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if attrs.dim {
+            fg = mix(fg, bg, 0.5);
+        }
+        let under_cursor = cursor.filter(|c| c.col == col);
+        if let Some(c) = under_cursor {
+            if c.filled {
+                fg = palette.cursor_ink;
+            }
+            out.cursor = Some(CursorPaint {
                 row,
-                col: c0,
-                cols: c1 - c0 + 1,
-                color: palette.selection,
+                col,
+                cols: if cell.width == CellWidth::Wide { 2 } else { 1 },
+                shape: c.shape,
+                filled: c.filled,
             });
         }
 
-        // The span being extended, if the next cell may join it.
-        let mut open: Option<(TextSpan, SpanStyle)> = None;
-        grid.visit_row(row, &mut |col, cell| {
-            let attrs = cell.attrs;
-            let mut fg = palette.resolve(cell.fg, true);
-            let mut bg = palette.resolve(cell.bg, false);
-            if attrs.inverse {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if attrs.dim {
-                fg = mix(fg, bg, 0.5);
-            }
-            let under_cursor = cursor_cell == Some((row, col));
-            if under_cursor && filled_cursor {
-                fg = palette.cursor_ink;
-            }
-            if under_cursor {
-                out.cursor = Some(CursorPaint {
+        if bg != palette.bg {
+            match out.backgrounds.last_mut() {
+                Some(span) if span.col + span.cols == col && span.color == bg => {
+                    span.cols += 1;
+                }
+                _ => out.backgrounds.push(CellSpan {
                     row,
                     col,
-                    cols: if cell.width == CellWidth::Wide { 2 } else { 1 },
-                    shape: cursor.shape,
-                    filled: filled_cursor,
-                });
+                    cols: 1,
+                    color: bg,
+                }),
             }
+        }
 
-            if bg != palette.bg {
-                match out.backgrounds.last_mut() {
-                    Some(span)
-                        if span.row == row && span.col + span.cols == col && span.color == bg =>
-                    {
-                        span.cols += 1;
-                    }
-                    _ => out.backgrounds.push(CellSpan {
-                        row,
-                        col,
-                        cols: 1,
-                        color: bg,
-                    }),
-                }
-            }
-
-            if cell.width == CellWidth::WideContinuation {
-                return;
-            }
-            let text = cell.text;
-            if text.trim().is_empty() {
-                if let Some((span, _)) = open.take() {
-                    out.texts.push(span);
-                }
-                return;
-            }
-            if let Some(glyph) = boxdraw::classify_text(text) {
-                if let Some((span, _)) = open.take() {
-                    out.texts.push(span);
-                }
-                out.boxes.push(BoxCell {
-                    row,
-                    col,
-                    glyph,
-                    fg,
-                });
-                return;
-            }
-
-            let style = SpanStyle {
-                fg,
-                bold: attrs.bold,
-                italic: attrs.italic,
-                underline: attrs.underline,
-                strikethrough: attrs.strikethrough,
-            };
-            let joinable = cell.width == CellWidth::Narrow && text.len() == 1 && text.is_ascii();
-            if joinable {
-                if let Some((span, open_style)) = open.as_mut() {
-                    let next_col = span.col + span.text.len() as u16;
-                    if *open_style == style && next_col == col {
-                        span.text.push_str(text);
-                        return;
-                    }
-                }
-            }
+        if cell.width == CellWidth::WideContinuation {
+            return;
+        }
+        let text = cell.text;
+        if text.trim().is_empty() {
             if let Some((span, _)) = open.take() {
                 out.texts.push(span);
             }
-            let span = TextSpan {
-                row,
-                col,
-                text: text.to_string(),
-                fg,
-                bold: attrs.bold,
-                italic: attrs.italic,
-                underline: attrs.underline,
-                strikethrough: attrs.strikethrough,
-                wide: cell.width == CellWidth::Wide,
-            };
-            if joinable {
-                open = Some((span, style));
-            } else {
+            return;
+        }
+        if let Some(glyph) = boxdraw::classify_text(text) {
+            if let Some((span, _)) = open.take() {
                 out.texts.push(span);
             }
-        });
+            out.boxes.push(BoxCell {
+                row,
+                col,
+                glyph,
+                fg,
+            });
+            return;
+        }
+
+        let style = SpanStyle {
+            fg,
+            bold: attrs.bold,
+            italic: attrs.italic,
+            underline: attrs.underline,
+            strikethrough: attrs.strikethrough,
+        };
+        let joinable = cell.width == CellWidth::Narrow && text.len() == 1 && text.is_ascii();
+        if joinable {
+            if let Some((span, open_style)) = open.as_mut() {
+                let next_col = span.col + span.text.len() as u16;
+                if *open_style == style && next_col == col {
+                    span.text.push_str(text);
+                    return;
+                }
+            }
+        }
         if let Some((span, _)) = open.take() {
             out.texts.push(span);
         }
+        let span = TextSpan {
+            row,
+            col,
+            text: text.to_string(),
+            fg,
+            bold: attrs.bold,
+            italic: attrs.italic,
+            underline: attrs.underline,
+            strikethrough: attrs.strikethrough,
+            wide: cell.width == CellWidth::Wide,
+        };
+        if joinable {
+            open = Some((span, style));
+        } else {
+            out.texts.push(span);
+        }
+    });
+    if let Some((span, _)) = open.take() {
+        out.texts.push(span);
     }
     out
 }

@@ -1,10 +1,12 @@
 //! The GPUI element that paints a terminal's cell grid.
 //!
 //! Each frame: measure the monospace cell, size the grid (and so the PTY) to
-//! the bounds, ask [`super::layout`] what to draw, then paint it back to front
-//! — backgrounds, selection, a filled cursor, text, box geometry, and the
-//! outline/bar/underline cursors. Colours were resolved by the layout; this
-//! file only turns cells into pixels.
+//! the bounds, bring the view's [`RowCache`] up to date (only rows the
+//! emulator reports damaged are laid out and shaped again, see
+//! [`super::rowcache`]), then paint it back to front — backgrounds, selection,
+//! a filled cursor, text, box geometry, and the outline/bar/underline cursors.
+//! Colours were resolved by the layout; this file only turns cells into
+//! pixels.
 //!
 //! Text is shaped per span. An ASCII span is shaped with GPUI's forced
 //! per-glyph advance set to the cell width, so every glyph lands on its column
@@ -15,11 +17,13 @@
 use gpui::{
     fill, point, px, relative, size, App, Bounds, Element, ElementId, ElementInputHandler, Entity,
     Font, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PathBuilder, Pixels,
-    Point, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
+    Point, ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
+    Window,
 };
 
 use super::boxdraw::{BoxGlyph, Corner, Weight};
-use super::layout::{FrameLayout, TextSpan};
+use super::layout::{CellSpan, TextSpan};
+use super::rowcache::RowCache;
 use super::view::TerminalView;
 use crate::theme::Hex;
 use flightdeck::contracts::PtySize;
@@ -109,12 +113,15 @@ impl IntoElement for TerminalElement {
     }
 }
 
-/// What prepaint hands paint.
+/// What prepaint hands paint. The row cache is the view's; the element holds
+/// it for the length of one frame (paint hands it back), so painting can read
+/// the shaped lines while it has the window and app borrowed.
 pub struct Prepared {
-    /// `None` when no terminal is on screen (no agent selected yet).
-    frame: Option<FrameLayout>,
+    cache: RowCache<Vec<ShapedLine>>,
+    selection: Vec<CellSpan>,
     metrics: CellMetrics,
     background: Hex,
+    cursor_colour: Hex,
 }
 
 impl Element for TerminalElement {
@@ -151,6 +158,9 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if let Some(probe) = self.view.read(cx).probe() {
+            probe.borrow_mut().prepaint_started();
+        }
         let (width, height) = measure_cell(window);
         let metrics = CellMetrics {
             origin: bounds.origin,
@@ -162,16 +172,40 @@ impl Element for TerminalElement {
         let rows = (bounds.size.height / height).floor().max(1.0) as u16;
         let focused = self.view.read(cx).focus_handle().is_focused(window);
 
-        self.view.update(cx, |view, cx| {
+        let (mut cache, selection, palette) = self.view.update(cx, |view, cx| {
+            // Shaped text is only valid for the cell size it was forced to.
+            let resized_cells = view
+                .metrics()
+                .is_none_or(|old| (old.width, old.height) != (width, height));
             view.set_metrics(metrics);
             view.resize(PtySize { rows, cols }, cx);
+            let (mut cache, selection) = view.prepare_rows(focused, cx);
+            if resized_cells {
+                cache.invalidate_derived();
+            }
+            (cache, selection, *view.palette())
         });
-        let view = self.view.read(cx);
-        let frame = view.frame(focused, cx);
+
+        // Shape what the update re-laid (and everything after a cell resize);
+        // every other row paints the lines shaped on an earlier frame.
+        let font_size = px(FONT_SIZE);
+        for row in cache.rows_mut() {
+            if row.derived.is_none() {
+                let lines = row
+                    .layout
+                    .texts
+                    .iter()
+                    .map(|span| shape_text(span, width, font_size, window))
+                    .collect();
+                row.derived = Some(lines);
+            }
+        }
         Prepared {
-            frame,
+            cache,
+            selection,
             metrics,
-            background: view.palette().bg,
+            background: palette.bg,
+            cursor_colour: palette.cursor,
         }
     }
 
@@ -185,13 +219,9 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Prepared {
-            frame,
-            metrics,
-            background,
-        } = prepared;
-        let m = *metrics;
-        window.paint_quad(fill(bounds, background.hsla()));
+        let m = prepared.metrics;
+        let rows = prepared.cache.rows();
+        window.paint_quad(fill(bounds, prepared.background.hsla()));
         if self.text_input {
             let focus = self.view.read(cx).focus_handle().clone();
             window.handle_input(
@@ -200,31 +230,41 @@ impl Element for TerminalElement {
                 cx,
             );
         }
-        let Some(frame) = frame else {
-            return;
-        };
 
-        for span in frame.backgrounds.iter().chain(&frame.selection) {
+        let backgrounds = rows.iter().flat_map(|r| &r.layout.backgrounds);
+        for span in backgrounds.chain(&prepared.selection) {
             window.paint_quad(fill(
                 m.cell_bounds(span.row, span.col, span.cols),
                 span.color.hsla(),
             ));
         }
 
-        let cursor_colour = self.view.read(cx).palette().cursor.hsla();
-        if let Some(cursor) = frame.cursor.filter(|c| c.filled) {
+        let cursor_colour = prepared.cursor_colour.hsla();
+        let cursor = rows.iter().find_map(|r| r.layout.cursor);
+        if let Some(cursor) = cursor.filter(|c| c.filled) {
             window.paint_quad(fill(
                 m.cell_bounds(cursor.row, cursor.col, cursor.cols),
                 cursor_colour,
             ));
         }
 
-        let font_size = px(FONT_SIZE);
-        for span in &frame.texts {
-            paint_text(span, &m, font_size, window, cx);
+        for row in rows {
+            let Some(lines) = &row.derived else {
+                continue;
+            };
+            for (span, line) in row.layout.texts.iter().zip(lines) {
+                let _ = line.paint(
+                    m.cell_origin(span.row, span.col),
+                    m.height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
         }
 
-        for cell in &frame.boxes {
+        for cell in rows.iter().flat_map(|r| &r.layout.boxes) {
             paint_box(
                 &cell.glyph,
                 m.cell_bounds(cell.row, cell.col, 1),
@@ -233,7 +273,7 @@ impl Element for TerminalElement {
             );
         }
 
-        if let Some(cursor) = frame.cursor.filter(|c| !c.filled) {
+        if let Some(cursor) = cursor.filter(|c| !c.filled) {
             let cell = m.cell_bounds(cursor.row, cursor.col, cursor.cols);
             let stroke = px(2.);
             match cursor.shape {
@@ -254,9 +294,17 @@ impl Element for TerminalElement {
                 CursorShape::Block => paint_outline(cell, px(1.), cursor_colour, window),
             }
         }
+        let cache = std::mem::take(&mut prepared.cache);
+        self.view.update(cx, |view, _| {
+            view.put_row_cache(cache);
+            if let Some(probe) = view.probe() {
+                probe.borrow_mut().painted();
+            }
+        });
     }
 }
 
+/// Shape and paint one span at its cell, for a caller without a row cache.
 pub(crate) fn paint_text(
     span: &TextSpan,
     m: &CellMetrics,
@@ -264,6 +312,25 @@ pub(crate) fn paint_text(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let line = shape_text(span, m.width, font_size, window);
+    let _ = line.paint(
+        m.cell_origin(span.row, span.col),
+        m.height,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
+/// Shape one span's text in its style (see the module docs for the forced
+/// advance).
+pub(crate) fn shape_text(
+    span: &TextSpan,
+    cell_width: Pixels,
+    font_size: Pixels,
+    window: &Window,
+) -> ShapedLine {
     let mut font = mono_font();
     if span.bold {
         font = font.bold();
@@ -288,21 +355,13 @@ pub(crate) fn paint_text(
         }),
     };
     // Force the cell advance only on multi-glyph ASCII spans; see the module docs.
-    let force_width = (!span.wide && span.text.is_ascii()).then_some(m.width);
-    let line = window.text_system().shape_line(
+    let force_width = (!span.wide && span.text.is_ascii()).then_some(cell_width);
+    window.text_system().shape_line(
         SharedString::from(span.text.clone()),
         font_size,
         &[run],
         force_width,
-    );
-    let _ = line.paint(
-        m.cell_origin(span.row, span.col),
-        m.height,
-        TextAlign::Left,
-        None,
-        window,
-        cx,
-    );
+    )
 }
 
 /// A 1-pixel-per-`stroke` rectangle outline inside `b`.

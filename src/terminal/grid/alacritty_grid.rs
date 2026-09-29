@@ -17,14 +17,14 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as AnsiCursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 
 use super::{
-    xterm_rgb, CellAttrs, CellWidth, CursorShape, GridCell, GridColor, GridCursor, GridView,
-    MouseEncoding, MouseMode, TerminalGrid, TerminalModes,
+    xterm_rgb, CellAttrs, CellWidth, CursorShape, GridCell, GridColor, GridCursor, GridDamage,
+    GridView, MouseEncoding, MouseMode, TerminalGrid, TerminalModes,
 };
 use crate::tui::selection::Selection;
 
@@ -238,6 +238,34 @@ impl TerminalGrid for AlacrittyGrid {
         self.selection = selection;
     }
 
+    /// `Term`'s own damage tracking. It already covers the old and new cursor
+    /// cells (and always the current one), marks everything on a scroll of
+    /// the viewport, a resize or a mode that repaints the screen, and reports
+    /// partial damage in viewport rows. Reading it leaves the damage in place,
+    /// so it is reset here to start the next interval.
+    fn take_damage(&mut self) -> GridDamage {
+        let rows = self.term.screen_lines();
+        let damage = match self.term.damage() {
+            TermDamage::Full => GridDamage::Full,
+            TermDamage::Partial(lines) => {
+                let mut damaged: Vec<u16> = lines
+                    .map(|bounds| bounds.line)
+                    .filter(|&line| line < rows)
+                    .map(|line| line as u16)
+                    .collect();
+                damaged.sort_unstable();
+                damaged.dedup();
+                GridDamage::Rows(damaged)
+            }
+        };
+        self.term.reset_damage();
+        damage
+    }
+
+    fn holds_output(&self) -> bool {
+        self.processor.sync_timeout().sync_timeout().is_some()
+    }
+
     fn set_default_colors(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
         self.default_fg = Rgb {
             r: fg.0,
@@ -365,5 +393,74 @@ impl GridView for AlacrittyGrid {
 
     fn scrollback(&self) -> usize {
         self.term.grid().display_offset()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(damage: GridDamage) -> Vec<u16> {
+        match damage {
+            GridDamage::Rows(rows) => rows,
+            GridDamage::Full => panic!("expected partial damage, got Full"),
+        }
+    }
+
+    #[test]
+    fn damage_starts_full_then_names_only_the_rows_that_changed() {
+        let mut grid = AlacrittyGrid::new(6, 20, 100);
+        assert_eq!(grid.take_damage(), GridDamage::Full);
+        // Nothing happened: only the cursor's row, which Term always reports.
+        assert_eq!(rows(grid.take_damage()), vec![0]);
+
+        // Write on row 3 and leave the cursor on row 4: the old cursor row,
+        // the written row and the new cursor row.
+        grid.process(b"\x1b[4;1Hhello\x1b[5;1H");
+        assert_eq!(rows(grid.take_damage()), vec![0, 3, 4]);
+        assert_eq!(rows(grid.take_damage()), vec![4]);
+    }
+
+    #[test]
+    fn scrolling_resizing_and_clearing_damage_everything() {
+        let mut grid = AlacrittyGrid::new(4, 20, 100);
+        for i in 0..10 {
+            grid.process(format!("line {i}\r\n").as_bytes());
+        }
+        let _ = grid.take_damage();
+        grid.set_scrollback(2);
+        assert_eq!(grid.take_damage(), GridDamage::Full);
+        grid.set_scrollback(0);
+        let _ = grid.take_damage();
+
+        grid.resize(5, 20);
+        assert_eq!(grid.take_damage(), GridDamage::Full);
+
+        grid.process(b"\x1b[2J");
+        assert_eq!(grid.take_damage(), GridDamage::Full);
+    }
+
+    #[test]
+    fn a_synchronized_update_is_held_until_it_ends() {
+        let mut grid = AlacrittyGrid::new(3, 10, 100);
+        assert!(!grid.holds_output());
+        grid.process(b"\x1b[?2026hhidden");
+        assert!(grid.holds_output());
+        assert_eq!(grid.row_text(0, 0, 9), "");
+        grid.process(b"\x1b[?2026l");
+        assert!(!grid.holds_output());
+        assert_eq!(grid.row_text(0, 0, 9), "hidden");
+    }
+
+    #[test]
+    fn output_that_scrolls_the_screen_damages_every_row() {
+        let mut grid = AlacrittyGrid::new(3, 10, 100);
+        grid.process(b"a\r\nb\r\nc");
+        let _ = grid.take_damage();
+        // A newline on the last row moves every visible line up one.
+        grid.process(b"\r\nd");
+        let damage = grid.take_damage();
+        let all = damage == GridDamage::Full || damage == GridDamage::Rows(vec![0, 1, 2]);
+        assert!(all, "a scroll must repaint every row, got {damage:?}");
     }
 }
