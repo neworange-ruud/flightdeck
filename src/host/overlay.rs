@@ -411,3 +411,20 @@ pub struct HostNotices {
     /// This is an `--isolated` run (SPECS §32): the `ISOLATED` badge.
     pub isolated: bool,
 }
+
+/// The remote-access facts a status bar shows on its right-hand side ("web ·
+/// 2 viewers", "phone paired", who holds the input lock), read out as plain
+/// data. Like [`HostNotices`] it is chrome, not an overlay.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteStatus {
+    /// The embedded web interface is listening.
+    pub web_running: bool,
+    /// Browsers currently attached (observers included); zero when the
+    /// interface is stopped.
+    pub web_viewers: usize,
+    /// A phone is paired: configured at start-up or joined this session.
+    pub phone_paired: bool,
+    /// Who holds the web input lock, when somebody other than this desktop
+    /// could be typing (the same value as [`crate::host::AppHost::input_holder`]).
+    pub input_holder: Option<String>,
+}

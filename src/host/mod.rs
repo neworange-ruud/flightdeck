@@ -65,7 +65,7 @@ pub mod overlay;
 pub use overlay::{
     AgentChoice, ButtonRole, ConfigView, DialogButton, DialogKind, DialogRow, DialogView,
     GitStatusView, HostNotices, MessageView, NewAgentForm, NewAgentTarget, OverlayInput,
-    OverlayKey, OverlayView, PairingView, PaletteRow, PaletteView, WebAccessOverlay,
+    OverlayKey, OverlayView, PairingView, PaletteRow, PaletteView, RemoteStatus, WebAccessOverlay,
 };
 
 #[cfg(test)]
@@ -1237,6 +1237,20 @@ impl<'a> AppHost<'a> {
                 }
             }),
             isolated: state.isolated,
+        }
+    }
+
+    /// The remote-access indicators for a status bar: whether the web
+    /// interface is up and how many browsers are attached, whether a phone is
+    /// paired, and who holds the input lock. Pure: it reads state the last
+    /// [`AppHost::pump`] refreshed and starts or stops nothing.
+    pub fn remote_status(&self) -> RemoteStatus {
+        let handle = self.web_surface.handle.as_ref();
+        RemoteStatus {
+            web_running: handle.is_some(),
+            web_viewers: handle.map_or(0, |h| h.viewer_count()),
+            phone_paired: self.ui.remote_paired,
+            input_holder: self.ui.input_holder.clone(),
         }
     }
 

@@ -1403,6 +1403,25 @@ mod overlays {
     }
 
     #[test]
+    fn remote_status_reports_the_web_viewers_and_the_phone() {
+        let fakes = Fakes::new();
+        let (mut state, _pty) = fakes.state_with_a_tab();
+        state.config.web.bind = "127.0.0.1".into();
+        state.config.web.port = 0;
+        let mut host = fakes.host(state);
+        assert_eq!(host.remote_status(), RemoteStatus::default());
+
+        run(&mut host, PaletteAction::StartWebInterface);
+        host.publish();
+        host.ui.remote_paired = true;
+        let status = host.remote_status();
+        assert!(status.web_running);
+        assert_eq!(status.web_viewers, 0, "listening, nobody attached");
+        assert!(status.phone_paired);
+        host.stop_services();
+    }
+
+    #[test]
     fn the_overlay_api_names_no_terminal_ui_library() {
         for (file, source) in [
             ("overlay.rs", include_str!("overlay.rs")),
