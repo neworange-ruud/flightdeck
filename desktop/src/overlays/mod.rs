@@ -53,7 +53,7 @@
 //! gets [`forward_keys`]: every key as the [`OverlayKey`] the TUI's handler
 //! expects, which already drives help, the configuration manager and the
 //! remote overlays with the TUI's own keys. The shared chrome ([`card`],
-//! [`button`], [`keycap`], [`text_field`], [`hint_bar`]) is public so every
+//! [`button`], [`keycap`], [`TextField`], [`hint_bar`]) is public so every
 //! overlay looks like one family.
 
 pub mod about;
@@ -64,6 +64,7 @@ pub mod help;
 mod new_agent;
 mod palette;
 pub mod remote;
+pub mod text_field;
 pub mod update;
 
 #[cfg(any(test, feature = "spike-snapshot"))]
@@ -87,6 +88,7 @@ use std::path::PathBuf;
 
 use crate::keys::binding_specs;
 use crate::theme::{Palette, SCRIM_ALPHA};
+use text_field::{FieldSpec, Look, Sink, TextField};
 
 /// The GPUI key context on the overlay layer's root.
 pub const KEY_CONTEXT: &str = "Overlay";
@@ -146,6 +148,9 @@ pub struct OverlayCx<'a> {
     /// dialog's list), kept across frames by the layer so the highlighted row
     /// can be scrolled into view as the host moves it.
     pub list_scroll: &'a ScrollHandle,
+    /// The one text field, for whichever overlay has a text input (see
+    /// [`field_spec`]); it keeps its caret and composition across frames.
+    pub field: &'a Entity<TextField>,
 }
 
 impl OverlayCx<'_> {
@@ -174,6 +179,9 @@ pub struct OverlayLayer {
     view: Option<OverlayView>,
     context: OverlayContext,
     list_scroll: ScrollHandle,
+    /// The text input of the palette, a dialog or the configuration manager's
+    /// inline editor (never more than one is on screen).
+    field: Entity<TextField>,
     /// Who had focus before the overlay took it; given back when it closes.
     restore_focus: Option<FocusHandle>,
 }
@@ -181,9 +189,12 @@ pub struct OverlayLayer {
 impl OverlayLayer {
     /// A layer answering through `emit`, with nothing on screen.
     pub fn new(emit: Emit, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        let field = cx.new(|_| TextField::new(emit.clone(), focus.clone()));
         Self {
-            focus: cx.focus_handle(),
+            focus,
             config_focus: cx.focus_handle(),
+            field,
             emit,
             view: None,
             context: OverlayContext::default(),
@@ -204,6 +215,9 @@ impl OverlayLayer {
         cx: &mut Context<Self>,
     ) {
         if view == self.view {
+            // Nothing new to draw, but the field still follows the host: a
+            // text it refused is put back.
+            self.sync_field(cx);
             return;
         }
         let was_open = self.view.is_some();
@@ -237,7 +251,20 @@ impl OverlayLayer {
                 self.list_scroll.scroll_to_item(selected);
             }
         }
+        self.sync_field(cx);
         cx.notify();
+    }
+
+    /// Show the host's text in the field, attached to the element that holds
+    /// the keyboard for the open overlay.
+    fn sync_field(&self, cx: &mut Context<Self>) {
+        let spec = self.view.as_ref().and_then(field_spec);
+        let holder = match &self.view {
+            Some(OverlayView::Config(_)) => self.config_focus.clone(),
+            _ => self.focus.clone(),
+        };
+        self.field
+            .update(cx, |field, cx| field.set_spec(spec, &holder, cx));
     }
 
     /// Replace the chrome's context facts.
@@ -274,6 +301,23 @@ impl OverlayLayer {
         let Some(view) = self.view.clone() else {
             return;
         };
+        if let Some(spec) = field_spec(&view) {
+            // A composition owns the keyboard: Enter or Esc here is the input
+            // method's, not the dialog's.
+            if self.field.read(cx).composing() {
+                return;
+            }
+            let field = self.field.clone();
+            if field.update(cx, |f, cx| f.key_down(event, spec.caret_keys, window, cx)) {
+                cx.stop_propagation();
+                return;
+            }
+            // Printable text and dead keys reach the field through the
+            // platform's input handler, which only sees a key nobody stopped.
+            if matches!(key_press(&event.keystroke), None | Some(KeyPress::Text(_))) {
+                return;
+            }
+        }
         // Modal: nothing typed while an overlay is up reaches anything behind it.
         cx.stop_propagation();
         let press = match key_press(&event.keystroke) {
@@ -304,6 +348,7 @@ impl Render for OverlayLayer {
             context: &self.context,
             config_focus: &self.config_focus,
             list_scroll: &self.list_scroll,
+            field: &self.field,
         };
         let content = render_overlay(view, &ocx, cx);
         let emit = self.emit.clone();
@@ -349,6 +394,65 @@ fn selected_row(view: &OverlayView) -> Option<usize> {
     }
 }
 
+/// The text input `view` shows, if it has one: what the [`TextField`] displays
+/// and where its edits go. The renderers draw the field exactly when this is
+/// `Some`, and the layer routes keys to it on the same test.
+pub fn field_spec(view: &OverlayView) -> Option<FieldSpec> {
+    match view {
+        OverlayView::Palette(v) => Some(FieldSpec {
+            text: v.filter.clone(),
+            placeholder: "Type a command…",
+            look: Look::Bare {
+                size: 15.,
+                mono: false,
+            },
+            sink: Sink::PaletteFilter,
+            caret_keys: true,
+        }),
+        OverlayView::Dialog(v) => dialog_field_spec(v),
+        OverlayView::Config(v) => {
+            let row = v.rows.iter().find(|r| r.is_text && r.editing)?;
+            Some(FieldSpec {
+                text: row.value.clone(),
+                placeholder: "",
+                look: Look::Bare {
+                    size: 14.,
+                    mono: true,
+                },
+                sink: Sink::SetText,
+                caret_keys: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`field_spec`] for a dialog: its input, if it has one. The folder browser
+/// keeps `←`/`→` for the host (out of / into a folder), so its caret moves
+/// with Home and End only.
+pub(crate) fn dialog_field_spec(view: &flightdeck::host::DialogView) -> Option<FieldSpec> {
+    let text = view.input.clone()?;
+    let (placeholder, mono) = match &view.kind {
+        DialogKind::OpenProject { .. } => ("or type a path", true),
+        DialogKind::ChangeProjectBase => ("filter branches", true),
+        DialogKind::NewAgent(form) => match form.target {
+            flightdeck::host::NewAgentTarget::NewBranch => {
+                ("name the task — it becomes the branch", false)
+            }
+            flightdeck::host::NewAgentTarget::ExistingBranch => ("filter local branches", true),
+            flightdeck::host::NewAgentTarget::Base => return None,
+        },
+        _ => ("", false),
+    };
+    Some(FieldSpec {
+        text,
+        placeholder,
+        look: Look::Boxed { mono },
+        sink: Sink::SetText,
+        caret_keys: !matches!(view.kind, DialogKind::OpenProject { .. }),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch: one arm per overlay
 // ---------------------------------------------------------------------------
@@ -369,7 +473,7 @@ pub fn render_overlay(view: &OverlayView, cx: &OverlayCx, app: &App) -> AnyEleme
         OverlayView::Help(doc) => help::help_view(doc, emit(), app).into_any_element(),
         OverlayView::About(doc) => about::about_view(doc, emit(), app).into_any_element(),
         OverlayView::Config(v) => {
-            config::config_view(v, emit(), cx.config_focus, app).into_any_element()
+            config::config_view(v, emit(), cx.config_focus, cx.field, app).into_any_element()
         }
         OverlayView::WebAccess(v) => remote::web_access_view(v, emit(), app).into_any_element(),
         OverlayView::Pairing(v) => remote::pairing_view(v, emit(), app).into_any_element(),
@@ -713,36 +817,6 @@ pub fn button_row(p: &Palette, dialog_buttons: &[DialogButton], cx: &OverlayCx) 
     footer(p)
         .justify_end()
         .children(buttons(p, dialog_buttons, cx))
-}
-
-/// A read-only picture of a text field: its text (or a faint placeholder) and
-/// a caret. Typing goes to the host as key presses; the next view shows it.
-pub fn text_field(p: &Palette, text: &str, placeholder: &str, mono: bool) -> Div {
-    let caret = div().w(px(1.5)).h(px(16.)).bg(p.accent.hsla());
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(34.))
-        .px(px(10.))
-        .rounded(px(7.))
-        .border_1()
-        .border_color(p.border_strong.hsla())
-        .bg(p.surface_input.hsla())
-        .when(mono, |d| d.font_family(MONO).text_size(px(12.5)))
-        .map(|d| {
-            if text.is_empty() {
-                d.child(caret).child(
-                    div()
-                        .pl(px(2.))
-                        .text_color(p.faint.hsla())
-                        .child(placeholder.to_string()),
-                )
-            } else {
-                d.child(div().text_color(p.ink.hsla()).child(text.to_string()))
-                    .child(caret)
-            }
-        })
 }
 
 /// A row of keyboard hints (`↑↓ select  ⏎ run  esc close`).

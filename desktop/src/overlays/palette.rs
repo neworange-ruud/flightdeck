@@ -21,6 +21,11 @@ pub fn row_selector(index: usize) -> String {
 }
 
 /// What a key means in the palette.
+///
+/// Typing, Backspace and paste are here for a caller with no text field; the
+/// layer routes them through the [`TextField`](super::text_field::TextField)
+/// instead, which sends the whole new filter (caret movement and IME
+/// composition included).
 pub fn key_events(view: &PaletteView, key: &KeyPress) -> Vec<HostEvent> {
     let one = |input| vec![overlay(input)];
     match key {
@@ -76,28 +81,8 @@ pub fn render(view: &PaletteView, cx: &OverlayCx) -> AnyElement {
                 .text_color(p.muted.hsla())
                 .child("›"),
         )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .text_size(px(15.))
-                .map(|d| {
-                    let caret = div().w(px(1.5)).h(px(18.)).bg(p.accent.hsla());
-                    if view.filter.is_empty() {
-                        d.child(caret).child(
-                            div()
-                                .pl(px(2.))
-                                .text_color(p.faint.hsla())
-                                .child("Type a command…"),
-                        )
-                    } else {
-                        d.child(div().text_color(p.ink.hsla()).child(view.filter.clone()))
-                            .child(caret)
-                    }
-                }),
-        )
+        // The filter: a caret, the IME composition, everything the field draws.
+        .child(cx.field.clone())
         .child(keycap("esc", p));
 
     let context = context_line(cx);

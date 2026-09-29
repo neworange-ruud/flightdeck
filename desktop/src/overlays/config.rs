@@ -22,12 +22,14 @@ use flightdeck::host::{ConfigView, HostEvent, OverlayInput, OverlayKey};
 use flightdeck::tui::config_manager::{ConfigRow, ConfigScope, FieldValue, Origin};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, Div, FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    Keystroke, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
+    div, px, App, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    KeyDownEvent, Keystroke, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
+    Styled,
 };
 use gpui_component::{h_flex, v_flex};
 
 use super::help::{button, card, danger, ButtonKind, MONO};
+use super::text_field::TextField;
 use super::Emit;
 use crate::theme::Palette;
 
@@ -43,13 +45,14 @@ pub fn config_view(
     view: &ConfigView,
     emit: Emit,
     focus: &FocusHandle,
+    field: &Entity<TextField>,
     cx: &App,
 ) -> impl IntoElement {
     let p = *Palette::global(cx);
 
     let mut rows = v_flex().gap_px();
     for (i, row) in view.rows.iter().enumerate() {
-        rows = rows.child(setting_row(view, i, row, &emit, &p));
+        rows = rows.child(setting_row(view, i, row, &emit, field, &p));
     }
 
     let editing = view.editing;
@@ -169,7 +172,14 @@ fn header(view: &ConfigView, emit: &Emit, p: &Palette) -> Div {
 
 /// One setting: label and key on the left, its control, origin and (for an
 /// override) a reset on the right.
-fn setting_row(view: &ConfigView, i: usize, row: &ConfigRow, emit: &Emit, p: &Palette) -> Div {
+fn setting_row(
+    view: &ConfigView,
+    i: usize,
+    row: &ConfigRow,
+    emit: &Emit,
+    field: &Entity<TextField>,
+    p: &Palette,
+) -> Div {
     let selected = view.selected == i;
 
     let select = {
@@ -203,7 +213,7 @@ fn setting_row(view: &ConfigView, i: usize, row: &ConfigRow, emit: &Emit, p: &Pa
                 .child(row.key.clone()),
         );
 
-    let control = control(view, i, row, emit, p);
+    let control = control(view, i, row, emit, field, p);
 
     let mut right = v_flex().items_end().gap_1().child(
         h_flex()
@@ -268,7 +278,14 @@ fn setting_row(view: &ConfigView, i: usize, row: &ConfigRow, emit: &Emit, p: &Pa
 }
 
 /// The value control for a row's kind.
-fn control(view: &ConfigView, i: usize, row: &ConfigRow, emit: &Emit, p: &Palette) -> Div {
+fn control(
+    view: &ConfigView,
+    i: usize,
+    row: &ConfigRow,
+    emit: &Emit,
+    field: &Entity<TextField>,
+    p: &Palette,
+) -> Div {
     let scope = view.scope;
     let set = {
         let emit = emit.clone();
@@ -314,12 +331,14 @@ fn control(view: &ConfigView, i: usize, row: &ConfigRow, emit: &Emit, p: &Palett
     if row.is_text {
         let editing = row.editing;
         let emit = emit.clone();
+        // While editing, the shared field draws the caret and any IME
+        // composition; otherwise the value, or `(empty)`.
         let shown = if editing {
-            format!("{}▏", row.value)
+            field.clone().into_any_element()
         } else if row.value.is_empty() {
-            "(empty)".to_string()
+            "(empty)".into_any_element()
         } else {
-            row.value.clone()
+            row.value.clone().into_any_element()
         };
         return div().child(
             div()
@@ -459,9 +478,10 @@ fn footer(view: &ConfigView, emit: &Emit, p: &Palette) -> Div {
 /// What a keystroke means to the configuration manager, as the overlay input
 /// the TUI's own `handle_config_key` would receive.
 ///
-/// While a text field is being edited every printable key is text and only
-/// Enter (commit), Esc (cancel the edit) and Backspace do anything else, as in
-/// the TUI. Otherwise the keys are the manager's: up/down, tab (scope), enter
+/// While a text field is being edited only Enter (commit) and Esc (cancel the
+/// edit) are the manager's: the text itself — characters, IME composition,
+/// Backspace, the caret — belongs to the [`TextField`] and reaches the host as
+/// [`OverlayInput::SetText`]. Otherwise the keys are the manager's: up/down, tab (scope), enter
 /// or space (toggle), and the letters `c` (clear), `s` (save), `e` (edit raw)
 /// passed through for the host to interpret. Chords with ctrl/alt/cmd are not
 /// the manager's.
@@ -484,11 +504,10 @@ pub fn key_to_input(editing: bool, keystroke: &Keystroke) -> Option<OverlayInput
     match keystroke.key.as_str() {
         "enter" => Some(OverlayInput::Submit),
         "escape" => Some(OverlayInput::Cancel),
-        "backspace" if editing => Some(OverlayInput::Key(OverlayKey::Backspace)),
         "up" if !editing => Some(OverlayInput::Key(OverlayKey::Up)),
         "down" if !editing => Some(OverlayInput::Key(OverlayKey::Down)),
         "tab" if !editing => Some(OverlayInput::Key(OverlayKey::Tab)),
-        _ if editing => typed().map(|c| OverlayInput::Key(OverlayKey::Char(c))),
+        _ if editing => None,
         "space" => Some(OverlayInput::Key(OverlayKey::Char(' '))),
         "c" | "s" | "e" => typed().map(|c| OverlayInput::Key(OverlayKey::Char(c))),
         _ => None,
@@ -500,7 +519,7 @@ mod tests {
     use std::path::PathBuf;
 
     use flightdeck::tui::config_manager::ConfigManager;
-    use gpui::{Keystroke, TestAppContext, VisualTestContext};
+    use gpui::{AppContext as _, Keystroke, TestAppContext, VisualTestContext};
 
     use super::super::help::testkit::{click, mount, recorder, scroll_down, take, Events};
     use super::*;
@@ -544,10 +563,17 @@ mod tests {
     fn draw(cx: &mut TestAppContext, view: ConfigView) -> (&mut VisualTestContext, Events) {
         let (emit, events) = recorder();
         let focus = cx.update(|cx| cx.focus_handle());
+        let field = field_for(cx, &emit, &focus);
         let cx = mount(cx, move |_, cx| {
-            config_view(&view, emit.clone(), &focus, cx).into_any_element()
+            config_view(&view, emit.clone(), &focus, &field, cx).into_any_element()
         });
         (cx, events)
+    }
+
+    /// The shared text field the layer would hand the card.
+    fn field_for(cx: &mut TestAppContext, emit: &Emit, focus: &FocusHandle) -> Entity<TextField> {
+        let (emit, focus) = (emit.clone(), focus.clone());
+        cx.update(|cx| cx.new(|_| TextField::new(emit, focus)))
     }
 
     fn leak(s: String) -> &'static str {
@@ -718,8 +744,9 @@ mod tests {
         let (emit, events) = recorder();
         let focus = cx.update(|cx| cx.focus_handle());
         let handle = focus.clone();
+        let field = field_for(cx, &emit, &focus);
         let cx = mount(cx, move |_, cx| {
-            config_view(&view, emit.clone(), &handle, cx).into_any_element()
+            config_view(&view, emit.clone(), &handle, &field, cx).into_any_element()
         });
         cx.update(|window, cx| window.focus(&focus, cx));
         cx.simulate_keystrokes("down");
@@ -748,14 +775,11 @@ mod tests {
         assert_eq!(key_to_input(false, &key("s")), ki(OverlayKey::Char('s')));
         assert_eq!(key_to_input(false, &key("x")), None);
         assert_eq!(key_to_input(false, &key("ctrl-s")), None);
-        // Editing: printable keys are text, including the ones that mean
-        // something when browsing.
-        assert_eq!(key_to_input(true, &key("s")), ki(OverlayKey::Char('s')));
-        assert_eq!(key_to_input(true, &key("x")), ki(OverlayKey::Char('x')));
-        assert_eq!(
-            key_to_input(true, &key("backspace")),
-            ki(OverlayKey::Backspace)
-        );
+        // Editing: the text field owns the text (characters, Backspace, the
+        // caret), so only Enter and Esc are the manager's.
+        assert_eq!(key_to_input(true, &key("s")), None);
+        assert_eq!(key_to_input(true, &key("x")), None);
+        assert_eq!(key_to_input(true, &key("backspace")), None);
         assert_eq!(key_to_input(true, &key("down")), None);
         assert_eq!(
             key_to_input(true, &key("enter")),

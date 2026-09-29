@@ -511,9 +511,11 @@ fn palette_keys_filter_select_and_run(app: &mut TestAppContext) {
         h.keys("s"),
         vec![ev(OverlayInput::PaletteFilter("pus".into()))]
     );
+    // The field is local until the host's next view: it erases from what it
+    // typed, not from the stale view.
     assert_eq!(
         h.keys("backspace"),
-        vec![ev(OverlayInput::PaletteFilter("p".into()))]
+        vec![ev(OverlayInput::PaletteFilter("pu".into()))]
     );
     assert_eq!(
         h.keys("enter"),
@@ -571,12 +573,21 @@ fn confirmations_press_their_buttons_and_never_confirm_on_enter(app: &mut TestAp
 #[gpui::test]
 fn text_dialogs_type_through_the_host(app: &mut TestAppContext) {
     let mut h = open(app);
-    h.show(Some(OverlayView::Dialog(rename())));
+    let mut view = rename();
+    view.input = Some(String::new());
+    h.show(Some(OverlayView::Dialog(view)));
+    // Typing is the whole new text, through the platform's input handler.
     assert_eq!(
         h.keys("a shift-b"),
-        vec![key(OverlayKey::Char('a')), key(OverlayKey::Char('B'))]
+        vec![
+            ev(OverlayInput::SetText("a".into())),
+            ev(OverlayInput::SetText("aB".into()))
+        ]
     );
-    assert_eq!(h.keys("backspace"), vec![key(OverlayKey::Backspace)]);
+    assert_eq!(
+        h.keys("backspace"),
+        vec![ev(OverlayInput::SetText("a".into()))]
+    );
     assert_eq!(h.keys("enter"), vec![ev(OverlayInput::Submit)]);
     assert_eq!(
         h.click("overlay-button-Enter", 1),
@@ -610,7 +621,7 @@ fn the_new_agent_form_answers_with_the_tui_keys(app: &mut TestAppContext) {
             key(OverlayKey::Down)
         ]
     );
-    assert_eq!(h.keys("x"), vec![key(OverlayKey::Char('x'))]);
+    assert_eq!(h.keys("x"), vec![ev(OverlayInput::SetText("fixx".into()))]);
     assert_eq!(h.keys("tab"), vec![key(OverlayKey::Tab)]);
     assert_eq!(h.keys("enter"), vec![ev(OverlayInput::Submit)]);
     assert_eq!(
@@ -764,4 +775,238 @@ fn the_config_card_reads_its_own_keys(app: &mut TestAppContext) {
     assert!(h.layer_focused());
     h.show(None);
     assert!(h.app_focused());
+}
+
+// ---------------------------------------------------------------------------
+// Text entry through the platform's input handler (beads bmej.4.9)
+// ---------------------------------------------------------------------------
+
+use flightdeck::tui::platform::IS_MACOS;
+use gpui::{Bounds, ClipboardItem, ElementInputHandler, InputHandler as _};
+
+use super::text_field::TextField;
+
+/// The "select all" and "paste" chords for this platform.
+const SELECT_ALL: &str = if IS_MACOS { "cmd-a" } else { "ctrl-a" };
+const PASTE: &str = if IS_MACOS { "cmd-v" } else { "ctrl-v" };
+
+impl Harness<'_> {
+    fn field(&mut self) -> Entity<TextField> {
+        let layer = self.layer();
+        layer.read_with(self.cx, |l, _| l.field.clone())
+    }
+
+    /// The field's text and caret (byte offset).
+    fn typed(&mut self) -> (String, usize) {
+        let field = self.field();
+        field.read_with(self.cx, |f, _| (f.text().to_string(), f.cursor()))
+    }
+
+    /// Drive the field as the platform's input method does.
+    fn ime<R>(
+        &mut self,
+        f: impl FnOnce(&mut ElementInputHandler<TextField>, &mut Window, &mut App) -> R,
+    ) -> R {
+        let field = self.field();
+        self.cx.update(|window, cx| {
+            let mut handler = ElementInputHandler::new(Bounds::default(), field);
+            f(&mut handler, window, cx)
+        })
+    }
+}
+
+/// A rename dialog whose field holds `text`.
+fn rename_with(text: &str) -> OverlayView {
+    let mut view = rename();
+    view.input = Some(text.to_string());
+    OverlayView::Dialog(view)
+}
+
+#[gpui::test]
+fn a_japanese_composition_emits_only_the_committed_text(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(OverlayView::Palette(palette(""))));
+    h.take();
+
+    // "nihon", then 日本 chosen: marked-text updates, then one insert.
+    h.ime(|ime, window, cx| {
+        for preview in ["n", "に", "にh", "にほ", "にほn", "にほん"] {
+            ime.replace_and_mark_text_in_range(None, preview, None, window, cx);
+        }
+        assert_eq!(ime.marked_text_range(window, cx), Some(0..3));
+    });
+    assert_eq!(h.take(), vec![], "a composition is not the host's yet");
+    assert_eq!(h.typed().0, "にほん", "but the field shows it");
+    // Enter and Esc while composing belong to the input method, which takes
+    // them before the app on a real platform: they must not reach the host
+    // (delivered as bare key events here, without the simulated IME fallback).
+    for name in ["enter", "escape"] {
+        h.cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: Keystroke::parse(name).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+    }
+    assert_eq!(h.take(), vec![]);
+    assert_eq!(h.typed().0, "にほん");
+
+    h.ime(|ime, window, cx| {
+        ime.replace_text_in_range(None, "日本", window, cx);
+        assert_eq!(ime.marked_text_range(window, cx), None);
+    });
+    assert_eq!(
+        h.take(),
+        vec![ev(OverlayInput::PaletteFilter("日本".into()))]
+    );
+    assert_eq!(h.typed(), ("日本".to_string(), "日本".len()));
+
+    // The composition also works mid-text, and an abandoned one types nothing.
+    h.show(Some(rename_with("ab")));
+    h.keys("left");
+    h.ime(|ime, window, cx| ime.replace_and_mark_text_in_range(None, "か", None, window, cx));
+    h.ime(|ime, window, cx| ime.replace_and_mark_text_in_range(None, "", None, window, cx));
+    assert_eq!(h.take(), vec![], "nothing was left of it");
+    assert_eq!(h.typed().0, "ab");
+    h.ime(|ime, window, cx| {
+        ime.replace_and_mark_text_in_range(None, "か", None, window, cx);
+        ime.replace_text_in_range(None, "漢", window, cx);
+    });
+    assert_eq!(h.take(), vec![ev(OverlayInput::SetText("a漢b".into()))]);
+    assert_eq!(h.typed(), ("a漢b".to_string(), 1 + "漢".len()));
+}
+
+#[gpui::test]
+fn the_caret_moves_and_typing_lands_at_it(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(rename_with("abd")));
+    h.take();
+
+    // Left does not reach the host (it is the caret's), typing inserts there.
+    assert_eq!(h.keys("left"), vec![]);
+    assert_eq!(h.typed().1, 2);
+    assert_eq!(h.keys("c"), vec![ev(OverlayInput::SetText("abcd".into()))]);
+    assert_eq!(h.typed(), ("abcd".to_string(), 3));
+
+    // Home / Delete, End / Backspace.
+    assert_eq!(h.keys("home"), vec![]);
+    assert_eq!(
+        h.keys("delete"),
+        vec![ev(OverlayInput::SetText("bcd".into()))]
+    );
+    assert_eq!(h.keys("end"), vec![]);
+    assert_eq!(
+        h.keys("backspace"),
+        vec![ev(OverlayInput::SetText("bc".into()))]
+    );
+    // Right at the end and Backspace at the start change nothing.
+    assert_eq!(h.keys("right"), vec![]);
+    assert_eq!(h.keys("home backspace"), vec![]);
+    assert_eq!(h.typed(), ("bc".to_string(), 0));
+
+    // Select all, then typing replaces it; select all + Backspace clears it.
+    assert_eq!(h.keys(SELECT_ALL), vec![]);
+    assert_eq!(h.keys("z"), vec![ev(OverlayInput::SetText("z".into()))]);
+    h.keys(SELECT_ALL);
+    assert_eq!(
+        h.keys("backspace"),
+        vec![ev(OverlayInput::SetText("".into()))]
+    );
+
+    // Shift-Left selects a character, which the next key replaces.
+    h.show(Some(rename_with("xy")));
+    h.keys("shift-left");
+    assert_eq!(h.keys("q"), vec![ev(OverlayInput::SetText("xq".into()))]);
+}
+
+#[gpui::test]
+fn a_paste_goes_in_at_the_caret_as_one_line(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(rename_with("ad")));
+    h.keys("left");
+    h.cx.write_to_clipboard(ClipboardItem::new_string("b\nc\n".into()));
+    assert_eq!(
+        h.keys(PASTE),
+        vec![ev(OverlayInput::SetText("ab cd".into()))]
+    );
+    assert_eq!(h.typed().1, "ab c".len());
+
+    // The platform's own paste (the input handler) takes the same path.
+    h.take();
+    h.ime(|ime, window, cx| ime.paste(ClipboardItem::new_string("!".into()), window, cx));
+    assert_eq!(h.take(), vec![ev(OverlayInput::SetText("ab c!d".into()))]);
+
+    h.show(Some(OverlayView::Palette(palette(""))));
+    h.cx.write_to_clipboard(ClipboardItem::new_string("push".into()));
+    assert_eq!(
+        h.keys(PASTE),
+        vec![ev(OverlayInput::PaletteFilter("push".into()))]
+    );
+}
+
+#[gpui::test]
+fn the_host_owns_the_text_and_the_caret_survives_its_echo(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(rename_with("abd")));
+    h.keys("left");
+    h.keys("c");
+    // The host applied it and reports the same text: the caret stays.
+    h.show(Some(rename_with("abcd")));
+    assert_eq!(h.typed(), ("abcd".to_string(), 3));
+    // A text the host set itself replaces the local one, caret at the end.
+    h.show(Some(rename_with("renamed")));
+    assert_eq!(h.typed(), ("renamed".to_string(), 7));
+    // A text it refused (the view is unchanged) is put back.
+    h.keys("x");
+    assert_eq!(h.typed().0, "renamedx");
+    h.show(Some(rename_with("renamed")));
+    assert_eq!(h.typed().0, "renamed");
+}
+
+#[gpui::test]
+fn the_folder_browser_keeps_left_and_right_for_the_host(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(OverlayView::Dialog(open_project())));
+    let before = h.typed();
+    assert_eq!(h.keys("left"), vec![key(OverlayKey::Left)]);
+    assert_eq!(h.keys("right"), vec![key(OverlayKey::Right)]);
+    assert_eq!(h.typed(), before, "the caret did not move");
+    // Home/End and typing are still the field's.
+    h.keys("home");
+    assert_eq!(h.typed().1, 0);
+}
+
+#[gpui::test]
+fn only_dialogs_with_an_input_have_a_field(app: &mut TestAppContext) {
+    let mut h = open(app);
+    // A confirmation: a typed letter is the button's accelerator, no text.
+    h.show(Some(OverlayView::Dialog(quit())));
+    assert_eq!(h.keys("y"), vec![ev(OverlayInput::Choose("y".into()))]);
+    // The base target of the New Agent form has no field either: the key goes
+    // to the host as before, which ignores it.
+    h.show(Some(OverlayView::Dialog(new_agent(
+        NewAgentTarget::Base,
+        "",
+    ))));
+    assert_eq!(h.keys("x"), vec![key(OverlayKey::Char('x'))]);
+    assert_eq!(h.typed().0, "", "and the field shows nothing");
+}
+
+#[gpui::test]
+fn the_configuration_editor_takes_text_from_the_field(app: &mut TestAppContext) {
+    let mut h = open(app);
+    let mut view = config();
+    let at = view
+        .rows
+        .iter()
+        .position(|r| r.is_text)
+        .expect("a text row");
+    view.rows[at].editing = true;
+    view.rows[at].value = "opus".into();
+    view.editing = true;
+    h.show(Some(OverlayView::Config(view)));
+    h.take();
+    // Typing and caret keys are the field's; Enter is still the manager's.
+    assert_eq!(h.keys("left"), vec![]);
+    assert_eq!(h.keys("x"), vec![ev(OverlayInput::SetText("opuxs".into()))]);
+    assert_eq!(h.keys("enter"), vec![ev(OverlayInput::Submit)]);
 }

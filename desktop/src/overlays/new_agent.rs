@@ -25,7 +25,7 @@ use gpui::{
 
 use super::{
     buttons, dialog_card, footer, heading, origin_line, overlay, section_label, split_hint,
-    text_field, OverlayCx, MONO,
+    OverlayCx, MONO,
 };
 use crate::theme::Palette;
 
@@ -137,16 +137,7 @@ pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElem
     let targets = segmented(p, form, cx);
 
     let detail: Div = match form.target {
-        NewAgentTarget::NewBranch => field_block(
-            p,
-            "Task name",
-            text_field(
-                p,
-                &form.branch,
-                "name the task — it becomes the branch",
-                false,
-            ),
-        ),
+        NewAgentTarget::NewBranch => field_block(p, "Task name", cx.field.clone()),
         NewAgentTarget::ExistingBranch => {
             let rows = super::dialog::render_rows(view, true, false, cx);
             field_block(
@@ -156,7 +147,7 @@ pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElem
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(text_field(p, &form.branch, "filter local branches", true))
+                    .child(cx.field.clone())
                     .child(rows),
             )
         }

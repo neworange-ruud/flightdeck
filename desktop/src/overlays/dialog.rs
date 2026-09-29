@@ -17,7 +17,7 @@ use gpui::{
 
 use super::{
     button_row, buttons, choose_folder, dialog_button, dialog_button_with, dialog_card, footer,
-    heading, origin_line, overlay, split_hint, text_field, KeyPress, OverlayCx, MONO,
+    heading, origin_line, overlay, split_hint, KeyPress, OverlayCx, MONO,
 };
 
 /// The debug selector on dialog list row `index`, for tests.
@@ -87,14 +87,7 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
         DialogKind::OpenProject { .. } | DialogKind::ChangeProjectBase
     );
 
-    let field = view.input.as_deref().map(|text| {
-        let placeholder = match view.kind {
-            DialogKind::OpenProject { .. } => "or type a path",
-            DialogKind::ChangeProjectBase => "filter branches",
-            _ => "",
-        };
-        text_field(p, text, placeholder, mono_list)
-    });
+    let field = super::dialog_field_spec(view).map(|_| cx.field.clone());
 
     let list = (!view.list.is_empty()).then(|| render_rows(view, mono_list, browsing, cx));
 
