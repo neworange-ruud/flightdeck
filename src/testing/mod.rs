@@ -1176,6 +1176,38 @@ impl CommandRunner for FakeCommandRunner {
     }
 }
 
+// ===========================================================================
+// FakeNotifier — records OS notifications
+// ===========================================================================
+
+/// [`Notifier`] that records every notification it was asked to post, so a
+/// test can assert what the desktop would have shown without touching a
+/// platform notification API.
+///
+/// [`Notifier`]: crate::contracts::traits::Notifier
+#[derive(Debug, Default)]
+pub struct FakeNotifier {
+    posted: Mutex<Vec<crate::contracts::domain::Notification>>,
+}
+
+impl FakeNotifier {
+    /// New notifier with nothing posted.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every notification posted so far, in order.
+    pub fn posted(&self) -> Vec<crate::contracts::domain::Notification> {
+        self.posted.lock().unwrap().clone()
+    }
+}
+
+impl crate::contracts::traits::Notifier for FakeNotifier {
+    fn notify(&self, notification: &crate::contracts::domain::Notification) {
+        self.posted.lock().unwrap().push(notification.clone());
+    }
+}
+
 /// [`Clock`] returning a fixed timestamp and a settable millisecond counter.
 #[derive(Debug, Clone)]
 pub struct FakeClock {
