@@ -208,3 +208,207 @@ aws-lc) are unchanged. Unknown: whether a headless CI runner can *open* a window
 - The precompiled-shader release path (`--no-default-features`).
 - gpui-component widgets rendered with our palette. `theme::init` maps our tokens
   onto its theme, but no stock widget is drawn in M0.
+
+## Keyboard parity (S3)
+
+Written for beads issue `remote-control-bmej.1.3`. Code: `desktop/src/keys/`
+(a library module, `flightdeck_desktop::keys`). Tests: `desktop/src/keys/tests.rs`.
+
+### How it works
+
+- **Bindings come from the table.** `keys::register(cx, keymap)` enumerates
+  `Keymap::bindings_in(context)` and binds each trigger's exact chord. No chord is
+  written by hand in the desktop crate. `chord_to_gpui` spells a crate `Chord` the
+  way GPUI does (`ctrl-g`, `alt-up`, `shift-escape`, `f2`, `cmd-v`), and
+  `chord_from_keystroke` goes the other way for typed keys.
+- **One action type.** GPUI dispatches by Rust type and `actions!` needs a type for
+  each name in source, which would be a second, hand-written list. Instead there is
+  one `KeymapAction { id }` with a hand-written `Action` impl. Its `name()` is the
+  entry's `gpui_action_name()` (`flightdeck::OpenPalette`) and `partial_eq`
+  compares ids, so `keystroke_text_for` and `bindings_for_action` still tell
+  entries apart. The view registers a single `on_action::<KeymapAction>` handler.
+- **Key contexts** are the table's context names. `"Global"` goes on the window root
+  (`app.rs` does this now), `"Terminal"` on the focused terminal element, and
+  `"App"` on the element that has focus in app-command mode. Two rules come from
+  how GPUI matches contexts:
+  - Global bindings get a named context, not `None`. GPUI ranks a context-less
+    binding *above* every context, so it would take Alt-Left from a text field
+    inside an overlay.
+  - `"App"` must never be an ancestor of `"Terminal"`. GPUI matches a context
+    anywhere on the focus path, so bare Up and Ctrl-n would fire inside a terminal.
+- **Leniency.** The TUI's `Trigger::tolerate` (Ctrl-Shift-g still opens the palette,
+  Alt-Shift-Up still switches tabs) is not expanded into extra GPUI bindings. The
+  key-down fallbacks (`terminal_key_down`, `app_key_down`) look the chord up in the
+  table instead, so the results match the TUI.
+- **Terminal mode, unbound keys.** `terminal_key_down` returns what to do with a key
+  no binding claimed:
+  - `Action`: a lenient table match.
+  - `Pty(bytes)`: the key goes to the PTY, encoded with `encode_pty`, so arrows are
+    always CSI.
+  - `Text`: printable text. The handler does nothing and lets the platform input
+    handler deliver the character.
+  - `Ignore`: Cmd shortcuts, and keys like Insert that have no chord.
+- **Text and IME.** Printable keys are not encoded on key-down. They go through
+  GPUI's `EntityInputHandler`, so CJK composition works. `ImeState` holds the
+  composition (marked text) as a preview and sends nothing. Only committed text
+  (`replace_text_in_range`) reaches the PTY, as UTF-8. The doc comment on
+  `ImeState` has the method-by-method delegation the terminal element should copy.
+  An abandoned composition (`unmark_text`) is dropped rather than typed, which
+  matches what Zed's terminal does.
+- **Paste.** `paste_bytes(text, bracketed)` is the TUI's encoder. It moved from a
+  private function in `src/lib.rs` to `flightdeck::app::keymap::encode_paste`, so the
+  TUI, the phone relay (`remote::commands::encode_reply`) and the GUI all share one
+  implementation. It turns newlines into CR, and adds `ESC[200~` … `ESC[201~` when
+  the app has turned DECSET 2004 on.
+- **Cmd on macOS** is never used for a FlightDeck chord, except the table's Cmd-V
+  paste, which is bound exactly. A Cmd keystroke that is not bound returns
+  `Ignore`/`None` and propagates to the platform (Cmd-Q, Cmd-comma, Cmd-C). This
+  means the TUI's leniency does not apply to Cmd chords: Cmd-Shift-V is not a
+  paste.
+- **F2.** It follows `KeymapOptions::use_f2_to_leave_focus`. When F2 is on, it
+  matches with any modifier held, as in the TUI, and Alt/Shift-Esc goes to the PTY.
+  The GUI does not read that config setting yet (it uses the default table;
+  `remote-control-9diy`).
+
+### The macOS Option policy
+
+GPUI reports a keystroke as the key on the keycap (`key`), the modifiers held, and
+the character the press would type (`key_char`). Option+1 is `key "1"`, `alt`,
+`key_char "¡"`. Bindings match on `key`, so **Option always works as Alt for bound
+chords**: Alt-1..9, Alt-o, Alt-h, Alt-Esc and Alt-arrows fire whatever glyph the
+layout composes. The TUI can't do this, which is why it asks users to turn on "Use
+Option as Meta" in their terminal.
+
+For an **unbound** Option+key in Terminal mode, `OptionKey` decides:
+
+- `Compose`, the macOS default, types the composed character (`∫`, a dead-key
+  accent, `@` on a German layout). When the platform reports no composed character,
+  it falls back to Meta.
+- `Meta` sends `ESC` + key. That is byte-for-byte what the TUI sends when the host
+  terminal has Option as Meta turned on, and it keeps readline's Meta-b/f/d.
+
+**Why Compose by default:** Non-US Mac layouts put characters a shell needs behind
+Option: `@ [ ] { } | \ ~` on German, French and Nordic layouts. Under Meta those
+users could not type them into an agent. The reason the TUI needed Meta was to reach
+FlightDeck's own Alt chords, and that reason no longer applies because those chords
+are bindings. Compose is also the default in macOS Terminal.app and in Zed's
+terminal. The cost is readline Meta-word motions for US-layout users, which is why a
+setting for it is filed (`remote-control-9diy`). On Linux and Windows the policy
+makes no difference. Alt does not compose there (Windows AltGr arrives with
+`prefer_character_input`, which is honoured first), so both policies send `ESC` +
+key.
+
+### Chord matrix
+
+The "macOS" column is the result on this machine (Darwin 27, Apple M2 Pro).
+`cargo test -p flightdeck-desktop` drives each keystroke through GPUI's real keymap,
+key-context matching, action dispatch, key-down listeners and input handler, using
+GPUI's headless test platform (`gpui/test-support`, `VisualTestContext::
+simulate_keystrokes`). The test window has the app's shape: a `"Global"` root with
+sibling `"App"` and `"Terminal"` panes. The platform layer (AppKit's event
+translation and `NSTextInputContext`) is the one piece not exercised. See "Not
+verified" below.
+
+**Linux and Windows: not run.** No Linux or Windows machine was available. The
+tests are OS-independent (every table variant is built on every OS, and Cmd is
+spelled per-OS), but they have never been compiled or executed there. That is
+`remote-control-hu6n`.
+
+"passthrough" means the chord is not bound in that mode, and the Terminal pane wrote
+exactly `encode_pty(chord)`, the TUI's bytes (shown in brackets). "nothing" means
+App mode ignores the key.
+
+| Chord | Entry | Context | GPUI binding | App mode | Terminal mode | macOS | Linux | Windows |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ctrl-g | OpenPalette | Global | `ctrl-g` | action | action | pass | not run | not run |
+| Ctrl-q | Quit | Global | `ctrl-q` | action | action | pass | not run | not run |
+| F1 | OpenHelp | Global | `f1` | action | action | pass | not run | not run |
+| Alt-h | OpenHelp | Global | `alt-h` | action | action (also as `alt-h->˙`) | pass | not run | not run |
+| Shift-Left / Shift-Right | SwitchProjectPrev / Next | Global | `shift-left` / `shift-right` | action | action | pass | not run | not run |
+| Alt-Up / Alt-Down | AgentTabPrev / Next | Global | `alt-up` / `alt-down` | action | action | pass | not run | not run |
+| Alt-Left / Alt-Right | TerminalTabPrev / Next | Global | `alt-left` / `alt-right` | action | action | pass | not run | not run |
+| Alt-1 .. Alt-9 | JumpToAgentTab1..9 | Global | `alt-1` .. `alt-9` | action | action (also as `alt-1->¡`, `alt-9->ª`) | pass | not run | not run |
+| Alt-o | OpenWorktreeInFileManager | Global | `alt-o` | action | action (also as `alt-o->ø`) | pass | not run | not run |
+| Up / Down | AgentTabPrev / Next | App | `up` / `down` | action | passthrough (`ESC[A` / `ESC[B`) | pass | not run | not run |
+| Left / Right | TerminalTabPrev / Next | App | `left` / `right` | action | passthrough (`ESC[D` / `ESC[C`) | pass | not run | not run |
+| Ctrl-n | NewAgentTab | App | `ctrl-n` | action | passthrough (`0x0e`) | pass | not run | not run |
+| Ctrl-p | PushBranch | App | `ctrl-p` | action | passthrough (`0x10`) | pass | not run | not run |
+| Ctrl-u | PullBase | App | `ctrl-u` | action | passthrough (`0x15`) | pass | not run | not run |
+| Ctrl-f | FinishLocalMerge | App | `ctrl-f` | action | passthrough (`0x06`) | pass | not run | not run |
+| Ctrl-k | CloseAgentTab | App | `ctrl-k` | action | passthrough (`0x0b`) | pass | not run | not run |
+| Ctrl-t | NewChildTerminal | App | `ctrl-t` | action | passthrough (`0x14`) | pass | not run | not run |
+| Ctrl-w | CloseChildTerminal | App | `ctrl-w` | action | passthrough (`0x17`) | pass | not run | not run |
+| Ctrl-b | ToggleSplitView | App | `ctrl-b` | action | passthrough (`0x02`) | pass | not run | not run |
+| Enter | FocusTerminal | App | `enter` | action | passthrough (`\r`) | pass | not run | not run |
+| Ctrl-s | SetManualStatus | App | `ctrl-s` | action | passthrough (`0x13`) | pass | not run | not run |
+| Ctrl-r | RestartAgent | App | `ctrl-r` | action | passthrough (`0x12`) | pass | not run | not run |
+| Ctrl-v | Paste | Terminal | `ctrl-v` | nothing | action | pass | not run | not run |
+| Cmd-V (macOS table) | Paste | Terminal | `cmd-v` | nothing | action | pass | not run | not run |
+| Alt-Esc (macOS table) | FocusApp | Terminal | `alt-escape` | nothing | action | pass | not run | not run |
+| Shift-Esc (Linux/Windows table) | FocusApp | Terminal | `shift-escape` | nothing | action | pass (table built here) | not run | not run |
+| F2 (`use_f2_to_leave_focus`) | FocusApp | Terminal | `f2` | nothing | action, with any modifier; then Alt-Esc is passthrough (`ESC`) | pass | not run | not run |
+
+Every row is checked for all 8 combinations of the table's options (F2 on/off ×
+Shift-Esc/Alt-Esc × Cmd-V on/off). Rows that depend on the OS are marked. The test
+fails when the table gains, loses or re-spells a chord, until the expected matrix in
+the test (and this table) is updated.
+
+Also covered:
+
+- **Every Ctrl-letter in App mode** (a–z) resolves to exactly the table's App-mode
+  entry or to nothing, and never types.
+- **Leniency matches the TUI's `map_key`:** Ctrl-Shift-g (both modes), Alt-Shift-Up,
+  Ctrl-Alt-1, Ctrl-Alt-n (App) and Ctrl-Shift-v are all compared against the TUI's
+  own result for the same crossterm event.
+- **Cmd is left to the platform:** Cmd-Q, Cmd-comma, Cmd-C, Cmd-A, Cmd-Shift-G and
+  Cmd-Up do nothing in either mode.
+- **Unbound keys in Terminal mode, byte for byte with the TUI.** 40 representative
+  keys give the same bytes as both `encode_pty` and the TUI's own
+  `tui::input::encode_key` on the crossterm event. The keys: text (`a`, `A`, space,
+  digits), Enter, Esc, Tab, Shift-Tab (`ESC[Z`), Backspace, Delete, the arrows
+  (always CSI, including Shift- and Ctrl-arrows), Home, End, PgUp, PgDn, F2–F5, F12,
+  F13 (sends nothing), Ctrl-a/c/d/n/r/z, Ctrl-Alt-a, and Alt-b/f/Shift-a/Backspace/PgUp
+  under Meta. A sweep then presses **every** key (letters in both cases, digits,
+  punctuation, named keys, F1–F24) with **every** Shift/Ctrl/Alt combination that is
+  unbound in Terminal mode, which is about 800 presses, and checks each against both
+  encoders.
+- **Option policy:** Compose types `∫`, `@` and a dead-key `´` as UTF-8. Meta sends
+  `ESC b` / `ESC l` for the same keystrokes. Compose with no composed character sends
+  `ESC b`. Ctrl-Option is never treated as text.
+- **IME:** a Japanese composition (`n` → `に` → … → `にほん`, then commit `日本`)
+  goes through `ElementInputHandler`, the adapter GPUI gives the platform. Nothing
+  reaches the PTY until the commit, and then the bytes are the UTF-8 of `日本`. An
+  abandoned composition types nothing, and neither does an emptied one.
+  `text_for_range` returns the requested slice in UTF-16 units.
+- **Typing and paste:** `simulate_input("git status -sb")` arrives through the input
+  handler byte for byte. A two-line paste gives `ESC[200~echo 1\recho 2ESC[201~` with
+  bracketed paste on, and raw text with CR line breaks when it is off.
+
+Test counts: 21 desktop library tests (`keys::tests`) plus the existing 4 theme
+tests. Three `encode_paste` tests moved with the function into
+`src/app/keymap/tests.rs`, so the root library count is unchanged at 1586.
+
+`test-support` pulls `proptest` and a handful of small crates into `Cargo.lock`
+(`bit-set`, `bit-vec`, `convert_case`, `proptest-macro`, `quick-error`,
+`rand_xorshift`, `rusty-fork`, `unarray`, `wait-timeout`). They are dev-dependencies
+of the desktop crate only. The root package and the shipped GUI binary do not get
+them.
+
+### Not verified (said plainly)
+
+- **Linux and Windows: nothing was run** (`remote-control-hu6n`). This includes
+  Windows AltGr through `prefer_character_input`, how Linux reports `key_char` for
+  Alt+letter, and ibus/fcitx commits.
+- **No physical keyboard on macOS** (`remote-control-6xdd`). The headless platform
+  replays GPUI's dispatch order but not AppKit's. It does not cover: which events
+  AppKit sends to `NSTextInputContext` first (an active CJK input source takes
+  printable keys before the keymap does), real Option composition and dead keys
+  under a German layout, the Cmd-Q/Cmd-comma path through a real app menu, press-and-hold,
+  or a real IME's candidate window (`bounds_for_range` belongs to the terminal
+  element, which does not exist yet).
+- **Nothing is wired end-to-end.** No terminal element or PTY exists in the GUI yet.
+  The harness in `tests.rs` shows the wiring the terminal element should copy. In the
+  app, only Quit does anything. Every other entry is claimed by the root's action
+  handler, so a FlightDeck chord never reaches a PTY, but it does nothing yet. The
+  root has no focus target in M0, so the Global context is not on the focus path
+  until a focused view exists.

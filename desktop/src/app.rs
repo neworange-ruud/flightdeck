@@ -13,9 +13,12 @@
 //! +--------------------------------------------------------------+
 //! ```
 
+use flightdeck::app::keymap::{Action as KeymapEffect, Context as KeymapContext, Keymap};
+use flightdeck_desktop::keys::{self, KeymapAction};
 use gpui::{
-    actions, div, px, size, App, AppContext, Bounds, Context, Entity, IntoElement, KeyBinding,
-    ParentElement, Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, div, px, size, App, AppContext, Bounds, Context, Entity, InteractiveElement,
+    IntoElement, KeyBinding, ParentElement, Render, Styled, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::{h_flex, v_flex, Root};
 
@@ -37,6 +40,8 @@ pub fn run() {
         // and `Root` (below) needs its globals.
         gpui_component::init(cx);
         theme::init(cx);
+        // Every FlightDeck chord, generated from the keymap table.
+        keys::register(cx, keymap());
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         // The platform's quit chord. On macOS there is no app menu yet to
@@ -120,6 +125,9 @@ impl Render for FlightDeckWindow {
         let p = Palette::global(cx);
 
         v_flex()
+            // The table's Global bindings apply under this context (see keys).
+            .key_context(KeymapContext::Global.name())
+            .on_action(perform_keymap_action)
             .size_full()
             .bg(p.surface_window.hsla())
             .text_color(p.ink.hsla())
@@ -133,6 +141,26 @@ impl Render for FlightDeckWindow {
                     .child(main_area(p)),
             )
             .child(StatusBar)
+    }
+}
+
+/// The keymap table for this platform.
+///
+/// The `[ui] use_f2_to_leave_terminal_focus` setting is not read yet (the GUI
+/// loads no config in M0), so this is the default table.
+fn keymap() -> &'static Keymap {
+    Keymap::for_this_platform(false)
+}
+
+/// Perform a table entry's action. Only Quit is wired in M0; every other
+/// entry is still claimed here, so a FlightDeck chord is never typed into a
+/// terminal while its feature is being built.
+fn perform_keymap_action(action: &KeymapAction, _window: &mut Window, cx: &mut App) {
+    if action
+        .entry(keymap())
+        .is_some_and(|entry| entry.action == KeymapEffect::Quit)
+    {
+        cx.quit();
     }
 }
 
