@@ -229,7 +229,9 @@ impl MissionControl {
             // The selected tile keeps up with its output; the rest wait for
             // the next refresh.
             if let Some(tile) = host_selection(model.host()).and_then(|k| this.tiles.get(&k)) {
-                tile.update(cx, |_, cx| cx.notify());
+                if tile.read(cx).has_changes(model.host()) {
+                    tile.update(cx, |_, cx| cx.notify());
+                }
             }
         })
         .detach();
@@ -276,7 +278,12 @@ impl MissionControl {
         if !std::mem::take(&mut self.dirty) {
             return;
         }
+        // Only the tiles whose own terminal changed redraw: output in one
+        // session leaves the other tiles' cached frames alone.
         for tile in self.tiles.values() {
+            if !tile.read(cx).has_changes(self.host.read(cx).host()) {
+                continue;
+            }
             tile.update(cx, |_, cx| cx.notify());
         }
     }

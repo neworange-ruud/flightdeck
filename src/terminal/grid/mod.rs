@@ -197,9 +197,9 @@ impl TerminalModes {
     }
 }
 
-/// Which visible rows may have changed since the last
-/// [`TerminalGrid::take_damage`], so a front-end that caches per-row layout can
-/// redo only those.
+/// Which visible rows may have changed since a point in the grid's history
+/// ([`TerminalGrid::damage_since`]), so a front-end that caches per-row layout
+/// can redo only those.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GridDamage {
     /// Treat every row as changed: a resize, a scrollback move, a whole-screen
@@ -314,15 +314,18 @@ pub trait TerminalGrid: GridView + Send {
     /// emulator that does not answer those queries.
     fn set_default_colors(&mut self, _fg: (u8, u8, u8), _bg: (u8, u8, u8)) {}
 
-    /// The rows that may have changed since the previous call, which starts a
-    /// new tracking interval. Covers everything a [`GridView`] reports except
-    /// the selection, which a front-end draws from [`TerminalGrid::selection`]
-    /// on its own. The first call after creation reports [`GridDamage::Full`].
+    /// The rows that may have changed since `since`, a sequence number this
+    /// method returned earlier (0 for "never looked"), and the sequence number
+    /// to pass next time. Reading changes nothing, so any number of views can
+    /// each keep their own position: the app's terminal and a Mission control
+    /// tile of the same session, say. Covers everything a [`GridView`]
+    /// reports except the selection, which a front-end draws from
+    /// [`TerminalGrid::selection`] on its own.
     ///
-    /// Always `Full` unless an emulator overrides it, which is correct, only
-    /// slower: vt100 keeps no damage information.
-    fn take_damage(&mut self) -> GridDamage {
-        GridDamage::Full
+    /// Always `Full` (and position 0) unless an emulator overrides it, which
+    /// is correct, only slower: vt100 keeps no damage information.
+    fn damage_since(&self, _since: u64) -> (GridDamage, u64) {
+        (GridDamage::Full, 0)
     }
 
     /// Whether the emulator is holding parsed output back until a later

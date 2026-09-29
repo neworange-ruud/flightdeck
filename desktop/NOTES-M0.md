@@ -703,16 +703,23 @@ What the numbers say:
 
 ### What changed in the element (`remote-control-bmej.3.9`)
 
-- **Damage tracking.** `TerminalGrid::take_damage` (new, in the core seam)
-  returns the rows that changed since the last call. The alacritty backend
-  forwards `Term::damage`, which also covers the old and new cursor rows and
-  reports scrolls, resizes and full-screen changes as `Full`. vt100 always says
-  `Full`. `desktop/src/terminal/rowcache.rs` keeps each row's layout and shaped
-  lines, and redoes a row only when:
+- **Damage tracking.** `TerminalGrid::damage_since(seq)` (new, in the core
+  seam) returns the rows that changed since a position the caller got from an
+  earlier call, plus the new position. Reading changes nothing, so every view
+  of a grid keeps its own position: the app's terminal and a Mission control
+  tile of the same session never take each other's damage. The alacritty
+  backend folds `Term::damage` into per-row sequence numbers after every
+  change (parse, resize, scrollback move, a released synchronized update).
+  `Term` also covers the old and new cursor rows and reports scrolls, resizes
+  and full-screen changes as `Full`. An idle tick folds nothing, so an idle
+  terminal reads as undamaged. vt100 always says `Full`.
+  `desktop/src/terminal/rowcache.rs` keeps each row's layout and shaped lines,
+  and redoes a row only when:
   - it is damaged,
   - the cursor entered it, left it or changed shape on it (checked there as
     well, so correctness does not rest on the emulator's cursor bookkeeping),
-  - or the size or palette changed (then every row).
+  - or the size or palette changed, or a different grid is on screen (the app
+    switched agents), and then every row is redone.
 
   The selection is an overlay rebuilt each frame. `layout::layout_row` is the
   per-row half of the old whole-frame `layout`, which `--dump-grid` and the
@@ -752,3 +759,74 @@ Not done, because the numbers do not call for it:
 With several terminals in one window, GPUI redraws every element when any one
 of them notifies. The others then only repaint cached rows. If that ever shows
 up in a profile, the app shell can wrap each terminal in a cached view.
+
+### The app: the host path and Mission control
+
+The numbers above are the `--bench` window, where each view owns its terminal.
+The real app draws the host's terminals (`AppHost::active_terminal`, and in
+Mission control `AppHost::tab_terminal` per tile). The same machinery applies
+there:
+
+- **The host's terminals are alacritty, the TUI's stay vt100.** `Env::terminal`
+  (a `TerminalProfile`: emulator plus default colours) is the front-end's
+  choice. The TUI passes `TerminalProfile::TUI` (vt100, no colours). The
+  desktop passes `terminal::desktop_profile()`: alacritty, with the theme's
+  terminal ink and background as default colours, so OSC 10/11 queries are
+  answered with the colours actually painted. Every project's `AppState`
+  carries the profile, and its sessions build their terminals with it. The host
+  now ticks every terminal's emulator each turn, so a synchronized update that
+  times out is shown (vt100's tick is a no-op).
+- **The element** reads damage from whichever terminal is on screen and lays
+  out only what changed. It relays everything when the grid on screen changes
+  (a grid's first read is always `Full`).
+- **The host redraws only on change.** `HostModel::turn` used to redraw at
+  least once a second "for elapsed times". Now it redraws when the host
+  reports a change, or when the time-derived text the views show changes. That
+  text is every agent row's badge and `done · 3m` wording plus the open
+  overlay (a pairing countdown). `HostModel::clock_signature` checks it every
+  250 ms. A 30 s backstop covers anything the signature misses.
+- **Two host fixes that the redraw-on-change exposed.** A git-status refresh
+  that found nothing new still counted as a change, and the refresh was paced
+  by turn count, so a faster-turning front-end ran `git status` faster. Now
+  only an actual status change counts, and the refresh is also held to at
+  least 2 s apart (`GIT_REFRESH_MIN_MS`, the TUI's 40 × 50 ms).
+- **Host turn rate** follows the same cadence as a single terminal, but with
+  slower rates, because a host turn services every project:
+  - every 1 ms for 40 ms after terminal input (`HostEvent::TerminalInput` or
+    `Paste` restarts the sleep),
+  - 16 ms while output flows,
+  - 50 ms when idle, the TUI's own loop.
+- **Mission control tiles** each keep their own `RowCache`: own damage
+  position, shaped lines kept until they change or the tile's font size does,
+  and only the rows shown are shaped. The 100 ms refresh now notifies only the
+  tiles whose terminal changed (`TileView::has_changes`), not every tile
+  whenever anything changed.
+
+Measured on the release app (`perf.py app-idle mission-idle`): a throwaway
+HOME and repo, an agent that is `/bin/sh` or the 1 s `date` ticker, 30 s of
+`ps` sampling after 5 s of warm-up. Terminal frames come from the app's own
+count (`FLIGHTDECK_BENCH_FRAME_LOG=1`, which counts every terminal element and
+tile paint). "Upstream" is `flightdeck/ui-redesign` at f7f7bea: vt100, a 16 ms
+turn and a redraw every second.
+
+| App, idle | upstream | after |
+| --- | --- | --- |
+| 1 agent (`-I`), idle shell | 1.6–2.4 % | **0.7–1.25 %**, 0.03 terminal frames/s |
+| 1 agent (`-I`), ticker | 1.75 % | **0.9–1.3 %**, 1.0 frames/s (one per tick) |
+| Mission control, 4 tiles, waiting, idle shells | (not measured) | **1.7 %**, ~0 tile frames/s |
+| Mission control, 4 tiles, waiting, tickers | (not measured) | **2.2–2.5 %**, 4–5 tile frames/s (one per tile per tick) |
+| Mission control, 4 tiles, **working**, idle shells or tickers | (not measured) | 6–21 % |
+
+The last row is not the terminals. A working session draws an animated
+spinner in the sidebar, on its tile and on the project tab, and GPUI redraws
+the window at the display's rate to animate them. The tiles are cached views,
+so those frames replay the tiles instead of painting them (the tile paint
+count stays at 0–8 a second). The spread (6–21 %) follows whether the window
+was the key window (GPUI caps an inactive window at 30 fps). Bringing that
+down means animating the spinners less often, or pausing them in a background
+window. That is a shell decision, left to the shell; the terminals and tiles
+cost about the same with or without the spinners.
+
+Not measured on the host path: keystroke latency. The key → `TerminalInput` →
+fast host turns path is the same design as the `--bench` view's (a 1 ms poll
+for 40 ms after input), which measured 6.1 / 9.5 ms p50 / p95 above.

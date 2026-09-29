@@ -13,13 +13,28 @@
 //!
 //! ## The turn loop
 //!
-//! [`HostModel::start_ticking`] spawns a foreground task that wakes every
-//! [`TICK_INTERVAL`] and runs one [`HostModel::turn`]: apply a pending
-//! viewport size, `AppHost::tick` (pump every project's PTYs and workers, then
-//! publish to the web and the relay), and redraw when the host says something
-//! changed — or at least every [`COARSE_REDRAW`], because elapsed times and
-//! countdowns move without any event. A quit asked for by the host (Ctrl-q, a
-//! confirmed dialog) or by a signal ends the app from here.
+//! [`HostModel::start_ticking`] spawns a foreground task that runs one
+//! [`HostModel::turn`] after each sleep: apply a pending viewport size,
+//! `AppHost::tick` (pump every project's PTYs and workers, then publish to the
+//! web and the relay), and redraw when something on screen changed. A quit
+//! asked for by the host (Ctrl-q, a confirmed dialog) or by a signal ends the
+//! app from here.
+//!
+//! How long it sleeps is the terminal element's [`Cadence`]
+//! (desktop/NOTES-M0.md, "Performance (S4)"): every millisecond for a moment
+//! after terminal input, so an echo is read in time for the next frame; every
+//! [`HOST_ACTIVE_TURN`] (16 ms) while output flows; every [`HOST_IDLE_TURN`]
+//! (50 ms, the TUI's loop) when idle.
+//! Terminal input restarts the sleep, so the fast turns begin at the
+//! keystroke.
+//!
+//! "Something changed" is the host's own `tick` result (PTY output, worker
+//! results, status changes, …) or a change in the time-derived text the
+//! views show (an agent's `done · 3m`, a pairing countdown), which the model
+//! checks every [`CLOCK_CHECK`] through [`HostModel::clock_signature`] rather
+//! than redrawing on a timer. An idle app therefore draws no frames at all;
+//! [`SAFETY_REDRAW`] only guards against a time-derived value the signature
+//! does not know about.
 //!
 //! ## Teardown
 //!
@@ -36,9 +51,11 @@
 //! new agent starts waiting. The banner and sound are the host's own
 //! (`SystemNotifier`, the TUI's).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flightdeck::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use flightdeck::contracts::PtySize;
@@ -50,14 +67,27 @@ use flightdeck::Env;
 use gpui::{Context, Task};
 
 use crate::notify::{self, AttentionState};
+use crate::terminal::cadence::Cadence;
 
-/// How often the host turns. The TUI polls every 50 ms when idle; 16 ms keeps
-/// agent output within a frame of arriving.
-pub const TICK_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the host turns while output flows: its turn services every
+/// project, and output anywhere keeps it active, so it runs at the display's
+/// 60 Hz rather than a single terminal's 8 ms. Echoes still get the 1 ms
+/// turns right after input.
+pub const HOST_ACTIVE_TURN: Duration = Duration::from_millis(16);
 
-/// Redraw at least this often even when nothing arrived, for elapsed times
-/// (`working · 2m`) and countdowns.
-pub const COARSE_REDRAW: Duration = Duration::from_secs(1);
+/// How often the host turns when nothing is happening: the TUI's own loop, so
+/// output an agent starts on its own is read as soon as the TUI would read it,
+/// and an idle app costs what an idle TUI does.
+pub const HOST_IDLE_TURN: Duration = Duration::from_millis(50);
+
+/// How often the time-derived text on screen is checked for a change (see the
+/// module docs). Elapsed times and countdowns move in whole seconds.
+pub const CLOCK_CHECK: Duration = Duration::from_millis(250);
+
+/// Redraw at least this often even when nothing seems to have changed: a
+/// backstop for time-derived display [`HostModel::clock_signature`] does not
+/// cover, far too rare to cost anything.
+pub const SAFETY_REDRAW: Duration = Duration::from_secs(30);
 
 /// The real services the host borrows, leaked to `'static` (see the module
 /// docs). Built once, by the app's start-up.
@@ -91,6 +121,7 @@ impl RealServices {
             clock: &self.clock,
             container: &self.container,
             command: &self.command,
+            terminal: crate::terminal::desktop_profile(),
         }
     }
 
@@ -110,8 +141,13 @@ pub struct HostModel {
     pending_viewport: Option<PtySize>,
     /// The size every project's terminals were last resized to.
     viewport: Option<PtySize>,
-    /// Turns since the last redraw, for [`COARSE_REDRAW`].
-    quiet_turns: u32,
+    /// When the last redraw was asked for, for [`SAFETY_REDRAW`].
+    last_redraw: Instant,
+    /// When the time-derived display was last checked, and what it read.
+    last_clock_check: Instant,
+    clock_signature: u64,
+    /// Terminal input and output times, which set the turn rate.
+    cadence: Cadence,
     torn_down: bool,
     /// The needs-you count last shown on the app icon; `None` until the app
     /// asks for it ([`HostModel::report_attention`]), so tests never touch the
@@ -133,7 +169,10 @@ impl HostModel {
             shutdown: None,
             pending_viewport: None,
             viewport: None,
-            quiet_turns: 0,
+            last_redraw: Instant::now(),
+            last_clock_check: Instant::now(),
+            clock_signature: 0,
+            cadence: Cadence::with_rates(HOST_ACTIVE_TURN, HOST_IDLE_TURN),
             torn_down: false,
             attention: None,
             #[cfg(test)]
@@ -165,14 +204,45 @@ impl HostModel {
         self.attention = Some(AttentionState::default());
     }
 
-    /// Spawn the turn loop on GPUI's foreground executor.
+    /// Spawn the turn loop on GPUI's foreground executor (restarting it if
+    /// it runs, which cuts short the current sleep).
     pub fn start_ticking(&mut self, cx: &mut Context<Self>) {
         self._ticker = Some(cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(TICK_INTERVAL).await;
+            let delay = this.update(cx, |model, _| {
+                model.cadence.next_delay(Instant::now(), false)
+            });
+            let Ok(delay) = delay else {
+                break;
+            };
+            cx.background_executor().timer(delay).await;
             if this.update(cx, |model, cx| model.turn(cx)).is_err() {
                 break;
             }
         }));
+    }
+
+    /// A fingerprint of the time-derived text the views show: every agent
+    /// row's badge and elapsed time as the sidebar words it, and the open
+    /// overlay (a pairing code's countdown lives there). A redraw is due when
+    /// it changes.
+    pub fn clock_signature(&self) -> u64 {
+        let host = &self.host;
+        let mut hasher = DefaultHasher::new();
+        for i in 0..host.project_count() {
+            let (Some(state), Some(git)) = (host.project_state(i), host.git_status(i)) else {
+                continue;
+            };
+            for row in
+                flightdeck::view::agent_row_views(state, git, host.now_ms(), host.now_unix_secs())
+            {
+                format!("{:?}", row.badge).hash(&mut hasher);
+                row.status_since_secs
+                    .map(flightdeck::view::format_elapsed)
+                    .hash(&mut hasher);
+            }
+        }
+        format!("{:?}", host.overlay()).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// One turn: see the module docs. Returns whether it redrew.
@@ -187,15 +257,24 @@ impl HostModel {
             }
         }
         let changed = self.host.tick();
+        let now = Instant::now();
+        if changed {
+            self.cadence.output(now);
+        }
         if let Some(attention) = self.attention.as_mut() {
             notify::apply(attention, self.host.needs_you_count(), cx);
         }
-        self.quiet_turns += 1;
-        let coarse =
-            self.quiet_turns as u128 * TICK_INTERVAL.as_millis() >= COARSE_REDRAW.as_millis();
-        let redraw = changed || coarse;
+        let mut clock_moved = false;
+        if now.duration_since(self.last_clock_check) >= CLOCK_CHECK {
+            self.last_clock_check = now;
+            let signature = self.clock_signature();
+            clock_moved = signature != self.clock_signature;
+            self.clock_signature = signature;
+        }
+        let redraw =
+            changed || clock_moved || now.duration_since(self.last_redraw) >= SAFETY_REDRAW;
         if redraw {
-            self.quiet_turns = 0;
+            self.last_redraw = now;
             cx.notify();
         }
         let signalled = self
@@ -215,6 +294,13 @@ impl HostModel {
     pub fn dispatch(&mut self, event: HostEvent, cx: &mut Context<Self>) {
         #[cfg(test)]
         self.dispatched.push(event.clone());
+        // Terminal input: turn fast for the echo, starting now.
+        if matches!(event, HostEvent::TerminalInput(_) | HostEvent::Paste(_)) {
+            self.cadence.input(Instant::now());
+            if self._ticker.is_some() {
+                self.start_ticking(cx);
+            }
+        }
         let is_overlay = matches!(event, HostEvent::Overlay(_));
         if let Err(e) = self.host.handle(event) {
             if is_overlay {

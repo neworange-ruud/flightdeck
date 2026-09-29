@@ -39,7 +39,7 @@ use crate::runtime::guards::enforce_guardrails;
 use crate::runtime::image;
 use crate::runtime::name::{container_name, repo_hash};
 use crate::runtime::spec::{ContainerSpec, ResolvedAuthMount};
-use crate::terminal::session::Session;
+use crate::terminal::session::{Session, TerminalProfile};
 use crate::terminal::shell::{container_shell, shell_launch};
 
 /// The services the app core dispatches into (SPECS §27). Passing these as a
@@ -642,6 +642,9 @@ pub struct AppState {
     /// [`Self::pin_resumable_sessions`], rate-limiting it to
     /// [`SESSION_SCAN_INTERVAL_MS`]. `None` until the first scan. Runtime-only.
     last_session_scan_ms: Option<u64>,
+    /// How this project's tab terminals are built (emulator, default colours):
+    /// the front-end's choice, from `Env::terminal`. Runtime-only.
+    pub terminal_profile: TerminalProfile,
 }
 
 impl AppState {
@@ -678,6 +681,7 @@ impl AppState {
             isolated: false,
             isolated_status_root: None,
             last_session_scan_ms: None,
+            terminal_profile: TerminalProfile::TUI,
         }
     }
 
@@ -1524,6 +1528,7 @@ impl AppState {
             services.container.start_detached(start_args)?;
         }
         let mut session = Session::new();
+        session.set_profile(self.terminal_profile);
         if let Err(e) = session.spawn_primary_with_env(
             services.pty,
             &spawn.command,
@@ -2020,6 +2025,7 @@ impl AppState {
     fn cmd_new_child(&mut self, services: &Services) -> Result<Effect> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
+        let profile = self.terminal_profile;
         let Some(tab) = self.selected_mut() else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
@@ -2037,6 +2043,7 @@ impl AppState {
         } else {
             shell_launch()
         };
+        tab.session.set_profile(profile);
         let _idx = tab
             .session
             .spawn_child(services.pty, &cmd, &args, &cwd, size)?;
@@ -2089,6 +2096,7 @@ impl AppState {
             (launch.command, launch.args)
         };
         let tab = &mut self.tabs[idx];
+        tab.session.set_profile(self.terminal_profile);
         tab.session
             .spawn_agent_child(services.pty, &cmd, &args, &cwd, size)?;
         // The new agent tab appearing is its own confirmation; no toast needed.
@@ -2527,6 +2535,7 @@ impl AppState {
                 let _ = primary.session_mut().terminate_tree();
             }
         }
+        tab.session.set_profile(self.terminal_profile);
         if let Err(e) = tab.session.spawn_primary_with_env(
             services.pty,
             &spawn.command,

@@ -41,6 +41,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -56,6 +57,35 @@ use flightdeck::terminal::session::Terminal;
 
 use super::view::TerminalView;
 use crate::theme;
+
+/// Terminal frames painted in this process, by any terminal element or
+/// Mission control tile. One
+/// relaxed increment per frame; read by [`log_frames_if_asked`].
+pub static PAINTS: AtomicU64 = AtomicU64::new(0);
+
+/// The environment variable that makes the full app report frames (see
+/// [`log_frames_if_asked`]).
+pub const FRAME_LOG_ENV: &str = "FLIGHTDECK_BENCH_FRAME_LOG";
+
+/// When [`FRAME_LOG_ENV`] is set, print the running count of terminal frames
+/// every 5 s (`frames=N at_s=T`), so desktop/benches/perf.py can measure the
+/// idle frame rate of the real app, not just the `--bench` window. A no-op
+/// otherwise.
+pub fn log_frames_if_asked(cx: &mut App) {
+    if std::env::var_os(FRAME_LOG_ENV).is_none() {
+        return;
+    }
+    let started = Instant::now();
+    cx.spawn(async move |cx| loop {
+        cx.background_executor().timer(Duration::from_secs(5)).await;
+        println!(
+            "frames={} at_s={:.1}",
+            PAINTS.load(Ordering::Relaxed),
+            started.elapsed().as_secs_f64()
+        );
+    })
+    .detach();
+}
 
 /// What the throughput scenario waits for. Typed as `FD-%s` + `DONE` so the
 /// echoed command line itself never contains it.

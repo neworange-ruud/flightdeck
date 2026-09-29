@@ -51,6 +51,7 @@ fn env(f: &'static Fakes) -> Env<'static> {
         clock: &f.clock,
         container: &f.container,
         command: &f.command,
+        terminal: crate::terminal::desktop_profile(),
     }
 }
 
@@ -394,4 +395,42 @@ fn plus_opens_the_picked_folder_through_the_host(app: &mut TestAppContext) {
         other => panic!("expected the refusal, got {other:?}"),
     }
     assert_eq!(model.read_with(cx, |m, _| m.host().project_count()), 2);
+}
+
+#[gpui::test]
+fn the_hosts_terminals_are_alacritty_answering_with_the_theme_colours(app: &mut TestAppContext) {
+    let (_f, model, cx) = open(app, two_projects());
+    let profiles: Vec<_> = model.read_with(cx, |m, _| {
+        (0..m.host().project_count())
+            .map(|i| m.host().project_state(i).unwrap().terminal_profile)
+            .collect()
+    });
+    let palette = crate::theme::Palette::dark();
+    let channels = crate::terminal::view::channels;
+    for profile in profiles {
+        // The desktop's choice; the TUI keeps vt100 (`TerminalProfile::TUI`).
+        assert_eq!(
+            profile.emulator,
+            flightdeck::terminal::grid::Emulator::Alacritty
+        );
+        assert_eq!(
+            profile.default_colors,
+            Some((
+                channels(palette.terminal_ink),
+                channels(palette.surface_terminal)
+            ))
+        );
+    }
+}
+
+#[gpui::test]
+fn an_idle_turn_asks_for_no_redraw(app: &mut TestAppContext) {
+    let (_f, model, cx) = open(app, two_projects());
+    // The first turns settle whatever start-up changed.
+    model.update(cx, |m, cx| {
+        m.turn(cx);
+        m.turn(cx);
+    });
+    let redrew = model.update(cx, |m, cx| m.turn(cx));
+    assert!(!redrew, "nothing happened, so nothing is drawn");
 }

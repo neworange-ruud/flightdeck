@@ -23,7 +23,7 @@
 //!   handed to the host, which resizes every project's PTYs on its next turn.
 //!
 //! In both, the element redraws only the rows the emulator reports changed
-//! ([`super::rowcache`], fed by `TerminalGrid::take_damage`), and nothing
+//! ([`super::rowcache`], fed by `TerminalGrid::damage_since`), and nothing
 //! repaints an idle terminal: there is no periodic repaint and the cursor does
 //! not blink. GPUI draws at most one frame per display refresh however often a
 //! view notifies, so output arriving over many polls lands in one frame.
@@ -169,6 +169,7 @@ impl TerminalView {
     pub fn for_host(host: Entity<HostModel>, cx: &mut Context<Self>) -> Self {
         let palette = TermPalette::from_palette(Palette::global(cx));
         cx.observe(&host, |_, _, cx| cx.notify()).detach();
+        super::bench::log_frames_if_asked(cx);
         Self::with_source(TerminalSource::Host(host), palette, cx)
     }
 
@@ -255,10 +256,9 @@ impl TerminalView {
     ) -> (RowCache<Vec<ShapedLine>>, Vec<CellSpan>) {
         let mut cache = std::mem::take(&mut self.row_cache);
         let palette = self.palette;
-        let prepared = self.with_terminal_mut(cx, |terminal| {
+        let prepared = self.with_terminal(cx, |terminal| {
             let identity = grid_identity(terminal);
-            let damage = terminal.screen_mut().take_damage();
-            let laid_out = cache.update(identity, terminal.screen(), damage, &palette, focused);
+            let laid_out = cache.refresh(identity, terminal.screen(), &palette, focused);
             let selection =
                 layout::selection_spans(terminal.screen(), terminal.selection(), &palette);
             (laid_out, selection)
@@ -551,7 +551,7 @@ impl TerminalView {
 /// Which grid a row cache was built from: the address of the terminal's
 /// boxed grid, stable for the terminal's life. See [`TerminalView::prepare_rows`]
 /// for why an address reused by a later terminal is still safe.
-fn grid_identity(terminal: &Terminal) -> usize {
+pub(crate) fn grid_identity(terminal: &Terminal) -> usize {
     terminal.screen() as *const dyn flightdeck::terminal::grid::TerminalGrid as *const () as usize
 }
 

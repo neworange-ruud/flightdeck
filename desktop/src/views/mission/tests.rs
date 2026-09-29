@@ -56,6 +56,7 @@ fn env(f: &'static Fakes) -> Env<'static> {
         clock: &f.clock,
         container: &f.container,
         command: &f.command,
+        terminal: crate::terminal::desktop_profile(),
     }
 }
 

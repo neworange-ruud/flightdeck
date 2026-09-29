@@ -294,6 +294,7 @@ impl Element for TerminalElement {
                 CursorShape::Block => paint_outline(cell, px(1.), cursor_colour, window),
             }
         }
+        super::bench::PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cache = std::mem::take(&mut prepared.cache);
         self.view.update(cx, |view, _| {
             view.put_row_cache(cache);
@@ -302,25 +303,6 @@ impl Element for TerminalElement {
             }
         });
     }
-}
-
-/// Shape and paint one span at its cell, for a caller without a row cache.
-pub(crate) fn paint_text(
-    span: &TextSpan,
-    m: &CellMetrics,
-    font_size: Pixels,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let line = shape_text(span, m.width, font_size, window);
-    let _ = line.paint(
-        m.cell_origin(span.row, span.col),
-        m.height,
-        TextAlign::Left,
-        None,
-        window,
-        cx,
-    );
 }
 
 /// Shape one span's text in its style (see the module docs for the forced

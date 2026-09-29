@@ -26,6 +26,15 @@ whose command is `/bin/sh`:
   that contains `FD-DONE`;
 - idle: `ps` over the TUI process with 1 terminal, or 4 (the agent plus three
   child shells, Ctrl-T), idle or each running a 1 s `date` ticker.
+
+The full desktop app (the host-driven path the `--bench` window bypasses):
+
+- app-idle: `flightdeck-desktop -I` with one agent, idle or ticking;
+- mission-idle: four recovered sessions shown as Mission control tiles, each
+  reporting `waiting` (still badges) or `working` (animated spinners);
+
+both sampled with `ps`, with terminal and tile frames counted by the app itself
+(FLIGHTDECK_BENCH_FRAME_LOG=1).
 """
 
 import argparse
@@ -118,22 +127,30 @@ def big_file(path, mb=50):
 
 # --- TUI -------------------------------------------------------------------
 
+def sandbox(workdir, prefix, agent_args=()):
+    """A throwaway HOME and git repo whose default agent is `/bin/sh
+    AGENT_ARGS…`. Returns (dir, home, repo)."""
+    root = tempfile.mkdtemp(prefix=prefix, dir=workdir)
+    home, repo = os.path.join(root, "home"), os.path.join(root, "repo")
+    os.makedirs(os.path.join(home, ".flightdeck"))
+    os.makedirs(repo)
+    git = ["git", "-c", "user.email=bench@example.invalid", "-c", "user.name=bench"]
+    subprocess.run(git + ["init", "-q", "-b", "main", repo], check=True)
+    subprocess.run(git + ["-C", repo, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    args = ", ".join(f'"{a}"' for a in agent_args)
+    with open(os.path.join(home, ".flightdeck", "config.toml"), "w") as f:
+        f.write('[ui]\ndefault_agent = "sh"\nagent_tab_position = "left"\n'
+                'use_f2_to_leave_terminal_focus = true\n'
+                '[update]\ncheck = false\n'
+                f'[agents.sh]\ndisplay_name = "sh"\ncommand = "/bin/sh"\nargs = [{args}]\n')
+    return root, home, repo
+
+
 class Tui:
     """The real TUI in a 160x50 PTY, in a throwaway HOME and repo."""
 
     def __init__(self, workdir):
-        self.dir = tempfile.mkdtemp(prefix="perf-tui-", dir=workdir)
-        home, repo = os.path.join(self.dir, "home"), os.path.join(self.dir, "repo")
-        os.makedirs(os.path.join(home, ".flightdeck"))
-        os.makedirs(repo)
-        git = ["git", "-c", "user.email=bench@example.invalid", "-c", "user.name=bench"]
-        subprocess.run(git + ["init", "-q", "-b", "main", repo], check=True)
-        subprocess.run(git + ["-C", repo, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
-        with open(os.path.join(home, ".flightdeck", "config.toml"), "w") as f:
-            f.write('[ui]\ndefault_agent = "sh"\nagent_tab_position = "left"\n'
-                    'use_f2_to_leave_terminal_focus = true\n'
-                    '[update]\ncheck = false\n'
-                    '[agents.sh]\ndisplay_name = "sh"\ncommand = "/bin/sh"\nargs = []\n')
+        self.dir, home, repo = sandbox(workdir, "perf-tui-")
         master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
         env = dict(os.environ, HOME=home, SHELL="/bin/sh", PS1="$ ", TERM="xterm-256color")
@@ -312,10 +329,95 @@ def gui_idle(args, terminals, ticker):
             print(f"  {line}")
 
 
+def recovered_tabs(root, home, repo, tabs, ticker, status="working"):
+    """Make the app start with `tabs` recovered sessions on the base branch
+    (which it resumes at launch) and Mission control on screen, each one a
+    live tile. A tile is only shown for a session that is working or waiting
+    for the user, so the agent is a script named `claude` (the command name is
+    what FlightDeck reads lifecycle status by) that reports `status` through
+    the status file Claude Code's hooks write, then runs the idle shell or the
+    ticker. `waiting` draws a still badge; `working` animates a spinner per
+    session, which is the shell's own frame cost, not the terminals'."""
+    import json
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    agent = os.path.join(bindir, "claude")
+    body = "while true; do date; sleep 1; done" if ticker else "exec /bin/sh"
+    with open(agent, "w") as f:
+        f.write(f"#!/bin/sh\nprintf '{status}\\n' >> .flightdeck/agent-status\n" + body + "\n")
+    os.chmod(agent, 0o755)
+    config = os.path.join(home, ".flightdeck", "config.toml")
+    with open(config) as f:
+        text = f.read()
+    with open(config, "w") as f:
+        f.write(text.replace('command = "/bin/sh"', f'command = "{agent}"'))
+    state = {"version": 2, "project_root_relative": ".", "base_branch": "main", "tabs": []}
+    for i in range(tabs):
+        state["tabs"].append({
+            "id": f"bench-{i}", "name": f"bench{i}", "slug": f"bench{i}", "agent": "sh",
+            "branch": "main", "worktree_path_relative": ".", "base_branch": "main",
+            "base_commit_sha": "0", "created_at": "2026-01-01T00:00:00Z",
+            "attached_existing_branch": True, "recovered": False, "last_known_status": "unknown",
+            "manual_status": None, "containerized": False, "container_image": None,
+            "runs_on_base": True, "resume_args": [],
+            "activity": {"last_output_at": None, "last_status_change_at": None,
+                         "last_git_change_at": None},
+        })
+    os.makedirs(os.path.join(repo, ".flightdeck"), exist_ok=True)
+    with open(os.path.join(repo, ".flightdeck", "state.json"), "w") as f:
+        json.dump(state, f)
+    with open(os.path.join(repo, ".flightdeck", "config.toml"), "w") as f:
+        f.write('[project]\nname = "repo"\ndefault_base_branch = "main"\n')
+    with open(os.path.join(home, ".flightdeck", "workspace.json"), "w") as f:
+        json.dump({"version": 1, "projects": [os.path.realpath(repo)], "active": 0,
+                   "ui": {"view": "mission"}}, f)
+
+
+def app_idle(args, ticker, mission_tiles=0, status="working"):
+    """The full desktop app (the host-driven path), left alone: CPU/RSS from
+    `ps`, frames from its FLIGHTDECK_BENCH_FRAME_LOG report. Its agents are an
+    idle `/bin/sh` or a `date` ticker: one isolated session (`-I`) in the
+    Projects view, or `mission_tiles` recovered sessions shown as Mission
+    control tiles."""
+    agent = ("-c", "while true; do date; sleep 1; done") if ticker else ()
+    root, home, repo = sandbox(args.workdir, "perf-app-", agent)
+    argv = [args.gui, "-I"]
+    if mission_tiles:
+        recovered_tabs(root, home, repo, mission_tiles, ticker, status)
+        argv = [args.gui]
+    env = dict(os.environ, HOME=home, SHELL="/bin/sh", PS1="$ ", FLIGHTDECK_BENCH_FRAME_LOG="1")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, cwd=repo, env=env)
+    reports = []
+    reader = threading.Thread(target=lambda: reports.extend(proc.stdout), daemon=True)
+    reader.start()
+    try:
+        time.sleep(3.0)
+        first = len(reports)
+        s = sample(proc.pid, args.seconds)
+        window = [r for r in reports[first:] if r.startswith("frames=")]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(root, ignore_errors=True)
+    fps = "n/a"
+    if len(window) >= 2:
+        f0, t0 = [float(x.split("=")[1]) for x in window[0].split()]
+        f1, t1 = [float(x.split("=")[1]) for x in window[-1].split()]
+        fps = f"{(f1 - f0) / (t1 - t0):.2f}"
+    label = f"app idle ticker={ticker}" + (
+        f" mission_tiles={mission_tiles} status={status}" if mission_tiles else "")
+    print(f"{label}: cpu={s['cpu_pct']:.2f}% rss={s['rss_mb']:.1f}MB (max {s['rss_max_mb']:.1f}) "
+          f"terminal_frames_per_s={fps}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("what", nargs="+", help="all | gui-latency gui-throughput gui-idle gui-scroll "
-                                            "tui-latency tui-throughput tui-idle")
+                                            "app-idle mission-idle tui-latency tui-throughput tui-idle")
     ap.add_argument("--seconds", type=float, default=30.0, help="idle sampling window")
     ap.add_argument("--keys", type=int, default=300)
     ap.add_argument("--workdir", default=tempfile.gettempdir())
@@ -324,7 +426,7 @@ def main():
     args = ap.parse_args()
     want = set(args.what)
     if "all" in want:
-        want = {"gui-latency", "gui-throughput", "gui-idle", "gui-scroll",
+        want = {"gui-latency", "gui-throughput", "gui-idle", "gui-scroll", "app-idle", "mission-idle",
                 "tui-latency", "tui-throughput", "tui-idle"}
     big = big_file(os.path.join(args.workdir, "perf-big.txt"))
     loads = [f"cat {big}", "seq 1 2000000"]
@@ -344,6 +446,12 @@ def main():
                 tui_throughput(args, cmd)
     if "gui-scroll" in want:
         gui(args, "scroll", "--seconds", "10")
+    for ticker in (False, True):
+        if "app-idle" in want:
+            app_idle(args, ticker)
+        if "mission-idle" in want:
+            for status in ("waiting", "working"):
+                app_idle(args, ticker, mission_tiles=4, status=status)
     for terminals in (1, 4):
         for ticker in (False, True):
             if "gui-idle" in want:

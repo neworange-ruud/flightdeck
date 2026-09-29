@@ -88,6 +88,12 @@ pub const GIT_REFRESH_EVERY: u64 = 40;
 /// `AppHost::answered_prompts`): far more than can be waiting at once.
 const ANSWERED_PROMPTS_KEPT: usize = 64;
 
+/// And never more often than this, whatever the tick rate: the TUI's 40
+/// ticks of 50 ms. A front-end that turns faster (the desktop polls every
+/// millisecond after a keystroke, see desktop/NOTES-M0.md, "Performance
+/// (S4)") must not also run `git status` faster.
+pub const GIT_REFRESH_MIN_MS: u64 = 2_000;
+
 /// One front-end-neutral input for [`AppHost::handle`].
 ///
 /// These are the actions a key map or a click resolves *to*, not raw keys: a
@@ -180,6 +186,9 @@ pub struct AppHost<'a> {
     /// Loop iterations so far; drives the coarse git refresh and the one-shot
     /// first-tick autopair seam.
     tick: u64,
+    /// The clock reading at the last git-status refresh, for
+    /// [`GIT_REFRESH_MIN_MS`].
+    last_git_refresh_ms: Option<u64>,
     /// The clock reading taken at the top of the current [`AppHost::pump`], so
     /// every phase of one turn — and the front-end's render — agree on "now".
     now_ms: u64,
@@ -306,10 +315,15 @@ impl<'a> AppHost<'a> {
     pub(crate) fn from_parts(
         env: Env<'a>,
         notifier: &'a dyn Notifier,
-        workspace: Workspace,
+        mut workspace: Workspace,
         web_surface: WebSurface,
         isolated: bool,
     ) -> AppHost<'a> {
+        // Every project builds its terminals the front-end's way
+        // (`Env::terminal`); `open_project` does the same for one opened later.
+        for p in workspace.projects.iter_mut() {
+            p.state.terminal_profile = env.terminal;
+        }
         let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
         // FlightDeck Remote (optional): a long-lived relay-client thread, mirroring
         // the update-check thread idiom. Off by default — when disabled `start`
@@ -325,6 +339,7 @@ impl<'a> AppHost<'a> {
             ws_path: None,
             workspace_ui: WorkspaceUi::default(),
             tick: 0,
+            last_git_refresh_ms: None,
             now_ms: 0,
             store_home: None,
             update_rx,
@@ -606,7 +621,7 @@ impl<'a> AppHost<'a> {
             let is_active = idx == active;
             let p = &mut workspace.projects[idx];
 
-            drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
+            let released = drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
                 changed = true;
                 // FlightDeck Web (D2): the raw chunk into this terminal's replay
                 // ring, and straight out to every attached viewer. Only while the
@@ -625,6 +640,9 @@ impl<'a> AppHost<'a> {
                     }
                 }
             });
+            // A synchronized update the emulator released on its timer changes
+            // the screen with no bytes to show for it.
+            changed |= released;
 
             {
                 let services = env.services(&p.git);
@@ -637,9 +655,11 @@ impl<'a> AppHost<'a> {
                 .retain(|id, _| p.state.tabs.iter().any(|t| &t.meta.id == id));
 
             while let Ok(msg) = p.status_rx.try_recv() {
-                changed = true;
                 match msg {
                     StatusMsg::Update(id, status) => {
+                        // A refresh that found what was already known changes
+                        // nothing on screen, so it asks for no redraw.
+                        changed |= p.cache.get(&id) != Some(&status);
                         p.state
                             .observe_git_status(&id, &status, env.clock.now_unix_secs());
                         p.cache.insert(id, status);
@@ -876,7 +896,11 @@ impl<'a> AppHost<'a> {
 
         // --- Refresh the git-status cache for the ACTIVE project only (it is
         //     the only one whose sidebar/info bar is on screen). ---
-        if self.tick.is_multiple_of(GIT_REFRESH_EVERY) {
+        let refresh_due = self
+            .last_git_refresh_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= GIT_REFRESH_MIN_MS);
+        if self.tick.is_multiple_of(GIT_REFRESH_EVERY) && refresh_due {
+            self.last_git_refresh_ms = Some(now_ms);
             let p = &mut workspace.projects[active];
             if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
                 p.status_in_flight = true;

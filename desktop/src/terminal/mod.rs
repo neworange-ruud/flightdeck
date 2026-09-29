@@ -29,10 +29,24 @@ pub mod spike;
 pub mod view;
 
 use flightdeck::terminal::grid::Emulator;
-use flightdeck::terminal::session::Terminal;
+use flightdeck::terminal::session::{Terminal, TerminalProfile};
 
 /// The emulator every desktop terminal is built on.
 pub const EMULATOR: Emulator = Emulator::Alacritty;
+
+/// How the app's tab terminals are built (`Env::terminal`): on [`EMULATOR`],
+/// with the theme's terminal ink and background as the emulator's default
+/// colours, so the answers to OSC 10/11 colour queries (which agents use to
+/// choose a light or dark theme) are the colours actually painted. From
+/// `Palette::dark()`, the palette `theme::init` installs: the app is
+/// dark-only. The TUI keeps `TerminalProfile::TUI` (vt100).
+pub fn desktop_profile() -> TerminalProfile {
+    let palette = layout::TermPalette::from_palette(&crate::theme::Palette::dark());
+    TerminalProfile {
+        emulator: EMULATOR,
+        default_colors: Some((view::channels(palette.fg), view::channels(palette.bg))),
+    }
+}
 
 /// The most bytes one [`pump`] parses. alacritty_terminal parses roughly
 /// 150 MB/s on an M2 Pro, so this is a few milliseconds of UI-thread time:

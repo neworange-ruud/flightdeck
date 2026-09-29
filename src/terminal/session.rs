@@ -55,6 +55,47 @@ pub enum TerminalKind {
     Child,
 }
 
+/// How a front-end wants its tab terminals built: which emulator parses them
+/// and the colours its default foreground / background are painted with (so
+/// the emulator can answer OSC 10/11 colour queries truthfully, which agents
+/// use to pick a light or dark theme). The TUI's is [`TerminalProfile::TUI`];
+/// the desktop app sets its own through `Env::terminal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalProfile {
+    pub emulator: Emulator,
+    /// `(foreground, background)` as RGB, or `None` to leave the emulator's
+    /// own defaults.
+    pub default_colors: Option<(Rgb, Rgb)>,
+}
+
+/// An RGB colour, as `TerminalGrid::set_default_colors` takes it.
+pub type Rgb = (u8, u8, u8);
+
+impl TerminalProfile {
+    /// The TUI's terminals: [`TUI_EMULATOR`], emulator default colours (a
+    /// real host terminal sits outside the TUI, see
+    /// desktop/NOTES-M0.md, "Terminal emulator").
+    pub const TUI: TerminalProfile = TerminalProfile {
+        emulator: TUI_EMULATOR,
+        default_colors: None,
+    };
+
+    /// A fresh grid for this profile at `rows` x `cols`.
+    fn build(self, rows: u16, cols: u16) -> Box<dyn TerminalGrid> {
+        let mut grid = self.emulator.build(rows, cols);
+        if let Some((fg, bg)) = self.default_colors {
+            grid.set_default_colors(fg, bg);
+        }
+        grid
+    }
+}
+
+impl Default for TerminalProfile {
+    fn default() -> Self {
+        TerminalProfile::TUI
+    }
+}
+
 /// A single terminal (primary or child): its live PTY session plus the
 /// emulator grid that turns the raw PTY byte stream into renderable cells.
 ///
@@ -89,14 +130,14 @@ impl Terminal {
         session: Box<dyn PtySession>,
         size: PtySize,
         stream_id: u64,
-        emulator: Emulator,
+        profile: TerminalProfile,
     ) -> Self {
         let size = clamp_grid(size);
         Terminal {
             kind,
             title,
             session,
-            grid: emulator.build(size.rows, size.cols),
+            grid: profile.build(size.rows, size.cols),
             stream_id,
         }
     }
@@ -122,7 +163,10 @@ impl Terminal {
             session,
             size,
             0,
-            emulator,
+            TerminalProfile {
+                emulator,
+                default_colors: None,
+            },
         ))
     }
 
@@ -313,12 +357,20 @@ pub struct Session {
     /// session and **never** decremented when a child is closed, which is the
     /// whole point: a closed child's id is retired, not recycled.
     next_stream_id: u64,
+    /// How this session's terminals are built.
+    profile: TerminalProfile,
 }
 
 impl Session {
     /// Create an empty session.
     pub fn new() -> Self {
         Session::default()
+    }
+
+    /// Build this session's terminals from now on with `profile`. Terminals
+    /// already spawned keep the emulator they were built with.
+    pub fn set_profile(&mut self, profile: TerminalProfile) {
+        self.profile = profile;
     }
 
     /// Spawn the primary agent terminal (SPECS §17).
@@ -350,7 +402,7 @@ impl Session {
             session,
             size,
             0,
-            TUI_EMULATOR,
+            self.profile,
         ));
         Ok(())
     }
@@ -401,7 +453,7 @@ impl Session {
             session,
             size,
             stream_id,
-            TUI_EMULATOR,
+            self.profile,
         ));
         let index = self.children.len() - 1;
         self.selected_child = Some(index);
@@ -583,6 +635,54 @@ mod tests {
 
     fn sz() -> PtySize {
         PtySize::default()
+    }
+
+    /// The TUI's sessions stay on vt100 (which answers no colour query); a
+    /// session given another profile builds that emulator, with its default
+    /// colours, for every terminal it spawns afterwards.
+    #[test]
+    fn a_sessions_profile_picks_the_emulator_and_its_default_colours() {
+        const OSC11_QUERY: &[u8] = b"\x1b]11;?\x07";
+        let pty = FakePty::new();
+
+        let tui = pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output(OSC11_QUERY);
+        term.answer_cursor_position_query(OSC11_QUERY);
+        assert!(tui.input().is_empty(), "vt100 answers no OSC 11");
+        assert_eq!(TerminalProfile::default(), TerminalProfile::TUI);
+        assert_eq!(TerminalProfile::TUI.emulator, Emulator::Vt100);
+
+        let desktop = pty.queue_session();
+        let mut session = Session::new();
+        session.set_profile(TerminalProfile {
+            emulator: Emulator::Alacritty,
+            default_colors: Some(((0xee, 0xee, 0xee), (0x12, 0x34, 0x56))),
+        });
+        session
+            .spawn_primary(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.active_mut().unwrap();
+        term.process_output(OSC11_QUERY);
+        term.answer_cursor_position_query(OSC11_QUERY);
+        let reply = String::from_utf8(desktop.input()).unwrap();
+        assert!(reply.contains("rgb:1212/3434/5656"), "{reply:?}");
+
+        // Children follow the session's profile too.
+        let child = pty.queue_session();
+        let index = session
+            .spawn_child(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+        let term = session.child_mut(index).unwrap();
+        term.process_output(OSC11_QUERY);
+        term.answer_cursor_position_query(OSC11_QUERY);
+        assert!(String::from_utf8(child.input())
+            .unwrap()
+            .contains("rgb:1212/3434/5656"));
     }
 
     /// Regression: resizing to a tiny grid and then feeding output must not

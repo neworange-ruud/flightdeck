@@ -172,6 +172,7 @@ pub fn run() -> Result<()> {
         clock: &clock,
         container: &container,
         command: &command,
+        terminal: crate::terminal::session::TerminalProfile::TUI,
     };
 
     // Opening the workspace is the host's job, not the terminal's: the launch
@@ -1441,6 +1442,11 @@ pub struct Env<'a> {
     pub clock: &'a dyn Clock,
     pub container: &'a dyn ContainerRuntime,
     pub command: &'a dyn CommandRunner,
+    /// How tab terminals are built for this front-end: the TUI keeps
+    /// [`TerminalProfile::TUI`](crate::terminal::session::TerminalProfile::TUI)
+    /// (vt100); the desktop app builds alacritty grids answering colour
+    /// queries with its theme.
+    pub terminal: crate::terminal::session::TerminalProfile,
 }
 
 impl<'a> Env<'a> {
@@ -1895,10 +1901,11 @@ fn open_project(env: &Env, path: &Path, isolated: Option<&Path>) -> Result<Proje
     let git = ProjectGit::cli(GitCli::discover(path)?);
     let root = git.root().to_path_buf();
     let name = derive_project_name(&root);
-    let state = {
+    let mut state = {
         let services = env.services(&git);
         startup(&services, &root, &root, isolated)?
     };
+    state.terminal_profile = env.terminal;
     let (create_tx, create_rx) = std::sync::mpsc::channel::<CreateOutcome>();
     let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusMsg>();
     Ok(Project {
@@ -8185,13 +8192,24 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
 // ---------------------------------------------------------------------------
 
 /// Drain output from every terminal of every tab and feed each terminal's VT
-/// parser so it can be rendered. Lifecycle status is handled separately by
-/// backend hooks/plugins (SPECS §24).
+/// parser so it can be rendered, then advance each emulator's timers. Lifecycle
+/// status is handled separately by backend hooks/plugins (SPECS §24).
+///
+/// Returns whether an emulator released output it had been holding without new
+/// bytes (a synchronized update, `?2026`, that timed out): the screen changed
+/// although `tee` saw nothing. Only an emulator that buffers such updates
+/// (alacritty, the desktop's) ever does; vt100's timers are no-ops.
 fn drain_pty_output(
     state: &mut AppState,
     _now_ms: u64,
     mut tee: impl FnMut(&str, Option<usize>, u64, &[u8]),
-) {
+) -> bool {
+    let mut released = false;
+    let mut tick = |terminal: &mut crate::terminal::session::Terminal| {
+        let held = terminal.screen().holds_output();
+        terminal.tick();
+        released |= held && !terminal.screen().holds_output();
+    };
     // Read once before the loop: auto-continuation gates resume-hint capture,
     // and the per-tab borrow below would otherwise conflict with reading config.
     let auto_continue = state.config.ui.auto_continue;
@@ -8227,6 +8245,9 @@ fn drain_pty_output(
             tab.note_output();
             tab.capture_resume_hint(&bytes, auto_continue);
         }
+        if let Some(primary) = tab.session.primary_mut() {
+            tick(primary);
+        }
 
         // Child terminals: drain → VT parser (so they don't stall and so their
         // screen renders when selected), teeing each child's raw bytes so a
@@ -8244,9 +8265,11 @@ fn drain_pty_output(
                         tee(&tab.meta.id, Some(c), stream_id, &bytes);
                     }
                 }
+                tick(child);
             }
         }
     }
+    released
 }
 
 /// Who holds the input lock, as the desktop's status bar should name it, or
@@ -9576,6 +9599,7 @@ mod tests {
             clock: &clock,
             container: &container,
             command: &command,
+            terminal: crate::terminal::session::TerminalProfile::TUI,
         };
 
         // Selecting the retained runtime value must still repair an invalid
@@ -10370,6 +10394,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10442,6 +10467,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10507,6 +10533,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10574,6 +10601,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10708,6 +10736,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10748,6 +10777,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10815,6 +10845,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10861,6 +10892,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -10916,6 +10948,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -11133,6 +11166,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -11303,6 +11337,7 @@ mod tests {
                 clock: &clock,
                 container: &container,
                 command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             };
 
             let mut workspace = Workspace {
@@ -11764,6 +11799,7 @@ mod tests {
                 clock,
                 container,
                 command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
             }
         }
 

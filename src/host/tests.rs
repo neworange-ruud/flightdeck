@@ -53,6 +53,7 @@ impl Fakes {
             clock: &self.clock,
             container: &self.container,
             command: &self.command,
+            terminal: crate::terminal::session::TerminalProfile::TUI,
         }
     }
 

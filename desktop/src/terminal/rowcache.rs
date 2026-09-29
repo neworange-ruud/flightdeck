@@ -5,9 +5,12 @@
 //! element derives from it, which is GPUI's shaped text) and redoes a row only
 //! when something it depends on changed:
 //!
-//! - the emulator says the row changed ([`GridDamage`], from
-//!   `TerminalGrid::take_damage`; alacritty_terminal tracks it natively and
-//!   also reports the old and new cursor rows),
+//! - the emulator says the row changed since this cache last looked
+//!   ([`GridDamage`], from `TerminalGrid::damage_since` with
+//!   [`RowCache::seen`]; alacritty_terminal tracks it natively and also
+//!   reports the old and new cursor rows). Each cache keeps its own position,
+//!   so the app's terminal and a Mission control tile of the same session
+//!   never take each other's damage,
 //! - the cursor moved onto or off the row, or changed shape or focus (the glyph
 //!   under a filled block is inked differently), which is checked here too, so
 //!   correctness never rests on the emulator's cursor bookkeeping alone,
@@ -20,7 +23,7 @@
 //! `S` is generic so the cache logic is tested without a window; the element
 //! uses `Vec<ShapedLine>`.
 
-use flightdeck::terminal::grid::{GridDamage, GridView};
+use flightdeck::terminal::grid::{GridDamage, GridView, TerminalGrid};
 
 use super::layout::{self, RowCursor, RowLayout, TermPalette};
 
@@ -45,6 +48,9 @@ pub struct RowCache<S> {
     palette: Option<TermPalette>,
     /// Rows laid out by the most recent [`RowCache::update`].
     pub last_laid_out: usize,
+    /// The grid's damage position this cache has caught up to: what to pass
+    /// to `TerminalGrid::damage_since` next.
+    pub seen: u64,
 }
 
 impl<S> Default for RowCache<S> {
@@ -55,13 +61,15 @@ impl<S> Default for RowCache<S> {
             size: (0, 0),
             palette: None,
             last_laid_out: 0,
+            seen: 0,
         }
     }
 }
 
 impl<S> RowCache<S> {
     /// Bring the cache up to date with `grid`, given the damage the emulator
-    /// reported since the previous update. `source` names the grid: a
+    /// reported since [`RowCache::seen`] (the caller then stores the new
+    /// position there, see [`RowCache::refresh`]). `source` names the grid: a
     /// different one than last time lays out everything. Returns the rows
     /// laid out.
     pub fn update(
@@ -112,6 +120,27 @@ impl<S> RowCache<S> {
         laid_out
     }
 
+    /// [`RowCache::update`] with the damage read from `grid` itself, moving
+    /// [`RowCache::seen`] on. What the element and the tiles call.
+    pub fn refresh(
+        &mut self,
+        source: usize,
+        grid: &dyn TerminalGrid,
+        palette: &TermPalette,
+        focused: bool,
+    ) -> usize {
+        let (damage, now) = grid.damage_since(self.seen);
+        let laid_out = self.update(source, grid, damage, palette, focused);
+        self.seen = now;
+        laid_out
+    }
+
+    /// Which grid the rows came from, as last passed to
+    /// [`RowCache::update`].
+    pub fn source(&self) -> Option<usize> {
+        self.source
+    }
+
     pub fn rows(&self) -> &[CachedRow<S>] {
         &self.rows
     }
@@ -156,10 +185,9 @@ mod tests {
         }
 
         fn frame(&mut self, focused: bool) -> usize {
-            let damage = self.grid.take_damage();
             let n = self
                 .cache
-                .update(1, self.grid.as_ref(), damage, &self.palette, focused);
+                .refresh(1, self.grid.as_ref(), &self.palette, focused);
             // Mark every row's derived data, so a test sees which were dropped.
             for row in self.cache.rows_mut() {
                 row.derived.get_or_insert(7);
@@ -188,12 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn the_first_frame_lays_out_every_row_and_an_idle_one_only_the_cursor_row() {
+    fn the_first_frame_lays_out_every_row_and_an_idle_one_none() {
         let mut h = Harness::new(10, 40);
         h.grid.process(b"one\r\ntwo\r\n$ ");
         assert_eq!(h.frame(true), 10);
-        // Nothing changed: alacritty still names the cursor's row.
-        assert_eq!(h.frame(true), 1);
+        // Nothing changed since: nothing to lay out.
+        assert_eq!(h.frame(true), 0);
         h.assert_matches_fresh_layout(true);
     }
 
@@ -291,8 +319,9 @@ mod tests {
         // partial damage says nothing about rows the cache holds for the first.
         let mut other = Emulator::Alacritty.build(4, 20);
         other.process(b"second");
-        let _ = other.take_damage();
-        let damage = GridDamage::Rows(Vec::new());
+        // Its damage read from an unrelated position: partial.
+        let (damage, _) = other.damage_since(other.damage_since(0).1);
+        assert_eq!(damage, GridDamage::Rows(Vec::new()));
         assert_eq!(
             h.cache.update(2, other.as_ref(), damage, &h.palette, true),
             4

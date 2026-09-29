@@ -30,13 +30,37 @@ pub const IDLE_POLL: Duration = Duration::from_millis(25);
 pub const BACKLOG_POLL: Duration = Duration::from_millis(1);
 
 /// The last input and output times one view has seen.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cadence {
     last_input: Option<Instant>,
     last_output: Option<Instant>,
+    /// The rate while output flows: [`ACTIVE_POLL`] unless set otherwise.
+    active_poll: Duration,
+    /// The rate when idle: [`IDLE_POLL`] unless set otherwise.
+    idle_poll: Duration,
+}
+
+impl Default for Cadence {
+    fn default() -> Self {
+        Cadence::with_rates(ACTIVE_POLL, IDLE_POLL)
+    }
 }
 
 impl Cadence {
+    /// A cadence that polls every `active_poll` while output flows and every
+    /// `idle_poll` when idle. The app's host uses slower ones than a single
+    /// terminal: its turn services every project (PTYs, status files, the
+    /// repository status refresh), and output from any of them keeps it
+    /// active.
+    pub fn with_rates(active_poll: Duration, idle_poll: Duration) -> Self {
+        Cadence {
+            last_input: None,
+            last_output: None,
+            active_poll,
+            idle_poll,
+        }
+    }
+
     /// Input was written to the PTY.
     pub fn input(&mut self, now: Instant) {
         self.last_input = Some(now);
@@ -56,12 +80,12 @@ impl Cadence {
         if within(self.last_input, ECHO_WINDOW) {
             ECHO_POLL
         } else if busy {
-            BACKLOG_POLL.max(ECHO_POLL).min(ACTIVE_POLL)
+            BACKLOG_POLL.max(ECHO_POLL).min(self.active_poll)
         } else if within(self.last_input, ACTIVE_WINDOW) || within(self.last_output, ACTIVE_WINDOW)
         {
-            ACTIVE_POLL
+            self.active_poll
         } else {
-            IDLE_POLL
+            self.idle_poll
         }
     }
 }
@@ -112,6 +136,20 @@ mod tests {
             c.next_delay(t + Duration::from_millis(500), false),
             IDLE_POLL
         );
+    }
+
+    #[test]
+    fn the_rates_can_be_slower() {
+        let t = Instant::now();
+        let mut c = Cadence::with_rates(Duration::from_millis(16), Duration::from_millis(50));
+        assert_eq!(c.next_delay(t, false), Duration::from_millis(50));
+        c.output(t);
+        assert_eq!(
+            c.next_delay(t + Duration::from_millis(100), false),
+            Duration::from_millis(16)
+        );
+        c.input(t);
+        assert_eq!(c.next_delay(t, false), ECHO_POLL, "echoes stay fast");
     }
 
     #[test]
