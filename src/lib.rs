@@ -91,6 +91,7 @@ use crate::remote::pairing::PairingSession;
 use crate::remote::shell::ShellManager;
 use crate::remote::state::remote_state_path;
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
+use crate::terminal::grid::{encode_mouse_button, encode_mouse_report};
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key_with_f2, KeyAction};
@@ -4311,59 +4312,6 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
         && col < r.x.saturating_add(r.width)
         && row >= r.y
         && row < r.y.saturating_add(r.height)
-}
-
-/// Encode a mouse report for the hosted application, matching its active mouse
-/// encoding. `cb` is the xterm protocol button code; `col`/`row` are 0-based
-/// cell coordinates within the terminal viewport (protocol coordinates are
-/// 1-based).
-fn encode_mouse_report(
-    encoding: vt100::MouseProtocolEncoding,
-    cb: u8,
-    col: u16,
-    row: u16,
-) -> Vec<u8> {
-    let cx = col.saturating_add(1);
-    let cy = row.saturating_add(1);
-    match encoding {
-        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{cb};{cx};{cy}M").into_bytes(),
-        // Default (X10) and, approximately, the legacy UTF-8 encoding: one
-        // printable byte per field, offset by 32 and clamped to a single byte.
-        _ => {
-            let bx = cx.saturating_add(32).min(255) as u8;
-            let by = cy.saturating_add(32).min(255) as u8;
-            vec![0x1b, b'[', b'M', cb.saturating_add(32), bx, by]
-        }
-    }
-}
-
-/// Encode a mouse button press/drag/release report for a mouse-aware hosted
-/// application. `cb` is the xterm button code (0 = left, +32 = motion/drag);
-/// `pressed` distinguishes press/drag (`true`) from release (`false`). `col`/
-/// `row` are 0-based viewport cells (protocol coordinates are 1-based).
-fn encode_mouse_button(
-    encoding: vt100::MouseProtocolEncoding,
-    cb: u8,
-    col: u16,
-    row: u16,
-    pressed: bool,
-) -> Vec<u8> {
-    let cx = col.saturating_add(1);
-    let cy = row.saturating_add(1);
-    match encoding {
-        // SGR reports the same button code for release but terminate with 'm'.
-        vt100::MouseProtocolEncoding::Sgr => {
-            let end = if pressed { 'M' } else { 'm' };
-            format!("\x1b[<{cb};{cx};{cy}{end}").into_bytes()
-        }
-        // X10 has no release button code — release is reported as button 3.
-        _ => {
-            let code = if pressed { cb } else { 3 };
-            let bx = cx.saturating_add(32).min(255) as u8;
-            let by = cy.saturating_add(32).min(255) as u8;
-            vec![0x1b, b'[', b'M', code.saturating_add(32), bx, by]
-        }
-    }
 }
 
 /// Route a key press. Returns `Ok(true)` when the loop should quit. Workspace-
@@ -8625,12 +8573,22 @@ mod tests {
     fn encodes_sgr_wheel_report() {
         // Wheel-up at viewport cell (0,0) → column/row 1.
         assert_eq!(
-            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, MOUSE_WHEEL_UP, 0, 0),
+            encode_mouse_report(
+                crate::terminal::grid::MouseEncoding::Sgr,
+                MOUSE_WHEEL_UP,
+                0,
+                0
+            ),
             b"\x1b[<64;1;1M".to_vec()
         );
         // Wheel-down at cell (4,2) → column 5, row 3.
         assert_eq!(
-            encode_mouse_report(vt100::MouseProtocolEncoding::Sgr, MOUSE_WHEEL_DOWN, 4, 2),
+            encode_mouse_report(
+                crate::terminal::grid::MouseEncoding::Sgr,
+                MOUSE_WHEEL_DOWN,
+                4,
+                2
+            ),
             b"\x1b[<65;5;3M".to_vec()
         );
     }
@@ -8639,7 +8597,12 @@ mod tests {
     #[test]
     fn encodes_default_wheel_report() {
         assert_eq!(
-            encode_mouse_report(vt100::MouseProtocolEncoding::Default, MOUSE_WHEEL_UP, 0, 0),
+            encode_mouse_report(
+                crate::terminal::grid::MouseEncoding::Default,
+                MOUSE_WHEEL_UP,
+                0,
+                0
+            ),
             vec![0x1b, b'[', b'M', 32 + 64, 32 + 1, 32 + 1]
         );
     }

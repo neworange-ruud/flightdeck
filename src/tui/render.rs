@@ -30,6 +30,7 @@ use ratatui::Frame;
 use crate::app::modes::InputMode;
 use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
+use crate::terminal::grid::{GridColor, GridView};
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::mode_style;
@@ -1532,13 +1533,17 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, n
 /// Background colour used to highlight selected terminal cells (SPECS §20).
 const SELECTION_BG: Color = Color::Rgb(58, 90, 138);
 
-/// Render a VT100 [`vt100::Screen`] into `area`, cell-by-cell. When `focused`,
-/// the terminal cursor is positioned to match the screen's cursor. Cells inside
-/// `selection` are drawn with the selection highlight.
+/// Render a terminal's visible [`GridView`] into `area`, cell-by-cell. When
+/// `focused`, the terminal cursor is positioned to match the screen's cursor.
+/// Cells inside `selection` are drawn with the selection highlight.
+///
+/// Reads the emulator only through the grid seam
+/// ([`crate::terminal::grid`]), so the TUI draws whichever emulator backs the
+/// terminal.
 fn render_screen(
     frame: &mut Frame,
     area: Rect,
-    screen: &vt100::Screen,
+    screen: &dyn GridView,
     focused: bool,
     selection: Option<&Selection>,
     dim: bool,
@@ -1555,30 +1560,29 @@ fn render_screen(
         for r in 0..max_r {
             // Columns selected on this visible row, if any.
             let sel_cols = selection.and_then(|s| s.row_selection(r, rows, cols, offset));
-            for c in 0..max_c {
-                let Some(cell) = screen.cell(r, c) else {
-                    continue;
-                };
+            screen.visit_row(r, &mut |c, cell| {
+                if c >= max_c {
+                    return;
+                }
                 let target = &mut buf[(area.x + c, area.y + r)];
-                let contents = cell.contents();
-                if contents.is_empty() {
+                if cell.text.is_empty() {
                     target.set_symbol(" ");
                 } else {
-                    target.set_symbol(contents);
+                    target.set_symbol(cell.text);
                 }
                 let mut style = Style::default()
-                    .fg(vt_color(cell.fgcolor()))
-                    .bg(vt_color(cell.bgcolor()));
-                if cell.bold() {
+                    .fg(grid_color(cell.fg))
+                    .bg(grid_color(cell.bg));
+                if cell.attrs.bold {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                if cell.italic() {
+                if cell.attrs.italic {
                     style = style.add_modifier(Modifier::ITALIC);
                 }
-                if cell.underline() {
+                if cell.attrs.underline {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
-                if cell.inverse() {
+                if cell.attrs.inverse {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 // Gray out dimmed (unfocused) terminal text: force a muted gray
@@ -1600,23 +1604,24 @@ fn render_screen(
                         .remove_modifier(Modifier::REVERSED);
                 }
                 target.set_style(style);
-            }
+            });
         }
     }
-    if focused && offset == 0 && !screen.hide_cursor() {
-        let (cr, cc) = screen.cursor_position();
+    let cursor = screen.cursor();
+    if focused && offset == 0 && cursor.visible {
+        let (cr, cc) = (cursor.row, cursor.col);
         if cr < area.height && cc < area.width {
             frame.set_cursor_position((area.x + cc, area.y + cr));
         }
     }
 }
 
-/// Convert a [`vt100::Color`] to a ratatui [`Color`].
-fn vt_color(c: vt100::Color) -> Color {
+/// Convert a grid [`GridColor`] to a ratatui [`Color`].
+fn grid_color(c: GridColor) -> Color {
     match c {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        GridColor::Default => Color::Reset,
+        GridColor::Indexed(i) => Color::Indexed(i),
+        GridColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
 
@@ -6184,6 +6189,54 @@ mod tests {
             Some(SELECTION_BG),
             "selected cell must keep the selection background even while dimmed"
         );
+    }
+
+    /// The renderer reads only the grid seam: a `FakeGrid` with no parser behind
+    /// it draws exactly the cells, styles and cursor it was given.
+    #[test]
+    fn render_screen_draws_any_grid_view() {
+        use crate::terminal::grid::{CellAttrs, GridCursor, OwnedCell};
+        use crate::testing::FakeGrid;
+
+        let mut grid = FakeGrid::new(3, 8);
+        grid.set_text(0, 0, "ok");
+        grid.set_cell(
+            1,
+            2,
+            OwnedCell {
+                text: "R".to_string(),
+                fg: GridColor::Indexed(1),
+                bg: GridColor::Rgb(1, 2, 3),
+                attrs: CellAttrs {
+                    bold: true,
+                    underline: true,
+                    ..CellAttrs::default()
+                },
+                ..OwnedCell::default()
+            },
+        );
+        grid.set_cursor(GridCursor {
+            row: 2,
+            col: 5,
+            visible: true,
+            ..GridCursor::default()
+        });
+
+        let mut term = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        term.draw(|f| render_screen(f, Rect::new(0, 0, 8, 3), &grid, true, None, false))
+            .unwrap();
+        term.backend_mut()
+            .assert_cursor_position(ratatui::layout::Position { x: 5, y: 2 });
+        let buf = term.backend().buffer().clone();
+        assert_eq!(buf[(0, 0)].symbol(), "o");
+        let red = &buf[(2, 1)];
+        assert_eq!(red.symbol(), "R");
+        assert_eq!(red.style().fg, Some(Color::Indexed(1)));
+        assert_eq!(red.style().bg, Some(Color::Rgb(1, 2, 3)));
+        assert!(red
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
     }
 
     #[test]

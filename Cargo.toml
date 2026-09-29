@@ -72,6 +72,14 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 toml_edit = "0.25.13"
 vt100 = "0.16.2"
+# The second terminal emulator behind `src/terminal/grid.rs`'s `TerminalGrid`
+# trait. The TUI stays on vt100 above; the GPUI desktop front-end draws through
+# this one (see desktop/NOTES-M0.md, "Terminal emulator"). Apache-2.0, the
+# emulator core of Alacritty and of Zed's terminal. Pure Rust on every target
+# (vte, parking_lot, polling, rustix-openpty on Unix, windows-sys + miow on
+# Windows), so the Windows build stays C-free. `default-features = false` drops
+# serde, which only its config types need.
+alacritty_terminal = { version = "0.26.0", default-features = false }
 
 # --- FlightDeck Remote (relay client, src/remote/) -------------------------
 # Shared phone<->desktop wire types. Path dep into the sibling `remote/`

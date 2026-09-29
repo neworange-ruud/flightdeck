@@ -4,11 +4,9 @@
 //! Children may outlive the primary and are not persisted (SPECS §19).
 
 use crate::contracts::{FlightDeckError, ProcessState, PtyBackend, PtySession, PtySize, Result};
-use crate::tui::selection::{screen_row_to_rfb, Point, Selection};
+use crate::terminal::grid::{point_at, Emulator, MouseEncoding, TerminalGrid, TUI_EMULATOR};
+use crate::tui::selection::Selection;
 use std::path::Path;
-
-/// Scrollback lines kept by each terminal's VT parser.
-const SCROLLBACK: usize = 2000;
 
 /// The smallest VT grid a terminal is ever driven at.
 ///
@@ -43,35 +41,9 @@ fn clamp_grid(size: PtySize) -> PtySize {
     }
 }
 
-thread_local! {
-    /// Set only while [`Terminal::process_output`] is inside `vt100`, so the
-    /// process-wide panic hook can tell a panic we handle from one we do not.
-    static PARSER_PANIC_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether the current thread is inside a guarded `vt100` parse whose panic is
-/// already handled. The panic hook installed in `run()` uses this to stay quiet
-/// and leave the terminal alone.
-pub fn parser_panic_expected() -> bool {
-    PARSER_PANIC_EXPECTED.with(std::cell::Cell::get)
-}
-
-/// Sets [`PARSER_PANIC_EXPECTED`] for its lifetime. Clearing happens in `Drop`,
-/// so it is correct on the unwinding path too.
-struct ExpectedParserPanic;
-
-impl ExpectedParserPanic {
-    fn new() -> Self {
-        PARSER_PANIC_EXPECTED.with(|f| f.set(true));
-        Self
-    }
-}
-
-impl Drop for ExpectedParserPanic {
-    fn drop(&mut self) {
-        PARSER_PANIC_EXPECTED.with(|f| f.set(false));
-    }
-}
+/// Re-exported from the vt100 grid, where the guarded parse now lives, so the
+/// panic hook in `run()` keeps its path.
+pub use crate::terminal::grid::vt100_grid::parser_panic_expected;
 
 /// What a terminal hosts: the primary agent, an additional agent (a second
 /// agent process running in the same worktree), or a child shell.
@@ -83,15 +55,17 @@ pub enum TerminalKind {
     Child,
 }
 
-/// A single terminal (primary or child): its live PTY session plus a VT100
-/// parser that turns the raw PTY byte stream into a renderable screen grid.
+/// A single terminal (primary or child): its live PTY session plus the
+/// emulator grid that turns the raw PTY byte stream into renderable cells.
+///
+/// The grid is reached only through [`TerminalGrid`], so which emulator backs a
+/// terminal is the caller's [`Emulator`] choice ([`TUI_EMULATOR`] for tab
+/// sessions) and nothing here depends on it.
 pub struct Terminal {
     pub kind: TerminalKind,
     pub title: String,
     session: Box<dyn PtySession>,
-    parser: vt100::Parser,
-    /// The active mouse text selection, if any (SPECS §20).
-    selection: Option<Selection>,
+    grid: Box<dyn TerminalGrid>,
     /// Per-session mint counter, assigned once at spawn and never reused.
     ///
     /// This exists so a terminal has an identity that is **not** its position
@@ -107,24 +81,49 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Construct a terminal wrapping a spawned session, with a VT parser sized
-    /// to the terminal's viewport.
+    /// Construct a terminal wrapping a spawned session, with an `emulator` grid
+    /// sized to the terminal's viewport.
     fn new(
         kind: TerminalKind,
         title: String,
         session: Box<dyn PtySession>,
         size: PtySize,
         stream_id: u64,
+        emulator: Emulator,
     ) -> Self {
         let size = clamp_grid(size);
         Terminal {
             kind,
             title,
             session,
-            parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK),
-            selection: None,
+            grid: emulator.build(size.rows, size.cols),
             stream_id,
         }
+    }
+
+    /// Spawn a terminal outside any tab [`Session`]: one process on `backend`,
+    /// parsed by `emulator`. The desktop app's terminal view and its headless
+    /// grid dump use this, so they run the exact pipeline a tab's terminal does
+    /// (same size floor, same query replies, same selection logic).
+    pub fn spawn(
+        backend: &dyn PtyBackend,
+        emulator: Emulator,
+        cmd: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: &Path,
+        size: PtySize,
+    ) -> Result<Self> {
+        let size = clamp_grid(size);
+        let session = backend.spawn(cmd, args, env, cwd, size)?;
+        Ok(Terminal::new(
+            TerminalKind::Primary,
+            cmd.to_string(),
+            session,
+            size,
+            0,
+            emulator,
+        ))
     }
 
     /// The mint counter this terminal was spawned with. See [`Terminal::stream_id`]
@@ -143,53 +142,17 @@ impl Terminal {
         self.session.as_mut()
     }
 
-    /// Feed raw PTY output bytes into the VT parser (updates the screen grid).
-    ///
-    /// Guarded, because `vt100 0.16.2` can panic while printing and there is no
-    /// released version that does not. `Grid::set_size` truncates each row with a
-    /// plain `Vec::resize` (`grid.rs:78-80` -> `row.rs:73-76`), so shrinking the
-    /// column count through the middle of a wide (width-2) character drops the
-    /// continuation half and leaves the first half flagged `is_wide()` in the new
-    /// last column. The next print onto that cell reaches `screen.rs:870`, which
-    /// unwraps `drawing_cell_mut(col + 1)` on the library's own assumption that a
-    /// wide cell is always followed by its other half — and gets `None`.
-    ///
-    /// [`MIN_GRID_COLS`] does not help here: the stranded cell can sit at any
-    /// column, so the panic is reachable at any grid size. Rather than let a
-    /// resize take the whole app down, the panic is contained and the parser is
-    /// rebuilt. The rebuild is not optional: the panic unwinds out of
-    /// `Screen::text` mid-mutation and the stranded cell is still there, so
-    /// reusing the parser would just panic again on the next chunk.
-    ///
-    /// Cost when this fires: the pane's scrollback and screen contents are lost
-    /// and the agent repaints. That is a far better failure than losing every
-    /// pane and the user's session.
+    /// Feed raw PTY output bytes into the emulator (updates the screen grid).
+    /// Never panics: see [`crate::terminal::grid::Vt100Grid`] for how the vt100
+    /// grid contains its library's panics.
     pub fn process_output(&mut self, bytes: &[u8]) {
-        if Self::feed(&mut self.parser, bytes).is_ok() {
-            return;
-        }
-        // Start from a clean grid at the same size, then let the chunk land on it.
-        let (rows, cols) = self.parser.screen().size();
-        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
-        self.selection = None;
-        let _ = Self::feed(&mut self.parser, bytes);
+        self.grid.process(bytes);
     }
 
-    /// Run one `vt100` parse, containing a panic from inside the library.
-    ///
-    /// The hook installed in `run()` checks [`parser_panic_expected`] so a panic
-    /// caught here does not tear down the user's terminal modes or print a
-    /// backtrace over a live UI.
-    fn feed(parser: &mut vt100::Parser, bytes: &[u8]) -> std::result::Result<(), ()> {
-        let _expected = ExpectedParserPanic::new();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)))
-            .map_err(|_| ())
-    }
-
-    /// Reply to a Device Status Report cursor-position query (`ESC[6n`) found in
-    /// freshly-read PTY output by writing a Cursor Position Report
-    /// (`ESC[<row>;<col>R`) back on the PTY input — exactly as a real terminal
-    /// emulator does.
+    /// Write back whatever the emulator must answer after parsing `output` —
+    /// above all a Device Status Report cursor-position query (`ESC[6n`), which
+    /// gets a Cursor Position Report (`ESC[<row>;<col>R`) on the PTY input
+    /// exactly as a real terminal emulator sends.
     ///
     /// ConPTY (Windows) and many interactive programs that probe the cursor
     /// (PowerShell's PSReadLine, Node-based TUIs such as Claude Code) **block
@@ -198,27 +161,42 @@ impl Terminal {
     /// (Unix PTYs/programs don't gate their first paint on this handshake, so
     /// the macOS-first build never needed it.)
     ///
-    /// Call after [`Self::process_output`] so the reported position reflects the
-    /// parser's current cursor. Detection is per-chunk; a query split across two
-    /// reads (not observed from ConPTY, which emits `ESC[6n` atomically) would
-    /// be missed.
+    /// Call after [`Self::process_output`] with the same chunk. Every query is
+    /// an escape sequence, so a chunk without an `ESC` byte cannot have raised
+    /// one and is skipped without touching the grid; the replies themselves come
+    /// from the emulator ([`TerminalGrid::take_replies`]), which saw the chunk.
     pub fn answer_cursor_position_query(&mut self, output: &[u8]) {
-        const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
-        if !output
-            .windows(DSR_CPR_QUERY.len())
-            .any(|w| w == DSR_CPR_QUERY)
-        {
+        if !output.contains(&0x1b) {
             return;
         }
-        let (row, col) = self.parser.screen().cursor_position();
-        // CPR is 1-based; vt100 reports a 0-based cursor position.
-        let reply = format!("\x1b[{};{}R", row + 1, col + 1);
-        let _ = self.session.write_input(reply.as_bytes());
+        self.write_replies();
+    }
+
+    /// Advance the emulator's timers (a synchronized update's timeout, for
+    /// emulators that buffer one). A front-end that polls the PTY calls this on
+    /// every poll, output or not; replies raised by the flush go to the PTY.
+    pub fn tick(&mut self) {
+        self.grid.tick();
+        self.write_replies();
+    }
+
+    /// Drain the emulator's pending replies onto the PTY input.
+    fn write_replies(&mut self) {
+        let reply = self.grid.take_replies();
+        if !reply.is_empty() {
+            let _ = self.session.write_input(&reply);
+        }
     }
 
     /// The current parsed screen, for rendering.
-    pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+    pub fn screen(&self) -> &dyn TerminalGrid {
+        self.grid.as_ref()
+    }
+
+    /// Mutable access to the parsed screen, for a front-end that sets emulator
+    /// options such as its default colours.
+    pub fn screen_mut(&mut self) -> &mut dyn TerminalGrid {
+        self.grid.as_mut()
     }
 
     /// Whether the hosted application has enabled xterm mouse reporting. When
@@ -226,12 +204,12 @@ impl Terminal {
     /// the app's own scroll region / scrollbar responds, exactly as in a real
     /// terminal emulator (SPECS §20).
     pub fn wants_mouse(&self) -> bool {
-        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        self.grid.modes().wants_mouse()
     }
 
     /// The mouse-report encoding the hosted application expects.
-    pub fn mouse_encoding(&self) -> vt100::MouseProtocolEncoding {
-        self.parser.screen().mouse_protocol_encoding()
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.grid.modes().mouse_encoding
     }
 
     /// Whether the hosted application has enabled bracketed paste mode (DECSET
@@ -240,7 +218,7 @@ impl Terminal {
     /// treats a multi-line paste as one atomic insert instead of executing each
     /// line as it arrives.
     pub fn bracketed_paste(&self) -> bool {
-        self.parser.screen().bracketed_paste()
+        self.grid.modes().bracketed_paste
     }
 
     /// Whether the hosted application has enabled application cursor keys mode
@@ -249,74 +227,60 @@ impl Terminal {
     /// TUIs (Claude Code, OpenCode) typically enable it, so a synthesized arrow
     /// keystroke must match this mode or the app ignores it (remote-control-qa1).
     pub fn application_cursor(&self) -> bool {
-        self.parser.screen().application_cursor()
+        self.grid.modes().app_cursor
     }
 
-    /// Scroll the viewport `lines` rows up into the VT100 scrollback. Used for
-    /// plain (non-mouse-aware) output; clamped to the available scrollback.
+    /// Scroll the viewport `lines` rows up into the scrollback. Used for plain
+    /// (non-mouse-aware) output; clamped to the available scrollback.
     pub fn scroll_up(&mut self, lines: usize) {
-        let cur = self.parser.screen().scrollback();
-        self.parser
-            .screen_mut()
-            .set_scrollback(cur.saturating_add(lines));
+        let cur = self.grid.scrollback();
+        self.grid.set_scrollback(cur.saturating_add(lines));
     }
 
     /// Scroll the viewport `lines` rows back down toward the live bottom.
     pub fn scroll_down(&mut self, lines: usize) {
-        let cur = self.parser.screen().scrollback();
-        self.parser
-            .screen_mut()
-            .set_scrollback(cur.saturating_sub(lines));
+        let cur = self.grid.scrollback();
+        self.grid.set_scrollback(cur.saturating_sub(lines));
     }
 
     /// Snap the viewport back to the live bottom (scrollback offset 0).
     pub fn scroll_to_bottom(&mut self) {
-        self.parser.screen_mut().set_scrollback(0);
+        self.grid.set_scrollback(0);
     }
 
     // --- Mouse text selection (SPECS §20) ---------------------------------
 
     /// The active selection, if any (for rendering the highlight).
     pub fn selection(&self) -> Option<&Selection> {
-        self.selection.as_ref()
+        self.grid.selection()
     }
 
     /// Whether a non-empty selection exists (something is actually highlighted).
     pub fn has_selection(&self) -> bool {
-        self.selection.map(|s| !s.is_empty()).unwrap_or(false)
+        self.grid
+            .selection()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
     }
 
     /// Clear any active selection.
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        self.grid.set_selection(None);
     }
 
     /// Begin a selection at a visible screen cell (drag start).
     pub fn begin_selection(&mut self, screen_row: u16, col: u16) {
-        let p = self.point_at(screen_row, col);
-        self.selection = Some(Selection::new(p));
+        let p = point_at(self.grid.as_ref(), screen_row, col);
+        self.grid.set_selection(Some(Selection::new(p)));
     }
 
     /// Move the selection head to a visible screen cell (drag move). No-op if no
     /// selection is in progress.
     pub fn update_selection(&mut self, screen_row: u16, col: u16) {
-        let p = self.point_at(screen_row, col);
-        if let Some(sel) = self.selection.as_mut() {
+        let p = point_at(self.grid.as_ref(), screen_row, col);
+        if let Some(mut sel) = self.grid.selection().copied() {
             sel.head = p;
-        }
-    }
-
-    /// Map a visible screen cell to a scroll-stable [`Point`], clamping to the
-    /// current screen bounds and offset.
-    fn point_at(&self, screen_row: u16, col: u16) -> Point {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let offset = screen.scrollback();
-        let row = screen_row.min(rows.saturating_sub(1));
-        let col = col.min(cols.saturating_sub(1));
-        Point {
-            rows_from_bottom: screen_row_to_rfb(row, rows, offset).max(0),
-            col,
+            self.grid.set_selection(Some(sel));
         }
     }
 
@@ -325,64 +289,15 @@ impl Terminal {
     /// Lines are joined with `\n` and trailing whitespace is trimmed per line.
     /// Restores the viewport's scrollback offset before returning.
     pub fn selected_text(&mut self) -> Option<String> {
-        let sel = self.selection?;
-        if sel.is_empty() {
-            return None;
-        }
-        let (rows, cols) = self.parser.screen().size();
-        let saved = self.parser.screen().scrollback();
-        let (first, last) = sel.first_last();
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut rfb = first.rows_from_bottom;
-        while rfb >= last.rows_from_bottom {
-            if let Some((c0, c1)) = sel.col_range_for_rfb(rfb, cols) {
-                // Bring this content line into view at the bottom-most row (the
-                // offset clamps internally for very old lines).
-                self.parser.screen_mut().set_scrollback(rfb.max(0) as usize);
-                let actual = self.parser.screen().scrollback();
-                let screen_row = (rows as i64 - 1) - rfb + actual as i64;
-                if (0..rows as i64).contains(&screen_row) {
-                    lines.push(self.read_row(
-                        screen_row as u16,
-                        c0,
-                        c1.min(cols.saturating_sub(1)),
-                    ));
-                }
-            }
-            rfb -= 1;
-        }
-
-        self.parser.screen_mut().set_scrollback(saved);
-        if lines.is_empty() {
-            None
-        } else {
-            Some(lines.join("\n"))
-        }
+        self.grid.selected_text()
     }
 
-    /// Read the cell contents of a visible `screen_row` from column `c0` to `c1`
-    /// inclusive, with trailing whitespace trimmed.
-    fn read_row(&self, screen_row: u16, c0: u16, c1: u16) -> String {
-        let screen = self.parser.screen();
-        let mut s = String::new();
-        for c in c0..=c1 {
-            let contents = screen.cell(screen_row, c).map(|cell| cell.contents());
-            match contents {
-                Some(text) if !text.is_empty() => s.push_str(text),
-                _ => s.push(' '),
-            }
-        }
-        s.trim_end().to_string()
-    }
-
-    /// Resize both the VT screen grid and the underlying PTY (SPECS §23). The
+    /// Resize both the emulator grid and the underlying PTY (SPECS §23). The
     /// active selection is dropped, as content reflows under a new width.
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
         // Never below the floor the VT parser tolerates (see [`clamp_grid`]).
         let size = clamp_grid(size);
-        self.selection = None;
-        self.parser.screen_mut().set_size(size.rows, size.cols);
+        self.grid.resize(size.rows, size.cols);
         self.session.resize(size)
     }
 }
@@ -435,6 +350,7 @@ impl Session {
             session,
             size,
             0,
+            TUI_EMULATOR,
         ));
         Ok(())
     }
@@ -485,6 +401,7 @@ impl Session {
             session,
             size,
             stream_id,
+            TUI_EMULATOR,
         ));
         let index = self.children.len() - 1;
         self.selected_child = Some(index);
@@ -1147,7 +1064,7 @@ mod tests {
         // TUI like opencode does.
         term.process_output(b"\x1b[?1000h\x1b[?1006h");
         assert!(term.wants_mouse());
-        assert_eq!(term.mouse_encoding(), vt100::MouseProtocolEncoding::Sgr);
+        assert_eq!(term.mouse_encoding(), MouseEncoding::Sgr);
     }
 
     // §20: a drag selects text on the visible screen and extracts it.

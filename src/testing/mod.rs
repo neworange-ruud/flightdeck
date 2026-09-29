@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod fake_grid;
+pub use fake_grid::FakeGrid;
+
 // ===========================================================================
 // FakeFs — in-memory filesystem
 // ===========================================================================
