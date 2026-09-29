@@ -15,6 +15,7 @@ pub mod config;
 pub mod fs;
 pub mod git;
 pub mod hooks;
+pub mod host;
 pub mod notify;
 pub mod persistence;
 pub mod remote;
@@ -70,25 +71,23 @@ use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::real::{RealClock, RealFs, SystemCommandRunner};
 use crate::contracts::{
     AgentDef, Clock, CommandRunner, Config, ContainerRuntime, FileSystem, GitExecutor,
-    ManualStatus, Notifier, ProcessState, PtyBackend, PtySize, STATE_VERSION,
+    ManualStatus, ProcessState, PtyBackend, PtySize, STATE_VERSION,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
 use crate::git::repo::{detect_base_branch, GitCli};
 use crate::git::status::{collect_status, WorktreeStatus};
+use crate::host::{AppHost, HostEvent};
 use crate::notify::SystemNotifier;
 use crate::persistence::project_state::{default_state, load_state, save_state};
 use crate::persistence::recovery::{recover, RecoveryReport};
-use crate::persistence::workspace::{
-    load_workspace, save_workspace, workspace_state_path, WorkspaceState, WORKSPACE_VERSION,
-};
 use crate::remote::client::RemoteHandle;
 use crate::remote::commands::{
     build_index, encode_reply, first_task_decision, translate, CommandLedger, FirstTaskDecision,
     MainLoopAction, PendingFirstTask, ShellAction, Translation,
 };
 use crate::remote::identity::load_or_create_identity;
-use crate::remote::pairing::{build_channel, PairingSession};
+use crate::remote::pairing::PairingSession;
 use crate::remote::shell::ShellManager;
 use crate::remote::state::remote_state_path;
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
@@ -112,12 +111,9 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 
 /// How long to block waiting for an input event before looping again so PTY
-/// output keeps flowing and statuses keep refreshing.
+/// output keeps flowing and statuses keep refreshing. One wait is one
+/// [`AppHost`] turn, so this also paces [`crate::host::GIT_REFRESH_EVERY`].
 const POLL_TIMEOUT: Duration = Duration::from_millis(50);
-
-/// Refresh the git-status cache every N ticks (a tick is one loop iteration,
-/// roughly [`POLL_TIMEOUT`] when idle). Kept coarse so we never block the UI.
-const GIT_REFRESH_EVERY: u64 = 40;
 
 /// Entry point invoked by the binary: run first-run init, recover state, and
 /// drive the Ratatui event loop (SPECS §4, §7, §10).
@@ -141,11 +137,6 @@ pub fn run() -> Result<()> {
 
     let argv: Vec<String> = std::env::args().collect();
     let isolated = parse_isolated(&argv)?;
-    let isolated_root: Option<PathBuf> = if isolated {
-        Some(isolated_status_dir())
-    } else {
-        None
-    };
 
     // Subcommand dispatch. These configure status/notification
     // features and exit without launching the TUI (SPECS §24).
@@ -182,55 +173,15 @@ pub fn run() -> Result<()> {
         command: &command,
     };
 
-    // The launch project (the cwd's repository) must be a git repo — fail fast
-    // with the friendly message if not. It is always opened and made active.
-    let launch = open_project(&env, &cwd, isolated_root.as_deref()).map_err(|e| {
-        FlightDeckError::Git(format!(
-            "not inside a Git repository (run FlightDeck from a git project): {e}"
-        ))
-    })?;
-    let repo_root = launch.git.root().to_path_buf();
-
-    let mut workspace = Workspace {
-        projects: vec![launch],
-        active: 0,
-    };
-
-    // Reopen any other projects remembered from the previous session (best
-    // effort): skip the launch project, folders that no longer exist, and any
-    // that are no longer git repositories. Each project's own tabs are still
-    // recovered from its `state.json` (agents are never auto-relaunched).
-    // An isolated run is exactly one project by definition: skip the reopen
-    // loop entirely (SPECS §32). This must not merely pass `None` through to
-    // `open_project` for each remembered project and discard the result —
-    // `open_project` runs `startup` (init, config writes, `.gitignore`
-    // update, state load + recovery) against every one of them, including
-    // the launch repo's own root when it is already in the workspace file
-    // (the normal case for a repo the user has opened before), before the
-    // `contains_root` guard below throws the duplicate away. Binding
-    // `ws_path` to `None` also makes teardown skip writing the workspace
-    // file for free (Task 8).
-    let ws_path = if isolated {
-        None
-    } else {
-        workspace_state_path()
-    };
-    if let Some(ref wp) = ws_path {
-        if let Ok(saved) = load_workspace(&fs, wp) {
-            for p in &saved.projects {
-                let pr = Path::new(p);
-                if !fs.is_dir(pr) {
-                    continue;
-                }
-                match open_project(&env, pr, None) {
-                    Ok(proj) if !workspace.contains_root(proj.git.root()) => {
-                        workspace.projects.push(proj)
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
+    // Opening the workspace is the host's job, not the terminal's: the launch
+    // project plus every project remembered from the previous session (SPECS
+    // §10). A GPUI front-end opens it the same way.
+    let notifier = SystemNotifier;
+    let mut host = AppHost::open(env, &notifier, &cwd, isolated)?;
+    let repo_root = host
+        .project_root(host.active_project_index())
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
 
     // 5–8. Initialise the terminal (raw mode + alt screen + panic-restore hook)
     // and run the loop, ensuring teardown happens no matter how we exit.
@@ -308,11 +259,10 @@ pub fn run() -> Result<()> {
             rows: size.height,
             cols: size.width,
         };
-        for p in workspace.projects.iter_mut() {
-            let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
-            let vp = viewport_pty_size(full, p.state.mode(), reserve);
-            p.state.set_pty_size(vp);
-        }
+        host.seed_pty_sizes(|state| {
+            let reserve = crate::tui::mode_style::border_enabled(&state.config.ui);
+            viewport_pty_size(full, state.mode(), reserve)
+        });
     }
 
     // Resume: start the primary agent for every recovered/loaded tab whose
@@ -329,52 +279,22 @@ pub fn run() -> Result<()> {
     // `flightdeck error: <msg>` — while still running the full teardown below
     // (terminal restore, session termination) exactly like any other
     // `loop_result` error.
-    let isolated_session_result = {
-        let active = workspace.active;
-        let p = &mut workspace.projects[active];
-        let services = env.services(&p.git);
-        if isolated {
-            // One fresh session; nothing to resume, because nothing was
-            // recovered (SPECS §32).
-            start_isolated_session(&mut p.state, &services)
-        } else {
-            let _ = p.state.resume_agents(&services);
-            Ok(())
-        }
-    };
+    let isolated_session_result = host.resume_launch_project();
 
-    let notifier = SystemNotifier;
     let loop_result = match isolated_session_result {
         Err(e) => Err(e),
-        Ok(()) => event_loop(&mut terminal, &mut workspace, &env, &notifier),
+        Ok(()) => event_loop(&mut terminal, &mut host),
     };
+    // Tell any attached browser FlightDeck is going away and wind the relay
+    // client down — on every exit path, including an early `?` out of the loop.
+    host.stop_services();
 
     // CLEAN TEARDOWN (SPECS §25). Persist FIRST, before touching the terminal:
     // on a severed terminal (Konsole/window close closes stdin+stdout+stderr) the
     // terminal-restore step is worthless anyway, and it must never run ahead of
     // the save — otherwise a failed restore that writes to the dead stderr can
     // take the process down before the state is written.
-    let mut persist_result = Ok(());
-    if !isolated {
-        for p in workspace.projects.iter() {
-            let services = env.services(&p.git);
-            if let Err(e) = persist_quietly(&p.state, &services) {
-                persist_result = Err(e);
-            }
-        }
-    }
-    if let Some(wp) = &ws_path {
-        let ws_state = WorkspaceState {
-            version: WORKSPACE_VERSION,
-            projects: workspace
-                .projects
-                .iter()
-                .map(|p| p.git.root().to_string_lossy().to_string())
-                .collect(),
-            active: workspace.active,
-        };
-        let _ = save_workspace(&fs, wp, &ws_state);
-    }
+    let persist_result = host.persist();
 
     // Restore the terminal (best effort). Use `try_restore` — NOT `restore` —
     // because `ratatui::restore` `eprintln!`s on failure, and `eprintln!` itself
@@ -392,16 +312,12 @@ pub fn run() -> Result<()> {
     std::mem::forget(terminal);
 
     // Terminate every session so no orphaned child processes remain.
-    for p in workspace.projects.iter_mut() {
-        terminate_all_sessions(&mut p.state);
-    }
+    host.terminate_sessions();
 
     // Remove the temp status directory only after every agent is dead —
     // otherwise a hook still running mid-teardown could recreate files under
     // a directory just deleted, or write into a partially-removed tree.
-    if isolated {
-        cleanup_isolated_run(&fs, &isolated_status_dir());
-    }
+    host.cleanup_isolated();
 
     loop_result.and(persist_result)
 }
@@ -1461,6 +1377,13 @@ impl Ui {
         self.overlay = UiOverlay::Dialog(Dialog::notification(msg));
     }
 
+    /// Take the phone-pairing overlay down, if it is the one on screen.
+    fn close_remote_overlay(&mut self) {
+        if matches!(self.overlay, UiOverlay::Remote(_)) {
+            self.overlay = UiOverlay::None;
+        }
+    }
+
     /// Clear every overlay/prompt back to the normal main view.
     fn clear(&mut self) {
         self.overlay = UiOverlay::None;
@@ -1510,12 +1433,13 @@ impl Ui {
 /// process-wide (a `RealFs`/`RealClock`/…); git is per-repository, so
 /// [`Env::services`] pairs this bundle with a project's own [`GitCli`] to build
 /// the [`Services`] a dispatch needs. Built once in [`run`].
-struct Env<'a> {
-    fs: &'a dyn FileSystem,
-    pty: &'a dyn PtyBackend,
-    clock: &'a dyn Clock,
-    container: &'a dyn ContainerRuntime,
-    command: &'a dyn CommandRunner,
+#[derive(Clone, Copy)]
+pub struct Env<'a> {
+    pub fs: &'a dyn FileSystem,
+    pub pty: &'a dyn PtyBackend,
+    pub clock: &'a dyn Clock,
+    pub container: &'a dyn ContainerRuntime,
+    pub command: &'a dyn CommandRunner,
 }
 
 impl<'a> Env<'a> {
@@ -2120,36 +2044,15 @@ fn next_loop_step(
     }
 }
 
-/// The main event loop. Services every open project's PTYs/status/notifications
-/// each tick (so background projects stay live), renders the active project plus
-/// the project tab row, and routes input until the user quits or a fatal error
-/// occurs.
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    workspace: &mut Workspace,
-    env: &Env,
-    notifier: &dyn Notifier,
-) -> Result<()> {
-    let mut ui = Ui::default();
-    let mut tick: u64 = 0;
-
-    // Suppress notifications briefly at startup so resumed/just-launched agents
-    // settling to idle don't produce a burst of "finished" alerts (SPECS §24).
-    let now0 = env.clock.now_millis();
-    for p in workspace.projects.iter_mut() {
-        p.state.begin_notification_grace(now0);
-    }
-
-    // Once-a-day update notice (SPECS §30): surface any cached "newer version"
-    // finding immediately and, when due, kick off a background check. Applied to
-    // every project so whichever is active shows the hint.
-    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    let check_enabled = update_check_enabled(&workspace.active_project().state);
-    if let Some(latest) =
-        crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
-    {
-        apply_update_notice(workspace, latest);
-    }
+/// The TUI's event loop: the first client of [`AppHost`]. The host services
+/// every open project (PTYs, workers, notifications, remote, web) each turn;
+/// this loop owns only what is the terminal's — reading crossterm input on a
+/// thread, mapping keys and mouse gestures, sizing terminals to the ratatui
+/// layout, drawing the frame, and suspending itself for `$EDITOR` — and routes
+/// input until the user quits or a fatal error occurs.
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, host: &mut AppHost) -> Result<()> {
+    // Grace window, update check, FlightDeck Remote and FlightDeck Web.
+    host.start();
 
     // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
     // so the caller's clean teardown (persist `state.json` + terminate agents)
@@ -2176,650 +2079,68 @@ fn event_loop(
         }
     });
 
-    // Home dir for locating agent session stores (used to pin each tab's resume
-    // session id). Resolved once; `None` disables pinning.
-    let store_home = crate::app::state::user_home();
-
-    // FlightDeck Remote (optional): a long-lived relay-client thread, mirroring
-    // the update-check thread idiom above. Off by default — when disabled this
-    // spawns nothing and the channels stay idle, so behaviour is unchanged. The
-    // `_remote_out_tx` end is retained (unused for now) because the app→relay
-    // bridge that feeds it is a later task; keeping the channel here fixes the
-    // wiring shape so that task is purely additive.
-    let (remote_in_tx, remote_in_rx) = std::sync::mpsc::channel::<RemoteInbound>();
-    let (remote_out_tx, remote_out_rx) = std::sync::mpsc::channel::<RemoteOutbound>();
-    let remote_setup = start_remote(env, workspace, remote_in_tx, remote_out_rx);
-    // The outbound feed bridge exists only while the relay thread does. It builds
-    // the phone-facing snapshots/deltas/transcript/events each tick and seals
-    // them. A passthrough sealer is the default; when an already-established
-    // pairing exists, the real E2E channel is installed right away (spec §7.1).
-    // When remote is disabled this stays `None`, so every tee/tick below is a
-    // cheap no-op and behaviour is bit-for-bit unchanged.
-    let mut remote_bridge: Option<RemoteBridge> = remote_setup
-        .as_ref()
-        .map(|_| RemoteBridge::passthrough(now0 + crate::app::state::NOTIFY_STARTUP_GRACE_MS));
-    // Locate agent session files (per worktree) for transcript reconstruction
-    // (remote-control-72k). Uses the same home the resume machinery uses.
-    if let Some(b) = remote_bridge.as_mut() {
-        b.set_transcript_home(store_home.clone());
-    }
-    if let (Some(b), Some(setup)) = (remote_bridge.as_mut(), remote_setup.as_ref()) {
-        if let Some(est) = &setup.established {
-            if let Ok((seal, open)) = build_channel(
-                &setup.identity_scalar,
-                &est.peer_ka_b64,
-                est.pairing_id.as_str(),
-                &est.claim_token,
-            ) {
-                b.install_channel(seal, open, est.last_sent_seq);
-            }
-        }
-    }
-    // The desktop pairing surface (Settings → Remote overlay). `Some` only while
-    // the QR/code overlay is on screen.
-    let mut pairing_session: Option<PairingSession> = None;
-    // Test / E2E seam (read once at startup): when `FLIGHTDECK_REMOTE_AUTOPAIR`
-    // holds a 4-digit value and remote is enabled, the desktop offers pairing
-    // non-interactively on the first tick using that fixed code, so an automated
-    // harness gets a deterministic claim token instead of a random one plus a
-    // keypress. `None` in every normal run, so behaviour is unchanged.
-    let autopair_hint: Option<String> = std::env::var("FLIGHTDECK_REMOTE_AUTOPAIR")
-        .ok()
-        .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
-    // Inbound command-bridge state: the idempotency ledger and the first tasks
-    // of phone-created sessions awaiting a ready agent. Only ever touched when
-    // the remote bridge exists, so disabled-remote behaviour is unchanged.
-    let mut remote_ledger = CommandLedger::new();
-    let mut remote_first_tasks: Vec<PendingFirstTask> = Vec::new();
-    // Whether a phone pairing was persisted at startup and has not been
-    // forgotten this session. `RemoteBridge::is_paired()` only turns true once
-    // the phone reconnects, so this keeps "Unpair Phone" available (and "Pair
-    // Phone" gated) for a configured-but-currently-absent phone. Cleared on
-    // unpair and on a relay-side pairing rejection.
-    let mut remote_has_persisted_pairing = remote_setup
-        .as_ref()
-        .map(|s| s.established.is_some())
-        .unwrap_or(false);
-
-    // FlightDeck Web (optional): the embedded browser surface. Constructed
-    // always (it is cheap and holds no buffers until the server runs) and
-    // started here only when `[web] enabled` opted in — D10 makes auto-start the
-    // TUI's decision, which is why `server::start` deliberately ignores the flag.
-    let mut web_surface = WebSurface::new(&workspace.active_project().state.config.web);
-    // Q1 addition 2's address picker, behind its trait seam. One value for the
-    // process: enumeration is a syscall, not state, and the overlay re-runs it
-    // every time it opens so a cable plugged in mid-session shows up.
-    let interfaces = crate::web::interfaces::RealInterfaceEnumerator;
-    // Test / E2E seam, debug builds only (read once at startup): when
-    // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
-    // always has *that* bootstrap code live, so the Playwright suite (D15) can
-    // exchange it in a real browser instead of screen-scraping a TUI overlay for
-    // a random one. `None` in every normal run, and absent entirely from a
-    // release build — see `WebSurface::ensure_test_bootstrap_code`.
-    #[cfg(debug_assertions)]
-    let web_test_code: Option<String> = std::env::var("FLIGHTDECK_WEB_TEST_CODE")
-        .ok()
-        .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
-    if workspace.active_project().state.config.web.enabled {
-        let config = workspace.active_project().state.config.web.clone();
-        // Deliberately no access overlay here. `[web] enabled` is a user who
-        // asked for the server on every launch, not for a modal on every
-        // launch; `Show Web Access` in the palette is how they reach the code.
-        let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now0);
-        match web_surface.start(&config, initial) {
-            Ok((addr, exposure)) => ui.message(web_started_message(addr, exposure)),
-            Err(e) => ui.message(format!("Web interface did not start: {e}")),
-        }
-    }
-
     loop {
-        let now_ms = env.clock.now_millis();
-        let active = workspace.active;
-        let n = workspace.projects.len();
+        // --- Service every project, the relay and the pairing overlay. ---
+        host.pump();
 
-        // --- Service EVERY project each tick so background projects stay live:
-        //     drain their PTYs, finalize completed worktrees, poll status files,
-        //     and fire notifications regardless of which project is on screen. ---
-        for idx in 0..n {
-            let is_active = idx == active;
-            let p = &mut workspace.projects[idx];
+        {
+            let (workspace, _env, ui) = host.tui_parts();
+            let active = workspace.active;
 
-            drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
-                // FlightDeck Web (D2): the raw chunk into this terminal's replay
-                // ring, and straight out to every attached viewer. Only while the
-                // server is running — see `WebSurface` on the memory this costs
-                // and why it is not paid by a user who never starts it.
-                web_surface.tee(sid, which, mint, bytes);
-                if let Some(b) = remote_bridge.as_mut() {
-                    // Primary (None) bytes no longer build the transcript — it is
-                    // reconstructed from the agent's session file each tick (see
-                    // `RemoteBridge::sync_transcript`, remote-control-72k), because
-                    // full-screen agents paint the alt-screen and emit no lines.
-                    // Child bytes still stream to the phone iff that child backs
-                    // the session's live remote shell.
-                    if let Some(child_index) = which {
-                        b.shell_pump(sid, child_index, bytes);
-                    }
-                }
-            });
-
-            {
-                let services = env.services(&p.git);
-                drain_create_outcomes(&p.create_rx, &mut p.state, &services, &mut ui, is_active);
-            }
-
-            // Prune cache entries for tabs that no longer exist.
-            p.cache
-                .retain(|id, _| p.state.tabs.iter().any(|t| &t.meta.id == id));
-
-            while let Ok(msg) = p.status_rx.try_recv() {
-                match msg {
-                    StatusMsg::Update(id, status) => {
-                        p.state
-                            .observe_git_status(&id, &status, env.clock.now_unix_secs());
-                        p.cache.insert(id, status);
-                    }
-                    StatusMsg::Done => p.status_in_flight = false,
+            // --- Auto-scroll the active terminal while a drag rests at an edge. ---
+            if ui.drag.is_some() {
+                if let Ok(size) = terminal.size() {
+                    autoscroll_drag(
+                        &mut workspace.projects[active].state,
+                        ui,
+                        Rect::new(0, 0, size.width, size.height),
+                    );
                 }
             }
 
-            {
-                let services = env.services(&p.git);
-                p.state.poll_status_files(&services, now_ms);
-                p.state
-                    .sync_activity(services.clock.now_unix_secs(), now_ms, is_active);
-                // Pin each freshly-launched agent's session id for later
-                // resume. A no-op unless a tab is awaiting its session file, and
-                // rate-limited to `SESSION_SCAN_INTERVAL_MS` when one is, since
-                // that wait has no deadline.
-                if let Some(home) = &store_home {
-                    p.state.pin_resumable_sessions(home, &services, now_ms);
-                }
-            }
-
-            // Prefix the project name so alerts read "project: tab" — useful
-            // when several projects are open at once (SPECS §24).
-            for mut note in p.state.take_finish_notifications(now_ms) {
-                note.title = format!("{}: {}", p.name, note.title);
-                notifier.notify(&note);
-            }
-
-            // FlightDeck Web (D11): the same lifecycle signal, recorded a second
-            // time for the browser's activity feed. Deliberately a *tee at the
-            // source* rather than a second read of the notifications above:
-            // `take_finish_notifications` spends each tab's arming and drops
-            // whatever `[notifications]` disabled or the startup grace window
-            // suppressed, so a feed built from its output would be missing
-            // exactly the events D11 exists to deliver. Running after it is
-            // therefore free of consequence for the desktop — the two keep
-            // separate per-tab edge memory — and this record happens whether or
-            // not the server is up, so a browser opened later lands on history
-            // rather than silence (`WebSurface::activity`).
-            //
-            // A finished session's row also wants the count artboard 2e shows
-            // (`finished, 18 files touched`), which only git knows: each
-            // returned request is one `git status --porcelain` on that tab's
-            // worktree, spawned here and answered into `count_tx`. This is the
-            // *only* git work the feed adds, it is per finished session rather
-            // than per tick, and the periodic cache above still refreshes the
-            // active project alone.
-            for request in record_web_transitions(&mut web_surface, p, env.clock, now_ms) {
-                spawn_finish_count(&p.git, &web_surface.count_tx, request);
-            }
-        }
-
-        // Land the finish-edge counts that came back, and let go of any row
-        // that has waited too long for one — before anything reads the feed
-        // this tick.
-        web_surface.drain_finish_counts(env.clock, now_ms);
-
-        // --- Apply a completed background update check (SPECS §30). ---
-        while let Ok(latest) = update_rx.try_recv() {
-            apply_update_notice(workspace, latest);
-        }
-
-        // --- Drain relay-client events (link state, envelopes, presence) into
-        //     the outbound bridge, then push this tick's feed. Inbound is
-        //     handled before the tick so a just-arrived `request_snapshot` /
-        //     pairing is reflected in what we send. Command envelopes beyond
-        //     snapshot/transcript requests are queued for the command-bridge
-        //     task via `RemoteBridge::take_pending_commands`. ---
-        if let Some(b) = remote_bridge.as_mut() {
-            let identity_scalar = remote_setup
-                .as_ref()
-                .map(|s| s.identity_scalar.as_slice())
-                .unwrap_or(&[]);
-            while let Ok(msg) = remote_in_rx.try_recv() {
-                // Drive the pairing overlay + E2E go-live off the pairing frames.
-                match &msg {
-                    RemoteInbound::PairingOffered {
-                        pairing_id,
-                        claim_token,
-                        expires_at_ms,
-                    } => {
-                        if let Some(ps) = pairing_session.as_mut() {
-                            ps.on_offered(pairing_id.clone(), claim_token.clone(), *expires_at_ms);
-                        }
-                    }
-                    RemoteInbound::PairingClaimed {
-                        pairing_id,
-                        peer_key_agreement_public_key,
-                        ..
-                    } => {
-                        if let Some(ps) = pairing_session.as_mut() {
-                            if ps.on_claimed(
-                                pairing_id.clone(),
-                                peer_key_agreement_public_key.clone(),
-                            ) {
-                                // The instant a phone joins: derive the real
-                                // channel and swap it in for the passthrough.
-                                if let Ok((_pid, seal, open)) = ps.derive_channel(identity_scalar) {
-                                    b.install_channel(seal, open, 0);
-                                }
-                            }
-                        }
-                    }
-                    RemoteInbound::HandshakeFailed { reason, retrying } => {
-                        // The relay link never reached `auth_ok`, so no pairing
-                        // code can arrive. Tell the overlay why: a refusal (no
-                        // relay password configured, for instance) fails the
-                        // attempt, a transient failure just explains the wait.
-                        // Without this the overlay showed "Requesting a pairing
-                        // code from the relay…" forever while the client
-                        // backoff-looped in silence.
-                        if let Some(ps) = pairing_session.as_mut() {
-                            ps.on_handshake_failed(reason, *retrying);
-                        }
-                    }
-                    RemoteInbound::PairingRejected { .. } => {
-                        // The relay no longer recognizes our pairing; the client
-                        // dropped the stale record and will re-offer. Give the
-                        // user a clear, actionable state instead of a silent,
-                        // endless "reconnecting" (remote-control-1jy).
-                        pairing_session = None;
-                        remote_has_persisted_pairing = false;
-                        if matches!(ui.overlay, UiOverlay::Remote(_)) {
-                            ui.overlay = UiOverlay::None;
-                        }
-                        ui.message(
-                            "Phone pairing is no longer recognized by the relay. \
-                             Open Settings → Remote to pair again.",
-                        );
-                    }
-                    RemoteInbound::PairingRevoked { .. } => {
-                        // The phone unpaired this Mac (spec §10.2). The client
-                        // already dropped the pairing; clear the overlay/session
-                        // and let the user know they can pair again.
-                        pairing_session = None;
-                        remote_has_persisted_pairing = false;
-                        if matches!(ui.overlay, UiOverlay::Remote(_)) {
-                            ui.overlay = UiOverlay::None;
-                        }
-                        ui.message(
-                            "Your phone unpaired this Mac. \
-                             Open Settings → Remote to pair again.",
-                        );
-                    }
-                    _ => {}
-                }
-                b.handle_inbound(msg);
-            }
-            {
-                let views: Vec<ProjectView> = workspace
-                    .projects
-                    .iter()
-                    .map(|p| ProjectView {
-                        id: ProjectId::new(p.name.clone()),
-                        name: &p.name,
-                        state: &p.state,
-                        cache: &p.cache,
-                    })
-                    .collect();
-                b.tick(&views, now_ms, &mut |out| {
-                    let _ = remote_out_tx.send(out);
-                });
-            }
-            // Inbound phone commands queued by the bridge: idempotency-check,
-            // translate, execute on this (main) thread through the existing
-            // Command/PTY paths, and ack each with its actual outcome.
-            service_remote_commands(
-                b,
-                &mut remote_ledger,
-                &mut remote_first_tasks,
-                workspace,
-                env,
-                now_ms,
-                &mut |out| {
-                    let _ = remote_out_tx.send(out);
-                },
-            );
-        } else {
-            // Remote disabled: drain (and drop) so the channel never fills.
-            while remote_in_rx.try_recv().is_ok() {}
-        }
-
-        // --- Test / E2E seam: on the first tick, auto-offer pairing with the
-        //     fixed `FLIGHTDECK_REMOTE_AUTOPAIR` code when set and remote is
-        //     enabled. This just requests the same offer the palette action does. ---
-        if tick == 0 && autopair_hint.is_some() && remote_setup.is_some() {
-            ui.pending_pair = true;
-        }
-
-        // A confirmed unpair (handled by `drive_pairing_overlay` below) forgets
-        // the pairing, so drop the persisted flag before it is consumed.
-        if ui.pending_unpair {
-            remote_has_persisted_pairing = false;
-        }
-        // Refresh the palette's pairing gate: paired iff the live bridge has an
-        // active pairing or a persisted one is still configured this session.
-        ui.remote_paired = remote_bridge
-            .as_ref()
-            .map(|b| b.is_paired())
-            .unwrap_or(false)
-            || remote_has_persisted_pairing;
-
-        // --- Desktop pairing surface (Settings → Remote): start an offer, keep
-        //     the overlay in sync with the pairing session, and handle unpair. ---
-        drive_pairing_overlay(
-            &mut ui,
-            &mut pairing_session,
-            remote_bridge.as_mut(),
-            remote_setup.as_ref(),
-            &remote_out_tx,
-            autopair_hint.as_deref(),
-            now_ms,
-        );
-
-        // --- Refresh the git-status cache for the ACTIVE project only (it is
-        //     the only one whose sidebar/info bar is on screen). ---
-        if tick.is_multiple_of(GIT_REFRESH_EVERY) {
-            let p = &mut workspace.projects[active];
-            if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
-                p.status_in_flight = true;
-            }
-        }
-        tick = tick.wrapping_add(1);
-
-        // --- Auto-scroll the active terminal while a drag rests at an edge. ---
-        if ui.drag.is_some() {
+            // --- Keep the active tab's terminals sized to the current layout. ---
             if let Ok(size) = terminal.size() {
-                autoscroll_drag(
+                sync_terminal_sizes(
                     &mut workspace.projects[active].state,
-                    &ui,
-                    Rect::new(0, 0, size.width, size.height),
+                    PtySize {
+                        rows: size.height,
+                        cols: size.width,
+                    },
                 );
             }
         }
 
-        // --- Keep the active tab's terminals sized to the current layout. ---
-        if let Ok(size) = terminal.size() {
-            sync_terminal_sizes(
-                &mut workspace.projects[active].state,
-                PtySize {
-                    rows: size.height,
-                    cols: size.width,
-                },
-            );
-        }
-
-        // --- FlightDeck Web: drain what the browsers said, then publish the
-        //     state and the deltas that describe how it changed.
-        //
-        //     Ordering matters and is deliberate. Inbound is drained *first*, so
-        //     a selection the browser just moved (D3) is reflected in the state
-        //     published on this same tick rather than a tick later. And publish
-        //     comes after `sync_terminal_sizes` above, so the geometry the
-        //     browser letterboxes is the grid the PTY actually has (D4). ---
-        if web_surface.running() {
-            let inbound: Vec<crate::web::server::WebInbound> =
-                web_surface.inbound_rx.try_iter().collect();
-            for event in inbound {
-                // A `Command` frame is the browser's palette pressing Enter:
-                // `run_web_command` routes it into the same `run_palette_action`
-                // the desktop's own palette calls, and answers with the ack that
-                // dispatch earned. The server has already refused an unknown
-                // name, a read-only seat's frame (D14) and every command whose
-                // effect must not land for a browser (D16, including `quit`), so
-                // reaching here means a controller sent something runnable.
-                if let crate::web::server::WebInbound::Command {
-                    viewer_id,
-                    label,
-                    command,
-                } = &event
-                {
-                    // D13: a dialog this command opens is tagged with the seat
-                    // that asked, so the desktop can say `opened from browser ·
-                    // 192.168.2.20` about a modal nobody at this keyboard
-                    // requested.
-                    let origin = crate::web::protocol::DialogOrigin::Browser {
-                        viewer_id: Some(viewer_id.clone()),
-                        label: label.clone(),
-                    };
-                    let reply = run_web_command(
-                        command,
-                        &origin,
-                        workspace,
-                        env,
-                        &mut ui,
-                        &mut web_surface.activity,
-                    );
-                    if let Some(handle) = web_surface.handle.as_ref() {
-                        handle.send(crate::web::server::WebOutbound::Viewer {
-                            viewer_id: viewer_id.clone(),
-                            msg: crate::web::protocol::ServerMsg::Ack(reply.ack),
-                        });
-                        // SPECS §21's panel, to the viewer that asked and to no
-                        // other (§6.5 R16). After the ack, so a browser that
-                        // reads frames in order learns the command landed
-                        // before it is handed what the command produced.
-                        if let Some(view) = reply.git_status {
-                            handle.send(crate::web::server::WebOutbound::Viewer {
-                                viewer_id: viewer_id.clone(),
-                                msg: crate::web::protocol::ServerMsg::GitStatus(view),
-                            });
-                        }
-                        // SPECS §8's manager, likewise to the viewer that
-                        // asked and after the ack (§6.5 R22).
-                        if let Some(view) = reply.config {
-                            handle.send(crate::web::server::WebOutbound::Viewer {
-                                viewer_id: viewer_id.clone(),
-                                msg: crate::web::protocol::ServerMsg::Configuration(view),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                let mut host = WorkspaceTerminals {
-                    projects: &mut workspace.projects,
-                };
-                let out = web_surface.streams.apply_inbound(&event, &mut host);
-                if let Some(handle) = web_surface.handle.as_ref() {
-                    for frame in out {
-                        handle.send(frame);
-                    }
-                }
-            }
-
-            let activity = web_surface.activity_events(env.clock);
-            let next = build_web_host_state(
-                workspace,
-                &web_surface.streams,
-                activity,
-                web_dialog_view(
-                    &ui,
-                    &workspace.active_project().name,
-                    &workspace.active_project().state,
-                ),
-                now_ms,
-            );
-            let decided = std::mem::take(&mut ui.dialog_decisions);
-            if next != web_surface.published {
-                // Publish, *then* the matching deltas: publishing changes what
-                // the next attach sees and notifies nobody, deliberately, so the
-                // host is the one that says what changed (see `HostState`).
-                let mut frames = crate::web::stream::deltas(&web_surface.published, &next);
-                // D13: the diff can only say `Superseded` about a dialog that is
-                // gone. Where somebody actually decided, say so.
-                resolve_dialog_outcomes(&mut frames, &decided);
-                if let Some(handle) = web_surface.handle.as_ref() {
-                    handle.publish_state(next.clone());
-                    for delta in frames {
-                        handle.send(crate::web::server::WebOutbound::All(
-                            crate::web::protocol::ServerMsg::Delta(delta),
-                        ));
-                    }
-                }
-                web_surface.published = next;
-            }
-        }
-        // Drained whether or not anyone is watching (D13). A desktop-only run
-        // still decides dialogs, and a list nobody ever reads would grow for the
-        // life of the process — so the take above is paired with a clear here
-        // rather than living inside the `running()` branch.
-        ui.dialog_decisions.clear();
-
-        // --- Start / stop the web interface, when the palette asked (D10). ---
-        if ui.pending_web_start {
-            ui.pending_web_start = false;
-            let config = workspace.active_project().state.config.web.clone();
-            let initial = web_host_state_now(workspace, &mut web_surface, &ui, env.clock, now_ms);
-            match web_surface.start(&config, initial) {
-                // The access overlay carries the bound address *and* D5's
-                // warning in a stronger form than this one line does, so when
-                // it is about to open the line would only be overwritten by it
-                // — and a message the user never sees is worse than no message.
-                Ok((addr, exposure)) => {
-                    if !ui.pending_web_access_open {
-                        ui.message(web_started_message(addr, exposure));
-                    }
-                }
-                Err(e) => {
-                    ui.pending_web_access_open = false;
-                    ui.message(format!("Web interface did not start: {e}"));
-                }
-            }
-        }
-        if ui.pending_web_stop {
-            ui.pending_web_stop = false;
-            if web_surface.running() {
-                web_surface.stop(crate::web::server::ShutdownNotice::server_stopped());
-                ui.web_access = None;
-                ui.message("Web interface stopped.".to_string());
-            }
-        }
-        // A revocation is two halves, and this is the one the listener owns: the
-        // key handler took the credentials away, and this closes the sockets
-        // that were still using them (§6.5 R20). Nothing is reported back — the
-        // overlay's own notice already says what was revoked, and a second
-        // sentence from here would be the desktop congratulating itself.
-        if std::mem::take(&mut ui.pending_web_recheck_credentials) {
-            if let Some(handle) = web_surface.handle.as_ref() {
-                handle.recheck_credentials();
-            }
-        }
-
-        // --- The access overlay (D5, Q1; design 2a). --------------------------
-        //
-        // Everything the overlay cannot do for itself happens here, because
-        // everything it cannot do for itself needs the listener: rebinding
-        // between its two states, and knowing what address was actually bound.
-        // The store handle is republished every tick so the key handler can
-        // mint against exactly the store the server verifies against, and is
-        // withdrawn the moment there is no server — an overlay describing a
-        // binding that no longer exists is the thing this whole surface is
-        // meant to prevent.
-        ui.web_credentials = web_surface
-            .running()
-            .then(|| Arc::clone(&web_surface.credentials));
-        if let Some(bind) = ui.pending_web_rebind.take() {
-            rebind_web_interface(
-                workspace,
-                &mut web_surface,
-                &mut ui,
-                &interfaces,
-                env.clock,
-                now_ms,
-                bind,
-            );
-        }
-        if std::mem::take(&mut ui.pending_web_access_open) {
-            open_web_access_overlay(&mut web_surface, &mut ui, &interfaces);
-        }
-        #[cfg(debug_assertions)]
-        if let Some(digits) = web_test_code.as_deref() {
-            web_surface.ensure_test_bootstrap_code(digits);
-        }
-        // Rebuilt every tick, which is what makes the countdown move without the
-        // renderer touching a credential — the same contract the phone pairing
-        // overlay has with `remote_pairing_view`.
-        refresh_web_access_overlay(&mut web_surface, &mut ui);
-        ui.web_running = web_surface.running();
-
-        // --- The input lock (D14 as revised). ---------------------------------
-        //
-        // The desktop is one of the writers, so it holds the same lock every
-        // browser does and reads it from the same place. Three things happen
-        // here, all once per tick:
-        //
-        //   1. The handle is picked up (or dropped) as the server starts and
-        //      stops, so `write_active_pty` has something to claim through —
-        //      and, when the server is stopped, deliberately does not.
-        //   2. `sync_input_lock` retires a holder that has gone quiet. Nobody
-        //      *causes* an expiry, so without a tick nothing would announce it
-        //      and both surfaces would keep naming somebody who stopped typing.
-        //   3. The palette's explicit override is applied, and only here: it is
-        //      the one act that may cut into a live burst.
-        match web_surface.handle.as_ref() {
-            Some(handle) => {
-                if ui.input_lock.is_none() {
-                    ui.input_lock = Some(handle.input_lock());
-                }
-                if std::mem::take(&mut ui.pending_input_preempt) {
-                    let message = match handle.preempt_input_for_desktop(now_ms as i64) {
-                        Some(interrupted) => {
-                            format!("Input lock taken from {interrupted}.")
-                        }
-                        // Nobody was mid-burst. Say what happened rather than
-                        // implying somebody was interrupted.
-                        None => "Input lock held by this desktop.".to_string(),
-                    };
-                    ui.message(message);
-                }
-                handle.sync_input_lock(now_ms as i64);
-                // Named only while somebody else could be typing: with no
-                // browser seated as a writer the chip would be permanent noise
-                // about a contest that cannot happen.
-                ui.input_holder = web_input_holder(handle);
-            }
-            None => {
-                ui.pending_input_preempt = false;
-                ui.input_lock = None;
-                ui.input_holder = None;
-            }
-        }
+        // --- FlightDeck Web in and out, the web lifecycle, the input lock.
+        //     After the size sync above, so the geometry a browser letterboxes
+        //     is the grid the PTY actually has (D4). ---
+        host.publish();
 
         // --- Render: the project tab row (workspace-level) plus the active
         //     project's full UI. The project row is painted first so any
         //     centered overlay drawn by `draw` still wins on tiny screens. ---
-        let overlay = ui.render_overlay();
-        let input_holder = ui.input_holder.as_deref();
-        let infos = workspace.tab_infos(now_ms);
-        let active_idx = workspace.active;
-        let p = &workspace.projects[active_idx];
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                let chrome = crate::tui::layout::chrome_for(area, p.state.mode());
-                let ml = crate::tui::layout::compute(
-                    area,
-                    chrome,
-                    crate::tui::mode_style::border_enabled(&p.state.config.ui),
-                    p.state.config.ui.agent_tab_side(),
-                );
-                draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
-                draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
-            })
-            .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
+        let now_ms = host.now_ms();
+        {
+            let (workspace, ui) = host.view();
+            let overlay = ui.render_overlay();
+            let input_holder = ui.input_holder.as_deref();
+            let infos = workspace.tab_infos(now_ms);
+            let active_idx = workspace.active;
+            let p = &workspace.projects[active_idx];
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let chrome = crate::tui::layout::chrome_for(area, p.state.mode());
+                    let ml = crate::tui::layout::compute(
+                        area,
+                        chrome,
+                        crate::tui::mode_style::border_enabled(&p.state.config.ui),
+                        p.state.config.ui.agent_tab_side(),
+                    );
+                    draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
+                    draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
+                })
+                .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;
+        }
 
         // --- Wait for input via the reader thread (short timeout so PTY output
         //     keeps flowing and the shutdown flag is observed promptly). ---
@@ -2831,7 +2152,8 @@ fn event_loop(
 
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_key(key, workspace, env, &mut ui)? {
+                let (workspace, env, ui) = host.tui_parts();
+                if handle_key(key, workspace, env, ui)? {
                     break; // Quit requested via the Ctrl-q key action.
                 }
             }
@@ -2840,58 +2162,42 @@ fn event_loop(
                     Ok(s) => Rect::new(0, 0, s.width, s.height),
                     Err(_) => continue,
                 };
-                handle_mouse(me, area, workspace, env, &mut ui);
+                let (workspace, env, ui) = host.tui_parts();
+                handle_mouse(me, area, workspace, env, ui);
             }
             Event::Paste(data) => {
-                handle_paste(data, workspace, env, &mut ui)?;
+                host.handle(HostEvent::Paste(data))?;
             }
             Event::Resize(cols, rows) => {
                 let full = PtySize { rows, cols };
-                // Resize every project's sessions so a background agent's output
-                // wraps correctly the moment the user switches back to it.
-                for p in workspace.projects.iter_mut() {
-                    let reserve = crate::tui::mode_style::border_enabled(&p.state.config.ui);
-                    let size = viewport_pty_size(full, p.state.mode(), reserve);
-                    p.state.set_pty_size(size);
-                    resize_sessions(&mut p.state, size);
-                }
+                // Each project's viewport follows its own border setting and
+                // input mode, so the per-project size is the layout's call.
+                host.resize_projects(|state| {
+                    let reserve = crate::tui::mode_style::border_enabled(&state.config.ui);
+                    viewport_pty_size(full, state.mode(), reserve)
+                });
             }
             _ => {}
         }
 
         // --- Hand off queued worktree-creation jobs to the owning project's
         //     background worker so `git worktree add` never blocks the loop. ---
-        for pj in ui.pending_jobs.drain(..) {
-            if let Some(p) = workspace.projects.get(pj.project) {
-                spawn_worktree_job(pj.job, &p.git, &p.git_lock, &p.create_tx);
-            }
-        }
+        host.after_input();
 
         // --- Open a config file in $EDITOR if requested (SPECS §8). Done here,
         //     where we own the terminal to suspend/restore, then reload every
         //     project's effective config to pick up any edits. ---
-        if let Some((_project, path)) = ui.pending_editor.take() {
+        if let Some(path) = host.take_pending_editor() {
             if let Err(e) = open_in_editor(terminal, &path) {
-                ui.message(format!("Editor failed: {e}"));
+                host.message(format!("Editor failed: {e}"));
             }
-            reload_all_projects_config(workspace, env);
+            host.reload_config();
         }
 
         // A dispatched Effect::Quit (e.g. the "Quit" palette action) also exits.
-        if ui.should_quit {
+        if host.should_quit() {
             break;
         }
-    }
-
-    // Tell any attached browser that FlightDeck itself is going away, before the
-    // listener closes (Q5), so it enters a terminal state instead of spinning in
-    // "reconnecting…" against a host that no longer exists.
-    web_surface.stop(crate::web::server::ShutdownNotice::host_quit(None));
-
-    // Tear down the relay client (best-effort join). A dropped handle also
-    // signals the thread, so an early `?` return above still winds it down.
-    if let Some(setup) = remote_setup {
-        setup.handle.stop();
     }
 
     Ok(())
@@ -4302,15 +3608,18 @@ fn spawn_worktree_job(
 
 /// Drain finished worktree-creation jobs and reflect them in [`AppState`]:
 /// finalize (spawn the agent, flip to Ready) on success, or remove the
-/// placeholder tab and surface the error on failure.
+/// placeholder tab and surface the error on failure. Returns whether any
+/// outcome landed, which is [`AppHost::pump`]'s cue that the tab row changed.
 fn drain_create_outcomes(
     create_rx: &Receiver<CreateOutcome>,
     state: &mut AppState,
     services: &Services,
     ui: &mut Ui,
     is_active: bool,
-) {
+) -> bool {
+    let mut drained = false;
     while let Ok(outcome) = create_rx.try_recv() {
+        drained = true;
         match outcome.result {
             Ok(()) => match state.finalize_new_tab(&outcome.tab_id, services) {
                 // Finalize (spawn the agent, flip to Ready) happens regardless of
@@ -4341,6 +3650,7 @@ fn drain_create_outcomes(
             }
         }
     }
+    drained
 }
 
 /// Snapshot every [`TabPhase::Ready`] tab's parameters and spawn a single
@@ -14914,6 +14224,7 @@ mod tests {
             AgentDef, InterpretedStatus, ProjectState as CoreProjectState, StatusPatterns,
             TabState, STATE_VERSION,
         };
+        use crate::host::GIT_REFRESH_EVERY;
         use crate::testing::FakeGit;
 
         /// An agent whose command basename `status_backend` recognises, so
