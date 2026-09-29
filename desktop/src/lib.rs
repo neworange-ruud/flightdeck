@@ -6,3 +6,7 @@
 //! The binary (`main.rs`) owns the window and views.
 
 pub mod keys;
+pub mod overlays;
+// The palette lives in the library (the binary re-uses it) because the overlay
+// views paint with it and are tested here, without a window.
+pub mod theme;

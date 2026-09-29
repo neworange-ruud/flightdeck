@@ -5,7 +5,7 @@
 
 mod app;
 mod terminal;
-mod theme;
+use flightdeck_desktop::theme;
 mod views;
 
 fn main() {
