@@ -810,6 +810,18 @@ impl TranscriptBuilder {
         (self.prompt_seq > 0)
             .then(|| PromptId::new(format!("{}:p{}", self.session_id, self.prompt_seq)))
     }
+
+    /// The most recently minted prompt's item — exactly what the phone was
+    /// sent for it — or `None` before any prompt (or once it has aged out of
+    /// the ring, which a session still waiting on it cannot do: nothing is
+    /// appended while the agent waits). The desktop's inline answers read it
+    /// (`RemoteBridge::surfaced_prompt`), so they offer what the phone offers.
+    pub fn last_prompt(&self) -> Option<&TranscriptItem> {
+        let id = self.last_prompt_id()?;
+        self.items.iter().rev().find(|item| {
+            matches!(item, TranscriptItem::PermissionPrompt { prompt_id, .. } if *prompt_id == id)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

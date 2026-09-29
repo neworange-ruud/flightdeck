@@ -1713,3 +1713,5 @@ mod front_end_reads {
         assert_eq!(host.project_count(), 1);
     }
 }
+
+mod prompts;

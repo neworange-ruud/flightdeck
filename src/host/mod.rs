@@ -50,11 +50,12 @@ use crate::remote::commands::{CommandLedger, PendingFirstTask};
 use crate::remote::pairing::{build_channel, PairingSession};
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::{
-    apply_host_event, apply_update_notice, build_web_host_state, cleanup_isolated_run,
-    drain_create_outcomes, drain_pty_output, drive_pairing_overlay, isolated_status_dir,
-    open_project, open_web_access_overlay, persist_quietly, rebind_web_interface,
-    record_web_transitions, refresh_web_access_overlay, reload_all_projects_config,
-    resize_workspace, resolve_dialog_outcomes, service_remote_commands, spawn_finish_count,
+    answer_prompt, apply_host_event, apply_update_notice, build_web_host_state,
+    cleanup_isolated_run, drain_create_outcomes, drain_pty_output, drive_pairing_overlay,
+    flush_deferred_pty, isolated_status_dir, open_project, open_web_access_overlay,
+    persist_quietly, prompt_for, rebind_web_interface, record_web_transitions,
+    refresh_web_access_overlay, reload_all_projects_config, resize_workspace,
+    resolve_dialog_outcomes, service_remote_commands, session_index, spawn_finish_count,
     spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
     terminate_all_sessions, update_check_enabled, web_dialog_view, web_host_state_now,
     web_input_holder, web_started_message, Env, RemoteSetup, StatusMsg, Ui, WebSurface, Workspace,
@@ -82,6 +83,10 @@ mod tests;
 /// roughly the front-end's poll interval when idle — 50 ms in the TUI). Kept
 /// coarse so we never block the UI.
 pub const GIT_REFRESH_EVERY: u64 = 40;
+
+/// How many prompts answered from this desktop the host remembers (see
+/// `AppHost::answered_prompts`): far more than can be waiting at once.
+const ANSWERED_PROMPTS_KEPT: usize = 64;
 
 /// One front-end-neutral input for [`AppHost::handle`].
 ///
@@ -132,6 +137,14 @@ pub enum HostEvent {
     /// folder outside any git repository is refused with a notification — and
     /// refused outright in an isolated run, like the palette's Open Project.
     OpenProject(PathBuf),
+    /// Answer the prompt a waiting session shows (a Mission control tile's
+    /// Approve / Deny or option button; see [`AppHost::track_prompts`]). Runs
+    /// through the phone's own translator and keystroke queue, so it types
+    /// what a phone tap would, and claims the input lock first like
+    /// [`HostEvent::TerminalInput`]. A reply to a prompt that is no longer
+    /// pending is refused with a notification. A no-op while prompts are not
+    /// tracked.
+    AnswerPrompt(crate::view::PromptReply),
 }
 
 /// The projects remembered from the last session that still exist, the one
@@ -183,6 +196,18 @@ pub struct AppHost<'a> {
     remote_out_tx: Sender<RemoteOutbound>,
     remote_setup: Option<RemoteSetup>,
     remote_bridge: Option<RemoteBridge>,
+    /// A never-paired bridge that only detects prompts, for a front-end that
+    /// asked for them ([`AppHost::track_prompts`]) while FlightDeck Remote is
+    /// off. `None` whenever `remote_bridge` exists: that one already runs the
+    /// same detection, and two would race over the agents' prompt sidecars
+    /// (each consumes them on the needs-input edge).
+    local_prompts: Option<RemoteBridge>,
+    /// Prompts answered from this desktop (their ids, newest last, at most
+    /// [`ANSWERED_PROMPTS_KEPT`]). A session stays "waiting" until its agent
+    /// reports otherwise, so without this the answered prompt would still be
+    /// offered — and a second click would type its keys into whatever the
+    /// agent shows next.
+    answered_prompts: std::collections::VecDeque<String>,
     /// The desktop pairing surface (Settings → Remote overlay). `Some` only
     /// while the QR/code overlay is on screen.
     pairing_session: Option<PairingSession>,
@@ -309,6 +334,8 @@ impl<'a> AppHost<'a> {
             remote_out_tx,
             remote_setup: None,
             remote_bridge: None,
+            local_prompts: None,
+            answered_prompts: std::collections::VecDeque::new(),
             pairing_session: None,
             autopair_hint: None,
             remote_ledger: CommandLedger::new(),
@@ -396,6 +423,8 @@ impl<'a> AppHost<'a> {
             // (remote-control-72k). Uses the same home the resume machinery uses.
             if let Some(b) = self.remote_bridge.as_mut() {
                 b.set_transcript_home(self.store_home.clone());
+                // The relay's bridge detects prompts from now on.
+                self.local_prompts = None;
             }
             if let (Some(b), Some(setup)) =
                 (self.remote_bridge.as_mut(), self.remote_setup.as_ref())
@@ -793,6 +822,24 @@ impl<'a> AppHost<'a> {
         } else {
             // Remote disabled: drain (and drop) so the channel never fills.
             while self.remote_in_rx.try_recv().is_ok() {}
+            // Prompt tracking without the relay (`track_prompts`): the same
+            // edge detection the relay's bridge runs, sending nothing (it is
+            // never paired), plus the keystroke queue a desktop answer may
+            // have filled.
+            if let Some(b) = self.local_prompts.as_mut() {
+                let views: Vec<ProjectView> = workspace
+                    .projects
+                    .iter()
+                    .map(|p| ProjectView {
+                        id: ProjectId::new(p.name.clone()),
+                        name: &p.name,
+                        state: &p.state,
+                        cache: &p.cache,
+                    })
+                    .collect();
+                b.tick(&views, now_ms, &mut |_| {});
+                flush_deferred_pty(b, workspace, now_ms);
+            }
         }
 
         // --- Test / E2E seam: on the first tick, auto-offer pairing with the
@@ -1112,6 +1159,30 @@ impl<'a> AppHost<'a> {
     /// dialog does not show, a palette row it does not offer); the latter
     /// changes nothing.
     pub fn handle(&mut self, event: HostEvent) -> Result<()> {
+        if let HostEvent::AnswerPrompt(reply) = &event {
+            // Needs the bridge whose prompt ids the answer is checked
+            // against, which `apply_host_event` does not see.
+            let bridge = self.remote_bridge.as_mut().or(self.local_prompts.as_mut());
+            // A repeat click on a prompt already answered here does nothing.
+            let fresh = !self.answered_prompts.contains(&reply.prompt_id);
+            if let (Some(bridge), true) = (bridge, fresh) {
+                if answer_prompt(
+                    bridge,
+                    &mut self.workspace,
+                    &self.env,
+                    &mut self.ui,
+                    &mut self.remote_first_tasks,
+                    reply,
+                ) {
+                    self.answered_prompts.push_back(reply.prompt_id.clone());
+                    while self.answered_prompts.len() > ANSWERED_PROMPTS_KEPT {
+                        self.answered_prompts.pop_front();
+                    }
+                }
+            }
+            self.after_input();
+            return Ok(());
+        }
         // The same function the TUI's key map resolves into (`handle_key`), so
         // the two front-ends share one meaning per action.
         let result = apply_host_event(event, &mut self.workspace, &self.env, &mut self.ui);
@@ -1304,8 +1375,46 @@ impl<'a> AppHost<'a> {
         crate::view::git_strip_view(&p.state, &p.cache)
     }
 
+    /// Detect the prompts waiting sessions show, so [`AppHost::mission_view`]
+    /// can offer inline answers ([`crate::view::MissionTile::prompt`]) and
+    /// [`HostEvent::AnswerPrompt`] can deliver them. For a front-end that draws
+    /// them (the desktop app); the TUI does not call it, and pays nothing.
+    ///
+    /// The detection is FlightDeck Remote's — the needs-input edge, the
+    /// agents' prompt sidecars, the Claude session-file ingest — so a tile
+    /// offers exactly what the phone would. With Remote on, its bridge already
+    /// runs it; with Remote off, this keeps a never-paired bridge that runs
+    /// only that part (it transmits nothing). Idempotent.
+    pub fn track_prompts(&mut self) {
+        if self.remote_bridge.is_none() && self.local_prompts.is_none() {
+            let mut bridge = RemoteBridge::passthrough(0);
+            bridge.set_transcript_home(self.store_home.clone());
+            self.local_prompts = Some(bridge);
+        }
+    }
+
+    /// The prompt session `tab_id` of project `project` is waiting on, when
+    /// prompts are tracked ([`AppHost::track_prompts`]) and one was detected:
+    /// its inline answers, or [`crate::view::PromptShape::Unsupported`] when it
+    /// has to be answered in the session itself. `None` when the session is
+    /// not waiting on a detected prompt (or its agent is not running).
+    pub fn pending_prompt(&self, project: usize, tab_id: &str) -> Option<crate::view::PromptView> {
+        let bridge = self
+            .remote_bridge
+            .as_ref()
+            .or(self.local_prompts.as_ref())?;
+        let index = session_index(&self.workspace, bridge, self.now_ms);
+        self.unanswered(prompt_for(&index, bridge, project, tab_id))
+    }
+
+    /// `view`, unless it was answered from here already.
+    fn unanswered(&self, view: Option<crate::view::PromptView>) -> Option<crate::view::PromptView> {
+        view.filter(|v| !self.answered_prompts.contains(&v.prompt_id))
+    }
+
     /// Mission control (designs A2/A3) over every open project, under the
     /// persisted scope ([`AppHost::workspace_ui`]), against the host clock.
+    /// With prompts tracked, each waiting tile carries its prompt.
     pub fn mission_view(&self) -> crate::view::MissionView {
         let sources: Vec<crate::view::MissionSource<'_>> = self
             .workspace
@@ -1318,12 +1427,24 @@ impl<'a> AppHost<'a> {
                 git: &p.cache,
             })
             .collect();
-        crate::view::mission_view(
+        let mut view = crate::view::mission_view(
             &sources,
             &self.workspace_ui.mission_scope,
             self.now_ms,
             self.now_unix_secs(),
-        )
+        );
+        if let Some(bridge) = self.remote_bridge.as_ref().or(self.local_prompts.as_ref()) {
+            let index = session_index(&self.workspace, bridge, self.now_ms);
+            for tile in view.tiles.iter_mut().filter(|t| t.needs_you) {
+                tile.prompt = self.unanswered(prompt_for(
+                    &index,
+                    bridge,
+                    tile.key.project,
+                    &tile.key.tab_id,
+                ));
+            }
+        }
+        view
     }
 
     /// The terminal Agent Tab `tab_id` of project `project` has on screen —

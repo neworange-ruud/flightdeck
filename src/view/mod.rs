@@ -23,6 +23,7 @@ pub mod git_strip;
 pub mod mission;
 pub mod mode_bar;
 pub mod project;
+pub mod prompt;
 
 pub use agent::{
     agent_badge, agent_row_view, agent_row_views, agent_status_text, format_elapsed,
@@ -36,3 +37,7 @@ pub use mission::{
 };
 pub use mode_bar::{mode_bar_view, HintAction, HintView, ModeBarView};
 pub use project::{project_tab_view, ProjectStatus, ProjectTabView};
+pub use prompt::{
+    prompt_view, PromptAnswer, PromptButton, PromptReply, PromptShape, PromptView,
+    MAX_INLINE_OPTIONS,
+};

@@ -2946,17 +2946,7 @@ fn service_remote_commands(
     now_ms: u64,
     send: &mut dyn FnMut(RemoteOutbound),
 ) {
-    // Flush any deferred keystrokes now due — e.g. Claude's multi-select submit
-    // Enter, held back until the Tab-driven Confirm-tab switch has rendered so
-    // the Ink TUI does not drop it (remote-control-dc9). Re-resolve the tab
-    // since indices may have shifted during the delay.
-    for (session_id, bytes) in bridge.take_due_deferred_pty(now_ms) {
-        if let Some((pi, ti)) = resolve_primary_tab(workspace, &session_id) {
-            if let Some(p) = workspace.projects.get_mut(pi) {
-                let _ = write_primary_pty(&mut p.state, ti, &bytes);
-            }
-        }
-    }
+    flush_deferred_pty(bridge, workspace, now_ms);
 
     for cmd in bridge.take_pending_commands() {
         // Idempotency: a retransmitted command id is acked, never re-applied.
@@ -2966,63 +2956,10 @@ fn service_remote_commands(
         }
         // A fresh index per command: an earlier command in this batch may have
         // closed a tab and shifted indices.
-        let index = {
-            let views: Vec<ProjectView> = workspace
-                .projects
-                .iter()
-                .map(|p| ProjectView {
-                    id: ProjectId::new(p.name.clone()),
-                    name: &p.name,
-                    state: &p.state,
-                    cache: &p.cache,
-                })
-                .collect();
-            build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
-        };
+        let index = session_index(workspace, bridge, now_ms);
         let translation = translate(&cmd.body, &index);
-        let (outcome, message) = match translation {
-            // Timed keystroke sequence: write the first chunk now and queue the
-            // rest at increasing due times so Claude's Ink TUI re-renders between
-            // keys (remote-control-dc9). The queued chunks flush on later ticks.
-            Translation::PtyInputSequence {
-                project,
-                tab,
-                session_id,
-                chunks,
-                step_delay_ms,
-            } => match workspace.projects.get_mut(project) {
-                None => remote_target_gone(),
-                Some(p) => {
-                    let first_ok = chunks
-                        .first()
-                        .map(|c| write_primary_pty(&mut p.state, tab, c))
-                        .unwrap_or(true);
-                    if first_ok {
-                        for (i, chunk) in chunks.iter().enumerate().skip(1) {
-                            bridge.enqueue_deferred_pty(
-                                session_id.clone(),
-                                now_ms + (i as u64) * step_delay_ms,
-                                chunk.clone(),
-                            );
-                        }
-                        (CommandOutcome::Applied, None)
-                    } else {
-                        (
-                            CommandOutcome::Failed,
-                            Some("could not write to the agent terminal".to_string()),
-                        )
-                    }
-                }
-            },
-            other => execute_remote_translation(
-                other,
-                workspace,
-                env,
-                now_ms,
-                first_tasks,
-                bridge.shells_mut(),
-            ),
-        };
+        let (outcome, message) =
+            execute_queued_translation(translation, bridge, workspace, env, now_ms, first_tasks);
         ledger.record(cmd.command_id.clone(), outcome, message.clone());
         bridge.send_ack(
             CommandAck {
@@ -3037,6 +2974,202 @@ fn service_remote_commands(
     deliver_first_tasks(first_tasks, workspace, now_ms);
     // Report any remote shell whose process has exited (flushed next tick).
     poll_remote_shell_exits(bridge, workspace);
+}
+
+/// Flush any deferred keystrokes now due — e.g. Claude's multi-select submit
+/// Enter, held back until the Tab-driven Confirm-tab switch has rendered so
+/// the Ink TUI does not drop it (remote-control-dc9). Re-resolves the tab
+/// since indices may have shifted during the delay.
+fn flush_deferred_pty(bridge: &mut RemoteBridge, workspace: &mut Workspace, now_ms: u64) {
+    for (session_id, bytes) in bridge.take_due_deferred_pty(now_ms) {
+        if let Some((pi, ti)) = resolve_primary_tab(workspace, &session_id) {
+            if let Some(p) = workspace.projects.get_mut(pi) {
+                let _ = write_primary_pty(&mut p.state, ti, &bytes);
+            }
+        }
+    }
+}
+
+/// The translator's read-model of the live workspace, with each session's
+/// pending prompt id as `bridge` minted it. Rebuilt per command: an earlier
+/// command in the same batch may have closed a tab and shifted indices.
+pub(crate) fn session_index(
+    workspace: &Workspace,
+    bridge: &RemoteBridge,
+    now_ms: u64,
+) -> crate::remote::commands::SessionIndex {
+    let views: Vec<ProjectView> = workspace
+        .projects
+        .iter()
+        .map(|p| ProjectView {
+            id: ProjectId::new(p.name.clone()),
+            name: &p.name,
+            state: &p.state,
+            cache: &p.cache,
+        })
+        .collect();
+    build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
+}
+
+/// The inline view of the prompt session `tab_id` of project `project` is
+/// waiting on. Only while the translator would accept an answer to it: the
+/// session is waiting, its agent is running, and the prompt surfaced for this
+/// wait is the one the translator checks answers against.
+pub(crate) fn prompt_for(
+    index: &crate::remote::commands::SessionIndex,
+    bridge: &RemoteBridge,
+    project: usize,
+    tab_id: &str,
+) -> Option<crate::view::PromptView> {
+    let session = index
+        .sessions
+        .iter()
+        .find(|s| s.project == project && s.id.as_str() == tab_id)?;
+    if !matches!(
+        session.status,
+        flightdeck_remote_protocol::AgentStatus::NeedsInput
+    ) || !session.primary_running
+    {
+        return None;
+    }
+    let item = bridge.surfaced_prompt(tab_id)?;
+    let view = crate::view::prompt_view(item, session.backend)?;
+    (session.pending_prompt.as_ref().map(|p| p.as_str()) == Some(view.prompt_id.as_str()))
+        .then_some(view)
+}
+
+/// Execute one translated command against the workspace and report the
+/// honest outcome. A [`Translation::PtyInputSequence`] is written here, not
+/// in [`execute_remote_translation`], because spacing its chunks needs the
+/// bridge's `deferred_pty` queue: chunk 0 now, chunk `i` `i * step_delay_ms`
+/// later, flushed by [`flush_deferred_pty`] on later ticks. Both the phone's
+/// commands and the desktop's inline prompt answers ([`answer_prompt`]) come
+/// through here, so a click and a tap type the same keys at the same pace.
+fn execute_queued_translation(
+    translation: Translation,
+    bridge: &mut RemoteBridge,
+    workspace: &mut Workspace,
+    env: &Env,
+    now_ms: u64,
+    first_tasks: &mut Vec<PendingFirstTask>,
+) -> (CommandOutcome, Option<String>) {
+    match translation {
+        // Timed keystroke sequence: write the first chunk now and queue the
+        // rest at increasing due times so Claude's Ink TUI re-renders between
+        // keys (remote-control-dc9). The queued chunks flush on later ticks.
+        Translation::PtyInputSequence {
+            project,
+            tab,
+            session_id,
+            chunks,
+            step_delay_ms,
+        } => match workspace.projects.get_mut(project) {
+            None => remote_target_gone(),
+            Some(p) => {
+                let first_ok = chunks
+                    .first()
+                    .map(|c| write_primary_pty(&mut p.state, tab, c))
+                    .unwrap_or(true);
+                if first_ok {
+                    for (i, chunk) in chunks.iter().enumerate().skip(1) {
+                        bridge.enqueue_deferred_pty(
+                            session_id.clone(),
+                            now_ms + (i as u64) * step_delay_ms,
+                            chunk.clone(),
+                        );
+                    }
+                    (CommandOutcome::Applied, None)
+                } else {
+                    (
+                        CommandOutcome::Failed,
+                        Some("could not write to the agent terminal".to_string()),
+                    )
+                }
+            }
+        },
+        other => execute_remote_translation(
+            other,
+            workspace,
+            env,
+            now_ms,
+            first_tasks,
+            bridge.shells_mut(),
+        ),
+    }
+}
+
+/// Answer the prompt session `tab_id` of project `project` is waiting on,
+/// from the desktop (a Mission control tile's Approve / Deny or option
+/// button): [`HostEvent::AnswerPrompt`].
+///
+/// The answer becomes the phone's own `permission_decision`
+/// ([`crate::view::PromptAnswer::decision`]) and goes through the phone's
+/// translator against the same [`session_index`] and then
+/// [`execute_queued_translation`] — so it is refused for exactly the reasons a
+/// phone tap is (the prompt was answered or superseded, the agent stopped, a
+/// custom agent) and types exactly the bytes a tap types, spaced through the
+/// same `deferred_pty` queue when the translation is a timed sequence.
+///
+/// One difference, and it is the desktop's rather than the phone's: these are
+/// bytes the person at the machine aims at a PTY, so they claim the input
+/// lock first, on the terms [`HostEvent::TerminalInput`] does (D14 as
+/// revised). Refused means dropped, with the holder named on the status bar;
+/// a click is never queued to land in the middle of someone else's typing.
+/// (The phone's writes do not take the lock: the relay path predates it.)
+///
+/// A refusal by the translator is shown as a notification, since the click
+/// otherwise did nothing visible. Returns whether the answer was typed.
+fn answer_prompt(
+    bridge: &mut RemoteBridge,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    first_tasks: &mut Vec<PendingFirstTask>,
+    reply: &crate::view::PromptReply,
+) -> bool {
+    let crate::view::PromptReply {
+        key: crate::view::SessionKey { project, tab_id },
+        prompt_id,
+        answer,
+    } = reply;
+    let (project, answer) = (*project, *answer);
+    let now_ms = env.clock.now_millis();
+    let index = session_index(workspace, bridge, now_ms);
+    // Only an answer the tile could have offered, to the prompt on screen.
+    // The translator checks the prompt id but never the prompt's shape (the
+    // phone only sends what it rendered), so without this an option index
+    // aimed at a checklist would type a number key into it.
+    let offered = prompt_for(&index, bridge, project, tab_id)
+        .filter(|view| view.prompt_id == *prompt_id)
+        .is_some_and(|view| view.buttons.iter().any(|b| b.answer == answer));
+    if !offered {
+        ui.message(
+            "That prompt is no longer waiting for this answer. Open the session to answer it.",
+        );
+        return false;
+    }
+    let body = answer.decision(
+        SessionId::new(tab_id.as_str()),
+        flightdeck_remote_protocol::PromptId::new(prompt_id.as_str()),
+    );
+    let translation = translate(&body, &index);
+    if let Translation::Reject { reason } = &translation {
+        ui.message(format!("Could not answer the prompt: {reason}."));
+        return false;
+    }
+    if !desktop_may_type(ui, now_ms as i64) {
+        return false;
+    }
+    let (outcome, message) =
+        execute_queued_translation(translation, bridge, workspace, env, now_ms, first_tasks);
+    let typed = matches!(outcome, CommandOutcome::Applied | CommandOutcome::Accepted);
+    if !typed {
+        ui.message(format!(
+            "Could not answer the prompt: {}.",
+            message.unwrap_or_else(|| "the agent terminal did not take it".to_string())
+        ));
+    }
+    typed
 }
 
 /// Poll each live remote shell's backing child terminal and report a one-shot
@@ -4742,6 +4875,9 @@ fn apply_host_event(
         HostEvent::Overlay(input) => {
             crate::tui::overlay_bridge::apply_overlay_input(input, workspace, env, ui)?
         }
+        // Answered by `AppHost::handle`, which owns the prompt tracker the
+        // answer is checked against; the TUI's key map never produces it.
+        HostEvent::AnswerPrompt(_) => {}
     }
     Ok(())
 }

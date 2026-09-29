@@ -34,6 +34,7 @@ use crate::git::status::WorktreeStatus;
 use crate::persistence::workspace::MissionScope;
 use crate::view::agent::{agent_row_view, AgentBadge, AgentRowView, UpstreamState};
 use crate::view::git_strip::git_actions;
+use crate::view::prompt::PromptView;
 
 /// One open project, as Mission control reads it.
 #[derive(Clone, Copy)]
@@ -77,6 +78,11 @@ pub struct MissionTile {
     /// Everything the Projects view's row shows about it: name, agent,
     /// branch, badge, status text and age, diff.
     pub row: AgentRowView,
+    /// The prompt it is waiting on, when FlightDeck detected one: what the
+    /// tile's inline Approve / Deny (or option buttons) answer. Always `None`
+    /// from [`mission_view`], which only reads [`AppState`]; the host fills it
+    /// in from its prompt tracker (`AppHost::mission_view`).
+    pub prompt: Option<PromptView>,
 }
 
 /// Which of a session's three recorded moments was the latest.
@@ -279,6 +285,7 @@ pub fn mission_view(
                 status: c.status,
                 needs_you: needs,
                 row,
+                prompt: None,
             });
         } else if is_recent(&c.activity.activity, now_secs, window) {
             let tab = &source.state.tabs[c.tab_index];
