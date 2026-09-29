@@ -19,7 +19,7 @@
 //!   background task and updating the cache on completion.
 //! - Pass [`UiOverlays`] to control which (if any) overlay is visible.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,12 +30,14 @@ use ratatui::Frame;
 use crate::app::modes::InputMode;
 use crate::app::state::{AppState, TabPhase};
 use crate::git::status::WorktreeStatus;
-use crate::terminal::session::TerminalKind;
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
 use crate::tui::selection::Selection;
+use crate::view::{
+    AgentBadge, AgentRowView, ProjectStatus, ProjectTabView, TerminalRef, UpstreamState,
+};
 use crate::web::access::{AccessMode, WebAccessView};
 
 // ---------------------------------------------------------------------------
@@ -318,19 +320,6 @@ const PROJECT_NAME_FLOOR: u16 = 2;
 /// Dark navy used for the active project tab and its row-level action.
 const PROJECT_TAB_ACTIVE_BG: Color = Color::Rgb(16, 38, 68);
 
-/// One project's summary for the project tab row (SPECS: multi-project). Carries
-/// only what the row needs to render, so the pure renderer never touches the
-/// runtime `Workspace`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectTabInfo {
-    /// Display name (the project's folder name).
-    pub name: String,
-    /// An agent in this project needs attention / is waiting / failed.
-    pub attention: bool,
-    /// An agent in this project is actively working.
-    pub busy: bool,
-}
-
 /// What a click on the project tab row resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectHit {
@@ -533,26 +522,21 @@ fn sidebar_hit(
 /// always agree.
 fn child_tab_entries(state: &AppState) -> Vec<(ChildTarget, String)> {
     // The primary agent terminal is "agent"; additional agents count up from 2,
-    // shells count up from 1, each numbered in creation order (SPECS §19).
-    let mut v = vec![(ChildTarget::Primary, "agent".to_string())];
-    if let Some(tab) = state.selected() {
-        let mut agent_n = 2;
-        let mut shell_n = 1;
-        for i in 0..tab.session.child_count() {
-            let is_agent = tab.session.child(i).map(|t| t.kind) == Some(TerminalKind::Agent);
-            let label = if is_agent {
-                let l = format!("agent {agent_n}");
-                agent_n += 1;
-                l
-            } else {
-                let l = format!("shell {shell_n}");
-                shell_n += 1;
-                l
-            };
-            v.push((ChildTarget::Child(i), label));
-        }
+    // shells count up from 1, each numbered in creation order (SPECS §19). The
+    // labels come from the shared view model.
+    match state.selected() {
+        Some(tab) => crate::view::terminal_views(tab)
+            .into_iter()
+            .map(|t| {
+                let target = match t.target {
+                    TerminalRef::Primary => ChildTarget::Primary,
+                    TerminalRef::Child(i) => ChildTarget::Child(i),
+                };
+                (target, t.label)
+            })
+            .collect(),
+        None => vec![(ChildTarget::Primary, "agent".to_string())],
     }
-    v
 }
 
 /// The screen geometry of one child-terminal tab segment.
@@ -972,7 +956,7 @@ pub fn project_tab_hit_test(
 pub fn draw_project_tab_bar(
     frame: &mut Frame,
     area: Rect,
-    projects: &[ProjectTabInfo],
+    projects: &[ProjectTabView],
     active: usize,
     now_ms: u64,
 ) {
@@ -1004,12 +988,10 @@ pub fn draw_project_tab_bar(
         };
         // Attention keeps visual priority when one agent needs input while
         // another is working in the same project.
-        let (indicator, indicator_color) = if p.attention {
-            ('●', Color::Red)
-        } else if p.busy {
-            (spinner_frame(now_ms), Color::Red)
-        } else {
-            ('●', Color::Green)
+        let (indicator, indicator_color) = match p.status {
+            ProjectStatus::NeedsAttention => ('●', Color::Red),
+            ProjectStatus::Working => (spinner_frame(now_ms), Color::Red),
+            ProjectStatus::Idle => ('●', Color::Green),
         };
         spans.push(Span::styled(" ", tab_style));
         spans.push(Span::styled(
@@ -1088,10 +1070,11 @@ pub fn draw_sidebar(
 
     // Each tab block is SIDEBAR_ROWS_PER_TAB rows: divider, name, agent, git —
     // a divider above every tab including the first (SPECS §20).
-    for (i, tab) in state.tabs.iter().enumerate() {
-        let selected = state.selected_tab == Some(i);
-        let ds = tab.display_status(now_ms);
-        let git = cache.get(&tab.meta.id);
+    // What each row says comes from the shared view model; the loop below only
+    // decides how it looks. The TUI tracks no unread marks, so none are passed.
+    let rows = crate::view::agent_row_views(state, cache, &HashSet::new(), now_ms);
+    for row in &rows {
+        let selected = row.selected;
 
         // Divider (top of the tab block).
         lines.push(divider_line(width));
@@ -1109,7 +1092,7 @@ pub fn draw_sidebar(
         // A tab whose worktree is still being materialized on a background
         // worker shows an animated spinner instead of a process/status line, so
         // the user always sees that something is happening (SPECS §16/§17).
-        if tab.phase == TabPhase::Creating {
+        if row.creating {
             let spin = Style::default().fg(Color::Red);
             lines.push(sidebar_name_line(
                 width,
@@ -1117,7 +1100,7 @@ pub fn draw_sidebar(
                 marker,
                 name_style,
                 Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
-                &tab.meta.name,
+                &row.name,
             ));
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -1131,19 +1114,14 @@ pub fn draw_sidebar(
         // dot, active work is a red spinner, and input-required/errors are
         // red. Manual override takes colour priority but never hides the
         // lifecycle.
-        let indicator_color = if matches!(
-            ds.interpreted,
-            crate::contracts::InterpretedStatus::Starting
-                | crate::contracts::InterpretedStatus::Running
-                | crate::contracts::InterpretedStatus::Working
-        ) {
+        let indicator_color = if row.badge == AgentBadge::Working {
             Color::Red
         } else {
-            ds.manual
+            row.manual_status
                 .map(|_| Color::Cyan)
-                .unwrap_or_else(|| status_label_color(ds.interpreted).1)
+                .unwrap_or_else(|| badge_color(row.badge))
         };
-        let indicator = status_indicator(ds.interpreted, now_ms);
+        let indicator = badge_indicator(row.badge, now_ms);
         lines.push(sidebar_name_line(
             width,
             side,
@@ -1153,36 +1131,29 @@ pub fn draw_sidebar(
                 format!("{indicator} "),
                 Style::default().fg(indicator_color),
             ),
-            &tab.meta.name,
+            &row.name,
         ));
 
         // Agent name + simplified status, e.g. "Claude Code [in progress]".
         // A manual override (cyan) takes visual priority; otherwise the
         // interpreted status collapses to idle / in progress / waiting / error.
-        let agent_name = state
-            .registry
-            .get(&tab.meta.agent)
-            .map(|a| a.display_name.clone())
-            .unwrap_or_else(|| tab.meta.agent.clone());
-        let (status_label, status_color) = match ds.manual {
-            Some(manual) => (manual.as_str().to_string(), Color::Cyan),
-            None => {
-                let (label, color) = status_label_color(ds.interpreted);
-                (label.to_string(), color)
-            }
+        let status_color = if row.manual_status.is_some() {
+            Color::Cyan
+        } else {
+            badge_color(row.badge)
         };
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(agent_name, Style::default().fg(Color::Gray)),
+            Span::styled(row.agent_name.clone(), Style::default().fg(Color::Gray)),
             Span::raw(" "),
             Span::styled(
-                format!("[{status_label}]"),
+                format!("[{}]", row.status_text),
                 Style::default().fg(status_color),
             ),
         ]));
 
         // Git indicators (dirty, ahead/behind, base drift, recovered/existing).
-        lines.push(build_git_indicator_line(tab, git));
+        lines.push(build_git_indicator_line(row));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1198,18 +1169,11 @@ fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_m
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> = state
-        .tabs
-        .iter()
-        .enumerate()
-        .map(|(i, tab)| {
-            Line::from(collapsed_agent_span(
-                tab,
-                state.selected_tab == Some(i),
-                now_ms,
-            ))
-        })
-        .collect();
+    let lines: Vec<Line> =
+        crate::view::agent_row_views(state, &HashMap::new(), &HashSet::new(), now_ms)
+            .iter()
+            .map(|row| Line::from(collapsed_agent_span(row, now_ms)))
+            .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1218,14 +1182,8 @@ fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_m
 /// selection arrow, a spinner while it works, or its status dot. Same glyphs
 /// and colours the full sidebar draws on each agent's name line, with the text
 /// removed.
-fn collapsed_agent_span(
-    tab: &crate::app::state::RuntimeTab,
-    selected: bool,
-    now_ms: u64,
-) -> Span<'static> {
-    use crate::contracts::InterpretedStatus::{Running, Starting, Working};
-
-    if selected {
+fn collapsed_agent_span(row: &AgentRowView, now_ms: u64) -> Span<'static> {
+    if row.selected {
         return Span::styled(
             "▸",
             Style::default()
@@ -1239,17 +1197,13 @@ fn collapsed_agent_span(
             Style::default().fg(Color::Red),
         )
     };
-    if tab.phase == TabPhase::Creating {
+    if row.creating || row.badge == AgentBadge::Working {
         return spinner();
     }
-    let ds = tab.display_status(now_ms);
-    if matches!(ds.interpreted, Starting | Running | Working) {
-        return spinner();
-    }
-    let color = ds
-        .manual
+    let color = row
+        .manual_status
         .map(|_| Color::Cyan)
-        .unwrap_or_else(|| status_label_color(ds.interpreted).1);
+        .unwrap_or_else(|| badge_color(row.badge));
     Span::styled("●", Style::default().fg(color))
 }
 
@@ -1355,74 +1309,71 @@ pub fn spinner_frame(now_ms: u64) -> char {
     FRAMES[((now_ms / 80) % FRAMES.len() as u64) as usize]
 }
 
-/// Use the smooth one-cell braille spinner for active lifecycle states and the
-/// stable centered dot for every settled state.
-fn status_indicator(status: crate::contracts::InterpretedStatus, now_ms: u64) -> char {
-    use crate::contracts::InterpretedStatus::*;
-    match status {
-        Starting | Running | Working => spinner_frame(now_ms),
+/// Use the smooth one-cell braille spinner for a working agent and the stable
+/// centered dot for every settled state.
+fn badge_indicator(badge: AgentBadge, now_ms: u64) -> char {
+    match badge {
+        AgentBadge::Working => spinner_frame(now_ms),
         _ => '●',
     }
 }
 
-/// Collapse an interpreted status to a glanceable sidebar label + colour.
-fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
-    use crate::contracts::InterpretedStatus::*;
-    match status {
-        Starting | Running | Working => ("in progress", Color::Cyan),
-        WaitingForInput | NeedsAttention => ("waiting", Color::Red),
-        Failed | SessionLost => ("error", Color::Red),
-        Idle | Completed | Stopped | Recovered | Unknown => ("idle", Color::Green),
+/// The colour the sidebar gives an agent's badge.
+fn badge_color(badge: AgentBadge) -> Color {
+    match badge {
+        AgentBadge::Working => Color::Cyan,
+        AgentBadge::WaitingAttention | AgentBadge::Error => Color::Red,
+        AgentBadge::Idle | AgentBadge::Done => Color::Green,
     }
 }
 
 /// Build a single line of git indicators for a sidebar tab row.
-fn build_git_indicator_line(
-    tab: &crate::app::state::RuntimeTab,
-    git: Option<&WorktreeStatus>,
-) -> Line<'static> {
+fn build_git_indicator_line(row: &AgentRowView) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
 
     // Recovered / attached markers.
-    if tab.meta.recovered {
+    if row.recovered {
         spans.push(Span::styled(
             "[recovered]",
             Style::default().fg(Color::Magenta),
         ));
         spans.push(Span::raw(" "));
     }
-    if tab.meta.attached_existing_branch {
+    if row.attached_existing_branch {
         spans.push(Span::styled("[existing]", Style::default().fg(Color::Cyan)));
         spans.push(Span::raw(" "));
     }
 
-    match git {
+    match &row.changes {
         None => {
             spans.push(Span::styled("git: ?", Style::default().fg(Color::DarkGray)));
         }
-        Some(ws) => {
+        Some(changes) => {
             // Dirty indicator.
-            if ws.dirty {
+            if !changes.is_clean() {
                 spans.push(Span::styled("~dirty", Style::default().fg(Color::Yellow)));
                 spans.push(Span::raw(" "));
             }
             // Ahead/behind vs upstream.
-            if ws.upstream.is_some() {
-                if ws.ahead > 0 || ws.behind > 0 {
-                    let ab = format!("+{} -{}", ws.ahead, ws.behind);
-                    spans.push(Span::styled(ab, Style::default().fg(Color::Cyan)));
+            match &row.upstream {
+                UpstreamState::Tracking { ahead, behind, .. } => {
+                    if *ahead > 0 || *behind > 0 {
+                        let ab = format!("+{ahead} -{behind}");
+                        spans.push(Span::styled(ab, Style::default().fg(Color::Cyan)));
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                UpstreamState::None | UpstreamState::Unknown => {
+                    spans.push(Span::styled(
+                        "no-upstream",
+                        Style::default().fg(Color::DarkGray),
+                    ));
                     spans.push(Span::raw(" "));
                 }
-            } else {
-                spans.push(Span::styled(
-                    "no-upstream",
-                    Style::default().fg(Color::DarkGray),
-                ));
-                spans.push(Span::raw(" "));
             }
             // Target-base movement.
-            if ws.base_drift > 0 {
-                let moved = format!("target+{}", ws.base_drift);
+            if row.base_drift > 0 {
+                let moved = format!("target+{}", row.base_drift);
                 spans.push(Span::styled(moved, Style::default().fg(Color::Magenta)));
             }
         }
@@ -1815,13 +1766,12 @@ fn shorten_branch(branch: &str, max_chars: usize) -> String {
 
 /// Build the git info bar [`Line`] for the selected tab. Exported for testing.
 pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> {
-    let configured_default = state
-        .invalid_base_branch
-        .as_deref()
-        .unwrap_or(&state.base_branch);
-    let configured_default = shorten_branch(configured_default, 18);
-    let invalid_default = state.invalid_base_branch.is_some();
-    let Some(tab) = state.selected() else {
+    use crate::view::UpstreamState;
+
+    let view = crate::view::git_strip_view(state, cache);
+    let configured_default = shorten_branch(&view.default_branch, 18);
+    let invalid_default = !view.default_branch_valid;
+    let Some(agent) = &view.agent else {
         return Line::from(vec![
             Span::styled(" Default base: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1843,7 +1793,6 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
             ),
         ]);
     };
-    let git = cache.get(&tab.meta.id);
 
     let mut spans = vec![Span::styled(
         if invalid_default {
@@ -1853,7 +1802,7 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
         },
         if invalid_default {
             Style::default().fg(Color::Red)
-        } else if tab.meta.base_branch == state.base_branch {
+        } else if agent.target_is_default {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::Yellow)
@@ -1861,41 +1810,34 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
     )];
     spans.push(info_sep());
     spans.push(Span::styled(
-        format!("target: {}", shorten_branch(&tab.meta.base_branch, 18)),
+        format!("target: {}", shorten_branch(&agent.target_branch, 18)),
         Style::default().fg(Color::DarkGray),
     ));
-    if let Some(ws) = git {
-        if ws.base_drift > 0 {
-            spans.push(info_sep());
-            spans.push(Span::styled(
-                format!("target advanced +{}", ws.base_drift),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
+    if agent.base_drift > 0 {
+        spans.push(info_sep());
+        spans.push(Span::styled(
+            format!("target advanced +{}", agent.base_drift),
+            Style::default().fg(Color::Magenta),
+        ));
     }
 
-    // Branch (prefer the freshly-collected name; fall back to stored meta).
-    let branch = git
-        .map(|w| w.branch.clone())
-        .unwrap_or_else(|| tab.meta.branch.clone());
     spans.push(Span::styled(" ⎇ ", Style::default().fg(Color::Blue)));
     spans.push(Span::styled(
-        branch,
+        agent.branch.clone(),
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     ));
 
-    match git {
+    match &agent.changes {
         None => {
             spans.push(info_sep());
             spans.push(Span::styled("git: ?", Style::default().fg(Color::DarkGray)));
         }
-        Some(ws) => {
+        Some(ch) => {
             // Change counts: +added ~modified -deleted (N files), or "clean".
             spans.push(info_sep());
-            let ch = ws.changes;
-            if ch.is_empty() {
+            if ch.is_clean() {
                 spans.push(Span::styled("clean", Style::default().fg(Color::Green)));
             } else {
                 spans.push(Span::styled(
@@ -1914,23 +1856,26 @@ pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> 
                 ));
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
-                    format!("({} files)", ch.total()),
+                    format!("({} files)", ch.files),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
 
             // Ahead/behind vs upstream.
             spans.push(info_sep());
-            if ws.upstream.is_some() {
-                spans.push(Span::styled(
-                    format!("↑{} ↓{}", ws.ahead, ws.behind),
-                    Style::default().fg(Color::Cyan),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    "no upstream",
-                    Style::default().fg(Color::DarkGray),
-                ));
+            match &agent.upstream {
+                UpstreamState::Tracking { ahead, behind, .. } => {
+                    spans.push(Span::styled(
+                        format!("↑{ahead} ↓{behind}"),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+                UpstreamState::None | UpstreamState::Unknown => {
+                    spans.push(Span::styled(
+                        "no upstream",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
     }
@@ -1981,19 +1926,9 @@ pub fn draw_status_bar(
 
 /// What a click on a status-bar label does. Every variant is exactly what the
 /// label's own shortcut does, so the bar never grows an action the keyboard
-/// cannot reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusAction {
-    /// Leave terminal focus for the app chrome (Terminal mode's mode chip and
-    /// its leave-focus hint).
-    FocusApp,
-    /// Give focus back to the terminal (App mode's mode chip and `Enter` hint).
-    FocusTerminal,
-    /// Open the command palette.
-    OpenPalette,
-    /// Open the help screen.
-    OpenHelp,
-}
+/// cannot reach. The type is the front-end neutral [`crate::view::HintAction`],
+/// shared with the desktop app's mode bar.
+pub use crate::view::HintAction as StatusAction;
 
 /// One run of status-bar spans that a click resolves as a unit. Separators and
 /// read-out badges carry no action, so a click between two hints — or on a
@@ -2262,53 +2197,31 @@ fn status_bar_segments(
         .bg(chip_bg)
         .add_modifier(Modifier::BOLD);
     let key_style = Style::default().fg(Color::Yellow);
-    let use_f2 = ui.use_f2_to_leave_terminal_focus;
-    // Leaving the mode you are in: what the chip and the first hint both mean.
-    let leave = match mode {
-        InputMode::Terminal => StatusAction::FocusApp,
-        InputMode::App => StatusAction::FocusTerminal,
-    };
+    // What the bar says (pill, hints, which badges) is the shared view model;
+    // this function only decides how it looks.
+    let view = crate::view::mode_bar_view(
+        mode,
+        crate::tui::platform::leave_focus_key(ui.use_f2_to_leave_terminal_focus),
+        HELP_KEYS,
+        update_available,
+        isolated,
+        input_holder,
+    );
     let mut segs = vec![inert(vec![Span::raw(" ")])];
-    match mode {
-        InputMode::Terminal => {
-            segs.push(clickable(
-                vec![Span::styled("MODE: TERMINAL", chip_style)],
-                leave,
-            ));
-            segs.push(status_sep());
-            segs.push(clickable(
-                vec![
-                    Span::styled(crate::tui::platform::leave_focus_key(use_f2), key_style),
-                    Span::raw(": app mode"),
-                ],
-                leave,
-            ));
-        }
-        InputMode::App => {
-            segs.push(clickable(
-                vec![Span::styled("MODE: APP", chip_style)],
-                leave,
-            ));
-            segs.push(status_sep());
-            segs.push(clickable(
-                vec![
-                    Span::styled("Enter", key_style),
-                    Span::raw(": focus terminal"),
-                ],
-                leave,
-            ));
-        }
+    segs.push(clickable(
+        vec![Span::styled(view.pill, chip_style)],
+        view.pill_action,
+    ));
+    for hint in &view.hints {
+        segs.push(status_sep());
+        segs.push(clickable(
+            vec![
+                Span::styled(hint.key.clone(), key_style),
+                Span::raw(format!(": {}", hint.label)),
+            ],
+            hint.action,
+        ));
     }
-    segs.push(status_sep());
-    segs.push(clickable(
-        vec![Span::styled("Ctrl-g", key_style), Span::raw(": palette")],
-        StatusAction::OpenPalette,
-    ));
-    segs.push(status_sep());
-    segs.push(clickable(
-        vec![Span::styled(HELP_KEYS, key_style), Span::raw(": help")],
-        StatusAction::OpenHelp,
-    ));
 
     // The input lock (`specs/WEB_INTERFACE.md` D14 as revised). Drawn only when
     // a browser is seated as a writer and somebody holds the turn, because with
@@ -2319,7 +2232,7 @@ fn status_bar_segments(
     // the model refuses a keystroke typed into another writer's live burst
     // rather than interleaving it, and §5.1 does not allow that to happen
     // silently. `Take Input Lock` in the palette is the way past it.
-    if let Some(holder) = input_holder {
+    if let Some(holder) = &view.input_holder {
         segs.push(inert(vec![
             Span::raw("  "),
             Span::styled(
@@ -2334,7 +2247,7 @@ fn status_bar_segments(
 
     // Isolated run (SPECS §32): nothing persists and several actions are gone,
     // so say so permanently rather than once at launch.
-    if isolated {
+    if view.isolated {
         segs.push(inert(vec![
             Span::raw("  "),
             Span::styled(
@@ -2352,7 +2265,7 @@ fn status_bar_segments(
     // `brew update && brew upgrade`, so a single message is correct for every
     // install method. Deliberately inert: a stray click must never start an
     // update.
-    if let Some(version) = update_available {
+    if let Some(version) = &view.update_available {
         segs.push(inert(vec![
             Span::raw("  "),
             Span::styled(
@@ -4152,6 +4065,34 @@ mod tests {
         )
     }
 
+    /// A project tab view with the status the old attention/busy flags meant.
+    fn project_view(name: impl Into<String>, attention: bool, busy: bool) -> ProjectTabView {
+        ProjectTabView {
+            name: name.into(),
+            status: if attention {
+                ProjectStatus::NeedsAttention
+            } else if busy {
+                ProjectStatus::Working
+            } else {
+                ProjectStatus::Idle
+            },
+            agent_count: 1,
+            active: false,
+        }
+    }
+
+    /// The sidebar's label and colour for an interpreted status.
+    fn status_label_color(status: crate::contracts::InterpretedStatus) -> (&'static str, Color) {
+        (
+            crate::view::agent::agent_status_text(status),
+            badge_color(crate::view::agent_badge(status)),
+        )
+    }
+
+    fn status_indicator(status: crate::contracts::InterpretedStatus, now_ms: u64) -> char {
+        badge_indicator(crate::view::agent_badge(status), now_ms)
+    }
+
     fn empty_cache() -> GitStatusCache {
         GitStatusCache::new()
     }
@@ -4427,7 +4368,7 @@ mod tests {
     fn draw_composition(
         term: &mut Terminal<TestBackend>,
         state: &AppState,
-        projects: &[ProjectTabInfo],
+        projects: &[ProjectTabView],
     ) {
         term.draw(|frame| {
             let area = frame.area();
@@ -4454,11 +4395,7 @@ mod tests {
             layout::Chrome::Collapsed
         );
 
-        let projects = vec![ProjectTabInfo {
-            name: "alpha".to_string(),
-            attention: false,
-            busy: false,
-        }];
+        let projects = vec![project_view("alpha".to_string(), false, false)];
         let mut term = test_terminal(w, h);
         draw_composition(&mut term, &state, &projects);
         let buffer = term.backend().buffer().clone();
@@ -4487,11 +4424,7 @@ mod tests {
             layout::Chrome::Full
         );
 
-        let projects = vec![ProjectTabInfo {
-            name: "alpha".to_string(),
-            attention: false,
-            busy: false,
-        }];
+        let projects = vec![project_view("alpha".to_string(), false, false)];
         let mut term = test_terminal(w, h);
         draw_composition(&mut term, &state, &projects);
         let buffer = term.backend().buffer().clone();
@@ -4686,16 +4619,8 @@ mod tests {
     fn draw_project_tab_bar_renders_names_and_button() {
         let mut term = test_terminal(80, 3);
         let projects = vec![
-            ProjectTabInfo {
-                name: "alpha".to_string(),
-                attention: false,
-                busy: true,
-            },
-            ProjectTabInfo {
-                name: "beta".to_string(),
-                attention: true,
-                busy: false,
-            },
+            project_view("alpha".to_string(), false, true),
+            project_view("beta".to_string(), true, false),
         ];
         term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))
             .unwrap();
@@ -4711,13 +4636,9 @@ mod tests {
     /// Render the project tab row at `width` and return it as a string.
     fn rendered_project_row(width: u16, names: &[&str], active: usize) -> String {
         let mut term = test_terminal(width, 1);
-        let projects: Vec<ProjectTabInfo> = names
+        let projects: Vec<ProjectTabView> = names
             .iter()
-            .map(|n| ProjectTabInfo {
-                name: (*n).to_string(),
-                attention: false,
-                busy: false,
-            })
+            .map(|n| project_view((*n).to_string(), false, false))
             .collect();
         term.draw(|frame| {
             draw_project_tab_bar(frame, Rect::new(0, 0, width, 1), &projects, active, 0)
@@ -4852,16 +4773,8 @@ mod tests {
     fn project_tab_uses_spinner_when_busy_and_green_dot_when_idle() {
         let mut term = test_terminal(80, 1);
         let projects = vec![
-            ProjectTabInfo {
-                name: "alpha".to_string(),
-                attention: false,
-                busy: true,
-            },
-            ProjectTabInfo {
-                name: "beta".to_string(),
-                attention: false,
-                busy: false,
-            },
+            project_view("alpha".to_string(), false, true),
+            project_view("beta".to_string(), false, false),
         ];
 
         term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))

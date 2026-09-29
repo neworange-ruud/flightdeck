@@ -24,6 +24,7 @@ pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
+pub mod view;
 pub mod web;
 
 // No-op stand-in when the real self-updater is not built: either the
@@ -99,7 +100,7 @@ use crate::tui::render::{
     child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, overlay_dismissed_by_click,
     palette_hit, project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel,
     DialogButton, DialogHit, DialogListItem, GitStatusCache, HitTarget, PaletteHit, ProjectHit,
-    ProjectTabInfo, RemotePairing, StatusAction, UiOverlay,
+    RemotePairing, StatusAction, UiOverlay,
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
@@ -2033,21 +2034,12 @@ impl Workspace {
     }
 
     /// Build the per-project summaries for the project tab row.
-    fn tab_infos(&self, now_ms: u64) -> Vec<ProjectTabInfo> {
+    fn tab_infos(&self, now_ms: u64) -> Vec<crate::view::ProjectTabView> {
         self.projects
             .iter()
-            .map(|p| {
-                let (attention, busy) = project_status_flags(
-                    p.state
-                        .tabs
-                        .iter()
-                        .map(|tab| tab.display_status(now_ms).interpreted),
-                );
-                ProjectTabInfo {
-                    name: p.name.clone(),
-                    attention,
-                    busy,
-                }
+            .enumerate()
+            .map(|(i, p)| {
+                crate::view::project_tab_view(&p.name, &p.state, i == self.active, now_ms)
             })
             .collect()
     }
@@ -2076,25 +2068,6 @@ fn switch_project(workspace: &mut Workspace, env: &Env, sel: Selector, ui: &mut 
     }
     workspace.switch(sel);
     resume_active_project_agents(workspace, env);
-}
-
-/// Collapse agent lifecycle states into the two indicators shown on a project
-/// tab. Because callers pass display-ready states, project progress follows the
-/// same explicit backend events as each agent tab.
-fn project_status_flags(
-    statuses: impl IntoIterator<Item = crate::contracts::InterpretedStatus>,
-) -> (bool, bool) {
-    use crate::contracts::InterpretedStatus::*;
-    let mut busy = false;
-    let mut attention = false;
-    for status in statuses {
-        match status {
-            Starting | Running | Working => busy = true,
-            WaitingForInput | NeedsAttention | Failed => attention = true,
-            _ => {}
-        }
-    }
-    (attention, busy)
 }
 
 // ---------------------------------------------------------------------------
@@ -9224,27 +9197,6 @@ mod tests {
             args: vec![],
             status_patterns: StatusPatterns::default(),
         }
-    }
-
-    #[test]
-    fn project_progress_uses_explicit_agent_lifecycle_states() {
-        use crate::contracts::InterpretedStatus;
-
-        assert_eq!(
-            project_status_flags([InterpretedStatus::Idle]),
-            (false, false)
-        );
-        assert_eq!(
-            project_status_flags([InterpretedStatus::Idle, InterpretedStatus::Working]),
-            (false, true)
-        );
-        assert_eq!(
-            project_status_flags([
-                InterpretedStatus::Working,
-                InterpretedStatus::WaitingForInput,
-            ]),
-            (true, true)
-        );
     }
 
     // §20: SGR mouse reports use 1-based viewport coordinates and a trailing 'M'.
