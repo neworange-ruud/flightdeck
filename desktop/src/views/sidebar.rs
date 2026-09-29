@@ -25,7 +25,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 
 use crate::assets::icon;
-use crate::commands::{keycap, perform_id};
+use crate::commands::{disabled_in, keycap, keymap, perform_id};
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
 use crate::theme::{Hex, Palette};
@@ -40,6 +40,9 @@ pub struct SidebarData {
     /// The selected agent's focused terminal: `None` for its agent, `Some(i)`
     /// for child `i` (the terminal row drawn raised).
     pub focused_child: Option<usize>,
+    /// An `--isolated` run (SPECS §32): one session, so New agent is drawn
+    /// disabled.
+    pub isolated: bool,
 }
 
 impl SidebarData {
@@ -47,6 +50,7 @@ impl SidebarData {
     pub fn read(model: &HostModel) -> SidebarData {
         let host = model.host();
         SidebarData {
+            isolated: host.is_isolated(),
             rows: host.agent_rows(),
             focused_child: host
                 .active_state()
@@ -153,7 +157,7 @@ pub fn sidebar(data: &SidebarData, host: &Entity<HostModel>, p: &Palette) -> gpu
                 .when(data.rows.is_empty(), |d| d.child(empty_state(p)))
                 .child(list),
         )
-        .child(footer(host, p))
+        .child(footer(host, p, data.isolated))
 }
 
 fn empty_state(p: &Palette) -> impl IntoElement {
@@ -546,8 +550,12 @@ fn command_hint(title: &str) -> String {
         .to_string()
 }
 
-/// New agent (⌃N) and New shell (⌃T): the keymap's own entries.
-fn footer(host: &Entity<HostModel>, p: &Palette) -> impl IntoElement {
+/// New agent (⌃N) and New shell (⌃T): the keymap's own entries. New agent is
+/// drawn disabled, with no click handler at all, in an isolated run.
+fn footer(host: &Entity<HostModel>, p: &Palette, isolated: bool) -> impl IntoElement {
+    let new_agent_disabled = keymap()
+        .entry("NewAgentTab")
+        .is_some_and(|entry| disabled_in(entry, isolated));
     let new_agent = {
         let host = host.clone();
         h_flex()
@@ -572,7 +580,14 @@ fn footer(host: &Entity<HostModel>, p: &Palette) -> impl IntoElement {
                 keycap("NewAgentTab").unwrap_or_default(),
                 p.muted,
             ))
-            .on_click(move |_, _, cx| perform_id("NewAgentTab", &host, cx))
+            .when(new_agent_disabled, |d| {
+                d.opacity(0.45)
+                    .cursor_default()
+                    .tooltip(icons::tooltip("Not available in an isolated run"))
+            })
+            .when(!new_agent_disabled, |d| {
+                d.on_click(move |_, _, cx| perform_id("NewAgentTab", &host, cx))
+            })
     };
     let new_shell = {
         let host = host.clone();

@@ -77,11 +77,69 @@ pub fn save_workspace(fs: &dyn FileSystem, path: &Path, state: &WorkspaceState) 
     Ok(())
 }
 
+/// The projects remembered from the last session that are still folders on
+/// disk, the one that was active first. What a front-end launched outside any
+/// repository (from Finder, a launcher) offers to reopen. Best-effort like the
+/// rest of this module: a missing or unreadable file is an empty list.
+pub fn recent_projects(fs: &dyn FileSystem, path: &Path) -> Vec<PathBuf> {
+    let Ok(saved) = load_workspace(fs, path) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for (i, root) in saved.projects.iter().enumerate() {
+        let root = PathBuf::from(root);
+        if !fs.is_dir(&root) || roots.contains(&root) {
+            continue;
+        }
+        if i == saved.active {
+            roots.insert(0, root);
+        } else {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::FakeFs;
     use std::path::Path;
+
+    #[test]
+    fn recent_projects_lists_existing_folders_active_first() {
+        let fs = FakeFs::new();
+        let path = Path::new("/home/user/.flightdeck/workspace.json");
+        for dir in ["/a/one", "/b/two", "/c/three"] {
+            fs.create_dir_all(Path::new(dir)).expect("dir");
+        }
+        let state = WorkspaceState {
+            version: WORKSPACE_VERSION,
+            projects: vec![
+                "/a/one".into(),
+                "/gone/away".into(),
+                "/b/two".into(),
+                "/a/one".into(),
+                "/c/three".into(),
+            ],
+            active: 2,
+        };
+        save_workspace(&fs, path, &state).expect("save");
+        assert_eq!(
+            recent_projects(&fs, path),
+            vec![
+                PathBuf::from("/b/two"),
+                PathBuf::from("/a/one"),
+                PathBuf::from("/c/three")
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_projects_without_a_workspace_file_is_empty() {
+        let fs = FakeFs::new();
+        assert!(recent_projects(&fs, Path::new("/nope/workspace.json")).is_empty());
+    }
 
     #[test]
     fn round_trip_save_then_load() {

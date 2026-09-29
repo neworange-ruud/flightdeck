@@ -27,6 +27,14 @@
 //! terminate sessions, remove an isolated run's temp directory — once, from
 //! GPUI's quit hook (window close, Cmd-Q, Ctrl-q and SIGTERM/SIGINT all quit
 //! through it).
+//!
+//! ## Attention
+//!
+//! When the app asks ([`HostModel::report_attention`]), each turn also reads
+//! `AppHost::needs_you_count` and hands it to [`crate::notify`], which keeps
+//! the Dock badge current and asks the OS to flag a background window when a
+//! new agent starts waiting. The banner and sound are the host's own
+//! (`SystemNotifier`, the TUI's).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,6 +48,8 @@ use flightdeck::runtime::PodmanCli;
 use flightdeck::terminal::pty::PortablePtyBackend;
 use flightdeck::Env;
 use gpui::{Context, Task};
+
+use crate::notify::{self, AttentionState};
 
 /// How often the host turns. The TUI polls every 50 ms when idle; 16 ms keeps
 /// agent output within a frame of arriving.
@@ -103,6 +113,10 @@ pub struct HostModel {
     /// Turns since the last redraw, for [`COARSE_REDRAW`].
     quiet_turns: u32,
     torn_down: bool,
+    /// The needs-you count last shown on the app icon; `None` until the app
+    /// asks for it ([`HostModel::report_attention`]), so tests never touch the
+    /// developer's Dock.
+    attention: Option<AttentionState>,
     /// Every event dispatched, in order — what the tests compare a button
     /// with its chord by.
     #[cfg(test)]
@@ -121,6 +135,7 @@ impl HostModel {
             viewport: None,
             quiet_turns: 0,
             torn_down: false,
+            attention: None,
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
@@ -141,6 +156,13 @@ impl HostModel {
     /// Watch this flag for a shutdown signal.
     pub fn set_shutdown_flag(&mut self, flag: Arc<AtomicBool>) {
         self.shutdown = Some(flag);
+    }
+
+    /// Show the needs-you count on the app icon and ask the OS to draw
+    /// attention to the window when someone new is waiting
+    /// ([`crate::notify`]), every turn from now on.
+    pub fn report_attention(&mut self) {
+        self.attention = Some(AttentionState::default());
     }
 
     /// Spawn the turn loop on GPUI's foreground executor.
@@ -165,6 +187,9 @@ impl HostModel {
             }
         }
         let changed = self.host.tick();
+        if let Some(attention) = self.attention.as_mut() {
+            notify::apply(attention, self.host.needs_you_count(), cx);
+        }
         self.quiet_turns += 1;
         let coarse =
             self.quiet_turns as u128 * TICK_INTERVAL.as_millis() >= COARSE_REDRAW.as_millis();

@@ -350,3 +350,22 @@ fn encode_paste_normalises_crlf_and_lf_to_cr() {
     // Both CRLF (Windows clipboard) and bare LF collapse to a single CR.
     assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
 }
+
+// --- isolated runs -------------------------------------------------------------
+
+#[test]
+fn an_isolated_run_refuses_exactly_new_agent_and_project_switching() {
+    // SPECS §32: one session, one project. The palette hides the same actions;
+    // a native front-end draws these entries' controls disabled.
+    let keymap = Keymap::new(KeymapOptions::for_this_platform(false));
+    let refused: Vec<&str> = keymap
+        .entries()
+        .iter()
+        .filter(|e| e.refused_when_isolated())
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(
+        refused,
+        ["SwitchProjectPrev", "SwitchProjectNext", "NewAgentTab"]
+    );
+}

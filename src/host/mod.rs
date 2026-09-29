@@ -133,6 +133,16 @@ pub enum HostEvent {
     OpenProject(PathBuf),
 }
 
+/// The projects remembered from the last session that still exist, the one
+/// that was active first: what a front-end started outside any repository
+/// offers instead of exiting. Empty when nothing was saved (or `$HOME` is
+/// unset).
+pub fn recent_projects(env: &Env) -> Vec<PathBuf> {
+    workspace_state_path()
+        .map(|path| crate::persistence::workspace::recent_projects(env.fs, &path))
+        .unwrap_or_default()
+}
+
 /// The UI-agnostic application host. See the module docs.
 ///
 /// Borrows its services (`'a`) rather than owning them, the same shape the
@@ -1310,6 +1320,25 @@ impl<'a> AppHost<'a> {
             }),
             isolated: state.isolated,
         }
+    }
+
+    /// How many agents, across every open project, are waiting for the user:
+    /// asking for input or needing attention (the agent row's "waiting"
+    /// badge, and so Mission control's count). What a dock badge or taskbar
+    /// overlay counts.
+    pub fn needs_you_count(&self) -> usize {
+        use crate::contracts::InterpretedStatus::{NeedsAttention, WaitingForInput};
+        self.workspace
+            .projects
+            .iter()
+            .flat_map(|p| p.state.tabs.iter())
+            .filter(|tab| {
+                matches!(
+                    tab.display_status(self.now_ms).interpreted,
+                    WaitingForInput | NeedsAttention
+                )
+            })
+            .count()
     }
 
     /// The remote-access indicators for a status bar: whether the web

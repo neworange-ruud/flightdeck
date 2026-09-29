@@ -88,6 +88,7 @@ pub fn isolated_badge(notices: &HostNotices, cx: &App) -> Option<Div> {
     let p = Palette::global(cx);
     Some(
         div()
+            .debug_selector(|| "isolated-badge".into())
             .px_1p5()
             .rounded_sm()
             .bg(p.status_attention_bg.hsla())

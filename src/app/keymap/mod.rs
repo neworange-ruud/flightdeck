@@ -171,6 +171,17 @@ impl KeymapEntry {
         format!("{ACTION_NAMESPACE}::{}", self.id)
     }
 
+    /// Whether an `--isolated` run refuses this action (SPECS §32): it has one
+    /// session in one project, so a new agent and switching projects have
+    /// nothing to act on. A front-end draws the matching control disabled; the
+    /// host refuses the event regardless.
+    pub fn refused_when_isolated(&self) -> bool {
+        matches!(
+            self.action,
+            Action::SwitchProject(_) | Action::Dispatch(Command::NewAgentTab { .. })
+        )
+    }
+
     /// The label a hint shows for this action: its first chord (`Ctrl-g`).
     pub fn keycap(&self) -> Option<String> {
         self.triggers.first().map(|t| t.chord.to_string())

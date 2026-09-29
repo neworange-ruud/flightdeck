@@ -261,6 +261,36 @@ fn a_status_file_edge_reaches_the_notifier_through_a_pump() {
 }
 
 #[test]
+fn needs_you_counts_agents_waiting_for_the_user() {
+    let fakes = Fakes::new();
+    let (mut state, _pty) = fakes.state_with_a_tab();
+    let status = PathBuf::from("/status/task");
+    state.tabs[0].status_file = Some(status.clone());
+    let mut host = fakes.host(state);
+    assert_eq!(host.needs_you_count(), 0);
+
+    fakes.fs.write(&status, "working\n").unwrap();
+    host.pump();
+    assert_eq!(
+        host.needs_you_count(),
+        0,
+        "a working agent does not need you"
+    );
+
+    fakes.fs.write(&status, "working\nwaiting\n").unwrap();
+    host.pump();
+    assert_eq!(
+        host.active_state().tabs[0].display_status(0).interpreted,
+        InterpretedStatus::WaitingForInput
+    );
+    assert_eq!(host.needs_you_count(), 1);
+
+    fakes.fs.write(&status, "working\nwaiting\nidle\n").unwrap();
+    host.pump();
+    assert_eq!(host.needs_you_count(), 0, "answered, it stops counting");
+}
+
+#[test]
 fn a_command_event_changes_the_active_project_state() {
     let fakes = Fakes::new();
     let (state, _pty) = fakes.state_with_a_tab();

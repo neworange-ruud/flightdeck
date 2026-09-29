@@ -9,11 +9,16 @@ mod assets;
 mod commands;
 mod fonts;
 mod host;
+mod menus;
+mod notify;
+mod root;
 mod shell;
 mod terminal;
 use flightdeck_desktop::theme;
 mod views;
 
+#[cfg(test)]
+mod platform_tests;
 #[cfg(test)]
 mod shell_tests;
 

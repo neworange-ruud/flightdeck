@@ -12,15 +12,40 @@ use flightdeck::host::HostEvent;
 use flightdeck::tui::platform;
 use flightdeck::view::HintAction;
 use gpui::{App, Entity};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::host::HostModel;
 
-/// The keymap table the app binds and its buttons label themselves from.
-///
-/// The `[ui] use_f2_to_leave_terminal_focus` setting is not read yet, so this
-/// is the default table (`remote-control-9diy`).
+/// `[ui] use_f2_to_leave_terminal_focus`, as read once at start-up
+/// ([`set_use_f2`]). GPUI bindings are registered once, so the table the app
+/// binds, its buttons label themselves from and the terminal reads is fixed
+/// for the process: changing the setting (or a project overriding it) takes
+/// effect on the next launch.
+static USE_F2: AtomicBool = AtomicBool::new(false);
+
+/// Record the `[ui] use_f2_to_leave_terminal_focus` setting the table is
+/// built with. Call before the bindings are registered.
+pub fn set_use_f2(use_f2: bool) {
+    USE_F2.store(use_f2, Ordering::Relaxed);
+}
+
+/// The keymap table the app binds and its buttons label themselves from: the
+/// platform's, with the leave-focus key the configuration chose.
 pub fn keymap() -> &'static Keymap {
-    Keymap::for_this_platform(false)
+    keymap_for(USE_F2.load(Ordering::Relaxed))
+}
+
+/// The table for an explicit `use_f2` (what [`keymap`] resolves to, and what
+/// tests compare).
+pub fn keymap_for(use_f2: bool) -> &'static Keymap {
+    Keymap::for_this_platform(use_f2)
+}
+
+/// Whether `entry`'s control is disabled: an isolated run has one session in
+/// one project (SPECS §32). The host refuses the event regardless; this is
+/// what a button, menu item or hint draws itself from.
+pub fn disabled_in(entry: &KeymapEntry, isolated: bool) -> bool {
+    isolated && entry.refused_when_isolated()
 }
 
 /// What performing a table entry means.
@@ -173,6 +198,34 @@ mod tests {
                 .map(|e| intent_for(&e.action)),
             Some(Intent::Host(HostEvent::SwitchProject(Selector::Next)))
         );
+    }
+
+    #[test]
+    fn the_f2_setting_selects_the_leave_focus_key() {
+        let chord = |use_f2| keymap_for(use_f2).entry("FocusApp").unwrap().triggers[0].chord;
+        assert_eq!(chord(true), Chord::bare(Key::F(2)));
+        assert_ne!(chord(false), Chord::bare(Key::F(2)));
+        // Only that entry changes; the rest of the table is the same.
+        assert_eq!(
+            keymap_for(true).entries().len(),
+            keymap_for(false).entries().len()
+        );
+    }
+
+    #[test]
+    fn an_isolated_run_disables_new_agent_and_project_switching_only() {
+        for entry in keymap().entries() {
+            let expected = matches!(
+                entry.id,
+                "NewAgentTab" | "SwitchProjectPrev" | "SwitchProjectNext"
+            );
+            assert_eq!(disabled_in(entry, true), expected, "{}", entry.id);
+            assert!(
+                !disabled_in(entry, false),
+                "{} outside --isolated",
+                entry.id
+            );
+        }
     }
 
     #[test]

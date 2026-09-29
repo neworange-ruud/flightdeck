@@ -2367,6 +2367,8 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "gpui-pre-platform",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "qrcode",
  "serde_json",
  "tempfile",

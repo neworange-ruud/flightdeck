@@ -109,10 +109,34 @@ dev-dependencies.
   set from the theme.
 - One size for every project's PTYs (the TUI's per-mode chrome differences do
   not apply to the GUI yet).
-- A launch from Finder has no git cwd: the app exits with the TUI's error
-  instead of offering to open a folder.
 - The context menu shows keycaps as trailing text, not aligned columns; the
   close `×` is only on the active project tab.
 - Every host notify re-renders the whole window (fine at this size; a
   terminal-only redraw path is a later optimisation).
-- `[ui] use_f2_to_leave_terminal_focus` is still not read (`remote-control-9diy`).
+
+## Platform layer (`remote-control-bmej.3.7`, `.3.8`, `.4.7`, `9diy`)
+
+- **Menus** (`menus.rs`): the macOS menu bar is generated from the keymap
+  table; items are the same `KeymapAction`s as the chords, so a menu click and
+  a chord both end in `commands::perform_entry`. Cmd-, / Cmd-O / Cmd-Q are the
+  only platform-convention shortcuts; Cmd-W is deliberately unbound. Windows
+  and Linux have no menu bar; the palette (Ctrl-g) and F1 help are the
+  equivalent, and no titlebar hamburger is built. Mission control joins the
+  View menu when its view exists.
+- **F2**: `[ui] use_f2_to_leave_terminal_focus` is read once at start-up
+  (the launch project's effective value, or the global config when launched
+  without a project) and fixes the keymap for the process; changing it takes
+  effect on the next launch. Option-as-Meta is not a setting yet.
+- **Attention** (`notify.rs`): banners and sounds are the core's, through the
+  TUI's own `SystemNotifier`. The Dock badge is the needs-you count
+  (`AppHost::needs_you_count`); a new waiting agent asks the OS to flag an
+  inactive window. Windows taskbar overlay and a Linux badge are not done
+  (GPUI exposes neither; see the module docs).
+- **Isolated** (`--isolated`): New agent, project switching and Open project
+  are drawn disabled (button, menu item) from
+  `KeymapEntry::refused_when_isolated`; the host refuses the chords and menu
+  actions with the TUI's message; the `ISOLATED` badge shows; nothing is saved.
+- **No repository** (`root.rs`): the window opens on an empty state with
+  "Open project…" and the remembered projects (`host::recent_projects`);
+  choosing a folder runs `AppHost::open` on it and swaps in the shell.
+  `--isolated` there is still the TUI's error.

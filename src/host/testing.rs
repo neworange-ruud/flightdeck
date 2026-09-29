@@ -100,6 +100,27 @@ pub fn host<'a>(
     projects: Vec<TestProject>,
     active: usize,
 ) -> AppHost<'a> {
+    build(env, notifier, projects, active, false)
+}
+
+/// An `--isolated` host (SPECS §32): exactly one project, marked isolated the
+/// way `open_project` marks it, and refusing what an isolated run refuses.
+pub fn isolated_host<'a>(
+    env: Env<'a>,
+    notifier: &'a dyn Notifier,
+    mut project: TestProject,
+) -> AppHost<'a> {
+    project.state.set_isolated(None);
+    build(env, notifier, vec![project], 0, true)
+}
+
+fn build<'a>(
+    env: Env<'a>,
+    notifier: &'a dyn Notifier,
+    projects: Vec<TestProject>,
+    active: usize,
+    isolated: bool,
+) -> AppHost<'a> {
     assert!(active < projects.len(), "the active project must exist");
     let workspace = Workspace {
         projects: projects
@@ -108,7 +129,7 @@ pub fn host<'a>(
             .collect(),
         active,
     };
-    let mut host = AppHost::from_parts(env, notifier, workspace, web_surface(), false);
+    let mut host = AppHost::from_parts(env, notifier, workspace, web_surface(), isolated);
     host.tick = 1;
     host
 }
