@@ -360,6 +360,7 @@ branch_prefix = "flightdeck/"
 agent_tab_position = "left"
 default_agent = "opencode"
 use_f2_to_leave_terminal_focus = false
+macos_option_as_meta = false
 file_manager = ""
 
 [agents.opencode]
@@ -952,6 +953,16 @@ Settings (`[ui]`):
 | `app_mode_color` | (same set) | cyan |
 | `mode_border` | off, dim, normal, bright | off |
 | `dim_terminal_in_app_mode` | true / false | true |
+| `macos_option_as_meta` | true / false | false |
+
+`ui.macos_option_as_meta` applies to the native desktop app on macOS only: when
+`true`, an Option+key that FlightDeck does not bind is sent to the terminal as
+`ESC` + the key (Meta), byte for byte what the TUI receives from a host terminal
+with "Use Option as Meta" on; when `false` (default) it types the character the
+keyboard layout composes, so `@ [ ] { } | \ ~` stay reachable on non-US layouts.
+FlightDeck's own Alt chords are bindings and work either way. It is a no-op on
+Linux and Windows (Alt is always Meta there) and in the TUI, and, like
+`use_f2_to_leave_terminal_focus`, is read when the desktop app starts.
 
 Required shortcuts:
 

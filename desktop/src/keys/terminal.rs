@@ -8,6 +8,7 @@
 //! wires the two ends to [`terminal_key_down`] and [`ImeState`].
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flightdeck::app::keymap::{encode_paste, encode_pty, Key, Keymap, KeymapEntry, Mods};
 use flightdeck::app::modes::InputMode;
@@ -41,19 +42,45 @@ pub enum OptionKey {
     Compose,
 }
 
+/// `[ui] macos_option_as_meta`, as read once at start-up
+/// ([`OptionKey::set_macos_option_as_meta`]). A process-wide setting for the
+/// same reason as the leave-focus key: the terminal element asks
+/// [`OptionKey::for_this_platform`] on every press, and the setting is only
+/// read at launch (a change applies on the next one).
+static MACOS_OPTION_AS_META: AtomicBool = AtomicBool::new(false);
+
 impl OptionKey {
-    /// The default for this OS: [`OptionKey::Compose`] on macOS, so non-US
-    /// layouts can type the characters they put behind Option (`@ [ ] { } | \
-    /// ~` on German, French, Nordic layouts …) — without that a shell is
-    /// unusable for their users, while FlightDeck's own Alt chords keep
-    /// working because they are bindings. [`OptionKey::Meta`] elsewhere, where
-    /// the two are the same anyway.
-    pub fn for_this_platform() -> OptionKey {
-        if IS_MACOS {
+    /// The policy for an OS and the `[ui] macos_option_as_meta` setting. Pure,
+    /// so both settings can be checked on any host.
+    ///
+    /// - macOS, setting off (default): [`OptionKey::Compose`], so non-US
+    ///   layouts can type the characters they put behind Option (`@ [ ] { } |
+    ///   \ ~` on German, French, Nordic layouts …) — without that a shell is
+    ///   unusable for their users, while FlightDeck's own Alt chords keep
+    ///   working because they are bindings.
+    /// - macOS, setting on: [`OptionKey::Meta`], the TUI's bytes under a host
+    ///   terminal with "Use Option as Meta" (readline's Meta-b / Meta-f).
+    /// - Elsewhere: always [`OptionKey::Meta`] and the setting is ignored,
+    ///   because Alt never composes a character there, so both policies are
+    ///   the same and Linux/Windows behave identically whatever the file says.
+    pub fn resolve(is_macos: bool, macos_option_as_meta: bool) -> OptionKey {
+        if is_macos && !macos_option_as_meta {
             OptionKey::Compose
         } else {
             OptionKey::Meta
         }
+    }
+
+    /// Record the `[ui] macos_option_as_meta` setting. Call once at start-up,
+    /// before the first key press.
+    pub fn set_macos_option_as_meta(as_meta: bool) {
+        MACOS_OPTION_AS_META.store(as_meta, Ordering::Relaxed);
+    }
+
+    /// The policy in force on this OS with the launch-time setting (see
+    /// [`OptionKey::resolve`]).
+    pub fn for_this_platform() -> OptionKey {
+        OptionKey::resolve(IS_MACOS, MACOS_OPTION_AS_META.load(Ordering::Relaxed))
     }
 }
 

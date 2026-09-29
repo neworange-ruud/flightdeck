@@ -1006,3 +1006,45 @@ fn paste_is_bracketed_when_the_app_asked_for_it() {
         assert_eq!(view.update(cx, |h, _| h.take()), (vec![], bytes));
     }
 }
+
+/// The `[ui] macos_option_as_meta` setting picks the policy on macOS only; on
+/// Linux and Windows both values resolve to Meta, so the file cannot make the
+/// three OSes differ.
+#[test]
+fn the_option_as_meta_setting_only_matters_on_macos() {
+    assert_eq!(OptionKey::resolve(true, false), OptionKey::Compose);
+    assert_eq!(OptionKey::resolve(true, true), OptionKey::Meta);
+    for setting in [false, true] {
+        assert_eq!(OptionKey::resolve(false, setting), OptionKey::Meta);
+    }
+}
+
+/// End to end through the terminal element's key path, for each setting on
+/// each kind of OS: the bytes a composing macOS keyboard (`alt-b` reporting
+/// `∫`) and a Linux/Windows one (`alt-b`, no composed character) produce.
+#[test]
+fn the_option_as_meta_setting_decides_what_a_composing_option_key_sends() {
+    let keymap = Keymap::for_this_platform(false).clone();
+    // (is_macos, setting, keystroke, expected PTY bytes)
+    let cases: [(bool, bool, &str, &[u8]); 6] = [
+        (true, false, "alt-b->∫", "∫".as_bytes()),
+        (true, true, "alt-b->∫", b"\x1bb"),
+        // macOS keys that compose nothing are Meta either way.
+        (true, false, "alt-b", b"\x1bb"),
+        (true, true, "alt-b", b"\x1bb"),
+        // Elsewhere the setting changes nothing.
+        (false, false, "alt-b", b"\x1bb"),
+        (false, true, "alt-b", b"\x1bb"),
+    ];
+    for (is_macos, setting, keystroke, bytes) in cases {
+        let option = OptionKey::resolve(is_macos, setting);
+        let mut app = TestAppContext::single();
+        let (view, cx) = open(&mut app, keymap.clone(), option);
+        let (performed, pty) = press(&view, cx, Pane::Terminal, keystroke);
+        assert!(performed.is_empty(), "{keystroke}");
+        assert_eq!(
+            pty, bytes,
+            "{keystroke} (macos={is_macos}, option_as_meta={setting})"
+        );
+    }
+}

@@ -112,6 +112,18 @@ fn use_f2_in(fs: &dyn FileSystem, path: &Path) -> bool {
     load_config(fs, path).is_ok_and(|config| config.ui.use_f2_to_leave_terminal_focus)
 }
 
+/// `[ui] macos_option_as_meta` from the global config, for a launch with no
+/// project; the same fallback as [`global_use_f2`].
+fn global_option_as_meta() -> bool {
+    global_config_path().is_some_and(|path| option_as_meta_in(&RealFs, &path))
+}
+
+/// The setting in the config file at `path`; a missing or unreadable file is
+/// the default, off.
+fn option_as_meta_in(fs: &dyn FileSystem, path: &Path) -> bool {
+    load_config(fs, path).is_ok_and(|config| config.ui.macos_option_as_meta)
+}
+
 /// Start GPUI, open the workspace and the main window. Blocks until quit.
 pub fn run(args: Vec<String>) {
     let launch = match parse_args(args) {
@@ -156,6 +168,15 @@ pub fn run(args: Vec<String>) {
         None => global_use_f2(),
     };
     crate::commands::set_use_f2(use_f2);
+    // Option-as-Meta is read the same way (effective value when a project is
+    // open, the global file otherwise) and once: the terminal element consults
+    // it per key press, but a change applies on the next launch. It only ever
+    // changes anything on macOS (`OptionKey::resolve`).
+    let option_as_meta = match &initial {
+        Some(host) => host.active_state().config.ui.macos_option_as_meta,
+        None => global_option_as_meta(),
+    };
+    flightdeck_desktop::keys::OptionKey::set_macos_option_as_meta(option_as_meta);
     let shutdown = flightdeck::signals::install_shutdown_flag();
     let snapshot = launch.snapshot;
     let isolated = launch.isolated;
@@ -294,6 +315,26 @@ mod tests {
         assert!(!use_f2_in(&fs, path));
         fs.write(path, "not toml [[[").unwrap();
         assert!(!use_f2_in(&fs, path), "unreadable: the default");
+    }
+
+    #[test]
+    fn the_option_as_meta_setting_is_read_from_the_config_file() {
+        use flightdeck::testing::FakeFs;
+        let fs = FakeFs::new();
+        let path = Path::new("/home/u/.flightdeck/config.toml");
+        assert!(!option_as_meta_in(&fs, path), "no file: the default");
+
+        let config = |flag: bool| {
+            let mut config = flightdeck::config::schema::default_config("proj", "main");
+            config.ui.macos_option_as_meta = flag;
+            flightdeck::config::load::serialize_config(&config).unwrap()
+        };
+        fs.write(path, &config(true)).unwrap();
+        assert!(option_as_meta_in(&fs, path));
+        fs.write(path, &config(false)).unwrap();
+        assert!(!option_as_meta_in(&fs, path));
+        fs.write(path, "not toml [[[").unwrap();
+        assert!(!option_as_meta_in(&fs, path), "unreadable: the default");
     }
 
     #[test]

@@ -290,6 +290,16 @@ pub struct UiConfig {
     /// terminal focus. Off by default.
     #[serde(default)]
     pub use_f2_to_leave_terminal_focus: bool,
+    /// Desktop app, macOS only: treat Option as Meta in a terminal, so an
+    /// Option+key that FlightDeck itself does not bind is sent as `ESC` + the
+    /// key (readline's Meta-b / Meta-f) instead of the character the layout
+    /// composes (`∫`, `@`, …). Off by default, which keeps non-US layouts able
+    /// to type `@ [ ] { } | \ ~`. It mirrors the TUI running under a host
+    /// terminal with "Use Option as Meta" turned on, which the TUI cannot
+    /// configure itself. A no-op on Linux and Windows (Alt never composes a
+    /// character there, so it is always Meta) and in the TUI.
+    #[serde(default)]
+    pub macos_option_as_meta: bool,
     /// Command used to open a worktree directory in the OS file manager.
     /// Empty (the default) means the per-OS default: `open` on macOS,
     /// `explorer.exe` on Windows, `xdg-open` elsewhere. A non-empty value is
@@ -335,6 +345,7 @@ impl Default for UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            macos_option_as_meta: false,
             file_manager: String::new(),
             auto_continue: true,
             terminal_mode_color: default_terminal_mode_color(),

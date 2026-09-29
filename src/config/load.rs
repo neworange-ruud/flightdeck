@@ -684,6 +684,33 @@ default_agent = "opencode"
     }
 
     #[test]
+    fn option_as_meta_defaults_off_and_layers_project_over_global() {
+        // Absent from an old config: off (per-field default, siblings intact).
+        let old_config =
+            parse_config("[ui]\nagent_tab_position = \"left\"\ndefault_agent = \"opencode\"\n")
+                .unwrap();
+        assert!(!old_config.ui.macos_option_as_meta);
+        assert_eq!(old_config.ui.terminal_mode_color, "green");
+
+        // The generated global file documents it, off.
+        let global_text = serialize_global_config(&default_config("x", "main")).unwrap();
+        assert!(global_text.contains("macos_option_as_meta = false"));
+
+        // Global on, project silent: inherited. Project off: wins.
+        let mut global = global_base();
+        global
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert("macos_option_as_meta".into(), toml::Value::Boolean(true));
+        let cfg = effective_config(global.clone(), toml::Table::new()).unwrap();
+        assert!(cfg.ui.macos_option_as_meta);
+        let project = "[ui]\nmacos_option_as_meta = false\n".parse().unwrap();
+        let cfg = effective_config(global, project).unwrap();
+        assert!(!cfg.ui.macos_option_as_meta);
+    }
+
+    #[test]
     fn missing_project_inherits_global_wholesale() {
         let cfg = effective_config(global_base(), toml::Table::new()).unwrap();
         assert_eq!(cfg.agents.len(), 4);

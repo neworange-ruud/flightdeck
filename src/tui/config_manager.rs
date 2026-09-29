@@ -548,6 +548,11 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             "ui",
             "use_f2_to_leave_terminal_focus",
         ),
+        b(
+            "Option as Meta (macOS desktop app)",
+            "ui",
+            "macos_option_as_meta",
+        ),
         CuratedField {
             label: "Agent tab position",
             section: "ui",
@@ -724,16 +729,16 @@ mod tests {
     #[test]
     fn choice_cycles_through_options() {
         let mut m = mgr(toml::Table::new(), toml::Table::new());
-        // Move to "Agent tab position" (index 7).
-        for _ in 0..7 {
+        // Move to "Agent tab position" (index 8).
+        for _ in 0..8 {
             m.select_next();
         }
-        let before = m.rows()[7].value.clone();
+        let before = m.rows()[8].value.clone();
         assert_eq!(before, "left");
         m.toggle_selected();
-        assert_eq!(m.rows()[7].value, "right");
+        assert_eq!(m.rows()[8].value, "right");
         m.toggle_selected();
-        assert_eq!(m.rows()[7].value, "left");
+        assert_eq!(m.rows()[8].value, "left");
     }
 
     #[test]
@@ -747,6 +752,18 @@ mod tests {
         let body = &m.outputs().unwrap()[0].1;
         assert!(body.contains("[ui]"));
         assert!(body.contains("use_f2_to_leave_terminal_focus = true"));
+    }
+
+    #[test]
+    fn option_as_meta_setting_is_a_project_scoped_toggle() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        let idx = goto(&mut m, "Option as Meta (macOS desktop app)");
+        assert_eq!(m.rows()[idx].value, "off", "the shipped default is off");
+        m.toggle_selected();
+
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[ui]"));
+        assert!(body.contains("macos_option_as_meta = true"));
     }
 
     #[test]
