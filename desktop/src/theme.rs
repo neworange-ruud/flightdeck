@@ -133,6 +133,17 @@ pub struct Palette {
     /// alone).
     pub status_error: Hex,
 
+    // --- Mission control (A2/A3) ---------------------------------------------
+    /// Header of a session that needs you: its tile's title row, its entry in
+    /// the focus view's strip. Warm, so the eye finds it before reading.
+    pub attention_surface: Hex,
+    /// Border of a tile / strip entry that needs you (not selected).
+    pub attention_border: Hex,
+    /// The "2 working" count chip.
+    pub working_chip_bg: Hex,
+    /// Text on [`Palette::working_chip_bg`].
+    pub working_chip_ink: Hex,
+
     // --- diffs -----------------------------------------------------------------
     /// Lines added (`+214` in a sidebar row).
     pub diff_added: Hex,
@@ -234,6 +245,11 @@ impl Palette {
             status_idle: Hex(0x8a8279),
             status_done: Hex(0x7cc47f),
             status_error: Hex(0xf07a6a),
+
+            attention_surface: Hex(0x251f15),
+            attention_border: Hex(0x4a3a1c),
+            working_chip_bg: Hex(0x34232f),
+            working_chip_ink: Hex(0xecb3dc),
 
             diff_added: Hex(0x8fcf8f),
             diff_removed: Hex(0xef8f7e),
@@ -431,6 +447,9 @@ mod tests {
             ("removed lines", p.diff_removed, p.surface_sidebar),
             ("secondary ink", p.ink_2, p.surface_raised_nested),
             ("attention count", p.status_attention, p.status_attention_bg),
+            ("working chip", p.working_chip_ink, p.working_chip_bg),
+            ("needs-you header", p.ink, p.attention_surface),
+            ("needs-you header meta", p.muted, p.attention_surface),
             ("chip text", p.muted, p.chip_bg),
             ("faint meta", p.faint, p.surface_window),
         ];

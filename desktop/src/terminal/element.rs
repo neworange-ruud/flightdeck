@@ -257,7 +257,7 @@ impl Element for TerminalElement {
     }
 }
 
-fn paint_text(
+pub(crate) fn paint_text(
     span: &TextSpan,
     m: &CellMetrics,
     font_size: Pixels,
@@ -321,7 +321,7 @@ fn paint_outline(b: Bounds<Pixels>, stroke: Pixels, color: Hsla, window: &mut Wi
 }
 
 /// Paint a box-drawing / block glyph into cell `b`.
-fn paint_box(glyph: &BoxGlyph, b: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+pub(crate) fn paint_box(glyph: &BoxGlyph, b: Bounds<Pixels>, color: Hsla, window: &mut Window) {
     let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.width, b.size.height);
     // Stroke widths scale with the cell and are whole pixels, so parallel
     // borders look equally heavy.

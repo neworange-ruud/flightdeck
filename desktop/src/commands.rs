@@ -55,6 +55,9 @@ pub enum Intent {
     Host(HostEvent),
     /// Read the system clipboard and hand it over as `HostEvent::Paste`.
     PasteClipboard,
+    /// Switch Projects ⇄ Mission control: the desktop's own view state
+    /// (`crate::views::mission::toggle_view`), no host event.
+    ToggleMainView,
 }
 
 /// The intent behind a keymap action. Total: every action has one.
@@ -67,6 +70,7 @@ pub fn intent_for(action: &Action) -> Intent {
         Action::OpenHelp => Intent::Host(HostEvent::OpenHelp),
         Action::FocusApp => Intent::Host(HostEvent::FocusApp),
         Action::FocusTerminal => Intent::Host(HostEvent::FocusTerminal),
+        Action::ToggleMissionControl => Intent::ToggleMainView,
         Action::Quit => Intent::Host(HostEvent::Quit),
     }
 }
@@ -76,6 +80,7 @@ pub fn intent_for(action: &Action) -> Intent {
 pub fn perform_entry(entry: &KeymapEntry, host: &Entity<HostModel>, cx: &mut App) {
     match intent_for(&entry.action) {
         Intent::Host(event) => host.update(cx, |model, cx| model.dispatch(event, cx)),
+        Intent::ToggleMainView => crate::views::mission::toggle_view(host, cx),
         Intent::PasteClipboard => {
             let text = cx.read_from_clipboard().and_then(|item| item.text());
             if let Some(text) = text {
@@ -160,6 +165,7 @@ mod tests {
                 | (Action::OpenHelp, Intent::Host(HostEvent::OpenHelp))
                 | (Action::FocusApp, Intent::Host(HostEvent::FocusApp))
                 | (Action::FocusTerminal, Intent::Host(HostEvent::FocusTerminal))
+                | (Action::ToggleMissionControl, Intent::ToggleMainView)
                 | (Action::Quit, Intent::Host(HostEvent::Quit)) => {}
                 (action, intent) => panic!("{}: {action:?} became {intent:?}", entry.id),
             }

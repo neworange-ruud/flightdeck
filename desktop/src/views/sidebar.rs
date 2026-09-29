@@ -198,7 +198,7 @@ pub fn monogram(agent_name: &str) -> String {
 }
 
 /// Which monogram ink an agent gets (`Palette::monogram_ink`).
-fn monogram_ink(agent_name: &str, p: &Palette) -> Hex {
+pub fn monogram_ink(agent_name: &str, p: &Palette) -> Hex {
     let name = agent_name.to_lowercase();
     let slot = if name.contains("claude") {
         0

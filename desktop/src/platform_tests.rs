@@ -151,6 +151,27 @@ fn every_menu_item_dispatches_what_its_chord_dispatches(app: &mut TestAppContext
         let expected = match intent_for(&entry.action) {
             Intent::Host(event) => event,
             Intent::PasteClipboard => panic!("{id}: no menu item pastes"),
+            // The view switch is the window's own state, not a host event:
+            // the menu item and Alt-m must both flip it.
+            Intent::ToggleMainView => {
+                let view = |model: &Entity<HostModel>, cx: &mut VisualTestContext| {
+                    model.read_with(cx, |m, _| m.host().workspace_ui().view)
+                };
+                for how in ["menu", "chord"] {
+                    reset(&model, cx);
+                    let before = view(&model, cx);
+                    if how == "menu" {
+                        cx.dispatch_action(KeymapAction::for_entry(entry));
+                    } else {
+                        cx.simulate_keystrokes("alt-m");
+                    }
+                    cx.run_until_parked();
+                    assert_eq!(view(&model, cx), before.toggled(), "{id} from its {how}");
+                    cx.update(|_, cx| crate::views::mission::toggle_view(&model, cx));
+                    cx.run_until_parked();
+                }
+                continue;
+            }
         };
 
         reset(&model, cx);

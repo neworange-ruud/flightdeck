@@ -205,6 +205,7 @@ const LAYOUT: &[(&str, &[Slot])] = &[
     (
         "View",
         &[
+            Entry("ToggleMissionControl"),
             Entry("ToggleSplitView"),
             Entry("OpenPalette"),
             Sep,
@@ -575,7 +576,7 @@ mod tests {
             let entry = keymap.entry(id).unwrap();
             assert!(matches!(
                 intent_for(&entry.action),
-                Intent::Host(_) | Intent::PasteClipboard
+                Intent::Host(_) | Intent::PasteClipboard | Intent::ToggleMainView
             ));
         }
     }

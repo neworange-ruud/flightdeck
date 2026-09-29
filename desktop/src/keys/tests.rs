@@ -98,6 +98,7 @@ fn expected_matrix(options: KeymapOptions) -> BTreeSet<(&'static str, &'static s
         ("FocusTerminal", "App", "enter".into()),
         ("SetManualStatus", "App", "ctrl-s".into()),
         ("RestartAgent", "App", "ctrl-r".into()),
+        ("ToggleMissionControl", "App", "alt-m".into()),
         ("Paste", "Terminal", "ctrl-v".into()),
     ];
     let leave_focus = if options.use_f2_to_leave_focus {

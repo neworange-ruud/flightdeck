@@ -23,6 +23,11 @@ pub mod icon {
     pub const SEARCH: &str = "icons/search.svg";
     pub const PROJECTS: &str = "icons/projects.svg";
     pub const MISSION: &str = "icons/mission.svg";
+    /// Mission control's scope menu.
+    pub const CLOCK: &str = "icons/clock.svg";
+    /// A dropdown's caret. At the path gpui-component's `IconName::ChevronDown`
+    /// resolves to, so its buttons' `dropdown_caret` draws this one.
+    pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 }
 
 /// Every embedded file, by path.
@@ -59,6 +64,11 @@ const FILES: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/projects.svg"),
     ),
     (icon::MISSION, include_bytes!("../assets/icons/mission.svg")),
+    (icon::CLOCK, include_bytes!("../assets/icons/clock.svg")),
+    (
+        icon::CHEVRON_DOWN,
+        include_bytes!("../assets/icons/chevron-down.svg"),
+    ),
 ];
 
 /// The asset source handed to `Application::with_assets`.

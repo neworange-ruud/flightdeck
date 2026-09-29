@@ -23,10 +23,21 @@
 //! layer's: each render hands it `AppHost::overlay()`, it takes the keyboard
 //! while one is up (its "Overlay" context disables every Global chord, as the
 //! TUI's modal swallows every key) and gives focus back when it closes.
+//!
+//! ## The view switch
+//!
+//! While the persisted main view is Mission control (`views::mission`), its
+//! view replaces the sidebar and main area, and its status bar the Projects
+//! one; it carries the same `"App"` focus on its own rail, and in TERMINAL
+//! mode shows this window's terminal view full size, so the focus rule above
+//! holds unchanged. Its moving keys are taken before a chord is performed
+//! (`MissionControl::intercept`).
 
 use flightdeck::app::modes::InputMode;
 use flightdeck::contracts::PtySize;
+use flightdeck::persistence::workspace::MainView;
 use flightdeck_desktop::keys::{app_key_down, KeymapAction};
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, Styled, Window,
@@ -43,6 +54,7 @@ use crate::host::HostModel;
 use crate::terminal::view::TerminalView;
 use crate::theme::Palette;
 use crate::views::git_strip::git_strip;
+use crate::views::mission::{mission_status_bar, MissionControl};
 use crate::views::sidebar::{sidebar, SidebarData};
 use crate::views::status_bar::status_bar;
 use crate::views::titlebar::TitleBar;
@@ -61,6 +73,9 @@ pub struct FlightDeckWindow {
     titlebar: Entity<TitleBar>,
     terminal: Entity<TerminalView>,
     app_focus: FocusHandle,
+    /// Mission control (A2/A3), drawn instead of the Projects view's sidebar
+    /// and main area while it is the persisted main view.
+    mission: Entity<MissionControl>,
     /// Draws the host's overlay and answers it through `emit`.
     layer: Entity<OverlayLayer>,
     /// The update banner was dismissed for this session.
@@ -79,11 +94,15 @@ impl FlightDeckWindow {
         let titlebar = cx.new(|cx| TitleBar::new(host.clone(), emit.clone(), cx));
         let terminal = cx.new(|cx| TerminalView::for_host(host.clone(), cx));
         let layer = cx.new(|cx| OverlayLayer::new(emit, cx));
+        let app_focus = cx.focus_handle();
+        let mission =
+            cx.new(|cx| MissionControl::new(host.clone(), terminal.clone(), app_focus.clone(), cx));
         Self {
             host,
             titlebar,
             terminal,
-            app_focus: cx.focus_handle(),
+            app_focus,
+            mission,
             layer,
             update_dismissed: false,
         }
@@ -98,6 +117,11 @@ impl FlightDeckWindow {
             return;
         }
         if let Some(entry) = action.entry(keymap()) {
+            // In Mission control the moving keys follow tile order.
+            let mission = self.host.read(cx).host().workspace_ui().view == MainView::Mission;
+            if mission && MissionControl::intercept(&self.host, entry, cx) {
+                return;
+            }
             perform_entry(entry, &self.host, cx);
         }
     }
@@ -118,6 +142,7 @@ impl Render for FlightDeckWindow {
         let bar = host.mode_bar(&leave, &help);
         let remote = host.remote_status();
         let notices = host.notices();
+        let view = host.workspace_ui().view;
         let banner = if self.update_dismissed {
             None
         } else {
@@ -195,15 +220,24 @@ impl Render for FlightDeckWindow {
             .font_family(crate::fonts::UI_FAMILY)
             .child(self.titlebar.clone())
             .children(banner)
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_start()
-                    .child(sidebar)
-                    .child(main),
-            )
-            .child(status_bar(&bar, &remote, &notices, &self.host, &p, cx))
+            // The view switch: Mission control replaces the sidebar, the main
+            // area and the status bar's hints; the titlebar and the overlay
+            // layer are the same in both.
+            .map(|root| match view {
+                MainView::Projects => root
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .items_start()
+                            .child(sidebar)
+                            .child(main),
+                    )
+                    .child(status_bar(&bar, &remote, &notices, &self.host, &p, cx)),
+                MainView::Mission => root
+                    .child(self.mission.clone())
+                    .child(mission_status_bar(&self.host, &p, cx)),
+            })
             .child(self.layer.clone())
     }
 }

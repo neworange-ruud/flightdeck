@@ -17,8 +17,9 @@
 
 use flightdeck::app::commands::Selector;
 use flightdeck::host::HostEvent;
+use flightdeck::persistence::workspace::MainView;
 use flightdeck::tui::palette::PaletteAction;
-use flightdeck::view::{AgentBadge, ProjectStatus, ProjectTabView};
+use flightdeck::view::{ProjectStatus, ProjectTabView};
 use gpui::prelude::FluentBuilder;
 #[cfg(target_os = "macos")]
 use gpui::MouseButton;
@@ -82,7 +83,8 @@ impl Render for TitleBar {
         let model = self.host.read(cx);
         let tabs = model.host().project_tabs();
         let isolated = model.host().is_isolated();
-        let needs_you = agents_needing_you(model);
+        let needs_you = model.host().needs_you_count();
+        let view = model.host().workspace_ui().view;
 
         let bar = h_flex()
             .id("titlebar")
@@ -94,7 +96,7 @@ impl Render for TitleBar {
             .bg(p.surface_window.hsla())
             .border_b_1()
             .border_color(p.hairline.hsla())
-            .child(view_switcher(&p, needs_you))
+            .child(view_switcher(&p, needs_you, view, &self.host))
             .child(div().flex_none().w(px(1.)).h(px(20.)).bg(p.border.hsla()))
             .child(project_tabs(&p, &tabs, &self.host, &self.emit, isolated))
             .child(command_field(&p, &self.emit));
@@ -126,29 +128,32 @@ impl Render for TitleBar {
     }
 }
 
-/// How many agents across every open project are waiting for the user: the
-/// Mission control badge.
-fn agents_needing_you(model: &HostModel) -> usize {
-    let host = model.host();
-    (0..host.project_count())
-        .filter_map(|i| Some((host.project_state(i)?, host.git_status(i)?)))
-        .flat_map(|(state, git)| {
-            flightdeck::view::agent_row_views(state, git, host.now_ms(), host.now_unix_secs())
-        })
-        .filter(|row| row.badge == AgentBadge::WaitingAttention)
-        .count()
-}
-
-/// `[ Projects | Mission control (n) ]`, Projects selected. Mission control
-/// is milestone M5; its segment shows the needs-you count already.
-fn view_switcher(p: &Palette, needs_you: usize) -> impl IntoElement {
-    let segment = |path: &'static str, label: &'static str, selected: bool| {
+/// `[ Projects | Mission control (n) ]`: the view switch (Alt-m), with the
+/// needs-you count across every project on the Mission control segment. A
+/// click shows that view, as the chord toggles it.
+fn view_switcher(
+    p: &Palette,
+    needs_you: usize,
+    current: MainView,
+    host: &Entity<HostModel>,
+) -> impl IntoElement {
+    let segment = |path: &'static str, label: &'static str, view: MainView| {
+        let selected = view == current;
+        let id = match view {
+            MainView::Projects => "view-projects",
+            MainView::Mission => "view-mission",
+        };
+        let host = host.clone();
         let base = h_flex()
+            .id(id)
+            .debug_selector(move || id.into())
             .h(px(24.))
             .px(px(10.))
             .gap(px(6.))
             .rounded(px(5.))
-            .text_size(px(12.));
+            .text_size(px(12.))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| crate::views::mission::switch_view(&host, view, cx));
         if selected {
             base.bg(p.surface_raised_nested.hsla())
                 .text_color(p.ink.hsla())
@@ -168,11 +173,12 @@ fn view_switcher(p: &Palette, needs_you: usize) -> impl IntoElement {
         .bg(p.surface_input.hsla())
         .border_1()
         .border_color(p.border.hsla())
-        .child(segment(icon::PROJECTS, "Projects", true))
+        .child(segment(icon::PROJECTS, "Projects", MainView::Projects))
         .child(
-            segment(icon::MISSION, "Mission control", false).when(needs_you > 0, |s| {
+            segment(icon::MISSION, "Mission control", MainView::Mission).when(needs_you > 0, |s| {
                 s.child(
                     div()
+                        .debug_selector(|| "view-mission-badge".into())
                         .size(px(16.))
                         .rounded_full()
                         .flex()
