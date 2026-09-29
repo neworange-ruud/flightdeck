@@ -1345,6 +1345,27 @@ impl<'a> AppHost<'a> {
         self.active_state_mut().selected_mut()?.session.active_mut()
     }
 
+    /// The host state FlightDeck Web would publish right now, built by the
+    /// same function a turn publishes with (activity feed left empty). For a
+    /// front-end's tests: it is how a test proves that what a browser is told
+    /// (the geometry it letterboxes, D4) follows the PTY size the front-end
+    /// set.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn web_host_state(&self) -> crate::web::server::HostState {
+        let workspace = &self.workspace;
+        build_web_host_state(
+            workspace,
+            &self.web_surface.streams,
+            Vec::new(),
+            web_dialog_view(
+                &self.ui,
+                &workspace.active_project().name,
+                &workspace.active_project().state,
+            ),
+            self.now_ms,
+        )
+    }
+
     /// Whether the active project's terminal currently has input focus.
     pub fn terminal_focused(&self) -> bool {
         self.active_state().mode() == InputMode::Terminal
