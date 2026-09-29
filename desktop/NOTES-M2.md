@@ -275,6 +275,20 @@ move:X,Y up:X,Y wheel:N blur"` flag): a three-line selection ending mid-row;
 the scrollbar after 20 wheel notches over `seq 1 300`; the underline and bar
 cursors; the filled block; the hollow block after `blur`.
 
+**S4 re-run** (release builds, `perf.py gui-latency gui-idle app-idle --keys
+300`, M2 Pro, 2026-09-29; "before" is `d8a06b9`, run right after):
+
+| | before | after |
+| --- | --- | --- |
+| Key → glyph p50 / p95 | 6.33 / 10.47 ms | 6.32 / 10.41 ms |
+| Idle CPU, 1 terminal / + ticker | 0.56 / 0.76 % | 0.56 / 0.76 % |
+| Idle CPU, 4 terminals / + tickers | 0.66 / 1.02 % | 0.69 / 1.02 % |
+| Idle frames/s, 1 and 4 terminals | 0 | 0 |
+| App idle / + ticker (terminal frames/s) | 0.73 % (0.03) / 0.92 % (0.96) | 0.72 % (0.03) / 0.92 % (0.96) |
+
+Within noise everywhere: a steady cursor adds no frames, and the new
+window-level mouse listeners cost nothing when no one moves the mouse.
+
 **Not done / follow-ups**
 
 - Selection by word or line (double/triple click), and dragging the scrollbar:
