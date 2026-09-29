@@ -135,6 +135,12 @@ macro_rules! contract {
                     (grid.cursor().shape, grid.cursor().blinking),
                     (CursorShape::Block, false)
                 );
+                grid.process(b"\x1b[5 q\x1b[0 q");
+                assert_eq!(
+                    (grid.cursor().shape, grid.cursor().blinking),
+                    (CursorShape::Block, false),
+                    "0 resets to the default"
+                );
             }
 
             #[test]

@@ -412,3 +412,169 @@ them.
   handler, so a FlightDeck chord never reaches a PTY, but it does nothing yet. The
   root has no focus target in M0, so the Global context is not on the focus path
   until a focused view exists.
+
+## Terminal emulator (spike S2, `remote-control-bmej.1.2` / `.2.3`)
+
+Verified 2026-09-29 on the same machine as above. This section compares the two
+candidate emulators behind the new grid seam, records the recommendation, and
+says how the spike terminal was checked.
+
+### The seam
+
+`src/terminal/grid/` in the core defines two traits. `GridView` is read-only: size,
+`visit_row` (per cell: grapheme, fg/bg, bold/dim/italic/underline/inverse/
+strikethrough, wide or continuation), cursor (position, shape, blink, visible),
+modes (alt screen, mouse mode + encoding, bracketed paste, app cursor/keypad) and
+the scrollback offset. `TerminalGrid: GridView` adds feed, `tick`, query replies,
+resize, scrollback length/offset and the selection.
+
+The emulator is picked in one place, `Emulator` plus `TUI_EMULATOR`. `vt100_grid.rs`
+and `alacritty_grid.rs` are the only files that name an emulator crate.
+`testing::FakeGrid` covers tests that need no parser.
+
+The TUI renderer, `Terminal`, the mouse encoders and the desktop element all go
+through the traits. Web replay still streams raw PTY bytes and touches none of this.
+
+### Comparison
+
+Every row marked "fixture" is asserted in `src/terminal/grid/fixtures.rs`. The
+shared contract runs against both emulators, and a second set of tests pins down
+where they differ.
+
+| | vt100 0.16.2 (TUI today) | alacritty_terminal 0.26.0 |
+| --- | --- | --- |
+| Licence | MIT | Apache-2.0. We use only the emulation core (`Term` + vte). Its `tty`/`event_loop` stay unused, because our PTY stays behind `PtySession`. |
+| Graph added to the root | none (already there) | 13 crates on windows-msvc (aho-corasick, regex-automata/-syntax, polling, piper, miow, concurrent-queue, crossbeam-utils, fastrand, futures-io, cursor-icon, home, itself). darwin and linux each add 9: the same set minus the six that are Windows-only
+or already present, plus rustix-openpty and signal-hook. **No `-sys` crate and no `cc` on any target.** Checked with `cargo tree -p flightdeck -e normal,build --target …` before and after, so the Windows TUI build stays pure Rust. |
+| Scrollback | yes, primary screen only. The offset API is public but the filled length is private (`Vt100Grid` measures it by clamping). | yes, primary only. `display_offset` / `history_size`. |
+| Selection | none. FlightDeck's own scroll-stable `Selection`. | Native selection (simple, semantic, line, block; rotates with scroll) is available but **not used yet**. Both backends share FlightDeck's `Selection` through the trait. |
+| Reflow on resize | **no.** Rows are truncated and the cut text is lost (fixture). Shrinking through a wide character can also panic, which `Vt100Grid` contains by rebuilding the parser and losing the screen. | **yes.** Soft-wrapped lines rewrap both ways and the cursor line stays put (fixture). |
+| Wide / emoji / combining | CJK and emoji Wide, combining marks join the cell (fixture) | same (fixture) |
+| Emoji + VS16 (`❤️`) | 1 column (fixture) | 1 column (fixture). Fonts draw it 2 wide, which is the gap the `*-alacritty-terminal` forks on crates.io patch. |
+| Alternate screen | `?1049`, `?47` | `?1049` only. `?47` is ignored (fixture). |
+| Mouse modes | `?9` X10, `?1000`, `?1002`, `?1003`; encodings `?1005`, `?1006` | `?1000`, `?1002`, `?1003`, `?1005`, `?1006`, also focus `?1004` and alternate scroll `?1007`. **No X10 `?9`** (fixture). |
+| Bracketed paste, DECCKM, DECKPAM, DECTCEM | yes (fixture) | yes (fixture) |
+| Cursor shape (DECSCUSR) | not modelled. Recovered through vt100's `unhandled_csi` callback (fixture). | native, with blink (fixture) |
+| Synchronized output `?2026` | ignored, so half-drawn frames show | buffers until ESU or a 150 ms timeout (`tick` flushes it) (fixture) |
+| Query replies | none of its own. FlightDeck answers DSR 6 by hand. | DSR 5/6, DA1/DA2, OSC 4/10/11/12 colour queries (fixture: OSC 11 answers with the theme background). The pixel-size query (`CSI 14 t`) is not answered because no pixel size is wired. |
+| OSC 4/10/11 palette sets | ignored (fixture) | applied to cells (fixture) |
+| SGR extras | no strikethrough, conceal or underline variants | strikethrough (fixture), conceal, double/curly/dotted/dashed underline, underline colour, OSC 8 hyperlinks |
+| Kitty keyboard protocol | no | optional (off; config) |
+| Robustness | panics in 0.16.2 (see `Vt100Grid::process`), contained by `catch_unwind` + rebuild. 0.16.2 is the newest release. | a 4 KiB noise feed plus wide characters at tiny sizes does not panic (fixture) |
+| Upstream | occasional releases | Alacritty and Zed both depend on it |
+
+Real agents through the same pipeline (`--dump-grid`, both emulators, 30x100, no
+prompt sent):
+
+- `claude` 2.1.284: the trust dialog, then the main screen (logo quadrants, rules,
+  prompt, footer).
+- `codex` 0.151: the update prompt.
+- `opencode` 1.18.33: alt screen, `?1003` + SGR mouse, bracketed paste, blinking
+  cursor.
+
+Every screen parsed cleanly. For each agent, the two emulators' dumps differ only
+in what the agent printed on that particular launch (opencode's random tip and
+placeholder, a claude announcement banner). The layout, modes and cursor match.
+The first codex run showed the cursor blinking on vt100 and steady on alacritty,
+from DECSCUSR 0. `Vt100Grid` now treats 0 as the steady default, as alacritty
+does (fixture).
+
+### Recommendation
+
+**alacritty_terminal for the desktop app, which is what the GPUI element uses
+now.** It reflows on resize, which a resizable GUI window hits constantly while
+vt100 loses text there and can panic. It honours synchronized output, which
+removes the redraw flicker from Claude Code and opencode frames. It answers the
+terminal queries agents use to detect capabilities and choose a light or dark
+theme. It tracks the SGR and OSC features that agents emit. And it is maintained
+by two large terminal projects. Its gaps (`?47`, X10 mouse) are legacy modes that
+none of the agent CLIs above use.
+
+**The TUI stays on vt100 for now** (`TUI_EMULATOR = Emulator::Vt100`). Switching
+it is the one line in `grid/mod.rs`, but it is not a pure swap:
+
+1. In the TUI a real host terminal sits outside FlightDeck. Answering OSC 11/DA
+   with FlightDeck's own values would misreport that terminal. The replies would
+   have to be proxied or suppressed per query.
+2. Reflow and sync buffering change what users see during resizes and repaints.
+3. The TUI's render tests pin vt100 behaviour.
+
+That is a follow-up issue, not part of this spike.
+
+**Why the alacritty impl lives in the core, not in `desktop/`:** the conformance
+fixtures run both backends in the root gate (`cargo test -p flightdeck --lib`),
+swapping the TUI stays a one-module change, and the root stays pure Rust (verified
+above). The cost is compile time for the TUI's library plus alacritty's
+`tty`/`event_loop` modules, which are compiled but never linked in.
+
+Zed's `terminal_view` (GPL) was not read or copied. The element uses only GPUI's
+public API. For example, the per-glyph advance in `shape_line`'s `force_width`
+is a GPUI parameter.
+
+### The spike terminal
+
+- `cargo run -p flightdeck-desktop -- --spike-terminal [cmd args…]`: one
+  900x600 window with one terminal running `cmd` (default `$SHELL`, PowerShell on
+  Windows), built on `Terminal::spawn(PortablePtyBackend, Emulator::Alacritty, …)`.
+  The process gets `TERM=xterm-256color` and `COLORTERM=truecolor`, because a GUI
+  launched from the Finder has no `TERM` to pass down.
+- `--dump-grid [--emulator vt100|alacritty] [--wait-ms N] [--size RxC] [cmd…]`:
+  the same pump and layout with no window. It prints the grid, modes, cursor and
+  the frame layout.
+- With `--features spike-snapshot` (off by default: it turns on GPUI's
+  test-support, which pulls proptest and other extra crates into `Cargo.lock` but
+  not into the default build), three more flags are accepted:
+  `--spike-snapshot PATH [--spike-keys "a b enter ctrl-c"] [--spike-wait-ms N]`.
+  They type through the real key handler and then write the window's own rendered
+  frame (`Window::render_to_image`) as a PPM file. This needs no Screen Recording
+  permission.
+
+How the element draws:
+
+- Menlo 13px on macOS (Consolas on Windows, DejaVu Sans Mono elsewhere). The cell
+  is the advance of `m` wide and `max(ascent+descent, 1.25em)` tall.
+- ASCII spans are shaped with a forced cell advance. Other spans are shaped alone
+  and placed at their column.
+- Box drawing (light/heavy lines, rounded corners), block elements, quadrants and
+  shades are drawn as geometry. Doubles and dashes fall back to the font.
+- Colours come from new `theme.rs` tokens: `terminal_ansi[16]`, cursor and
+  selection. The 256-colour cube and truecolour are passed through.
+- The cursor is a filled block when focused and an outline otherwise, or a bar or
+  underline per DECSCUSR.
+- Resizing the element resizes the grid and the PTY.
+- Keys are lifted into `Chord` and encoded by `keymap::encode_pty`, so arrows are
+  always CSI. Paste is Cmd+V on macOS and Ctrl+Shift+V elsewhere, honouring
+  bracketed paste.
+- Mouse events are forwarded when the program asked for them (Shift overrides).
+  Otherwise the mouse drives local selection (copied on release) and scrollback.
+  On the alt screen without mouse reporting, the wheel sends arrow keys.
+
+### Verified, and how
+
+- **Pixels, live, via `--spike-snapshot`** (macOS, debug build). I looked at each of
+  these frames:
+  - the fixture line (`\e[31mred` … truecolour, `┌─┬─┐` boxes, rounded box, heavy
+    lines, the `▐▛██▜▌` quadrants, shades, `😀 宽字 é`): every glyph sits on its
+    column, box joints meet, the wide glyphs span two cells;
+  - interactive bash with typed input (`echo hello world`, Enter, Ctrl-A, seven
+    Right arrows, insert, Ctrl-E, Backspace), which produced the expected command
+    line and output;
+  - vim on the alternate screen after `j j j V j j`: syntax colours, line numbers,
+    visual-line highlight, and a window-sized grid, which confirms the 24x80 → window
+    resize reached the PTY;
+  - the first screens of opencode (its truecolour background panels and block logo),
+    claude (the quadrant logo drawn as solid geometry) and codex.
+- **Window existence without the feature:** `--spike-terminal bash -lc 'printf …;
+  sleep 8'` opened a 900x600 layer-0 window (`CGWindowListCopyWindowInfo`) with no
+  stderr output.
+- **Headless:** `--dump-grid` on the fixture, vim, less and the three agents with
+  both emulators, and `a_real_pty_reaches_the_frame_layout` (a real `/bin/sh` PTY →
+  grid → layout, in `cargo test`).
+- **Tests only (not exercised live):** selection highlight and copy (layout test
+  `selection_becomes_one_span_per_row`, plus the grid fixtures), mouse-report
+  bytes, paste bracketing, the unfocused and bar/underline cursors, and scrollback
+  scrolling in the window.
+- **Not verified:** Linux and Windows builds or runs of the desktop element; how
+  the element performs on a large, busy grid (it re-lays out the whole grid each
+  frame and has no damage tracking yet); IME / dead keys (the spike reads
+  `key_char` only).

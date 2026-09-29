@@ -59,15 +59,18 @@ impl vt100::Callbacks for Extras {
         params: &[&[u16]],
         c: char,
     ) {
-        // DECSCUSR, `CSI Ps SP q`: 0/1 blinking block, 2 steady block,
-        // 3/4 underline, 5/6 bar (odd = blinking).
+        // DECSCUSR, `CSI Ps SP q`: 1 blinking block, 2 steady block, 3/4
+        // underline, 5/6 bar (odd = blinking). 0 is "the terminal's default"
+        // (a steady block here), as alacritty_terminal treats it, rather than
+        // xterm's literal blinking block, so both grids report the same
+        // cursor for the same bytes.
         if c != 'q' || i1 != Some(b' ') || i2.is_some() {
             return;
         }
         let ps = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         let (shape, blinking) = match ps {
-            0 | 1 => (CursorShape::Block, true),
-            2 => (CursorShape::Block, false),
+            1 => (CursorShape::Block, true),
+            0 | 2 => (CursorShape::Block, false),
             3 => (CursorShape::Underline, true),
             4 => (CursorShape::Underline, false),
             5 => (CursorShape::Bar, true),

@@ -29,6 +29,11 @@ dist = false
 # No effect on Windows or Linux.
 default = ["runtime-shaders"]
 runtime-shaders = ["gpui_platform/runtime_shaders"]
+# Debug aid, off by default: adds `--spike-snapshot PATH` to the terminal spike,
+# which renders the window's own frame offscreen (GPUI's `render_to_image`,
+# only compiled with its test-support) and writes it as a PPM image. That
+# checks the pixels the element paints without screen-recording permission.
+spike-snapshot = ["gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies]
 # The TUI's library crate: config, git/worktree plumbing and the agent model the

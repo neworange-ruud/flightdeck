@@ -101,6 +101,18 @@ pub struct Palette {
     /// Terminal foreground.
     pub terminal_ink: Hex,
 
+    // --- terminal grid -------------------------------------------------------
+    /// The ANSI 16 a terminal program picks from (`ESC[30-37m`, `90-97m`):
+    /// 0-7 normal, 8-15 bright. Warm, to sit on `surface_terminal`; indexes
+    /// 16-255 and truecolour are not themed.
+    pub terminal_ansi: [Hex; 16],
+    /// The terminal cursor (block fill / bar / outline).
+    pub terminal_cursor: Hex,
+    /// Text drawn on top of a block cursor.
+    pub terminal_cursor_ink: Hex,
+    /// Fill behind selected terminal text.
+    pub terminal_selection: Hex,
+
     // --- accent + status -----------------------------------------------------
     /// The user-selectable accent (default pink; alternates in the brief).
     pub accent: Hex,
@@ -144,6 +156,28 @@ impl Palette {
             faint: Hex(0x8a8279),
             separator: Hex(0x5f5750),
             terminal_ink: Hex(0xe8e2d8),
+
+            terminal_ansi: [
+                Hex(0x3a3430), // black
+                Hex(0xe06c6c), // red
+                Hex(0x8fc97a), // green
+                Hex(0xe5c07b), // yellow
+                Hex(0x6fa8dc), // blue
+                Hex(0xd86fb8), // magenta (the accent)
+                Hex(0x6cc4c4), // cyan
+                Hex(0xcfc7bd), // white
+                Hex(0x6b635c), // bright black
+                Hex(0xf08c8c), // bright red
+                Hex(0xa9dc96), // bright green
+                Hex(0xf0d39a), // bright yellow
+                Hex(0x8fc0ec), // bright blue
+                Hex(0xe89ad0), // bright magenta
+                Hex(0x8edcdc), // bright cyan
+                Hex(0xf2efe9), // bright white
+            ],
+            terminal_cursor: Hex(0xe8e2d8),
+            terminal_cursor_ink: Hex(0x161311),
+            terminal_selection: Hex(0x45505e),
 
             accent,
             status_working: accent,
@@ -262,6 +296,34 @@ mod tests {
                 "muted on {surface:?}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_ansi_colours_read_on_the_terminal_well() {
+        // The coloured ANSI entries carry program output (errors, diffs, prompts)
+        // so they must read as text; bright black is the "dim/comment" grey and
+        // only needs the non-text 3:1. Black (0) is for backgrounds.
+        let p = Palette::dark();
+        for (i, colour) in p.terminal_ansi.iter().enumerate() {
+            let ratio = colour.contrast_ratio(p.surface_terminal);
+            let floor = match i {
+                0 => continue,
+                8 => 3.0,
+                _ => 4.5,
+            };
+            assert!(
+                ratio >= floor,
+                "ANSI {i} ({colour:?}): {ratio:.2} < {floor}"
+            );
+        }
+        assert!(
+            p.terminal_ink.contrast_ratio(p.terminal_selection) >= 4.5,
+            "selected text"
+        );
+        assert!(
+            p.terminal_cursor_ink.contrast_ratio(p.terminal_cursor) >= 4.5,
+            "text under a block cursor"
+        );
     }
 
     #[test]
