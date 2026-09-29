@@ -500,6 +500,85 @@ Delivery on Linux: FlightDeck posts via `notify-send` (libnotify). On
 Debian/Ubuntu install it with `sudo apt install libnotify-bin`. If `notify-send`
 is not on `PATH`, notifications are silently dropped. Windows is a no-op.
 
+## Desktop app (preview)
+
+FlightDeck also has a native desktop window, `flightdeck-desktop`, built on
+[GPUI](https://www.gpui.rs/). It is a second front-end over the same core as the
+terminal UI: the same projects, worktrees, agents, git safety rules, keymap,
+notifications and saved state. The terminal UI is unchanged and remains the way
+to use FlightDeck over SSH or on a headless machine. The design and the
+decisions behind the desktop app are in [`specs/DESKTOP_UI.md`](specs/DESKTOP_UI.md).
+
+It is a preview. It has been built and run on macOS only. Linux and Windows have
+not been built or run yet, and **no packaged installers are published yet**; for
+now you build it from source.
+
+### Build and run
+
+```sh
+cargo run -p flightdeck-desktop            # from inside a git repository
+cargo build -p flightdeck-desktop --release
+```
+
+The desktop app is a separate package in the workspace, so a plain `cargo build`
+at the root still builds only the terminal UI. Started outside a git repository,
+the window shows a project picker with your recent projects. `--isolated` (`-I`)
+works as in the terminal UI.
+
+- **macOS.** Xcode or the Command Line Tools. The default `runtime-shaders`
+  feature compiles GPUI's Metal shaders when the app starts, so you do not need
+  the separate Metal Toolchain download that Xcode 26 and later require.
+- **Linux** (not yet verified). A C toolchain and the windowing libraries. On
+  Debian or Ubuntu:
+  `sudo apt install build-essential pkg-config cmake clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev`.
+  At run time it needs a Vulkan loader and driver (`libvulkan1`,
+  `mesa-vulkan-drivers`).
+- **Windows** (not yet verified). The MSVC toolchain with the Windows 10/11 SDK
+  installed; the build compiles shaders with `fxc.exe` from the SDK.
+
+### The two views
+
+![The desktop app's Projects view: project tabs, one row per agent with its status, the git strip, and the active agent's terminal](assets/screenshots/desktop-app-projects.png)
+
+**Projects** is the terminal UI's screen as a window: project tabs and the view
+switch in the titlebar, one row per agent in the sidebar, the git strip (Pull
+base, Finish, Push) and the active agent's terminal.
+
+![The desktop app's Mission control view: sessions from two projects grouped by what needs you, as tiles, with earlier activity below](assets/screenshots/desktop-app-mission-control.png)
+
+**Mission control** shows every live session across all open projects as tiles.
+Sessions that need you (waiting for input or needing attention) come first, then
+working ones, then the most recently updated. Sessions that are quiet but were
+active recently appear as smaller cards below, and the scope menu sets how far
+back that reaches (24 hours, 7 days, all) and can narrow the view to one
+project. In App mode the tiles form a grid; press `Enter` on a tile to open that
+session full size with its terminal focused, and `Alt-Esc` to return to the grid.
+A tile whose agent is waiting on a prompt FlightDeck can recognise offers Approve
+and Deny (or one button per option) directly on the tile. Anything else offers
+to open the session.
+
+(The screenshots use throwaway repositories and a stand-in agent script.)
+
+### Shortcuts if you use the terminal UI
+
+Every FlightDeck chord is the same in the desktop app: `Ctrl-g` palette,
+`Ctrl-n` new agent, `Shift-←/→` projects, `Alt-↑/↓` agents, `Alt-1..9`, `Alt-←/→`
+terminal tabs, `F1` help, and so on. Some differences:
+
+- **`Alt-m`** switches between Projects and Mission control. It works in App
+  mode only, because `Alt-m` is a shell and agent key inside a terminal. From a
+  focused terminal press `Alt-Esc` first. The titlebar switch and the View menu
+  do the same with the mouse.
+- **macOS Option works as Alt** for every FlightDeck chord; you do not need to
+  enable "Use Option as Meta". For other Option keys typed into a terminal, the
+  layout's composed character is typed (so `@`, `[`, `{` and `|` work on German
+  and Nordic layouts).
+- **Cmd is left to macOS.** FlightDeck binds no Cmd chord except paste (`Cmd-V`),
+  and the menu-bar conventions `Cmd-,`, `Cmd-O` and `Cmd-Q`. Elsewhere paste is
+  `Ctrl-Shift-V`.
+- Leaving terminal focus honours the same `[ui] use_f2_to_leave_terminal_focus`
+  setting, read when the app starts.
+
 ## Architecture
 
 Business logic is separated from the TUI and fully testable. Git, the

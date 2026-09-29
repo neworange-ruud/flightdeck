@@ -1,0 +1,71 @@
+---
+label: Desktop App (preview)
+section: Desktop App
+order: 35
+---
+
+# Desktop App (preview)
+
+FlightDeck has a native desktop window, `flightdeck-desktop`, as well as the
+terminal UI. It runs the same core, so projects, worktrees, agents, git safety
+rules, the keymap, notifications and saved state are the same. The terminal UI
+is unchanged and is still the way to use FlightDeck over SSH or on a machine
+without a display.
+
+<Callout type="warning">
+  This is a preview. It has been built and run on macOS only; Linux and Windows
+  have not been built or run yet. No packaged installers are published yet, so
+  you build it from source.
+</Callout>
+
+## Build and run
+
+```sh
+cargo run -p flightdeck-desktop            # from inside a git repository
+cargo build -p flightdeck-desktop --release
+```
+
+The desktop app is a separate package in the workspace. A plain `cargo build` at
+the repository root still builds only the terminal UI. If you start the app
+outside a git repository, the window shows a project picker with your recent
+projects. `--isolated` (`-I`) works as in the terminal UI.
+
+| OS | What you need |
+| --- | --- |
+| macOS | Xcode or the Command Line Tools. Shaders compile when the app starts, so the separate Metal Toolchain download is not needed. |
+| Linux (not yet verified) | A C toolchain, `pkg-config`, `cmake`, `clang`, and the `libxkbcommon`, `libxkbcommon-x11`, `libwayland`, `libx11-xcb`, `libxcb`, `libfontconfig` and `libfreetype` development packages. At run time, a Vulkan loader and driver. |
+| Windows (not yet verified) | The MSVC toolchain with the Windows 10/11 SDK. |
+
+## The two views
+
+![The Projects view: project tabs, one row per agent with its status, the git strip, and the active agent's terminal.](/screenshots/desktop-app/projects.png)
+
+**Projects** is the terminal UI's screen as a window: project tabs and the view
+switch in the titlebar, one row per agent in the sidebar, the git strip (Pull
+base, Finish, Push) and the active agent's terminal.
+
+![Mission control: live sessions from two projects as tiles, needs-you first, with earlier activity as cards below.](/screenshots/desktop-app/mission-control.png)
+
+**Mission control** shows every live session across all open projects as tiles.
+Sessions that need you come first, then working ones, then the most recently
+updated. Quiet sessions that were active recently appear as smaller cards, and
+the scope menu sets how far back that reaches (24 hours, 7 days, all) and can
+narrow the view to one project. Press `Enter` on a tile to open the session
+full size with its terminal focused, and `Alt-Esc` to go back to the grid.
+
+A tile whose agent is waiting on a prompt that FlightDeck can recognise offers
+Approve and Deny (or one button per option) directly on the tile. For anything
+else, the tile offers to open the session.
+
+## Shortcuts
+
+Every chord is the same as in the terminal UI. The differences:
+
+- `Alt-m` switches between Projects and Mission control. It works in App mode
+  only; from a focused terminal press `Alt-Esc` first.
+- On macOS, Option works as Alt for every FlightDeck chord, with no "Use Option
+  as Meta" setting.
+- On macOS, Cmd is left to the system. FlightDeck binds only `Cmd-V` (paste)
+  and the menu-bar conventions `Cmd-,`, `Cmd-O` and `Cmd-Q`.
+
+See [Keyboard reference](/reference/keyboard) for the full table.
