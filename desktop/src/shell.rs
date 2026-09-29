@@ -33,6 +33,10 @@ use gpui::{
 };
 use gpui_component::{h_flex, v_flex};
 
+use std::rc::Rc;
+
+use flightdeck_desktop::overlays::update::{update_banner, OnDismiss};
+
 use crate::commands::{keymap, perform_entry};
 use crate::host::HostModel;
 use crate::terminal::view::TerminalView;
@@ -58,6 +62,8 @@ pub struct FlightDeckWindow {
     terminal: Entity<TerminalView>,
     app_focus: FocusHandle,
     modal_focus: FocusHandle,
+    /// The update banner was dismissed for this session.
+    update_dismissed: bool,
 }
 
 impl FlightDeckWindow {
@@ -71,6 +77,7 @@ impl FlightDeckWindow {
             terminal,
             app_focus: cx.focus_handle(),
             modal_focus: cx.focus_handle(),
+            update_dismissed: false,
         }
     }
 
@@ -102,6 +109,18 @@ impl Render for FlightDeckWindow {
         let bar = host.mode_bar(&leave, &help);
         let remote = host.remote_status();
         let notices = host.notices();
+        let banner = if self.update_dismissed {
+            None
+        } else {
+            let this = cx.entity().downgrade();
+            let dismiss: OnDismiss = Rc::new(move |_, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    view.update_dismissed = true;
+                    cx.notify();
+                });
+            });
+            update_banner(&notices, Some(dismiss), cx)
+        };
 
         // Focus follows the host (see the module docs).
         let want = if overlay.is_some() {
@@ -153,6 +172,7 @@ impl Render for FlightDeckWindow {
             .text_color(p.ink.hsla())
             .font_family(crate::fonts::UI_FAMILY)
             .child(self.titlebar.clone())
+            .children(banner)
             .child(
                 h_flex()
                     .flex_1()
@@ -165,7 +185,7 @@ impl Render for FlightDeckWindow {
             .children(
                 overlay
                     .as_ref()
-                    .map(|o| modal(o, &self.host, &self.modal_focus, &p)),
+                    .map(|o| modal(o, &self.host, &self.modal_focus, &p, cx)),
             )
     }
 }

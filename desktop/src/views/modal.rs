@@ -20,6 +20,14 @@ use gpui::{
 };
 use gpui_component::{h_flex, v_flex};
 
+use std::rc::Rc;
+
+use flightdeck_desktop::overlays::about::about_view;
+use flightdeck_desktop::overlays::config::config_view;
+use flightdeck_desktop::overlays::help::help_view;
+use flightdeck_desktop::overlays::remote::{pairing_view, web_access_view};
+use flightdeck_desktop::overlays::Emit;
+
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
 use crate::theme::{Hex, Palette};
@@ -108,30 +116,6 @@ fn card(overlay: &OverlayView) -> Card {
                 .collect(),
             buttons: vec![close()],
         },
-        OverlayView::Help(help) => Card {
-            title: help.title.clone(),
-            lines: help
-                .sections
-                .iter()
-                .flat_map(|s| {
-                    std::iter::once(s.title.clone()).chain(
-                        s.rows
-                            .iter()
-                            .map(|r| format!("  {:<22} {}", r.keys, r.description)),
-                    )
-                })
-                .collect(),
-            input: None,
-            rows: Vec::new(),
-            buttons: vec![close()],
-        },
-        OverlayView::About(about) => Card {
-            title: format!("{} {}", about.name, about.version),
-            lines: vec![about.tagline.clone(), about.url.clone()],
-            input: None,
-            rows: Vec::new(),
-            buttons: vec![close()],
-        },
         OverlayView::GitStatus(g) => {
             let s = &g.status;
             let mut lines = vec![
@@ -158,47 +142,15 @@ fn card(overlay: &OverlayView) -> Card {
                 buttons: vec![close()],
             }
         }
-        OverlayView::Config(c) => Card {
-            title: format!("Configuration · {}", c.project_name),
-            lines: c.status.iter().cloned().collect(),
-            input: None,
-            rows: c
-                .rows
-                .iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    (
-                        format!("{:<28} {}", r.label, r.value),
-                        i == c.selected,
-                        OverlayInput::SelectRow(i),
-                    )
-                })
-                .collect(),
-            buttons: vec![close()],
-        },
-        OverlayView::WebAccess(w) => Card {
-            title: "Web access".into(),
-            lines: [
-                Some(w.view.url.clone()),
-                Some(w.view.exposure_line.clone()),
-                w.view.code.as_ref().map(|c| format!("code {c}")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            input: None,
-            rows: Vec::new(),
-            buttons: vec![close()],
-        },
-        OverlayView::Pairing(pair) => Card {
-            title: "Pair phone".into(),
-            lines: [
-                Some(pair.status_line.clone()),
-                pair.code.as_ref().map(|c| format!("code {c}")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+        // Drawn by their own views (see [`modal`]); a bare title if one ever
+        // reaches here.
+        OverlayView::Help(_)
+        | OverlayView::About(_)
+        | OverlayView::Config(_)
+        | OverlayView::WebAccess(_)
+        | OverlayView::Pairing(_) => Card {
+            title: "FlightDeck".into(),
+            lines: Vec::new(),
             input: None,
             rows: Vec::new(),
             buttons: vec![close()],
@@ -241,17 +193,82 @@ fn send(host: &Entity<HostModel>, input: OverlayInput, cx: &mut App) {
     });
 }
 
-/// The modal layer: a scrim over the window and the card on it. `focus` is
-/// the handle the shell keeps focused while an overlay is open.
+/// The modal layer: a scrim over the window and the overlay's card on it.
+/// `focus` is the handle the shell keeps focused while an overlay is open.
+///
+/// Help, About, the configuration manager, web access and phone pairing are
+/// drawn by their own views (`flightdeck_desktop::overlays`), answering
+/// through the same host model; everything else (messages, prompts, the
+/// palette, git status) by the generic card below. The configuration manager
+/// tracks `focus` and reads its own keys; for the rest the scrim does.
 pub fn modal(
     overlay: &OverlayView,
     host: &Entity<HostModel>,
     focus: &FocusHandle,
     p: &Palette,
+    cx: &App,
 ) -> impl IntoElement {
-    let card = card(overlay);
+    let emit: Emit = {
+        let host = host.clone();
+        Rc::new(move |event, _, cx| host.update(cx, |model, cx| model.dispatch(event, cx)))
+    };
+    let (content, owns_keys): (AnyElement, bool) = match overlay {
+        OverlayView::Help(doc) => (help_view(doc, emit, cx).into_any_element(), false),
+        OverlayView::About(doc) => (about_view(doc, emit, cx).into_any_element(), false),
+        OverlayView::Config(view) => (config_view(view, emit, focus, cx).into_any_element(), true),
+        OverlayView::WebAccess(o) => (web_access_view(o, emit, cx).into_any_element(), false),
+        OverlayView::Pairing(v) => (pairing_view(v, emit, cx).into_any_element(), false),
+        OverlayView::Message(_)
+        | OverlayView::Dialog(_)
+        | OverlayView::Palette(_)
+        | OverlayView::GitStatus(_) => (generic_card(overlay, host, p), false),
+    };
+
     let key_host = host.clone();
     let paste_host = host.clone();
+    let scrim = div()
+        .id("modal-scrim")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(p.scrim.hsla().opacity(0.7));
+    let scrim = if owns_keys {
+        scrim
+    } else {
+        scrim
+            .track_focus(focus)
+            .key_context("Overlay")
+            .on_key_down(move |event, _, cx| {
+                let ks = &event.keystroke;
+                // Paste into a text field: the platform's paste chord.
+                let paste = ks.key == "v"
+                    && if flightdeck::tui::platform::IS_MACOS {
+                        ks.modifiers.platform
+                    } else {
+                        ks.modifiers.control
+                    };
+                if paste {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                        paste_host
+                            .update(cx, |model, cx| model.dispatch(HostEvent::Paste(text), cx));
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                if let Some(input) = overlay_input_for_key(event) {
+                    send(&key_host, input, cx);
+                    cx.stop_propagation();
+                }
+            })
+    };
+    scrim.child(content)
+}
+
+/// The generic card: title, body lines, text field, choice rows, buttons.
+fn generic_card(overlay: &OverlayView, host: &Entity<HostModel>, p: &Palette) -> AnyElement {
+    let card = card(overlay);
 
     let rows = v_flex()
         .id("modal-rows")
@@ -290,93 +307,61 @@ pub fn modal(
             .map(|(b, input)| button(b, input, host, p)),
     );
 
-    div()
-        .id("modal-scrim")
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(p.scrim.hsla().opacity(0.6))
-        .track_focus(focus)
-        .key_context("Overlay")
-        .on_key_down(move |event, _, cx| {
-            let ks = &event.keystroke;
-            // Paste into a text field: the platform's paste chord.
-            let paste = ks.key == "v"
-                && if flightdeck::tui::platform::IS_MACOS {
-                    ks.modifiers.platform
-                } else {
-                    ks.modifiers.control
-                };
-            if paste {
-                if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    paste_host.update(cx, |model, cx| model.dispatch(HostEvent::Paste(text), cx));
-                }
-                cx.stop_propagation();
-                return;
-            }
-            if let Some(input) = overlay_input_for_key(event) {
-                send(&key_host, input, cx);
-                cx.stop_propagation();
-            }
-        })
+    v_flex()
+        .id("modal-card")
+        .debug_selector(|| "modal-card".into())
+        .w(px(520.))
+        .max_h(px(560.))
+        .p_4()
+        .gap_3()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(p.border_strong.hsla())
+        .bg(p.surface_raised.hsla())
+        .text_color(p.ink.hsla())
+        // Clicks on the card stay on it.
+        .on_click(|_, _, cx| cx.stop_propagation())
         .child(
-            v_flex()
-                .id("modal-card")
-                .debug_selector(|| "modal-card".into())
-                .w(px(520.))
-                .max_h(px(560.))
-                .p_4()
-                .gap_3()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(p.border_strong.hsla())
-                .bg(p.surface_raised.hsla())
-                .text_color(p.ink.hsla())
-                // Clicks on the card stay on it.
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(card.title),
-                )
-                .when(!card.lines.is_empty(), |c| {
-                    c.child(
-                        v_flex()
-                            .id("modal-body")
-                            .max_h(px(300.))
-                            .overflow_y_scroll()
-                            .gap_1()
-                            .text_size(px(12.5))
-                            .text_color(p.ink_2.hsla())
-                            .children(card.lines.into_iter().map(|l| {
-                                div().whitespace_nowrap().child(if l.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    l
-                                })
-                            })),
-                    )
-                })
-                .when_some(card.input, |c, text| {
-                    c.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(p.border_strong.hsla())
-                            .bg(p.surface_input.hsla())
-                            .font_family(MONO_FAMILY)
-                            .text_size(px(12.5))
-                            .child(format!("{text}▏")),
-                    )
-                })
-                .child(rows)
-                .child(buttons),
+            div()
+                .text_size(px(14.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(card.title),
         )
+        .when(!card.lines.is_empty(), |c| {
+            c.child(
+                v_flex()
+                    .id("modal-body")
+                    .max_h(px(300.))
+                    .overflow_y_scroll()
+                    .gap_1()
+                    .text_size(px(12.5))
+                    .text_color(p.ink_2.hsla())
+                    .children(card.lines.into_iter().map(|l| {
+                        div().whitespace_nowrap().child(if l.is_empty() {
+                            " ".to_string()
+                        } else {
+                            l
+                        })
+                    })),
+            )
+        })
+        .when_some(card.input, |c, text| {
+            c.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.border_strong.hsla())
+                    .bg(p.surface_input.hsla())
+                    .font_family(MONO_FAMILY)
+                    .text_size(px(12.5))
+                    .child(format!("{text}▏")),
+            )
+        })
+        .child(rows)
+        .child(buttons)
+        .into_any_element()
 }
 
 fn button(

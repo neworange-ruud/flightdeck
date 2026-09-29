@@ -286,6 +286,15 @@ fn the_generic_modal_answers_the_overlay(app: &mut TestAppContext) {
     );
     assert_eq!(model.read_with(cx, |m, _| m.host().overlay()), None);
 
+    // Help is drawn by its own overlay view, and Esc still closes it.
+    cx.simulate_keystrokes("f1");
+    assert!(matches!(
+        model.read_with(cx, |m, _| m.host().overlay()),
+        Some(OverlayView::Help(_))
+    ));
+    cx.simulate_keystrokes("escape");
+    assert_eq!(model.read_with(cx, |m, _| m.host().overlay()), None);
+
     // While an overlay is open a table chord is not performed: Shift-Right
     // stays with the modal instead of switching project.
     cx.simulate_keystrokes("ctrl-g");
