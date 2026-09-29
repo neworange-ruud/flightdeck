@@ -51,6 +51,147 @@ impl GitCli {
     }
 }
 
+/// One open project's repository handle: its root plus the [`GitExecutor`]
+/// that runs git against it.
+///
+/// The executor sits behind the trait (SPECS §27) rather than being a concrete
+/// [`GitCli`], so the whole host — dialogs, guarded confirms, background status
+/// refreshes — can be driven against `FakeGit` in tests. It is `Arc`-shared
+/// because the slow operations (`git worktree add`, `git status`) run on worker
+/// threads that each need a handle of their own; cloning one is a refcount bump,
+/// never a second repository discovery.
+///
+/// Implements [`GitExecutor`] itself by delegation, so every call site that
+/// took `&project.git` when the field was a `GitCli` reads exactly as before.
+#[derive(Clone)]
+pub struct ProjectGit {
+    root: PathBuf,
+    exec: std::sync::Arc<dyn GitExecutor + Send + Sync>,
+}
+
+impl ProjectGit {
+    /// A handle over any executor bound to `root`.
+    pub fn new(root: PathBuf, exec: std::sync::Arc<dyn GitExecutor + Send + Sync>) -> Self {
+        ProjectGit { root, exec }
+    }
+
+    /// The real `git`-binary handle for a discovered repository.
+    pub fn cli(git: GitCli) -> Self {
+        let root = git.root().to_path_buf();
+        ProjectGit::new(root, std::sync::Arc::new(git))
+    }
+
+    /// The repository root this handle is bound to.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Pure delegation to the executor, so a `&ProjectGit` is a `&dyn GitExecutor`
+/// wherever a [`crate::app::state::Services`] or a worker needs one. It adds no
+/// operation of its own — the SPECS §5 surface is exactly the trait's.
+impl GitExecutor for ProjectGit {
+    fn repo_root(&self, cwd: &Path) -> Result<PathBuf> {
+        self.exec.repo_root(cwd)
+    }
+
+    fn current_branch(&self, cwd: &Path) -> Result<String> {
+        self.exec.current_branch(cwd)
+    }
+
+    fn is_dirty(&self, cwd: &Path) -> Result<bool> {
+        self.exec.is_dirty(cwd)
+    }
+
+    fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>> {
+        self.exec.status_porcelain(cwd)
+    }
+
+    fn diff_numstat(&self, cwd: &Path) -> Result<Vec<String>> {
+        self.exec.diff_numstat(cwd)
+    }
+
+    fn branch_exists(&self, name: &str) -> Result<bool> {
+        self.exec.branch_exists(name)
+    }
+
+    fn list_local_branches(&self) -> Result<Vec<String>> {
+        self.exec.list_local_branches()
+    }
+
+    fn create_branch(&self, name: &str, from: &str) -> Result<()> {
+        self.exec.create_branch(name, from)
+    }
+
+    fn rev_parse(&self, refname: &str) -> Result<String> {
+        self.exec.rev_parse(refname)
+    }
+
+    fn add_worktree(&self, path: &Path, branch: &str) -> Result<()> {
+        self.exec.add_worktree(path, branch)
+    }
+
+    fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
+        self.exec.list_worktrees()
+    }
+
+    fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
+        self.exec.remove_worktree(path, force)
+    }
+
+    fn prune_worktrees(&self) -> Result<()> {
+        self.exec.prune_worktrees()
+    }
+
+    fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)> {
+        self.exec.ahead_behind(base, branch)
+    }
+
+    fn upstream_of(&self, branch: &str) -> Result<Option<String>> {
+        self.exec.upstream_of(branch)
+    }
+
+    fn push(&self, remote: &str, branch: &str, cwd: &Path) -> Result<()> {
+        self.exec.push(remote, branch, cwd)
+    }
+
+    fn remote_url(&self, remote: &str) -> Result<Option<String>> {
+        self.exec.remote_url(remote)
+    }
+
+    fn merge_no_ff(&self, branch: &str, cwd: &Path) -> Result<MergeOutcome> {
+        self.exec.merge_no_ff(branch, cwd)
+    }
+
+    fn rebase_onto(&self, onto: &str, cwd: &Path) -> Result<RebaseOutcome> {
+        self.exec.rebase_onto(onto, cwd)
+    }
+
+    fn pull_base(&self, cwd: &Path) -> Result<RebaseOutcome> {
+        self.exec.pull_base(cwd)
+    }
+
+    fn stash_push(&self, cwd: &Path) -> Result<bool> {
+        self.exec.stash_push(cwd)
+    }
+
+    fn stash_apply(&self, cwd: &Path) -> Result<bool> {
+        self.exec.stash_apply(cwd)
+    }
+
+    fn stash_drop(&self, cwd: &Path) -> Result<()> {
+        self.exec.stash_drop(cwd)
+    }
+}
+
+impl std::fmt::Debug for ProjectGit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectGit")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Execute `git -C <dir> <args...>` and capture output. Maps a non-zero exit or
 /// a spawn failure to [`FlightDeckError::Git`].
 fn run_git_in(dir: &Path, args: &[&str]) -> Result<Output> {

@@ -25,7 +25,9 @@ struct Fakes {
     container: FakeContainerRuntime,
     command: FakeCommandRunner,
     notifier: FakeNotifier,
-    git: FakeGit,
+    /// Shared with the host's project, so a test configures the same fake the
+    /// host's dispatches read (`Project::git` is behind the trait).
+    git: Arc<FakeGit>,
     /// Holds the stand-in agent executable `make_agent` writes.
     dir: TempDir,
 }
@@ -39,7 +41,7 @@ impl Fakes {
             container: FakeContainerRuntime::new(),
             command: FakeCommandRunner::new(),
             notifier: FakeNotifier::new(),
-            git: FakeGit::new().with_branches(["main"]),
+            git: Arc::new(FakeGit::new().with_branches(["main"])),
             dir: TempDir::new().expect("tempdir"),
         }
     }
@@ -56,7 +58,7 @@ impl Fakes {
 
     fn services(&self) -> Services<'_> {
         Services {
-            git: &self.git,
+            git: &*self.git,
             fs: &self.fs,
             pty: &self.pty,
             clock: &self.clock,
@@ -119,27 +121,26 @@ impl Fakes {
     /// A host over a one-project workspace holding `state`.
     fn host(&self, state: AppState) -> AppHost<'_> {
         let workspace = Workspace {
-            projects: vec![project("proj", "/repo", state)],
+            projects: vec![project("proj", "/repo", state, Arc::clone(&self.git))],
             active: 0,
         };
         let mut host =
             AppHost::from_parts(self.env(), &self.notifier, workspace, web_surface(), false);
-        // Skip the tick-0 git-status refresh. `Project::git` is the real
-        // `GitCli` (the per-project handle is not behind a trait yet), so that
-        // refresh would spawn a real `git status` against the fake `/repo`
-        // root. Everything else a turn does goes through the fakes.
+        // Skip the tick-0 git-status refresh. It would only read the fake, but
+        // it does so from a worker thread whose answer lands on a later turn,
+        // which would make "a quiet turn asks for no redraw" racy.
         host.tick = 1;
         host
     }
 }
 
 /// A [`Project`] with fresh worker channels, as `open_project` builds one.
-fn project(name: &str, root: &str, state: AppState) -> Project {
+fn project(name: &str, root: &str, state: AppState, git: Arc<FakeGit>) -> Project {
     let (create_tx, create_rx) = std::sync::mpsc::channel();
     let (status_tx, status_rx) = std::sync::mpsc::channel();
     Project {
         name: name.to_string(),
-        git: crate::git::repo::GitCli::new(PathBuf::from(root)),
+        git: crate::git::repo::ProjectGit::new(PathBuf::from(root), git),
         state,
         cache: HashMap::new(),
         create_tx,
@@ -345,7 +346,7 @@ fn switch_project_event_moves_the_active_project() {
     );
     host.workspace
         .projects
-        .push(project("other", "/repo2", other));
+        .push(project("other", "/repo2", other, Arc::new(FakeGit::new())));
 
     host.handle(HostEvent::SwitchProject(Selector::Next))
         .unwrap();

@@ -75,7 +75,7 @@ use crate::contracts::{
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
 use crate::fs::paths::to_absolute;
-use crate::git::repo::{detect_base_branch, GitCli};
+use crate::git::repo::{detect_base_branch, GitCli, ProjectGit};
 use crate::git::status::{collect_status, WorktreeStatus};
 use crate::host::{AppHost, HostEvent};
 use crate::notify::SystemNotifier;
@@ -1807,7 +1807,7 @@ fn record_web_transitions(
 /// another instance is holding a lock on must never freeze the loop. It costs
 /// one thread per finished session, which is rare — this is not the periodic
 /// refresh and deliberately does not become one.
-fn spawn_finish_count(git: &GitCli, tx: &Sender<FinishCount>, req: FinishCountRequest) {
+fn spawn_finish_count(git: &ProjectGit, tx: &Sender<FinishCount>, req: FinishCountRequest) {
     let git = git.clone();
     let tx = tx.clone();
     std::thread::spawn(move || {
@@ -1862,8 +1862,9 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
 struct Project {
     /// Display name for the project tab (the repo folder name).
     name: String,
-    /// This project's repository git handle (rooted at its own repo).
-    git: GitCli,
+    /// This project's repository git handle (rooted at its own repo), behind
+    /// the [`GitExecutor`] seam so a test can hand it a `FakeGit`.
+    git: ProjectGit,
     /// The project's headless application state.
     state: AppState,
     /// Git-status cache for this project's tabs (keyed by tab id).
@@ -1890,7 +1891,7 @@ struct Project {
 /// isolated run (SPECS §32) whose status plumbing lives at that root —
 /// forwarded straight through to [`startup`].
 fn open_project(env: &Env, path: &Path, isolated: Option<&Path>) -> Result<Project> {
-    let git = GitCli::discover(path)?;
+    let git = ProjectGit::cli(GitCli::discover(path)?);
     let root = git.root().to_path_buf();
     let name = derive_project_name(&root);
     let state = {
@@ -3574,7 +3575,7 @@ enum StatusMsg {
 /// requests don't race on the repo's index/worktree locks.
 fn spawn_worktree_job(
     job: WorktreeJob,
-    worker_git: &GitCli,
+    worker_git: &ProjectGit,
     git_lock: &Arc<Mutex<()>>,
     create_tx: &Sender<CreateOutcome>,
 ) {
@@ -3661,7 +3662,7 @@ fn drain_create_outcomes(
 /// the UI (SPECS §21).
 fn spawn_status_refresh(
     state: &AppState,
-    worker_git: &GitCli,
+    worker_git: &ProjectGit,
     status_tx: &Sender<StatusMsg>,
 ) -> bool {
     struct StatusReq {
@@ -9301,7 +9302,7 @@ mod tests {
         let mut workspace = Workspace {
             projects: vec![Project {
                 name: "project".to_string(),
-                git: GitCli::new(root.clone()),
+                git: ProjectGit::cli(GitCli::new(root.clone())),
                 state: app,
                 cache: GitStatusCache::new(),
                 create_tx,
@@ -10054,7 +10055,7 @@ mod tests {
             Workspace {
                 projects: vec![Project {
                     name: "proj".to_string(),
-                    git: GitCli::new(root),
+                    git: ProjectGit::cli(GitCli::new(root)),
                     state: app,
                     cache: GitStatusCache::new(),
                     create_tx,
@@ -11020,7 +11021,7 @@ mod tests {
             let (status_tx, status_rx) = std::sync::mpsc::channel();
             Project {
                 name: name.to_string(),
-                git: GitCli::new(PathBuf::from(root)),
+                git: ProjectGit::cli(GitCli::new(PathBuf::from(root))),
                 state: app,
                 cache: GitStatusCache::new(),
                 create_tx,
@@ -11452,7 +11453,7 @@ mod tests {
             Workspace {
                 projects: vec![Project {
                     name: "proj".to_string(),
-                    git: GitCli::new(PathBuf::from("/repo")),
+                    git: ProjectGit::cli(GitCli::new(PathBuf::from("/repo"))),
                     state: app,
                     cache: GitStatusCache::new(),
                     create_tx,
@@ -11485,7 +11486,7 @@ mod tests {
             let (status_tx, status_rx) = std::sync::mpsc::channel();
             ws.projects.push(Project {
                 name: "other".to_string(),
-                git: GitCli::new(PathBuf::from("/repo2")),
+                git: ProjectGit::cli(GitCli::new(PathBuf::from("/repo2"))),
                 state: other_app,
                 cache: GitStatusCache::new(),
                 create_tx,
@@ -14249,7 +14250,7 @@ mod tests {
             let (status_tx, status_rx) = std::sync::mpsc::channel();
             Project {
                 name: name.to_string(),
-                git: GitCli::new(PathBuf::from(root)),
+                git: ProjectGit::cli(GitCli::new(PathBuf::from(root))),
                 state: app,
                 cache: GitStatusCache::new(),
                 create_tx,
