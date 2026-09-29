@@ -82,6 +82,7 @@ cross-cutting work gets several (the seq-deadlock bug was
 | `area:relay` | `remote/` — the relay + protocol workspace |
 | `area:ios` | `ios/` — the Swift app |
 | `area:tui` | `src/tui/` — panes, input, rendering |
+| `area:gui` | the native GPUI desktop app — window, terminal element, views |
 | `area:web` | `web/` — the site and privacy policy |
 | `area:containers` | `containers/` — agent isolation images |
 | `area:ci` | `.github/workflows/` — CI, release, TestFlight |
