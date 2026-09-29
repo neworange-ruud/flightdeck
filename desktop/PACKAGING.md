@@ -150,6 +150,71 @@ Files: `desktop/wix/main.wxs`, `[package.metadata.wix]` in `desktop/Cargo.toml`,
   cargo-dist off the GUI crate, and it cannot use the self-contained windows-gnu setup
   in `scripts/build-windows`.
 
+## Self-update (`remote-control-bmej.6.5`)
+
+Code: `desktop/src/selfupdate/`, the banner in `desktop/src/overlays/update.rs`.
+The CLI's `flightdeck update` (axoupdater) is unchanged.
+
+**Behaviour.** Once a day (own cache, `desktop-update-check.json` next to the TUI's,
+honouring `[update] check`) the app asks GitHub for the newest `desktop-v*` release and,
+if it is newer, shows the banner (never a modal). What the banner offers depends on how
+the app was installed, detected from where the executable runs:
+
+| Install | Detected by | Banner |
+| --- | --- | --- |
+| Homebrew cask | bundle under `/opt/homebrew/Caskroom` or `/usr/local/Caskroom`, or in an `Applications` folder with a `Caskroom/flightdeck-desktop` receipt | "Update with: brew update && brew upgrade --cask flightdeck-desktop" |
+| `.deb` / `.rpm` | exe under `/usr` (not `/usr/local`) and `/var/lib/dpkg/info/flightdeck-desktop.list` / an rpm database | the apt / dnf command |
+| MSI / winget | exe under `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%` | winget or new MSI |
+| macOS `.app` (zip), AppImage (`$APPIMAGE`), Windows portable zip | none of the above | **Update now** |
+| bare binary, `/usr/local`, unknown | anything else | "download from the releases page" |
+
+**Update now** downloads the asset and its checksum, verifies SHA-256, and only then
+touches the installation. Staging is always a sibling of what it replaces (rename is
+atomic only on one volume):
+
+- macOS: unzip (`ditto -x -k`) to `.FlightDeck-update-<v>/`, rename the bundle to
+  `previous.app`, rename the new `.app` into place (two renames; the first is undone if
+  the second fails), delete staging, offer **Restart** (`App::restart`, which runs the
+  normal quit teardown). The app needs write access to the bundle's folder; without it
+  the banner shows the error and the installed copy is untouched.
+- AppImage: download to `.<name>.update-<v>/`, `chmod +x`, rename over the file (atomic;
+  the running image keeps its old inode), offer Restart.
+- Windows portable: Windows cannot overwrite a running `.exe`, so the update is unpacked
+  to `.flightdeck-update/payload` and a `READY` marker written last. At the **next
+  launch**, before any window opens, `finish_staged` renames each old top-level entry
+  into `.flightdeck-old/`, moves the new one in (all or nothing) and relaunches; the
+  parked files are deleted on the launch after.
+
+**Asset naming contract** (the release pipeline must publish exactly this; the updater
+finds files by name and refuses, rather than guesses, when one is missing):
+
+```text
+tag       desktop-v<version>                         e.g. desktop-v1.4.0  (plain major.minor.patch)
+macOS     FlightDeck-<version>-macos-<arch>.zip      FlightDeck.app at the zip root (ditto --keepParent)
+Linux     FlightDeck-<version>-linux-<arch>.AppImage
+Windows   FlightDeck-<version>-windows-<arch>-portable.zip   flightdeck-desktop.exe at the zip root
+checksum  <asset name>.sha256                        `sha256sum` format: <64 hex>  <asset name>
+```
+
+`<arch>` is `x86_64` or `aarch64`. Drafts and pre-releases are ignored. **Gap to close in
+the pipeline:** `scripts/desktop/macos-bundle.sh` currently names the zip
+`FlightDeck-<ver>-macos.zip` (no arch) and no script writes `.sha256` files or builds the
+portable Windows zip; those need aligning with the names above when the release job is
+written. The `.msi`, `.deb`, `.rpm` and the cask are for package managers and are never
+downloaded by the app.
+
+**Downloads and unzip** use `curl` (HTTPS only, `--fail`), `ditto` (macOS), `tar` (Windows
+10+) and `unzip` (Linux), by argv, so the crate carries no HTTP/TLS client or zip library.
+A machine without `curl` simply never shows the notice.
+
+**Not verified.** The release pipeline is unpublished, so the real download, the real
+`ditto`/`tar` extraction, `App::restart` after a swap, writing into `/Applications`,
+Gatekeeper behaviour on a swapped (unsigned or notarized) bundle, and everything on
+Linux and Windows have not been run. What is tested: install-kind detection for every
+OS from paths, asset selection, checksum parsing and mismatch refusal, GitHub response
+parsing, the once-a-day cache, and the whole install/rollback/staged-swap logic against a
+fake release source and temporary directories.
+
 ## Open questions for the owner
 
 1. Bundle id: `agency.neworange.flightdeck.desktop` (derived from the iOS prefix)? It is

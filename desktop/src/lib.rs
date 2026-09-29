@@ -7,6 +7,9 @@
 
 pub mod keys;
 pub mod overlays;
+// Self-update: install-kind detection, release/asset/checksum rules, the
+// once-a-day check and the download-verify-swap (beads bmej.6.5).
+pub mod selfupdate;
 // The palette lives in the library (the binary re-uses it) because the overlay
 // views paint with it and are tested here, without a window.
 pub mod theme;

@@ -124,6 +124,21 @@ fn option_as_meta_in(fs: &dyn FileSystem, path: &Path) -> bool {
     load_config(fs, path).is_ok_and(|config| config.ui.macos_option_as_meta)
 }
 
+/// `[update] check` from the global config, for a launch with no project. A
+/// missing or unreadable file is the default, on.
+fn global_update_check() -> bool {
+    global_config_path().is_none_or(|path| update_check_in(&RealFs, &path))
+}
+
+/// The setting in the config file at `path`; a missing or unreadable file is
+/// the default, on.
+fn update_check_in(fs: &dyn FileSystem, path: &Path) -> bool {
+    match load_config(fs, path) {
+        Ok(config) => config.update.check,
+        Err(_) => true,
+    }
+}
+
 /// Start GPUI, open the workspace and the main window. Blocks until quit.
 pub fn run(args: Vec<String>) {
     let launch = match parse_args(args) {
@@ -133,6 +148,9 @@ pub fn run(args: Vec<String>) {
             std::process::exit(2);
         }
     };
+    // Windows only: an update staged by the previous run replaces this
+    // installation before anything opens (and relaunches into it).
+    flightdeck_desktop::selfupdate::finish_staged_update_at_launch();
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(e) => {
@@ -177,6 +195,11 @@ pub fn run(args: Vec<String>) {
         None => global_option_as_meta(),
     };
     flightdeck_desktop::keys::OptionKey::set_macos_option_as_meta(option_as_meta);
+    // The once-a-day update notice honours `[update] check` like the TUI's.
+    let update_check = match &initial {
+        Some(host) => host.active_state().config.update.check,
+        None => global_update_check(),
+    };
     let shutdown = flightdeck::signals::install_shutdown_flag();
     let snapshot = launch.snapshot;
     let isolated = launch.isolated;
@@ -239,6 +262,9 @@ pub fn run(args: Vec<String>) {
                 }
             };
             cx.activate(true);
+            // Background and silent: the banner appears only if a newer
+            // release is found (see `selfupdate`).
+            flightdeck_desktop::selfupdate::start_check(cx, update_check);
 
             #[cfg(feature = "spike-snapshot")]
             if snapshot.is_requested() {
@@ -335,6 +361,26 @@ mod tests {
         assert!(!option_as_meta_in(&fs, path));
         fs.write(path, "not toml [[[").unwrap();
         assert!(!option_as_meta_in(&fs, path), "unreadable: the default");
+    }
+
+    #[test]
+    fn the_update_check_setting_defaults_on_and_is_read_from_the_config_file() {
+        use flightdeck::testing::FakeFs;
+        let fs = FakeFs::new();
+        let path = Path::new("/home/u/.flightdeck/config.toml");
+        assert!(update_check_in(&fs, path), "no file: the default, on");
+
+        let config = |flag: bool| {
+            let mut config = flightdeck::config::schema::default_config("proj", "main");
+            config.update.check = flag;
+            flightdeck::config::load::serialize_config(&config).unwrap()
+        };
+        fs.write(path, &config(false)).unwrap();
+        assert!(!update_check_in(&fs, path));
+        fs.write(path, &config(true)).unwrap();
+        assert!(update_check_in(&fs, path));
+        fs.write(path, "not toml [[[").unwrap();
+        assert!(update_check_in(&fs, path), "unreadable: the default");
     }
 
     #[test]

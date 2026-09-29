@@ -548,11 +548,6 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             "ui",
             "use_f2_to_leave_terminal_focus",
         ),
-        b(
-            "Option as Meta (macOS desktop app)",
-            "ui",
-            "macos_option_as_meta",
-        ),
         CuratedField {
             label: "Agent tab position",
             section: "ui",
@@ -599,6 +594,11 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             ),
         },
         b("Dim terminal in app mode", "ui", "dim_terminal_in_app_mode"),
+        b(
+            "Option as Meta (macOS desktop app)",
+            "ui",
+            "macos_option_as_meta",
+        ),
         // FlightDeck Remote (phone link). The relay URL is free-text so a user
         // can point it at a relay they host themselves — the default relay is
         // restricted and not publicly usable (surfaced as a note in the UI).
@@ -729,16 +729,16 @@ mod tests {
     #[test]
     fn choice_cycles_through_options() {
         let mut m = mgr(toml::Table::new(), toml::Table::new());
-        // Move to "Agent tab position" (index 8).
-        for _ in 0..8 {
+        // Move to "Agent tab position" (index 7).
+        for _ in 0..7 {
             m.select_next();
         }
-        let before = m.rows()[8].value.clone();
+        let before = m.rows()[7].value.clone();
         assert_eq!(before, "left");
         m.toggle_selected();
-        assert_eq!(m.rows()[8].value, "right");
+        assert_eq!(m.rows()[7].value, "right");
         m.toggle_selected();
-        assert_eq!(m.rows()[8].value, "left");
+        assert_eq!(m.rows()[7].value, "left");
     }
 
     #[test]
