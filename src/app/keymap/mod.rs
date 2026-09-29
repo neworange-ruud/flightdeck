@@ -58,7 +58,7 @@ mod pty;
 use std::sync::OnceLock;
 
 pub use chord::{Chord, Key, Mods};
-pub use pty::encode_pty;
+pub use pty::{encode_paste, encode_pty};
 
 use crate::app::commands::{Command, Selector};
 use crate::app::modes::InputMode;

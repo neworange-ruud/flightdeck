@@ -1,7 +1,8 @@
-//! Chord-to-bytes encoding for Terminal-mode passthrough.
+//! Chord-to-bytes and paste encoding for Terminal-mode passthrough.
 //!
-//! Every front-end that types into a PTY encodes through [`encode_pty`], so the
-//! bytes an agent receives do not depend on which window the user typed in.
+//! Every front-end that types into a PTY encodes through [`encode_pty`] (keys)
+//! and [`encode_paste`] (pasted text), so the bytes an agent receives do not
+//! depend on which window the user typed in.
 
 use super::chord::{Chord, Key, Mods};
 
@@ -77,5 +78,27 @@ pub fn encode_pty(chord: Chord) -> Vec<u8> {
             12 => vec![0x1b, b'[', b'2', b'4', b'~'],
             _ => vec![],
         },
+    }
+}
+
+/// Encode pasted text for the PTY, as every front-end sends a paste.
+///
+/// Newlines are normalised to carriage returns (the line break a terminal
+/// sends for Enter). When `bracketed` is set — the hosted application enabled
+/// bracketed paste mode (DECSET 2004), as Claude Code, OpenCode and modern
+/// shells do — the payload is wrapped in the `ESC [200~` / `ESC [201~` guards
+/// so the app treats it as one atomic insert rather than executing it line by
+/// line. Without the mode the app gets the raw text, exactly as a real
+/// terminal emulator forwards a paste.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let mut bytes = Vec::with_capacity(normalized.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        normalized.into_bytes()
     }
 }

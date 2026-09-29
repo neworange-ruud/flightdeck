@@ -8172,25 +8172,8 @@ fn paste_text_into_active_pty(state: &mut AppState, text: &str) {
         .selected()
         .and_then(|tab| tab.session.active())
         .is_some_and(|term| term.bracketed_paste());
-    let bytes = encode_paste(text, wants_bracket);
+    let bytes = crate::app::keymap::encode_paste(text, wants_bracket);
     write_active_pty(state, &bytes);
-}
-
-/// Encode pasted text for the PTY: normalise newlines to carriage returns (the
-/// line break a terminal sends for Enter) and, when `bracketed` is set, wrap the
-/// payload in the `ESC [200~` / `ESC [201~` guards so a bracketed-paste-aware
-/// app treats it as one atomic insert rather than executing line by line.
-fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-    if bracketed {
-        let mut bytes = Vec::with_capacity(normalized.len() + 12);
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(normalized.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
-        bytes
-    } else {
-        normalized.into_bytes()
-    }
 }
 
 /// Resize every live PTY session and its VT parser to the new viewport size
@@ -8917,31 +8900,6 @@ mod tests {
         assert!(!ui.should_quit);
         apply_effect_no_state(Effect::Quit, &mut ui);
         assert!(ui.should_quit);
-    }
-
-    // --- bracketed paste encoding -----------------------------------------
-
-    #[test]
-    fn encode_paste_wraps_when_app_enabled_bracketed_mode() {
-        // A multi-line paste must reach a bracketed-paste-aware agent as one
-        // atomic insert (guarded by ESC[200~/ESC[201~), not line-by-line, so it
-        // does not execute the first line and queue the rest as prompts.
-        let bytes = encode_paste("line one\nline two", true);
-        assert_eq!(bytes, b"\x1b[200~line one\rline two\x1b[201~".to_vec());
-    }
-
-    #[test]
-    fn encode_paste_passes_raw_when_app_disabled_bracketed_mode() {
-        // Without bracketed paste mode the app gets the raw text, exactly as a
-        // real terminal forwards a paste — no guards inserted.
-        let bytes = encode_paste("line one\nline two", false);
-        assert_eq!(bytes, b"line one\rline two".to_vec());
-    }
-
-    #[test]
-    fn encode_paste_normalises_crlf_and_lf_to_cr() {
-        // Both CRLF (Windows clipboard) and bare LF collapse to a single CR.
-        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
     }
 
     #[test]

@@ -325,3 +325,28 @@ fn this_platform_table_is_cached_per_setting() {
     assert!(!a.options().use_f2_to_leave_focus);
     assert!(b.options().use_f2_to_leave_focus);
 }
+
+// --- bracketed paste encoding ---------------------------------------------
+
+#[test]
+fn encode_paste_wraps_when_app_enabled_bracketed_mode() {
+    // A multi-line paste must reach a bracketed-paste-aware agent as one
+    // atomic insert (guarded by ESC[200~/ESC[201~), not line-by-line, so it
+    // does not execute the first line and queue the rest as prompts.
+    let bytes = encode_paste("line one\nline two", true);
+    assert_eq!(bytes, b"\x1b[200~line one\rline two\x1b[201~".to_vec());
+}
+
+#[test]
+fn encode_paste_passes_raw_when_app_disabled_bracketed_mode() {
+    // Without bracketed paste mode the app gets the raw text, exactly as a
+    // real terminal forwards a paste — no guards inserted.
+    let bytes = encode_paste("line one\nline two", false);
+    assert_eq!(bytes, b"line one\rline two".to_vec());
+}
+
+#[test]
+fn encode_paste_normalises_crlf_and_lf_to_cr() {
+    // Both CRLF (Windows clipboard) and bare LF collapse to a single CR.
+    assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+}
