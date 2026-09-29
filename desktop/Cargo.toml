@@ -90,3 +90,7 @@ gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
 crossterm = "0.29.0"
 # The configuration-manager fixtures build the manager from empty TOML tables.
 toml = "1.1.2"
+# The TUI library again, with its off-by-default `testing` feature: an
+# `AppHost` built over the core's fakes, so the shell's GPUI tests drive real
+# views against a real host. Dev-only, like `test-support` above.
+flightdeck = { path = "..", features = ["testing"] }

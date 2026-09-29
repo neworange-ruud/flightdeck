@@ -13,26 +13,21 @@
 //! their column, so a glyph with a foreign advance cannot shift its neighbours.
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, Element, ElementId, Entity, Font,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PathBuilder, Pixels, Point,
-    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
+    fill, point, px, relative, size, App, Bounds, Element, ElementId, ElementInputHandler, Entity,
+    Font, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PathBuilder, Pixels,
+    Point, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
 };
 
 use super::boxdraw::{BoxGlyph, Corner, Weight};
-use super::layout::{self, FrameLayout, TextSpan};
+use super::layout::{FrameLayout, TextSpan};
 use super::view::TerminalView;
 use crate::theme::Hex;
 use flightdeck::contracts::PtySize;
 use flightdeck::terminal::grid::CursorShape;
 
-/// The monospace family the spike draws with, per OS: each ships this font.
-/// (Bundled Geist Mono replaces this later.)
-#[cfg(target_os = "macos")]
-const MONO_FAMILY: &str = "Menlo";
-#[cfg(target_os = "windows")]
-const MONO_FAMILY: &str = "Consolas";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const MONO_FAMILY: &str = "DejaVu Sans Mono";
+/// The monospace family terminals draw with: the bundled Geist Mono
+/// (`crate::fonts`), the same on every OS.
+const MONO_FAMILY: &str = crate::fonts::MONO_FAMILY;
 
 /// Terminal text size.
 const FONT_SIZE: f32 = 13.0;
@@ -94,11 +89,15 @@ pub fn measure_cell(window: &Window) -> (Pixels, Pixels) {
 /// Paints the grid of the [`TerminalView`] it is given.
 pub struct TerminalElement {
     view: Entity<TerminalView>,
+    /// Register the view as the window's text input handler while focused,
+    /// so typed text and IME compositions arrive through
+    /// `EntityInputHandler` (the app; the spike types keys directly).
+    text_input: bool,
 }
 
 impl TerminalElement {
-    pub fn new(view: Entity<TerminalView>) -> Self {
-        Self { view }
+    pub fn new(view: Entity<TerminalView>, text_input: bool) -> Self {
+        Self { view, text_input }
     }
 }
 
@@ -112,7 +111,8 @@ impl IntoElement for TerminalElement {
 
 /// What prepaint hands paint.
 pub struct Prepared {
-    frame: FrameLayout,
+    /// `None` when no terminal is on screen (no agent selected yet).
+    frame: Option<FrameLayout>,
     metrics: CellMetrics,
     background: Hex,
 }
@@ -162,18 +162,12 @@ impl Element for TerminalElement {
         let rows = (bounds.size.height / height).floor().max(1.0) as u16;
         let focused = self.view.read(cx).focus_handle().is_focused(window);
 
-        self.view.update(cx, |view, _| {
+        self.view.update(cx, |view, cx| {
             view.set_metrics(metrics);
-            view.resize(PtySize { rows, cols });
+            view.resize(PtySize { rows, cols }, cx);
         });
         let view = self.view.read(cx);
-        let terminal = view.terminal();
-        let frame = layout::layout(
-            terminal.screen(),
-            terminal.selection(),
-            view.palette(),
-            focused,
-        );
+        let frame = view.frame(focused, cx);
         Prepared {
             frame,
             metrics,
@@ -198,6 +192,17 @@ impl Element for TerminalElement {
         } = prepared;
         let m = *metrics;
         window.paint_quad(fill(bounds, background.hsla()));
+        if self.text_input {
+            let focus = self.view.read(cx).focus_handle().clone();
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
+        }
+        let Some(frame) = frame else {
+            return;
+        };
 
         for span in frame.backgrounds.iter().chain(&frame.selection) {
             window.paint_quad(fill(

@@ -58,7 +58,7 @@ fn spawn(emulator: Emulator, argv: Vec<String>, size: PtySize) -> Result<Termina
 /// Automation for `--spike-terminal`, read from leading flags (only honoured in
 /// a build with the `spike-snapshot` feature; see desktop/Cargo.toml).
 #[derive(Debug, Default, PartialEq)]
-struct SnapshotOptions {
+pub(crate) struct SnapshotOptions {
     /// `--spike-snapshot PATH`: write the rendered frame here, then quit.
     path: Option<PathBuf>,
     /// `--spike-keys "k1 k2 …"`: GPUI keystrokes (`a`, `enter`, `ctrl-c`) typed
@@ -68,8 +68,16 @@ struct SnapshotOptions {
     wait: Option<Duration>,
 }
 
+impl SnapshotOptions {
+    /// Whether any automation was asked for.
+    pub(crate) fn is_requested(&self) -> bool {
+        *self != SnapshotOptions::default()
+    }
+}
+
 /// Peel the snapshot flags off the front of `argv`; the rest is the command.
-fn split_snapshot(
+/// The app window (`crate::app`) takes the same flags.
+pub(crate) fn split_snapshot(
     argv: Vec<String>,
 ) -> std::result::Result<(SnapshotOptions, Vec<String>), String> {
     let mut opts = SnapshotOptions::default();
@@ -111,7 +119,7 @@ pub fn run_window(argv: Vec<String>) {
         }
     };
     #[cfg(not(feature = "spike-snapshot"))]
-    if snapshot != SnapshotOptions::default() {
+    if snapshot.is_requested() {
         eprintln!(
             "flightdeck-desktop: --spike-snapshot/--spike-keys need a build with \
              `--features spike-snapshot`"
@@ -122,6 +130,9 @@ pub fn run_window(argv: Vec<String>) {
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_component::init(cx);
         theme::init(cx);
+        if let Err(e) = crate::fonts::register(cx) {
+            eprintln!("flightdeck-desktop: could not register the bundled fonts: {e}");
+        }
         cx.on_action(|_: &Quit, cx| cx.quit());
         #[cfg(target_os = "macos")]
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -187,7 +198,7 @@ pub fn run_window(argv: Vec<String>) {
 /// The `spike-snapshot` automation: type keys, render the frame offscreen,
 /// write it out, quit.
 #[cfg(feature = "spike-snapshot")]
-mod snapshot {
+pub(crate) mod snapshot {
     use std::io::Write as _;
     use std::time::Duration;
 

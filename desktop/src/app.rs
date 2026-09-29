@@ -1,29 +1,29 @@
-//! Application start-up, the main window, and its root view.
+//! Application start-up, the main window, and teardown.
 //!
-//! Layout (design brief A1), top to bottom:
+//! `flightdeck-desktop [--isolated|-I]` opens exactly what the TUI opens: the
+//! project for the current working directory (which must be inside a git
+//! repository) plus every project remembered from the last session, through
+//! the same `AppHost::open`. Then it seeds the PTY size, resumes the launch
+//! project's agents, starts the background services and drives the host from
+//! GPUI's executor ([`crate::host`]).
 //!
-//! ```text
-//! +--------------------------------------------------------------+
-//! | titlebar (44px)                                              |
-//! +--------------+-----------------------------------------------+
-//! | sidebar      | main area (git strip + terminal, later)       |
-//! | (272px)      |                                               |
-//! +--------------+-----------------------------------------------+
-//! | status bar (30px)                                            |
-//! +--------------------------------------------------------------+
-//! ```
+//! Quitting — closing the window, Cmd-Q on macOS, Ctrl-q (the table's Quit),
+//! a confirmed quit dialog, SIGTERM/SIGINT/SIGHUP — all end in `cx.quit()`,
+//! and GPUI's quit hook runs the TUI's teardown order before the process
+//! exits.
 
-use flightdeck::app::keymap::{Action as KeymapEffect, Context as KeymapContext, Keymap};
-use flightdeck_desktop::keys::{self, KeymapAction};
+use flightdeck::host::AppHost;
+#[cfg(target_os = "macos")]
+use gpui::KeyBinding;
 use gpui::{
-    actions, div, px, size, App, AppContext, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, Styled, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    actions, px, size, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 };
-use gpui_component::{h_flex, v_flex, Root};
+use gpui_component::Root;
 
-use crate::theme::{self, Palette};
-use crate::views::{sidebar::Sidebar, status_bar::StatusBar, titlebar::TitleBar};
+use crate::host::{HostModel, RealServices};
+use crate::shell::{FlightDeckWindow, NOMINAL_PTY_SIZE};
+use crate::terminal::spike::{split_snapshot, SnapshotOptions};
+use crate::theme;
 
 actions!(flightdeck, [Quit]);
 
@@ -33,44 +33,144 @@ actions!(flightdeck, [Quit]);
 #[cfg(target_os = "macos")]
 const TRAFFIC_LIGHT_INSET: gpui::Point<gpui::Pixels> = gpui::point(px(16.), px(15.));
 
-/// Start GPUI, install themes, open the main window. Blocks until quit.
-pub fn run() {
-    gpui_platform::application().run(|cx: &mut App| {
-        // gpui-component first: `theme::init` edits the theme it installs,
-        // and `Root` (below) needs its globals.
-        gpui_component::init(cx);
-        theme::init(cx);
-        // Every FlightDeck chord, generated from the keymap table.
-        keys::register(cx, keymap());
+/// What the command line asked for.
+struct Launch {
+    isolated: bool,
+    /// `--spike-snapshot PATH` & co. (a `spike-snapshot` build only): render
+    /// the window offscreen after it opens, write it out, quit.
+    snapshot: SnapshotOptions,
+}
 
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        // The platform's quit chord. On macOS there is no app menu yet to
-        // carry it, so bind it directly; elsewhere closing the window quits.
-        #[cfg(target_os = "macos")]
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        #[cfg(not(target_os = "macos"))]
-        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+fn parse_args(args: Vec<String>) -> Result<Launch, String> {
+    let isolated = flightdeck::parse_isolated(&args).map_err(|e| e.to_string())?;
+    let rest: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--isolated" && a != "-I")
+        .collect();
+    let (snapshot, rest) = split_snapshot(rest)?;
+    if let Some(unknown) = rest.first() {
+        return Err(format!("unknown argument {unknown:?}"));
+    }
+    #[cfg(not(feature = "spike-snapshot"))]
+    if snapshot.is_requested() {
+        return Err("--spike-snapshot/--spike-keys need a build with \
+                    `--features spike-snapshot`"
+            .to_string());
+    }
+    Ok(Launch { isolated, snapshot })
+}
 
-        // One window, one process: closing it ends the app on every OS
-        // (macOS would otherwise keep a windowless process in the Dock).
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
+/// Start GPUI, open the workspace and the main window. Blocks until quit.
+pub fn run(args: Vec<String>) {
+    let launch = match parse_args(args) {
+        Ok(launch) => launch,
+        Err(e) => {
+            eprintln!("flightdeck-desktop: {e}");
+            std::process::exit(2);
+        }
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("flightdeck-desktop: could not determine current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let services = RealServices::leak();
+    // Opened before GPUI starts, so "not a git repository" is a plain error on
+    // stderr and a non-zero exit, as it is for the TUI.
+    let mut host = match AppHost::open(services.env(), services.notifier(), &cwd, launch.isolated) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("flightdeck error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Agents spawn at the right width: seed the size first (the terminal
+    // element's first frame then measures the real one), then resume.
+    host.seed_pty_sizes(|_| NOMINAL_PTY_SIZE);
+    if let Err(e) = host.resume_launch_project() {
+        // An isolated run's one session failing is fatal in the TUI too —
+        // after the full teardown.
+        eprintln!("flightdeck error: {e}");
+        host.stop_services();
+        let _ = host.persist();
+        host.terminate_sessions();
+        host.cleanup_isolated();
+        std::process::exit(1);
+    }
+    host.start();
+    let shutdown = flightdeck::signals::install_shutdown_flag();
+    let snapshot = launch.snapshot;
+
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(move |cx: &mut App| {
+            // gpui-component first: `theme::init` edits the theme it installs,
+            // and `Root` (below) needs its globals.
+            gpui_component::init(cx);
+            theme::init(cx);
+            if let Err(e) = crate::fonts::register(cx) {
+                eprintln!("flightdeck-desktop: could not register the bundled fonts: {e}");
             }
-        })
-        .detach();
+            // Every FlightDeck chord, generated from the keymap table.
+            flightdeck_desktop::keys::register(cx, crate::commands::keymap());
 
-        let options = window_options(cx);
-        cx.open_window(options, |window, cx| {
-            let view = cx.new(FlightDeckWindow::new);
-            // gpui-component's `Root` hosts its overlays (dialogs, sheets,
-            // notifications) above our view; every window needs one at its top.
-            cx.new(|cx| Root::new(view, window, cx))
-        })
-        .expect("failed to open the FlightDeck window");
+            let model = cx.new(|cx| {
+                let mut model = HostModel::new(host);
+                model.set_shutdown_flag(shutdown);
+                model.start_ticking(cx);
+                model
+            });
 
-        cx.activate(true);
-    });
+            // Teardown, once, whatever ended the app.
+            let for_quit = model.clone();
+            cx.on_app_quit(move |cx| {
+                for_quit.update(cx, |model, _| model.teardown());
+                async {}
+            })
+            .detach();
+
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            // The platform's quit chord. On macOS there is no app menu yet to
+            // carry Cmd-Q, so bind it directly. Ctrl-q is the table's own Quit
+            // on every OS (`HostEvent::Quit`), so it needs no binding here.
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+
+            // One window, one process: closing it ends the app on every OS
+            // (macOS would otherwise keep a windowless process in the Dock).
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+
+            let options = window_options(cx);
+            let opened = cx.open_window(options, |window, cx| {
+                let view = cx.new(|cx| FlightDeckWindow::new(model.clone(), cx));
+                // gpui-component's `Root` hosts its overlays (menus, tooltips)
+                // above our view; every window needs one at its top.
+                cx.new(|cx| Root::new(view, window, cx))
+            });
+            let handle = match opened {
+                Ok(handle) => handle,
+                Err(e) => {
+                    eprintln!("flightdeck-desktop: could not open the window: {e}");
+                    cx.quit();
+                    return;
+                }
+            };
+            cx.activate(true);
+
+            #[cfg(feature = "spike-snapshot")]
+            if snapshot.is_requested() {
+                crate::terminal::spike::snapshot::schedule(handle.into(), snapshot, cx);
+            }
+            #[cfg(not(feature = "spike-snapshot"))]
+            let _ = (handle, snapshot);
+        });
 }
 
 /// Window chrome per OS. macOS: transparent titlebar, content drawn under it,
@@ -106,84 +206,23 @@ pub fn window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The main window's root view. Owns the stateful children; stateless regions
-/// (sidebar, status bar) are rebuilt each frame.
-pub struct FlightDeckWindow {
-    titlebar: Entity<TitleBar>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl FlightDeckWindow {
-    fn new(cx: &mut Context<Self>) -> Self {
-        Self {
-            titlebar: cx.new(|_| TitleBar::default()),
-        }
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
-}
 
-impl Render for FlightDeckWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::global(cx);
-
-        v_flex()
-            // The table's Global bindings apply under this context (see keys).
-            .key_context(KeymapContext::Global.name())
-            .on_action(perform_keymap_action)
-            .size_full()
-            .bg(p.surface_window.hsla())
-            .text_color(p.ink.hsla())
-            .child(self.titlebar.clone())
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_start()
-                    .child(Sidebar)
-                    .child(main_area(p)),
-            )
-            .child(StatusBar)
+    #[test]
+    fn isolated_passes_through_in_both_spellings() {
+        assert!(parse_args(args(&["--isolated"])).unwrap().isolated);
+        assert!(parse_args(args(&["-I"])).unwrap().isolated);
+        assert!(!parse_args(args(&[])).unwrap().isolated);
     }
-}
 
-/// The keymap table for this platform.
-///
-/// The `[ui] use_f2_to_leave_terminal_focus` setting is not read yet (the GUI
-/// loads no config in M0), so this is the default table.
-fn keymap() -> &'static Keymap {
-    Keymap::for_this_platform(false)
-}
-
-/// Perform a table entry's action. Only Quit is wired in M0; every other
-/// entry is still claimed here, so a FlightDeck chord is never typed into a
-/// terminal while its feature is being built.
-fn perform_keymap_action(action: &KeymapAction, _window: &mut Window, cx: &mut App) {
-    if action
-        .entry(keymap())
-        .is_some_and(|entry| entry.action == KeymapEffect::Quit)
-    {
-        cx.quit();
+    #[test]
+    fn an_unknown_argument_is_refused() {
+        assert!(parse_args(args(&["--frobnicate"])).is_err());
     }
-}
-
-/// Placeholder for the git strip + terminal: the terminal well and an empty
-/// state line, so the main surface colour can be judged next to the sidebar.
-fn main_area(p: &Palette) -> impl IntoElement {
-    v_flex()
-        .flex_1()
-        .h_full()
-        .bg(p.surface_terminal.hsla())
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .child(
-            div()
-                .text_sm()
-                .text_color(p.ink_2.hsla())
-                .child("No agent selected"),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(p.faint.hsla())
-                .child("Its terminal will appear here."),
-        )
 }
