@@ -96,6 +96,8 @@ fn open_workspace(
         return Err(e.to_string());
     }
     host.start();
+    // Mission control's tiles answer the prompts waiting sessions show.
+    host.track_prompts();
     Ok(host)
 }
 

@@ -38,6 +38,7 @@
 //! ones that mean *moving* ([`MissionControl::intercept`]): the arrows and
 //! Alt-1..9 follow tile order here, and Enter with no tiles does nothing.
 
+pub mod prompt;
 pub mod tile;
 
 #[cfg(test)]
@@ -872,6 +873,9 @@ fn tile(
             .child("open full size")
     });
 
+    // Waiting on a detected prompt: its inline answers (see `prompt`).
+    let answers = prompt::prompt_row(index, t, host, p);
+
     let mut shadow = p.status_attention.hsla();
     shadow.a = 0.14;
     let key = t.key.clone();
@@ -907,6 +911,7 @@ fn tile(
                 .py(px(10.))
                 .child(grid.cached(StyleRefinement::default().size_full())),
         )
+        .children(answers)
         .children(footer)
         .on_click(move |event, _, cx| {
             // A click selects; a double click opens it, as Enter does.

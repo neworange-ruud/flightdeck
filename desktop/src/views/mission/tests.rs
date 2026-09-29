@@ -561,3 +561,5 @@ fn scope_and_view_persist_across_a_reopen(app: &mut TestAppContext) {
         "still beta only"
     );
 }
+
+mod prompts;
