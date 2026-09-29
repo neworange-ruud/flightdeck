@@ -60,14 +60,11 @@ use crate::terminal::element::{measure_cell, paint_box, shape_text, CellMetrics}
 use crate::terminal::layout::TermPalette;
 use crate::terminal::rowcache::RowCache;
 use crate::terminal::view::grid_identity;
+use crate::terminal::zoom::{app_font_size, TerminalZoom};
 use crate::theme::Palette;
 
 /// A pane's header row: the terminal's label and command.
 pub const PANE_HEADER: Pixels = px(28.);
-
-/// The terminal font size the element draws at (`terminal::element`'s), for
-/// shaping the read-only panes identically.
-const FONT_SIZE: f32 = 13.0;
 
 /// The padding around a pane's grid: the app terminal's own (the terminal
 /// view pads its element by 18px / 22px), so a pane measures the same grid
@@ -246,6 +243,9 @@ pub struct PaneView {
 
 impl PaneView {
     fn new(host: Entity<HostModel>, key: PaneKey, cx: &mut Context<Self>) -> Self {
+        // A zoom chord resizes every terminal, the panes included.
+        cx.observe_global::<TerminalZoom>(|_, cx| cx.notify())
+            .detach();
         Self {
             host,
             key,
@@ -328,7 +328,10 @@ impl Element for PaneGrid {
             .pane
             .update(cx, |pane, _| std::mem::take(&mut pane.cache));
         let shaped_at = self.pane.read(cx).shaped_at;
-        let (width, height) = measure_cell(window);
+        // The active terminal's size (setting plus zoom), so a pane's grid is
+        // the one it has when it gains focus.
+        let points = app_font_size(self.host.read(cx).host(), cx);
+        let (width, height) = measure_cell(window, points);
         // The grid follows the pane, as the terminal element's does.
         let size = flightdeck::contracts::PtySize {
             rows: (bounds.size.height / height).floor().max(1.0) as u16,
@@ -356,7 +359,7 @@ impl Element for PaneGrid {
         if shaped_at != Some((width, height)) {
             cache.invalidate_derived();
         }
-        let font_size = px(FONT_SIZE);
+        let font_size = px(points);
         for row in cache.rows_mut() {
             if row.derived.is_none() {
                 let lines = row

@@ -355,7 +355,11 @@ impl TerminalView {
     /// The text size this frame draws at, in points: the setting plus the
     /// session zoom (see [`super::zoom`]).
     pub fn font_size(&self, cx: &gpui::App) -> f32 {
-        TerminalZoom::current(cx).size_for(self.base_font_size(cx))
+        match &self.source {
+            TerminalSource::Owned(_) => TerminalZoom::current(cx).size_for(self.base_font_size(cx)),
+            // The same rule split view's panes draw with.
+            TerminalSource::Host(host) => super::zoom::app_font_size(host.read(cx).host(), cx),
+        }
     }
 
     /// Whether the terminal draws dimmed: the TUI's `dim_terminal` — the app

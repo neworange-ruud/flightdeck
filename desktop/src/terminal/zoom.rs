@@ -98,6 +98,15 @@ impl TerminalZoom {
     }
 }
 
+/// The size the app's terminals draw at, in points: the active project's
+/// effective `[ui] desktop_terminal_font_size` plus the zoom. The terminal
+/// view and split view's read-only panes both read it, so a terminal keeps
+/// its grid when it gains or loses focus.
+pub fn app_font_size(host: &flightdeck::host::AppHost, cx: &App) -> f32 {
+    let base = host.active_state().config.ui.desktop_terminal_font_size;
+    TerminalZoom::current(cx).size_for(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
