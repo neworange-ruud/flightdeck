@@ -744,6 +744,29 @@ pub struct TabState {
     /// in place of the configured base args on resume/restart.
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// When this session last did something observable (output, status change,
+    /// git change). Wall-clock, so "updated in the last 24h" survives a restart.
+    /// Absent in state files written before the activity timeline existed.
+    #[serde(default)]
+    pub activity: TabActivity,
+}
+
+/// Per-session activity timeline: the wall-clock moment (Unix seconds, from
+/// [`crate::contracts::Clock::now_unix_secs`]) of the last PTY output, status
+/// change, and git change. `None` = never observed. Persisted inside
+/// [`TabState`]; the recording and window/ordering rules live in
+/// `crate::app::activity`, which keeps them front-end neutral.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabActivity {
+    /// Last time the primary PTY produced output.
+    #[serde(default)]
+    pub last_output_at: Option<u64>,
+    /// Last time the session's interpreted status changed.
+    #[serde(default)]
+    pub last_status_change_at: Option<u64>,
+    /// Last time the worktree's git state (changes, ahead count) changed.
+    #[serde(default)]
+    pub last_git_change_at: Option<u64>,
 }
 
 fn default_last_known_status() -> String {

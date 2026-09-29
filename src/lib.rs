@@ -2342,6 +2342,8 @@ fn event_loop(
             while let Ok(msg) = p.status_rx.try_recv() {
                 match msg {
                     StatusMsg::Update(id, status) => {
+                        p.state
+                            .observe_git_status(&id, &status, env.clock.now_unix_secs());
                         p.cache.insert(id, status);
                     }
                     StatusMsg::Done => p.status_in_flight = false,
@@ -2351,6 +2353,8 @@ fn event_loop(
             {
                 let services = env.services(&p.git);
                 p.state.poll_status_files(&services, now_ms);
+                p.state
+                    .sync_activity(services.clock.now_unix_secs(), now_ms);
                 // Pin each freshly-launched agent's session id for later
                 // resume. A no-op unless a tab is awaiting its session file, and
                 // rate-limited to `SESSION_SCAN_INTERVAL_MS` when one is, since
@@ -8699,6 +8703,7 @@ fn drain_pty_output(
         // Capture the agent's on-exit resume hint from that output (borrow of
         // `tab.session` has ended, so we can touch the rest of the tab).
         if let Some(bytes) = primary_bytes {
+            tab.note_output();
             tab.capture_resume_hint(&bytes, auto_continue);
         }
 
@@ -10068,6 +10073,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         });
         let app = AppState::new(config, project_state, &root, &state_path);
         let (create_tx, create_rx) = std::sync::mpsc::channel();
@@ -10582,6 +10588,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             }
         }
 
@@ -10685,6 +10692,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             });
             let mut state = AppState::new(
                 Config::default(),
@@ -10788,6 +10796,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             }
         }
 
@@ -11765,6 +11774,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             }
         }
 
@@ -14985,6 +14995,7 @@ mod tests {
                 container_image: None,
                 runs_on_base: false,
                 resume_args: Vec::new(),
+                activity: Default::default(),
             }
         }
 

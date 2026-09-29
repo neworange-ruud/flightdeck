@@ -14,6 +14,7 @@ use crate::agents::adapter::{build_launch, validate_agent};
 use crate::agents::registry::AgentRegistry;
 use crate::agents::setup::{prepare_status_launch, status_backend};
 use crate::agents::status::{combine_status, DisplayStatus};
+use crate::app::activity::{ActivityProbe, GitFingerprint};
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
@@ -27,7 +28,7 @@ use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
 use crate::git::remote::{github_pr_url, plan_push, push_branch, PushPlan};
 use crate::git::status::{
     base_drift, check_merge_preconditions, check_rebase_preconditions, collect_status, merge_back,
-    rebase_onto_base, MergeDecision, MergeRequest, RebaseDecision, RebaseRequest,
+    rebase_onto_base, MergeDecision, MergeRequest, RebaseDecision, RebaseRequest, WorktreeStatus,
 };
 use crate::git::worktree::{create_worktree, plan_worktree, remove_worktree_if_safe, WorktreePlan};
 use crate::persistence::project_state::save_state;
@@ -320,6 +321,10 @@ pub struct RuntimeTab {
     /// the session this tab's agent creates (so multiple agents in one worktree
     /// each resume their own). `None` once pinned or when not applicable.
     session_snapshot: Option<std::collections::HashSet<String>>,
+    /// Runtime-only edge memory feeding `meta.activity` (see
+    /// [`crate::app::activity`]): output seen since the last sync, and the last
+    /// status / git fingerprints compared against.
+    probe: ActivityProbe,
 }
 
 impl RuntimeTab {
@@ -336,9 +341,17 @@ impl RuntimeTab {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
             resume_scan: String::new(),
             session_snapshot: None,
         }
+    }
+
+    /// Note that the primary PTY produced output. Called on every PTY read, so
+    /// it only sets a flag (no clock read, no allocation); the timestamp is
+    /// stamped by [`AppState::sync_activity`].
+    pub fn note_output(&mut self) {
+        self.probe.note_output();
     }
 
     /// Stable id of this tab.
@@ -913,6 +926,40 @@ impl AppState {
         out
     }
 
+    /// Fold what happened since the last call into each tab's persisted
+    /// `meta.activity` timeline, stamped `now_secs`
+    /// ([`Clock::now_unix_secs`](crate::contracts::Clock::now_unix_secs)):
+    /// PTY output flagged by [`RuntimeTab::note_output`], and a change of the
+    /// interpreted status. A tab's first sighting only records a baseline — a
+    /// fresh launch is not a "status change". Cheap enough for every tick; it
+    /// writes nothing itself, so the values reach `state.json` on the existing
+    /// save points (and at teardown), never per PTY read.
+    pub fn sync_activity(&mut self, now_secs: u64, now_ms: u64) {
+        for tab in self.tabs.iter_mut() {
+            let status = tab.display_status(now_ms).interpreted;
+            let (output, status_changed) = tab.probe.take_edges(status);
+            if output {
+                tab.meta.activity.note_output(now_secs);
+            }
+            if status_changed {
+                tab.meta.activity.note_status_change(now_secs);
+            }
+        }
+    }
+
+    /// Record a fresh git status for tab `tab_id`: stamps
+    /// `meta.activity.last_git_change_at` when its changes / ahead count differ
+    /// from the previous observation (the first observation is a baseline).
+    pub fn observe_git_status(&mut self, tab_id: &str, status: &WorktreeStatus, now_secs: u64) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.meta.id == tab_id) else {
+            return;
+        };
+        let fingerprint = GitFingerprint::of(status);
+        if tab.probe.observe_git(fingerprint) {
+            tab.meta.activity.note_git_change(now_secs);
+        }
+    }
+
     /// Update the persisted PTY size used for future spawns (SPECS §23 resize).
     pub fn set_pty_size(&mut self, size: PtySize) {
         self.pty_size = size;
@@ -1257,6 +1304,7 @@ impl AppState {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -1267,6 +1315,7 @@ impl AppState {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -1379,6 +1428,7 @@ impl AppState {
             container_image: None,
             runs_on_base: true,
             resume_args: Vec::new(),
+            activity: Default::default(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -1389,6 +1439,7 @@ impl AppState {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -5578,6 +5629,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
         assert_eq!(app.tabs.len(), 1);
@@ -5658,6 +5710,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         }
     }
 

@@ -66,6 +66,7 @@ fn tab_state(id: &str, name: &str, agent: &str) -> TabState {
         container_image: None,
         runs_on_base: false,
         resume_args: Vec::new(),
+        activity: Default::default(),
     }
 }
 
