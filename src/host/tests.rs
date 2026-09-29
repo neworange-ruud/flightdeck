@@ -170,6 +170,24 @@ fn pump_feeds_pty_output_into_the_session_and_asks_for_a_redraw() {
 }
 
 #[test]
+fn active_terminal_is_the_selected_agents_focused_terminal() {
+    let fakes = Fakes::new();
+    let (state, pty) = fakes.state_with_a_tab();
+    let mut host = fakes.host(state);
+    pty.push_output("drawn by the gui");
+    host.pump();
+    let term = host.active_terminal().expect("the tab's agent is spawned");
+    assert!(term.screen().contents().contains("drawn by the gui"));
+    assert!(host.active_terminal_mut().is_some());
+
+    host.active_state_mut().selected_tab = None;
+    assert!(
+        host.active_terminal().is_none(),
+        "no agent selected, no terminal"
+    );
+}
+
+#[test]
 fn pump_reads_the_clock_once_per_turn() {
     let fakes = Fakes::new();
     let (state, _pty) = fakes.state_with_a_tab();

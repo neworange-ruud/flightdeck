@@ -1213,6 +1213,23 @@ impl<'a> AppHost<'a> {
         &mut self.workspace.active_project_mut().state
     }
 
+    /// The terminal on screen: the active project's selected Agent Tab's
+    /// focused terminal (its agent, or the child shell / extra agent selected
+    /// on its terminal row). `None` with no agent selected or before its
+    /// process is spawned. A front-end draws this grid; input for it goes
+    /// through [`HostEvent::TerminalInput`] / [`HostEvent::Paste`] so the web
+    /// input lock applies.
+    pub fn active_terminal(&self) -> Option<&crate::terminal::session::Terminal> {
+        self.active_state().selected()?.session.active()
+    }
+
+    /// The terminal on screen, mutably — for view-local state a front-end
+    /// drives with the mouse (selection, scrollback position, grid size). Not
+    /// for writing input, which must go through [`HostEvent::TerminalInput`].
+    pub fn active_terminal_mut(&mut self) -> Option<&mut crate::terminal::session::Terminal> {
+        self.active_state_mut().selected_mut()?.session.active_mut()
+    }
+
     /// Whether the active project's terminal currently has input focus.
     pub fn terminal_focused(&self) -> bool {
         self.active_state().mode() == InputMode::Terminal
