@@ -305,6 +305,7 @@ fn every_global_chord_is_disabled_under_the_overlay_context() {
         use_f2_to_leave_focus: false,
         leave_focus_uses_shift: false,
         command_v_pastes: true,
+        desktop: true,
     });
     let globals = crate::keys::binding_specs(&keymap)
         .into_iter()

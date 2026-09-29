@@ -540,6 +540,27 @@ fn terminal_input_reaches_the_focused_pty_only_in_terminal_focus() {
     assert_eq!(pty.input(), b"ls\r".to_vec(), "App mode swallows the paste");
 }
 
+/// The paste path the TUI and the desktop app share (`HostEvent::Paste`): a
+/// bracketed paste cannot smuggle an end marker, so the text after it never
+/// reaches the agent as typed input.
+#[test]
+fn a_bracketed_paste_event_is_stripped_of_embedded_markers() {
+    let fakes = Fakes::new();
+    let (state, pty) = fakes.state_with_a_tab();
+    let mut host = fakes.host(state);
+    host.handle(HostEvent::FocusTerminal).unwrap();
+    host.active_terminal_mut()
+        .expect("a terminal")
+        .process_output(b"\x1b[?2004h");
+
+    host.handle(HostEvent::Paste(
+        "a\x1b[201~rm -rf ~\x1b[20\x1b[201~1~".to_string(),
+    ))
+    .unwrap();
+
+    assert_eq!(pty.input(), b"\x1b[200~arm -rf ~\x1b[201~".to_vec());
+}
+
 #[test]
 fn resize_event_resizes_every_session_and_records_the_size() {
     let fakes = Fakes::new();
@@ -1340,6 +1361,21 @@ mod overlays {
             "an isolated run offers no project actions (SPECS §32)"
         );
         assert_eq!(host.overlay(), None);
+    }
+
+    /// The desktop front-end flag reaches the help overlay; without it the
+    /// screen is the TUI's, byte for byte.
+    #[test]
+    fn a_desktop_front_end_gets_the_desktop_help_document() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        host.set_desktop_front_end();
+        host.handle(HostEvent::OpenHelp).unwrap();
+        assert_eq!(
+            overlay(&host),
+            OverlayView::Help(crate::tui::help::help_doc_for(false, false, true))
+        );
     }
 
     #[test]

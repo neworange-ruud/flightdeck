@@ -85,6 +85,8 @@ fn open_workspace(
 ) -> Result<AppHost<'static>, String> {
     let mut host = AppHost::open(services.env(), services.notifier(), folder, isolated)
         .map_err(|e| e.to_string())?;
+    // The help overlay documents this app's own shortcuts too.
+    host.set_desktop_front_end();
     // Agents spawn at the right width: seed the size first (the terminal
     // element's first frame then measures the real one), then resume.
     host.seed_pty_sizes(|_| NOMINAL_PTY_SIZE);

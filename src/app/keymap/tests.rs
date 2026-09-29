@@ -9,11 +9,14 @@ fn all_options() -> Vec<KeymapOptions> {
     for use_f2 in [false, true] {
         for shift in [false, true] {
             for cmd_v in [false, true] {
-                out.push(KeymapOptions {
-                    use_f2_to_leave_focus: use_f2,
-                    leave_focus_uses_shift: shift,
-                    command_v_pastes: cmd_v,
-                });
+                for desktop in [false, true] {
+                    out.push(KeymapOptions {
+                        use_f2_to_leave_focus: use_f2,
+                        leave_focus_uses_shift: shift,
+                        command_v_pastes: cmd_v,
+                        desktop,
+                    });
+                }
             }
         }
     }
@@ -191,6 +194,7 @@ fn leave_focus_binding_follows_the_options() {
         use_f2_to_leave_focus: false,
         leave_focus_uses_shift: false,
         command_v_pastes: false,
+        desktop: false,
     };
     let focus = |o: KeymapOptions, c: Chord| {
         Keymap::new(o).lookup(InputMode::Terminal, c).map(|e| e.id) == Some("FocusApp")
@@ -412,5 +416,107 @@ fn an_isolated_run_refuses_exactly_new_agent_and_project_switching() {
     assert_eq!(
         refused,
         ["SwitchProjectPrev", "SwitchProjectNext", "NewAgentTab"]
+    );
+}
+
+// --- desktop-only help rows ---------------------------------------------------
+
+/// Every help row's keys and description, flattened, for comparing two tables.
+fn help_rows(options: KeymapOptions) -> Vec<(String, &'static str)> {
+    Keymap::new(options)
+        .help_sections()
+        .iter()
+        .flat_map(|s| s.rows.iter().map(|r| (r.keys.clone(), r.description)))
+        .collect()
+}
+
+#[test]
+fn desktop_shortcut_rows_appear_only_for_the_macos_desktop() {
+    let base = KeymapOptions::for_this_platform(false);
+    let with = |desktop, command_v_pastes| {
+        help_rows(KeymapOptions {
+            desktop,
+            command_v_pastes,
+            ..base
+        })
+    };
+    let has = |rows: &[(String, &str)], keys: &str| rows.iter().any(|(k, _)| k == keys);
+
+    let desktop_macos = with(true, true);
+    assert!(has(&desktop_macos, "Cmd-C"));
+    assert!(has(&desktop_macos, "Cmd-= / Cmd-- / Cmd-0"));
+
+    // The TUI (even on macOS) and the desktop off macOS have neither chord, so
+    // help must not claim them; both are exactly the table without the rows.
+    let tui_macos = with(false, true);
+    let desktop_elsewhere = with(true, false);
+    for rows in [&tui_macos, &desktop_elsewhere] {
+        assert!(!has(rows, "Cmd-C"));
+        assert!(!has(rows, "Cmd-= / Cmd-- / Cmd-0"));
+    }
+    let without: Vec<_> = desktop_macos
+        .iter()
+        .filter(|(k, _)| k != "Cmd-C" && k != "Cmd-= / Cmd-- / Cmd-0")
+        .cloned()
+        .collect();
+    assert_eq!(without, tui_macos);
+}
+
+// --- bracketed paste sanitising -----------------------------------------------
+
+const START: &str = "\x1b[200~";
+const END: &str = "\x1b[201~";
+
+#[test]
+fn bracketed_paste_drops_an_embedded_end_marker() {
+    // The injection: without stripping, `rm -rf ~` would arrive after the
+    // bracket closed, as typed input.
+    let bytes = encode_paste("safe\x1b[201~rm -rf ~\n", true);
+    assert_eq!(bytes, b"\x1b[200~saferm -rf ~\r\x1b[201~".to_vec());
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(text.matches(END).count(), 1, "only the closing guard");
+}
+
+#[test]
+fn bracketed_paste_drops_a_marker_that_reassembles_after_one_pass() {
+    // Removing the inner marker glues `ESC[20` and `1~` into a new one.
+    let text = String::from_utf8(encode_paste("a\x1b[20\x1b[201~1~b", true)).unwrap();
+    assert_eq!(text, format!("{START}ab{END}"));
+    // Nested three deep.
+    let nested = "\x1b[\x1b[\x1b[201~201~201~";
+    let text = String::from_utf8(encode_paste(nested, true)).unwrap();
+    assert_eq!(text, format!("{START}{END}"));
+}
+
+#[test]
+fn bracketed_paste_drops_the_start_marker_too() {
+    let text = String::from_utf8(encode_paste("x\x1b[200~y", true)).unwrap();
+    assert_eq!(text, format!("{START}xy{END}"));
+}
+
+#[test]
+fn bracketed_paste_keeps_unicode_and_other_escapes() {
+    // Only the two markers go: a pasted colour code and non-ASCII text are
+    // byte-identical inside the guards.
+    let text = "héllo \u{1f680} \x1b[31mred\x1b[0m 日本語";
+    let bytes = encode_paste(text, true);
+    assert_eq!(bytes, format!("{START}{text}{END}").into_bytes());
+}
+
+#[test]
+fn bracketed_paste_of_nothing_is_just_the_guards() {
+    assert_eq!(encode_paste("", true), format!("{START}{END}").into_bytes());
+    assert_eq!(
+        encode_paste("\x1b[201~", true),
+        format!("{START}{END}").into_bytes()
+    );
+}
+
+#[test]
+fn unbracketed_paste_is_forwarded_unchanged() {
+    // No bracket to escape, so nothing is stripped (see `encode_paste`).
+    assert_eq!(
+        encode_paste("a\x1b[201~b\x1b[200~c", false),
+        b"a\x1b[201~b\x1b[200~c".to_vec()
     );
 }

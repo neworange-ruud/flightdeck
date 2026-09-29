@@ -101,6 +101,16 @@ fn reply_translates_to_bracketed_paste_plus_enter() {
     );
 }
 
+/// A phone reply is untrusted text too: an embedded end marker must not close
+/// the bracket early, or the rest would run as typed input before the Enter.
+#[test]
+fn reply_strips_embedded_paste_markers_when_bracketed() {
+    assert_eq!(
+        encode_reply("ok\x1b[201~rm -rf ~\x1b[20\x1b[201~1~", true),
+        b"\x1b[200~okrm -rf ~\x1b[201~\r".to_vec()
+    );
+}
+
 #[test]
 fn reply_without_bracketed_paste_sends_raw_text_plus_enter() {
     let mut e = entry("t1");

@@ -176,6 +176,9 @@ pub struct AppHost<'a> {
     /// Whether this is an `--isolated` run (SPECS §32): one project, nothing
     /// persisted, a temp status directory to clean up.
     isolated: bool,
+    /// The front-end is the desktop app ([`AppHost::set_desktop_front_end`]):
+    /// its help screen also documents the desktop-only platform shortcuts.
+    desktop_front_end: bool,
     /// Where the workspace file lives, or `None` for an isolated run (which
     /// writes no workspace file at all).
     ws_path: Option<PathBuf>,
@@ -336,6 +339,7 @@ impl<'a> AppHost<'a> {
             workspace,
             ui: Ui::default(),
             isolated,
+            desktop_front_end: false,
             ws_path: None,
             workspace_ui: WorkspaceUi::default(),
             tick: 0,
@@ -1389,7 +1393,15 @@ impl<'a> AppHost<'a> {
             &self.workspace,
             self.pairing_session.as_ref(),
             &self.web_surface.credentials,
+            self.desktop_front_end,
         )
+    }
+
+    /// Mark the front-end as the desktop app, so the help overlay also lists
+    /// the platform shortcuts only it has (Cmd-C, terminal zoom on macOS).
+    /// The TUI and the browser never call this.
+    pub fn set_desktop_front_end(&mut self) {
+        self.desktop_front_end = true;
     }
 
     /// Unix seconds now, from the host's clock: the `now_secs` the view

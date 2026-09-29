@@ -202,6 +202,12 @@ pub struct KeymapOptions {
     pub leave_focus_uses_shift: bool,
     /// Command-V (reported as Super) pastes as well as Ctrl-V (macOS).
     pub command_v_pastes: bool,
+    /// The front-end is the GPUI desktop app, which binds a few platform
+    /// chords (Cmd-C copy, Cmd-= / Cmd-- / Cmd-0 zoom) in its own view rather
+    /// than through this table. Only the help screen reads it: together with
+    /// `command_v_pastes` (so macOS) it adds rows documenting those chords. The
+    /// TUI does not have them and never sets it.
+    pub desktop: bool,
 }
 
 impl KeymapOptions {
@@ -211,6 +217,7 @@ impl KeymapOptions {
             use_f2_to_leave_focus,
             leave_focus_uses_shift: crate::tui::platform::LEAVE_FOCUS_USES_SHIFT,
             command_v_pastes: crate::tui::platform::IS_MACOS,
+            desktop: false,
         }
     }
 }
@@ -296,9 +303,24 @@ impl Keymap {
 
     /// The table for this platform, built once per `use_f2` value.
     pub fn for_this_platform(use_f2_to_leave_focus: bool) -> &'static Keymap {
-        static KEYMAPS: [OnceLock<Keymap>; 2] = [OnceLock::new(), OnceLock::new()];
-        KEYMAPS[usize::from(use_f2_to_leave_focus)]
-            .get_or_init(|| Keymap::new(KeymapOptions::for_this_platform(use_f2_to_leave_focus)))
+        Keymap::for_front_end(use_f2_to_leave_focus, false)
+    }
+
+    /// The table for this platform as the given front-end sees it, built once
+    /// per `(use_f2, desktop)` pair. `desktop` is [`KeymapOptions::desktop`].
+    pub fn for_front_end(use_f2_to_leave_focus: bool, desktop: bool) -> &'static Keymap {
+        static KEYMAPS: [OnceLock<Keymap>; 4] = [
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+        ];
+        KEYMAPS[usize::from(use_f2_to_leave_focus) * 2 + usize::from(desktop)].get_or_init(|| {
+            Keymap::new(KeymapOptions {
+                desktop,
+                ..KeymapOptions::for_this_platform(use_f2_to_leave_focus)
+            })
+        })
     }
 
     /// The options this table was built for.
@@ -669,6 +691,24 @@ fn gesture_row(gesture: &str, description: &'static str) -> HelpRowSpec {
     }
 }
 
+/// The chords only the macOS desktop app binds, outside this table: Cmd-C
+/// copies the terminal selection and Cmd-= / Cmd-- / Cmd-0 zoom the terminal
+/// text (`desktop/src/terminal/`). Rows without entries, like the gestures,
+/// and present only when the front-end is the desktop *and* on macOS
+/// (`command_v_pastes`), the same platform the chords themselves exist on.
+fn desktop_command_rows(options: KeymapOptions) -> Vec<HelpRowSpec> {
+    if !(options.desktop && options.command_v_pastes) {
+        return Vec::new();
+    }
+    vec![
+        gesture_row("Cmd-C", "Copy the terminal selection"),
+        gesture_row(
+            "Cmd-= / Cmd-- / Cmd-0",
+            "Zoom terminal text in / out / reset",
+        ),
+    ]
+}
+
 /// The help screen's layout. Section titles and wording are the help screen's
 /// as shipped; note that "Global" lists some App-mode-only keys (Ctrl-n, …).
 fn build_help(options: KeymapOptions, entries: &[KeymapEntry]) -> Vec<HelpSectionSpec> {
@@ -745,7 +785,10 @@ fn build_help(options: KeymapOptions, entries: &[KeymapEntry]) -> Vec<HelpSectio
                 gesture_row("Drag", "Select terminal text (copies on release)"),
                 gesture_row("Drag past edge", "Auto-scrolls to reach offscreen text"),
                 gesture_row("Shift-drag", "Force selection over a mouse-driven app"),
-            ],
+            ]
+            .into_iter()
+            .chain(desktop_command_rows(options))
+            .collect(),
         },
         HelpSectionSpec {
             title: "Focus",

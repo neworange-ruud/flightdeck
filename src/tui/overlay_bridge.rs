@@ -52,6 +52,7 @@ pub(crate) fn overlay_view(
     workspace: &Workspace,
     pairing: Option<&PairingSession>,
     credentials: &Mutex<CredentialStore>,
+    desktop: bool,
 ) -> Option<OverlayView> {
     let state = &workspace.active_project().state;
     let use_f2 = state.config.ui.use_f2_to_leave_terminal_focus;
@@ -70,9 +71,10 @@ pub(crate) fn overlay_view(
         UiOverlay::None => None,
         UiOverlay::Palette(palette) => Some(OverlayView::Palette(palette_view(palette, use_f2))),
         UiOverlay::Config(cm) => Some(OverlayView::Config(config_view(cm))),
-        UiOverlay::Help => Some(OverlayView::Help(crate::tui::help::help_doc(
+        UiOverlay::Help => Some(OverlayView::Help(crate::tui::help::help_doc_for(
             use_f2,
             state.isolated,
+            desktop,
         ))),
         UiOverlay::About => Some(OverlayView::About(crate::tui::help::about_doc())),
         UiOverlay::GitStatus { status, pr_url } => Some(OverlayView::GitStatus(GitStatusView {

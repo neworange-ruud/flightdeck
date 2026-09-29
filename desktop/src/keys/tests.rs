@@ -53,6 +53,7 @@ fn all_options() -> Vec<KeymapOptions> {
                     use_f2_to_leave_focus: use_f2,
                     leave_focus_uses_shift: shift,
                     command_v_pastes: cmd_v,
+                    desktop: false,
                 });
             }
         }
@@ -768,6 +769,7 @@ fn unbound_terminal_keys_send_the_tui_bytes() {
         use_f2_to_leave_focus: false,
         leave_focus_uses_shift: false,
         command_v_pastes: true,
+        desktop: false,
     });
     let mut app = TestAppContext::single();
     let (view, cx) = open(&mut app, keymap.clone(), OptionKey::Meta);
@@ -834,6 +836,7 @@ fn option_chords_bind_as_alt_under_either_policy() {
         use_f2_to_leave_focus: false,
         leave_focus_uses_shift: false,
         command_v_pastes: true,
+        desktop: false,
     });
     for option in [OptionKey::Meta, OptionKey::Compose] {
         let mut app = TestAppContext::single();
@@ -888,6 +891,7 @@ fn f2_leaves_focus_only_when_enabled() {
             use_f2_to_leave_focus: use_f2,
             leave_focus_uses_shift: false,
             command_v_pastes: true,
+            desktop: false,
         });
         let mut app = TestAppContext::single();
         let (view, cx) = open(&mut app, keymap, OptionKey::Meta);

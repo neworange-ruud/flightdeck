@@ -90,9 +90,18 @@ pub fn encode_pty(chord: Chord) -> Vec<u8> {
 /// so the app treats it as one atomic insert rather than executing it line by
 /// line. Without the mode the app gets the raw text, exactly as a real
 /// terminal emulator forwards a paste.
+///
+/// Bracketed payloads are sanitised first ([`strip_paste_markers`]): clipboard
+/// text is untrusted, and one containing `ESC [201~` would close the bracket
+/// early so the rest reached the app as typed input (paste injection). With
+/// the mode off there is no bracket to escape, so the text is forwarded
+/// unchanged. The risk there (pasted control bytes reaching a shell as
+/// keystrokes) is inherent to a raw paste, and is what bracketed mode exists
+/// to contain.
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
+        let normalized = strip_paste_markers(&normalized);
         let mut bytes = Vec::with_capacity(normalized.len() + 12);
         bytes.extend_from_slice(b"\x1b[200~");
         bytes.extend_from_slice(normalized.as_bytes());
@@ -101,4 +110,28 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         normalized.into_bytes()
     }
+}
+
+/// Remove every bracketed-paste marker (`ESC [200~` and `ESC [201~`) from
+/// `text`, repeating until none remain.
+///
+/// One pass is not enough: removing the marker from `ESC [20 ESC [201~ 1~`
+/// leaves `ESC [201~` behind, so the scan runs to a fixed point.
+///
+/// Only the markers are removed, not every ESC. kitty and WezTerm do the same,
+/// while Alacritty drops all ESC bytes. The markers are the only sequences that
+/// can break out of the bracket; any other escape inside it is inert data to an
+/// app that honours bracketed paste, and keeping it leaves pasted ANSI text
+/// (a coloured log, say) intact instead of littering it with stray `[31m`.
+fn strip_paste_markers(text: &str) -> std::borrow::Cow<'_, str> {
+    const MARKERS: [&str; 2] = ["\x1b[200~", "\x1b[201~"];
+    let mut out = std::borrow::Cow::Borrowed(text);
+    while MARKERS.iter().any(|m| out.contains(m)) {
+        let mut next = out.into_owned();
+        for m in MARKERS {
+            next = next.replace(m, "");
+        }
+        out = std::borrow::Cow::Owned(next);
+    }
+    out
 }

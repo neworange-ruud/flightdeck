@@ -10642,6 +10642,31 @@ mod tests {
             assert_eq!(workspace.projects[0].state.selected_tab, Some(0));
         }
 
+        /// The TUI's paste path (a host-terminal paste event): an end marker in
+        /// the pasted text is stripped rather than closing the bracket early.
+        #[test]
+        fn tui_paste_strips_embedded_bracketed_paste_markers() {
+            let pty = FakePty::new();
+            let (app, handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            workspace.projects[0].state.tabs[0]
+                .session
+                .primary_mut()
+                .unwrap()
+                .process_output(b"\x1b[?2004h");
+
+            paste_text_into_active_pty(
+                &mut workspace.projects[0].state,
+                "a\x1b[201~rm -rf ~\x1b[20\x1b[201~1~",
+            );
+
+            assert_eq!(handles[0].input(), b"\x1b[200~arm -rf ~\x1b[201~".to_vec());
+        }
+
         /// First tasks queued by `new_agent` wait for the agent, then land as
         /// a bracketed paste + Enter the moment the agent enables the mode.
         #[test]

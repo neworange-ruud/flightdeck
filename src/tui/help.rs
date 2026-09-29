@@ -190,7 +190,14 @@ fn isolated_note(isolated: bool) -> Option<HelpNote> {
 /// the moment the screen is built, so neither surface can show a binding this
 /// process does not have.
 pub fn help_doc(use_f2: bool, isolated: bool) -> HelpDoc {
-    help_doc_from(Keymap::for_this_platform(use_f2), isolated)
+    help_doc_for(use_f2, isolated, false)
+}
+
+/// [`help_doc`] for a front-end: `desktop` adds the rows for the shortcuts only
+/// the desktop app has (see [`crate::app::keymap::KeymapOptions::desktop`]).
+/// The TUI and the browser pass `false` and get the screen they always had.
+pub fn help_doc_for(use_f2: bool, isolated: bool, desktop: bool) -> HelpDoc {
+    help_doc_from(Keymap::for_front_end(use_f2, desktop), isolated)
 }
 
 /// The help screen for an explicit keymap: its sections and rows, verbatim.
