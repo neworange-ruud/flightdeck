@@ -6,5 +6,7 @@ pub mod git_strip;
 pub mod icons;
 pub mod mission;
 pub mod sidebar;
+pub mod spinner;
+pub mod split;
 pub mod status_bar;
 pub mod titlebar;

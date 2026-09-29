@@ -58,6 +58,11 @@ impl Hex {
 /// Opacity of [`Palette::scrim`] behind a modal overlay.
 pub const SCRIM_ALPHA: f32 = 0.62;
 
+/// How strongly split view dims the panes that do not have the focus
+/// ([`Palette::pane_dim`] at this alpha): enough to tell at a glance where
+/// typing goes, light enough that their output stays readable.
+pub const PANE_DIM_ALPHA: f32 = 0.42;
+
 impl From<Hex> for Rgba {
     fn from(hex: Hex) -> Self {
         gpui::rgb(hex.0)
@@ -180,6 +185,9 @@ pub struct Palette {
     /// The backdrop dimming the window behind a modal overlay, painted at
     /// [`SCRIM_ALPHA`] so the frame behind stays legible but out of focus.
     pub scrim: Hex,
+    /// Split view: laid over every pane but the focused one, at
+    /// [`PANE_DIM_ALPHA`].
+    pub pane_dim: Hex,
 
     // --- mode pill (status bar) ------------------------------------------------
     /// TERMINAL mode pill fill.
@@ -273,6 +281,9 @@ impl Palette {
             danger_border: Hex(0x6e2f27),
 
             scrim: Hex(0x0e0c0b),
+            // The terminal well's own colour, so dimming darkens the ink
+            // towards the background rather than tinting it.
+            pane_dim: Hex(0x161311),
 
             pill_terminal_bg: Hex(0x34402f),
             pill_terminal_ink: Hex(0xb9e2a6),

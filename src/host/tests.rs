@@ -236,6 +236,67 @@ fn tab_terminal_reads_any_projects_tab_not_only_the_active_one() {
 }
 
 #[test]
+fn one_terminal_of_a_tab_is_read_and_resized_on_its_own() {
+    use crate::view::TerminalRef;
+    let fakes = Fakes::new();
+    let (state, primary_pty) = fakes.state_with_a_tab();
+    let tab_id = state.tabs[0].meta.id.clone();
+    let mut host = fakes.host(state);
+    let shell_pty = fakes.pty.queue_session();
+    host.handle(HostEvent::Command(Command::NewChildTerminal))
+        .unwrap();
+    shell_pty.push_output("in the shell");
+    host.pump();
+
+    // Each terminal by name, not only the focused one.
+    let shell = host
+        .tab_terminal_at(0, &tab_id, TerminalRef::Child(0))
+        .expect("the child is spawned");
+    assert!(shell.screen().contents().contains("in the shell"));
+    assert!(host
+        .tab_terminal_at(0, &tab_id, TerminalRef::Primary)
+        .is_some());
+    assert!(host
+        .tab_terminal_at(0, &tab_id, TerminalRef::Child(1))
+        .is_none());
+    assert!(host
+        .tab_terminal_at(3, &tab_id, TerminalRef::Primary)
+        .is_none());
+
+    // Split view's columns: the child alone gets its size.
+    let before = primary_pty.resizes().len();
+    let column = PtySize { rows: 30, cols: 57 };
+    assert!(host.resize_terminal(0, &tab_id, TerminalRef::Child(0), column));
+    assert_eq!(shell_pty.resizes().last(), Some(&column));
+    assert_eq!(
+        host.tab_terminal_at(0, &tab_id, TerminalRef::Child(0))
+            .unwrap()
+            .screen()
+            .size(),
+        (30, 57)
+    );
+    assert_eq!(
+        primary_pty.resizes().len(),
+        before,
+        "the agent kept its size"
+    );
+
+    // The same size again is no resize (no spurious SIGWINCH), nor is one
+    // below the parser's floor that clamps to the size it already has.
+    let resizes = shell_pty.resizes().len();
+    assert!(!host.resize_terminal(0, &tab_id, TerminalRef::Child(0), column));
+    let tiny = PtySize { rows: 1, cols: 1 };
+    assert!(host.resize_terminal(0, &tab_id, TerminalRef::Child(0), tiny));
+    assert!(!host.resize_terminal(0, &tab_id, TerminalRef::Child(0), tiny));
+    assert_eq!(shell_pty.resizes().len(), resizes + 1);
+
+    // Unknown targets change nothing.
+    assert!(!host.resize_terminal(0, &tab_id, TerminalRef::Child(4), column));
+    assert!(!host.resize_terminal(0, "no-such-tab", TerminalRef::Primary, column));
+    assert!(!host.resize_terminal(9, &tab_id, TerminalRef::Primary, column));
+}
+
+#[test]
 fn refresh_git_status_runs_for_a_background_project_on_request() {
     let fakes = Fakes::new();
     let projects = vec![

@@ -103,12 +103,14 @@ dev-dependencies.
 - No row detail the view models do not carry: the mockup's "Waiting for
   approval · Bash(cargo fmt)" and "PR #412 · checks ✓".
 - Mission control is a static segment (M5); only its needs-you count is live.
-- Split view (Ctrl-b) is not drawn: the main area shows the focused terminal.
+- ~~Split view (Ctrl-b) is not drawn~~: done, see "Terminals within a
+  session" below.
 - Host terminals use the TUI's emulator (`TUI_EMULATOR`, vt100), not the
   desktop's alacritty backend, and their OSC 10/11 default colours are not
   set from the theme.
 - One size for every project's PTYs (the TUI's per-mode chrome differences do
-  not apply to the GUI yet).
+  not apply to the GUI yet). Since `.3.6` the selected agent in split view is
+  the exception: its terminals get their panes' sizes.
 - The context menu shows keycaps as trailing text, not aligned columns; the
   close `×` is only on the active project tab.
 - Every host notify re-renders the whole window (fine at this size; a
@@ -140,3 +142,91 @@ dev-dependencies.
   "Open project…" and the remembered projects (`host::recent_projects`);
   choosing a folder runs `AppHost::open` on it and swaps in the shell.
   `--isolated` there is still the TUI's error.
+
+## Terminals within a session and split view (`remote-control-bmej.3.6`)
+
+- **The tabs are the sidebar's nested rows.** Under the selected agent the
+  sidebar lists its terminals (`agent`, `agent 2`, `shell 1`, …, from
+  `flightdeck::view::terminal_views`, the list the TUI's tab bar and split
+  columns use); the focused one is drawn raised and a click selects it and
+  enters TERMINAL mode. The main area is always the host's active terminal
+  (`AppHost::active_terminal`), so switching needs nothing of its own.
+- **Decision: no tab strip above the terminal.** The nested rows already
+  show every terminal, which one is focused, and its command, one click away.
+  A strip would repeat them. The one place a label is needed next to the
+  terminal is split view, where several are on screen at once, so each pane
+  has a header (label + command, the active one highlighted in the accent),
+  as the TUI's split columns do. Nothing is drawn above a single terminal.
+- **Split view (Ctrl-b)** (`views/split.rs`): the TUI's `draw_split_view`.
+  One pane per terminal, left to right in tab order, equal widths with a
+  hairline between. The active terminal's pane holds the window's one
+  `TerminalView`, which moves as the focus moves, so keys, IME, selection
+  and mouse reporting all go to the active terminal only. Every other pane
+  is a read-only `PaneView`: the element's row cache, layout and glyph
+  painting at the same font and padding (a terminal keeps its size when it
+  gains focus), no cursor (the TUI shows only the active column's), dimmed
+  by `Palette::pane_dim` at `PANE_DIM_ALPHA`. A click on a pane's header or
+  body selects that terminal and enters TERMINAL mode (the TUI's column
+  click). The toggle shows the TUI's own "Split view on." message.
+- **Per-pane PTY sizes.** Each pane measures its grid; the host model keeps
+  the sizes for the current (project, agent, pane count) and applies them on
+  its next turn through the new `AppHost::resize_terminal(project, tab_id,
+  target, size)` (resizes only on a change; unit-tested in
+  `src/host/tests.rs`), with `AppHost::tab_terminal_at` to read one named
+  terminal. That is the TUI's `sync_terminal_sizes`: out of split view every
+  terminal of the selected agent is put back to the viewport each turn.
+  While split view is on, the viewport (every other project's size) is not
+  updated; a window resize in split view reaches the other projects when
+  split view is left. The rest of the "one size for every project" gap
+  stays: the GUI's chrome is the same in every project, so one size is
+  right there.
+- **Not done:** scrolling a pane that is not the active one (click it
+  first), and split view inside Mission control's focus view (it keeps one
+  terminal full size).
+
+### The Child Terminal Navigation help, item by item
+
+| Help row | Desktop | Test (`shell_tests.rs`) |
+| --- | --- | --- |
+| Ctrl-t — New child terminal | the keymap chord; also the sidebar's New shell button; the new shell is active (and a new pane in split view) | `ctrl_t_adds_and_ctrl_w_closes_a_terminal_by_the_tuis_rules`, `ctrl_b_lays_the_terminals_side_by_side_each_at_its_own_size` |
+| Ctrl-w — Close active child terminal | the TUI's confirmation (`CloseTerminal { label }`), n keeps it, y ends its process tree; on the agent it is refused with "No child terminal selected." (the agent closes with its session, Ctrl-k, which asks first) | `ctrl_t_adds_and_ctrl_w_closes_a_terminal_by_the_tuis_rules` |
+| Left / Right (or Alt) — Cycle terminal tabs | bare arrows in APP mode, Alt-arrows in both modes, wrapping; bare arrows in TERMINAL mode go to the program | `left_right_and_alt_arrows_cycle_the_agents_terminals`, and in split view `in_split_view_focus_moves_between_panes_and_only_the_active_one_gets_input` |
+| Ctrl-b — Toggle split view | panes as above, off again restores one size | `ctrl_b_lays_the_terminals_side_by_side_each_at_its_own_size` |
+| Mouse click — Select terminal tab | a nested sidebar row; in split view a pane header or body | `clicking_a_nested_terminal_row_selects_and_focuses_it`, `in_split_view_focus_moves_between_panes_and_only_the_active_one_gets_input` |
+
+Rendered frames (`--features spike-snapshot`, a throwaway HOME and repo, keys
+typed through `--spike-keys`) of split view with two and with three
+terminals were checked by eye: equal columns, the active header underlined
+in the accent, the other panes dimmed and cursorless, output in a read-only
+pane drawn as the terminal element draws it.
+
+## Spinners (S4 follow-up)
+
+`views/spinner.rs`. The working arc no longer uses GPUI's `with_animation`,
+which asks for a frame on every display refresh. It turns in 8 steps of 45°,
+one every 125 ms, from one app-wide clock (`SpinnerClock`, a GPUI global).
+Each arc is its own small entity (`Window::use_keyed_state`, so it lives as
+long as the arc is on screen), embedded as a cached view; a step notifies
+only those. GPUI still re-renders the views that contain an arc (the window
+root, Mission control), because it has no narrower repaint, but the
+cached tiles and the other arcs are replayed, not drawn again. The clock
+runs only while at least one arc is alive and the window is active and
+visible (`observe_window_activation`, `observe_window_visibility`, which is
+`NSWindow.occlusionState` on macOS; on Windows a covered window still counts
+as visible, see GPUI's `WindowVisibility`). Otherwise the timer stops and
+the arcs hold their step. The rule is `SpinnerSchedule::running`
+(unit-tested), and a GPUI test checks the clock stops for an inactive and a
+hidden window and resumes after.
+
+Measured with `perf.py mission-idle --seconds 20` (4 Mission control tiles,
+release builds, the key window, M2 Pro, other builds running, load ~30):
+
+| 4 tiles | before | after |
+| --- | --- | --- |
+| waiting, idle shells | 1.39 % | 1.44 % |
+| **working**, idle shells | **19.48 %** | **2.87 %** |
+| waiting, tickers | 1.93 % | 2.22 % |
+| **working**, tickers | **21.35 %** | **3.42 %** |
+
+The arcs now cost about 1.2–1.4 % of a core on top of the waiting case. In a
+background or hidden window they cost nothing.

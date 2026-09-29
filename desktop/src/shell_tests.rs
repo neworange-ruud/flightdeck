@@ -9,11 +9,15 @@
 //! proven to send what its chord sends.
 
 use flightdeck::app::commands::{Command, Selector};
+use std::path::Path;
+
 use flightdeck::app::modes::InputMode;
+use flightdeck::contracts::PtySize;
 use flightdeck::host::testing::{self, TestProject};
 use flightdeck::host::{DialogKind, HostEvent, OverlayInput, OverlayView};
 use flightdeck::testing::{
     FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakeNotifier, FakePty,
+    FakePtyHandle,
 };
 use flightdeck::Env;
 use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext};
@@ -62,7 +66,15 @@ fn open(
     app: &mut TestAppContext,
     projects: Vec<TestProject>,
 ) -> (&'static Fakes, Entity<HostModel>, &mut VisualTestContext) {
-    let f = fakes();
+    open_with(app, fakes(), projects)
+}
+
+/// [`open`] over fakes the caller already used (to spawn a project's agent).
+fn open_with<'a>(
+    app: &'a mut TestAppContext,
+    f: &'static Fakes,
+    projects: Vec<TestProject>,
+) -> (&'static Fakes, Entity<HostModel>, &'a mut VisualTestContext) {
     let host = testing::host(env(f), &f.notifier, projects, 0);
     app.update(|cx| {
         gpui_component::init(cx);
@@ -433,4 +445,400 @@ fn an_idle_turn_asks_for_no_redraw(app: &mut TestAppContext) {
     });
     let redrew = model.update(cx, |m, cx| m.turn(cx));
     assert!(!redrew, "nothing happened, so nothing is drawn");
+}
+
+// --- Terminals within a session, split view, spinners ------------------------
+
+/// The PTY size agents spawn at in these tests.
+const SPAWN: PtySize = crate::shell::NOMINAL_PTY_SIZE;
+
+/// A project `alpha` whose one agent `a1` is running, and its PTY.
+fn live_agent(f: &'static Fakes) -> (Vec<TestProject>, FakePtyHandle) {
+    let mut project = TestProject::new("alpha", &["a1"]);
+    let handle = f.pty.queue_session();
+    let tab = &mut project.state.tabs[0];
+    tab.session.set_profile(crate::terminal::desktop_profile());
+    tab.session
+        .spawn_primary(&f.pty, "claude", &[], Path::new("/alpha"), SPAWN)
+        .expect("fake spawn");
+    (vec![project], handle)
+}
+
+/// A debug selector `prefix-i`.
+fn sel(prefix: &str, i: usize) -> &'static str {
+    Box::leak(format!("{prefix}-{i}").into_boxed_str())
+}
+
+fn selected_child(model: &Entity<HostModel>, cx: &mut VisualTestContext) -> Option<usize> {
+    model.read_with(cx, |m, _| {
+        m.host()
+            .active_state()
+            .selected()
+            .and_then(|t| t.session.selected_child())
+    })
+}
+
+fn child_count(model: &Entity<HostModel>, cx: &mut VisualTestContext) -> usize {
+    model.read_with(cx, |m, _| {
+        m.host()
+            .active_state()
+            .selected()
+            .map_or(0, |t| t.session.child_count())
+    })
+}
+
+fn mode(model: &Entity<HostModel>, cx: &mut VisualTestContext) -> InputMode {
+    model.read_with(cx, |m, _| m.host().active_state().mode())
+}
+
+fn dispatch(model: &Entity<HostModel>, event: HostEvent, cx: &mut VisualTestContext) {
+    model.update(cx, |m, cx| m.dispatch(event, cx));
+    cx.run_until_parked();
+}
+
+/// Ctrl-t (APP mode), with the PTY the new shell gets.
+fn new_shell(f: &'static Fakes, cx: &mut VisualTestContext) -> FakePtyHandle {
+    let handle = f.pty.queue_session();
+    cx.simulate_keystrokes("ctrl-t");
+    handle
+}
+
+/// The size each of the selected agent's terminals has now, agent first.
+fn grid_sizes(model: &Entity<HostModel>, cx: &mut VisualTestContext) -> Vec<(u16, u16)> {
+    model.read_with(cx, |m, _| {
+        let host = m.host();
+        let tab = host.active_state().selected().expect("an agent");
+        flightdeck::view::terminal_views(tab)
+            .iter()
+            .map(|t| {
+                host.tab_terminal_at(0, &tab.meta.id, t.target)
+                    .expect("spawned")
+                    .screen()
+                    .size()
+            })
+            .collect()
+    })
+}
+
+/// Draw, then take a turn: what a measured pane size needs to reach its PTY.
+fn draw_and_turn(model: &Entity<HostModel>, cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    model.update(cx, |m, cx| {
+        m.turn(cx);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn left_right_and_alt_arrows_cycle_the_agents_terminals(app: &mut TestAppContext) {
+    let f = fakes();
+    let (projects, agent) = live_agent(f);
+    let (_f, model, cx) = open_with(app, f, projects);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    let _s1 = new_shell(f, cx);
+    let _s2 = new_shell(f, cx);
+    assert_eq!(child_count(&model, cx), 2);
+    assert_eq!(selected_child(&model, cx), Some(1), "a new shell is active");
+    // The sidebar nests all three under the agent: those rows are the tabs.
+    for i in 0..3 {
+        assert!(cx.debug_bounds(sel("terminal-row", i)).is_some(), "row {i}");
+    }
+    assert!(cx.debug_bounds(sel("terminal-row", 3)).is_none());
+
+    // APP mode: bare Left / Right cycle agent → shell 1 → shell 2 → agent.
+    cx.simulate_keystrokes("left");
+    assert_eq!(selected_child(&model, cx), Some(0));
+    cx.simulate_keystrokes("left");
+    assert_eq!(selected_child(&model, cx), None, "the agent");
+    cx.simulate_keystrokes("left");
+    assert_eq!(selected_child(&model, cx), Some(1), "wraps");
+    cx.simulate_keystrokes("right");
+    assert_eq!(selected_child(&model, cx), None, "and back");
+    // The main area is the active terminal.
+    let on_screen = model.read_with(cx, |m, _| {
+        m.host().active_terminal().map(|t| t.title.clone())
+    });
+    assert_eq!(on_screen.as_deref(), Some("claude"));
+
+    // TERMINAL mode: Alt-Left / Alt-Right, and the mode stays.
+    dispatch(&model, HostEvent::FocusTerminal, cx);
+    cx.simulate_keystrokes("alt-right");
+    assert_eq!(selected_child(&model, cx), Some(0));
+    cx.simulate_keystrokes("alt-right");
+    assert_eq!(selected_child(&model, cx), Some(1));
+    cx.simulate_keystrokes("alt-left");
+    assert_eq!(selected_child(&model, cx), Some(0));
+    assert_eq!(mode(&model, cx), InputMode::Terminal);
+    // Bare Left in TERMINAL mode is the program's, not a switch.
+    cx.simulate_keystrokes("alt-left");
+    cx.simulate_keystrokes("left");
+    assert_eq!(selected_child(&model, cx), None);
+    assert!(
+        agent.input().ends_with(b"\x1b[D"),
+        "{:?}",
+        String::from_utf8_lossy(&agent.input())
+    );
+    // Alt-arrows work in APP mode too.
+    dispatch(&model, HostEvent::FocusApp, cx);
+    cx.simulate_keystrokes("alt-left");
+    assert_eq!(selected_child(&model, cx), Some(1));
+}
+
+#[gpui::test]
+fn clicking_a_nested_terminal_row_selects_and_focuses_it(app: &mut TestAppContext) {
+    let f = fakes();
+    let (projects, _agent) = live_agent(f);
+    let (_f, model, cx) = open_with(app, f, projects);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    let _s1 = new_shell(f, cx);
+    let _s2 = new_shell(f, cx);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    take_dispatched(&model, cx);
+
+    click(cx, "terminal-row-1");
+    assert_eq!(selected_child(&model, cx), Some(0), "shell 1");
+    assert_eq!(
+        mode(&model, cx),
+        InputMode::Terminal,
+        "and typing goes there"
+    );
+    assert_eq!(
+        take_dispatched(&model, cx),
+        [
+            HostEvent::Command(Command::SwitchChildTerminal(Selector::Index(0))),
+            HostEvent::FocusTerminal,
+        ]
+    );
+    dispatch(&model, HostEvent::FocusApp, cx);
+    click(cx, "terminal-row-0");
+    assert_eq!(selected_child(&model, cx), None, "the agent");
+    assert_eq!(mode(&model, cx), InputMode::Terminal);
+}
+
+#[gpui::test]
+fn ctrl_t_adds_and_ctrl_w_closes_a_terminal_by_the_tuis_rules(app: &mut TestAppContext) {
+    let f = fakes();
+    let (projects, agent) = live_agent(f);
+    let (_f, model, cx) = open_with(app, f, projects);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    let shell = new_shell(f, cx);
+    assert_eq!(child_count(&model, cx), 1);
+    assert_eq!(selected_child(&model, cx), Some(0));
+    assert!(
+        cx.debug_bounds("terminal-row-1").is_some(),
+        "its nested row"
+    );
+
+    // Ctrl-w asks first, as the TUI does; No keeps the shell.
+    let confirm = |model: &Entity<HostModel>, cx: &mut VisualTestContext| match model
+        .read_with(cx, |m, _| m.host().overlay())
+    {
+        Some(OverlayView::Dialog(d)) => {
+            assert_eq!(
+                d.kind,
+                DialogKind::CloseTerminal {
+                    label: "shell 1".to_string()
+                }
+            );
+        }
+        other => panic!("expected the close confirmation, got {other:?}"),
+    };
+    cx.simulate_keystrokes("ctrl-w");
+    confirm(&model, cx);
+    cx.simulate_keystrokes("n");
+    assert_eq!(model.read_with(cx, |m, _| m.host().overlay()), None);
+    assert_eq!(child_count(&model, cx), 1);
+    assert!(!shell.terminated());
+
+    // Yes closes the active shell (its process tree is ended) and the agent
+    // is active again.
+    cx.simulate_keystrokes("ctrl-w");
+    confirm(&model, cx);
+    cx.simulate_keystrokes("y");
+    assert_eq!(child_count(&model, cx), 0);
+    assert!(shell.terminated());
+    assert_eq!(selected_child(&model, cx), None);
+    assert!(cx.debug_bounds("terminal-row-1").is_none());
+
+    // On the agent itself Ctrl-w is refused with the TUI's message (the agent
+    // closes with its session, Ctrl-k, behind a confirmation).
+    cx.simulate_keystrokes("ctrl-w");
+    match model.read_with(cx, |m, _| m.host().overlay()) {
+        Some(OverlayView::Message(m)) => {
+            assert_eq!(m.text, "No child terminal selected.")
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    assert!(!agent.terminated());
+    close_overlays(&model, cx);
+    cx.simulate_keystrokes("ctrl-k");
+    assert!(
+        matches!(
+            model.read_with(cx, |m, _| m.host().overlay()),
+            Some(OverlayView::Dialog(_))
+        ),
+        "closing the agent asks first"
+    );
+    assert!(!agent.terminated());
+}
+
+#[gpui::test]
+fn ctrl_b_lays_the_terminals_side_by_side_each_at_its_own_size(app: &mut TestAppContext) {
+    let f = fakes();
+    let (projects, _agent) = live_agent(f);
+    let (_f, model, cx) = open_with(app, f, projects);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    draw_and_turn(&model, cx);
+    let single = grid_sizes(&model, cx)[0];
+
+    // Two terminals, split: two panes, each with its header.
+    let _s1 = new_shell(f, cx);
+    assert!(cx.debug_bounds("split-pane-0").is_none(), "off by default");
+    cx.simulate_keystrokes("ctrl-b");
+    assert!(model.read_with(cx, |m, _| m.host().active_state().split_view));
+    // The TUI's own confirmation of the toggle.
+    match model.read_with(cx, |m, _| m.host().overlay()) {
+        Some(OverlayView::Message(m)) => assert_eq!(m.text, "Split view on."),
+        other => panic!("expected the toggle's message, got {other:?}"),
+    }
+    close_overlays(&model, cx);
+    let bounds = |cx: &mut VisualTestContext, n: usize| -> Vec<gpui::Bounds<gpui::Pixels>> {
+        (0..n)
+            .map(|i| cx.debug_bounds(sel("split-pane", i)).expect("a pane"))
+            .collect()
+    };
+    let two = bounds(cx, 2);
+    assert!(cx.debug_bounds("split-pane-2").is_none());
+    assert!(cx.debug_bounds("split-header-1").is_some());
+    assert!(two[0].origin.x < two[1].origin.x, "left to right");
+    assert_eq!(two[0].origin.y, two[1].origin.y);
+    assert!((two[0].size.width - two[1].size.width).abs() <= gpui::px(1.));
+
+    draw_and_turn(&model, cx);
+    let halves = grid_sizes(&model, cx);
+    assert_eq!(halves[0].0, halves[1].0, "same height");
+    assert!(
+        halves[0].0 < single.0,
+        "a header row less: {halves:?} vs {single:?}"
+    );
+    assert!(halves[0].1.abs_diff(halves[1].1) <= 1, "{halves:?}");
+    assert!(halves[0].1 < single.1 / 2 + 1, "{halves:?} vs {single:?}");
+
+    // A third terminal: three panes, every column narrower.
+    let _s2 = new_shell(f, cx);
+    let three = bounds(cx, 3);
+    assert!(three[2].origin.x > three[1].origin.x);
+    draw_and_turn(&model, cx);
+    let thirds = grid_sizes(&model, cx);
+    assert_eq!(thirds.len(), 3);
+    assert!(thirds.iter().all(|s| s.1 < halves[1].1), "{thirds:?}");
+    let widest = thirds.iter().map(|s| s.1).max().unwrap();
+    let narrowest = thirds.iter().map(|s| s.1).min().unwrap();
+    assert!(widest - narrowest <= 1, "{thirds:?}");
+
+    // Off again: every terminal back to the one viewport.
+    cx.simulate_keystrokes("ctrl-b");
+    close_overlays(&model, cx);
+    assert!(cx.debug_bounds("split-pane-0").is_none());
+    draw_and_turn(&model, cx);
+    assert_eq!(grid_sizes(&model, cx), vec![single; 3]);
+}
+
+#[gpui::test]
+fn in_split_view_focus_moves_between_panes_and_only_the_active_one_gets_input(
+    app: &mut TestAppContext,
+) {
+    let f = fakes();
+    let (projects, agent) = live_agent(f);
+    let (_f, model, cx) = open_with(app, f, projects);
+    dispatch(&model, HostEvent::FocusApp, cx);
+    let s1 = new_shell(f, cx);
+    let s2 = new_shell(f, cx);
+    cx.simulate_keystrokes("ctrl-b");
+    close_overlays(&model, cx);
+    let input = |h: &FakePtyHandle| String::from_utf8_lossy(&h.input()).to_string();
+
+    // Shell 2 is active: typing reaches it alone.
+    dispatch(&model, HostEvent::FocusTerminal, cx);
+    cx.simulate_keystrokes("x");
+    assert_eq!(input(&s2), "x");
+    assert_eq!((input(&agent), input(&s1)), (String::new(), String::new()));
+
+    // Alt-Left moves the focus one pane left; typing follows it.
+    cx.simulate_keystrokes("alt-left");
+    assert_eq!(selected_child(&model, cx), Some(0));
+    cx.simulate_keystrokes("y");
+    assert_eq!((input(&s1), input(&s2)), ("y".to_string(), "x".to_string()));
+
+    // A click in another pane's body makes it active and focuses it.
+    dispatch(&model, HostEvent::FocusApp, cx);
+    click(cx, "split-pane-0");
+    assert_eq!(selected_child(&model, cx), None, "the agent's pane");
+    assert_eq!(mode(&model, cx), InputMode::Terminal);
+    cx.simulate_keystrokes("z");
+    assert_eq!(input(&agent), "z");
+    assert_eq!((input(&s1), input(&s2)), ("y".to_string(), "x".to_string()));
+
+    // A header click does the same.
+    click(cx, "split-header-2");
+    assert_eq!(selected_child(&model, cx), Some(1));
+    // APP-mode Right from the last pane wraps to the first, as the tabs do.
+    dispatch(&model, HostEvent::FocusApp, cx);
+    cx.simulate_keystrokes("right");
+    assert_eq!(selected_child(&model, cx), None);
+}
+
+#[gpui::test]
+fn the_spinner_clock_holds_still_while_the_window_is_inactive_or_hidden(app: &mut TestAppContext) {
+    use crate::views::spinner::{SpinnerClock, STEP};
+    let f = fakes();
+    let (mut projects, _agent) = live_agent(f);
+    projects[0].state.tabs[0].interpreted = Some(flightdeck::contracts::InterpretedStatus::Working);
+    let (_f, _model, cx) = open_with(app, f, projects);
+    // The test platform opens its window in the background; bring it to the
+    // front as the app's launch does.
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    let schedule = cx.update(|_, cx| SpinnerClock::schedule(cx));
+    assert!(
+        schedule.spinners >= 2,
+        "the sidebar row and the project tab: {schedule:?}"
+    );
+    assert!(schedule.running());
+    let steps = |cx: &mut VisualTestContext| cx.update(|_, cx| SpinnerClock::steps(cx));
+    let advance = |cx: &mut VisualTestContext, n: u32| {
+        cx.executor().advance_clock(STEP * n);
+        cx.run_until_parked();
+    };
+
+    let before = steps(cx);
+    advance(cx, 4);
+    assert!(steps(cx) >= before + 4, "8 fps while shown");
+
+    // Another app is active: the arcs stop, and so does the timer.
+    cx.deactivate_window();
+    assert!(!cx.update(|_, cx| SpinnerClock::schedule(cx)).running());
+    advance(cx, 1);
+    let paused = steps(cx);
+    advance(cx, 8);
+    assert_eq!(steps(cx), paused, "no steps while inactive");
+    assert!(!cx.update(|_, cx| SpinnerClock::is_ticking(cx)));
+
+    // Back to the front: they turn again.
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    advance(cx, 2);
+    assert!(steps(cx) > paused);
+
+    // Covered, minimised or on another Space: still again.
+    cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+    cx.run_until_parked();
+    advance(cx, 1);
+    let hidden = steps(cx);
+    advance(cx, 8);
+    assert_eq!(steps(cx), hidden, "no steps while hidden");
+    cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+    cx.run_until_parked();
+    advance(cx, 2);
+    assert!(steps(cx) > hidden);
 }

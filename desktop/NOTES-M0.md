@@ -815,7 +815,7 @@ turn and a redraw every second.
 | 1 agent (`-I`), ticker | 1.75 % | **0.9–1.3 %**, 1.0 frames/s (one per tick) |
 | Mission control, 4 tiles, waiting, idle shells | (not measured) | **1.7 %**, ~0 tile frames/s |
 | Mission control, 4 tiles, waiting, tickers | (not measured) | **2.2–2.5 %**, 4–5 tile frames/s (one per tile per tick) |
-| Mission control, 4 tiles, **working**, idle shells or tickers | (not measured) | 6–21 % |
+| Mission control, 4 tiles, **working**, idle shells or tickers | (not measured) | 6–21 %; **2.9 % / 3.4 %** after the spinner clock (below) |
 
 The last row is not the terminals. A working session draws an animated
 spinner in the sidebar, on its tile and on the project tab, and GPUI redraws
@@ -826,6 +826,12 @@ was the key window (GPUI caps an inactive window at 30 fps). Bringing that
 down means animating the spinners less often, or pausing them in a background
 window. That is a shell decision, left to the shell; the terminals and tiles
 cost about the same with or without the spinners.
+
+Done since (`desktop/src/views/spinner.rs`, desktop/NOTES-M2.md "Spinners"):
+the arcs step at 8 fps from one clock that notifies only their own cached
+views, and the clock stops while the window is inactive or hidden. Four
+working tiles: 19.5 % → 2.9 % with idle shells, 21.4 % → 3.4 % with tickers
+(`perf.py mission-idle --seconds 20`, the key window).
 
 Not measured on the host path: keystroke latency. The key → `TerminalInput` →
 fast host turns path is the same design as the `--bench` view's (a 1 ms poll

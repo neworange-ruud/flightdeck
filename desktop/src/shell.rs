@@ -24,6 +24,20 @@
 //! while one is up (its "Overlay" context disables every Global chord, as the
 //! TUI's modal swallows every key) and gives focus back when it closes.
 //!
+//! ## Split view
+//!
+//! With the active project's split view on (Ctrl-b), the main area below the
+//! git strip is the selected agent's terminals side by side
+//! ([`crate::views::split`]): the terminal view above sits in the active
+//! terminal's pane and read-only panes draw the others, so the focus rule
+//! above is unchanged: TERMINAL mode focuses the one terminal view, wherever
+//! it is.
+//!
+//! ## The spinners
+//!
+//! The window reports whether it is active and visible to the spinner clock
+//! ([`crate::views::spinner`]), which stops while it is neither.
+//!
 //! ## The view switch
 //!
 //! While the persisted main view is Mission control (`views::mission`), its
@@ -39,8 +53,9 @@ use flightdeck::persistence::workspace::MainView;
 use flightdeck_desktop::keys::{app_key_down, KeymapAction};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window,
+    div, px, AnyElement, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled,
+    Subscription, Window,
 };
 use gpui_component::{h_flex, v_flex};
 
@@ -55,7 +70,9 @@ use crate::terminal::view::TerminalView;
 use crate::theme::Palette;
 use crate::views::git_strip::git_strip;
 use crate::views::mission::{mission_status_bar, MissionControl};
-use crate::views::sidebar::{sidebar, SidebarData};
+use crate::views::sidebar::{command_hint, focus_terminal, sidebar, SidebarData};
+use crate::views::spinner::SpinnerClock;
+use crate::views::split::{PaneKey, Panes, SplitLayout, PANE_HEADER, PANE_PAD_X, PANE_PAD_Y};
 use crate::views::status_bar::status_bar;
 use crate::views::titlebar::TitleBar;
 
@@ -80,6 +97,11 @@ pub struct FlightDeckWindow {
     layer: Entity<OverlayLayer>,
     /// The update banner was dismissed for this session.
     update_dismissed: bool,
+    /// Split view's read-only panes (every terminal but the active one).
+    panes: Panes,
+    /// The window's activation and visibility, watched for the spinner
+    /// clock; set up on the first frame (the constructor has no window).
+    window_watch: Vec<Subscription>,
 }
 
 impl FlightDeckWindow {
@@ -105,6 +127,111 @@ impl FlightDeckWindow {
             mission,
             layer,
             update_dismissed: false,
+            panes: Panes::default(),
+            window_watch: Vec::new(),
+        }
+    }
+
+    /// Report the window's state to the spinner clock now and on every
+    /// change: the arcs stop while the window is inactive or not presented
+    /// (see [`crate::views::spinner`]).
+    fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.window_watch.is_empty() {
+            return;
+        }
+        SpinnerClock::set_window(window.is_window_active(), window.is_visible(), cx);
+        self.window_watch
+            .push(cx.observe_window_activation(window, |_, window, cx| {
+                SpinnerClock::set_window(window.is_window_active(), window.is_visible(), cx);
+            }));
+        self.window_watch.push(cx.observe_window_visibility(
+            window,
+            |_, visibility, window, cx| {
+                SpinnerClock::set_window(window.is_window_active(), visibility.is_visible(), cx);
+            },
+        ));
+    }
+
+    /// Split view's main area: one pane per terminal of the selected agent,
+    /// left to right, with a hairline between (see [`crate::views::split`]).
+    fn split_main(
+        &mut self,
+        layout: &SplitLayout,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut shown = Vec::new();
+        let mut row = h_flex().flex_1().min_h_0().w_full().items_start();
+        for (i, pane) in layout.panes.iter().enumerate() {
+            let active = pane.target == layout.active;
+            let spawned = self
+                .host
+                .read(cx)
+                .host()
+                .tab_terminal_at(layout.project, &layout.tab_id, pane.target)
+                .is_some();
+            if i > 0 {
+                row = row.child(div().flex_none().w(px(1.)).h_full().bg(p.hairline.hsla()));
+            }
+            let body: AnyElement = if !spawned {
+                starting(p).into_any_element()
+            } else if active {
+                self.terminal.clone().into_any_element()
+            } else {
+                let key = PaneKey::new(layout, pane.target);
+                shown.push(key.clone());
+                let view = self.panes.view(&self.host, key, cx);
+                let mut dim = p.pane_dim.hsla();
+                dim.a = crate::theme::PANE_DIM_ALPHA;
+                div()
+                    .relative()
+                    .size_full()
+                    .py(PANE_PAD_Y)
+                    .px(PANE_PAD_X)
+                    .child(view)
+                    .child(div().absolute().inset_0().bg(dim))
+                    .into_any_element()
+            };
+            let target = pane.target;
+            let host = self.host.clone();
+            let body = div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .when(!active, |d| {
+                    // A click in another pane makes it the active terminal
+                    // and focuses it, as the TUI's click in a column does.
+                    d.cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            focus_terminal(&host, target, cx)
+                        })
+                })
+                .child(body);
+            row = row.child(
+                v_flex()
+                    .id(("split-pane", i))
+                    .debug_selector(move || format!("split-pane-{i}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(pane_header(i, pane, active, &self.host, p))
+                    .child(body),
+            );
+        }
+        self.panes.retain(&shown);
+        row.into_any_element()
+    }
+
+    /// The main area without split view: the focused terminal, full size.
+    fn single_main(&self, has_terminal: bool, no_agents: bool, p: &Palette) -> AnyElement {
+        if has_terminal {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(self.terminal.clone())
+                .into_any_element()
+        } else {
+            empty_terminal(p, no_agents).into_any_element()
         }
     }
 
@@ -130,6 +257,7 @@ impl FlightDeckWindow {
 impl Render for FlightDeckWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *Palette::global(cx);
+        self.watch_window(window, cx);
         let model = self.host.read(cx);
         let host = model.host();
         let overlay = host.overlay();
@@ -143,6 +271,7 @@ impl Render for FlightDeckWindow {
         let remote = host.remote_status();
         let notices = host.notices();
         let view = host.workspace_ui().view;
+        let split = SplitLayout::read(host);
         let banner = if self.update_dismissed {
             None
         } else {
@@ -194,21 +323,20 @@ impl Render for FlightDeckWindow {
                 }
             });
 
+        let body = match &split {
+            Some(layout) => self.split_main(layout, &p, cx),
+            None => {
+                self.panes.retain(&[]);
+                self.single_main(has_terminal, sidebar_data.rows.is_empty(), &p)
+            }
+        };
         let main = v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(p.surface_terminal.hsla())
             .child(git_strip(&strip, &self.host, &p))
-            .child(if has_terminal {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.terminal.clone())
-                    .into_any_element()
-            } else {
-                empty_terminal(&p, sidebar_data.rows.is_empty()).into_any_element()
-            });
+            .child(body);
 
         v_flex()
             .key_context(flightdeck::app::keymap::Context::Global.name())
@@ -240,6 +368,75 @@ impl Render for FlightDeckWindow {
             })
             .child(self.layer.clone())
     }
+}
+
+/// A split pane's header: the terminal's label and command, highlighted on
+/// the active pane (the TUI's column header). A click selects that terminal
+/// and focuses it.
+fn pane_header(
+    index: usize,
+    pane: &flightdeck::view::TerminalView,
+    active: bool,
+    host: &Entity<HostModel>,
+    p: &Palette,
+) -> impl IntoElement {
+    let target = pane.target;
+    let host = host.clone();
+    h_flex()
+        .id(("split-header", index))
+        .debug_selector(move || format!("split-header-{index}"))
+        .flex_none()
+        .w_full()
+        .h(PANE_HEADER)
+        .px_3()
+        .gap_2()
+        .cursor_pointer()
+        .text_size(px(12.))
+        .border_b_2()
+        .when_else(
+            active,
+            |h| {
+                h.bg(p.surface_raised.hsla())
+                    .border_color(p.accent.hsla())
+                    .text_color(p.ink.hsla())
+                    .font_weight(FontWeight::SEMIBOLD)
+            },
+            |h| {
+                h.bg(p.surface_sidebar.hsla())
+                    .border_color(p.hairline.hsla())
+                    .text_color(p.muted.hsla())
+            },
+        )
+        .child(crate::views::icons::icon(
+            crate::assets::icon::TERMINAL,
+            px(12.),
+            if active { p.ink } else { p.muted },
+        ))
+        .child(div().flex_none().child(pane.label.clone()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_right()
+                .font_family(crate::fonts::MONO_FAMILY)
+                .text_size(px(10.5))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(p.muted.hsla())
+                .child(command_hint(&pane.title)),
+        )
+        .on_click(move |_, _, cx| focus_terminal(&host, target, cx))
+}
+
+/// A split pane whose process is not spawned yet (the TUI's `(starting…)`).
+fn starting(p: &Palette) -> impl IntoElement {
+    div()
+        .size_full()
+        .py(PANE_PAD_Y)
+        .px(PANE_PAD_X)
+        .text_size(px(12.))
+        .text_color(p.muted.hsla())
+        .child("starting…")
 }
 
 /// The terminal well with no agent selected.

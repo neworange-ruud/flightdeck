@@ -38,7 +38,6 @@ companion; it can pair with the phone through the same overlay the TUI uses.
   goes in the core and the TUI gets it too (D5).
 - A light theme in this milestone. The theme is a set of semantic tokens
   (`desktop/src/theme.rs`), so one can be added; none is designed.
-- Split view (`Ctrl-b`). The main area shows the focused terminal.
 
 ---
 
@@ -336,7 +335,17 @@ deliberately narrow.
   menu bar; the palette (`Ctrl-g`) and F1 help are the equivalent.
 - **PTY sizing.** The terminal element measures its cell and bounds each frame;
   the next turn resizes every project's PTYs. Before the first frame, agents
-  spawn at 123×38.
+  spawn at 123×38. In split view each pane measures its own terminal, and the
+  host model resizes that one terminal (`AppHost::resize_terminal`), as the
+  TUI's `sync_terminal_sizes` does.
+- **Terminals within a session.** The sidebar's nested rows under the selected
+  agent are its terminal tabs; there is no tab strip above the terminal.
+  Left/Right (APP), Alt-Left/Right (both modes), a row click, Ctrl-t and
+  Ctrl-w are the TUI's. Split view (`Ctrl-b`) lays them side by side with a
+  header per pane (`desktop/NOTES-M2.md`, "Terminals within a session").
+- **Spinners.** The working arc turns in 8 steps a second from one app-wide
+  clock that stops while the window is inactive or hidden
+  (`desktop/src/views/spinner.rs`).
 - **Self-update.** Once a day the app looks for a newer `desktop-v*` release and
   shows a banner (never a modal) whose offer depends on the install kind
   (`desktop/PACKAGING.md`).
@@ -488,8 +497,10 @@ From `desktop/NOTES-M2.md`, `desktop/NOTES-M0.md` and `desktop/PACKAGING.md`:
   the view models.
 - **No "Waiting for approval · Bash(…)" detail** on rows and tiles; only the
   status text the view models carry.
-- **Per-project PTY sizing.** One size for every project's PTYs; the TUI's
-  per-mode chrome differences do not apply to the GUI yet.
+- **Per-project PTY sizing.** One viewport for every project's PTYs (the GUI's
+  chrome is the same in every project), except the selected agent in split
+  view, whose terminals get their panes' sizes. A window resize during split
+  view reaches the other projects only when split view is left.
 - **Linux and Windows:** never built or run; no taskbar overlay or Linux badge;
   server-side decorations not seen.
 - **Live validation of Approve / Deny** against a real agent prompt has not been
@@ -499,7 +510,6 @@ From `desktop/NOTES-M2.md`, `desktop/NOTES-M0.md` and `desktop/PACKAGING.md`:
 - **CI has never run;** the release, signing, notarization, updater download and
   swap, Homebrew cask, `.deb`/`.rpm`/AppImage and MSI paths are written but not
   run.
-- Split view (`Ctrl-b`) is not drawn.
 - Host terminals use vt100, not alacritty, and OSC 10/11 defaults are not taken
   from the theme (D4).
 - The context menu shows keycaps as trailing text, not aligned columns; the tab

@@ -1496,6 +1496,78 @@ impl<'a> AppHost<'a> {
             .active()
     }
 
+    /// One named terminal of Agent Tab `tab_id` in project `project` — its
+    /// agent ([`TerminalRef::Primary`](crate::view::TerminalRef)) or child `i`
+    /// — whichever of them is focused. What a front-end drawing a tab's
+    /// terminals side by side (split view) reads each pane from. `None` for an
+    /// unknown project, tab or child, or before that process is spawned.
+    /// Read-only, like [`AppHost::tab_terminal`].
+    pub fn tab_terminal_at(
+        &self,
+        project: usize,
+        tab_id: &str,
+        target: crate::view::TerminalRef,
+    ) -> Option<&crate::terminal::session::Terminal> {
+        let session = &self
+            .workspace
+            .projects
+            .get(project)?
+            .state
+            .tabs
+            .iter()
+            .find(|t| t.meta.id == tab_id)?
+            .session;
+        match target {
+            crate::view::TerminalRef::Primary => session.primary(),
+            crate::view::TerminalRef::Child(i) => session.child(i),
+        }
+    }
+
+    /// Size one terminal of an Agent Tab: the front-end-neutral form of what
+    /// the TUI's `sync_terminal_sizes` does for split view, where each of the
+    /// tab's terminals gets its own column's size rather than the one viewport
+    /// [`AppHost::resize_projects`] gives every session. Only the front-end
+    /// knows those sizes (it measures its own panes), so it hands them over
+    /// one terminal at a time.
+    ///
+    /// Resizes the grid and the PTY only when the size differs from the
+    /// grid's (after the parser's minimum, [`MIN_GRID_ROWS`] ×
+    /// [`MIN_GRID_COLS`]), so calling it every turn is cheap and never sends
+    /// a program a spurious SIGWINCH. Returns whether it resized; `false` too
+    /// for an unknown project, tab or child, or an unspawned terminal.
+    ///
+    /// [`MIN_GRID_ROWS`]: crate::terminal::session::MIN_GRID_ROWS
+    /// [`MIN_GRID_COLS`]: crate::terminal::session::MIN_GRID_COLS
+    pub fn resize_terminal(
+        &mut self,
+        project: usize,
+        tab_id: &str,
+        target: crate::view::TerminalRef,
+        size: PtySize,
+    ) -> bool {
+        use crate::terminal::session::{MIN_GRID_COLS, MIN_GRID_ROWS};
+        let Some(tab) = self
+            .workspace
+            .projects
+            .get_mut(project)
+            .and_then(|p| p.state.tabs.iter_mut().find(|t| t.meta.id == tab_id))
+        else {
+            return false;
+        };
+        let terminal = match target {
+            crate::view::TerminalRef::Primary => tab.session.primary_mut(),
+            crate::view::TerminalRef::Child(i) => tab.session.child_mut(i),
+        };
+        let Some(terminal) = terminal else {
+            return false;
+        };
+        let want = (size.rows.max(MIN_GRID_ROWS), size.cols.max(MIN_GRID_COLS));
+        if terminal.screen().size() == want {
+            return false;
+        }
+        terminal.resize(size).is_ok()
+    }
+
     /// Start a git-status refresh of project `index` now, on its background
     /// worker (the answer lands in a later [`AppHost::pump`]). A no-op while
     /// one is already in flight, or for an unknown index.

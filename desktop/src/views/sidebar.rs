@@ -541,7 +541,7 @@ fn terminal_rows(
 
 /// The command a terminal runs, as its short name (`/usr/local/bin/claude
 /// --resume` → `claude`).
-fn command_hint(title: &str) -> String {
+pub fn command_hint(title: &str) -> String {
     let first = title.split_whitespace().next().unwrap_or("");
     first
         .rsplit(['/', '\\'])

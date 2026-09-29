@@ -2,22 +2,14 @@
 //!
 //! A status is never colour alone: each has its own shape (see
 //! [`crate::assets`]), and the working arc spins, so "busy" reads without any
-//! colour vision at all.
-
-use std::time::Duration;
+//! colour vision at all. How it spins, cheaply, is [`crate::views::spinner`].
 
 use flightdeck::view::{AgentBadge, ProjectStatus};
-use gpui::{
-    div, percentage, px, svg, Animation, AnimationExt, AnyElement, ElementId, IntoElement,
-    ParentElement, Pixels, Styled, Transformation,
-};
+use gpui::{div, px, svg, AnyElement, ElementId, IntoElement, ParentElement, Pixels, Styled};
 
 use crate::assets::icon;
 use crate::fonts::MONO_FAMILY;
 use crate::theme::{Hex, Palette};
-
-/// One full turn of the working arc.
-const SPIN: Duration = Duration::from_millis(1100);
 
 /// An icon from the embedded set, tinted `colour`.
 pub fn icon(path: &'static str, size: Pixels, colour: Hex) -> gpui::Svg {
@@ -28,14 +20,11 @@ pub fn icon(path: &'static str, size: Pixels, colour: Hex) -> gpui::Svg {
         .text_color(colour.hsla())
 }
 
-/// The working arc, spinning. `id` must be unique among its siblings (it keys
-/// the animation's state).
+/// The working arc, turning in steps with the app's spinner clock
+/// ([`crate::views::spinner`]). `id` must be unique among its siblings (it
+/// keys the arc's own entity).
 pub fn spinner(id: impl Into<ElementId>, size: Pixels, colour: Hex) -> AnyElement {
-    icon(icon::STATUS_WORKING, size, colour)
-        .with_animation(id, Animation::new(SPIN).repeat(), |svg, delta| {
-            svg.with_transformation(Transformation::rotate(percentage(delta)))
-        })
-        .into_any_element()
+    crate::views::spinner::spinner(id, size, colour).into_any_element()
 }
 
 /// An agent's status glyph: arc (working, spinning), filled triangle

@@ -68,6 +68,8 @@ use gpui::{Context, Task};
 
 use crate::notify::{self, AttentionState};
 use crate::terminal::cadence::Cadence;
+use crate::views::split::{PaneSizes, SplitLayout};
+use flightdeck::view::TerminalRef;
 
 /// How often the host turns while output flows: its turn services every
 /// project, and output anywhere keeps it active, so it runs at the display's
@@ -141,6 +143,9 @@ pub struct HostModel {
     pending_viewport: Option<PtySize>,
     /// The size every project's terminals were last resized to.
     viewport: Option<PtySize>,
+    /// Split view: the size each of the selected agent's terminals measured
+    /// in its own pane, applied on the next turn ([`HostModel::set_pane_size`]).
+    pane_sizes: PaneSizes,
     /// When the last redraw was asked for, for [`SAFETY_REDRAW`].
     last_redraw: Instant,
     /// When the time-derived display was last checked, and what it read.
@@ -169,6 +174,7 @@ impl HostModel {
             shutdown: None,
             pending_viewport: None,
             viewport: None,
+            pane_sizes: PaneSizes::default(),
             last_redraw: Instant::now(),
             last_clock_check: Instant::now(),
             clock_signature: 0,
@@ -256,6 +262,7 @@ impl HostModel {
                 self.host.resize_projects(|_| size);
             }
         }
+        self.sync_terminal_sizes();
         let changed = self.host.tick();
         let now = Instant::now();
         if changed {
@@ -315,10 +322,74 @@ impl HostModel {
         }
     }
 
-    /// Ask for every project's terminals to be `size` (applied next turn).
+    /// The terminal element measured `size`: every project's terminals are
+    /// to be that size (applied next turn). In split view the element sits in
+    /// the active terminal's pane, so the size is that pane's alone
+    /// ([`HostModel::set_pane_size`]) and the viewport stays as it was.
     pub fn set_viewport(&mut self, size: PtySize) {
+        if let Some(layout) = SplitLayout::read(&self.host) {
+            let (project, tab_id, active) = (layout.project, layout.tab_id.clone(), layout.active);
+            self.set_pane_size(project, &tab_id, active, size);
+            return;
+        }
         if self.viewport != Some(size) {
             self.pending_viewport = Some(size);
+        }
+    }
+
+    /// Split view: the pane showing `target` of Agent Tab `tab_id` in
+    /// `project` measured `size`. Applied to that terminal alone on the next
+    /// turn; ignored when that tab is not the one split view shows (a pane
+    /// racing a tab switch).
+    pub fn set_pane_size(
+        &mut self,
+        project: usize,
+        tab_id: &str,
+        target: TerminalRef,
+        size: PtySize,
+    ) {
+        let Some(layout) = SplitLayout::read(&self.host) else {
+            return;
+        };
+        if layout.project != project || layout.tab_id != tab_id {
+            return;
+        }
+        self.pane_sizes.record(&layout.key(), target, size);
+    }
+
+    /// The TUI's `sync_terminal_sizes`, per turn: in split view each of the
+    /// selected agent's terminals gets the size its pane measured; otherwise
+    /// every terminal of the selected agent gets the viewport (which also
+    /// undoes the column sizes when split view is turned off). Only the
+    /// selected agent is on screen, so only it is synced; another agent left
+    /// in split view gets the viewport when the window next resizes, and its
+    /// own pane sizes when it is selected again. Each resize happens only
+    /// when the size differs ([`AppHost::resize_terminal`]).
+    fn sync_terminal_sizes(&mut self) {
+        match SplitLayout::read(&self.host) {
+            Some(layout) => {
+                let sizes: Vec<_> = self.pane_sizes.for_key(&layout.key()).collect();
+                for (target, size) in sizes {
+                    self.host
+                        .resize_terminal(layout.project, &layout.tab_id, target, size);
+                }
+            }
+            None => {
+                let Some(size) = self.viewport else {
+                    return;
+                };
+                let project = self.host.active_project_index();
+                let Some(tab) = self.host.active_state().selected() else {
+                    return;
+                };
+                let tab_id = tab.meta.id.clone();
+                let children = tab.session.child_count();
+                let targets = std::iter::once(TerminalRef::Primary)
+                    .chain((0..children).map(TerminalRef::Child));
+                for target in targets {
+                    self.host.resize_terminal(project, &tab_id, target, size);
+                }
+            }
         }
     }
 
