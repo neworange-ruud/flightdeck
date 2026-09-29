@@ -12,6 +12,7 @@ pub mod input;
 pub mod layout;
 pub mod mode_style;
 pub mod opener;
+pub(crate) mod overlay_bridge;
 pub mod palette;
 pub mod platform;
 pub mod render;

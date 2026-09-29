@@ -2624,11 +2624,18 @@ fn map_web_access_key(key: KeyEvent) -> Option<crate::web::access::AccessKey> {
 /// code that expired. The two it cannot perform (rebinding, stopping) are left
 /// as flags, because the listener is not this function's to touch.
 fn handle_web_access_key(key: KeyEvent, ui: &mut Ui) {
+    if let Some(access_key) = map_web_access_key(key) {
+        apply_web_access_key(access_key, ui);
+    }
+}
+
+/// The access overlay's half of [`handle_web_access_key`], in the overlay's own
+/// key alphabet — so a front-end that has no terminal key events (the host's
+/// `OverlayInput::WebAccess`) drives exactly the same mint/reveal/rebind/revoke
+/// logic the TUI's keyboard does.
+fn apply_web_access_key(access_key: crate::web::access::AccessKey, ui: &mut Ui) {
     use crate::web::access::AccessOutcome;
 
-    let Some(access_key) = map_web_access_key(key) else {
-        return;
-    };
     let Some(credentials) = ui.web_credentials.clone() else {
         // The server went away underneath the overlay; there is nothing left to
         // describe, so it goes with it rather than answering keys about a
@@ -3778,11 +3785,16 @@ const MOUSE_WHEEL_DOWN: u8 = 65;
 ///   one project (SPECS §32). The flows refuse independently; this is
 ///   presentation only.
 fn open_palette(isolated: bool, ui: &mut Ui) {
+    ui.palette = Some(gated_palette(isolated, ui));
+}
+
+/// A fresh palette gated by the current pairing, web and isolation state.
+fn gated_palette(isolated: bool, ui: &Ui) -> CommandPalette {
     let mut palette = CommandPalette::new();
     palette.set_paired(ui.remote_paired);
     palette.set_web_running(ui.web_running);
     palette.set_isolated(isolated);
-    ui.palette = Some(palette);
+    palette
 }
 
 /// Handle a mouse event (SPECS §20, §22 — keyboard-first, but mouse-assisted):
@@ -4695,54 +4707,88 @@ fn handle_key(key: KeyEvent, workspace: &mut Workspace, env: &Env, ui: &mut Ui) 
         .config
         .ui
         .use_f2_to_leave_terminal_focus;
-    match map_key_with_f2(mode, key, use_f2) {
-        KeyAction::Dispatch(cmd) => {
+    // Every action the key map resolves to that has a front-end-neutral
+    // spelling goes through `apply_host_event`, the body of `AppHost::handle`,
+    // so a key and a GUI click cannot drift on what the action means.
+    let event = match map_key_with_f2(mode, key, use_f2) {
+        KeyAction::Dispatch(cmd) => HostEvent::Command(cmd),
+        KeyAction::SwitchProject(sel) => HostEvent::SwitchProject(sel),
+        KeyAction::Passthrough(bytes) => HostEvent::TerminalInput(bytes),
+        KeyAction::OpenPalette => HostEvent::OpenPalette,
+        KeyAction::OpenHelp => HostEvent::OpenHelp,
+        KeyAction::FocusApp => HostEvent::FocusApp,
+        KeyAction::FocusTerminal => HostEvent::FocusTerminal,
+        // The TUI's paste key reads the system clipboard itself (and may paste
+        // an image path); `HostEvent::Paste` carries text a front-end already
+        // read. Same lock, different source, so it stays here.
+        KeyAction::Paste => {
+            if desktop_may_type(ui, env.clock.now_millis() as i64) {
+                paste_into_active_pty(&mut workspace.active_project_mut().state);
+            }
+            return Ok(false);
+        }
+        // The event loop quits on this return value rather than on
+        // `Ui::should_quit`, so it is answered here.
+        KeyAction::Quit => return Ok(true),
+        KeyAction::None => return Ok(false),
+    };
+    apply_host_event(event, workspace, env, ui)?;
+    Ok(false)
+}
+
+/// Apply one front-end-neutral input: the body of [`AppHost::handle`], and what
+/// [`handle_key`] resolves its key map's actions into. One arm per meaning, so
+/// the TUI and any other front-end reach every effect through the same helper.
+fn apply_host_event(
+    event: HostEvent,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    match event {
+        HostEvent::Command(cmd) => {
             let active = workspace.active;
             let p = &mut workspace.projects[active];
             let services = env.services(&p.git);
             dispatch_command(cmd, &mut p.state, &services, ui)?;
-            Ok(false)
         }
         // Project switching is workspace-level, not an AppState command.
-        KeyAction::SwitchProject(sel) => {
-            switch_project(workspace, env, sel, ui);
-            Ok(false)
-        }
+        HostEvent::SwitchProject(sel) => switch_project(workspace, env, sel, ui),
         // D14 as revised: every byte the desktop aims at a PTY claims the input
         // lock first, on exactly the terms a browser's does. Refused means the
         // bytes are dropped — never queued for later, which would splice them
         // into the middle of whatever the other writer typed — and the status
         // bar names the holder, so nothing disappears without a trace (§5.1).
-        KeyAction::Passthrough(bytes) => {
+        HostEvent::TerminalInput(bytes) => {
             if desktop_may_type(ui, env.clock.now_millis() as i64) {
                 write_active_pty(&mut workspace.active_project_mut().state, &bytes);
             }
-            Ok(false)
         }
-        KeyAction::Paste => {
-            if desktop_may_type(ui, env.clock.now_millis() as i64) {
-                paste_into_active_pty(&mut workspace.active_project_mut().state);
-            }
-            Ok(false)
+        HostEvent::Paste(data) => handle_paste(data, workspace, env, ui)?,
+        HostEvent::Resize(size) => resize_workspace(workspace, |_| size),
+        HostEvent::FocusApp => workspace.active_project_mut().state.focus_app(),
+        HostEvent::FocusTerminal => workspace.active_project_mut().state.focus_terminal(),
+        HostEvent::Quit => ui.should_quit = true,
+        HostEvent::OpenPalette => open_palette(workspace.active_project().state.isolated, ui),
+        HostEvent::OpenHelp => ui.overlay = UiOverlay::Help,
+        HostEvent::RunPaletteAction(action) => {
+            run_offered_palette_action(action, workspace, env, ui)?
         }
-        KeyAction::OpenPalette => {
-            open_palette(workspace.active_project().state.isolated, ui);
-            Ok(false)
+        HostEvent::Overlay(input) => {
+            crate::tui::overlay_bridge::apply_overlay_input(input, workspace, env, ui)?
         }
-        KeyAction::OpenHelp => {
-            ui.overlay = UiOverlay::Help;
-            Ok(false)
-        }
-        KeyAction::FocusApp => {
-            workspace.active_project_mut().state.focus_app();
-            Ok(false)
-        }
-        KeyAction::FocusTerminal => {
-            workspace.active_project_mut().state.focus_terminal();
-            Ok(false)
-        }
-        KeyAction::Quit => Ok(true),
-        KeyAction::None => Ok(false),
+    }
+    Ok(())
+}
+
+/// Resize every project's sessions — not only the active one — so a background
+/// agent's output wraps correctly the moment the user switches back to it.
+/// `viewport` maps a project's state to its PTY viewport size.
+fn resize_workspace(workspace: &mut Workspace, viewport: impl Fn(&AppState) -> PtySize) {
+    for p in workspace.projects.iter_mut() {
+        let size = viewport(&p.state);
+        p.state.set_pty_size(size);
+        resize_sessions(&mut p.state, size);
     }
 }
 
@@ -5144,21 +5190,15 @@ fn apply_web_configuration(
 
     let mut cm = build_config_manager(workspace, env);
     for ConfigChange { scope, key, value } in &request.changes {
-        cm.set_scope(match scope {
+        let scope = match scope {
             ConfigScopeName::Global => ConfigScope::Global,
             ConfigScopeName::Project => ConfigScope::Project,
+        };
+        let value = value.as_ref().map(|value| match value {
+            ConfigValue::Bool(b) => FieldValue::Bool(*b),
+            ConfigValue::Text(t) => FieldValue::Text(t.clone()),
         });
-        if !cm.select_key(key) {
-            return Err(format!(
-                "`{key}` is not a setting this FlightDeck's configuration manager has. \
-                 Nothing has been saved."
-            ));
-        }
-        match value {
-            None => cm.clear_selected(),
-            Some(ConfigValue::Bool(b)) => cm.set_selected(FieldValue::Bool(*b))?,
-            Some(ConfigValue::Text(t)) => cm.set_selected(FieldValue::Text(t.clone()))?,
-        }
+        stage_config_change(&mut cm, scope, key, value)?;
     }
 
     let detail = if cm.dirty() {
@@ -5173,6 +5213,35 @@ fn apply_web_configuration(
         None
     };
     Ok((web_config_view(&mut cm), detail))
+}
+
+/// Stage one named edit on a configuration manager: move to `scope`, select the
+/// row whose `section.key` is `key`, and set (`Some`) or clear (`None`) it
+/// through the manager's own mutators. Nothing is written.
+///
+/// The one door both named-edit surfaces go through — a browser's staged save
+/// and the host's `OverlayInput::ConfigSet` — so a key this build lacks and a
+/// value a field does not admit are refused in the same words on both.
+fn stage_config_change(
+    cm: &mut ConfigManager,
+    scope: crate::tui::config_manager::ConfigScope,
+    key: &str,
+    value: Option<crate::tui::config_manager::FieldValue>,
+) -> std::result::Result<(), String> {
+    cm.set_scope(scope);
+    if !cm.select_key(key) {
+        return Err(format!(
+            "`{key}` is not a setting this FlightDeck's configuration manager has. \
+             Nothing has been saved."
+        ));
+    }
+    match value {
+        None => {
+            cm.clear_selected();
+            Ok(())
+        }
+        Some(value) => cm.set_selected(value),
+    }
 }
 
 /// One built manager, read out for the wire: both scopes, in the order the
@@ -6695,10 +6764,10 @@ fn handle_palette_key(
         KeyCode::Right => palette.select_right(),
         KeyCode::Backspace => palette.pop_char(),
         KeyCode::Enter => {
-            let action = palette.selected_action().cloned();
-            ui.palette = None;
-            if let Some(action) = action {
-                run_palette_action(action, workspace, env, ui)?;
+            if let Some(action) = palette.selected_action().cloned() {
+                confirm_palette_action(action, workspace, env, ui)?;
+            } else {
+                ui.palette = None;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -6707,6 +6776,47 @@ fn handle_palette_key(
         _ => {}
     }
     Ok(())
+}
+
+/// The palette's Enter on one row: close the palette, then run the row. Shared
+/// by the keyboard and the host's `OverlayInput::PaletteRun`.
+fn confirm_palette_action(
+    action: PaletteAction,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    ui.palette = None;
+    run_palette_action(action, workspace, env, ui)
+}
+
+/// Run a palette row with no palette open (a front-end's menu item), gated by
+/// exactly what the palette would offer right now — so an isolated run cannot
+/// reach `Open Project` this way either, and `Unpair Phone` needs a pairing.
+fn run_offered_palette_action(
+    action: PaletteAction,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+) -> Result<()> {
+    let offered = gated_palette(workspace.active_project().state.isolated, ui);
+    if !palette_offers(&offered, &action) {
+        return Err(FlightDeckError::Refused(
+            "That command is not offered in the current state.".to_string(),
+        ));
+    }
+    run_palette_action(action, workspace, env, ui)
+}
+
+/// Whether `palette` offers `action` in its current state, whatever is typed
+/// into its filter.
+fn palette_offers(palette: &CommandPalette, action: &PaletteAction) -> bool {
+    let mut unfiltered = palette.clone();
+    unfiltered.clear_filter();
+    unfiltered
+        .filtered()
+        .iter()
+        .any(|entry| &entry.action == action)
 }
 
 /// Convert a confirmed [`PaletteAction`] into a command (possibly opening a
@@ -7089,14 +7199,7 @@ fn web_dialog_view(
                 selected: item.selected,
             })
             .collect(),
-        list_filter: matches!(
-            &open.prompt,
-            Prompt::ChangeProjectBase { .. }
-                | Prompt::NewAgentForm {
-                    use_existing_branch: true,
-                    ..
-                }
-        ),
+        list_filter: dialog_list_filters(&open.prompt),
         buttons: open
             .dialog
             .buttons
@@ -7123,6 +7226,21 @@ fn web_dialog_view(
         // degrades to "no body" instead of taking the event loop with it.
         body: serde_json::to_value(&body).ok(),
     })
+}
+
+/// Whether a prompt's text field filters its list rather than naming
+/// something new: the branch pickers. One rule for every surface that reads a
+/// dialog out (the browser's `DialogBody::list_filter`, the host's
+/// `DialogView::list_filter`).
+fn dialog_list_filters(prompt: &Prompt) -> bool {
+    matches!(
+        prompt,
+        Prompt::ChangeProjectBase { .. }
+            | Prompt::NewAgentForm {
+                use_existing_branch: true,
+                ..
+            }
+    )
 }
 
 /// The wire `kind` for one prompt (D13). Stable strings: the browser switches on
@@ -7806,17 +7924,26 @@ fn handle_config_key(
             save_config_manager(workspace, env, ui)?;
         }
         KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(path) = cm.current_path() {
-                ui.pending_editor = Some((workspace.active, path));
-                ui.config = None;
-            } else {
-                ui.config = None;
-                ui.message("No global config to edit (no home directory).");
-            }
+            config_edit_raw(workspace, ui);
         }
         _ => {}
     }
     Ok(())
+}
+
+/// The configuration manager's `e`: close it and ask the front-end to open the
+/// shown scope's file in `$EDITOR` (it owns the screen it must hand over).
+fn config_edit_raw(workspace: &Workspace, ui: &mut Ui) {
+    let Some(cm) = ui.config.as_ref() else {
+        return;
+    };
+    if let Some(path) = cm.current_path() {
+        ui.pending_editor = Some((workspace.active, path));
+        ui.config = None;
+    } else {
+        ui.config = None;
+        ui.message("No global config to edit (no home directory).");
+    }
 }
 
 /// Write the configuration manager's dirty scopes to disk, then reload the

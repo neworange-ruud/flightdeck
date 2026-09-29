@@ -16,6 +16,12 @@
 //! mapping keys and mouse gestures, laying out panes (and so deciding PTY
 //! sizes), drawing, and suspending itself for `$EDITOR`.
 //!
+//! Every modal the TUI can show — confirmations, text prompts, choice lists,
+//! the palette, help, the configuration manager, the pairing and access
+//! overlays — is readable through [`AppHost::overlay`] as plain data
+//! ([`overlay`]) and answerable through [`HostEvent::Overlay`], routed into
+//! the same handlers the TUI's keys reach.
+//!
 //! Why a top-level module rather than `crate::app`: `app` is the headless
 //! per-project core that `web` and `remote` themselves build on. The host sits
 //! one layer *above* all three — it wires a whole workspace of `AppState`s to
@@ -43,17 +49,24 @@ use crate::remote::commands::{CommandLedger, PendingFirstTask};
 use crate::remote::pairing::{build_channel, PairingSession};
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::{
-    apply_update_notice, build_web_host_state, cleanup_isolated_run, desktop_may_type,
-    dispatch_command, drain_create_outcomes, drain_pty_output, drive_pairing_overlay, handle_paste,
-    isolated_status_dir, open_project, open_web_access_overlay, persist_quietly,
-    rebind_web_interface, record_web_transitions, refresh_web_access_overlay,
-    reload_all_projects_config, resize_sessions, resolve_dialog_outcomes, service_remote_commands,
-    spawn_finish_count, spawn_status_refresh, spawn_worktree_job, start_isolated_session,
-    start_remote, switch_project, terminate_all_sessions, update_check_enabled, web_dialog_view,
-    web_host_state_now, web_input_holder, web_started_message, write_active_pty, Env, RemoteSetup,
-    StatusMsg, Ui, WebSurface, Workspace, WorkspaceTerminals,
+    apply_host_event, apply_update_notice, build_web_host_state, cleanup_isolated_run,
+    drain_create_outcomes, drain_pty_output, drive_pairing_overlay, isolated_status_dir,
+    open_project, open_web_access_overlay, persist_quietly, rebind_web_interface,
+    record_web_transitions, refresh_web_access_overlay, reload_all_projects_config,
+    resize_workspace, resolve_dialog_outcomes, service_remote_commands, spawn_finish_count,
+    spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
+    terminate_all_sessions, update_check_enabled, web_dialog_view, web_host_state_now,
+    web_input_holder, web_started_message, Env, RemoteSetup, StatusMsg, Ui, WebSurface, Workspace,
+    WorkspaceTerminals,
 };
 use flightdeck_remote_protocol::ProjectId;
+
+pub mod overlay;
+pub use overlay::{
+    AgentChoice, ButtonRole, ConfigView, DialogButton, DialogKind, DialogRow, DialogView,
+    GitStatusView, HostNotices, MessageView, NewAgentForm, NewAgentTarget, OverlayInput,
+    OverlayKey, OverlayView, PairingView, PaletteRow, PaletteView, WebAccessOverlay,
+};
 
 #[cfg(test)]
 mod tests;
@@ -94,6 +107,18 @@ pub enum HostEvent {
     FocusTerminal,
     /// Ask the host to quit; see [`AppHost::should_quit`].
     Quit,
+    /// Open the command palette (the TUI's `Ctrl-p`); read it back through
+    /// [`AppHost::overlay`] and answer it with [`HostEvent::Overlay`].
+    OpenPalette,
+    /// Open the help overlay (the TUI's `F1`).
+    OpenHelp,
+    /// Run one palette row without the palette open — a front-end's menu item
+    /// for a workspace-level action (`Open Project`, `Open Configuration`,
+    /// `Pair Phone`, `Start Web Interface`, …) that no [`Command`] spells.
+    /// Refused unless the palette would offer that row right now.
+    RunPaletteAction(crate::tui::palette::PaletteAction),
+    /// Answer the overlay on screen (see [`AppHost::overlay`]).
+    Overlay(OverlayInput),
 }
 
 /// The UI-agnostic application host. See the module docs.
@@ -1049,31 +1074,17 @@ impl<'a> AppHost<'a> {
     /// Feed one front-end-neutral input. Hands off any worktree job the input
     /// queued before returning, so the caller need not call
     /// [`AppHost::after_input`] as well. Any handled input warrants a redraw.
+    ///
+    /// An `Err` is either a dispatch failure the TUI would also have hit, or an
+    /// [`OverlayInput`] that does not fit the overlay on screen (a button the
+    /// dialog does not show, a palette row it does not offer); the latter
+    /// changes nothing.
     pub fn handle(&mut self, event: HostEvent) -> Result<()> {
-        let env = &self.env;
-        let workspace = &mut self.workspace;
-        let ui = &mut self.ui;
-        match event {
-            HostEvent::Command(cmd) => {
-                let active = workspace.active;
-                let p = &mut workspace.projects[active];
-                let services = env.services(&p.git);
-                dispatch_command(cmd, &mut p.state, &services, ui)?;
-            }
-            HostEvent::SwitchProject(sel) => switch_project(workspace, env, sel, ui),
-            HostEvent::TerminalInput(bytes) => {
-                if desktop_may_type(ui, env.clock.now_millis() as i64) {
-                    write_active_pty(&mut workspace.active_project_mut().state, &bytes);
-                }
-            }
-            HostEvent::Paste(data) => handle_paste(data, workspace, env, ui)?,
-            HostEvent::Resize(size) => self.resize_projects(|_| size),
-            HostEvent::FocusApp => workspace.active_project_mut().state.focus_app(),
-            HostEvent::FocusTerminal => workspace.active_project_mut().state.focus_terminal(),
-            HostEvent::Quit => ui.should_quit = true,
-        }
+        // The same function the TUI's key map resolves into (`handle_key`), so
+        // the two front-ends share one meaning per action.
+        let result = apply_host_event(event, &mut self.workspace, &self.env, &mut self.ui);
         self.after_input();
-        Ok(())
+        result
     }
 
     /// Housekeeping after the front-end handled an input itself (its own key
@@ -1097,11 +1108,7 @@ impl<'a> AppHost<'a> {
     /// because only the front-end knows its chrome (sidebar, borders, collapsed
     /// bars) and that can differ per project and per input mode.
     pub fn resize_projects(&mut self, viewport: impl Fn(&AppState) -> PtySize) {
-        for p in self.workspace.projects.iter_mut() {
-            let size = viewport(&p.state);
-            p.state.set_pty_size(size);
-            resize_sessions(&mut p.state, size);
-        }
+        resize_workspace(&mut self.workspace, viewport);
     }
 
     /// Record every project's PTY size without resizing any live session —
@@ -1203,6 +1210,34 @@ impl<'a> AppHost<'a> {
     /// could be typing (D14 as revised); `None` means draw no chip.
     pub fn input_holder(&self) -> Option<&str> {
         self.ui.input_holder.as_deref()
+    }
+
+    /// The overlay on screen, if any, as plain data: the same prompt, palette,
+    /// configuration manager, help, pairing or access overlay the TUI would
+    /// draw this frame, in the order [`HostEvent::Overlay`] answers them.
+    ///
+    /// Live overlays (the pairing and access countdowns) are refreshed by
+    /// [`AppHost::pump`] and [`AppHost::publish`]; read this after them.
+    pub fn overlay(&self) -> Option<OverlayView> {
+        crate::tui::overlay_bridge::overlay_view(
+            &self.ui,
+            &self.workspace,
+            self.pairing_session.as_ref(),
+            &self.web_surface.credentials,
+        )
+    }
+
+    /// The non-modal hints the TUI keeps in its status bar (SPECS §30, §32).
+    pub fn notices(&self) -> HostNotices {
+        let state = self.active_state();
+        HostNotices {
+            update: state.update_available.as_ref().map(|latest| {
+                crate::web::protocol::UpdateNotice {
+                    latest_version: latest.clone(),
+                }
+            }),
+            isolated: state.isolated,
+        }
     }
 
     // -----------------------------------------------------------------------
