@@ -4,6 +4,12 @@
 //! and a [`crossterm::event::KeyEvent`] and returns a [`KeyAction`] describing
 //! what the wiring layer (T9) should do.
 //!
+//! This module owns no bindings. It lifts a crossterm event into the
+//! front-end-neutral [`Chord`] ([`chord_from_key_event`]), looks it up in the
+//! one keymap table ([`crate::app::keymap::Keymap`]) and, for an unbound chord
+//! in Terminal mode, encodes it with [`crate::app::keymap::encode_pty`]. Every
+//! binding, and the help screen that documents them, lives in that table.
+//!
 //! T9 integration note:
 //! - `KeyAction::Dispatch(cmd)` → call `AppState::dispatch(cmd, &services)`.
 //! - `KeyAction::Passthrough(bytes)` → write `bytes` to the active PTY.
@@ -17,7 +23,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::commands::{Command, Selector};
+use crate::app::keymap::{encode_pty, Action, Chord, Key, Keymap, Mods};
 use crate::app::modes::InputMode;
+#[cfg(test)]
 use crate::tui::platform;
 
 /// The result of mapping a key event (SPECS §23).
@@ -48,6 +56,21 @@ pub enum KeyAction {
     None,
 }
 
+impl From<Action> for KeyAction {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::Dispatch(cmd) => KeyAction::Dispatch(cmd),
+            Action::SwitchProject(sel) => KeyAction::SwitchProject(sel),
+            Action::Paste => KeyAction::Paste,
+            Action::OpenPalette => KeyAction::OpenPalette,
+            Action::OpenHelp => KeyAction::OpenHelp,
+            Action::FocusApp => KeyAction::FocusApp,
+            Action::FocusTerminal => KeyAction::FocusTerminal,
+            Action::Quit => KeyAction::Quit,
+        }
+    }
+}
+
 /// Map a key event to a [`KeyAction`] based on the current input mode (SPECS §23).
 ///
 /// In [`InputMode::Terminal`] most keys produce `Passthrough`; the global
@@ -61,210 +84,81 @@ pub fn map_key(mode: InputMode, key: KeyEvent) -> KeyAction {
 
 /// Map a key event with the optional F2 leave-focus binding enabled or disabled.
 pub fn map_key_with_f2(mode: InputMode, key: KeyEvent, use_f2: bool) -> KeyAction {
+    map_key_in(Keymap::for_this_platform(use_f2), mode, key)
+}
+
+/// Map a key event against an explicit keymap.
+fn map_key_in(keymap: &Keymap, mode: InputMode, key: KeyEvent) -> KeyAction {
+    let chord = chord_from_key_event(key);
+    if let Some(entry) = chord.and_then(|c| keymap.lookup(mode, c)) {
+        return entry.action.clone().into();
+    }
     match mode {
-        InputMode::Terminal => map_terminal_mode(key, use_f2),
-        InputMode::App => map_app_mode(key),
+        // Everything unbound passes through to the PTY — including bare Esc,
+        // which hosted agents use for their 2xEsc "abort prompt" gesture. A key
+        // with no chord encodes to nothing, as it always has.
+        InputMode::Terminal => KeyAction::Passthrough(chord.map(encode_pty).unwrap_or_default()),
+        // Unrecognised key in App mode: no-op.
+        InputMode::App => KeyAction::None,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Terminal Focus mode (SPECS §23)
-// ---------------------------------------------------------------------------
+/// Lift a crossterm key event into the front-end-neutral [`Chord`].
+///
+/// `None` for keys the keymap and the PTY encoder have no name for (Insert,
+/// media keys, bare modifiers, …): those match no binding and send no bytes.
+/// Shift+Tab stays [`Key::BackTab`], as crossterm reports it.
+pub fn chord_from_key_event(key: KeyEvent) -> Option<Chord> {
+    let code = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::F(n) => Key::F(n),
+        _ => return None,
+    };
+    Some(Chord::new(code, mods_from_crossterm(key.modifiers)))
+}
 
-fn map_terminal_mode(key: KeyEvent, use_f2: bool) -> KeyAction {
-    // Global intercepts work in both modes.
-    if let Some(global) = map_global(key) {
-        return global;
-    }
-    // Leave terminal focus (SPECS §23). Bare Esc must still reach the PTY for
-    // hosted-agent gestures, vim/readline cancel, fzf dismiss, etc. The default
-    // is Alt+Esc on macOS and Shift+Esc on Windows/Linux; users whose terminal
-    // cannot distinguish modified Esc can opt into the unambiguous F2 binding.
-    let modified_esc = key.code == KeyCode::Esc
-        && key.modifiers
-            == if platform::LEAVE_FOCUS_USES_SHIFT {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::ALT
-            };
-    if (use_f2 && key.code == KeyCode::F(2)) || (!use_f2 && modified_esc) {
-        return KeyAction::FocusApp;
-    }
-
-    // Bare Esc (and double-Esc) must pass through to the PTY so hosted agents
-    // like Claude Code / OpenCode can use their 2xEsc "abort prompt" gesture.
-    // Ctrl-V / Cmd-V on macOS: paste. The wiring layer gives local Codex CLI
-    // the literal key so it can read its native clipboard image; other agents,
-    // and containerized Codex, receive a temporary file path instead. With no
-    // image on the clipboard every agent falls back to Ctrl-V passthrough.
-    if is_paste_shortcut(key, platform::IS_MACOS) {
-        return KeyAction::Paste;
-    }
-    // Everything else passes through to the PTY.
-    KeyAction::Passthrough(encode_key(key))
+/// crossterm's modifier set as [`Mods`], all six bits.
+fn mods_from_crossterm(m: KeyModifiers) -> Mods {
+    [
+        (KeyModifiers::SHIFT, Mods::SHIFT),
+        (KeyModifiers::CONTROL, Mods::CTRL),
+        (KeyModifiers::ALT, Mods::ALT),
+        (KeyModifiers::SUPER, Mods::SUPER),
+        (KeyModifiers::HYPER, Mods::HYPER),
+        (KeyModifiers::META, Mods::META),
+    ]
+    .into_iter()
+    .filter(|(ct, _)| m.contains(*ct))
+    .fold(Mods::NONE, |acc, (_, ours)| acc | ours)
 }
 
 /// Whether a terminal-focused key event is FlightDeck's image-aware paste
 /// shortcut. macOS terminals that report Command as `SUPER` get Command-V;
-/// all platforms retain Ctrl-V.
+/// all platforms retain Ctrl-V. Answered by the keymap table.
+#[cfg(test)]
 fn is_paste_shortcut(key: KeyEvent, is_macos: bool) -> bool {
-    if key.code != KeyCode::Char('v') || key.modifiers.contains(KeyModifiers::ALT) {
-        return false;
-    }
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        || (is_macos
-            && key.modifiers.contains(KeyModifiers::SUPER)
-            && !key.modifiers.contains(KeyModifiers::CONTROL))
-}
-
-// ---------------------------------------------------------------------------
-// App Command mode (SPECS §23)
-// ---------------------------------------------------------------------------
-
-fn map_app_mode(key: KeyEvent) -> KeyAction {
-    // Global intercepts.
-    if let Some(global) = map_global(key) {
-        return global;
-    }
-
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let no_mod = key.modifiers.is_empty();
-
-    match key.code {
-        // --- Focus -------------------------------------------------------
-        // Enter: focus terminal (SPECS §23).
-        KeyCode::Enter if no_mod => KeyAction::FocusTerminal,
-
-        // --- Global shortcuts (App mode, non-global) ---------------------
-        // Ctrl-n: New Agent Tab.
-        KeyCode::Char('n') if ctrl => KeyAction::Dispatch(Command::NewAgentTab {
-            name: String::new(), // T9 must prompt for name
-            agent_key: None,
-        }),
-        // Ctrl-p: Push Branch.
-        KeyCode::Char('p') if ctrl => KeyAction::Dispatch(Command::PushBranch { confirm: None }),
-        // Ctrl-f: Finish / Local Merge.
-        KeyCode::Char('f') if ctrl => {
-            KeyAction::Dispatch(Command::FinishLocalMerge { confirm: false })
-        }
-        // Ctrl-u: Pull base (git pull --rebase on the base folder).
-        KeyCode::Char('u') if ctrl => KeyAction::Dispatch(Command::PullBase),
-        // Ctrl-k: Close Agent Tab.
-        KeyCode::Char('k') if ctrl => KeyAction::Dispatch(Command::CloseAgentTab { action: None }),
-
-        // --- Agent Tab Navigation (SPECS §23) ----------------------------
-        // Bare Up/Down: previous / next Agent Tab. The Alt-modified variants are
-        // handled in `map_global` so they also work in Terminal mode; the bare
-        // arrows are an App-mode-only fallback because some terminals (e.g. Warp)
-        // capture Option/Alt+Up/Down themselves, and in App mode the bare arrows
-        // are otherwise unused.
-        KeyCode::Up if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
-        // Down: next Agent Tab.
-        KeyCode::Down if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
-
-        // --- Child Terminal Navigation (SPECS §23) -----------------------
-        // Ctrl-t: New child terminal.
-        KeyCode::Char('t') if ctrl => KeyAction::Dispatch(Command::NewChildTerminal),
-        // Ctrl-w: Close active child terminal.
-        KeyCode::Char('w') if ctrl => KeyAction::Dispatch(Command::CloseChildTerminal),
-        // Bare Left/Right: previous / next terminal tab (cycles agent + shells).
-        // Alt-Left/Right are handled in `map_global` for Terminal mode.
-        KeyCode::Left if no_mod => {
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
-        }
-        // Right: next terminal tab (cycles agent + shells).
-        KeyCode::Right if no_mod => {
-            KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
-        }
-
-        // --- Status (SPECS §23) ------------------------------------------
-        // Ctrl-s: Set manual status.
-        KeyCode::Char('s') if ctrl => {
-            KeyAction::Dispatch(Command::SetManualStatus(None)) // T9 prompts
-        }
-        // Ctrl-r: Restart primary agent.
-        KeyCode::Char('r') if ctrl => KeyAction::Dispatch(Command::RestartAgent),
-
-        // --- View (split layout) -----------------------------------------
-        // Ctrl-b: Toggle split view (terminals side by side vs. tabs).
-        KeyCode::Char('b') if ctrl => KeyAction::Dispatch(Command::ToggleSplitView),
-
-        // Unrecognised key in App mode: no-op.
-        _ => KeyAction::None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global shortcuts active in BOTH modes (SPECS §23)
-// ---------------------------------------------------------------------------
-
-fn map_global(key: KeyEvent) -> Option<KeyAction> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-    match key.code {
-        // Ctrl-g: Command palette (both modes).
-        KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
-        // Ctrl-q: Quit.
-        KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
-        // F1 / Alt-h: Help / keybindings (both modes). Global so help is
-        // reachable with a terminal focused, which is when a user actually
-        // reaches for it; the cost is that hosted agents never see bare F1 or
-        // Alt-h. Modified F1 and bare 'h' are left to the PTY.
-        //
-        // Alt-h exists because Apple keyboards reserve F1 as a media key
-        // (brightness) unless the user enables standard function keys, so on a
-        // Mac laptop F1 never reaches the terminal. Alt-h carries its own macOS
-        // caveat — Option+letter composes a special character unless "Use
-        // Option as Meta key" is on — but that is the same requirement Alt-o
-        // and Alt-1..9 already impose, so it adds no new configuration burden.
-        //
-        // Pressing the same key again while the overlay is open opens the
-        // FlightDeck repository; that lives in the overlay key handling
-        // (`handle_key`), not here, since this map has no view of the overlay.
-        KeyCode::F(1) if key.modifiers.is_empty() => Some(KeyAction::OpenHelp),
-        KeyCode::Char('h') if alt && !ctrl && !shift => Some(KeyAction::OpenHelp),
-
-        // --- Project navigation (multi-project) --------------------------
-        // Shift-Left / Shift-Right cycle the open projects. Global so they work
-        // while a terminal is focused too; distinct from the Alt/plain arrows
-        // that switch agent tabs and child terminals. (`alt` takes precedence
-        // when both are held, since those arms are matched first below.)
-        KeyCode::Left if shift && !alt && !ctrl => Some(KeyAction::SwitchProject(Selector::Prev)),
-        KeyCode::Right if shift && !alt && !ctrl => Some(KeyAction::SwitchProject(Selector::Next)),
-
-        // --- Agent + child-terminal navigation (SPECS §23) ---------------
-        // Alt-based navigation is global so it works while a terminal is
-        // focused (Terminal mode) as well as in App mode; otherwise these keys
-        // would be swallowed by the PTY passthrough and tabs would never switch.
-        // Alt-Up: previous Agent Tab.
-        KeyCode::Up if alt => Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev))),
-        // Alt-Down: next Agent Tab.
-        KeyCode::Down if alt => Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next))),
-        // Alt-Left: previous terminal tab (cycles agent + shells).
-        KeyCode::Left if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
-            Selector::Prev,
-        ))),
-        // Alt-Right: next terminal tab (cycles agent + shells).
-        KeyCode::Right if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
-            Selector::Next,
-        ))),
-        // Alt-1..Alt-9: jump to Agent Tab by index.
-        KeyCode::Char(c @ '1'..='9') if alt => {
-            let idx = (c as usize) - ('1' as usize);
-            Some(KeyAction::Dispatch(Command::SwitchAgentTab(
-                Selector::Index(idx),
-            )))
-        }
-        // Alt-o: open the selected worktree in the OS file manager. Global so it
-        // works with a terminal focused (the common case). Alt-O is not a
-        // standard readline/agent binding, so the PTY loses nothing.
-        KeyCode::Char('o') if alt && !ctrl && !shift => {
-            Some(KeyAction::Dispatch(Command::OpenWorktreeInFileManager))
-        }
-        _ => None,
-    }
+    use crate::app::keymap::KeymapOptions;
+    let keymap = Keymap::new(KeymapOptions {
+        command_v_pastes: is_macos,
+        ..KeymapOptions::for_this_platform(false)
+    });
+    chord_from_key_event(key)
+        .and_then(|c| keymap.lookup(InputMode::Terminal, c))
+        .is_some_and(|e| e.action == Action::Paste)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,68 +167,13 @@ fn map_global(key: KeyEvent) -> Option<KeyAction> {
 
 /// Encode a [`KeyEvent`] to the bytes that should be sent to the active PTY.
 ///
-/// This is a best-effort encoding of common keys to their VT100/ANSI byte
-/// sequences. The wiring layer (T9) should augment this with the full
-/// encoding table it uses for the portable-pty backend.
+/// A thin adapter over [`crate::app::keymap::encode_pty`], which owns the
+/// encoding (arrows always CSI, never SS3) so every front-end sends the same
+/// bytes. A key with no [`Chord`] encodes to nothing.
 pub fn encode_key(key: KeyEvent) -> Vec<u8> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-
-    match key.code {
-        KeyCode::Char(c) => {
-            let mut bytes = Vec::new();
-            if alt {
-                bytes.push(0x1b); // ESC prefix for Alt
-            }
-            if ctrl {
-                // Ctrl+letter → 0x01..0x1a
-                let b = c.to_ascii_uppercase() as u8;
-                if b.is_ascii_uppercase() {
-                    bytes.push(b - b'A' + 1);
-                } else {
-                    bytes.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
-                }
-            } else {
-                bytes.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
-            }
-            bytes
-        }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::Tab => vec![b'\t'],
-        // crossterm reports Shift+Tab as the dedicated `BackTab` variant (with
-        // SHIFT set), never as `Tab` + SHIFT, on Unix and Windows alike.
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::F(n) => {
-            // F1-F4 use SS3; F5+ use CSI ~ sequences.
-            match n {
-                1 => vec![0x1b, b'O', b'P'],
-                2 => vec![0x1b, b'O', b'Q'],
-                3 => vec![0x1b, b'O', b'R'],
-                4 => vec![0x1b, b'O', b'S'],
-                5 => vec![0x1b, b'[', b'1', b'5', b'~'],
-                6 => vec![0x1b, b'[', b'1', b'7', b'~'],
-                7 => vec![0x1b, b'[', b'1', b'8', b'~'],
-                8 => vec![0x1b, b'[', b'1', b'9', b'~'],
-                9 => vec![0x1b, b'[', b'2', b'0', b'~'],
-                10 => vec![0x1b, b'[', b'2', b'1', b'~'],
-                11 => vec![0x1b, b'[', b'2', b'3', b'~'],
-                12 => vec![0x1b, b'[', b'2', b'4', b'~'],
-                _ => vec![],
-            }
-        }
-        _ => vec![],
-    }
+    chord_from_key_event(key)
+        .map(encode_pty)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -912,5 +751,417 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert_eq!(encode_key(k), vec![0x1b, b'O', b'P']);
+    }
+}
+
+/// Behaviour-preservation proof for the keymap refactor (remote-control-bmej.2.2).
+///
+/// `legacy_*` below is the pre-refactor mapper and encoder, verbatim apart from
+/// the `legacy_` prefix. The tests drive both over every key code the old code
+/// named (and more) under every modifier combination, in both modes and both
+/// leave-focus settings, and require identical answers.
+#[cfg(test)]
+mod legacy_equivalence_tests {
+    use super::*;
+    use crate::app::keymap::KeymapOptions;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn legacy_map_key_with_f2(mode: InputMode, key: KeyEvent, use_f2: bool) -> KeyAction {
+        match mode {
+            InputMode::Terminal => legacy_map_terminal_mode(key, use_f2),
+            InputMode::App => legacy_map_app_mode(key),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Terminal Focus mode (SPECS §23)
+    // ---------------------------------------------------------------------------
+
+    fn legacy_map_terminal_mode(key: KeyEvent, use_f2: bool) -> KeyAction {
+        // Global intercepts work in both modes.
+        if let Some(global) = legacy_map_global(key) {
+            return global;
+        }
+        // Leave terminal focus (SPECS §23). Bare Esc must still reach the PTY for
+        // hosted-agent gestures, vim/readline cancel, fzf dismiss, etc. The default
+        // is Alt+Esc on macOS and Shift+Esc on Windows/Linux; users whose terminal
+        // cannot distinguish modified Esc can opt into the unambiguous F2 binding.
+        let modified_esc = key.code == KeyCode::Esc
+            && key.modifiers
+                == if platform::LEAVE_FOCUS_USES_SHIFT {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::ALT
+                };
+        if (use_f2 && key.code == KeyCode::F(2)) || (!use_f2 && modified_esc) {
+            return KeyAction::FocusApp;
+        }
+
+        // Bare Esc (and double-Esc) must pass through to the PTY so hosted agents
+        // like Claude Code / OpenCode can use their 2xEsc "abort prompt" gesture.
+        // Ctrl-V / Cmd-V on macOS: paste. The wiring layer gives local Codex CLI
+        // the literal key so it can read its native clipboard image; other agents,
+        // and containerized Codex, receive a temporary file path instead. With no
+        // image on the clipboard every agent falls back to Ctrl-V passthrough.
+        if legacy_is_paste_shortcut(key, platform::IS_MACOS) {
+            return KeyAction::Paste;
+        }
+        // Everything else passes through to the PTY.
+        KeyAction::Passthrough(legacy_encode_key(key))
+    }
+
+    /// Whether a terminal-focused key event is FlightDeck's image-aware paste
+    /// shortcut. macOS terminals that report Command as `SUPER` get Command-V;
+    /// all platforms retain Ctrl-V.
+    fn legacy_is_paste_shortcut(key: KeyEvent, is_macos: bool) -> bool {
+        if key.code != KeyCode::Char('v') || key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            || (is_macos
+                && key.modifiers.contains(KeyModifiers::SUPER)
+                && !key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    // ---------------------------------------------------------------------------
+    // App Command mode (SPECS §23)
+    // ---------------------------------------------------------------------------
+
+    fn legacy_map_app_mode(key: KeyEvent) -> KeyAction {
+        // Global intercepts.
+        if let Some(global) = legacy_map_global(key) {
+            return global;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let no_mod = key.modifiers.is_empty();
+
+        match key.code {
+            // --- Focus -------------------------------------------------------
+            // Enter: focus terminal (SPECS §23).
+            KeyCode::Enter if no_mod => KeyAction::FocusTerminal,
+
+            // --- Global shortcuts (App mode, non-global) ---------------------
+            // Ctrl-n: New Agent Tab.
+            KeyCode::Char('n') if ctrl => KeyAction::Dispatch(Command::NewAgentTab {
+                name: String::new(), // T9 must prompt for name
+                agent_key: None,
+            }),
+            // Ctrl-p: Push Branch.
+            KeyCode::Char('p') if ctrl => {
+                KeyAction::Dispatch(Command::PushBranch { confirm: None })
+            }
+            // Ctrl-f: Finish / Local Merge.
+            KeyCode::Char('f') if ctrl => {
+                KeyAction::Dispatch(Command::FinishLocalMerge { confirm: false })
+            }
+            // Ctrl-u: Pull base (git pull --rebase on the base folder).
+            KeyCode::Char('u') if ctrl => KeyAction::Dispatch(Command::PullBase),
+            // Ctrl-k: Close Agent Tab.
+            KeyCode::Char('k') if ctrl => {
+                KeyAction::Dispatch(Command::CloseAgentTab { action: None })
+            }
+
+            // --- Agent Tab Navigation (SPECS §23) ----------------------------
+            // Bare Up/Down: previous / next Agent Tab. The Alt-modified variants are
+            // handled in `legacy_map_global` so they also work in Terminal mode; the bare
+            // arrows are an App-mode-only fallback because some terminals (e.g. Warp)
+            // capture Option/Alt+Up/Down themselves, and in App mode the bare arrows
+            // are otherwise unused.
+            KeyCode::Up if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)),
+            // Down: next Agent Tab.
+            KeyCode::Down if no_mod => KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)),
+
+            // --- Child Terminal Navigation (SPECS §23) -----------------------
+            // Ctrl-t: New child terminal.
+            KeyCode::Char('t') if ctrl => KeyAction::Dispatch(Command::NewChildTerminal),
+            // Ctrl-w: Close active child terminal.
+            KeyCode::Char('w') if ctrl => KeyAction::Dispatch(Command::CloseChildTerminal),
+            // Bare Left/Right: previous / next terminal tab (cycles agent + shells).
+            // Alt-Left/Right are handled in `legacy_map_global` for Terminal mode.
+            KeyCode::Left if no_mod => {
+                KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Prev))
+            }
+            // Right: next terminal tab (cycles agent + shells).
+            KeyCode::Right if no_mod => {
+                KeyAction::Dispatch(Command::SwitchChildTerminal(Selector::Next))
+            }
+
+            // --- Status (SPECS §23) ------------------------------------------
+            // Ctrl-s: Set manual status.
+            KeyCode::Char('s') if ctrl => {
+                KeyAction::Dispatch(Command::SetManualStatus(None)) // T9 prompts
+            }
+            // Ctrl-r: Restart primary agent.
+            KeyCode::Char('r') if ctrl => KeyAction::Dispatch(Command::RestartAgent),
+
+            // --- View (split layout) -----------------------------------------
+            // Ctrl-b: Toggle split view (terminals side by side vs. tabs).
+            KeyCode::Char('b') if ctrl => KeyAction::Dispatch(Command::ToggleSplitView),
+
+            // Unrecognised key in App mode: no-op.
+            _ => KeyAction::None,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Global shortcuts active in BOTH modes (SPECS §23)
+    // ---------------------------------------------------------------------------
+
+    fn legacy_map_global(key: KeyEvent) -> Option<KeyAction> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        match key.code {
+            // Ctrl-g: Command palette (both modes).
+            KeyCode::Char('g') if ctrl => Some(KeyAction::OpenPalette),
+            // Ctrl-q: Quit.
+            KeyCode::Char('q') if ctrl => Some(KeyAction::Quit),
+            // F1 / Alt-h: Help / keybindings (both modes). Global so help is
+            // reachable with a terminal focused, which is when a user actually
+            // reaches for it; the cost is that hosted agents never see bare F1 or
+            // Alt-h. Modified F1 and bare 'h' are left to the PTY.
+            //
+            // Alt-h exists because Apple keyboards reserve F1 as a media key
+            // (brightness) unless the user enables standard function keys, so on a
+            // Mac laptop F1 never reaches the terminal. Alt-h carries its own macOS
+            // caveat — Option+letter composes a special character unless "Use
+            // Option as Meta key" is on — but that is the same requirement Alt-o
+            // and Alt-1..9 already impose, so it adds no new configuration burden.
+            //
+            // Pressing the same key again while the overlay is open opens the
+            // FlightDeck repository; that lives in the overlay key handling
+            // (`handle_key`), not here, since this map has no view of the overlay.
+            KeyCode::F(1) if key.modifiers.is_empty() => Some(KeyAction::OpenHelp),
+            KeyCode::Char('h') if alt && !ctrl && !shift => Some(KeyAction::OpenHelp),
+
+            // --- Project navigation (multi-project) --------------------------
+            // Shift-Left / Shift-Right cycle the open projects. Global so they work
+            // while a terminal is focused too; distinct from the Alt/plain arrows
+            // that switch agent tabs and child terminals. (`alt` takes precedence
+            // when both are held, since those arms are matched first below.)
+            KeyCode::Left if shift && !alt && !ctrl => {
+                Some(KeyAction::SwitchProject(Selector::Prev))
+            }
+            KeyCode::Right if shift && !alt && !ctrl => {
+                Some(KeyAction::SwitchProject(Selector::Next))
+            }
+
+            // --- Agent + child-terminal navigation (SPECS §23) ---------------
+            // Alt-based navigation is global so it works while a terminal is
+            // focused (Terminal mode) as well as in App mode; otherwise these keys
+            // would be swallowed by the PTY passthrough and tabs would never switch.
+            // Alt-Up: previous Agent Tab.
+            KeyCode::Up if alt => {
+                Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Prev)))
+            }
+            // Alt-Down: next Agent Tab.
+            KeyCode::Down if alt => {
+                Some(KeyAction::Dispatch(Command::SwitchAgentTab(Selector::Next)))
+            }
+            // Alt-Left: previous terminal tab (cycles agent + shells).
+            KeyCode::Left if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
+                Selector::Prev,
+            ))),
+            // Alt-Right: next terminal tab (cycles agent + shells).
+            KeyCode::Right if alt => Some(KeyAction::Dispatch(Command::SwitchChildTerminal(
+                Selector::Next,
+            ))),
+            // Alt-1..Alt-9: jump to Agent Tab by index.
+            KeyCode::Char(c @ '1'..='9') if alt => {
+                let idx = (c as usize) - ('1' as usize);
+                Some(KeyAction::Dispatch(Command::SwitchAgentTab(
+                    Selector::Index(idx),
+                )))
+            }
+            // Alt-o: open the selected worktree in the OS file manager. Global so it
+            // works with a terminal focused (the common case). Alt-O is not a
+            // standard readline/agent binding, so the PTY loses nothing.
+            KeyCode::Char('o') if alt && !ctrl && !shift => {
+                Some(KeyAction::Dispatch(Command::OpenWorktreeInFileManager))
+            }
+            _ => None,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Key-to-bytes encoding for PTY passthrough (Terminal mode)
+    // ---------------------------------------------------------------------------
+
+    /// Encode a [`KeyEvent`] to the bytes that should be sent to the active PTY.
+    ///
+    /// This is a best-effort encoding of common keys to their VT100/ANSI byte
+    /// sequences. The wiring layer (T9) should augment this with the full
+    /// encoding table it uses for the portable-pty backend.
+    fn legacy_encode_key(key: KeyEvent) -> Vec<u8> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Char(c) => {
+                let mut bytes = Vec::new();
+                if alt {
+                    bytes.push(0x1b); // ESC prefix for Alt
+                }
+                if ctrl {
+                    // Ctrl+letter → 0x01..0x1a
+                    let b = c.to_ascii_uppercase() as u8;
+                    if b.is_ascii_uppercase() {
+                        bytes.push(b - b'A' + 1);
+                    } else {
+                        bytes.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+                    }
+                } else {
+                    bytes.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+                }
+                bytes
+            }
+            KeyCode::Enter => vec![b'\r'],
+            KeyCode::Backspace => vec![0x7f],
+            KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+            KeyCode::Tab => vec![b'\t'],
+            // crossterm reports Shift+Tab as the dedicated `BackTab` variant (with
+            // SHIFT set), never as `Tab` + SHIFT, on Unix and Windows alike.
+            KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+            KeyCode::Esc => vec![0x1b],
+            KeyCode::Up => vec![0x1b, b'[', b'A'],
+            KeyCode::Down => vec![0x1b, b'[', b'B'],
+            KeyCode::Right => vec![0x1b, b'[', b'C'],
+            KeyCode::Left => vec![0x1b, b'[', b'D'],
+            KeyCode::Home => vec![0x1b, b'[', b'H'],
+            KeyCode::End => vec![0x1b, b'[', b'F'],
+            KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
+            KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
+            KeyCode::F(n) => {
+                // F1-F4 use SS3; F5+ use CSI ~ sequences.
+                match n {
+                    1 => vec![0x1b, b'O', b'P'],
+                    2 => vec![0x1b, b'O', b'Q'],
+                    3 => vec![0x1b, b'O', b'R'],
+                    4 => vec![0x1b, b'O', b'S'],
+                    5 => vec![0x1b, b'[', b'1', b'5', b'~'],
+                    6 => vec![0x1b, b'[', b'1', b'7', b'~'],
+                    7 => vec![0x1b, b'[', b'1', b'8', b'~'],
+                    8 => vec![0x1b, b'[', b'1', b'9', b'~'],
+                    9 => vec![0x1b, b'[', b'2', b'0', b'~'],
+                    10 => vec![0x1b, b'[', b'2', b'1', b'~'],
+                    11 => vec![0x1b, b'[', b'2', b'3', b'~'],
+                    12 => vec![0x1b, b'[', b'2', b'4', b'~'],
+                    _ => vec![],
+                }
+            }
+            _ => vec![],
+        }
+    }
+
+    fn codes() -> Vec<KeyCode> {
+        let mut codes = vec![
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Null,
+            KeyCode::CapsLock,
+        ];
+        codes.extend((0..=30).map(KeyCode::F));
+        codes.extend((0u8..0x80).map(|b| KeyCode::Char(char::from(b))));
+        // Non-ASCII, including one whose low byte is an ASCII capital ('Ł' is
+        // U+0141): the old Ctrl encoding truncates with `as u8`, and must
+        // still do so.
+        codes.extend(['é', 'Ł', 'ß', '中', '😀'].map(KeyCode::Char));
+        codes
+    }
+
+    fn all_modifiers() -> impl Iterator<Item = KeyModifiers> {
+        (0u8..64).map(KeyModifiers::from_bits_truncate)
+    }
+
+    #[test]
+    fn map_key_matches_the_pre_refactor_mapper_exhaustively() {
+        for use_f2 in [false, true] {
+            for mode in [InputMode::Terminal, InputMode::App] {
+                for code in codes() {
+                    for mods in all_modifiers() {
+                        let key = KeyEvent::new(code, mods);
+                        assert_eq!(
+                            map_key_with_f2(mode, key, use_f2),
+                            legacy_map_key_with_f2(mode, key, use_f2),
+                            "{mode:?} use_f2={use_f2} {key:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_key_matches_the_pre_refactor_encoder_exhaustively() {
+        for code in codes() {
+            for mods in all_modifiers() {
+                let key = KeyEvent::new(code, mods);
+                assert_eq!(encode_key(key), legacy_encode_key(key), "{key:?}");
+            }
+        }
+    }
+
+    /// The other platforms' tables too, not only this host's: the macOS
+    /// Command-V paste binding, checked from any OS.
+    #[test]
+    fn paste_matches_the_pre_refactor_predicate_on_every_platform() {
+        for is_macos in [false, true] {
+            let keymap = Keymap::new(KeymapOptions {
+                command_v_pastes: is_macos,
+                ..KeymapOptions::for_this_platform(false)
+            });
+            for code in codes() {
+                for mods in all_modifiers() {
+                    let key = KeyEvent::new(code, mods);
+                    let ours = chord_from_key_event(key)
+                        .and_then(|c| keymap.lookup(InputMode::Terminal, c))
+                        .is_some_and(|e| e.action == Action::Paste);
+                    let old =
+                        legacy_map_global(key).is_none() && legacy_is_paste_shortcut(key, is_macos);
+                    assert_eq!(ours, old, "macos={is_macos} {key:?}");
+                }
+            }
+        }
+    }
+
+    /// Leave-focus on the other platform family, checked from any OS: the
+    /// legacy code read the compile-time constant, so compare against a
+    /// restatement of its rule for the opposite value.
+    #[test]
+    fn leave_focus_matches_the_pre_refactor_rule_for_both_platform_families() {
+        for uses_shift in [false, true] {
+            let keymap = Keymap::new(KeymapOptions {
+                leave_focus_uses_shift: uses_shift,
+                ..KeymapOptions::for_this_platform(false)
+            });
+            for mods in all_modifiers() {
+                let key = KeyEvent::new(KeyCode::Esc, mods);
+                let want = mods
+                    == if uses_shift {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::ALT
+                    };
+                let got = chord_from_key_event(key)
+                    .and_then(|c| keymap.lookup(InputMode::Terminal, c))
+                    .is_some_and(|e| e.action == Action::FocusApp);
+                assert_eq!(got, want, "shift={uses_shift} {mods:?}");
+            }
+        }
     }
 }

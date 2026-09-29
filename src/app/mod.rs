@@ -7,5 +7,6 @@
 pub mod activity;
 pub mod commands;
 pub mod events;
+pub mod keymap;
 pub mod modes;
 pub mod state;
