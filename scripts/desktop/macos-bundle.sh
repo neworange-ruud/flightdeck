@@ -4,9 +4,13 @@
 #
 # Signing and notarization are opt-in through environment variables and are skipped
 # when unset, so an unsigned local build needs no secrets:
-#   APPLE_SIGNING_IDENTITY   e.g. "Developer ID Application: Name (TEAMID)"  -> codesign
-#   NOTARY_KEYCHAIN_PROFILE  a `xcrun notarytool store-credentials` profile    -> notarize
-#   or APPLE_ID + APPLE_TEAM_ID + APPLE_APP_PASSWORD                            -> notarize
+#   CODESIGN_IDENTITY        e.g. "Developer ID Application: Name (TEAMID)"  -> codesign
+#                            (same name as the TUI release's secret; the workflow
+#                            imports the certificate, see desktop/PACKAGING.md)
+# Notarization (needs a signed app), first match wins:
+#   APPLE_API_KEY_PATH + APPLE_API_KEY_ID + APPLE_API_ISSUER_ID   App Store Connect API key
+#   NOTARY_KEYCHAIN_PROFILE  a `xcrun notarytool store-credentials` profile
+#   APPLE_ID + APPLE_TEAM_ID + APPLE_APP_PASSWORD                  Apple ID, app-specific password
 # Other knobs:
 #   CARGO_FEATURES_FLAGS     default "" (keeps the crate's default runtime-shaders feature).
 #                            Set to "--no-default-features" on a machine with the Metal
@@ -80,13 +84,15 @@ PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 # --- optional codesign ------------------------------------------------------
-if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  echo "codesign: $APPLE_SIGNING_IDENTITY"
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+  echo "codesign: $CODESIGN_IDENTITY"
+  # No --deep: the bundle holds a single binary, so signing the .app signs it. Hardened
+  # runtime needs no entitlements (Metal/GPUI does not require any).
   codesign --force --options runtime --timestamp \
-    --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+    --sign "$CODESIGN_IDENTITY" "$APP"
   codesign --verify --strict --verbose=2 "$APP"
 else
-  echo "codesign: skipped (APPLE_SIGNING_IDENTITY unset)"
+  echo "codesign: skipped (CODESIGN_IDENTITY unset)"
 fi
 
 # Asset name is a contract with the self-updater (desktop/src/selfupdate/release.rs):
@@ -102,18 +108,20 @@ make_zip
 
 # --- optional notarization (needs a signed app) -----------------------------
 notary_args=()
-if [[ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
+if [[ -n "${APPLE_API_KEY_PATH:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+  notary_args=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
+elif [[ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
   notary_args=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
 elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
   notary_args=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
 fi
-if [[ ${#notary_args[@]} -gt 0 && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+if [[ ${#notary_args[@]} -gt 0 && -n "${CODESIGN_IDENTITY:-}" ]]; then
   echo "notarize: submitting $ZIP"
   xcrun notarytool submit "$ZIP" "${notary_args[@]}" --wait
   xcrun stapler staple "$APP"
   make_zip # re-zip so the archive carries the stapled ticket
 else
-  echo "notarize: skipped (needs APPLE_SIGNING_IDENTITY plus NOTARY_KEYCHAIN_PROFILE or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD)"
+  echo "notarize: skipped (needs CODESIGN_IDENTITY plus APPLE_API_KEY_*, NOTARY_KEYCHAIN_PROFILE or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD)"
 fi
 
 # <asset>.sha256 in `sha256sum` format ("<64 hex>  <name>"), made from inside $OUT so

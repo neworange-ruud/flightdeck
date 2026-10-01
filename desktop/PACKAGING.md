@@ -78,22 +78,54 @@ macOS x86_64 (`macos-15-intel`), Ubuntu x86_64 and Windows x86_64, then `publish
    version. It runs the packaging scripts, then
    `scripts/desktop/check-asset-names.sh --os <os> --version <v>`, then uploads the files.
 2. `publish` (the only job with `contents: write`) downloads all artifacts, creates the
-   GitHub Release for the tag if it does not exist (not a draft or pre-release; the updater
-   ignores both) and uploads everything with `gh release upload --clobber`, so a re-run
+   GitHub Release for the tag if it does not exist (a pre-release for 0.x; the updater
+   ignores drafts and pre-releases) and uploads everything with `gh release upload --clobber`, so a re-run
    replaces assets. `.msi`, `.deb` and `.rpm` are attached too but never fetched by the app.
 
 Not built: Linux aarch64 (the AppImage job downloads the x86_64 `linuxdeploy`) and Windows
 aarch64. The updater refuses, rather than guesses, on those machines.
 
 Signing is optional and gated on repository secrets; unset secrets are empty strings and
-the steps or script branches are skipped:
+the steps or script branches are skipped. The macOS secrets are the **same ones the TUI's
+cargo-dist release uses** (`release.yml`), so one Developer ID certificate serves both:
 
 | Secret | Effect |
 | --- | --- |
-| `APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD` | imports the Developer ID cert into a temporary keychain |
-| `APPLE_SIGNING_IDENTITY` | `macos-bundle.sh` codesigns (hardened runtime) |
-| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | notarizes and staples (needs the identity too) |
+| `CODESIGN_CERTIFICATE` (base64 `.p12`), `CODESIGN_CERTIFICATE_PASSWORD` | imports the Developer ID cert into a temporary keychain |
+| `CODESIGN_IDENTITY` | `macos-bundle.sh` codesigns the `.app` (hardened runtime, timestamped; no `--deep`, no entitlements needed) |
+| `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_P8_BASE64` | notarization with an App Store Connect API key (preferred): `xcrun notarytool submit --key --key-id --issuer` |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | notarization alternative with an Apple ID and app-specific password |
 | `WINDOWS_SIGN_PFX_BASE64`, `WINDOWS_SIGN_PFX_PASSWORD` | decoded to a temp `.pfx`; `windows-package.ps1` signs the MSI and the portable `.exe` |
+
+Notarization only runs when the app is signed and one complete credential set exists (API
+key first, then `NOTARY_KEYCHAIN_PROFILE` for local use, then Apple ID). It then staples
+the ticket and re-zips.
+
+**Tags and cargo-dist.** A `desktop-v0.1.0` tag also matches `release.yml`'s generic
+version pattern (`**[0-9]+.[0-9]+.[0-9]+*`). `release.yml` therefore has a hand-added
+negative pattern `'!desktop-v**'` after it in `on.push.tags`, and `dist-workspace.toml`
+sets `allow-dirty = ["ci"]` so `dist` does not reject the edited workflow. If cargo-dist
+is upgraded and `release.yml` regenerated, re-apply the exclusion.
+
+**Resilience.** `build-release` uses `fail-fast: false`. `publish` runs even if some legs
+failed (`if: always()`), uploads every artifact that exists, then fails the job so the
+incomplete release is visible. Re-running the failed legs and `publish` fills in the
+missing assets (`--clobber`). Versions `0.x` are created as **pre-releases**; the
+self-updater ignores pre-releases, so promote the release (edit it on GitHub) when it
+should be offered to users.
+
+#### First release checklist
+
+1. Set the secrets above (at minimum `CODESIGN_*`; they already exist for the TUI).
+2. Run `desktop.yml` manually (workflow_dispatch, no tag) and confirm `check` and
+   `package` pass on all three OSes; this is the first time Linux and Windows run.
+3. Bump `desktop/Cargo.toml` to the release version and merge.
+4. Tag the merge commit `desktop-v<x.y.z>` and push. Confirm only `Desktop` starts, not
+   `Release`.
+5. Check the release has the macOS zips and `.sha256` files at least; fix and re-run any
+   failed leg, then `publish`.
+6. Download the macOS zip, run `spctl -a -vv FlightDeck.app` and `codesign --verify --strict`.
+7. Promote from pre-release when ready, and add the Homebrew cask update.
 
 To cut a release: bump the version in `desktop/Cargo.toml`, merge, then create and push the
 tag `desktop-v<x.y.z>` on the merge commit.
@@ -123,10 +155,10 @@ from `TARGET`, else `uname -m`; `FlightDeck.app` at the zip root) and
 - Shaders: the script builds with the crate's default `runtime-shaders` feature, so
   the app compiles Metal shaders at each launch. On a machine with the Metal Toolchain
   ship precompiled ones: `CARGO_FEATURES_FLAGS=--no-default-features scripts/desktop/macos-bundle.sh`.
-- Signing (skipped when unset): `APPLE_SIGNING_IDENTITY` runs `codesign --options runtime`
+- Signing (skipped when unset): `CODESIGN_IDENTITY` runs `codesign --options runtime`
   (hardened runtime, timestamped). The app currently needs no entitlements file; add one
   if a feature requires it (the TUI's e2e entitlements are in `scripts/e2e/`).
-- Notarization (skipped unless signed **and** credentials are set): either
+- Notarization (skipped unless signed **and** credentials are set): an App Store Connect API key (`APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`), or
   `NOTARY_KEYCHAIN_PROFILE` (a `xcrun notarytool store-credentials` profile), or
   `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_PASSWORD`. The script submits the zip with
   `--wait`, staples the app and re-zips.

@@ -211,6 +211,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/desktop-v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     needs: check
     strategy:
+      # First release: one broken OS leg must not stop the others from publishing.
       fail-fast: false
       matrix:
         include:
@@ -223,9 +224,15 @@ jobs:
     env:
       # Optional signing material. Unset secrets expand to "", which the scripts and the
       # gated steps below treat as "skip signing".
-      APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      # The CODESIGN_* secrets are shared with the TUI's cargo-dist release (release.yml).
+      CODESIGN_CERTIFICATE: ${{ secrets.CODESIGN_CERTIFICATE }}
+      CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}
+      CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+      # Notarization (optional): App Store Connect API key (preferred) ...
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      # ... or an Apple ID with an app-specific password.
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -266,18 +273,24 @@ jobs:
       # Import the Developer ID certificate only when the secret is set; the bundle
       # script then signs (and notarizes if the notary credentials are set too).
       - name: Import Apple signing certificate
-        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        if: runner.os == 'macOS' && env.CODESIGN_CERTIFICATE != ''
         run: |
           keychain="$RUNNER_TEMP/release.keychain-db"
           keychain_password="$(uuidgen)"
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          echo "$CODESIGN_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CODESIGN_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           rm -f "$RUNNER_TEMP/cert.p12"
+      # Write the App Store Connect API key (.p8) to a temp file for notarytool.
+      - name: Decode notarization API key
+        if: runner.os == 'macOS' && env.APPLE_API_KEY_P8_BASE64 != ''
+        run: |
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
       - name: Bundle macOS app
         if: runner.os == 'macOS'
         run: scripts/desktop/macos-bundle.sh
@@ -337,15 +350,20 @@ jobs:
             target/desktop-dist/*.deb
             target/desktop-dist/*.rpm
 
+  # Runs even when some build-release legs failed, so a first release still ships
+  # whatever was built (e.g. macOS when the never-run Linux/Windows legs break). The
+  # job fails at the end, after uploading, so the gap is visible.
   publish:
     name: publish GitHub Release
     needs: build-release
+    if: ${{ always() && needs.build-release.result != 'skipped' && needs.build-release.result != 'cancelled' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
+      BUILD_RESULT: ${{ needs.build-release.result }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -358,10 +376,28 @@ jobs:
       - name: List assets
         run: ls -l dist
       # Create the release if it does not exist, then upload (re-runs replace assets).
-      # Not a draft or pre-release: the updater ignores both.
+      # 0.x versions are created as pre-releases. Note the self-updater ignores
+      # pre-releases and drafts, so edit the release to a full one once 1.0 ships or
+      # when a 0.x build should be offered to users.
       - name: Create release and upload assets
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "FlightDeck Desktop ${RELEASE_TAG#desktop-v}" --generate-notes
+            flags=()
+            if [[ "${RELEASE_TAG#desktop-v}" == 0.* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "FlightDeck Desktop ${RELEASE_TAG#desktop-v}" --generate-notes "${flags[@]}"
           fi
-          gh release upload "$RELEASE_TAG" dist/* --clobber
+          shopt -s nullglob
+          assets=(dist/*)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "no release assets were built" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+      - name: Fail if any build leg failed
+        if: ${{ env.BUILD_RESULT != 'success' }}
+        run: |
+          echo "build-release result: $BUILD_RESULT. Assets that were built have been published; the release is incomplete." >&2
+          exit 1
