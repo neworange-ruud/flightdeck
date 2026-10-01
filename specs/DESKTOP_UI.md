@@ -417,59 +417,49 @@ The mockup shows details the view models do not carry yet (§7).
 These are open. Where a recommendation is given it is the author's, not a
 decision.
 
-### Q1 — Keep the ratatui TUI as `flightdeck --tui`, or retire it? · **open** (`bmej.1.6`)
+### Q1 — Keep the ratatui TUI · **decided 2026-10-01: keep it** (`bmej.1.6`)
 
-**Recommendation: keep it.** The TUI serves SSH and headless users, which the
-GUI cannot; it already runs on `AppHost` as a thin client (D5), so keeping it
-does not fork the logic; and it is the reference implementation the GUI is
-tested against for keymap and byte parity.
+**The TUI stays the main app.** The desktop app ships next to it as a preview
+for testing and replaces nothing. The TUI keeps running on `AppHost` as a thin
+client (D5) and stays the reference for keymap and byte parity.
 
-**Maintenance cost, stated:** two renderers over shared view models and the
-shared keymap, so every new view-model field or chord needs two front-end
-changes (or an explicit "GUI only" note); the TUI stays on `vt100` while the
-desktop uses `alacritty_terminal` (D4), so terminal behaviour differs between
-them and both conformance suites run in the root gate; and the TUI's render
-tests remain a separate maintenance surface. Retiring it would remove those
-costs and also the only route for SSH and headless use.
+**Maintenance cost, accepted:** two renderers over shared view models and one
+shared keymap. Every new view-model field or chord needs a change in both
+front-ends, or an explicit "GUI only" note. The two use different emulators (D4),
+so both conformance suites stay in the root gate, and the TUI's render tests
+remain their own maintenance surface.
 
-### Q2 — Binary and launch layout · **open** (`bmej.1.7`)
+### Q2 — Binary and launch layout · **decided 2026-10-01: separate app** (`bmej.1.7`)
 
-**Recommendation (the current implementation): a separate `flightdeck-desktop`
-binary (`FlightDeck.app` on macOS) next to the `flightdeck` CLI.** Launched from
-Finder, the Start menu or a launcher it needs no repository; launched outside a
-repository it shows a project picker (D9). Nothing about it depends on the CLI
-being installed. Packaging assumes this layout (`desktop/PACKAGING.md`).
+**A separate `flightdeck-desktop` binary (`FlightDeck.app` on macOS), next to the
+`flightdeck` CLI and distributed separately.** It is released by
+`.github/workflows/desktop.yml` on `desktop-v<x.y.z>` tags as its own GitHub
+Release, apart from cargo-dist's `v<x.y.z>` CLI releases. Its self-updater
+follows that tag line, and a Homebrew cask can follow later. Launched from
+Finder, the Start menu or a launcher it needs no repository. Launched outside a
+repository it shows a project picker (D9). It does not need the CLI installed.
 
-**Alternative:** one `flightdeck` binary with the GUI as the default and
-`--tui` for the terminal. Trade-offs: one thing to install and update and a
-single name; but the CLI would link GPUI, so the TUI's pure-Rust Windows build,
-its build time and binary size and the Linux system libraries (Vulkan, X11/
-Wayland) would become requirements for SSH/headless installs, or a feature-flag
-matrix would be needed; and a headless machine would need to detect that it has
-no display. If the layout changes, bundle executable names, the `.desktop`
-`Exec=`, the WiX component and the cask `app` stanza change with it.
+The alternative was one binary with the GUI as the default and `--tui` for the
+terminal. It was rejected because the CLI would link GPUI. That brings GPUI's
+system requirements (Vulkan, X11/Wayland on Linux; the MSVC + Windows SDK build
+on Windows) to SSH and headless installs, and loses the TUI's pure-Rust Windows
+build.
 
-### Q3 — Release identifiers · **open**
+### Q3 — Release identifiers · **partly decided 2026-10-01**
 
-1. Bundle id `agency.neworange.flightdeck.desktop` (derived from the iOS
-   prefix). Hard to change later: it keys macOS preferences and Gatekeeper
-   history.
-2. Signing identities: an Apple Developer ID Application certificate and notary
-   credentials; a Windows code-signing certificate (EV avoids SmartScreen
-   warnings).
-3. Homebrew tap: the existing `neworange-ruud/homebrew-tap`, and the tag scheme
-   `desktop-v<version>` (plain major.minor.patch) that the release pipeline and
-   updater assume.
-4. Whether the GUI joins cargo-dist releases or keeps its own workflow
-   (currently its own; `dist = false`).
+1. Bundle id **`agency.neworange.flightdeck.desktop`** — confirmed.
+2. Tag scheme **`desktop-v<version>`**, released by its own workflow
+   (`dist = false`), never by cargo-dist — confirmed.
+3. Signing: macOS reuses the CLI's Developer ID secrets (`CODESIGN_*`).
+   Notarization credentials and a Windows signing certificate are still to be
+   provided (`desktop/PACKAGING.md`).
+4. Homebrew tap: the existing `neworange-ruud/homebrew-tap` is assumed for a
+   later cask.
 
-### Q4 — Pull base in the GUI · **open** (`bmej.4.8`)
+### Q4 — Pull base in the GUI · **decided 2026-10-01: as built** (`bmej.4.8`)
 
-Confirm the GUI's Pull base (`git pull --rebase` on the base folder after a PR
-merges) is right as built. The git strip's button dispatches the same event as
-`Ctrl-u`, so the host's guards and messages are the TUI's; the owner has not yet
-confirmed that this, including any confirmation step, is what the GUI should
-do given the Git ownership boundary.
+The git strip's Pull base button dispatches the same event as `Ctrl-u`, with the
+TUI's guards and messages and no extra confirmation, in both front-ends.
 
 ### Q5 — App icon · **open**
 
