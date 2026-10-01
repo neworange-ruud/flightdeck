@@ -335,7 +335,7 @@ pub(crate) mod testkit {
 mod tests {
     use flightdeck::app::keymap::Keymap;
     use flightdeck::tui::help::help_doc;
-    use gpui::{IntoElement as _, TestAppContext};
+    use gpui::TestAppContext;
 
     use super::testkit::{click, mount, recorder, take};
     use super::*;

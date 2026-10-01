@@ -340,7 +340,7 @@ pub(crate) mod snapshot {
     ) -> std::io::Result<()> {
         let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
         write!(out, "P6\n{width} {height}\n255\n")?;
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             out.write_all(&px[..3])?;
         }
         out.flush()
