@@ -85,10 +85,13 @@
 //! still holds without a runtime check standing over it. Two properties do the
 //! work, and both are asserted in this module's tests.
 //!
-//! **1. A forwarding row ignores the frame's `args` entirely.** The action —
-//! and every `confirm` flag inside it — comes from this table, so a browser
-//! cannot smuggle `confirm: true` into `RebaseWorktree` any more than it can
-//! into `AbandonWorktree`. [`confirmation_of`] names the three states a command
+//! **1. A forwarding row takes nothing from the frame's `args` but a target.**
+//! The action — and every `confirm` flag inside it — comes from this table, so
+//! a browser cannot smuggle `confirm: true` into `RebaseWorktree` any more than
+//! it can into `AbandonWorktree`. Since web protocol v6 the args may name the
+//! `session_id` or `terminal_id` the row acts on (a native client browsing
+//! independently, `specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1); that chooses
+//! *which* tab, never *what happens* to it. [`confirmation_of`] names the three states a command
 //! *value* can be in, and no row in [`INVENTORY`] may carry
 //! [`Confirmation::Given`].
 //!
@@ -513,8 +516,8 @@ pub static INVENTORY: &[CommandSpec] = &[
     // history-rewriting command. It carries `confirm: false` — the same value
     // the desktop's palette row carries — so the first dispatch can only return
     // the confirmation prompt, which D13 then publishes to both surfaces. A
-    // frame's `args` are ignored, so `confirm: true` is unreachable from a
-    // browser by construction rather than by a check. See the module doc.
+    // frame's `args` can only name a target, so `confirm: true` is unreachable
+    // from a browser by construction rather than by a check. See the module doc.
     CommandSpec {
         name: names::REBASE_WORKTREE,
         label: "Rebase Worktree",

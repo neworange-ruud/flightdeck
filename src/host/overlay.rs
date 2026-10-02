@@ -206,6 +206,12 @@ pub enum DialogKind {
     UnpairPhone,
     /// Confirm quitting (only a browser's unconfirmed quit opens this).
     ConfirmQuit,
+    /// A dialog another FlightDeck is showing, mirrored by a native remote
+    /// client (`crate::web::client`). The wire carries its title, body, field,
+    /// list and buttons but not the typed facts the variants above hold, so it
+    /// is drawn generically. `kind` is the host's machine name for the flow
+    /// (`confirm_rebase`, `rename_tab`, …).
+    Remote { kind: String },
 }
 
 /// One registered agent backend.

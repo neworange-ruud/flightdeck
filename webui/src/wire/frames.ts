@@ -58,7 +58,7 @@
  * tab only understands the old local boolean and would display the wrong form,
  * so it must reload rather than answer a target it did not render.
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";

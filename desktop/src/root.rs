@@ -280,6 +280,25 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
         .cursor_pointer()
         .child("Open project…")
         .on_click(|_, _, cx| pick_folder(cx));
+    // FlightDeck Desktop as a remote control for another machine's FlightDeck
+    // (`crate::remote::connect`), beside Open project.
+    let connect = div()
+        .id("launcher-connect")
+        .debug_selector(|| "launcher-connect".into())
+        .flex_none()
+        .h(px(34.))
+        .px_4()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(7.))
+        .border_1()
+        .border_color(p.border_strong.hsla())
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child("Connect to remote…")
+        .on_click(|_, _, cx| crate::remote::connect::open_connect_window(None, cx));
 
     let recent = (!root.recent.is_empty()).then(|| {
         v_flex()
@@ -344,7 +363,7 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
                              Pick a folder inside a git repository.",
                         ),
                 )
-                .child(open)
+                .child(h_flex().gap_3().child(open).child(connect))
                 .children(error)
                 .children(recent.map(|list| div().mt_4().w(px(420.)).child(list))),
         )

@@ -311,7 +311,8 @@ impl Render for FlightDeckWindow {
         }
 
         let app_host = self.host.clone();
-        let sidebar = sidebar(&sidebar_data, &self.host, &p)
+        let surface = crate::surface::Surface::Local(self.host.clone());
+        let sidebar = sidebar(&sidebar_data, &surface, &p)
             .key_context(flightdeck::app::keymap::Context::App.name())
             .track_focus(&self.app_focus)
             .on_key_down(move |event, _, cx| {
@@ -335,7 +336,7 @@ impl Render for FlightDeckWindow {
             .min_w_0()
             .h_full()
             .bg(p.surface_terminal.hsla())
-            .child(git_strip(&strip, &self.host, &p))
+            .child(git_strip(&strip, &surface, &p))
             .child(body);
 
         v_flex()

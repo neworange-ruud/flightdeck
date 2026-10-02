@@ -71,6 +71,18 @@ existing single-selection app state and is what "remote control" means.
 
 > **Cost accepted:** two people cannot look at different sessions of one instance.
 
+> **Revised 2026-10-02 (protocol v6, `specs/DESKTOP_REMOTE_CONTROL_PLAN.md`
+> §3.1, R2):** the selection is **shared for browsers and local for native
+> clients.** A browser keeps everything above: it sends `select_*` and moves the
+> desktop with it. FlightDeck Desktop attached as a remote control browses on its
+> own — it never sends `select_*` — and every palette command it sends names its
+> target in `args` (`session_id`, `terminal_id`, or `project_id`), so the host
+> acts on that tab without touching its own selection. Dialogs such a command
+> opens carry the target and confirm against it. The host's selection still
+> travels to every viewer as `Delta::Selection`, which the native client draws as
+> a "host is here" marker. D4 is unchanged: the host owns PTY geometry for every
+> viewer, and a native client shows the host's grid as it is.
+
 ### D4 — PTY geometry: the desktop always owns it
 
 The PTY stays sized to the desktop TUI's pane. The browser scales the fixed grid

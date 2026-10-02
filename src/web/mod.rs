@@ -23,11 +23,13 @@
 //! | [`server`] | D6 | axum on the shared tokio runtime |
 //! | [`stream`] | D2, D8, D14 | PTY bytes out, keystrokes in, takeover |
 //! | [`commands`] | D3, D13, D16 | wire name to palette action, one table |
+//! | [`client`] | R1–R7 | a native client: FlightDeck Desktop controlling another instance |
 
 pub mod access;
 pub mod activity;
 pub mod arbiter;
 pub mod assets;
+pub mod client;
 pub mod commands;
 pub mod credentials;
 pub mod interfaces;

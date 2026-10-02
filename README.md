@@ -579,6 +579,45 @@ terminal tabs, `F1` help, and so on. Some differences:
 - Leaving terminal focus honours the same `[ui] use_f2_to_leave_terminal_focus`
   setting, read when the app starts.
 
+### Control another machine from FlightDeck Desktop
+
+The desktop app can also drive a FlightDeck running on another machine — the
+terminal UI or another desktop app — over your local network or a VPN. It is a
+native client of FlightDeck Web, so it needs nothing new on the other machine.
+
+On the machine you want to control:
+
+1. Run `Start Web Interface` from the command palette.
+2. In the access panel, press `n` for network mode and read the address and the
+   4-digit code it shows.
+
+On the machine you are at, choose **Connect to remote…** (the launcher, or File
+in the menu bar), type the address and the code, and pick Control or Observe.
+The remote opens in its own window, with the usual sidebar, git strip and
+terminals.
+
+- **You browse independently.** Looking at another agent never moves the
+  selection on the other screen. A small `host` marker shows which agent the
+  person at that machine is looking at.
+- **Commands act on what you see.** Push, Finish, Restart, Close and the rest
+  act on the agent this window shows, with the same refusals and the same
+  typed-name step for destructive answers as a browser. Dialogs are shared:
+  they appear on both screens and either side can answer.
+- **Typing is shared** through FlightDeck Web's input lock. Take over from the
+  status bar when someone else is typing, or switch to Observe.
+- **Pairing is remembered** in `~/.flightdeck/remotes.json` (owner-only), so
+  reconnecting needs no code. Forget a remote from the connect window, or revoke
+  it from the other machine's access panel, where it is listed as
+  `FlightDeck Desktop`. Nothing connects when the app starts until you choose a
+  remote.
+- **The link is plain WebSocket**, like FlightDeck Web. The first connect to an
+  address outside loopback or Tailscale warns you once. Use it on a network you
+  trust, or over Tailscale or WireGuard.
+
+Mission control, split view, the configuration manager and Pull Base are not
+offered in a remote window yet. The remote's terminals keep the other machine's
+size: the window shows that grid and does not resize it.
+
 ## Architecture
 
 Business logic is separated from the TUI and fully testable. Git, the

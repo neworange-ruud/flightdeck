@@ -103,6 +103,9 @@ pub fn git_bar(facts: GitFacts<'_>) -> GitBar {
             has_upstream: status.upstream.is_some(),
             files_changed: status.changes.added + status.changes.modified + status.changes.deleted,
             collected: true,
+            upstream: status.upstream.clone(),
+            lines_added: status.lines.added,
+            lines_removed: status.lines.removed,
         },
         None => GitBar {
             // The branch name is a persisted tab field, not a git observation,
@@ -123,6 +126,9 @@ pub fn git_bar(facts: GitFacts<'_>) -> GitBar {
             has_upstream: false,
             files_changed: 0,
             collected: false,
+            upstream: None,
+            lines_added: 0,
+            lines_removed: 0,
         },
     }
 }

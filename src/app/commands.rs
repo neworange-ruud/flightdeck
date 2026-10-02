@@ -8,7 +8,7 @@
 //! The app core never executes git/fs/pty directly — `dispatch` calls the
 //! services through trait objects (SPECS §27).
 
-use crate::contracts::ManualStatus;
+use crate::contracts::{ManualStatus, TabId};
 use crate::git::remote::PushPlan;
 use crate::git::status::WorktreeStatus;
 
@@ -21,6 +21,48 @@ pub enum Selector {
     Next,
     /// Select the previous item, wrapping.
     Prev,
+}
+
+/// Which Agent Session Tab a session-scoped [`Command`] acts on, when it is not
+/// the selected one (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1, R2).
+///
+/// A native remote client browses the host independently: it can look at — and
+/// act on — a tab the host is not showing, without moving the host's own
+/// selection. So the target travels *beside* the command instead of being
+/// smuggled in by switching tabs first: a two-phase flow (a dialog, then its
+/// confirm) re-dispatches against the same target, and the person at the host
+/// keeps the tab they were looking at.
+///
+/// Passed to [`AppState::dispatch_to`](crate::app::state::AppState::dispatch_to);
+/// `None` there means "the selected tab", which is every caller the TUI has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabTarget {
+    /// The tab, by its stable id.
+    pub tab: TabId,
+    /// One of the tab's terminals, for the commands that act on a terminal
+    /// rather than the whole tab (closing a child). `None` = the tab's own
+    /// selected terminal.
+    pub terminal: Option<TerminalPick>,
+}
+
+impl TabTarget {
+    /// Target a whole tab.
+    pub fn tab(tab: TabId) -> TabTarget {
+        TabTarget {
+            tab,
+            terminal: None,
+        }
+    }
+}
+
+/// One terminal of a [`TabTarget`]'s tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalPick {
+    /// The tab's primary agent terminal.
+    Primary,
+    /// A child terminal, by its stable stream id (the id the web stream names it
+    /// by, so it survives siblings closing around it).
+    Child(u64),
 }
 
 /// How to handle a tab's running processes when closing it (SPECS §25).

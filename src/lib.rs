@@ -1277,6 +1277,16 @@ struct Ui {
     /// Set and cleared in one place, so neither of the two dozen prompt-opening
     /// sites nor `apply_effect`'s other arms have to know a browser exists.
     web_origin: Option<crate::web::protocol::DialogOrigin>,
+    /// The explicit target of the remote command being run, when its frame
+    /// named one (web protocol v6, `specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1).
+    ///
+    /// Scoped exactly like [`Ui::web_origin`]: [`run_web_command`] sets it for
+    /// one palette dispatch and clears it after. [`start_prompt`] copies it onto
+    /// the dialog it opens, so the confirm — whoever presses it, and however
+    /// much later — acts on the tab that was named rather than on whatever is
+    /// selected by then. `None` for every desktop keypress and for a browser,
+    /// which names no target and keeps D3's shared selection.
+    web_target: Option<WebTarget>,
     /// SPECS §21's panel, collected by the dispatch a browser just made, for
     /// the browser that made it (`remote-control-ll5.8`, §6.5 R16).
     ///
@@ -1340,6 +1350,9 @@ struct PendingJob {
 struct PromptState {
     prompt: Prompt,
     dialog: Dialog,
+    /// The tab this dialog's confirm acts on, when the command that opened it
+    /// named one ([`Ui::web_target`]). `None` = the selected tab, as always.
+    target: Option<WebTarget>,
     /// Stable identity for the life of this prompt, minted by [`start_prompt`].
     /// The browser names it when it answers, so an answer that arrives for a
     /// dialog that has since been replaced is refused instead of applied to
@@ -1350,6 +1363,33 @@ struct PromptState {
     /// which case the desktop renders the origin line and the browser does not
     /// (it already knows — it asked).
     origin: crate::web::protocol::DialogOrigin,
+}
+
+/// A remote command's explicit target: the project it lives in (by the same
+/// id the snapshot publishes, the repository root, so it survives other
+/// projects opening and closing) and, unless the frame named only a project,
+/// the tab within it. A project-only target acts on that project's own
+/// selected tab, as the host's palette would if it were showing that project.
+#[derive(Clone, Debug)]
+struct WebTarget {
+    project_root: std::path::PathBuf,
+    target: Option<crate::app::commands::TabTarget>,
+}
+
+impl WebTarget {
+    /// The index of the project this target lives in, if it is still open.
+    fn project(&self, workspace: &Workspace) -> Option<usize> {
+        workspace
+            .projects
+            .iter()
+            .position(|p| p.git.root() == self.project_root)
+    }
+}
+
+/// The tab-level target an open prompt — or the running remote command — acts
+/// on, if any.
+fn tab_target(target: Option<&WebTarget>) -> Option<&crate::app::commands::TabTarget> {
+    target.and_then(|t| t.target.as_ref())
 }
 
 impl Ui {
@@ -2446,11 +2486,16 @@ fn web_host_state_now(
         workspace,
         &web.streams,
         activity,
-        web_dialog_view(
-            ui,
-            &workspace.active_project().name,
-            &workspace.active_project().state,
-        ),
+        {
+            // A dialog a targeted command opened is about its own project's tab.
+            let project = ui
+                .prompt
+                .as_ref()
+                .and_then(|p| p.target.as_ref())
+                .and_then(|t| t.project(workspace))
+                .map_or_else(|| workspace.active_project(), |i| &workspace.projects[i]);
+            web_dialog_view(ui, &project.name, &project.state)
+        },
         now_ms,
     )
 }
@@ -4974,6 +5019,10 @@ fn dispatch_command(
     services: &Services,
     ui: &mut Ui,
 ) -> Result<()> {
+    // The tab this acts on: the remote command's explicit target, else the
+    // selection (web protocol v6).
+    let web_target = ui.web_target.clone();
+    let target = tab_target(web_target.as_ref());
     // Intercept commands that need interactive input before dispatch.
     match &cmd {
         Command::NewAgentTab { name, .. } if name.is_empty() => {
@@ -4981,7 +5030,7 @@ fn dispatch_command(
             return Ok(());
         }
         Command::RenameAgentTab { new_name } if new_name.is_empty() => {
-            if state.selected().is_none() {
+            if state.target_tab(target).is_none() {
                 ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
@@ -4994,7 +5043,7 @@ fn dispatch_command(
             return Ok(());
         }
         Command::SetManualStatus(None) => {
-            if state.selected().is_none() {
+            if state.target_tab(target).is_none() {
                 ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
@@ -5008,9 +5057,9 @@ fn dispatch_command(
         Command::CloseChildTerminal => {
             // Confirm before closing a child terminal (Ctrl-w), mirroring the
             // tab's `✕` click. Acts on the currently-selected child.
-            match state.selected().and_then(|t| t.session.selected_child()) {
+            match targeted_child(state, target) {
                 Some(i) => {
-                    let label = child_tab_label(state, ChildTarget::Child(i))
+                    let label = targeted_child_label(state, target, i)
                         .unwrap_or_else(|| format!("shell {}", i + 1));
                     start_prompt(ui, Prompt::CloseChildConfirm { label });
                 }
@@ -5021,15 +5070,16 @@ fn dispatch_command(
         Command::CloseAgentTerminal => {
             // Confirm before closing the selected child agent. Refuse (no prompt)
             // when the selected terminal is not an additional agent.
-            let selected_agent = state.selected().and_then(|t| {
-                let i = t.session.selected_child()?;
-                let is_agent = t.session.child(i).map(|c| c.kind)
-                    == Some(crate::terminal::session::TerminalKind::Agent);
-                is_agent.then_some(i)
+            let selected_agent = targeted_child(state, target).filter(|&i| {
+                state
+                    .target_tab(target)
+                    .and_then(|t| t.session.child(i))
+                    .map(|c| c.kind)
+                    == Some(crate::terminal::session::TerminalKind::Agent)
             });
             match selected_agent {
                 Some(i) => {
-                    let label = child_tab_label(state, ChildTarget::Child(i))
+                    let label = targeted_child_label(state, target, i)
                         .unwrap_or_else(|| format!("agent {}", i + 1));
                     start_prompt(ui, Prompt::CloseChildConfirm { label });
                 }
@@ -5050,7 +5100,7 @@ fn dispatch_command(
     // project has none, or a git failure) must surface as a message, never
     // crash the event loop. Errors always become a toast; only the Ok path
     // maps its effect onto the UI.
-    match state.dispatch(cmd, services) {
+    match state.dispatch_to(cmd, target, services) {
         Ok(effect) => {
             // `Effect::Warning` is genuinely two different facts, and only the
             // command's phase separates them. From a *confirmed* dispatch it
@@ -5078,6 +5128,43 @@ fn dispatch_command(
         }
     }
     Ok(())
+}
+
+/// The child terminal a child-scoped command acts on, for the confirmation it
+/// raises: the target's own pick, else that tab's selected child. `None` when
+/// the primary is meant, the tab is gone, or a picked child has closed — the
+/// dispatch then refuses in its own words.
+fn targeted_child(
+    state: &AppState,
+    target: Option<&crate::app::commands::TabTarget>,
+) -> Option<usize> {
+    use crate::app::commands::TerminalPick;
+    let tab = state.target_tab(target)?;
+    match target.and_then(|t| t.terminal) {
+        None => tab.session.selected_child(),
+        Some(TerminalPick::Primary) => None,
+        Some(TerminalPick::Child(stream)) => (0..tab.session.child_count()).find(|&i| {
+            tab.session
+                .child(i)
+                .is_some_and(|c| c.stream_id() == stream)
+        }),
+    }
+}
+
+/// Child `index`'s tab-bar label in the targeted tab ("agent 2", "shell 1"), so
+/// a close confirmation names the terminal the asker chose.
+fn targeted_child_label(
+    state: &AppState,
+    target: Option<&crate::app::commands::TabTarget>,
+    index: usize,
+) -> Option<String> {
+    if target.is_none() {
+        return child_tab_label(state, ChildTarget::Child(index));
+    }
+    crate::view::terminal_views(state.target_tab(target)?)
+        .into_iter()
+        .find(|t| t.target == crate::view::TerminalRef::Child(index))
+        .map(|t| t.label)
 }
 
 /// Map a dispatch [`Effect`] onto the [`Ui`] overlays/prompts (SPECS §22).
@@ -5220,7 +5307,8 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
         // transient strip instead of a modal. One collection, two renderings,
         // and no arm anywhere that runs `collect_status` a second time.
         Effect::GitStatus { status, pr_url } => {
-            match web_git_status_view(&status, pr_url.as_deref(), _state) {
+            let target = tab_target(ui.web_target.as_ref()).cloned();
+            match web_git_status_view(&status, pr_url.as_deref(), _state, target.as_ref()) {
                 Some(view) if ui.web_origin.is_some() => {
                     ui.web_git_status = Some(view);
                 }
@@ -5256,8 +5344,9 @@ fn web_git_status_view(
     status: &crate::git::status::WorktreeStatus,
     pr_url: Option<&str>,
     state: &AppState,
+    target: Option<&crate::app::commands::TabTarget>,
 ) -> Option<crate::web::protocol::GitStatusView> {
-    let tab = state.selected()?;
+    let tab = state.target_tab(target)?;
     Some(crate::web::protocol::GitStatusView {
         // Filled in by `run_web_command`, which is the only place that knows
         // which frame this answers.
@@ -5462,6 +5551,7 @@ fn start_prompt(ui: &mut Ui, prompt: Prompt) {
     ui.prompt = Some(PromptState {
         prompt,
         dialog,
+        target: ui.web_target.clone(),
         id,
         origin,
     });
@@ -5545,7 +5635,10 @@ fn start_new_tab_flow(state: &AppState, services: &Services, ui: &mut Ui) {
 /// registered. With no session tab yet, fall back to creating a fresh Agent
 /// Session Tab/worktree (there is no session to add an agent to).
 fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mut Ui) {
-    if state.selected().is_none() {
+    if state
+        .target_tab(tab_target(ui.web_target.as_ref()))
+        .is_none()
+    {
         state.focus_app();
         start_new_tab_flow(state, services, ui);
         return;
@@ -6404,7 +6497,20 @@ fn handle_prompt_key_inner(
         _ => {}
     }
 
-    let active = workspace.active;
+    // A dialog a targeted remote command opened confirms in that tab's project,
+    // which need not be the one the host is showing (web protocol v6).
+    let target = ui.prompt.as_ref().and_then(|p| p.target.clone());
+    let active = match &target {
+        Some(target) => match target.project(workspace) {
+            Some(index) => index,
+            None => {
+                ui.prompt = None;
+                ui.message(format!("Refused: {}", crate::app::state::TARGET_GONE));
+                return Ok(());
+            }
+        },
+        None => workspace.active,
+    };
     let p = &mut workspace.projects[active];
     let services = env.services(&p.git);
     handle_prompt_key_project(key, &mut p.state, &services, ui, active)
@@ -6429,6 +6535,9 @@ fn handle_prompt_key_project(
     let Some(mut pstate) = ui.prompt.take() else {
         return Ok(());
     };
+    // The tab this dialog's answer acts on (web protocol v6); `None` = selected.
+    let target = pstate.target.as_ref().and_then(|t| t.target.clone());
+    let target = target.as_ref();
 
     match &mut pstate.prompt {
         Prompt::NewAgentForm { .. } => {
@@ -6616,10 +6725,11 @@ fn handle_prompt_key_project(
             if let KeyCode::Char(c @ '1'..='9') = key.code {
                 let idx = (c as usize) - ('1' as usize);
                 if let Some((agent_key, _display)) = agents.get(idx) {
-                    let result = state.dispatch(
+                    let result = state.dispatch_to(
                         Command::NewAgentTerminal {
                             agent_key: Some(agent_key.clone()),
                         },
+                        target,
                         services,
                     );
                     state.focus_terminal();
@@ -6643,8 +6753,11 @@ fn handle_prompt_key_project(
                         ui.prompt = Some(pstate);
                         return Ok(());
                     }
-                    let result =
-                        state.dispatch(Command::RenameAgentTab { new_name: name }, services);
+                    let result = state.dispatch_to(
+                        Command::RenameAgentTab { new_name: name },
+                        target,
+                        services,
+                    );
                     finish_prompt(result, ui);
                 }
                 KeyCode::Backspace => {
@@ -6677,7 +6790,8 @@ fn handle_prompt_key_project(
             };
             match choice {
                 Some(status) => {
-                    let result = state.dispatch(Command::SetManualStatus(status), services);
+                    let result =
+                        state.dispatch_to(Command::SetManualStatus(status), target, services);
                     finish_prompt(result, ui);
                 }
                 None => ui.prompt = Some(pstate), // ignore other keys
@@ -6688,10 +6802,11 @@ fn handle_prompt_key_project(
             if let KeyCode::Char(c @ '1'..='9') = key.code {
                 let idx = (c as usize) - ('1' as usize);
                 if let Some(&action) = actions.get(idx) {
-                    let result = state.dispatch(
+                    let result = state.dispatch_to(
                         Command::CloseAgentTab {
                             action: Some(action),
                         },
+                        target,
                         services,
                     );
                     finish_prompt(result, ui);
@@ -6702,7 +6817,7 @@ fn handle_prompt_key_project(
         }
         Prompt::CloseChildConfirm { .. } => match key.code {
             KeyCode::Char('y') => {
-                let result = state.dispatch(Command::CloseChildTerminal, services);
+                let result = state.dispatch_to(Command::CloseChildTerminal, target, services);
                 finish_prompt(result, ui);
             }
             KeyCode::Char('n') => ui.clear(),
@@ -6717,7 +6832,11 @@ fn handle_prompt_key_project(
                     let _ =
                         state.dispatch(Command::SwitchAgentTab(Selector::Index(index)), services);
                     ui.prompt = None;
-                    match state.dispatch(Command::AbandonWorktree { confirm: false }, services) {
+                    match state.dispatch_to(
+                        Command::AbandonWorktree { confirm: false },
+                        target,
+                        services,
+                    ) {
                         Ok(effect) => apply_effect_no_state(effect, ui),
                         Err(e) => ui.message(format!("Error: {e}")),
                     }
@@ -6727,7 +6846,11 @@ fn handle_prompt_key_project(
                     let _ =
                         state.dispatch(Command::SwitchAgentTab(Selector::Index(index)), services);
                     ui.prompt = None;
-                    match state.dispatch(Command::CloseAgentTab { action: None }, services) {
+                    match state.dispatch_to(
+                        Command::CloseAgentTab { action: None },
+                        target,
+                        services,
+                    ) {
                         Ok(effect) => apply_effect_no_state(effect, ui),
                         Err(e) => ui.message(format!("Error: {e}")),
                     }
@@ -6744,10 +6867,11 @@ fn handle_prompt_key_project(
             };
             match confirm {
                 Some(confirm) => {
-                    let result = state.dispatch(
+                    let result = state.dispatch_to(
                         Command::PushBranch {
                             confirm: Some(confirm),
                         },
+                        target,
                         services,
                     );
                     finish_prompt(result, ui);
@@ -6757,7 +6881,8 @@ fn handle_prompt_key_project(
         }
         Prompt::AbandonConfirm { .. } => match key.code {
             KeyCode::Char('y') => {
-                let result = state.dispatch(Command::AbandonWorktree { confirm: true }, services);
+                let result =
+                    state.dispatch_to(Command::AbandonWorktree { confirm: true }, target, services);
                 finish_prompt(result, ui);
             }
             KeyCode::Char('n') => ui.clear(),
@@ -6765,7 +6890,11 @@ fn handle_prompt_key_project(
         },
         Prompt::MergeConfirm { .. } => match key.code {
             KeyCode::Char('y') => {
-                let result = state.dispatch(Command::FinishLocalMerge { confirm: true }, services);
+                let result = state.dispatch_to(
+                    Command::FinishLocalMerge { confirm: true },
+                    target,
+                    services,
+                );
                 finish_prompt(result, ui);
             }
             KeyCode::Char('n') => ui.clear(),
@@ -6773,7 +6902,8 @@ fn handle_prompt_key_project(
         },
         Prompt::RebaseConfirm { .. } => match key.code {
             KeyCode::Char('y') => {
-                let result = state.dispatch(Command::RebaseWorktree { confirm: true }, services);
+                let result =
+                    state.dispatch_to(Command::RebaseWorktree { confirm: true }, target, services);
                 finish_prompt(result, ui);
             }
             KeyCode::Char('n') => ui.clear(),
@@ -6965,7 +7095,12 @@ fn run_palette_action(
             return Ok(());
         }
         PaletteAction::CloseProject => {
-            let i = workspace.active;
+            // A remote command names the project it is looking at (v6).
+            let i = ui
+                .web_target
+                .as_ref()
+                .and_then(|t| t.project(workspace))
+                .unwrap_or(workspace.active);
             start_close_project_flow(workspace, ui, i);
             return Ok(());
         }
@@ -7027,8 +7162,21 @@ fn run_palette_action(
         _ => {}
     }
 
-    // Project-level actions act on the active project.
-    let active = workspace.active;
+    // Project-level actions act on the active project — or, for a remote
+    // command that named a tab, on that tab's project (web protocol v6).
+    let active = match &ui.web_target {
+        Some(target) => match target.project(workspace) {
+            Some(index) => index,
+            None => {
+                ui.web_outcome = Some(WebDispatch::Refused(
+                    crate::app::state::TARGET_GONE.to_string(),
+                ));
+                return Ok(());
+            }
+        },
+        None => workspace.active,
+    };
+    let target = tab_target(ui.web_target.as_ref()).cloned();
     let p = &mut workspace.projects[active];
     let services = env.services(&p.git);
     let state = &mut p.state;
@@ -7043,7 +7191,7 @@ fn run_palette_action(
             Ok(())
         }
         PaletteAction::RenameAgentTab => {
-            if state.selected().is_none() {
+            if state.target_tab(target.as_ref()).is_none() {
                 ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
@@ -7065,7 +7213,7 @@ fn run_palette_action(
             )
         }
         PaletteAction::SetManualStatus => {
-            if state.selected().is_none() {
+            if state.target_tab(target.as_ref()).is_none() {
                 ui.message("No Agent Session Tab selected.");
                 return Ok(());
             }
@@ -7187,6 +7335,14 @@ fn run_web_command(
             }
         }
         Route::Palette(action) => {
+            // Web protocol v6: a frame may name the session — or the terminal —
+            // it is about, so a native client browsing independently (R2) acts
+            // on what it is showing without moving the host's selection. A
+            // browser names none and keeps D3's shared selection.
+            let target = match web_command_target(command.args.as_ref(), workspace) {
+                Ok(target) => target,
+                Err(reason) => return ack(AckOutcome::Rejected, Some(reason)),
+            };
             ui.web_outcome = None;
             ui.web_git_status = None;
             // D13: for as long as this dispatch runs, a dialog it opens was
@@ -7195,8 +7351,10 @@ fn run_web_command(
             // know a browser exists.
             let was_open = ui.dialog_id();
             ui.web_origin = Some(origin.clone());
+            ui.web_target = target;
             let dispatched = run_palette_action(action.clone(), workspace, env, ui);
             ui.web_origin = None;
+            ui.web_target = None;
             // SPECS §21's panel, if this dispatch produced one. The seq is
             // stamped here because this is the only place that knows which
             // frame is being answered — `apply_effect` sees an `Effect`, not a
@@ -7305,7 +7463,12 @@ fn web_dialog_view(
     let (confirm_gate, refusal) = match browser_confirm_gate(&open.prompt) {
         BrowserConfirm::OneStep => (None, None),
         BrowserConfirm::TypedName(gate) => {
-            match gate_expectation(gate.subject, project_name, project) {
+            match gate_expectation(
+                gate.subject,
+                project_name,
+                project,
+                tab_target(open.target.as_ref()),
+            ) {
                 Some(expected) => (
                     Some(wire::ConfirmGate {
                         key: gate.key.to_string(),
@@ -7491,6 +7654,7 @@ fn gate_expectation(
     subject: crate::web::commands::GateSubject,
     project_name: &str,
     project: &AppState,
+    target: Option<&crate::app::commands::TabTarget>,
 ) -> Option<String> {
     use crate::web::commands::GateSubject;
     match subject {
@@ -7498,10 +7662,9 @@ fn gate_expectation(
         // `fix-login-redirect` while the dialog above it names
         // `flightdeck/fix-login-redirect`, and the name is what the sidebar
         // shows the person typing it.
-        GateSubject::SelectedSession => {
-            let index = project.selected_tab?;
-            Some(project.tabs.get(index)?.meta.name.clone())
-        }
+        // A dialog a targeted command opened is about *its* tab, not the
+        // selection (web protocol v6).
+        GateSubject::SelectedSession => Some(project.target_tab(target)?.meta.name.clone()),
         GateSubject::ActiveProject => Some(project_name.to_string()),
     }
 }
@@ -7627,9 +7790,18 @@ fn apply_web_dialog(
     // all, because `DialogAct::Cancel` returned above.
     if let crate::web::commands::BrowserConfirm::TypedName(gate) = gate {
         if dialog_accel_key(deciding) == gate.key {
-            let active = workspace.active_project();
-            let expected = gate_expectation(gate.subject, &active.name, &active.state)
-                .ok_or_else(|| crate::web::commands::GATE_UNRESOLVED_REFUSAL.to_string())?;
+            let target = ui.prompt.as_ref().and_then(|p| p.target.clone());
+            let active = target
+                .as_ref()
+                .and_then(|t| t.project(workspace))
+                .map_or_else(|| workspace.active_project(), |i| &workspace.projects[i]);
+            let expected = gate_expectation(
+                gate.subject,
+                &active.name,
+                &active.state,
+                tab_target(target.as_ref()),
+            )
+            .ok_or_else(|| crate::web::commands::GATE_UNRESOLVED_REFUSAL.to_string())?;
             match args
                 .and_then(|a| a.get("confirm_name"))
                 .and_then(|n| n.as_str())
@@ -7846,6 +8018,63 @@ fn apply_web_selection(
             Ok(None)
         }
     }
+}
+
+/// The explicit target a palette `Command` frame names, if any (web protocol
+/// v6): `args.terminal_id` (a terminal, and through it its session),
+/// `args.session_id`, or `args.project_id` alone (that project, acting on its
+/// own selected tab). `Ok(None)` when it names none — every browser frame —
+/// and `Err` with [`stale_id`]'s sentence for an id the host does not have, so
+/// a stale view is refused instead of falling back to the selection.
+fn web_command_target(
+    args: Option<&serde_json::Value>,
+    workspace: &Workspace,
+) -> std::result::Result<Option<WebTarget>, String> {
+    use crate::app::commands::{TabTarget, TerminalPick};
+    let arg = |key: &str| {
+        args.and_then(|a| a.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let (project, tab, terminal) = if let Some(id) = arg("terminal_id") {
+        let (project, tab, child) =
+            locate_web_terminal(workspace, &id).ok_or_else(|| stale_id("terminal", &id))?;
+        let pick = match child {
+            ChildTarget::Primary => TerminalPick::Primary,
+            ChildTarget::Child(i) => {
+                let session = &workspace.projects[project].state.tabs[tab].session;
+                match session.child(i) {
+                    Some(child) => TerminalPick::Child(child.stream_id()),
+                    None => return Err(stale_id("terminal", &id)),
+                }
+            }
+        };
+        (project, tab, Some(pick))
+    } else if let Some(id) = arg("session_id") {
+        let (project, tab) =
+            locate_web_session(workspace, &id).ok_or_else(|| stale_id("session", &id))?;
+        (project, tab, None)
+    } else if let Some(id) = arg("project_id") {
+        let project = workspace
+            .projects
+            .iter()
+            .position(|p| p.git.root().display().to_string() == id)
+            .ok_or_else(|| stale_id("project", &id))?;
+        return Ok(Some(WebTarget {
+            project_root: workspace.projects[project].git.root().to_path_buf(),
+            target: None,
+        }));
+    } else {
+        return Ok(None);
+    };
+    let p = &workspace.projects[project];
+    Ok(Some(WebTarget {
+        project_root: p.git.root().to_path_buf(),
+        target: Some(TabTarget {
+            tab: p.state.tabs[tab].id(),
+            terminal,
+        }),
+    }))
 }
 
 /// One required string argument off a `Command` frame's `args` object.
@@ -12510,6 +12739,338 @@ mod tests {
                 .detail
                 .expect("a refusal states its reason")
                 .contains("git_force_push"));
+        }
+
+        // ===============================================================
+        // Web protocol v6: explicit command targets
+        // (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1, R2)
+        // ===============================================================
+
+        /// One project with two real tabs, `One` and `Two`. Creating a tab
+        /// selects it, so `Two` (index 1) is the host's selection and `One` is
+        /// the tab a remote viewer is looking at on its own.
+        fn workspace_with_two_tabs(dir: &TempDir, git: &FakeGit, pty: &FakePty) -> Workspace {
+            let mut ws = workspace_with_a_tab(dir, git, pty);
+            ws.projects[0].state.tabs[0].meta.name = "One".to_string();
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let services = Services {
+                git,
+                fs: &fs,
+                pty,
+                clock: &clock,
+                container: &container,
+                command: &runner,
+            };
+            pty.queue_session();
+            ws.projects[0]
+                .state
+                .dispatch(
+                    Command::NewAgentTab {
+                        name: "Two".to_string(),
+                        agent_key: None,
+                    },
+                    &services,
+                )
+                .expect("the second tab is created");
+            assert_eq!(ws.projects[0].state.selected_tab, Some(1));
+            ws
+        }
+
+        fn session_args(ws: &Workspace, index: usize) -> serde_json::Value {
+            json!({ "session_id": ws.projects[0].state.tabs[index].meta.id })
+        }
+
+        /// A targeted `restart_agent` restarts the tab it names — not the
+        /// selection — and the host's selection does not move.
+        #[test]
+        fn a_targeted_restart_acts_on_the_named_tab_and_leaves_the_selection() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            let one = session_args(&ws, 0);
+            let one_worktree = to_absolute(
+                Path::new("/repo"),
+                Path::new(&ws.projects[0].state.tabs[0].meta.worktree_path_relative),
+            );
+
+            let fs = FakeFs::new().with_dir(one_worktree.clone());
+            let restart_pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &restart_pty, &clock, &container, &runner);
+            let mut activity = ActivityStore::new();
+            let reply = run_web_command(
+                &frame(1, names::RESTART_AGENT, Some(one)),
+                &browser_origin(),
+                &mut ws,
+                &e,
+                &mut ui,
+                &mut activity,
+            );
+
+            assert_eq!(reply.ack.outcome, AckOutcome::Applied, "{:?}", reply.ack);
+            let spawns = restart_pty.spawns();
+            assert_eq!(spawns.len(), 1, "exactly one agent was restarted");
+            assert_eq!(spawns[0].2, one_worktree, "it was tab One's agent");
+            assert_eq!(
+                ws.projects[0].state.selected_tab,
+                Some(1),
+                "the host is still looking at Two"
+            );
+        }
+
+        /// Without a target the same row keeps acting on the selection — the
+        /// browser's D3 behaviour is unchanged by v6.
+        #[test]
+        fn an_untargeted_rename_still_acts_on_the_selection() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::RENAME_AGENT_SESSION_TAB, None),
+            );
+            let confirm = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "text": "Renamed" }));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            let names: Vec<&str> = ws.projects[0]
+                .state
+                .tabs
+                .iter()
+                .map(|t| t.meta.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["One", "Renamed"]);
+        }
+
+        /// A targeted rename opens the shared dialog, and the dialog's confirm
+        /// renames the tab that was named — even though `Two` is selected.
+        #[test]
+        fn a_targeted_rename_confirms_against_its_target() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            let one = session_args(&ws, 0);
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::RENAME_AGENT_SESSION_TAB, Some(one)),
+            );
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            let confirm = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "text": "Renamed" }));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            let names: Vec<&str> = ws.projects[0]
+                .state
+                .tabs
+                .iter()
+                .map(|t| t.meta.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["Renamed", "Two"]);
+            assert_eq!(ws.projects[0].state.selected_tab, Some(1));
+        }
+
+        /// A targeted close goes through §25's shared option dialog, and the
+        /// option chosen there closes the target, not the selection. The host's
+        /// selection stays on `Two` — now at index 0, because `One` before it
+        /// is gone.
+        #[test]
+        fn a_targeted_close_confirmed_through_the_dialog_closes_its_target() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            let one = session_args(&ws, 0);
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::CLOSE_AGENT_SESSION_TAB, Some(one)),
+            );
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+            assert!(ui.prompt.is_some(), "§25's options are open");
+            // `3` = force-terminate, the option that removes the tab outright.
+            let confirm = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "3" }));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            let state = &ws.projects[0].state;
+            let names: Vec<&str> = state.tabs.iter().map(|t| t.meta.name.as_str()).collect();
+            assert_eq!(names, vec!["Two"], "One was closed, Two survived");
+            assert_eq!(state.selected().map(|t| t.meta.name.as_str()), Some("Two"));
+        }
+
+        /// The desktop answering a dialog a targeted command opened acts on the
+        /// target too: the target lives on the dialog, not on who answers it.
+        #[test]
+        fn the_desktop_answering_a_targeted_dialog_acts_on_the_target() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            let one = session_args(&ws, 0);
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(1, names::SET_MANUAL_STATUS, Some(one)),
+            );
+
+            let fs = FakeFs::new();
+            let pty = FakePty::new();
+            let clock = FakeClock::default();
+            let container = crate::testing::FakeContainerRuntime::new();
+            let runner = crate::testing::FakeCommandRunner::new();
+            let e = env(&fs, &pty, &clock, &container, &runner);
+            let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+            handle_prompt_key(key, &mut ws, &e, &mut ui).unwrap();
+
+            let state = &ws.projects[0].state;
+            assert_eq!(state.tabs[0].meta.manual_status.as_deref(), Some("blocked"));
+            assert_eq!(state.tabs[1].meta.manual_status, None);
+        }
+
+        /// A target the host does not have is refused with the stale-view
+        /// sentence — never resolved to the selection instead.
+        #[test]
+        fn a_stale_target_is_refused_and_nothing_runs() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    1,
+                    names::CLOSE_AGENT_SESSION_TAB,
+                    Some(json!({ "session_id": "gone" })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert!(ack.detail.unwrap().contains("out of date"));
+            assert!(ui.prompt.is_none(), "no dialog opened for a stale target");
+            assert_eq!(ws.projects[0].state.tabs.len(), 2);
+        }
+
+        /// A targeted `show_git_status` answers with the target's panel, named
+        /// by the target's session id rather than the selection's.
+        #[test]
+        fn a_targeted_git_status_names_its_target() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            let one_id = ws.projects[0].state.tabs[0].id();
+
+            ui.web_origin = Some(browser_origin());
+            ui.web_target = Some(WebTarget {
+                project_root: PathBuf::from("/repo"),
+                target: Some(crate::app::commands::TabTarget::tab(one_id.clone())),
+            });
+            apply_effect(
+                Effect::GitStatus {
+                    status: Box::new(full_status()),
+                    pr_url: None,
+                },
+                &ws.projects[0].state,
+                &mut ui,
+            );
+
+            let panel = ui.web_git_status.expect("the panel answers the asker");
+            assert_eq!(panel.session_id, one_id);
+            assert_eq!(panel.session_name, "One");
+        }
+
+        /// A `project_id` target runs a project-level row in that project, not
+        /// the one the host is showing.
+        #[test]
+        fn a_project_target_acts_in_that_project() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            assert_eq!(ws.active, 0);
+            let other = ws.projects[1].git.root().display().to_string();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    1,
+                    names::TOGGLE_SPLIT_VIEW,
+                    Some(json!({ "project_id": other })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            assert!(ws.projects[1].state.split_view, "the named project");
+            assert!(!ws.projects[0].state.split_view, "not the host's");
+            assert_eq!(ws.active, 0, "and the host stayed where it was");
+        }
+
+        /// A `terminal_id` target closes that child, not the tab's selected one.
+        #[test]
+        fn a_terminal_target_closes_the_named_child() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
+            let mut ui = Ui::default();
+            // Two shells in tab One; the second is One's selected child.
+            for _ in 0..2 {
+                let one = session_args(&ws, 0);
+                let ack = run(
+                    &mut ws,
+                    &mut ui,
+                    &frame(1, names::NEW_CHILD_TERMINAL, Some(one)),
+                );
+                assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            }
+            let tab = &ws.projects[0].state.tabs[0];
+            assert_eq!(tab.session.child_count(), 2, "both shells landed in One");
+            assert_eq!(ws.projects[0].state.tabs[1].session.child_count(), 0);
+            let first = tab.session.child(0).unwrap().stream_id();
+            let second = tab.session.child(1).unwrap().stream_id();
+            let first_id = crate::web::stream::child_terminal_id(&tab.meta.id, first);
+
+            run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    2,
+                    names::CLOSE_CHILD_TERMINAL,
+                    Some(json!({ "terminal_id": first_id.as_str() })),
+                ),
+            );
+            let confirm = answer(3, names::DIALOG_CONFIRM, &ui, json!({}));
+            let ack = run(&mut ws, &mut ui, &confirm);
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            let tab = &ws.projects[0].state.tabs[0];
+            assert_eq!(tab.session.child_count(), 1);
+            assert_eq!(
+                tab.session.child(0).unwrap().stream_id(),
+                second,
+                "the named shell closed, the selected one survived"
+            );
         }
 
         // ===============================================================

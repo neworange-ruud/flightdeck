@@ -57,6 +57,9 @@ fn git_bar() -> GitBar {
         has_upstream: true,
         files_changed: 6,
         collected: true,
+        upstream: Some("origin/flightdeck/fix-login".into()),
+        lines_added: 40,
+        lines_removed: 7,
     }
 }
 
@@ -503,9 +506,13 @@ fn protocol_version_is_five_and_the_whole_supported_range() {
     // There is still no range, because server and SPA ship in one binary (D9)
     // and a stale tab is told to reload rather than served a half-spoken
     // protocol.
-    assert_eq!(PROTOCOL_VERSION, 5);
-    assert_eq!(MIN_SUPPORTED_VERSION, 5);
-    assert_eq!(MAX_SUPPORTED_VERSION, 5);
+    //
+    // **v6 is explicit command targets** (`remote-control-jija.1`): a palette
+    // `Command`'s `args` were ignored and may now name the session or terminal
+    // the command acts on — an existing field changing meaning.
+    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(MIN_SUPPORTED_VERSION, 6);
+    assert_eq!(MAX_SUPPORTED_VERSION, 6);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -557,30 +564,36 @@ fn mismatched_version_is_representable_and_detectable() {
     // does not know `configuration`, and the host's own palette inventory would
     // hand it the `open_configuration` row that produces one. Refusing the
     // attach is what turns a dead button into "reload to update".
-    let err = check_version(4).expect_err("v4 must not be accepted by a v5 host");
+    //
+    // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
+    // its palette rows with no target and be served fine, but a v5 *native
+    // client* would have its targets ignored by an older host, so the bump is
+    // refused both ways round.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v6 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 5,
-            peer: 4,
-            min_supported: 5,
-            max_supported: 5,
+            local: 6,
+            peer: 5,
+            min_supported: 6,
+            max_supported: 6,
         }
     );
-    // v1 and v2 are equally refused, and for D14's original reason.
-    assert!(check_version(1).is_err());
-    assert!(check_version(2).is_err());
+    // v1 to v4 are equally refused, and for D14's original reason.
+    for older in 1..=4 {
+        assert!(check_version(older).is_err());
+    }
     // Newer than our ceiling is equally a mismatch — there is no downgrade path,
     // because server and SPA ship together.
-    assert!(check_version(6).is_err());
+    assert!(check_version(7).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
     let value = serde_json::to_value(&frame).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
-    assert_eq!(value["version"]["peer"], 4);
-    assert_eq!(value["version"]["max_supported"], 5);
+    assert_eq!(value["version"]["peer"], 5);
+    assert_eq!(value["version"]["max_supported"], 6);
     assert_eq!(round_trip(&frame), frame);
 }
 

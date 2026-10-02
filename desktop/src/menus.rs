@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! FlightDeck  About · Settings… ⌘, · Services · Quit ⌘Q
-//! File        New agent · New shell · Open project… ⌘O · Close session · Close shell · Open worktree
+//! File        New agent · New shell · Open project… ⌘O · Connect to remote… · Close session · Close shell · Open worktree
 //! View        Toggle split · Command palette · Projects / Agent sessions / Terminals ▸ · Focus
 //! Git         Push · Pull base · Finish
 //! Agent       Set manual status · Restart
@@ -62,7 +62,13 @@ use crate::commands::disabled_in;
 
 actions!(
     flightdeck,
-    [About, OpenSettings, OpenProjectFolder, OpenGithub]
+    [
+        About,
+        OpenSettings,
+        OpenProjectFolder,
+        ConnectToRemote,
+        OpenGithub
+    ]
 );
 
 /// The project's home, for the Help menu's link.
@@ -74,6 +80,8 @@ pub enum AppCommand {
     About,
     Settings,
     OpenProject,
+    /// FlightDeck Desktop as a remote control (`crate::remote::connect`).
+    ConnectRemote,
     GitHub,
 }
 
@@ -83,6 +91,7 @@ impl AppCommand {
             AppCommand::About => "About FlightDeck",
             AppCommand::Settings => "Settings…",
             AppCommand::OpenProject => "Open project…",
+            AppCommand::ConnectRemote => "Connect to remote…",
             AppCommand::GitHub => "FlightDeck on GitHub",
         }
     }
@@ -92,7 +101,7 @@ impl AppCommand {
         match self {
             AppCommand::About => Some(HostEvent::Command(Command::ShowAbout)),
             AppCommand::Settings => Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig)),
-            AppCommand::OpenProject | AppCommand::GitHub => None,
+            AppCommand::OpenProject | AppCommand::ConnectRemote | AppCommand::GitHub => None,
         }
     }
 
@@ -101,6 +110,7 @@ impl AppCommand {
             AppCommand::About => Box::new(About),
             AppCommand::Settings => Box::new(OpenSettings),
             AppCommand::OpenProject => Box::new(OpenProjectFolder),
+            AppCommand::ConnectRemote => Box::new(ConnectToRemote),
             AppCommand::GitHub => Box::new(OpenGithub),
         }
     }
@@ -109,6 +119,7 @@ impl AppCommand {
     pub fn perform(self, cx: &mut App) {
         match self {
             AppCommand::OpenProject => crate::root::pick_folder(cx),
+            AppCommand::ConnectRemote => crate::remote::connect::open_connect_window(None, cx),
             AppCommand::GitHub => cx.open_url(GITHUB_URL),
             other => {
                 if let Some(event) = other.host_event() {
@@ -195,6 +206,7 @@ const LAYOUT: &[(&str, &[Slot])] = &[
             Entry("NewAgentTab"),
             Entry("NewChildTerminal"),
             AppSlot(AppCommand::OpenProject),
+            AppSlot(AppCommand::ConnectRemote),
             Sep,
             Entry("CloseAgentTab"),
             Entry("CloseChildTerminal"),
@@ -411,6 +423,7 @@ pub fn register_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| AppCommand::About.perform(cx));
     cx.on_action(|_: &OpenSettings, cx| AppCommand::Settings.perform(cx));
     cx.on_action(|_: &OpenProjectFolder, cx| AppCommand::OpenProject.perform(cx));
+    cx.on_action(|_: &ConnectToRemote, cx| AppCommand::ConnectRemote.perform(cx));
     cx.on_action(|_: &OpenGithub, cx| AppCommand::GitHub.perform(cx));
 }
 

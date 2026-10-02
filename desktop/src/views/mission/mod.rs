@@ -632,7 +632,7 @@ impl MissionControl {
                     .min_w_0()
                     .child(crate::views::git_strip::git_strip(
                         &strip_view,
-                        &self.host,
+                        &crate::surface::Surface::Local(self.host.clone()),
                         p,
                     )),
             )
