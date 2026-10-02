@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.23.0] - 2026-10-02
+
+### New features
+
 - **FlightDeck Desktop, a native app for macOS, is now released separately.**
   It runs the same core as the TUI, on its own `desktop-v<x.y.z>` releases
   with its own updater. Its changes are listed in `desktop/CHANGELOG.md`.
