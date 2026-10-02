@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.2.0] - 2026-10-02
+
+### New features
+
 - **Control a FlightDeck on another machine.** *Connect to remote…* (the
   launcher, and File in the menu bar) pairs with a FlightDeck running elsewhere
   on your network or VPN, using the address and 4-digit code its web access
