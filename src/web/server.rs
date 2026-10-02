@@ -1854,9 +1854,19 @@ pub(crate) fn truncate_chars(raw: &str, max: usize) -> String {
     raw.chars().take(max).collect()
 }
 
+/// The product name FlightDeck Desktop sends as its `User-Agent`
+/// (`FlightDeck Desktop/<version>`) when it controls another instance.
+pub const NATIVE_CLIENT_AGENT: &str = "FlightDeck Desktop";
+
 /// Reduce a `User-Agent` to the `Chrome on macOS` shape turn 2 asks for, keeping
 /// only characters that are safe to render verbatim in a terminal chip.
 pub(crate) fn coarse_user_agent(raw: &str) -> String {
+    // FlightDeck Desktop controlling this instance as a native client
+    // (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §2.4). It names itself in full,
+    // so the access overlay can list — and revoke — it by name.
+    if raw.starts_with(NATIVE_CLIENT_AGENT) {
+        return NATIVE_CLIENT_AGENT.to_string();
+    }
     let browser = if raw.contains("Firefox/") {
         "Firefox"
     } else if raw.contains("Edg/") {

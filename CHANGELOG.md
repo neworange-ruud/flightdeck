@@ -29,6 +29,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   without moving its own selection. Dialogs those commands open confirm against
   the same session. Browsers are unchanged; an open browser tab from an older
   build is asked to reload.
+- **A native client for FlightDeck Web in the core library** (`web::client`):
+  pairing with the 4-digit code, the WebSocket link with the browser's
+  reconnect backoff, a mirror of the host's workspace with its own selection,
+  held keystrokes replayed exactly once after a reconnect, and remote terminals
+  behind the same PTY seam local ones use. FlightDeck Desktop builds its
+  remote control on it. The host's access list now names it
+  `FlightDeck Desktop`.
 
 ### Bug fixes
 

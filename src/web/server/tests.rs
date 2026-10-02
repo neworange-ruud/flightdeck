@@ -629,6 +629,17 @@ fn the_chip_label_is_the_observed_address_plus_a_coarse_user_agent() {
 }
 
 #[test]
+fn flightdeck_desktop_is_named_as_itself() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        "FlightDeck Desktop/0.2.0".parse().expect("header parses"),
+    );
+    let identity = viewer_identity(peer("192.168.2.30", 1), &headers, token());
+    assert_eq!(identity.label(), "192.168.2.30 · FlightDeck Desktop");
+}
+
+#[test]
 fn an_unrecognised_user_agent_adds_nothing_rather_than_guessing() {
     let mut headers = HeaderMap::new();
     headers.insert(
