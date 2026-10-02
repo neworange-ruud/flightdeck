@@ -376,18 +376,27 @@ jobs:
       - name: List assets
         run: ls -l dist
       # Create the release if it does not exist, then upload (re-runs replace assets).
-      # 0.x versions are created as pre-releases. Note the self-updater ignores
-      # pre-releases and drafts, so edit the release to a full one once 1.0 ships or
-      # when a 0.x build should be offered to users.
+      # - A SemVer pre-release (desktop-v0.2.0-beta.1) is created as a pre-release,
+      #   which the self-updater ignores; any other version is offered to users.
+      # - Never "Latest": that marker belongs to the CLI, whose documented install
+      #   (`releases/latest/download/flightdeck-installer.sh`) must keep resolving.
+      # - Notes are the version's section of desktop/CHANGELOG.md
+      #   (scripts/release-desktop writes it), else GitHub's generated notes.
       - name: Create release and upload assets
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            flags=()
-            if [[ "${RELEASE_TAG#desktop-v}" == 0.* ]]; then
+            version="${RELEASE_TAG#desktop-v}"
+            flags=(--latest=false)
+            if [[ "$version" == *-* ]]; then
               flags+=(--prerelease)
             fi
+            if scripts/desktop/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"; then
+              flags+=(--notes-file "$RUNNER_TEMP/notes.md")
+            else
+              flags+=(--generate-notes)
+            fi
             gh release create "$RELEASE_TAG" --verify-tag \
-              --title "FlightDeck Desktop ${RELEASE_TAG#desktop-v}" --generate-notes "${flags[@]}"
+              --title "FlightDeck Desktop ${version}" "${flags[@]}"
           fi
           shopt -s nullglob
           assets=(dist/*)

@@ -8,25 +8,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- **Native desktop app (preview): `flightdeck-desktop`.** A GPUI window around
-  real agent terminals. Project tabs sit in the titlebar, with an agent sidebar
-  showing status, diff stats and unread dots, a git strip (Push, Pull base,
-  Finish) and a mode/status bar. It has the command palette, every TUI dialog
-  and confirmation, the configuration manager, help and about, web access and
-  phone pairing (QR drawn natively), split view and child terminals, native
-  macOS menus, a dock badge, `--isolated`, and a project picker when launched
-  outside a repository. Every TUI chord works the same; Cmd on macOS is left to
-  the platform. Build from source with `cargo run -p flightdeck-desktop`; no
-  packaged builds are published yet. See `specs/DESKTOP_UI.md`.
-- **Mission control view in the desktop app (Alt-m).** Live tiles for every
-  working or waiting session across all projects, ordered needs-you first, plus
-  "earlier today" cards with a one-click Push, Pull base or Finish. A scope menu
-  selects the last 24h, 7 days or all sessions, with a project filter. Enter
-  opens a tile full size and Alt-Esc goes back. Waiting tiles offer inline
-  Approve/Deny for permission and single-select prompts, using the same answer
-  path as the phone.
+- **FlightDeck Desktop, a native app for macOS, is now released separately.**
+  It runs the same core as the TUI, on its own `desktop-v<x.y.z>` releases
+  with its own updater. Its changes are listed in `desktop/CHANGELOG.md`.
 - **New settings:** `[ui] desktop_terminal_font_size` and
-  `[ui] macos_option_as_meta` (desktop app).
+  `[ui] macos_option_as_meta`, read by the desktop app.
 
 ### Improvements
 
@@ -46,17 +32,6 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   input. This covers the TUI, the desktop app and phone replies.
 - **UTF-8 mouse reporting (`?1005`) now sends real UTF-8 coordinates** instead
   of legacy bytes, which were wrong past column 95.
-- **The desktop app works when launched from Finder, the Dock or a desktop
-  launcher.** Such a launch only gets the system `PATH`, so `git` and the
-  agents did not resolve as they do in a terminal, and opening a project could
-  fail. The app now adopts your login shell's environment at start-up when it
-  was not started from a terminal. This is bounded to 5 seconds, and if it
-  fails the launch environment is kept.
-- **Agents in the desktop app show colour and bold when it is launched from
-  Finder or the Dock.** Their terminals now always start with
-  `TERM=xterm-256color` and `COLORTERM=truecolor`, describing the app's own
-  emulator. Before, they inherited the launch environment, which outside a
-  terminal has no `TERM`, so agents fell back to plain text.
 - **"Not a git repository" errors now name the folder and give git's own
   reason.** Before, any git failure became "could not determine repository
   root", and the desktop launcher told you to "run FlightDeck from a git

@@ -22,6 +22,10 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+      # Desktop app tags (desktop-v0.1.0) match the pattern above too, but they
+      # release only the desktop app (desktop.yml). A negative pattern must come
+      # after the positive one it filters.
+      - '!desktop-v**'
   release:
     types: [published]
   workflow_dispatch:
@@ -44,6 +48,9 @@ defaults:
 jobs:
   deploy:
     name: build + deploy (Azure Container Apps)
+    # A desktop release published by hand (a `release` event for a desktop-v
+    # tag) is not a release of this; `ref_name` is the release's tag there too.
+    if: ${{ !startsWith(github.ref_name, 'desktop-v') }}
     runs-on: ubuntu-latest
     environment: production
     permissions:

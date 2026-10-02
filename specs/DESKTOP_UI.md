@@ -446,6 +446,13 @@ follows that tag line, and a Homebrew cask can follow later. Launched from
 Finder, the Start menu or a launcher it needs no repository. Launched outside a
 repository it shows a project picker (D9). It does not need the CLI installed.
 
+Released as its own product (decided 2026-10-02): own version (`desktop/Cargo.toml`),
+changelog (`desktop/CHANGELOG.md`, the source of its release notes), script
+(`scripts/release-desktop`) and tag line. Desktop tags start no other workflow, and a
+desktop release is never GitHub's "Latest" (that is the CLI's, for its install URL). A
+SemVer pre-release version is published as a pre-release; any other is offered by the
+self-updater. Steps: `desktop/PACKAGING.md`, "Cutting a release".
+
 The alternative was one binary with the GUI as the default and `--tui` for the
 terminal. It was rejected because the CLI would link GPUI. That brings GPUI's
 system requirements (Vulkan, X11/Wayland on Linux; the MSVC + Windows SDK build

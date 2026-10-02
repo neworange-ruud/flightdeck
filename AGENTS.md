@@ -1,6 +1,6 @@
 # Agent Instructions
 
-- Always update `CHANGELOG.md` when creating or updating a pull request.
+- Always update the changelog when creating or updating a pull request: `CHANGELOG.md` for the CLI/TUI and the shared core, `desktop/CHANGELOG.md` for the desktop app (a core change both apps get goes in both).
 - Verify changes before finishing — run the ship gate (tests, clippy, fmt) and hand the user a local build. See `.agents/skills/shipping-flightdeck-changes` for the exact commands and checklist.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->

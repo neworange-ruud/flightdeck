@@ -78,9 +78,18 @@ macOS x86_64 (`macos-15-intel`), Ubuntu x86_64 and Windows x86_64, then `publish
    version. It runs the packaging scripts, then
    `scripts/desktop/check-asset-names.sh --os <os> --version <v>`, then uploads the files.
 2. `publish` (the only job with `contents: write`) downloads all artifacts, creates the
-   GitHub Release for the tag if it does not exist (a pre-release for 0.x; the updater
-   ignores drafts and pre-releases) and uploads everything with `gh release upload --clobber`, so a re-run
-   replaces assets. `.msi`, `.deb` and `.rpm` are attached too but never fetched by the app.
+   GitHub Release for the tag if it does not exist and uploads everything with
+   `gh release upload --clobber`, so a re-run replaces assets. `.msi`, `.deb` and `.rpm`
+   are attached too but never fetched by the app. The release is created:
+   - as a **pre-release only for a SemVer pre-release version** (`desktop-v0.2.0-beta.1`);
+     the self-updater ignores pre-releases and drafts, and offers every other version;
+   - **never as "Latest"** (`--latest=false`). The repository's Latest release is the
+     CLI's: its documented install, `releases/latest/download/flightdeck-installer.sh`,
+     would 404 on a desktop release. (The CLI's own updater, axoupdater, skips a
+     Latest release without its installer anyway.) Promoting a desktop release by hand,
+     leave "Set as the latest release" unticked;
+   - with the version's section of `desktop/CHANGELOG.md` as its notes
+     (`scripts/desktop/release-notes.sh`), or GitHub's generated notes if it has none.
 
 Not built: Linux aarch64 (the AppImage job downloads the x86_64 `linuxdeploy`) and Windows
 aarch64. The updater refuses, rather than guesses, on those machines.
@@ -101,34 +110,61 @@ Notarization only runs when the app is signed and one complete credential set ex
 key first, then `NOTARY_KEYCHAIN_PROFILE` for local use, then Apple ID). It then staples
 the ticket and re-zips.
 
-**Tags and cargo-dist.** A `desktop-v0.1.0` tag also matches `release.yml`'s generic
-version pattern (`**[0-9]+.[0-9]+.[0-9]+*`). `release.yml` therefore has a hand-added
-negative pattern `'!desktop-v**'` after it in `on.push.tags`, and `dist-workspace.toml`
-sets `allow-dirty = ["ci"]` so `dist` does not reject the edited workflow. If cargo-dist
-is upgraded and `release.yml` regenerated, re-apply the exclusion.
+**Tags and the other release workflows.** A `desktop-v0.1.0` tag also matches the
+generic version pattern (`**[0-9]+.[0-9]+.[0-9]+*`) that `release.yml` (cargo-dist),
+`relay-deploy.yml`, `web-deploy.yml` and `ios-testflight.yml` trigger on. Each has a
+negative pattern `'!desktop-v**'` after it in `on.push.tags`; the three deploy jobs also
+skip a `desktop-v` ref (`if: !startsWith(github.ref_name, 'desktop-v')`), which covers a
+desktop release published by hand (their `release: published` trigger). Before these,
+pushing `desktop-v0.1.0` and `desktop-v0.1.1` redeployed the relay and web and started a
+TestFlight upload. `release.yml`'s exclusion is a hand edit: `dist-workspace.toml` sets
+`allow-dirty = ["ci"]` so `dist` does not reject it, and if cargo-dist is upgraded and
+`release.yml` regenerated, re-apply it.
 
 **Resilience.** `build-release` uses `fail-fast: false`. `publish` runs even if some legs
 failed (`if: always()`), uploads every artifact that exists, then fails the job so the
 incomplete release is visible. Re-running the failed legs and `publish` fills in the
-missing assets (`--clobber`). Versions `0.x` are created as **pre-releases**; the
-self-updater ignores pre-releases, so promote the release (edit it on GitHub) when it
-should be offered to users.
+missing assets (`--clobber`).
 
 #### First release checklist
 
 1. Set the secrets above (at minimum `CODESIGN_*`; they already exist for the TUI).
 2. Run `desktop.yml` manually (workflow_dispatch, no tag) and confirm `check` and
    `package` pass on all three OSes; this is the first time Linux and Windows run.
-3. Bump `desktop/Cargo.toml` to the release version and merge.
-4. Tag the merge commit `desktop-v<x.y.z>` and push. Confirm only `Desktop` starts, not
-   `Release`.
-5. Check the release has the macOS zips and `.sha256` files at least; fix and re-run any
+3. Run `scripts/release-desktop <x.y.z>` on `main` (see "Cutting a release"). Confirm
+   only `Desktop` starts: not `Release`, `Relay deploy`, `Web deploy` or `TestFlight`.
+4. Check the release has the macOS zips and `.sha256` files at least; fix and re-run any
    failed leg, then `publish`.
-6. Download the macOS zip, run `spctl -a -vv FlightDeck.app` and `codesign --verify --strict`.
-7. Promote from pre-release when ready, and add the Homebrew cask update.
+5. Download the macOS zip, run `spctl -a -vv FlightDeck.app` and `codesign --verify --strict`.
+6. Add the Homebrew cask update.
 
-To cut a release: bump the version in `desktop/Cargo.toml`, merge, then create and push the
-tag `desktop-v<x.y.z>` on the merge commit.
+### Cutting a release
+
+The desktop app and the CLI are released independently, each with its own version,
+changelog and tag line:
+
+| | CLI / TUI (`flightdeck`) | Desktop (`flightdeck-desktop`) |
+| --- | --- | --- |
+| Version | root `Cargo.toml` | `desktop/Cargo.toml` |
+| Changelog | `CHANGELOG.md` | `desktop/CHANGELOG.md` |
+| Script | `scripts/release <x.y.z>` | `scripts/release-desktop <x.y.z>` |
+| Tag | `v<x.y.z>` | `desktop-v<x.y.z>` |
+| Built by | `release.yml` (cargo-dist) | `desktop.yml` |
+| Also deploys | relay, web, TestFlight | nothing else |
+
+From an up-to-date `main`, with the release notes under `Unreleased` in
+`desktop/CHANGELOG.md`:
+
+```bash
+scripts/release-desktop 0.2.0         # offered by the self-updater
+scripts/release-desktop 0.2.0-beta.1  # a pre-release, ignored by the self-updater
+```
+
+It refuses a dirty tree, a branch behind its upstream, an existing tag, or an empty
+`Unreleased`; then sets the version (and `Cargo.lock`), rolls `Unreleased` into the
+version, commits `Release desktop-v<x.y.z>`, tags and pushes. The tag runs the release
+job above. A change to the shared core (`src/`) ships in whichever app is released next;
+note it in both changelogs.
 
 ### Asset name check
 
