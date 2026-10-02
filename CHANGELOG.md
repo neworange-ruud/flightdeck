@@ -52,6 +52,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   fail. The app now adopts your login shell's environment at start-up when it
   was not started from a terminal. This is bounded to 5 seconds, and if it
   fails the launch environment is kept.
+- **Agents in the desktop app show colour and bold when it is launched from
+  Finder or the Dock.** Their terminals now always start with
+  `TERM=xterm-256color` and `COLORTERM=truecolor`, describing the app's own
+  emulator. Before, they inherited the launch environment, which outside a
+  terminal has no `TERM`, so agents fell back to plain text.
 - **"Not a git repository" errors now name the folder and give git's own
   reason.** Before, any git failure became "could not determine repository
   root", and the desktop launcher told you to "run FlightDeck from a git

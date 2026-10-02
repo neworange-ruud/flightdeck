@@ -41,12 +41,14 @@ pub const EMULATOR: Emulator = Emulator::Alacritty;
 /// colours, so the answers to OSC 10/11 colour queries (which agents use to
 /// choose a light or dark theme) are the colours actually painted. From
 /// `Palette::dark()`, the palette `theme::init` installs: the app is
-/// dark-only. The TUI keeps `TerminalProfile::TUI` (vt100).
+/// dark-only. Every agent, shell and child terminal starts with
+/// [`TERMINAL_ENV`]. The TUI keeps `TerminalProfile::TUI` (vt100).
 pub fn desktop_profile() -> TerminalProfile {
     let palette = layout::TermPalette::from_palette(&crate::theme::Palette::dark());
     TerminalProfile {
         emulator: EMULATOR,
         default_colors: Some((view::channels(palette.fg), view::channels(palette.bg))),
+        env: TERMINAL_ENV,
     }
 }
 
@@ -112,18 +114,33 @@ fn feed(terminal: &mut Terminal, bytes: &[u8]) {
 /// Environment a desktop terminal's process starts with. A GUI app launched
 /// from the Finder, Explorer or a desktop launcher has no `TERM` of its own to
 /// pass down (a TUI inherits its host terminal's), and without one most
-/// programs fall back to dumb-terminal output. `COLORTERM` advertises
+/// programs fall back to dumb-terminal output: no colour, no bold. Started
+/// from a terminal, the app would pass down *that* terminal's description,
+/// which is not the emulator these programs run in. `COLORTERM` advertises
 /// truecolour, which the grid and element support.
+pub const TERMINAL_ENV: &[(&str, &str)] = &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
+/// [`TERMINAL_ENV`] as a PTY takes it, for the terminals spawned outside a
+/// tab session (the spike and the benchmark).
 pub fn terminal_env() -> Vec<(String, String)> {
-    vec![
-        ("TERM".to_string(), "xterm-256color".to_string()),
-        ("COLORTERM".to_string(), "truecolor".to_string()),
-    ]
+    TERMINAL_ENV
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_terminals_say_what_they_are() {
+        // Launched from Finder the app has no TERM to pass down; without one
+        // agents print without colour or bold.
+        let profile = desktop_profile();
+        assert!(profile.env.contains(&("TERM", "xterm-256color")));
+        assert!(profile.env.contains(&("COLORTERM", "truecolor")));
+    }
     use flightdeck::contracts::PtySize;
     use flightdeck::testing::{FakePty, FakePtyHandle};
 

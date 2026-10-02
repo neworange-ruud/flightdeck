@@ -58,14 +58,20 @@ pub enum TerminalKind {
 /// How a front-end wants its tab terminals built: which emulator parses them
 /// and the colours its default foreground / background are painted with (so
 /// the emulator can answer OSC 10/11 colour queries truthfully, which agents
-/// use to pick a light or dark theme). The TUI's is [`TerminalProfile::TUI`];
-/// the desktop app sets its own through `Env::terminal`.
+/// use to pick a light or dark theme), and the environment that tells the
+/// programs inside what that emulator is. The TUI's is
+/// [`TerminalProfile::TUI`]; the desktop app sets its own through
+/// `Env::terminal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalProfile {
     pub emulator: Emulator,
     /// `(foreground, background)` as RGB, or `None` to leave the emulator's
     /// own defaults.
     pub default_colors: Option<(Rgb, Rgb)>,
+    /// Variables every terminal of this profile starts with (`TERM`,
+    /// `COLORTERM`), ahead of a launch's own environment, which wins on a
+    /// clash. Empty for the TUI: its terminals inherit the host terminal's.
+    pub env: &'static [(&'static str, &'static str)],
 }
 
 /// An RGB colour, as `TerminalGrid::set_default_colors` takes it.
@@ -78,9 +84,20 @@ impl TerminalProfile {
     pub const TUI: TerminalProfile = TerminalProfile {
         emulator: TUI_EMULATOR,
         default_colors: None,
+        env: &[],
     };
 
     /// A fresh grid for this profile at `rows` x `cols`.
+    /// [`TerminalProfile::env`] followed by `launch`, the order a PTY applies
+    /// them in (a later entry overrides an earlier one).
+    fn spawn_env(self, launch: &[(String, String)]) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain(launch.iter().cloned())
+            .collect()
+    }
+
     fn build(self, rows: u16, cols: u16) -> Box<dyn TerminalGrid> {
         let mut grid = self.emulator.build(rows, cols);
         if let Some((fg, bg)) = self.default_colors {
@@ -166,6 +183,7 @@ impl Terminal {
             TerminalProfile {
                 emulator,
                 default_colors: None,
+                env: &[],
             },
         ))
     }
@@ -395,7 +413,8 @@ impl Session {
         cwd: &Path,
         size: PtySize,
     ) -> Result<()> {
-        let session = backend.spawn(cmd, args, env, cwd, size)?;
+        let env = self.profile.spawn_env(env);
+        let session = backend.spawn(cmd, args, &env, cwd, size)?;
         self.primary = Some(Terminal::new(
             TerminalKind::Primary,
             cmd.to_string(),
@@ -444,7 +463,8 @@ impl Session {
         cwd: &Path,
         size: PtySize,
     ) -> Result<usize> {
-        let session = backend.spawn(cmd, args, &[], cwd, size)?;
+        let env = self.profile.spawn_env(&[]);
+        let session = backend.spawn(cmd, args, &env, cwd, size)?;
         self.next_stream_id += 1;
         let stream_id = self.next_stream_id;
         self.children.push(Terminal::new(
@@ -662,6 +682,7 @@ mod tests {
         session.set_profile(TerminalProfile {
             emulator: Emulator::Alacritty,
             default_colors: Some(((0xee, 0xee, 0xee), (0x12, 0x34, 0x56))),
+            env: &[],
         });
         session
             .spawn_primary(&pty, "sh", &[], Path::new(CWD), sz())
@@ -683,6 +704,60 @@ mod tests {
         assert!(String::from_utf8(child.input())
             .unwrap()
             .contains("rgb:1212/3434/5656"));
+    }
+
+    #[test]
+    fn a_profile_s_env_reaches_every_terminal_and_a_launch_s_env_wins() {
+        const ENV: &[(&str, &str)] = &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut session = Session::new();
+        session.set_profile(TerminalProfile {
+            emulator: Emulator::Alacritty,
+            default_colors: None,
+            env: ENV,
+        });
+        let launch = [
+            ("COLORTERM".to_string(), "24bit".to_string()),
+            ("FLIGHTDECK_HOOK".to_string(), "1".to_string()),
+        ];
+        session
+            .spawn_primary_with_env(&pty, "claude", &[], &launch, Path::new(CWD), sz())
+            .unwrap();
+        session
+            .spawn_child(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+
+        // What a PTY ends up with: entries applied in order, last one wins.
+        let effective = |env: &[(String, String)]| {
+            env.iter()
+                .cloned()
+                .collect::<std::collections::BTreeMap<String, String>>()
+        };
+        let envs = pty.spawn_envs();
+        let agent = effective(&envs[0]);
+        assert_eq!(agent["TERM"], "xterm-256color");
+        assert_eq!(agent["COLORTERM"], "24bit", "the launch's own value wins");
+        assert_eq!(agent["FLIGHTDECK_HOOK"], "1");
+        let child = effective(&envs[1]);
+        assert_eq!(child["TERM"], "xterm-256color");
+        assert_eq!(child["COLORTERM"], "truecolor");
+    }
+
+    #[test]
+    fn the_tui_profile_adds_no_environment() {
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut session = Session::new();
+        session
+            .spawn_primary(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+        assert_eq!(
+            pty.spawn_envs(),
+            vec![Vec::new()],
+            "inherits the host terminal's"
+        );
     }
 
     /// Regression: resizing to a tiny grid and then feeding output must not
