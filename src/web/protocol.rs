@@ -185,6 +185,14 @@ mod tests;
 /// and the old toggle metadata was removed. A stale v4 tab would render and
 /// confirm the wrong form, so it must reload.
 ///
+/// **v6 is explicit command targets** (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md`
+/// §3.1). A palette [`Command`]'s `args` used to be ignored; they may now name
+/// `session_id` or `terminal_id`, and the host then acts on that session or
+/// terminal instead of its own selection, without moving the selection. That
+/// is a change in what an existing field *means*, hence the bump. A browser
+/// sends no target and keeps D3's shared selection; a native client (FlightDeck
+/// Desktop as a remote control) browses independently and always names one.
+///
 /// It is deliberately the whole range — there is no older web protocol to
 /// interoperate with, because the browser SPA ships inside the same binary as
 /// the server (D9), and a stale tab is answered with "reload to update" rather
@@ -201,14 +209,14 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
 /// and SPA ship in the same binary (D9), so there is no older peer to keep.
-pub const MIN_SUPPORTED_VERSION: u16 = 5;
+pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 5;
+pub const MAX_SUPPORTED_VERSION: u16 = 6;
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -2456,6 +2464,11 @@ pub struct Command {
     /// The command name; see [`command`] for M1's set.
     pub name: String,
     /// Arguments, shaped per command. Absent for commands that take none.
+    ///
+    /// Since v6 a session-scoped palette command may carry `session_id` or
+    /// `terminal_id` here to act on that session (or terminal) rather than the
+    /// host's selection; an id the host does not have is rejected, never
+    /// resolved to the selection instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
 }

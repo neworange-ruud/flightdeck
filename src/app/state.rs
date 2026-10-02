@@ -15,7 +15,9 @@ use crate::agents::registry::AgentRegistry;
 use crate::agents::setup::{prepare_status_launch, status_backend};
 use crate::agents::status::{combine_status, DisplayStatus};
 use crate::app::activity::{ActivityProbe, GitFingerprint};
-use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
+use crate::app::commands::{
+    CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector, TabTarget, TerminalPick,
+};
 use crate::app::modes::InputMode;
 use crate::contracts::{
     AgentDef, Clock, CommandRunner, Config, ContainerRuntime, ContainerState, ContainersConfig,
@@ -238,6 +240,33 @@ fn validate_launchable(
         container.available()
     } else {
         validate_agent(agent, base)
+    }
+}
+
+/// The refusal for a [`TabTarget`] whose tab has closed since it was named.
+pub const TARGET_GONE: &str =
+    "That session is no longer open — the view it was chosen from is out of date.";
+
+/// The child terminal a child-scoped command acts on: the session's own
+/// selected child, or the one `pick` names. `Ok(None)` means "no child" (the
+/// primary is selected or picked); `Err` is the refusal for a child that has
+/// closed since it was named.
+fn picked_child(
+    session: &Session,
+    pick: Option<TerminalPick>,
+) -> std::result::Result<Option<usize>, Effect> {
+    match pick {
+        None => Ok(session.selected_child()),
+        Some(TerminalPick::Primary) => Ok(None),
+        Some(TerminalPick::Child(stream)) => (0..session.child_count())
+            .find(|&i| session.child(i).is_some_and(|c| c.stream_id() == stream))
+            .map(Some)
+            .ok_or_else(|| {
+                Effect::Refused(
+                    "That terminal is no longer open — the view it was chosen from is out of date."
+                        .to_string(),
+                )
+            }),
     }
 }
 
@@ -752,11 +781,25 @@ impl AppState {
         self.selected_tab.and_then(|i| self.tabs.get(i))
     }
 
-    /// Whether the selected tab's worktree is still being created.
-    fn selected_is_creating(&self) -> bool {
-        self.selected()
-            .map(|t| t.phase == TabPhase::Creating)
-            .unwrap_or(false)
+    /// Whether the tab at `index` exists and its worktree is still being created.
+    fn is_creating(&self, index: Option<usize>) -> bool {
+        index
+            .and_then(|i| self.tabs.get(i))
+            .is_some_and(|t| t.phase == TabPhase::Creating)
+    }
+
+    /// The index of the tab with this id, if it is open.
+    pub fn tab_index(&self, id: &TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.meta.id == id.0)
+    }
+
+    /// The tab a session-scoped command acts on: `target`'s, or the selected
+    /// one when there is no target (see [`AppState::dispatch_to`]).
+    pub fn target_tab(&self, target: Option<&TabTarget>) -> Option<&RuntimeTab> {
+        match target {
+            None => self.selected(),
+            Some(t) => self.tab_index(&t.tab).map(|i| &self.tabs[i]),
+        }
     }
 
     /// Mutable access to the selected runtime tab, if any.
@@ -1051,11 +1094,42 @@ impl AppState {
     /// The command reducer (SPECS §22). Calls the services through the trait
     /// objects and returns an [`Effect`] describing what the UI should surface.
     pub fn dispatch(&mut self, cmd: Command, services: &Services) -> Result<Effect> {
-        // Commands that act on the selected tab's live worktree/session are
-        // refused while that tab's worktree is still being created on a
-        // background worker (SPECS §16/§17). Closing/switching stays allowed so
-        // the user can always cancel — important if creation itself hangs.
-        if self.selected_is_creating() && requires_ready_tab(&cmd) {
+        self.dispatch_to(cmd, None, services)
+    }
+
+    /// [`AppState::dispatch`] against an explicit tab instead of the selected
+    /// one (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1).
+    ///
+    /// `target` `None` is exactly [`AppState::dispatch`]. With a target, every
+    /// session-scoped command acts on that tab — and, for the child-terminal
+    /// commands, on [`TabTarget::terminal`] — and `selected_tab` is never read
+    /// or moved for it, so a remote viewer acting on a tab the host is not
+    /// showing leaves the host's own view where it was. Global commands (new
+    /// tab, pull base, switching tabs, split view, help, quit) ignore the
+    /// target.
+    ///
+    /// A target naming a tab that is no longer open is refused rather than
+    /// falling back to the selection: acting on a tab nobody named is the one
+    /// outcome this exists to prevent.
+    pub fn dispatch_to(
+        &mut self,
+        cmd: Command,
+        target: Option<&TabTarget>,
+        services: &Services,
+    ) -> Result<Effect> {
+        let tab = match target {
+            None => self.selected_tab,
+            Some(t) => match self.tab_index(&t.tab) {
+                Some(index) => Some(index),
+                None => return Ok(Effect::Refused(TARGET_GONE.to_string())),
+            },
+        };
+        let pick = target.and_then(|t| t.terminal);
+        // Commands that act on a tab's live worktree/session are refused while
+        // that tab's worktree is still being created on a background worker
+        // (SPECS §16/§17). Closing/switching stays allowed so the user can
+        // always cancel — important if creation itself hangs.
+        if self.is_creating(tab) && requires_ready_tab(&cmd) {
             return Ok(Effect::Refused(
                 "This tab is still being created — please wait.".to_string(),
             ));
@@ -1064,26 +1138,26 @@ impl AppState {
             Command::NewAgentTab { name, agent_key } => {
                 self.cmd_new_agent_tab(&name, agent_key.as_deref(), services)
             }
-            Command::RenameAgentTab { new_name } => self.cmd_rename(&new_name, services),
-            Command::CloseAgentTab { action } => self.cmd_close_tab(action, services),
-            Command::PushBranch { confirm } => self.cmd_push(confirm, services),
-            Command::FinishLocalMerge { confirm } => self.cmd_finish_merge(confirm, services),
-            Command::RebaseWorktree { confirm } => self.cmd_rebase(confirm, services),
+            Command::RenameAgentTab { new_name } => self.cmd_rename(tab, &new_name, services),
+            Command::CloseAgentTab { action } => self.cmd_close_tab(tab, action, services),
+            Command::PushBranch { confirm } => self.cmd_push(tab, confirm, services),
+            Command::FinishLocalMerge { confirm } => self.cmd_finish_merge(tab, confirm, services),
+            Command::RebaseWorktree { confirm } => self.cmd_rebase(tab, confirm, services),
             Command::PullBase => self.cmd_pull_base(services),
-            Command::CopyEnvFile => self.cmd_copy_env_file(services),
-            Command::AbandonWorktree { confirm } => self.cmd_abandon(confirm, services),
-            Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(services),
+            Command::CopyEnvFile => self.cmd_copy_env_file(tab, services),
+            Command::AbandonWorktree { confirm } => self.cmd_abandon(tab, confirm, services),
+            Command::NewChildTerminal | Command::OpenShell => self.cmd_new_child(tab, services),
             Command::NewAgentTerminal { agent_key } => {
-                self.cmd_new_agent_child(agent_key.as_deref(), services)
+                self.cmd_new_agent_child(tab, agent_key.as_deref(), services)
             }
-            Command::CloseChildTerminal => self.cmd_close_child(),
-            Command::CloseAgentTerminal => self.cmd_close_agent_child(),
+            Command::CloseChildTerminal => self.cmd_close_child(tab, pick),
+            Command::CloseAgentTerminal => self.cmd_close_agent_child(tab, pick),
             Command::SwitchAgentTab(sel) => self.cmd_switch_tab(sel),
-            Command::SwitchChildTerminal(sel) => self.cmd_switch_child(sel),
-            Command::SetManualStatus(status) => self.cmd_set_manual_status(status, services),
-            Command::RestartAgent => self.cmd_restart_agent(services),
-            Command::ShowGitStatus => self.cmd_show_git_status(services),
-            Command::OpenWorktreeInFileManager => Ok(self.cmd_open_in_file_manager()),
+            Command::SwitchChildTerminal(sel) => self.cmd_switch_child(tab, sel),
+            Command::SetManualStatus(status) => self.cmd_set_manual_status(tab, status, services),
+            Command::RestartAgent => self.cmd_restart_agent(tab, services),
+            Command::ShowGitStatus => self.cmd_show_git_status(tab, services),
+            Command::OpenWorktreeInFileManager => Ok(self.cmd_open_in_file_manager(tab)),
             Command::ShowHelp => Ok(Effect::ShowHelp),
             Command::ShowAbout => Ok(Effect::ShowAbout),
             Command::ToggleSplitView => {
@@ -1600,8 +1674,13 @@ impl AppState {
 
     /// Rename: change only the tab `name`; never touch branch/slug/worktree/base
     /// metadata (SPECS §18).
-    fn cmd_rename(&mut self, new_name: &str, services: &Services) -> Result<Effect> {
-        let Some(tab) = self.selected_mut() else {
+    fn cmd_rename(
+        &mut self,
+        tab: Option<usize>,
+        new_name: &str,
+        services: &Services,
+    ) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         tab.meta.name = new_name.to_string();
@@ -1613,10 +1692,11 @@ impl AppState {
     /// set; never auto-escalate to force-kill.
     fn cmd_close_tab(
         &mut self,
+        tab: Option<usize>,
         action: Option<CloseAction>,
         services: &Services,
     ) -> Result<Effect> {
-        let Some(idx) = self.selected_tab else {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
 
@@ -1673,8 +1753,13 @@ impl AppState {
     }
 
     /// Push (SPECS §14): plan; warn on uncommitted; on confirm push; then PR URL.
-    fn cmd_push(&mut self, confirm: Option<PushConfirm>, services: &Services) -> Result<Effect> {
-        let Some(tab) = self.selected() else {
+    fn cmd_push(
+        &mut self,
+        tab: Option<usize>,
+        confirm: Option<PushConfirm>,
+        services: &Services,
+    ) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
@@ -1704,8 +1789,13 @@ impl AppState {
     /// Finish / Local Merge (SPECS §13/§15). Dirty base → disabled with the
     /// persistent warning; otherwise check preconditions and merge only when
     /// allowed; never auto-resolve conflicts.
-    fn cmd_finish_merge(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
-        let Some(idx) = self.selected_tab else {
+    fn cmd_finish_merge(
+        &mut self,
+        tab: Option<usize>,
+        confirm: bool,
+        services: &Services,
+    ) -> Result<Effect> {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         if self.tabs[idx].meta.runs_on_base {
@@ -1802,8 +1892,13 @@ impl AppState {
     /// base tip — drift (SPECS §12) then reflects that the base has been
     /// incorporated. The worktree branch's history is rewritten, so a previously
     /// pushed branch will need a force-push to update the remote / PR.
-    fn cmd_rebase(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
-        let Some(idx) = self.selected_tab else {
+    fn cmd_rebase(
+        &mut self,
+        tab: Option<usize>,
+        confirm: bool,
+        services: &Services,
+    ) -> Result<Effect> {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         if self.tabs[idx].meta.runs_on_base {
@@ -1949,8 +2044,13 @@ impl AppState {
     /// prompt whether uncommitted changes would be lost); once the user confirms
     /// (`confirm` true) it is force-removed regardless of uncommitted changes.
     /// The tab is dropped after a successful removal.
-    fn cmd_abandon(&mut self, confirm: bool, services: &Services) -> Result<Effect> {
-        let Some(idx) = self.selected_tab else {
+    fn cmd_abandon(
+        &mut self,
+        tab: Option<usize>,
+        confirm: bool,
+        services: &Services,
+    ) -> Result<Effect> {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         if self.tabs[idx].meta.runs_on_base {
@@ -1998,8 +2098,8 @@ impl AppState {
     }
 
     /// Copy the first available base env file into the selected worktree.
-    fn cmd_copy_env_file(&mut self, services: &Services) -> Result<Effect> {
-        let Some(tab) = self.selected() else {
+    fn cmd_copy_env_file(&mut self, tab: Option<usize>, services: &Services) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
@@ -2022,11 +2122,11 @@ impl AppState {
     /// New child shell terminal in the selected tab's worktree (SPECS §19). When
     /// the tab's agent runs in a container, the shell runs *inside* it via
     /// `podman exec` so it shares `/workspace` and the toolchain (SPECS §31).
-    fn cmd_new_child(&mut self, services: &Services) -> Result<Effect> {
+    fn cmd_new_child(&mut self, tab: Option<usize>, services: &Services) -> Result<Effect> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
         let profile = self.terminal_profile;
-        let Some(tab) = self.selected_mut() else {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let cwd = to_absolute(&repo_root, Path::new(&tab.meta.worktree_path_relative));
@@ -2058,12 +2158,13 @@ impl AppState {
     /// containerized, otherwise a local launch.
     fn cmd_new_agent_child(
         &mut self,
+        tab: Option<usize>,
         agent_key: Option<&str>,
         services: &Services,
     ) -> Result<Effect> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
-        let Some(idx) = self.selected_tab else {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let agent_key = agent_key
@@ -2103,12 +2204,21 @@ impl AppState {
         Ok(Effect::None)
     }
 
-    /// Close the selected tab's currently-selected child terminal (SPECS §19).
-    fn cmd_close_child(&mut self) -> Result<Effect> {
-        let Some(tab) = self.selected_mut() else {
+    /// Close the selected tab's currently-selected child terminal (SPECS §19),
+    /// or the one `pick` names.
+    fn cmd_close_child(
+        &mut self,
+        tab: Option<usize>,
+        pick: Option<TerminalPick>,
+    ) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let Some(child) = tab.session.selected_child() else {
+        let child = match picked_child(&tab.session, pick) {
+            Ok(child) => child,
+            Err(refusal) => return Ok(refusal),
+        };
+        let Some(child) = child else {
             return Ok(Effect::Refused("No child terminal selected.".to_string()));
         };
         tab.session.close_child(child)?;
@@ -2118,11 +2228,19 @@ impl AppState {
 
     /// Close the selected tab's currently-selected child terminal, but only when
     /// it is an additional *agent* (not a shell). Refuses otherwise (SPECS §19).
-    fn cmd_close_agent_child(&mut self) -> Result<Effect> {
-        let Some(tab) = self.selected_mut() else {
+    fn cmd_close_agent_child(
+        &mut self,
+        tab: Option<usize>,
+        pick: Option<TerminalPick>,
+    ) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let Some(child) = tab.session.selected_child() else {
+        let child = match picked_child(&tab.session, pick) {
+            Ok(child) => child,
+            Err(refusal) => return Ok(refusal),
+        };
+        let Some(child) = child else {
             return Ok(Effect::Refused("No agent tab selected.".to_string()));
         };
         let is_agent = tab.session.child(child).map(|t| t.kind)
@@ -2155,11 +2273,11 @@ impl AppState {
     /// Switch the selected tab's active terminal (SPECS §22). `Next`/`Prev`
     /// cycle the full horizontal tab ring — the primary "agent" terminal plus
     /// every child shell — wrapping around. `Index(i)` selects child shell `i`.
-    fn cmd_switch_child(&mut self, sel: Selector) -> Result<Effect> {
+    fn cmd_switch_child(&mut self, tab: Option<usize>, sel: Selector) -> Result<Effect> {
         // No selected tab (e.g. a freshly-opened project with no agents yet):
         // switching terminals is simply a no-op, never an error — pressing an
         // arrow must never be fatal. Mirrors `cmd_switch_tab`.
-        let Some(tab) = self.selected_mut() else {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Ok(Effect::None);
         };
         let child_count = tab.session.child_count();
@@ -2198,10 +2316,11 @@ impl AppState {
     /// visible — only the manual field changes.
     fn cmd_set_manual_status(
         &mut self,
+        tab: Option<usize>,
         status: Option<ManualStatus>,
         services: &Services,
     ) -> Result<Effect> {
-        let Some(tab) = self.selected_mut() else {
+        let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         tab.meta.manual_status = status.map(|s| s.as_str().to_string());
@@ -2571,8 +2690,8 @@ impl AppState {
 
     /// Restart the primary agent of the selected (recovered/stopped) tab
     /// (SPECS §10, §23). Re-validates the agent before spawning.
-    fn cmd_restart_agent(&mut self, services: &Services) -> Result<Effect> {
-        let Some(idx) = self.selected_tab else {
+    fn cmd_restart_agent(&mut self, tab: Option<usize>, services: &Services) -> Result<Effect> {
+        let Some(idx) = tab else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         // An explicit restart always starts fresh (never silently reattaches).
@@ -2689,8 +2808,8 @@ impl AppState {
     }
 
     /// Show the git status panel for the selected tab (SPECS §21).
-    fn cmd_show_git_status(&mut self, services: &Services) -> Result<Effect> {
-        let Some(tab) = self.selected() else {
+    fn cmd_show_git_status(&mut self, tab: Option<usize>, services: &Services) -> Result<Effect> {
+        let Some(tab) = tab.and_then(|i| self.tabs.get(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
         let branch = tab.meta.branch.clone();
@@ -2723,8 +2842,8 @@ impl AppState {
     /// tab's worktree, or the project's repo root when no tab is selected (a
     /// freshly opened project). Performs no I/O — the TUI layer spawns the
     /// launcher (SPECS §27).
-    fn cmd_open_in_file_manager(&self) -> Effect {
-        let path = match self.selected() {
+    fn cmd_open_in_file_manager(&self, tab: Option<usize>) -> Effect {
+        let path = match tab.and_then(|i| self.tabs.get(i)) {
             Some(tab) => to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative)),
             None => self.repo_root.clone(),
         };
@@ -4220,6 +4339,112 @@ mod tests {
     }
 
     // --- §26 / §24: manual status applied AND process state represented --
+
+    /// Two real tabs, `One` then `Two`; creating a tab selects it, so `Two`
+    /// is selected.
+    fn two_tab_state(dir: &TempDir, svc: &Services, pty: &FakePty) -> AppState {
+        let (agent, _cmd) = make_real_agent(dir, "opencode");
+        let mut app = fresh_state(config_with_agent(agent));
+        for name in ["One", "Two"] {
+            pty.queue_session();
+            app.dispatch(
+                Command::NewAgentTab {
+                    name: name.to_string(),
+                    agent_key: None,
+                },
+                svc,
+            )
+            .unwrap();
+        }
+        assert_eq!(app.selected_tab, Some(1));
+        app
+    }
+
+    /// `dispatch_to` acts on the tab it names and never moves the selection
+    /// (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1).
+    #[test]
+    fn a_targeted_dispatch_acts_on_its_tab_and_leaves_the_selection() {
+        let dir = TempDir::new().unwrap();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+        let mut app = two_tab_state(&dir, &svc, &pty);
+        let one = TabTarget::tab(app.tabs[0].id());
+
+        app.dispatch_to(
+            Command::SetManualStatus(Some(ManualStatus::Blocked)),
+            Some(&one),
+            &svc,
+        )
+        .unwrap();
+        app.dispatch_to(
+            Command::RenameAgentTab {
+                new_name: "Renamed".to_string(),
+            },
+            Some(&one),
+            &svc,
+        )
+        .unwrap();
+
+        assert_eq!(app.tabs[0].meta.manual_status.as_deref(), Some("blocked"));
+        assert_eq!(app.tabs[0].meta.name, "Renamed");
+        assert_eq!(app.tabs[1].meta.manual_status, None);
+        assert_eq!(app.tabs[1].meta.name, "Two");
+        assert_eq!(app.selected_tab, Some(1), "the selection never moved");
+    }
+
+    /// A target that names a closed tab is refused; it never falls back to the
+    /// selection.
+    #[test]
+    fn a_target_naming_a_closed_tab_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+        let mut app = two_tab_state(&dir, &svc, &pty);
+        let gone = TabTarget::tab(TabId("closed-long-ago".to_string()));
+
+        let effect = app
+            .dispatch_to(
+                Command::SetManualStatus(Some(ManualStatus::Done)),
+                Some(&gone),
+                &svc,
+            )
+            .unwrap();
+
+        assert_eq!(effect, Effect::Refused(TARGET_GONE.to_string()));
+        assert!(app.tabs.iter().all(|t| t.meta.manual_status.is_none()));
+    }
+
+    /// Removing a targeted tab *before* the selection keeps the selection on
+    /// the same tab, at its new index.
+    #[test]
+    fn closing_a_targeted_tab_keeps_the_selection_on_its_tab() {
+        let dir = TempDir::new().unwrap();
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+        let mut app = two_tab_state(&dir, &svc, &pty);
+        let one = TabTarget::tab(app.tabs[0].id());
+
+        app.dispatch_to(
+            Command::CloseAgentTab {
+                action: Some(CloseAction::ForceTerminate),
+            },
+            Some(&one),
+            &svc,
+        )
+        .unwrap();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.selected().map(|t| t.meta.name.as_str()), Some("Two"));
+    }
 
     #[test]
     fn manual_status_override_keeps_process_state_visible() {

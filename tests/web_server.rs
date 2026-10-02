@@ -4573,3 +4573,51 @@ fn the_qr_payload_carries_a_code_the_server_accepts() {
         );
     });
 }
+
+/// Web protocol v6 (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §3.1): a palette
+/// command may name the session or terminal it acts on, and the server hands
+/// that target to the host untouched. The host — not the server — resolves it
+/// (the dispatch tests in `src/lib.rs` cover a targeted `restart_agent`, a
+/// targeted close confirmed through the shared dialog, and a stale target), so
+/// what this pins is that the socket neither strips nor rewrites it.
+#[test]
+fn a_targeted_command_reaches_the_host_with_its_target() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut ws = control(&addr, &cookie).await;
+        for (seq, name, args) in [
+            (
+                1,
+                names::RESTART_AGENT,
+                serde_json::json!({ "session_id": "tab-not-selected" }),
+            ),
+            (
+                2,
+                names::CLOSE_AGENT_SESSION_TAB,
+                serde_json::json!({ "session_id": "tab-not-selected" }),
+            ),
+            (
+                3,
+                names::CLOSE_CHILD_TERMINAL,
+                serde_json::json!({ "terminal_id": "tab-not-selected:child-7" }),
+            ),
+        ] {
+            send(
+                &mut ws,
+                &ClientMsg::Command(WireCommand {
+                    seq,
+                    name: name.to_string(),
+                    args: Some(args.clone()),
+                }),
+            )
+            .await;
+            let (_, _, forwarded) = wait_for_command(&harness);
+            assert_eq!(forwarded.seq, seq);
+            assert_eq!(forwarded.name, name);
+            assert_eq!(forwarded.args, Some(args), "the target arrives verbatim");
+        }
+    });
+}

@@ -23,6 +23,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   vt100 and the desktop uses alacritty_terminal. TUI behaviour is unchanged.
 - **The TUI sidebar marks unread agents,** and agent rows now carry line diff
   stats.
+- **Remote commands can name the session they act on.** FlightDeck Web
+  (protocol v6) accepts a `session_id` or `terminal_id` on session commands
+  such as restart, rename, close and push, and the host acts on that session
+  without moving its own selection. Dialogs those commands open confirm against
+  the same session. Browsers are unchanged; an open browser tab from an older
+  build is asked to reload.
 
 ### Bug fixes
 

@@ -18,7 +18,11 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **Remote commands can name the session they act on.** When the app is
+  controlled from another machine, FlightDeck Web (protocol v6) accepts a
+  `session_id` or `terminal_id` on session commands and acts on that session
+  without moving this window's selection. Browsers are unchanged; an open
+  browser tab from an older build is asked to reload.
 
 ### Bug fixes
 
