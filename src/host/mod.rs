@@ -58,8 +58,8 @@ use crate::{
     resolve_dialog_outcomes, service_remote_commands, session_index, spawn_finish_count,
     spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
     terminate_all_sessions, update_check_enabled, web_dialog_view, web_host_state_now,
-    web_input_holder, web_started_message, Env, RemoteSetup, StatusMsg, Ui, WebSurface, Workspace,
-    WorkspaceTerminals,
+    web_input_holder, web_started_message, Env, RemoteSetup, RemoteStart, StatusMsg, Ui,
+    WebSurface, Workspace, WorkspaceTerminals,
 };
 use flightdeck_remote_protocol::ProjectId;
 
@@ -423,7 +423,14 @@ impl<'a> AppHost<'a> {
         // FlightDeck Remote (optional). When disabled `start_remote` spawns
         // nothing and returns `None`, so every tee/tick below is a cheap no-op.
         if let Some((remote_in_tx, remote_out_rx)) = self.remote_wiring.take() {
-            self.remote_setup = start_remote(env, workspace, remote_in_tx, remote_out_rx);
+            self.remote_setup = match start_remote(env, workspace, remote_in_tx, remote_out_rx) {
+                RemoteStart::Started(setup) => Some(setup),
+                RemoteStart::HeldElsewhere => {
+                    self.ui.remote_held_elsewhere = true;
+                    None
+                }
+                RemoteStart::Off => None,
+            };
         }
         // The outbound feed bridge exists only while the relay thread does. It builds
         // the phone-facing snapshots/deltas/transcript/events each tick and seals

@@ -1226,6 +1226,9 @@ struct Ui {
     /// the two lifecycle flags above: the lock lives behind
     /// [`crate::web::server::WebServerHandle`], which only the event loop holds.
     pending_input_preempt: bool,
+    /// Whether another FlightDeck on this machine is the relay client, so this
+    /// one started none ([`RemoteStart::HeldElsewhere`]).
+    remote_held_elsewhere: bool,
     /// Whether the front-end performs the palette's front-end rows
     /// ([`PaletteAction::FrontEnd`]): set once by the desktop app
     /// ([`crate::host::AppHost::set_desktop_front_end`]), never by the TUI.
@@ -2831,10 +2834,39 @@ struct RemoteSetup {
     relay_url: String,
     /// An already-paired pairing to bring live immediately, if any.
     established: Option<EstablishedPairing>,
+    /// Held for as long as this process is the machine's relay client (see
+    /// [`RELAY_LOCK_FILE`]); `None` only on a filesystem that cannot lock.
+    _owner: Option<crate::contracts::FileLock>,
+}
+
+/// Beside `remote.json`: whichever FlightDeck holds an exclusive lock on this
+/// file is the one process on this machine that talks to the relay.
+///
+/// Every FlightDeck on a machine shares one relay identity and one set of
+/// pairings (`remote.json`). Two of them connected at once — a TUI and the
+/// desktop app, or two desktop instances — supersede each other's relay
+/// connection over and over, and each numbers the same pairing's envelopes
+/// from its own counter, so the relay rejects one stream as a seq gap and the
+/// other as a rewind. The first process to start the relay client owns it; the
+/// others leave it alone ([`RemoteStart::HeldElsewhere`]).
+const RELAY_LOCK_FILE: &str = "remote.lock";
+
+/// What Pair Phone says when another FlightDeck owns the relay.
+const REMOTE_HELD_ELSEWHERE: &str = "FlightDeck Remote is running in another FlightDeck on this \
+     computer. Pair the phone from that one, or quit it and restart this one.";
+
+/// What [`start_remote`] did.
+enum RemoteStart {
+    /// `[remote]` is off, or not configured, or the identity is unreadable.
+    Off,
+    /// Another FlightDeck on this machine is the relay client.
+    HeldElsewhere,
+    Started(RemoteSetup),
 }
 
 /// Construct the FlightDeck Remote client thread when `[remote]` is enabled and
-/// a relay URL is configured. Returns `None` (spawning nothing) when disabled,
+/// a relay URL is configured, and no other FlightDeck on this machine already
+/// is the relay client ([`RELAY_LOCK_FILE`]). Spawns nothing when disabled,
 /// when no relay URL is set, or when the per-user identity file cannot be
 /// located/created — the app runs exactly as before in every such case.
 fn start_remote(
@@ -2842,13 +2874,40 @@ fn start_remote(
     workspace: &Workspace,
     inbound_tx: Sender<RemoteInbound>,
     outbound_rx: Receiver<RemoteOutbound>,
-) -> Option<RemoteSetup> {
+) -> RemoteStart {
     let cfg = workspace.active_project().state.config.remote.clone();
     if !cfg.enabled || cfg.relay_url.is_empty() {
-        return None;
+        return RemoteStart::Off;
     }
-    let path = remote_state_path()?;
-    let (identity, state) = load_or_create_identity(env.fs, &path).ok()?;
+    let Some(path) = remote_state_path() else {
+        return RemoteStart::Off;
+    };
+    start_remote_at(env, &path, cfg, inbound_tx, outbound_rx)
+}
+
+/// [`start_remote`] for the state file at `path`, once `[remote]` is known to
+/// be on.
+fn start_remote_at(
+    env: &Env,
+    path: &Path,
+    cfg: crate::contracts::RemoteConfig,
+    inbound_tx: Sender<RemoteInbound>,
+    outbound_rx: Receiver<RemoteOutbound>,
+) -> RemoteStart {
+    // Claimed before the identity is read, so a second process never touches
+    // the relay or the pairings' cursors at all. A filesystem that cannot lock
+    // runs as before rather than lose the phone.
+    let owner = match env
+        .fs
+        .try_lock_exclusive(&path.with_file_name(RELAY_LOCK_FILE))
+    {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => return RemoteStart::HeldElsewhere,
+        Err(_) => None,
+    };
+    let Ok((identity, state)) = load_or_create_identity(env.fs, path) else {
+        return RemoteStart::Off;
+    };
     let identity_scalar = identity.private_key_bytes();
     // A per-device relay URL override wins over config (matches the client).
     let relay_url = match &state.relay_url {
@@ -2870,12 +2929,64 @@ fn start_remote(
                 last_sent_seq: p.last_sent_seq,
             });
     let handle = RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx);
-    Some(RemoteSetup {
+    RemoteStart::Started(RemoteSetup {
         handle,
         identity_scalar,
         relay_url,
         established,
+        _owner: owner,
     })
+}
+
+#[cfg(test)]
+mod relay_owner_tests {
+    use super::*;
+    use crate::testing::{FakeClock, FakeCommandRunner, FakeContainerRuntime, FakeFs, FakePty};
+
+    /// A second FlightDeck on the machine leaves the relay to the first: it
+    /// starts no client and never reads or creates the shared identity, whose
+    /// pairing cursors the owner is advancing.
+    #[test]
+    fn a_second_process_leaves_the_relay_to_the_owner() {
+        let fs = FakeFs::new();
+        let (pty, clock) = (FakePty::new(), FakeClock::default());
+        let (container, command) = (FakeContainerRuntime::new(), FakeCommandRunner::new());
+        let env = Env {
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+            terminal: crate::terminal::session::TerminalProfile::TUI,
+        };
+        let state = Path::new("/home/u/.flightdeck/remote.json");
+        let owner = fs
+            .try_lock_exclusive(&state.with_file_name(RELAY_LOCK_FILE))
+            .unwrap()
+            .expect("the first process owns the relay");
+
+        let (in_tx, _in_rx) = std::sync::mpsc::channel();
+        let (_out_tx, out_rx) = std::sync::mpsc::channel();
+        let started = start_remote_at(
+            &env,
+            state,
+            crate::contracts::RemoteConfig::default(),
+            in_tx,
+            out_rx,
+        );
+        assert!(matches!(started, RemoteStart::HeldElsewhere));
+        assert!(
+            fs.file_contents(state).is_none(),
+            "the identity was not created by the process that does not own the relay"
+        );
+
+        // The owner going away (quit, crash) frees it for the next start.
+        drop(owner);
+        assert!(fs
+            .try_lock_exclusive(&state.with_file_name(RELAY_LOCK_FILE))
+            .unwrap()
+            .is_some());
+    }
 }
 
 /// Per-tick driver for the desktop pairing overlay: start an offer when the
@@ -2907,6 +3018,7 @@ fn drive_pairing_overlay(
                 ui.overlay = UiOverlay::Remote(remote_pairing_view(&session, now_ms));
                 *pairing_session = Some(session);
             }
+            None if ui.remote_held_elsewhere => ui.message(REMOTE_HELD_ELSEWHERE),
             None => ui.message(
                 "FlightDeck Remote is disabled — enable it in configuration to pair a phone.",
             ),

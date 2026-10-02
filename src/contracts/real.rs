@@ -6,7 +6,7 @@
 
 use crate::contracts::domain::CommandOutcome;
 use crate::contracts::error::{FlightDeckError, Result};
-use crate::contracts::traits::{Clock, CommandRunner, FileSystem};
+use crate::contracts::traits::{Clock, CommandRunner, FileLock, FileSystem};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -106,6 +106,26 @@ impl FileSystem for RealFs {
 
     fn remove_dir_all(&self, p: &Path) -> Result<()> {
         remove_dir_all_resilient(p)
+    }
+
+    fn try_lock_exclusive(&self, p: &Path) -> Result<Option<FileLock>> {
+        let io = |e: std::io::Error| FlightDeckError::Io(format!("{}: {e}", p.display()));
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).map_err(io)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(p)
+            .map_err(io)?;
+        // `flock` on Unix, `LockFileEx` on Windows: released by the OS when the
+        // file is closed or the process ends, however it ends.
+        match file.try_lock() {
+            Ok(()) => Ok(Some(FileLock::new(file))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(e)) => Err(io(e)),
+        }
     }
 }
 
@@ -255,6 +275,30 @@ fn format_iso8601_utc(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The OS lock is exclusive between holders (two opens of the file, as two
+    /// processes would have) and released when the holder goes away.
+    #[test]
+    fn an_exclusive_lock_has_one_holder_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("remote.lock");
+        let fs = RealFs;
+        let first = fs.try_lock_exclusive(&path).unwrap();
+        assert!(
+            first.is_some(),
+            "an unheld lock is taken (and its file created)"
+        );
+        assert!(path.exists());
+        assert!(
+            fs.try_lock_exclusive(&path).unwrap().is_none(),
+            "a second holder is refused, not made to wait"
+        );
+        drop(first);
+        assert!(
+            fs.try_lock_exclusive(&path).unwrap().is_some(),
+            "released on drop"
+        );
+    }
 
     #[test]
     fn write_is_atomic_and_preserves_destination_when_temp_step_fails() {

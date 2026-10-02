@@ -1615,6 +1615,19 @@ mod overlays {
         assert!(!host.remote_has_persisted_pairing);
     }
 
+    /// Another FlightDeck on this machine is the relay client: Pair Phone says
+    /// where to pair instead of claiming Remote is off.
+    #[test]
+    fn pairing_names_the_other_flightdeck_that_owns_the_relay() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        host.ui.remote_held_elsewhere = true;
+        run(&mut host, PaletteAction::PairPhone);
+        host.pump();
+        assert_eq!(message(&host), crate::REMOTE_HELD_ELSEWHERE);
+    }
+
     #[test]
     fn pairing_reports_remote_disabled_and_hands_out_the_qr_payload() {
         let fakes = Fakes::new();

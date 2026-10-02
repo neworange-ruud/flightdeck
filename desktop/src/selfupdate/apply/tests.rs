@@ -314,6 +314,12 @@ impl FileSystem for FailingRename {
     fn remove_dir_all(&self, p: &Path) -> flightdeck::contracts::Result<()> {
         RealFs.remove_dir_all(p)
     }
+    fn try_lock_exclusive(
+        &self,
+        p: &Path,
+    ) -> flightdeck::contracts::Result<Option<flightdeck::contracts::FileLock>> {
+        RealFs.try_lock_exclusive(p)
+    }
 }
 
 impl UpdateFs for FailingRename {

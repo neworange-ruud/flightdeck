@@ -134,6 +134,36 @@ pub trait FileSystem {
     /// Recursively remove a directory and all its contents. Used to clean up an
     /// orphaned worktree directory that git no longer tracks (SPECS §5/§15).
     fn remove_dir_all(&self, p: &Path) -> Result<()>;
+    /// Take an exclusive lock on the file at `p` (created if absent) without
+    /// waiting, held until the returned [`FileLock`] is dropped. `Ok(None)`
+    /// means another holder — in practice another FlightDeck process — has it.
+    ///
+    /// The real lock is the OS's advisory file lock, which the OS releases when
+    /// the holding process exits, so a crashed FlightDeck never leaves a stale
+    /// lock behind (there is no lock *file* to clean up; the file merely
+    /// carries the lock).
+    fn try_lock_exclusive(&self, p: &Path) -> Result<Option<FileLock>>;
+}
+
+/// A held [`FileSystem::try_lock_exclusive`] lock; dropping it releases it.
+pub struct FileLock {
+    _holder: Box<dyn Send>,
+}
+
+impl FileLock {
+    /// Wrap whatever keeps the lock held (an open, locked file; a fake's
+    /// guard) for as long as this value lives.
+    pub fn new(holder: impl Send + 'static) -> FileLock {
+        FileLock {
+            _holder: Box::new(holder),
+        }
+    }
+}
+
+impl std::fmt::Debug for FileLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileLock")
+    }
 }
 
 /// Spawns PTY-backed processes (SPECS §26).
