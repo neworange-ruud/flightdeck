@@ -1,6 +1,7 @@
 # FlightDeck Desktop as a remote control — implementation plan
 
-> Status: **draft for review** (2026-10-02). Nothing here is implemented.
+> Status: **implemented** (2026-10-02, epic `remote-control-jija`, M0–M4). The
+> deviations from the plan below are listed in §9.
 > Scope: the Desktop app (GPUI, `desktop/`) connects to a FlightDeck instance
 > running on another machine (TUI first, Desktop too) and controls it. Only the
 > Desktop app gains the *controller* role; the TUI and the Desktop app already
@@ -300,3 +301,36 @@ reviewable on their own.
 All open points were decided on 2026-10-02 and folded into §0 (R5–R7). The
 plan is approved for tracking: next step is the beads epic with one child per
 milestone, then M0.
+
+## 9. As built
+
+What changed on the way, and why:
+
+- **Targets travel beside the command, not inside it.** `AppState::dispatch_to(cmd,
+  Option<&TabTarget>, services)` instead of a `target` field on every session-scoped
+  `Command` variant. Same semantics (`None` = the selection, every existing caller
+  unchanged), without touching the hundred places that build those variants. The
+  `cmd_*` handlers take the resolved tab index, so nothing swaps `selected_tab`.
+- **`project_id` targets** were added for a remote looking at a project the host is
+  not showing: New Agent Session Tab and Close Project then act in that project.
+- **No `SurfaceRead` trait over `HostModel`.** R4 keeps a remote and local projects in
+  separate windows, so a remote window has its own `RemoteModel` and `RemoteWindow`.
+  The leaf views (sidebar, git strip, terminal element, overlay layer) are shared:
+  they take the core's view structs (`web::client::views` builds them from the
+  mirror) and a `Surface` handle (`Local` | `Remote`) for their clicks. Mission
+  control and split view read `AppState` internals and stay local-only in v1
+  (`remote-control-k6o4`).
+- **The saved-remotes store lives in the core** (`web::client::store`), because the
+  desktop crate has no serde. Same file, same 0600 hardening as `remote.json`.
+- **Mirrored terminals never answer queries** (`Terminal::mirror`): the host's own
+  emulator already replied, and a second reply would arrive as input.
+- **`GitBar` grew the upstream's name and line counts** (additive, defaulted), so the
+  remote git strip states facts instead of a placeholder upstream.
+- **Not offered remotely in v1:** the configuration manager (`remote-control-96y4`),
+  Change Project Default Base (`remote-control-raxj`), Pull Base (refused for every
+  remote surface, SPECS §5.2), split view, and quitting the host.
+
+Coverage: `tests/web_client.rs` drives the client against the real server;
+`src/host/tests.rs` (`native_remote_client`) pairs it with a real `AppHost`; the
+desktop's `remote::tests` drive the window from a recorded snapshot. The manual
+two-machine check is `remote-control-rk8g`.
