@@ -9,8 +9,8 @@
 //!
 //! All logic here is pure: it depends only on the screen geometry (`rows`,
 //! `cols`) and the current scrollback `offset`, never on a live terminal. Text
-//! extraction lives on [`crate::terminal::session::Terminal`] because it needs
-//! to read cells from (possibly off-screen) scrollback.
+//! extraction lives on [`crate::terminal::grid::TerminalGrid::selected_text`]
+//! because it needs to read cells from (possibly off-screen) scrollback.
 
 /// A point in a terminal's content.
 ///

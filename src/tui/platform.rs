@@ -23,12 +23,10 @@ pub const IS_MACOS: bool = cfg!(target_os = "macos");
 pub const LEAVE_FOCUS_USES_SHIFT: bool = IS_WINDOWS || IS_LINUX;
 
 /// User-facing label for the configured leave-terminal-focus binding.
+///
+/// Owned by the keymap table ([`crate::app::keymap::leave_focus_label`]).
 pub fn leave_focus_key(use_f2: bool) -> &'static str {
-    if use_f2 {
-        "F2"
-    } else if LEAVE_FOCUS_USES_SHIFT {
-        "Shift+Esc"
-    } else {
-        "Alt+Esc"
-    }
+    crate::app::keymap::leave_focus_label(crate::app::keymap::KeymapOptions::for_this_platform(
+        use_f2,
+    ))
 }

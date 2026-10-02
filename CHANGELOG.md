@@ -8,15 +8,34 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **FlightDeck Desktop, a native app for macOS, is now released separately.**
+  It runs the same core as the TUI, on its own `desktop-v<x.y.z>` releases
+  with its own updater. Its changes are listed in `desktop/CHANGELOG.md`.
+- **New settings:** `[ui] desktop_terminal_font_size` and
+  `[ui] macos_option_as_meta`, read by the desktop app.
 
 ### Improvements
 
-- None yet.
+- **Shared core for every front-end.** The event loop now lives in a
+  UI-neutral `AppHost`, bindings and help come from one keymap table, and the
+  sidebar, tabs, git strip and status bar are built from shared view models.
+  The terminal emulator sits behind a `TerminalGrid` seam: the TUI stays on
+  vt100 and the desktop uses alacritty_terminal. TUI behaviour is unchanged.
+- **The TUI sidebar marks unread agents,** and agent rows now carry line diff
+  stats.
 
 ### Bug fixes
 
-- None yet.
+- **Pasted text can no longer end bracketed paste early.** Embedded
+  `ESC[200~`/`ESC[201~` markers are stripped, including ones split to reassemble
+  after a single pass. Before, the rest of a crafted paste could run as typed
+  input. This covers the TUI, the desktop app and phone replies.
+- **UTF-8 mouse reporting (`?1005`) now sends real UTF-8 coordinates** instead
+  of legacy bytes, which were wrong past column 95.
+- **"Not a git repository" errors now name the folder and give git's own
+  reason.** Before, any git failure became "could not determine repository
+  root", and the desktop launcher told you to "run FlightDeck from a git
+  project".
 
 ## [1.22.0] - 2026-09-21
 

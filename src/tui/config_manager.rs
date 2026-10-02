@@ -33,6 +33,12 @@ pub enum ConfigScope {
 pub enum FieldKind {
     Bool,
     Choice(Vec<String>),
+    /// A fixed set of whole numbers, stored as a TOML integer (a
+    /// [`FieldKind::Choice`] would write a string, which a numeric field fails
+    /// to load). Every surface shows and cycles it exactly like a `Choice`: the
+    /// row's value and choices are the numbers spelled out, and a browser names
+    /// one by that spelling.
+    IntegerChoice(Vec<i64>),
     Text,
 }
 
@@ -248,6 +254,15 @@ impl ConfigManager {
                         false,
                         false,
                     ),
+                    FieldKind::IntegerChoice(_) => (
+                        value
+                            .as_integer()
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        false,
+                        false,
+                        false,
+                    ),
                     FieldKind::Text => {
                         let display = if editing_this {
                             self.editing.clone().unwrap_or_default()
@@ -269,6 +284,9 @@ impl ConfigManager {
                     editing: editing_this,
                     choices: match &f.kind {
                         FieldKind::Choice(options) => options.clone(),
+                        FieldKind::IntegerChoice(options) => {
+                            options.iter().map(i64::to_string).collect()
+                        }
                         FieldKind::Bool | FieldKind::Text => Vec::new(),
                     },
                 }
@@ -318,6 +336,17 @@ impl ConfigManager {
                 FieldValue::Text(options[(idx + 1) % options.len()].clone())
             }
             FieldKind::Choice(_) => return,
+            // A number off the list (typed into the TOML) cycles from the
+            // first option, as an unknown string does for a `Choice`.
+            FieldKind::IntegerChoice(options) if !options.is_empty() => {
+                let cur = current.as_integer();
+                let next = match options.iter().position(|o| Some(*o) == cur) {
+                    Some(idx) => options[(idx + 1) % options.len()],
+                    None => options[0],
+                };
+                FieldValue::Text(next.to_string())
+            }
+            FieldKind::IntegerChoice(_) => return,
             // A text field is not toggled — activating it opens an inline editor
             // seeded with the current effective value. The edit is committed by
             // [`Self::commit_edit`] and discarded by [`Self::cancel_edit`].
@@ -362,6 +391,23 @@ impl ConfigManager {
                     field.label,
                     options.join(", ")
                 ));
+            }
+            (FieldKind::IntegerChoice(options), value) => {
+                let named = match value {
+                    FieldValue::Text(s) => s.trim().parse::<i64>().ok(),
+                    FieldValue::Bool(_) => None,
+                };
+                match named.filter(|n| options.contains(n)) {
+                    Some(n) => toml::Value::Integer(n),
+                    None => {
+                        let spelled: Vec<String> = options.iter().map(i64::to_string).collect();
+                        return Err(format!(
+                            "`{}` is one of: {}.",
+                            field.label,
+                            spelled.join(", ")
+                        ));
+                    }
+                }
             }
             (FieldKind::Text, FieldValue::Text(s)) => toml::Value::String(s),
             (FieldKind::Text, FieldValue::Bool(_)) => {
@@ -594,6 +640,19 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             ),
         },
         b("Dim terminal in app mode", "ui", "dim_terminal_in_app_mode"),
+        b(
+            "Option as Meta (macOS desktop app)",
+            "ui",
+            "macos_option_as_meta",
+        ),
+        CuratedField {
+            label: "Terminal font size (desktop app)",
+            section: "ui",
+            key: "desktop_terminal_font_size",
+            // A curated subset of what validation accepts (8 to 32): any other
+            // size in range is still a raw-TOML edit away.
+            kind: FieldKind::IntegerChoice(vec![10, 11, 12, 13, 14, 15, 16, 18, 20, 24]),
+        },
         // FlightDeck Remote (phone link). The relay URL is free-text so a user
         // can point it at a relay they host themselves — the default relay is
         // restricted and not publicly usable (surfaced as a note in the UI).
@@ -750,6 +809,18 @@ mod tests {
     }
 
     #[test]
+    fn option_as_meta_setting_is_a_project_scoped_toggle() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        let idx = goto(&mut m, "Option as Meta (macOS desktop app)");
+        assert_eq!(m.rows()[idx].value, "off", "the shipped default is off");
+        m.toggle_selected();
+
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[ui]"));
+        assert!(body.contains("macos_option_as_meta = true"));
+    }
+
+    #[test]
     fn switch_scope_changes_target_and_editing_target() {
         let mut m = mgr(toml::Table::new(), toml::Table::new());
         assert_eq!(m.scope(), ConfigScope::Project);
@@ -837,6 +908,29 @@ mod tests {
         m.select_next();
         assert!(!m.is_editing());
         assert!(!m.dirty());
+    }
+
+    #[test]
+    fn the_desktop_font_size_cycles_and_is_written_as_an_integer() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Terminal font size (desktop app)");
+        let row = m.rows().into_iter().find(|r| r.selected).unwrap();
+        // Shown like a choice: the default spelled out, the options listed.
+        assert_eq!(row.value, "13");
+        assert!(!row.is_bool && !row.is_text);
+        assert!(row.choices.contains(&"13".to_string()));
+        m.toggle_selected();
+        let body = &m.outputs().unwrap()[0].1;
+        // An integer, so the numeric field loads back (a string would not).
+        assert!(body.contains("desktop_terminal_font_size = 14"), "{body}");
+        // A browser names a value by its spelling; off-list is refused.
+        assert!(m.set_selected(FieldValue::Text("20".into())).is_ok());
+        assert!(m.outputs().unwrap()[0]
+            .1
+            .contains("desktop_terminal_font_size = 20"));
+        let err = m.set_selected(FieldValue::Text("17".into())).unwrap_err();
+        assert!(err.contains("one of"), "{err}");
+        assert!(m.set_selected(FieldValue::Bool(true)).is_err());
     }
 
     #[test]

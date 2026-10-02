@@ -1,0 +1,337 @@
+# flightdeck-desktop: CI and packaging
+
+Covers beads `remote-control-bmej.6.1` (CI), `.6.2` (macOS), `.6.3` (Windows) and `.6.4` (Linux).
+
+**Assumption (bmej.1.7 is not final):** the desktop app ships as a separate
+`flightdeck-desktop` binary next to the `flightdeck` CLI, as it is built today. If the
+launch layout changes (one binary, or the CLI launching the GUI), the bundle
+executable names, the `.desktop` `Exec=`, the WiX component and the cask `app` stanza
+change with it; nothing here depends on the CLI being installed.
+
+## Verification status
+
+| Piece | Status |
+| --- | --- |
+| `.github/workflows/desktop.yml` | Passes `actionlint`. **Never run**: CI cannot be run from this environment. The release jobs (`build-release`, `publish`) have never created a real release. |
+| macOS `.app` (`scripts/desktop/macos-bundle.sh`) | **Built and launched locally, unsigned** (see below). Zip name, `.sha256` and zip layout verified locally (aarch64). |
+| `scripts/desktop/check-asset-names.sh` | Run locally against the macOS output (pass) and a misnamed file (fail). |
+| Linux AppImage `.sha256`, Windows portable zip | Written, **not run** (no Linux/Windows machine). |
+| Codesign / notarize steps | Written, **not run** (no Developer ID identity here). |
+| Homebrew cask template | Not audited or published. |
+| Linux `.deb` / `.rpm` / AppImage | **Not run** (no Linux machine). Config only. |
+| Windows MSI | **Not run** (no Windows machine). Config only; XML is well-formed. |
+
+## CI (`.github/workflows/desktop.yml`)
+
+Triggers: `desktop-v*` tag pushes (release, below); pull requests that touch `desktop/**`, `src/**`, `Cargo.toml`, `Cargo.lock`,
+`scripts/desktop/**` or the workflow itself; pushes to `main` touching the same code
+paths; and manual `workflow_dispatch`.
+
+`check` job, on macOS, Ubuntu and Windows (`fail-fast: false`):
+
+- `cargo clippy -p flightdeck-desktop --all-targets --locked -- -D warnings`
+- `cargo test -p flightdeck-desktop --locked` (Linux under `xvfb-run -a`)
+- macOS only: `cargo build -p flightdeck-desktop --features spike-snapshot --locked`
+  and a `--release` build.
+- Cargo is cached with `Swatinem/rust-cache` (own `prefix-key`, separate from `ci.yml`).
+
+Per-OS prerequisites: Ubuntu installs the apt list from `NOTES-M0.md` (plus
+`xvfb`, `libvulkan1`, `mesa-vulkan-drivers`); macOS relies on the default
+`runtime-shaders` feature, so the missing Metal Toolchain does not matter; the
+Windows runner image already has MSVC and the Windows SDK (`fxc.exe`, `rc.exe`).
+
+Notes:
+
+- **Display on Linux.** GPUI tests use `TestAppContext` on the headless test platform
+  and should not open a window. `xvfb-run` is wrapped around the Linux test step as
+  cheap insurance. If the first green run shows it is unnecessary, remove it.
+- **Root CI is unchanged.** `ci.yml` keeps covering the TUI only (`default-members = ["."]`).
+  Its `cargo fmt --all -- --check` job already formats `desktop/` as well (`--all`
+  walks every workspace member), so no separate fmt job was added.
+- **Path filters and required checks.** If `check (...)` is made a required status
+  check in branch protection, a PR that touches none of the filtered paths never
+  gets the check and would stay blocked. Either leave these checks non-required or
+  drop the `paths:` filter.
+- **Cold builds** take several minutes per OS (about 3.5 minutes release on an M2 Pro,
+  from NOTES-M0); the job timeout is 45 minutes.
+
+### Packaging job
+
+`package` runs only on manual `workflow_dispatch` (input `package`, default true),
+after `check` passes. It builds **unsigned** artifacts and uploads them:
+
+| OS | Artifact | Built with |
+| --- | --- | --- |
+| macOS | `FlightDeck-<ver>-macos-<arch>.zip` + `.sha256` | `scripts/desktop/macos-bundle.sh` |
+| Linux | `.deb`, `.rpm`, `FlightDeck-<ver>-linux-<arch>.AppImage` + `.sha256` | `cargo-deb`, `cargo-generate-rpm`, `scripts/desktop/linux-appimage.sh` |
+| Windows | `FlightDeck-windows-x64.msi`, `FlightDeck-<ver>-windows-<arch>-portable.zip` + `.sha256` | `cargo-wix` and the zip step of `scripts/desktop/windows-package.ps1` |
+
+This manual job is unsigned. Signing runs only in the release job (below).
+
+### Release job (`desktop-v*` tags)
+
+Pushing a tag `desktop-v<x.y.z>` (or running the workflow manually with the `tag` input set
+to an existing tag) runs `check`, then `build-release` on macOS arm64 (`macos-latest`),
+macOS x86_64 (`macos-15-intel`), Ubuntu x86_64 and Windows x86_64, then `publish`:
+
+1. `build-release` fails unless the tag equals `desktop-v` + the `desktop/Cargo.toml`
+   version. It runs the packaging scripts, then
+   `scripts/desktop/check-asset-names.sh --os <os> --version <v>`, then uploads the files.
+2. `publish` (the only job with `contents: write`) downloads all artifacts, creates the
+   GitHub Release for the tag if it does not exist and uploads everything with
+   `gh release upload --clobber`, so a re-run replaces assets. `.msi`, `.deb` and `.rpm`
+   are attached too but never fetched by the app. The release is created:
+   - as a **pre-release only for a SemVer pre-release version** (`desktop-v0.2.0-beta.1`);
+     the self-updater ignores pre-releases and drafts, and offers every other version;
+   - **never as "Latest"** (`--latest=false`). The repository's Latest release is the
+     CLI's: its documented install, `releases/latest/download/flightdeck-installer.sh`,
+     would 404 on a desktop release. (The CLI's own updater, axoupdater, skips a
+     Latest release without its installer anyway.) Promoting a desktop release by hand,
+     leave "Set as the latest release" unticked;
+   - with the version's section of `desktop/CHANGELOG.md` as its notes
+     (`scripts/desktop/release-notes.sh`), or GitHub's generated notes if it has none.
+
+Not built: Linux aarch64 (the AppImage job downloads the x86_64 `linuxdeploy`) and Windows
+aarch64. The updater refuses, rather than guesses, on those machines.
+
+Signing is optional and gated on repository secrets; unset secrets are empty strings and
+the steps or script branches are skipped. The macOS secrets are the **same ones the TUI's
+cargo-dist release uses** (`release.yml`), so one Developer ID certificate serves both:
+
+| Secret | Effect |
+| --- | --- |
+| `CODESIGN_CERTIFICATE` (base64 `.p12`), `CODESIGN_CERTIFICATE_PASSWORD` | imports the Developer ID cert into a temporary keychain |
+| `CODESIGN_IDENTITY` | `macos-bundle.sh` codesigns the `.app` (hardened runtime, timestamped; no `--deep`, no entitlements needed) |
+| `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_P8_BASE64` | notarization with an App Store Connect API key (preferred): `xcrun notarytool submit --key --key-id --issuer` |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | notarization alternative with an Apple ID and app-specific password |
+| `WINDOWS_SIGN_PFX_BASE64`, `WINDOWS_SIGN_PFX_PASSWORD` | decoded to a temp `.pfx`; `windows-package.ps1` signs the MSI and the portable `.exe` |
+
+Notarization only runs when the app is signed and one complete credential set exists (API
+key first, then `NOTARY_KEYCHAIN_PROFILE` for local use, then Apple ID). It then staples
+the ticket and re-zips.
+
+**Tags and the other release workflows.** A `desktop-v0.1.0` tag also matches the
+generic version pattern (`**[0-9]+.[0-9]+.[0-9]+*`) that `release.yml` (cargo-dist),
+`relay-deploy.yml`, `web-deploy.yml` and `ios-testflight.yml` trigger on. Each has a
+negative pattern `'!desktop-v**'` after it in `on.push.tags`; the three deploy jobs also
+skip a `desktop-v` ref (`if: !startsWith(github.ref_name, 'desktop-v')`), which covers a
+desktop release published by hand (their `release: published` trigger). Before these,
+pushing `desktop-v0.1.0` and `desktop-v0.1.1` redeployed the relay and web and started a
+TestFlight upload. `release.yml`'s exclusion is a hand edit: `dist-workspace.toml` sets
+`allow-dirty = ["ci"]` so `dist` does not reject it, and if cargo-dist is upgraded and
+`release.yml` regenerated, re-apply it.
+
+**Resilience.** `build-release` uses `fail-fast: false`. `publish` runs even if some legs
+failed (`if: always()`), uploads every artifact that exists, then fails the job so the
+incomplete release is visible. Re-running the failed legs and `publish` fills in the
+missing assets (`--clobber`).
+
+#### First release checklist
+
+1. Set the secrets above (at minimum `CODESIGN_*`; they already exist for the TUI).
+2. Run `desktop.yml` manually (workflow_dispatch, no tag) and confirm `check` and
+   `package` pass on all three OSes; this is the first time Linux and Windows run.
+3. Run `scripts/release-desktop <x.y.z>` on `main` (see "Cutting a release"). Confirm
+   only `Desktop` starts: not `Release`, `Relay deploy`, `Web deploy` or `TestFlight`.
+4. Check the release has the macOS zips and `.sha256` files at least; fix and re-run any
+   failed leg, then `publish`.
+5. Download the macOS zip, run `spctl -a -vv FlightDeck.app` and `codesign --verify --strict`.
+6. Add the Homebrew cask update.
+
+### Cutting a release
+
+The desktop app and the CLI are released independently, each with its own version,
+changelog and tag line:
+
+| | CLI / TUI (`flightdeck`) | Desktop (`flightdeck-desktop`) |
+| --- | --- | --- |
+| Version | root `Cargo.toml` | `desktop/Cargo.toml` |
+| Changelog | `CHANGELOG.md` | `desktop/CHANGELOG.md` |
+| Script | `scripts/release <x.y.z>` | `scripts/release-desktop <x.y.z>` |
+| Tag | `v<x.y.z>` | `desktop-v<x.y.z>` |
+| Built by | `release.yml` (cargo-dist) | `desktop.yml` |
+| Also deploys | relay, web, TestFlight | nothing else |
+
+From an up-to-date `main`, with the release notes under `Unreleased` in
+`desktop/CHANGELOG.md`:
+
+```bash
+scripts/release-desktop 0.2.0         # offered by the self-updater
+scripts/release-desktop 0.2.0-beta.1  # a pre-release, ignored by the self-updater
+```
+
+It refuses a dirty tree, a branch behind its upstream, an existing tag, or an empty
+`Unreleased`; then sets the version (and `Cargo.lock`), rolls `Unreleased` into the
+version, commits `Release desktop-v<x.y.z>`, tags and pushes. The tag runs the release
+job above. A change to the shared core (`src/`) ships in whichever app is released next;
+note it in both changelogs.
+
+### Asset name check
+
+`scripts/desktop/check-asset-names.sh [--os macos|linux|windows] [--version X.Y.Z] [DIR]`
+(default dir `target/desktop-dist`) asserts every zip/AppImage there matches the regex
+copied from the `asset_name` format strings in `release.rs`, that each has a `.sha256` in
+`sha256sum` format naming it, and that the hash matches. It fails on a misnamed asset or when
+none is found for `--os`. If `release.rs` changes its names, change the regex in both places.
+
+## macOS (`scripts/desktop/macos-bundle.sh`)
+
+Builds `target/desktop-dist/FlightDeck.app`, `FlightDeck-<ver>-macos-<arch>.zip` (arch
+from `TARGET`, else `uname -m`; `FlightDeck.app` at the zip root) and
+`FlightDeck-<ver>-macos-<arch>.zip.sha256`, and prints the zip's sha256 (for the cask).
+
+- Info.plist: bundle id `agency.neworange.flightdeck.desktop` (the iOS app uses the
+  prefix `agency.neworange.flightdeck`, `ios/project.yml`), `LSMinimumSystemVersion`
+  11.0 (`MIN_MACOS`), `NSHighResolutionCapable`, version from `desktop/Cargo.toml`.
+- Icon: `AppIcon.icns` generated with `sips` + `iconutil` from
+  `desktop/packaging/icons/flightdeck-1024.png`. That master is a copy of the iOS app icon
+  (the repo has no other icon; `assets/` only holds a sound). It has no alpha channel
+  and is a full-bleed square, so macOS shows it as a square tile; a proper
+  rounded-rectangle Mac icon needs design work.
+- Shaders: the script builds with the crate's default `runtime-shaders` feature, so
+  the app compiles Metal shaders at each launch. On a machine with the Metal Toolchain
+  ship precompiled ones: `CARGO_FEATURES_FLAGS=--no-default-features scripts/desktop/macos-bundle.sh`.
+- Signing (skipped when unset): `CODESIGN_IDENTITY` runs `codesign --options runtime`
+  (hardened runtime, timestamped). The app currently needs no entitlements file; add one
+  if a feature requires it (the TUI's e2e entitlements are in `scripts/e2e/`).
+- Notarization (skipped unless signed **and** credentials are set): an App Store Connect API key (`APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`), or
+  `NOTARY_KEYCHAIN_PROFILE` (a `xcrun notarytool store-credentials` profile), or
+  `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_PASSWORD`. The script submits the zip with
+  `--wait`, staples the app and re-zips.
+- Other env: `SKIP_BUILD=1`, `TARGET=<triple>` (cross-arch), `BUNDLE_ID`, `MIN_MACOS`.
+  Universal binaries are not produced; build each arch and `lipo` if wanted.
+- Homebrew cask: `packaging/homebrew/flightdeck-desktop.rb.tmpl` (placeholders
+  `@VERSION@`, `@SHA256@`). The existing TUI formula is published by cargo-dist to
+  `neworange-ruud/homebrew-tap`; the cask would go into `Casks/` of the same tap.
+  cargo-dist does not know the GUI (`dist = false` in `desktop/Cargo.toml`), so the
+  GUI has its own release job (above); the cask update is still to be written.
+
+Local verification (2026-09-29, Darwin 27, Apple silicon, unsigned): the script built
+the bundle and `plutil -lint` passed. Executing the bundle's binary from inside a git
+repository ran and stayed up until killed. Launching through Finder or `open -n`
+(working directory `/`) exits at once with `flightdeck error: git error: not inside a
+Git repository`, because startup requires the current directory to be a git project.
+That is app behaviour in `desktop/src`, not a packaging fault, but a `.app` cannot ship
+until the GUI starts without a repo (project picker or last-opened project).
+
+## Linux
+
+Files: `desktop/packaging/linux/flightdeck-desktop.desktop`, PNG icons in
+`desktop/packaging/icons/` (16 to 512 px, installed as hicolor `flightdeck-desktop.png`),
+`[package.metadata.deb]` and `[package.metadata.generate-rpm]` in `desktop/Cargo.toml`,
+and `scripts/desktop/linux-appimage.sh`.
+
+- **Runtime dependencies** (declared in the deb; the rpm lists the equivalents):
+  libxkbcommon (+ x11), libwayland-client, libxcb, fontconfig, freetype, a Vulkan
+  loader and a driver (`mesa-vulkan-drivers` or any Vulkan ICD). GPUI renders through
+  wgpu/Vulkan, so a machine without a Vulkan driver cannot run the app.
+- `.deb`: `cargo deb -p flightdeck-desktop --no-build` after a release build.
+- `.rpm`: `cargo generate-rpm -p desktop` from the repo root after a release build.
+  Auto-detected library requirements are used besides the explicit ones.
+- AppImage: `scripts/desktop/linux-appimage.sh` writes `FlightDeck-<ver>-linux-<arch>.AppImage`
+  plus its `.sha256` and uses `linuxdeploy` (path via
+  `$LINUXDEPLOY`). It deliberately does **not** bundle `libvulkan`/GPU drivers, because
+  they must match the host. Set `APPIMAGE_EXTRACT_AND_RUN=1` where FUSE is missing.
+- Untested guesses to check on first run: the deb `depends` names on Debian vs Ubuntu,
+  and the Wayland `app_id` / `StartupWMClass` (the `.desktop` file has none because the
+  app does not set an app id yet).
+
+## Windows
+
+Files: `desktop/wix/main.wxs`, `[package.metadata.wix]` in `desktop/Cargo.toml`,
+`desktop/packaging/icons/flightdeck.ico`, `scripts/desktop/windows-package.ps1`.
+
+- Installer: WiX v3 through `cargo-wix` (`cargo install cargo-wix`, WiX v3 toolset on
+  PATH). Per-machine install under `Program Files\FlightDeck`, Start-menu shortcut,
+  Add/Remove Programs entry with the icon, in-place major upgrades. No PATH entry.
+  The `upgrade-guid` identifies the product line and must never change.
+  MSIX was not chosen because it needs a signing certificate to install at all.
+- Portable zip: the same script also writes `FlightDeck-<ver>-windows-<arch>-portable.zip`
+  (`flightdeck-desktop.exe` at the zip root) and its `.sha256` (LF, no BOM), which the
+  self-updater installs from.
+- Signing hook: `scripts/desktop/windows-package.ps1` runs `signtool` on the MSI (and the portable `.exe`) when
+  `WINDOWS_SIGN_PFX_PATH` (and `WINDOWS_SIGN_PFX_PASSWORD`, optional
+  `WINDOWS_SIGN_TIMESTAMP_URL`) are set, and skips it otherwise. Neither the `.exe`
+  inside the MSI nor the MSI itself is signed by default, so SmartScreen will warn.
+- **Non-pure-Rust exception.** The TUI's Windows build is pure Rust and needs no C
+  toolchain (`dist-workspace.toml` comments, `Cargo.toml` target gating). The GUI is
+  not: `gpui-pre-windows` compiles HLSL shaders with `fxc.exe` and embeds a manifest
+  with `rc.exe`, so building `flightdeck-desktop` on Windows requires **MSVC plus the
+  Windows 10/11 SDK** (`GPUI_FXC_PATH` overrides the fxc lookup). This does not leak
+  into the TUI: `default-members = ["."]` keeps `cargo build`, the TUI gate and
+  cargo-dist off the GUI crate, and it cannot use the self-contained windows-gnu setup
+  in `scripts/build-windows`.
+
+## Self-update (`remote-control-bmej.6.5`)
+
+Code: `desktop/src/selfupdate/`, the banner in `desktop/src/overlays/update.rs`.
+The CLI's `flightdeck update` (axoupdater) is unchanged.
+
+**Behaviour.** Once a day (own cache, `desktop-update-check.json` next to the TUI's,
+honouring `[update] check`) the app asks GitHub for the newest `desktop-v*` release and,
+if it is newer, shows the banner (never a modal). What the banner offers depends on how
+the app was installed, detected from where the executable runs:
+
+| Install | Detected by | Banner |
+| --- | --- | --- |
+| Homebrew cask | bundle under `/opt/homebrew/Caskroom` or `/usr/local/Caskroom`, or in an `Applications` folder with a `Caskroom/flightdeck-desktop` receipt | "Update with: brew update && brew upgrade --cask flightdeck-desktop" |
+| `.deb` / `.rpm` | exe under `/usr` (not `/usr/local`) and `/var/lib/dpkg/info/flightdeck-desktop.list` / an rpm database | the apt / dnf command |
+| MSI / winget | exe under `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%` | winget or new MSI |
+| macOS `.app` (zip), AppImage (`$APPIMAGE`), Windows portable zip | none of the above | **Update now** |
+| bare binary, `/usr/local`, unknown | anything else | "download from the releases page" |
+
+**Update now** downloads the asset and its checksum, verifies SHA-256, and only then
+touches the installation. Staging is always a sibling of what it replaces (rename is
+atomic only on one volume):
+
+- macOS: unzip (`ditto -x -k`) to `.FlightDeck-update-<v>/`, rename the bundle to
+  `previous.app`, rename the new `.app` into place (two renames; the first is undone if
+  the second fails), delete staging, offer **Restart** (`App::restart`, which runs the
+  normal quit teardown). The app needs write access to the bundle's folder; without it
+  the banner shows the error and the installed copy is untouched.
+- AppImage: download to `.<name>.update-<v>/`, `chmod +x`, rename over the file (atomic;
+  the running image keeps its old inode), offer Restart.
+- Windows portable: Windows cannot overwrite a running `.exe`, so the update is unpacked
+  to `.flightdeck-update/payload` and a `READY` marker written last. At the **next
+  launch**, before any window opens, `finish_staged` renames each old top-level entry
+  into `.flightdeck-old/`, moves the new one in (all or nothing) and relaunches; the
+  parked files are deleted on the launch after.
+
+**Asset naming contract** (the release pipeline must publish exactly this; the updater
+finds files by name and refuses, rather than guesses, when one is missing):
+
+```text
+tag       desktop-v<version>                         e.g. desktop-v1.4.0  (plain major.minor.patch)
+macOS     FlightDeck-<version>-macos-<arch>.zip      FlightDeck.app at the zip root (ditto --keepParent)
+Linux     FlightDeck-<version>-linux-<arch>.AppImage
+Windows   FlightDeck-<version>-windows-<arch>-portable.zip   flightdeck-desktop.exe at the zip root
+checksum  <asset name>.sha256                        `sha256sum` format: <64 hex>  <asset name>
+```
+
+`<arch>` is `x86_64` or `aarch64`. Drafts and pre-releases are ignored. The packaging
+scripts and the release job emit exactly these names (see "Release job" and "Asset name
+check" above). The `.msi`, `.deb`, `.rpm` and the cask are for package managers and are never
+downloaded by the app.
+
+**Downloads and unzip** use `curl` (HTTPS only, `--fail`), `ditto` (macOS), `tar` (Windows
+10+) and `unzip` (Linux), by argv, so the crate carries no HTTP/TLS client or zip library.
+A machine without `curl` simply never shows the notice.
+
+**Not verified.** The release pipeline is unpublished, so the real download, the real
+`ditto`/`tar` extraction, `App::restart` after a swap, writing into `/Applications`,
+Gatekeeper behaviour on a swapped (unsigned or notarized) bundle, and everything on
+Linux and Windows have not been run. What is tested: install-kind detection for every
+OS from paths, asset selection, checksum parsing and mismatch refusal, GitHub response
+parsing, the once-a-day cache, and the whole install/rollback/staged-swap logic against a
+fake release source and temporary directories.
+
+## Open questions for the owner
+
+1. Bundle id: `agency.neworange.flightdeck.desktop` (derived from the iOS prefix)? It is
+   hard to change later, because it keys the macOS preferences and Gatekeeper history.
+2. Signing identities: Apple Developer ID Application cert and notary credentials, and
+   a Windows code-signing certificate (EV avoids SmartScreen warnings).
+3. Cask location: the existing `neworange-ruud/homebrew-tap`, and the release tag
+   scheme the template assumes (`desktop-v<version>`)?
+4. A proper macOS/Windows icon (the iOS icon is reused as is).
+5. Should the GUI join cargo-dist releases, or keep its own release workflow?

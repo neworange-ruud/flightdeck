@@ -1,0 +1,67 @@
+# FlightDeck Desktop changelog
+
+All notable changes to the FlightDeck desktop app (`flightdeck-desktop`,
+`FlightDeck.app`) are documented in this file. The desktop app is released on
+its own `desktop-v<x.y.z>` tags, separately from the `flightdeck` CLI/TUI, whose
+changes are in the root `CHANGELOG.md`. A change to the shared core that both
+apps get is listed in both.
+
+Group notes under `New features`, `Improvements` and `Bug fixes`.
+`scripts/release-desktop` rolls `Unreleased` into a version, and the release job
+uses that version's section as the GitHub Release notes.
+
+## [Unreleased]
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- **Agents show colour and bold when the app is launched from Finder or the
+  Dock.** Their terminals now always start with `TERM=xterm-256color` and
+  `COLORTERM=truecolor`, describing the app's own emulator. Before, they
+  inherited the launch environment, which outside a terminal has no `TERM`, so
+  agents fell back to plain text.
+
+## [0.1.1] - 2026-10-02
+
+### Bug fixes
+
+- **The app works when launched from Finder, the Dock or a desktop launcher.**
+  Such a launch only gets the system `PATH`, so `git` and the agents did not
+  resolve as they do in a terminal, and opening a project could fail. The app
+  now adopts your login shell's environment at start-up when it was not started
+  from a terminal. This is bounded to 5 seconds, and if it fails the launch
+  environment is kept.
+- **"Not a git repository" errors now name the folder and give git's own
+  reason.** Before, any git failure became "could not determine repository
+  root", and the launcher told you to "run FlightDeck from a git project".
+
+## [0.1.0] - 2026-10-01
+
+### New features
+
+- **Native desktop app (preview).** A GPUI window around real agent terminals.
+  Project tabs sit in the titlebar, with an agent sidebar showing status, diff
+  stats and unread dots, a git strip (Push, Pull base, Finish) and a
+  mode/status bar. It has the command palette, every TUI dialog and
+  confirmation, the configuration manager, help and about, web access and phone
+  pairing (QR drawn natively), split view and child terminals, native macOS
+  menus, a dock badge, `--isolated`, and a project picker when launched outside
+  a repository. Every TUI chord works the same; Cmd on macOS is left to the
+  platform. See `specs/DESKTOP_UI.md`.
+- **Mission control view (Alt-m).** Live tiles for every working or waiting
+  session across all projects, ordered needs-you first, plus "earlier today"
+  cards with a one-click Push, Pull base or Finish. A scope menu selects the
+  last 24h, 7 days or all sessions, with a project filter. Enter opens a tile
+  full size and Alt-Esc goes back. Waiting tiles offer inline Approve/Deny for
+  permission and single-select prompts, using the same answer path as the
+  phone.
+- **Self-update** from the `desktop-v*` GitHub Releases.
+- **New settings:** `[ui] desktop_terminal_font_size` and
+  `[ui] macos_option_as_meta`.

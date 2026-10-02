@@ -14,6 +14,7 @@ use crate::agents::adapter::{build_launch, validate_agent};
 use crate::agents::registry::AgentRegistry;
 use crate::agents::setup::{prepare_status_launch, status_backend};
 use crate::agents::status::{combine_status, DisplayStatus};
+use crate::app::activity::{ActivityProbe, GitFingerprint};
 use crate::app::commands::{CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector};
 use crate::app::modes::InputMode;
 use crate::contracts::{
@@ -27,7 +28,7 @@ use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
 use crate::git::remote::{github_pr_url, plan_push, push_branch, PushPlan};
 use crate::git::status::{
     base_drift, check_merge_preconditions, check_rebase_preconditions, collect_status, merge_back,
-    rebase_onto_base, MergeDecision, MergeRequest, RebaseDecision, RebaseRequest,
+    rebase_onto_base, MergeDecision, MergeRequest, RebaseDecision, RebaseRequest, WorktreeStatus,
 };
 use crate::git::worktree::{create_worktree, plan_worktree, remove_worktree_if_safe, WorktreePlan};
 use crate::persistence::project_state::save_state;
@@ -38,7 +39,7 @@ use crate::runtime::guards::enforce_guardrails;
 use crate::runtime::image;
 use crate::runtime::name::{container_name, repo_hash};
 use crate::runtime::spec::{ContainerSpec, ResolvedAuthMount};
-use crate::terminal::session::Session;
+use crate::terminal::session::{Session, TerminalProfile};
 use crate::terminal::shell::{container_shell, shell_launch};
 
 /// The services the app core dispatches into (SPECS §27). Passing these as a
@@ -320,6 +321,15 @@ pub struct RuntimeTab {
     /// the session this tab's agent creates (so multiple agents in one worktree
     /// each resume their own). `None` once pinned or when not applicable.
     session_snapshot: Option<std::collections::HashSet<String>>,
+    /// Runtime-only edge memory feeding `meta.activity` (see
+    /// [`crate::app::activity`]): output seen since the last sync, and the last
+    /// status / git fingerprints compared against.
+    probe: ActivityProbe,
+    /// Whether the primary PTY produced output while this tab was not the one
+    /// on screen. Runtime-only (never persisted); cleared when the user views
+    /// the tab. Maintained by [`AppState::sync_activity`] and
+    /// [`AppState::cmd_switch_tab`], read through [`RuntimeTab::is_unread`].
+    unread: bool,
 }
 
 impl RuntimeTab {
@@ -336,9 +346,23 @@ impl RuntimeTab {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         }
+    }
+
+    /// Note that the primary PTY produced output. Called on every PTY read, so
+    /// it only sets a flag (no clock read, no allocation); the timestamp is
+    /// stamped by [`AppState::sync_activity`].
+    pub fn note_output(&mut self) {
+        self.probe.note_output();
+    }
+
+    /// Whether the agent produced output the user has not looked at yet.
+    pub fn is_unread(&self) -> bool {
+        self.unread
     }
 
     /// Stable id of this tab.
@@ -618,6 +642,9 @@ pub struct AppState {
     /// [`Self::pin_resumable_sessions`], rate-limiting it to
     /// [`SESSION_SCAN_INTERVAL_MS`]. `None` until the first scan. Runtime-only.
     last_session_scan_ms: Option<u64>,
+    /// How this project's tab terminals are built (emulator, default colours):
+    /// the front-end's choice, from `Env::terminal`. Runtime-only.
+    pub terminal_profile: TerminalProfile,
 }
 
 impl AppState {
@@ -654,6 +681,7 @@ impl AppState {
             isolated: false,
             isolated_status_root: None,
             last_session_scan_ms: None,
+            terminal_profile: TerminalProfile::TUI,
         }
     }
 
@@ -911,6 +939,55 @@ impl AppState {
             });
         }
         out
+    }
+
+    /// Fold what happened since the last call into each tab's persisted
+    /// `meta.activity` timeline, stamped `now_secs`
+    /// ([`Clock::now_unix_secs`](crate::contracts::Clock::now_unix_secs)):
+    /// PTY output flagged by [`RuntimeTab::note_output`], and a change of the
+    /// interpreted status. A tab's first sighting only records a baseline — a
+    /// fresh launch is not a "status change". Cheap enough for every tick; it
+    /// writes nothing itself, so the values reach `state.json` on the existing
+    /// save points (and at teardown), never per PTY read.
+    ///
+    /// `project_viewed` is whether this project is the one on screen. It also
+    /// maintains each tab's unread flag: output on a tab that is not the
+    /// selected tab of the viewed project sets it, and the selected tab of the
+    /// viewed project is always read (so switching projects clears the newly
+    /// shown tab on the next sync). Flags are folded per sync, so output that
+    /// arrives and is followed by a selection change within one tick is judged
+    /// against the selection at sync time.
+    pub fn sync_activity(&mut self, now_secs: u64, now_ms: u64, project_viewed: bool) {
+        let selected = self.selected_tab;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            let status = tab.display_status(now_ms).interpreted;
+            let (output, status_changed) = tab.probe.take_edges(status);
+            let viewed = project_viewed && selected == Some(i);
+            if viewed {
+                tab.unread = false;
+            } else if output {
+                tab.unread = true;
+            }
+            if output {
+                tab.meta.activity.note_output(now_secs);
+            }
+            if status_changed {
+                tab.meta.activity.note_status_change(now_secs);
+            }
+        }
+    }
+
+    /// Record a fresh git status for tab `tab_id`: stamps
+    /// `meta.activity.last_git_change_at` when its changes / ahead count differ
+    /// from the previous observation (the first observation is a baseline).
+    pub fn observe_git_status(&mut self, tab_id: &str, status: &WorktreeStatus, now_secs: u64) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.meta.id == tab_id) else {
+            return;
+        };
+        let fingerprint = GitFingerprint::of(status);
+        if tab.probe.observe_git(fingerprint) {
+            tab.meta.activity.note_git_change(now_secs);
+        }
     }
 
     /// Update the persisted PTY size used for future spawns (SPECS §23 resize).
@@ -1257,6 +1334,7 @@ impl AppState {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -1267,6 +1345,8 @@ impl AppState {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -1379,6 +1459,7 @@ impl AppState {
             container_image: None,
             runs_on_base: true,
             resume_args: Vec::new(),
+            activity: Default::default(),
         };
         self.tabs.push(RuntimeTab {
             meta,
@@ -1389,6 +1470,8 @@ impl AppState {
             status_file_seen: None,
             notify_armed: false,
             activity_seen: None,
+            probe: ActivityProbe::default(),
+            unread: false,
             resume_scan: String::new(),
             session_snapshot: None,
         });
@@ -1445,6 +1528,7 @@ impl AppState {
             services.container.start_detached(start_args)?;
         }
         let mut session = Session::new();
+        session.set_profile(self.terminal_profile);
         if let Err(e) = session.spawn_primary_with_env(
             services.pty,
             &spawn.command,
@@ -1941,6 +2025,7 @@ impl AppState {
     fn cmd_new_child(&mut self, services: &Services) -> Result<Effect> {
         let size = self.pty_size;
         let repo_root = self.repo_root.clone();
+        let profile = self.terminal_profile;
         let Some(tab) = self.selected_mut() else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
@@ -1958,6 +2043,7 @@ impl AppState {
         } else {
             shell_launch()
         };
+        tab.session.set_profile(profile);
         let _idx = tab
             .session
             .spawn_child(services.pty, &cmd, &args, &cwd, size)?;
@@ -2010,6 +2096,7 @@ impl AppState {
             (launch.command, launch.args)
         };
         let tab = &mut self.tabs[idx];
+        tab.session.set_profile(self.terminal_profile);
         tab.session
             .spawn_agent_child(services.pty, &cmd, &args, &cwd, size)?;
         // The new agent tab appearing is its own confirmation; no toast needed.
@@ -2056,6 +2143,9 @@ impl AppState {
         match Self::resolve_selector(sel, self.selected_tab, len) {
             Some(idx) => {
                 self.selected_tab = Some(idx);
+                // Viewing a tab reads it, straight away rather than at the
+                // next activity sync.
+                self.tabs[idx].unread = false;
                 Ok(Effect::None)
             }
             None => Ok(Effect::Refused("No such Agent Tab.".to_string())),
@@ -2445,6 +2535,7 @@ impl AppState {
                 let _ = primary.session_mut().terminate_tree();
             }
         }
+        tab.session.set_profile(self.terminal_profile);
         if let Err(e) = tab.session.spawn_primary_with_env(
             services.pty,
             &spawn.command,
@@ -5578,6 +5669,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         });
         let app = AppState::new(Config::default(), state, REPO, STATE);
         assert_eq!(app.tabs.len(), 1);
@@ -5658,6 +5750,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         }
     }
 
@@ -6611,5 +6704,94 @@ mod tests {
             vec!["attach".to_string(), name],
             "PTY attaches"
         );
+    }
+
+    // --- Unread flag ---------------------------------------------------------
+
+    /// An app with `n` tabs, none spawned, tab 0 selected.
+    fn app_with_tabs(n: usize) -> AppState {
+        let mut ps = default_state("main");
+        for i in 0..n {
+            ps.tabs.push(crate::contracts::TabState {
+                id: format!("t{i}"),
+                name: format!("tab{i}"),
+                slug: format!("tab{i}"),
+                agent: "opencode".to_string(),
+                branch: format!("flightdeck/tab{i}"),
+                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}"),
+                base_branch: "main".to_string(),
+                base_commit_sha: "sha".to_string(),
+                created_at: "t".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: false,
+                resume_args: Vec::new(),
+                activity: Default::default(),
+            });
+        }
+        AppState::new(Config::default(), ps, REPO, STATE)
+    }
+
+    fn unread_flags(app: &AppState) -> Vec<bool> {
+        app.tabs.iter().map(|t| t.is_unread()).collect()
+    }
+
+    #[test]
+    fn output_on_a_non_viewed_tab_sets_unread() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert_eq!(unread_flags(&app), vec![false, true]);
+    }
+
+    #[test]
+    fn output_on_the_viewed_tab_does_not_set_unread() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert_eq!(unread_flags(&app), vec![false, false]);
+    }
+
+    #[test]
+    fn selecting_a_tab_clears_its_unread_flag() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        assert!(app.tabs[1].is_unread());
+        app.cmd_switch_tab(Selector::Index(1)).unwrap();
+        assert_eq!(unread_flags(&app), vec![false, false]);
+    }
+
+    #[test]
+    fn output_in_a_background_project_marks_even_the_selected_tab() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.sync_activity(10, 10_000, false);
+        assert_eq!(unread_flags(&app), vec![true, false]);
+    }
+
+    #[test]
+    fn switching_to_the_project_clears_its_selected_tab() {
+        let mut app = app_with_tabs(2);
+        app.tabs[0].note_output();
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, false);
+        assert_eq!(unread_flags(&app), vec![true, true]);
+        // The project comes on screen: only its selected tab is now viewed.
+        app.sync_activity(11, 11_000, true);
+        assert_eq!(unread_flags(&app), vec![false, true]);
+    }
+
+    #[test]
+    fn unread_persists_across_syncs_without_new_output() {
+        let mut app = app_with_tabs(2);
+        app.tabs[1].note_output();
+        app.sync_activity(10, 10_000, true);
+        app.sync_activity(11, 11_000, true);
+        assert!(app.tabs[1].is_unread());
     }
 }

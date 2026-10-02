@@ -684,6 +684,67 @@ default_agent = "opencode"
     }
 
     #[test]
+    fn option_as_meta_defaults_off_and_layers_project_over_global() {
+        // Absent from an old config: off (per-field default, siblings intact).
+        let old_config =
+            parse_config("[ui]\nagent_tab_position = \"left\"\ndefault_agent = \"opencode\"\n")
+                .unwrap();
+        assert!(!old_config.ui.macos_option_as_meta);
+        assert_eq!(old_config.ui.terminal_mode_color, "green");
+
+        // The generated global file documents it, off.
+        let global_text = serialize_global_config(&default_config("x", "main")).unwrap();
+        assert!(global_text.contains("macos_option_as_meta = false"));
+
+        // Global on, project silent: inherited. Project off: wins.
+        let mut global = global_base();
+        global
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert("macos_option_as_meta".into(), toml::Value::Boolean(true));
+        let cfg = effective_config(global.clone(), toml::Table::new()).unwrap();
+        assert!(cfg.ui.macos_option_as_meta);
+        let project = "[ui]\nmacos_option_as_meta = false\n".parse().unwrap();
+        let cfg = effective_config(global, project).unwrap();
+        assert!(!cfg.ui.macos_option_as_meta);
+    }
+
+    #[test]
+    fn desktop_terminal_font_size_defaults_layers_and_is_validated() {
+        // Absent from an old config: the size the desktop always drew at.
+        let old_config =
+            parse_config("[ui]\nagent_tab_position = \"left\"\ndefault_agent = \"opencode\"\n")
+                .unwrap();
+        assert_eq!(old_config.ui.desktop_terminal_font_size, 13);
+
+        // The generated global file documents it.
+        let global_text = serialize_global_config(&default_config("x", "main")).unwrap();
+        assert!(global_text.contains("desktop_terminal_font_size = 13"));
+
+        // Global 15, project silent: inherited. Project 11: wins.
+        let mut global = global_base();
+        global
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "desktop_terminal_font_size".into(),
+                toml::Value::Integer(15),
+            );
+        let cfg = effective_config(global.clone(), toml::Table::new()).unwrap();
+        assert_eq!(cfg.ui.desktop_terminal_font_size, 15);
+        let project = "[ui]\ndesktop_terminal_font_size = 11\n".parse().unwrap();
+        let cfg = effective_config(global.clone(), project).unwrap();
+        assert_eq!(cfg.ui.desktop_terminal_font_size, 11);
+
+        // Out of range is refused at load, naming the key.
+        let project = "[ui]\ndesktop_terminal_font_size = 99\n".parse().unwrap();
+        let err = effective_config(global, project).unwrap_err().to_string();
+        assert!(err.contains("desktop_terminal_font_size"), "{err}");
+    }
+
+    #[test]
     fn missing_project_inherits_global_wholesale() {
         let cfg = effective_config(global_base(), toml::Table::new()).unwrap();
         assert_eq!(cfg.agents.len(), 4);

@@ -1,0 +1,27 @@
+# Homebrew cask template for the FlightDeck desktop app (GPUI). NOT published yet:
+# the tap (currently neworange-ruud/homebrew-tap, formula "flightdeck" for the TUI)
+# takes this as Casks/flightdeck-desktop.rb once releases exist. Fill the @...@
+# placeholders (release job or `sed`), then `brew audit --cask --new flightdeck-desktop`.
+#   @VERSION@   e.g. 0.1.0 (desktop/Cargo.toml)
+#   @SHA256@    sha256 of FlightDeck-@VERSION@-macos.zip (printed by scripts/desktop/macos-bundle.sh)
+# The zip must be signed + notarized, or Gatekeeper blocks the cask install.
+cask "flightdeck-desktop" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/neworange-ruud/flightdeck/releases/download/desktop-v#{version}/FlightDeck-#{version}-macos.zip"
+  name "FlightDeck"
+  desc "Native desktop app for orchestrating AI coding agents"
+  homepage "https://github.com/neworange-ruud/flightdeck"
+
+  depends_on macos: ">= :big_sur"
+
+  app "FlightDeck.app"
+
+  zap trash: [
+    "~/Library/Application Support/agency.neworange.flightdeck.desktop",
+    "~/Library/Caches/agency.neworange.flightdeck.desktop",
+    "~/Library/Preferences/agency.neworange.flightdeck.desktop.plist",
+    "~/Library/Saved Application State/agency.neworange.flightdeck.desktop.savedState",
+  ]
+end

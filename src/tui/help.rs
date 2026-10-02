@@ -40,6 +40,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::keymap::{Keymap, KeymapOptions};
+
 /// Everything the help overlay shows, for one running FlightDeck.
 ///
 /// Built by [`help_doc`] from the two facts that change it: the leave-focus
@@ -156,15 +158,10 @@ pub fn about_doc() -> AboutDoc {
 /// Three answers, one of them chosen by `[ui] use_f2_to_leave_terminal_focus`
 /// and the other two by the platform. The help screen has to state the one that
 /// is actually bound, not the one that usually is — which is why this is a
-/// function of the config rather than a constant.
+/// function of the config rather than a constant. The keymap table owns the
+/// answer ([`crate::app::keymap::leave_focus_label`]).
 pub fn leave_focus_key(use_f2: bool) -> &'static str {
-    if use_f2 {
-        "F2"
-    } else if crate::tui::platform::LEAVE_FOCUS_USES_SHIFT {
-        "Shift+Esc"
-    } else {
-        "Alt+Esc"
-    }
+    crate::app::keymap::leave_focus_label(KeymapOptions::for_this_platform(use_f2))
 }
 
 /// SPECS §32's isolated-run note, or `None` for an ordinary run.
@@ -193,76 +190,37 @@ fn isolated_note(isolated: bool) -> Option<HelpNote> {
 /// the moment the screen is built, so neither surface can show a binding this
 /// process does not have.
 pub fn help_doc(use_f2: bool, isolated: bool) -> HelpDoc {
+    help_doc_for(use_f2, isolated, false)
+}
+
+/// [`help_doc`] for a front-end: `desktop` adds the rows for the shortcuts only
+/// the desktop app has (see [`crate::app::keymap::KeymapOptions::desktop`]).
+/// The TUI and the browser pass `false` and get the screen they always had.
+pub fn help_doc_for(use_f2: bool, isolated: bool, desktop: bool) -> HelpDoc {
+    help_doc_from(Keymap::for_front_end(use_f2, desktop), isolated)
+}
+
+/// The help screen for an explicit keymap: its sections and rows, verbatim.
+///
+/// The rows are [`Keymap::help_sections`] and nothing else, so the screen
+/// cannot list a key the table does not bind, nor miss one it does (bar the
+/// documented [`crate::app::keymap::HIDDEN_FROM_HELP`]).
+fn help_doc_from(keymap: &Keymap, isolated: bool) -> HelpDoc {
     HelpDoc {
         title: "FlightDeck Keyboard Shortcuts".to_string(),
         notes: isolated_note(isolated).into_iter().collect(),
-        sections: vec![
-            HelpSection {
-                title: "Global".to_string(),
-                rows: vec![
-                    HelpRow::new("Ctrl-g", "Command palette"),
-                    HelpRow::new("Ctrl-q", "Quit / close app"),
-                    HelpRow::new("Ctrl-n", "New Agent Session Tab"),
-                    HelpRow::new("Ctrl-p", "Push current branch"),
-                    HelpRow::new("Ctrl-u", "Pull base (git pull --rebase)"),
-                    HelpRow::new("Ctrl-f", "Finish current Agent Session Tab"),
-                    HelpRow::new("Ctrl-k", "Close current Agent Session Tab"),
-                    HelpRow::new("Alt-o", "Open worktree in file manager"),
-                    HelpRow::new(crate::tui::render::HELP_KEYS, "Help / keybindings"),
-                ],
-            },
-            HelpSection {
-                title: "Projects".to_string(),
-                rows: vec![
-                    HelpRow::new("Shift-Left / Shift-Right", "Previous / Next project"),
-                    HelpRow::new("Mouse click", "Switch project (top tab row)"),
-                    HelpRow::new("+ project", "Open another project folder"),
-                ],
-            },
-            HelpSection {
-                title: "Agent Session Tab Navigation".to_string(),
-                rows: vec![
-                    HelpRow::new("Up / Down (or Alt)", "Previous / Next Agent Session Tab"),
-                    HelpRow::new("Alt-1 .. Alt-9", "Jump to Agent Session Tab by index"),
-                    HelpRow::new("Mouse click", "Select Agent Session Tab"),
-                ],
-            },
-            HelpSection {
-                title: "Child Terminal Navigation".to_string(),
-                rows: vec![
-                    HelpRow::new("Ctrl-t", "New child terminal"),
-                    HelpRow::new("Ctrl-w", "Close active child terminal"),
-                    HelpRow::new(
-                        "Left / Right (or Alt)",
-                        "Cycle terminal tabs (agent + shells)",
-                    ),
-                    HelpRow::new("Ctrl-b", "Toggle split view (terminals side by side)"),
-                    HelpRow::new("Mouse click", "Select terminal tab"),
-                ],
-            },
-            HelpSection {
-                title: "Selection / Clipboard".to_string(),
-                rows: vec![
-                    HelpRow::new("Drag", "Select terminal text (copies on release)"),
-                    HelpRow::new("Drag past edge", "Auto-scrolls to reach offscreen text"),
-                    HelpRow::new("Shift-drag", "Force selection over a mouse-driven app"),
-                ],
-            },
-            HelpSection {
-                title: "Focus".to_string(),
-                rows: vec![
-                    HelpRow::new(leave_focus_key(use_f2), "Leave terminal focus / focus app"),
-                    HelpRow::new("Enter", "Focus active terminal"),
-                ],
-            },
-            HelpSection {
-                title: "Status".to_string(),
-                rows: vec![
-                    HelpRow::new("Ctrl-s", "Set manual status"),
-                    HelpRow::new("Ctrl-r", "Restart primary agent"),
-                ],
-            },
-        ],
+        sections: keymap
+            .help_sections()
+            .iter()
+            .map(|section| HelpSection {
+                title: section.title.to_string(),
+                rows: section
+                    .rows
+                    .iter()
+                    .map(|row| HelpRow::new(&row.keys, row.description))
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -329,5 +287,148 @@ mod tests {
     fn about_reports_this_builds_version() {
         assert_eq!(about_doc().version, env!("CARGO_PKG_VERSION"));
         assert!(!about_doc().credits.is_empty());
+    }
+
+    /// Help renders exactly the keymap table's help layout: same sections,
+    /// same rows, same order, same words.
+    #[test]
+    fn help_renders_exactly_the_keymap_tables_rows() {
+        for use_f2 in [false, true] {
+            let keymap = Keymap::for_this_platform(use_f2);
+            let doc = help_doc(use_f2, false);
+            let from_table: Vec<(String, Vec<(String, String)>)> = keymap
+                .help_sections()
+                .iter()
+                .map(|s| {
+                    (
+                        s.title.to_string(),
+                        s.rows
+                            .iter()
+                            .map(|r| (r.keys.clone(), r.description.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let rendered: Vec<(String, Vec<(String, String)>)> = doc
+                .sections
+                .iter()
+                .map(|s| {
+                    (
+                        s.title.clone(),
+                        s.rows
+                            .iter()
+                            .map(|r| (r.keys.clone(), r.description.clone()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            assert_eq!(rendered, from_table);
+        }
+    }
+
+    /// The help screen as it shipped before the keymap table drove it, row for
+    /// row. Moving the rows into the table must not have changed a word.
+    #[test]
+    fn help_is_unchanged_by_the_keymap_refactor() {
+        let leave = leave_focus_key(false);
+        let expected: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            (
+                "Global",
+                vec![
+                    ("Ctrl-g", "Command palette"),
+                    ("Ctrl-q", "Quit / close app"),
+                    ("Ctrl-n", "New Agent Session Tab"),
+                    ("Ctrl-p", "Push current branch"),
+                    ("Ctrl-u", "Pull base (git pull --rebase)"),
+                    ("Ctrl-f", "Finish current Agent Session Tab"),
+                    ("Ctrl-k", "Close current Agent Session Tab"),
+                    ("Alt-o", "Open worktree in file manager"),
+                    (crate::tui::render::HELP_KEYS, "Help / keybindings"),
+                ],
+            ),
+            (
+                "Projects",
+                vec![
+                    ("Shift-Left / Shift-Right", "Previous / Next project"),
+                    ("Mouse click", "Switch project (top tab row)"),
+                    ("+ project", "Open another project folder"),
+                    // Added after the refactor: the desktop app's view switch.
+                    ("Alt-m", "Projects / Mission control (desktop app)"),
+                ],
+            ),
+            (
+                "Agent Session Tab Navigation",
+                vec![
+                    ("Up / Down (or Alt)", "Previous / Next Agent Session Tab"),
+                    ("Alt-1 .. Alt-9", "Jump to Agent Session Tab by index"),
+                    ("Mouse click", "Select Agent Session Tab"),
+                ],
+            ),
+            (
+                "Child Terminal Navigation",
+                vec![
+                    ("Ctrl-t", "New child terminal"),
+                    ("Ctrl-w", "Close active child terminal"),
+                    (
+                        "Left / Right (or Alt)",
+                        "Cycle terminal tabs (agent + shells)",
+                    ),
+                    ("Ctrl-b", "Toggle split view (terminals side by side)"),
+                    ("Mouse click", "Select terminal tab"),
+                ],
+            ),
+            (
+                "Selection / Clipboard",
+                vec![
+                    ("Drag", "Select terminal text (copies on release)"),
+                    ("Drag past edge", "Auto-scrolls to reach offscreen text"),
+                    ("Shift-drag", "Force selection over a mouse-driven app"),
+                ],
+            ),
+            (
+                "Focus",
+                vec![
+                    (leave, "Leave terminal focus / focus app"),
+                    ("Enter", "Focus active terminal"),
+                ],
+            ),
+            (
+                "Status",
+                vec![
+                    ("Ctrl-s", "Set manual status"),
+                    ("Ctrl-r", "Restart primary agent"),
+                ],
+            ),
+        ];
+        let doc = help_doc(false, false);
+        assert_eq!(doc.title, "FlightDeck Keyboard Shortcuts");
+        let got: Vec<(&str, Vec<(&str, &str)>)> = doc
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    s.title.as_str(),
+                    s.rows
+                        .iter()
+                        .map(|r| (r.keys.as_str(), r.description.as_str()))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    /// The status bar's help hint and the help row are the same keys, now
+    /// derived from the OpenHelp binding's chords.
+    #[test]
+    fn the_help_row_is_spelled_from_the_bindings_and_matches_the_status_bar() {
+        let keymap = Keymap::for_this_platform(false);
+        let row = keymap
+            .help_sections()
+            .iter()
+            .flat_map(|s| &s.rows)
+            .find(|r| r.entry_ids == ["OpenHelp"])
+            .expect("the help row");
+        assert_eq!(row.keys, crate::tui::render::HELP_KEYS);
     }
 }

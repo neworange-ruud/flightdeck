@@ -1,6 +1,6 @@
 # Agent Instructions
 
-- Always update `CHANGELOG.md` when creating or updating a pull request.
+- Always update the changelog when creating or updating a pull request: `CHANGELOG.md` for the CLI/TUI and the shared core, `desktop/CHANGELOG.md` for the desktop app (a core change both apps get goes in both).
 - Verify changes before finishing — run the ship gate (tests, clippy, fmt) and hand the user a local build. See `.agents/skills/shipping-flightdeck-changes` for the exact commands and checklist.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
@@ -82,6 +82,7 @@ cross-cutting work gets several (the seq-deadlock bug was
 | `area:relay` | `remote/` — the relay + protocol workspace |
 | `area:ios` | `ios/` — the Swift app |
 | `area:tui` | `src/tui/` — panes, input, rendering |
+| `area:gui` | the native GPUI desktop app — window, terminal element, views |
 | `area:web` | `web/` — the site and privacy policy |
 | `area:containers` | `containers/` — agent isolation images |
 | `area:ci` | `.github/workflows/` — CI, release, TestFlight |

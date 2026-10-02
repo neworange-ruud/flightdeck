@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A2 — Mission control grid</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:'Geist',system-ui,sans-serif;background:#161311;color:#f2efe9}
+a{color:#e7a6d4}a:hover{color:#f4c9e6}
+button{font-family:inherit}
+.term>div{white-space:pre;min-height:18px}
+</style>
+</helmet>
+<div style="width: 1440px; height: 900px; box-sizing: border-box; display: flex; flex-direction: column; background: #1c1917; color: #f2efe9; font-family: 'Geist', system-ui, sans-serif; overflow: hidden; border-radius: 12px; border: 1px solid #3a3430">
+
+<!-- TITLEBAR: view switch + scope -->
+<div style="height: 44px; flex-shrink: 0; display: flex; align-items: center; gap: 14px; padding: 0 12px 0 16px; background: #1c1917; border-bottom: 1px solid #2f2a26">
+<div style="display: flex; gap: 8px; align-items: center" aria-hidden="true">
+<div style="width: 12px; height: 12px; border-radius: 6px; background: #ec6a5e"></div>
+<div style="width: 12px; height: 12px; border-radius: 6px; background: #f4bf4f"></div>
+<div style="width: 12px; height: 12px; border-radius: 6px; background: #61c554"></div>
+</div>
+<div style="width: 8px"></div>
+<div style="display: flex; padding: 3px; gap: 2px; border-radius: 8px; background: #221e1b; border: 1px solid #3a3430" role="group" aria-label="View">
+<a href="Main.dc.html" style="height: 24px; padding: 0 10px; display: flex; align-items: center; gap: 6px; border-radius: 5px; color: #a39b92; font-size: 12px; text-decoration: none">
+<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2" width="11" height="10" rx="1.5"></rect><path d="M5 2v10"></path></svg>Projects</a>
+<a href="A2-MissionGrid.dc.html" style="height: 24px; padding: 0 10px; display: flex; align-items: center; gap: 6px; border-radius: 5px; background: #3a322d; color: #f2efe9; font-size: 12px; font-weight: 500; text-decoration: none">
+<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1"></rect><rect x="8" y="1.5" width="4.5" height="4.5" rx="1"></rect><rect x="1.5" y="8" width="4.5" height="4.5" rx="1"></rect><rect x="8" y="8" width="4.5" height="4.5" rx="1"></rect></svg>Mission control</a>
+</div>
+<div style="width: 1px; height: 20px; background: #3a3430"></div>
+<button style="height: 28px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border-radius: 7px; border: 1px solid #3a3430; background: transparent; color: #cfc7bd; font-size: 12.5px">
+<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="7" cy="7" r="5.2"></circle><path d="M7 4v3l2 1.5"></path></svg>Active + updated in the last 24h
+<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="m2 3.5 3 3 3-3"></path></svg></button>
+<button style="height: 28px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border-radius: 7px; border: 1px solid #3a3430; background: transparent; color: #cfc7bd; font-size: 12.5px">All 7 projects
+<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="m2 3.5 3 3 3-3"></path></svg></button>
+<div style="display: flex; gap: 6px; font-size: 12px">
+<span style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 12px; background: #3a2c14; color: #f0b54a"><svg width="10" height="10" viewBox="0 0 12 12" fill="#f0b54a"><path d="M6 1.5 11 10.5H1Z"></path></svg>2 need you</span>
+<span style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 12px; background: #34232f; color: #ecb3dc"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="{{accent}}" stroke-width="2" stroke-linecap="round"><path d="M6 1.2a4.8 4.8 0 1 1-4.8 4.8"></path></svg>2 working</span>
+<span style="display: flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 12px; background: #2b2622; color: #a39b92">3 earlier today</span>
+</div>
+<div style="flex-grow: 1"></div>
+<button style="display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 8px 0 12px; border: 1px solid #3a3430; border-radius: 7px; background: #221e1b; color: #a39b92; font-size: 12.5px; width: 200px; flex-shrink: 0">
+<svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6" cy="6" r="4.2"></circle><path d="m9.2 9.2 3 3"></path></svg>
+<span style="flex-grow: 1; text-align: left">Command…</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #cfc7bd; padding: 2px 6px; border-radius: 4px; border: 1px solid #453e39; background: #2b2622">⌃G</span>
+</button>
+</div>
+
+<div style="display: flex; flex-grow: 1; min-height: 0">
+
+<!-- SIDEBAR: same rail, regrouped by status across all projects -->
+<div style="width: 272px; flex-shrink: 0; display: flex; flex-direction: column; background: #201c19; border-right: 1px solid #2f2a26">
+<div style="display: flex; flex-direction: column; gap: 2px; padding: 14px 8px">
+
+<div style="display: flex; justify-content: space-between; padding: 0 10px 6px 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #f0b54a"><span>NEEDS YOU</span><span style="font-family: 'Geist Mono', monospace; font-weight: 400">2</span></div>
+<div style="display: flex; gap: 11px; padding: 9px 10px; border-radius: 8px; background: #2b2622; border: 1px solid #3a3430">
+<div style="position: relative; width: 28px; height: 28px; flex-shrink: 0; border-radius: 7px; background: #3a322d; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 500; color: #9fc4ee">CX
+<div style="position: absolute; right: -4px; bottom: -4px; width: 14px; height: 14px; border-radius: 7px; background: #2b2622; display: flex; align-items: center; justify-content: center"><svg width="10" height="10" viewBox="0 0 12 12" fill="#f0b54a"><path d="M6 1.5 11 10.5H1Z"></path></svg></div></div>
+<div style="display: flex; flex-direction: column; gap: 2px; flex-grow: 1; min-width: 0">
+<div style="display: flex; justify-content: space-between"><span style="font-size: 13px; font-weight: 600">fix-relay-seq</span><span style="font-size: 11px; color: #a39b92">1m</span></div>
+<div style="font-size: 11.5px; color: #a39b92">flightdeck · approve cargo fmt</div></div></div>
+<div style="display: flex; gap: 11px; padding: 9px 10px; border-radius: 8px">
+<div style="position: relative; width: 28px; height: 28px; flex-shrink: 0; border-radius: 7px; background: #2e2926; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 500; color: #f0c3a8">CC
+<div style="position: absolute; right: -4px; bottom: -4px; width: 14px; height: 14px; border-radius: 7px; background: #201c19; display: flex; align-items: center; justify-content: center"><svg width="10" height="10" viewBox="0 0 12 12" fill="#f0b54a"><path d="M6 1.5 11 10.5H1Z"></path></svg></div></div>
+<div style="display: flex; flex-direction: column; gap: 2px; flex-grow: 1; min-width: 0">
+<div style="display: flex; justify-content: space-between"><span style="font-size: 13px; font-weight: 500">score-parser</span><span style="font-size: 11px; color: #a39b92">4m</span></div>
+<div style="font-size: 11.5px; color: #a39b92">symphony · edit parser.ts?</div></div></div>
+
+<div style="display: flex; justify-content: space-between; padding: 14px 10px 6px 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #ecb3dc"><span>WORKING</span><span style="font-family: 'Geist Mono', monospace; font-weight: 400">2</span></div>
+<div style="display: flex; gap: 11px; padding: 9px 10px; border-radius: 8px">
+<div style="position: relative; width: 28px; height: 28px; flex-shrink: 0; border-radius: 7px; background: #2e2926; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 500; color: #f0c3a8">CC
+<div style="position: absolute; right: -4px; bottom: -4px; width: 14px; height: 14px; border-radius: 7px; background: #201c19; display: flex; align-items: center; justify-content: center"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="{{accent}}" stroke-width="1.8" stroke-linecap="round"><path d="M6 1.2a4.8 4.8 0 1 1-4.8 4.8"></path></svg></div></div>
+<div style="display: flex; flex-direction: column; gap: 2px; flex-grow: 1; min-width: 0">
+<div style="display: flex; justify-content: space-between"><span style="font-size: 13px; font-weight: 500">ui-redesign</span><span style="font-size: 11px; color: #a39b92">2m</span></div>
+<div style="font-size: 11.5px; color: #a39b92">flightdeck · refactoring layout</div></div></div>
+<div style="display: flex; gap: 11px; padding: 9px 10px; border-radius: 8px">
+<div style="position: relative; width: 28px; height: 28px; flex-shrink: 0; border-radius: 7px; background: #2e2926; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 500; color: #c7b4f0">OC
+<div style="position: absolute; right: -4px; bottom: -4px; width: 14px; height: 14px; border-radius: 7px; background: #201c19; display: flex; align-items: center; justify-content: center"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="{{accent}}" stroke-width="1.8" stroke-linecap="round"><path d="M6 1.2a4.8 4.8 0 1 1-4.8 4.8"></path></svg></div></div>
+<div style="display: flex; flex-direction: column; gap: 2px; flex-grow: 1; min-width: 0">
+<div style="display: flex; justify-content: space-between"><span style="font-size: 13px; font-weight: 500">ingest-docs</span><span style="font-size: 11px; color: #a39b92">9m</span></div>
+<div style="font-size: 11.5px; color: #a39b92">neworange-knowledge · running tests</div></div></div>
+
+<div style="display: flex; justify-content: space-between; padding: 14px 10px 6px 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #a39b92"><span>EARLIER TODAY</span><span style="font-family: 'Geist Mono', monospace; font-weight: 400">3</span></div>
+<div style="display: flex; gap: 11px; padding: 7px 10px; border-radius: 8px; align-items: center">
+<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#7cc47f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2.5 6.3 2.3 2.3 4.7-5"></path></svg>
+<span style="font-size: 13px; color: #cfc7bd">add-tests</span><span style="margin-left: auto; font-size: 11px; color: #a39b92">2h</span></div>
+<div style="display: flex; gap: 11px; padding: 7px 10px; border-radius: 8px; align-items: center">
+<span style="width: 12px; display: flex; justify-content: center"><span style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid #8a8279; box-sizing: border-box"></span></span>
+<span style="font-size: 13px; color: #cfc7bd">main</span><span style="margin-left: auto; font-size: 11px; color: #a39b92">3h</span></div>
+<div style="display: flex; gap: 11px; padding: 7px 10px; border-radius: 8px; align-items: center">
+<span style="width: 12px; display: flex; justify-content: center"><span style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid #8a8279; box-sizing: border-box"></span></span>
+<span style="font-size: 13px; color: #cfc7bd">brain-sync</span><span style="margin-left: auto; font-size: 11px; color: #a39b92">6h</span></div>
+</div>
+<div style="flex-grow: 1"></div>
+<div style="padding: 12px 18px; border-top: 1px solid #2f2a26; font-size: 12px; color: #a39b92">5 quiet sessions hidden · <a href="Main.dc.html">see all in Projects</a></div>
+</div>
+
+<!-- MAIN: live tiles for active, compact cards for earlier today -->
+<div style="flex-grow: 1; display: flex; flex-direction: column; gap: 10px; padding: 10px; min-width: 0; background: #161311">
+<div style="flex-grow: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); gap: 10px; min-height: 0">
+
+<!-- tile: needs you (keyboard-selected) -->
+<div style="display: flex; flex-direction: column; border-radius: 10px; border: 1.5px solid #f0b54a; box-shadow: 0 0 0 4px rgba(240, 181, 74, 0.14); background: #141110; overflow: hidden">
+<div style="height: 36px; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #251f15; border-bottom: 1px solid #3d321c; font-size: 12.5px">
+<svg width="11" height="11" viewBox="0 0 12 12" fill="#f0b54a"><path d="M6 1.5 11 10.5H1Z"></path></svg>
+<span style="font-weight: 600">fix-relay-seq</span><span style="color: #a39b92">flightdeck · Codex</span>
+<span style="margin-left: auto; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #8fcf8f">+52</span> <span style="color: #ef8f7e">−9</span></span></div>
+<div style="flex-grow: 1; padding: 10px 14px; font-family: 'Geist Mono', monospace; font-size: 12px; line-height: 18px; color: #e8e2d8; overflow: hidden" class="term">
+<div><span style="color: #7cc47f">•</span> Patched remote/relay/src/seq.rs</div>
+<div> </div>
+<div><span style="color: #f0b54a">▌</span> Allow command?</div>
+<div><span style="color: #f0b54a">▌</span> <span style="color: #a39b92">$ cargo fmt --all</span></div>
+<div> </div>
+<div><span style="color: #9fc4ee">›</span> 1. Yes, run it</div>
+<div>  2. Yes, and don't ask again for cargo fmt</div>
+<div>  3. No, tell Codex what to do differently</div>
+</div>
+<div style="height: 40px; flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-top: 1px solid #3d321c; background: #1d1912">
+<button style="height: 28px; padding: 0 12px; border-radius: 6px; border: none; background: #f0b54a; color: #1a1305; font-size: 12px; font-weight: 600">Approve</button>
+<button style="height: 28px; padding: 0 12px; border-radius: 6px; border: 1px solid #4a3a1c; background: transparent; color: #e0cfa8; font-size: 12px">Deny</button>
+<span style="margin-left: auto; font-size: 11.5px; color: #a39b92"><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">⏎</span> open full size</span>
+</div>
+</div>
+
+<!-- tile: needs you 2 -->
+<div style="display: flex; flex-direction: column; border-radius: 10px; border: 1px solid #4a3a1c; background: #141110; overflow: hidden">
+<div style="height: 36px; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #1f1a13; border-bottom: 1px solid #332a18; font-size: 12.5px">
+<svg width="11" height="11" viewBox="0 0 12 12" fill="#f0b54a"><path d="M6 1.5 11 10.5H1Z"></path></svg>
+<span style="font-weight: 600">score-parser</span><span style="color: #a39b92">symphony · Claude Code</span>
+<span style="margin-left: auto; font-size: 11px; color: #a39b92">waiting 4m</span></div>
+<div style="flex-grow: 1; padding: 10px 14px; font-family: 'Geist Mono', monospace; font-size: 12px; line-height: 18px; color: #e8e2d8; overflow: hidden" class="term">
+<div><span style="color: #7cc47f">⏺</span> <span style="font-weight: 600">Update</span>(src/parser.ts)</div>
+<div> </div>
+<div style="color: #5f5750"> ╭────────────────────────────────────╮</div>
+<div> <span style="color: #5f5750">│</span> Do you want to make this edit to   <span style="color: #5f5750">│</span></div>
+<div> <span style="color: #5f5750">│</span> <span style="font-weight: 600">parser.ts</span>?                         <span style="color: #5f5750">│</span></div>
+<div> <span style="color: #5f5750">│</span> <span style="color: #9fc4ee">❯ 1. Yes</span>                           <span style="color: #5f5750">│</span></div>
+<div> <span style="color: #5f5750">│</span>   2. Yes, allow all edits          <span style="color: #5f5750">│</span></div>
+<div> <span style="color: #5f5750">│</span>   3. No, and tell Claude what to do<span style="color: #5f5750">│</span></div>
+<div style="color: #5f5750"> ╰────────────────────────────────────╯</div>
+</div>
+</div>
+
+<!-- tile: working -->
+<div style="display: flex; flex-direction: column; border-radius: 10px; border: 1px solid #3a3430; background: #141110; overflow: hidden">
+<div style="height: 36px; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #201c19; border-bottom: 1px solid #2f2a26; font-size: 12.5px">
+<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="{{accent}}" stroke-width="2" stroke-linecap="round"><path d="M6 1.2a4.8 4.8 0 1 1-4.8 4.8"></path></svg>
+<span style="font-weight: 600">ui-redesign</span><span style="color: #a39b92">flightdeck · Claude Code</span>
+<span style="margin-left: auto; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #8fcf8f">+214</span> <span style="color: #ef8f7e">−38</span></span></div>
+<div style="flex-grow: 1; padding: 10px 14px; font-family: 'Geist Mono', monospace; font-size: 12px; line-height: 18px; color: #e8e2d8; overflow: hidden" class="term">
+<div><span style="color: #7cc47f">⏺</span> <span style="font-weight: 600">Read</span>(src/tui/render.rs)</div>
+<div><span style="color: #8a8279">  ⎿  Read 7487 lines</span></div>
+<div><span style="color: #7cc47f">⏺</span> <span style="font-weight: 600">Update</span>(src/tui/layout.rs)</div>
+<div><span style="color: #8a8279">  ⎿  14 additions and 6 removals</span></div>
+<div> </div>
+<div><span style="color: {{accent}}">✻ Refactoring layout…</span><span style="color: #8a8279"> (2m 14s)</span></div>
+<div> </div>
+<div style="color: #3a3430">────────────────────────────────────────────</div>
+<div><span style="color: #a39b92">❯</span></div>
+</div>
+</div>
+
+<!-- tile: working 2 -->
+<div style="display: flex; flex-direction: column; border-radius: 10px; border: 1px solid #3a3430; background: #141110; overflow: hidden">
+<div style="height: 36px; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #201c19; border-bottom: 1px solid #2f2a26; font-size: 12.5px">
+<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="{{accent}}" stroke-width="2" stroke-linecap="round"><path d="M6 1.2a4.8 4.8 0 1 1-4.8 4.8"></path></svg>
+<span style="font-weight: 600">ingest-docs</span><span style="color: #a39b92">neworange-knowledge · OpenCode</span>
+<span style="margin-left: auto; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #8fcf8f">+96</span> <span style="color: #ef8f7e">−12</span></span></div>
+<div style="flex-grow: 1; padding: 10px 14px; font-family: 'Geist Mono', monospace; font-size: 12px; line-height: 18px; color: #e8e2d8; overflow: hidden" class="term">
+<div><span style="color: #c7b4f0">◇</span> bash  <span style="color: #a39b92">npm test -- ingest</span></div>
+<div> </div>
+<div><span style="color: #7cc47f"> ✓</span> chunker splits on headings <span style="color: #8a8279">(4 ms)</span></div>
+<div><span style="color: #7cc47f"> ✓</span> chunker keeps code fences whole <span style="color: #8a8279">(2 ms)</span></div>
+<div><span style="color: #7cc47f"> ✓</span> embeds batch of 64 <span style="color: #8a8279">(118 ms)</span></div>
+<div><span style="color: {{accent}}"> ◌</span> <span style="color: #a39b92">dedupes by content hash…</span></div>
+<div> </div>
+<div><span style="color: #8a8279"> Tests: 3 passed, 1 running</span></div>
+</div>
+</div>
+</div>
+
+<!-- EARLIER TODAY: compact cards, not live terminals -->
+<div style="flex-shrink: 0; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; align-items: center; gap: 10px; padding: 0 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #a39b92">EARLIER TODAY<span style="flex-grow: 1; height: 1px; background: #2f2a26"></span></div>
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px">
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 10px; background: #201c19; border: 1px solid #2f2a26">
+<div style="display: flex; align-items: center; gap: 8px; font-size: 13px"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#7cc47f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2.5 6.3 2.3 2.3 4.7-5"></path></svg><span style="font-weight: 600">add-tests</span><span style="color: #a39b92">flightdeck</span><span style="margin-left: auto; font-size: 11.5px; color: #a39b92">2h ago</span></div>
+<div style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #cfc7bd">Opened PR #412 · checks passed</div>
+<div style="display: flex; gap: 8px; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #8fcf8f">+388</span><span style="color: #ef8f7e">−0</span><span style="margin-left: auto; color: #a39b92">Finish ⌃F</span></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 10px; background: #201c19; border: 1px solid #2f2a26">
+<div style="display: flex; align-items: center; gap: 8px; font-size: 13px"><span style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid #8a8279; box-sizing: border-box"></span><span style="font-weight: 600">main</span><span style="color: #a39b92">flightdeck</span><span style="margin-left: auto; font-size: 11.5px; color: #a39b92">3h ago</span></div>
+<div style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #cfc7bd">Idle · target +24 behind origin</div>
+<div style="display: flex; gap: 8px; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #a39b92">clean</span><span style="margin-left: auto; color: #a39b92">Pull ⌃U</span></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 10px; background: #201c19; border: 1px solid #2f2a26">
+<div style="display: flex; align-items: center; gap: 8px; font-size: 13px"><span style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid #8a8279; box-sizing: border-box"></span><span style="font-weight: 600">brain-sync</span><span style="color: #a39b92">neworange-brain</span><span style="margin-left: auto; font-size: 11.5px; color: #a39b92">6h ago</span></div>
+<div style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #cfc7bd">Idle · 2 files changed, not pushed</div>
+<div style="display: flex; gap: 8px; font-family: 'Geist Mono', monospace; font-size: 11px"><span style="color: #8fcf8f">+31</span><span style="color: #ef8f7e">−4</span><span style="margin-left: auto; color: #a39b92">Push ⌃P</span></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- STATUS BAR -->
+<div style="height: 30px; flex-shrink: 0; display: flex; align-items: center; gap: 16px; padding: 0 14px; border-top: 1px solid #2f2a26; background: #1c1917; font-size: 11.5px; color: #a39b92">
+<span style="padding: 2px 8px; border-radius: 4px; background: #3a322d; color: #f2efe9; font-family: 'Geist Mono', monospace; font-size: 10.5px; font-weight: 500">APP</span>
+<span><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">↑↓←→</span> move between tiles</span>
+<span><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">⏎</span> open full size</span>
+<span><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">Alt-1…9</span> jump</span>
+<span><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">Alt-m</span> switch view</span>
+<div style="flex-grow: 1"></div>
+<span><span style="font-family: 'Geist Mono', monospace; color: #cfc7bd">F1</span> help</span>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#d86fb8","options":["#d86fb8","#6fa8ff","#e8915a","#58c4b0"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return { accent: this.props.accent ?? '#d86fb8' };
+}
+}
+</script>
+</body>
+</html>

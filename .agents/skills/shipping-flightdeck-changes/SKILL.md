@@ -91,10 +91,21 @@ cargo build --release --locked   # then tell the user the path to the binary
 
 ## CHANGELOG at PR time
 
-Update `CHANGELOG.md` when **creating or updating a PR**, not on intermediate
+Update the changelog when **creating or updating a PR**, not on intermediate
 task commits (project instruction). Group under `New features`, `Improvements`,
-`Bug fixes`. `scripts/release` rolls `Unreleased` into a version at release
-time — don't hand-edit released sections.
+`Bug fixes`. Don't hand-edit released sections.
+
+The two apps are released separately, so there are two changelogs:
+
+| Change touches | Changelog | Rolled by |
+| --- | --- | --- |
+| The CLI/TUI (`src/tui/`, commands, cargo-dist builds) | `CHANGELOG.md` | `scripts/release` |
+| The desktop app (`desktop/`) | `desktop/CHANGELOG.md` | `scripts/release-desktop` |
+| The shared core (`src/` outside the TUI) both apps get | both | both |
+
+`desktop/CHANGELOG.md`'s version section becomes the desktop GitHub Release's
+notes, and `scripts/release-desktop` refuses to release with nothing under
+`Unreleased`. See `desktop/PACKAGING.md`, "Cutting a release".
 
 ## Commits
 

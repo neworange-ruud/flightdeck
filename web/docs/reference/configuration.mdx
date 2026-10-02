@@ -45,6 +45,8 @@ Project identity — lives in the **project** file only.
 | `agent_tab_position` | `left` | Sidebar on the `left` or `right` |
 | `default_agent` | `opencode` | Agent key selected by default for new tabs |
 | `use_f2_to_leave_terminal_focus` | `false` | Use `F2` instead of modified `Esc` to leave terminal focus |
+| `macos_option_as_meta` | `false` | Desktop app on macOS only: send unbound `Option`+key as `Esc`+key (Meta) instead of the composed character. No effect on Linux, Windows or in the TUI |
+| `desktop_terminal_font_size` | `13` | Desktop app only: terminal text size in points, 8 to 32. On macOS `Cmd`-`=` / `Cmd`-`-` zoom for the session and `Cmd`-`0` resets |
 | `file_manager` | `""` (per-OS default) | Command used by **Open Worktree in File Manager**; empty means `open` / `explorer.exe` / `xdg-open` |
 
 ## `[notifications]`

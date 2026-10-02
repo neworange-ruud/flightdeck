@@ -609,7 +609,7 @@ fn normalize_selections(selections: &[Vec<u32>]) -> Vec<Vec<u32>> {
 /// newlines normalised to carriage returns — see `encode_paste`), followed by
 /// the `\r` a terminal sends for Enter to submit it.
 pub fn encode_reply(text: &str, bracketed: bool) -> Vec<u8> {
-    let mut bytes = crate::encode_paste(text, bracketed);
+    let mut bytes = crate::app::keymap::encode_paste(text, bracketed);
     bytes.push(b'\r');
     bytes
 }

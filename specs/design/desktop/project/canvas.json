@@ -1,0 +1,35 @@
+{
+  "v": 3,
+  "attachments": {},
+  "boards": {
+    "Main.dc.html": {"h": 900, "title": "A1 — Projects view", "w": 1440, "x": 0, "y": 0, "is_interactive": true},
+    "A2-MissionGrid.dc.html": {"h": 900, "title": "A2 — Mission control: active + last 24h", "w": 1440, "x": 1520, "y": 0, "is_interactive": true},
+    "A3-MissionFocus.dc.html": {"h": 900, "title": "A3 — Mission control: session opened (⏎)", "w": 1440, "x": 3040, "y": 0, "is_interactive": true},
+    "B-Triptych.dc.html": {"h": 900, "title": "B — Triptych with inspector", "w": 1440, "x": 0, "y": 1320},
+    "C-MissionControl.dc.html": {"h": 900, "title": "C — Mission Control (grid)", "w": 1440, "x": 1520, "y": 1320},
+    "D-Quiet.dc.html": {"h": 900, "title": "D — Quiet rail + palette", "w": 1440, "x": 3040, "y": 1320},
+    "Tech-Options.dc.html": {"h": 900, "title": "Technology options", "w": 1440, "x": 0, "y": 2640},
+    "Shortcut-Map.dc.html": {"h": 900, "title": "Shortcuts → native surfaces", "w": 1440, "x": 1520, "y": 2640}
+  },
+  "createdOnFiles": {"at": "2026-09-29T12:00:00Z", "v": 1},
+  "designSystems": [],
+  "launch": {"view": "canvas"},
+  "notes": {
+    "row1": {"kind": "title1", "maxW": 4480, "text": "Direction A — Projects view ⇄ Mission control", "w": 240, "x": 0, "y": -300},
+    "row2": {"kind": "title1", "maxW": 4480, "text": "Alternatives explored — B, C, D", "w": 240, "x": 0, "y": 1020},
+    "row3": {"kind": "title1", "maxW": 2960, "text": "How to build it, and keeping every hotkey", "w": 240, "x": 0, "y": 2340},
+    "mcrules": {"x": 4560, "y": 0, "w": 420, "maxH": 720, "fill": "orange", "size": "m", "text": "Mission control — what shows up\n\n• Live tiles: every session that is working, waiting for input or needs attention, across ALL open projects.\n• Earlier today: sessions with output, a status change or a git change in the last 24h. Shown as compact cards, not live terminals.\n• Everything else is hidden (\"5 quiet sessions\"), one click back to Projects.\n• Order: needs you → working → most recently updated.\n• The scope menu can widen it (last 7 days, all) or narrow it to a single project.\n\nKeys\n• Alt-m switches Projects ⇄ Mission control (proposed new chord).\n• Arrows move between tiles, ⏎ opens one full size, Alt-Esc goes back to the grid.\n• Alt-1…9 follow the tile order, so the same number reaches the same tile in both layouts.\n• Every existing chord (⌃P, ⌃F, ⌃T…) acts on the selected tile."}
+  },
+  "order": [
+    "Main.dc.html",
+    "A2-MissionGrid.dc.html",
+    "A3-MissionFocus.dc.html",
+    "B-Triptych.dc.html",
+    "C-MissionControl.dc.html",
+    "D-Quiet.dc.html",
+    "Tech-Options.dc.html",
+    "Shortcut-Map.dc.html"
+  ],
+  "pages": [],
+  "title": "FlightDeck UI Directions"
+}

@@ -1,0 +1,12 @@
+//! The window's regions, one module each, drawn from the shared view models
+//! (`flightdeck::view`) the host hands back. Colours come only from
+//! [`crate::theme::Palette`]; controls act only through [`crate::commands`].
+
+pub mod git_strip;
+pub mod icons;
+pub mod mission;
+pub mod sidebar;
+pub mod spinner;
+pub mod split;
+pub mod status_bar;
+pub mod titlebar;

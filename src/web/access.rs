@@ -178,6 +178,15 @@ const MAX_KEYED_BROWSERS: usize = 9;
 /// send for them, so the two footers can be matched exhaustively and a future
 /// binding cannot be added without every arm being revisited.
 ///
+/// Deliberately **not** [`crate::app::keymap::Chord`]. This is the overlay's
+/// own modal vocabulary, not a binding in the app keymap: it is live only while
+/// the overlay captures input (so none of its letters collide with anything),
+/// its lifting folds case and refuses Ctrl/Alt outright, and it is documented
+/// by the overlay's footer (`keys_for`) rather than by the help screen. Routing
+/// it through the keymap would give the table rows that exist in no input mode.
+/// It is already free of crossterm types, which is the property a second
+/// front-end needs.
+///
 /// [`KeyEvent`]: crossterm::event::KeyEvent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessKey {

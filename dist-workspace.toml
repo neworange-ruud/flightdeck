@@ -38,3 +38,9 @@ macos-sign = true
 # Custom build-job steps (relative to .github/workflows/). build-setup.steps sets
 # CODESIGN_OPTIONS=runtime so the macOS signer enables the hardened runtime.
 github-build-setup = "build-setup.steps"
+# .github/workflows/release.yml is hand-edited: its tag trigger has an extra
+# '!desktop-v**' pattern so `desktop-v<x.y.z>` tags (the native desktop app, released
+# by desktop.yml) do not also start a cargo-dist release. Without this, `dist`
+# CI checks would flag the generated workflow as dirty. Re-apply the edit if the
+# workflow is ever regenerated.
+allow-dirty = ["ci"]

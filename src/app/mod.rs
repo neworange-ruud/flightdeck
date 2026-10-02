@@ -4,7 +4,9 @@
 //! This layer performs **no** terminal I/O and never executes git/fs/pty
 //! directly — it dispatches commands into the services (SPECS §27).
 
+pub mod activity;
 pub mod commands;
 pub mod events;
+pub mod keymap;
 pub mod modes;
 pub mod state;

@@ -360,6 +360,8 @@ branch_prefix = "flightdeck/"
 agent_tab_position = "left"
 default_agent = "opencode"
 use_f2_to_leave_terminal_focus = false
+macos_option_as_meta = false
+desktop_terminal_font_size = 13
 file_manager = ""
 
 [agents.opencode]
@@ -952,6 +954,25 @@ Settings (`[ui]`):
 | `app_mode_color` | (same set) | cyan |
 | `mode_border` | off, dim, normal, bright | off |
 | `dim_terminal_in_app_mode` | true / false | true |
+| `macos_option_as_meta` | true / false | false |
+| `desktop_terminal_font_size` | 8 to 32 (points) | 13 |
+
+`ui.macos_option_as_meta` applies to the native desktop app on macOS only: when
+`true`, an Option+key that FlightDeck does not bind is sent to the terminal as
+`ESC` + the key (Meta), byte for byte what the TUI receives from a host terminal
+with "Use Option as Meta" on; when `false` (default) it types the character the
+keyboard layout composes, so `@ [ ] { } | \ ~` stay reachable on non-US layouts.
+FlightDeck's own Alt chords are bindings and work either way. It is a no-op on
+Linux and Windows (Alt is always Meta there) and in the TUI, and, like
+`use_f2_to_leave_terminal_focus`, is read when the desktop app starts.
+
+`ui.desktop_terminal_font_size` is the desktop app's terminal text size in
+points (the TUI draws in its host terminal's font and ignores it). Unlike the two
+settings above it applies as soon as the config is saved. On macOS, Cmd-= / Cmd-+
+and Cmd-- zoom a terminal a point at a time for the session and Cmd-0 returns to
+the setting; the zoom is not saved. Linux and Windows have no zoom chord, because
+Ctrl-= / Ctrl-- / Ctrl-0 belong to the terminal (Ctrl-- is readline's undo). A
+value outside 8 to 32 is rejected at load.
 
 Required shortcuts:
 

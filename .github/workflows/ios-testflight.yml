@@ -35,6 +35,10 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+      # Desktop app tags (desktop-v0.1.0) match the pattern above too, but they
+      # release only the desktop app (desktop.yml). A negative pattern must come
+      # after the positive one it filters.
+      - '!desktop-v**'
   release:
     types: [published]
   # Re-upload a tag that failed processing, or ship a build off a branch. Run it
@@ -57,6 +61,9 @@ permissions:
 
 jobs:
   testflight:
+    # A desktop release published by hand (a `release` event for a desktop-v
+    # tag) is not a release of this; `ref_name` is the release's tag there too.
+    if: ${{ !startsWith(github.ref_name, 'desktop-v') }}
     runs-on: macos-latest
     # An archive plus SwiftPM resolution plus two altool round-trips; well under
     # this, but far under GitHub's 360-minute default if something wedges.

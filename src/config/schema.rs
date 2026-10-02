@@ -155,6 +155,18 @@ pub fn validate(config: &Config) -> Result<()> {
         )));
     }
 
+    // A size outside the range would draw an unreadable or near-empty
+    // terminal in the desktop app, and nothing on screen would say why.
+    let sizes = crate::contracts::UiConfig::DESKTOP_TERMINAL_FONT_SIZES;
+    if !sizes.contains(&config.ui.desktop_terminal_font_size) {
+        return Err(FlightDeckError::Config(format!(
+            "ui.desktop_terminal_font_size {} is not valid (expected {} to {})",
+            config.ui.desktop_terminal_font_size,
+            sizes.start(),
+            sizes.end()
+        )));
+    }
+
     validate_containers(&config.containers)?;
     validate_web(&config.web)?;
 
@@ -549,6 +561,24 @@ mod tests {
         assert_eq!(cfg.ui.terminal_mode_color, "green");
         assert_eq!(cfg.ui.mode_border, "off");
         assert!(cfg.ui.dim_terminal_in_app_mode);
+        assert_eq!(cfg.ui.desktop_terminal_font_size, 13);
+    }
+
+    #[test]
+    fn validate_bounds_the_desktop_terminal_font_size() {
+        let mut cfg = default_config("proj", "main");
+        for ok in [8, 13, 32] {
+            cfg.ui.desktop_terminal_font_size = ok;
+            assert!(validate(&cfg).is_ok(), "{ok} is in range");
+        }
+        for bad in [0, 7, 33] {
+            cfg.ui.desktop_terminal_font_size = bad;
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("desktop_terminal_font_size") && err.contains("8 to 32"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

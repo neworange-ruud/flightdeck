@@ -773,6 +773,29 @@ impl RemoteBridge {
             .and_then(|b| b.last_prompt_id())
     }
 
+    /// The prompt `session_id` is waiting on right now, as the phone was sent
+    /// it — or `None` when the session is not waiting, or is waiting but its
+    /// prompt has not been surfaced yet (a Claude wait inside the
+    /// [`PROMPT_SETTLE_MS`] window, deciding between a racing AskUserQuestion
+    /// and the binary fallback).
+    ///
+    /// Why not simply [`Self::pending_prompt_id`]: that is the most recently
+    /// minted id, which stays set after its prompt was answered, and during a
+    /// deferred Claude wait it still names the *previous* prompt. The needs-input
+    /// preview is recorded exactly when this wait's prompt is surfaced and
+    /// dropped when the wait ends, so its presence is the "surfaced for this
+    /// wait" signal.
+    pub fn surfaced_prompt(
+        &self,
+        session_id: &str,
+    ) -> Option<&flightdeck_remote_protocol::TranscriptItem> {
+        let sid = SessionId::new(session_id);
+        if !self.previews.contains_key(&sid) {
+            return None;
+        }
+        self.transcripts.get(&sid)?.last_prompt()
+    }
+
     /// Seal and enqueue a [`CommandAck`] on the outbound path (the command
     /// bridge acks every drained phone command with its actual outcome).
     /// `now_ms` stamps the envelope header the AEAD binds (spec §7.1).

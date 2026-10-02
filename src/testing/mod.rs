@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod fake_grid;
+pub use fake_grid::FakeGrid;
+
 // ===========================================================================
 // FakeFs — in-memory filesystem
 // ===========================================================================
@@ -238,6 +241,10 @@ struct FakeGitState {
     /// message (e.g. a repo whose index is locked by another process, or a
     /// worktree directory that has been removed).
     porcelain_error: Option<String>,
+    /// Per-cwd `git diff HEAD --numstat` line overrides; absent means no diff.
+    numstat: HashMap<PathBuf, Vec<String>>,
+    /// When set, [`GitExecutor::diff_numstat`] fails with this `Git` message.
+    numstat_error: Option<String>,
     worktrees: Vec<WorktreeInfo>,
     revs: HashMap<String, String>,
     ahead_behind: HashMap<(String, String), (u32, u32)>,
@@ -284,6 +291,8 @@ impl Default for FakeGit {
                 default_dirty: false,
                 porcelain: HashMap::new(),
                 porcelain_error: None,
+                numstat: HashMap::new(),
+                numstat_error: None,
                 worktrees: Vec::new(),
                 revs: HashMap::new(),
                 ahead_behind: HashMap::new(),
@@ -377,6 +386,25 @@ impl FakeGit {
         let mut st = self.inner.lock().unwrap();
         st.dirty.insert(path.clone(), !lines.is_empty());
         st.porcelain.insert(path, lines);
+    }
+
+    /// Set explicit `git diff HEAD --numstat` lines for a specific path.
+    pub fn set_numstat_at<I, S>(&self, path: impl Into<PathBuf>, lines: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let lines: Vec<String> = lines.into_iter().map(Into::into).collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .numstat
+            .insert(path.into(), lines);
+    }
+
+    /// Make [`GitExecutor::diff_numstat`] fail with `msg`, for every path.
+    pub fn set_numstat_error(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().numstat_error = Some(msg.into());
     }
 
     /// Make [`GitExecutor::status_porcelain`] fail with `msg`, for every path.
@@ -565,6 +593,14 @@ impl GitExecutor for FakeGit {
         } else {
             Vec::new()
         })
+    }
+
+    fn diff_numstat(&self, cwd: &Path) -> Result<Vec<String>> {
+        let st = self.inner.lock().unwrap();
+        if let Some(msg) = st.numstat_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
+        Ok(st.numstat.get(cwd).cloned().unwrap_or_default())
     }
 
     fn branch_exists(&self, name: &str) -> Result<bool> {
@@ -1140,6 +1176,38 @@ impl CommandRunner for FakeCommandRunner {
                 code: Some(0),
                 output: String::new(),
             }))
+    }
+}
+
+// ===========================================================================
+// FakeNotifier — records OS notifications
+// ===========================================================================
+
+/// [`Notifier`] that records every notification it was asked to post, so a
+/// test can assert what the desktop would have shown without touching a
+/// platform notification API.
+///
+/// [`Notifier`]: crate::contracts::traits::Notifier
+#[derive(Debug, Default)]
+pub struct FakeNotifier {
+    posted: Mutex<Vec<crate::contracts::domain::Notification>>,
+}
+
+impl FakeNotifier {
+    /// New notifier with nothing posted.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every notification posted so far, in order.
+    pub fn posted(&self) -> Vec<crate::contracts::domain::Notification> {
+        self.posted.lock().unwrap().clone()
+    }
+}
+
+impl crate::contracts::traits::Notifier for FakeNotifier {
+    fn notify(&self, notification: &crate::contracts::domain::Notification) {
+        self.posted.lock().unwrap().push(notification.clone());
     }
 }
 

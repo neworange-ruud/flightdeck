@@ -135,6 +135,7 @@ pub fn recover(
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         };
 
         state.tabs.push(new_tab);
@@ -171,6 +172,7 @@ mod tests {
             container_image: None,
             runs_on_base: false,
             resume_args: Vec::new(),
+            activity: Default::default(),
         }
     }
 

@@ -17,6 +17,7 @@ network access or a live MCP login.
 | File | Contents |
 | --- | --- |
 | `flightdeck-web-turn2.dc.html` | **Current.** Turn 2 (2a–2g) followed by turn 1 (1a–1h) in one document. Turn 2: access overlay in both states, the three browser-side access screens, every connection state, live/asleep/stale/asleep-and-stale/catching-up, the activity feed, the takeover trio, and the semantic reference sheet. |
+| `desktop/project/*.dc.html`, `desktop/project/canvas.json` | **Desktop app (GPUI), Direction A.** From the design canvas https://claude.ai/artifact/TRyC2w8Rh49UbvqtKkGotM: `Main.dc.html` = A1 Projects view, `A2-MissionGrid.dc.html` = A2 Mission control, `A3-MissionFocus.dc.html` = A3 a session opened full size, `Shortcut-Map.dc.html` = chords mapped to native surfaces. `canvas.json` holds the board index and the Mission control rules note. See `specs/DESKTOP_UI.md`. |
 | `flightdeck-web-turn1.dc.html` | Turn 1 as originally delivered, artboards 1a–1h: main screen in Terminal and App mode, split view ×3, filtered command palette, new-agent dialog (both states), configuration manager, destructive confirmation, and the stated positions. Kept as the record of that turn; the turn-2 file carries the same artboards unchanged. |
 
 **Read `flightdeck-web-turn2.dc.html`** unless you specifically need the turn-1

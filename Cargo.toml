@@ -10,6 +10,35 @@ license = "MIT"
 keywords = ["ai", "agents", "git", "tui", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
+# The root is also a cargo workspace so the native desktop front-end
+# (`desktop/`, package `flightdeck-desktop`, GPUI) can share this Cargo.lock and
+# depend on the `flightdeck` library by path. `default-members` keeps every
+# root command (`cargo test -p flightdeck --lib`, `cargo clippy --all-targets`,
+# `cargo build`, cargo-dist) scoped to the TUI package alone, so the GUI's large
+# GPUI graph never enters the TUI's gate or its pure-Rust Windows build. Build
+# the GUI explicitly with `-p flightdeck-desktop`. `remote/` is its own,
+# separate workspace (protocol + relay) and is excluded so cargo does not try to
+# fold it into this one.
+[workspace]
+members = [".", "desktop"]
+default-members = ["."]
+exclude = ["remote"]
+resolver = "2"
+
+# Not used by any member of THIS workspace. It exists because of a cargo quirk
+# with nested workspaces: `remote/protocol` (a path dependency of the root
+# package) inherits `edition`/`license`/`repository` from `remote/Cargo.toml`
+# via `*.workspace = true`, but once the root is itself a workspace, cargo
+# resolves that inheritance against the already-loaded OUTER workspace (its
+# workspace-root cache is consulted before the nearer, unloaded `remote/`
+# manifest) and fails with "`workspace.package.edition` was not defined". These
+# values mirror `remote/Cargo.toml`'s `[workspace.package]` exactly so the
+# protocol crate builds identically from either workspace. Keep the two in sync.
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/neworange-ruud/flightdeck"
+
 [lib]
 name = "flightdeck"
 path = "src/lib.rs"
@@ -32,6 +61,10 @@ default = ["self-update"]
 # non-optional dependency on every target, so `--no-default-features` still
 # builds a working relay client — it only drops the updater.
 self-update = ["dep:axoupdater"]
+# Off by default: `flightdeck::host::testing`, which builds an `AppHost` over
+# the fakes in `flightdeck::testing` for another front-end's tests. Only the
+# desktop app's dev-dependencies turn it on, so no shipped binary carries it.
+testing = []
 
 [dependencies]
 crossterm = "0.29.0"
@@ -43,6 +76,14 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 toml_edit = "0.25.13"
 vt100 = "0.16.2"
+# The second terminal emulator behind `src/terminal/grid.rs`'s `TerminalGrid`
+# trait. The TUI stays on vt100 above; the GPUI desktop front-end draws through
+# this one (see desktop/NOTES-M0.md, "Terminal emulator"). Apache-2.0, the
+# emulator core of Alacritty and of Zed's terminal. Pure Rust on every target
+# (vte, parking_lot, polling, rustix-openpty on Unix, windows-sys + miow on
+# Windows), so the Windows build stays C-free. `default-features = false` drops
+# serde, which only its config types need.
+alacritty_terminal = { version = "0.26.0", default-features = false }
 
 # --- FlightDeck Remote (relay client, src/remote/) -------------------------
 # Shared phone<->desktop wire types. Path dep into the sibling `remote/`

@@ -10,6 +10,7 @@
 //! manual status choice) and call `AppState::dispatch`.
 
 use crate::app::commands::{Command, Selector};
+use crate::app::keymap::{Action, Keymap};
 
 /// A single entry in the command palette (SPECS §22).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,42 @@ pub enum PaletteAction {
     /// Offered only while the web interface is running, because with no browser
     /// attached there is one writer and nothing to interrupt.
     TakeInputLock,
+}
+
+impl PaletteAction {
+    /// The keymap action this row performs, when a key performs it too.
+    ///
+    /// The palette and the keyboard reach the same effect through different
+    /// payloads in a few places (the palette's `Quit` is pre-confirmed, its
+    /// `Show Help` is a command where the key opens the overlay directly), so
+    /// this maps the row to the binding a user would press instead.
+    pub fn keymap_action(&self) -> Option<Action> {
+        Some(match self {
+            PaletteAction::Dispatch(Command::ShowHelp) => Action::OpenHelp,
+            PaletteAction::Dispatch(Command::Quit { .. }) => Action::Quit,
+            PaletteAction::Dispatch(cmd) => Action::Dispatch(cmd.clone()),
+            PaletteAction::NewAgentTab => Action::Dispatch(Command::NewAgentTab {
+                name: String::new(),
+                agent_key: None,
+            }),
+            PaletteAction::CloseAgentTab => {
+                Action::Dispatch(Command::CloseAgentTab { action: None })
+            }
+            PaletteAction::SetManualStatus => Action::Dispatch(Command::SetManualStatus(None)),
+            PaletteAction::SwitchProjectNext => Action::SwitchProject(Selector::Next),
+            PaletteAction::SwitchProjectPrev => Action::SwitchProject(Selector::Prev),
+            _ => return None,
+        })
+    }
+}
+
+impl PaletteEntry {
+    /// The keycap hint for this row (`Ctrl-p`), read from the keymap table, or
+    /// `None` when no key performs it.
+    pub fn keycap(&self, keymap: &Keymap) -> Option<String> {
+        let action = self.action.keymap_action()?;
+        keymap.entry_for_action(&action)?.keycap()
+    }
 }
 
 /// All §22 command-palette entries, in display order.
@@ -895,5 +932,63 @@ mod tests {
         assert_eq!(palette.selected_index(), 2);
         palette.set_isolated(true);
         assert_eq!(palette.selected_index(), 0);
+    }
+
+    fn keycap_of(label: &str) -> Option<String> {
+        let keymap = Keymap::for_this_platform(false);
+        all_entries()
+            .iter()
+            .find(|e| e.label == label)
+            .unwrap_or_else(|| panic!("no palette row {label}"))
+            .keycap(keymap)
+    }
+
+    #[test]
+    fn keycap_hints_come_from_the_keymap_table() {
+        assert_eq!(keycap_of("Push Branch").as_deref(), Some("Ctrl-p"));
+        assert_eq!(
+            keycap_of("New Agent Session Tab").as_deref(),
+            Some("Ctrl-n")
+        );
+        assert_eq!(
+            keycap_of("Close Agent Session Tab").as_deref(),
+            Some("Ctrl-k")
+        );
+        assert_eq!(keycap_of("Set Manual Status").as_deref(), Some("Ctrl-s"));
+        assert_eq!(keycap_of("Next Project").as_deref(), Some("Shift-Right"));
+        assert_eq!(keycap_of("Previous Project").as_deref(), Some("Shift-Left"));
+        assert_eq!(keycap_of("Show Help").as_deref(), Some("F1"));
+        assert_eq!(keycap_of("Quit").as_deref(), Some("Ctrl-q"));
+        assert_eq!(
+            keycap_of("Switch Agent Session Tab").as_deref(),
+            Some("Alt-Down")
+        );
+        assert_eq!(
+            keycap_of("Open Worktree in File Manager").as_deref(),
+            Some("Alt-o")
+        );
+        // Rows no key performs have no hint rather than an invented one.
+        assert_eq!(keycap_of("Open Project"), None);
+        assert_eq!(keycap_of("Rebase Worktree"), None);
+        assert_eq!(keycap_of("Pair Phone"), None);
+    }
+
+    /// Every hint is some binding's chord, never a string of the palette's own.
+    #[test]
+    fn every_keycap_hint_is_a_bound_chord() {
+        let keymap = Keymap::for_this_platform(false);
+        for entry in all_entries() {
+            if let Some(hint) = entry.keycap(keymap) {
+                assert!(
+                    keymap
+                        .entries()
+                        .iter()
+                        .flat_map(|e| &e.triggers)
+                        .any(|t| t.chord.to_string() == hint),
+                    "{}: {hint}",
+                    entry.label
+                );
+            }
+        }
     }
 }

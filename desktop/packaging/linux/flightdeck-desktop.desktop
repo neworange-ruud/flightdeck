@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FlightDeck
+GenericName=AI Agent Workspace
+Comment=Orchestrate AI coding agents across git worktrees
+Exec=flightdeck-desktop
+Icon=flightdeck-desktop
+Terminal=false
+Categories=Development;
+Keywords=agents;git;worktree;terminal;ai;
+StartupNotify=true

@@ -290,6 +290,16 @@ pub struct UiConfig {
     /// terminal focus. Off by default.
     #[serde(default)]
     pub use_f2_to_leave_terminal_focus: bool,
+    /// Desktop app, macOS only: treat Option as Meta in a terminal, so an
+    /// Option+key that FlightDeck itself does not bind is sent as `ESC` + the
+    /// key (readline's Meta-b / Meta-f) instead of the character the layout
+    /// composes (`∫`, `@`, …). Off by default, which keeps non-US layouts able
+    /// to type `@ [ ] { } | \ ~`. It mirrors the TUI running under a host
+    /// terminal with "Use Option as Meta" turned on, which the TUI cannot
+    /// configure itself. A no-op on Linux and Windows (Alt never composes a
+    /// character there, so it is always Meta) and in the TUI.
+    #[serde(default)]
+    pub macos_option_as_meta: bool,
     /// Command used to open a worktree directory in the OS file manager.
     /// Empty (the default) means the per-OS default: `open` on macOS,
     /// `explorer.exe` on Windows, `xdg-open` elsewhere. A non-empty value is
@@ -317,6 +327,16 @@ pub struct UiConfig {
     /// Dim the terminal viewport while in APP mode (it is not receiving keys).
     #[serde(default = "default_true")]
     pub dim_terminal_in_app_mode: bool,
+    /// Desktop app only: the terminal text size in points, a whole number in
+    /// [`UiConfig::DESKTOP_TERMINAL_FONT_SIZES`] (validated at load). Cmd +/-
+    /// on macOS zooms from it for the session and Cmd-0 returns to it. The TUI
+    /// draws in its host terminal's font and ignores it.
+    #[serde(default = "default_desktop_terminal_font_size")]
+    pub desktop_terminal_font_size: u16,
+}
+
+fn default_desktop_terminal_font_size() -> u16 {
+    UiConfig::DEFAULT_DESKTOP_TERMINAL_FONT_SIZE
 }
 
 fn default_terminal_mode_color() -> String {
@@ -335,17 +355,28 @@ impl Default for UiConfig {
             agent_tab_position: "left".to_string(),
             default_agent: "opencode".to_string(),
             use_f2_to_leave_terminal_focus: false,
+            macos_option_as_meta: false,
             file_manager: String::new(),
             auto_continue: true,
             terminal_mode_color: default_terminal_mode_color(),
             app_mode_color: default_app_mode_color(),
             mode_border: default_mode_border(),
             dim_terminal_in_app_mode: true,
+            desktop_terminal_font_size: default_desktop_terminal_font_size(),
         }
     }
 }
 
 impl UiConfig {
+    /// [`UiConfig::desktop_terminal_font_size`]'s default: the size the
+    /// desktop terminal drew at before it was a setting.
+    pub const DEFAULT_DESKTOP_TERMINAL_FONT_SIZE: u16 = 13;
+
+    /// The sizes [`UiConfig::desktop_terminal_font_size`] accepts, in points.
+    /// Below 8 a cell is too small to hit with the mouse; above 32 a laptop
+    /// screen holds too few columns for an agent's UI.
+    pub const DESKTOP_TERMINAL_FONT_SIZES: std::ops::RangeInclusive<u16> = 8..=32;
+
     /// Read [`UiConfig::agent_tab_position`].
     ///
     /// Anything other than `right` is [`AgentTabPosition::Left`]: config
@@ -744,6 +775,29 @@ pub struct TabState {
     /// in place of the configured base args on resume/restart.
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// When this session last did something observable (output, status change,
+    /// git change). Wall-clock, so "updated in the last 24h" survives a restart.
+    /// Absent in state files written before the activity timeline existed.
+    #[serde(default)]
+    pub activity: TabActivity,
+}
+
+/// Per-session activity timeline: the wall-clock moment (Unix seconds, from
+/// [`crate::contracts::Clock::now_unix_secs`]) of the last PTY output, status
+/// change, and git change. `None` = never observed. Persisted inside
+/// [`TabState`]; the recording and window/ordering rules live in
+/// `crate::app::activity`, which keeps them front-end neutral.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabActivity {
+    /// Last time the primary PTY produced output.
+    #[serde(default)]
+    pub last_output_at: Option<u64>,
+    /// Last time the session's interpreted status changed.
+    #[serde(default)]
+    pub last_status_change_at: Option<u64>,
+    /// Last time the worktree's git state (changes, ahead count) changed.
+    #[serde(default)]
+    pub last_git_change_at: Option<u64>,
 }
 
 fn default_last_known_status() -> String {

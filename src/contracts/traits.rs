@@ -36,6 +36,11 @@ pub trait GitExecutor {
     /// The lines of `git status --porcelain` for `cwd` (one per changed path).
     /// An empty vector means the worktree is clean.
     fn status_porcelain(&self, cwd: &Path) -> Result<Vec<String>>;
+    /// The lines of `git diff HEAD --numstat` for `cwd`: one
+    /// `<added>\t<removed>\t<path>` line per tracked file that differs from
+    /// `HEAD` (staged and unstaged together; binary files report `-\t-`).
+    /// Read-only. An empty vector means no tracked file differs.
+    fn diff_numstat(&self, cwd: &Path) -> Result<Vec<String>>;
     /// Whether a local branch exists.
     fn branch_exists(&self, name: &str) -> Result<bool>;
     /// Local branch names without the `refs/heads/` prefix, sorted by refname.

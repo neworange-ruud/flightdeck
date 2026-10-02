@@ -1,0 +1,180 @@
+#!/usr/bin/env sh
+# Cut a FlightDeck Desktop release: bump desktop/Cargo.toml, roll the
+# `Unreleased` section of desktop/CHANGELOG.md into the version, commit, tag
+# `desktop-v<version>` and push. The tag push runs desktop.yml's release jobs
+# (build, sign, publish). The CLI is released separately by scripts/release.
+#
+#   scripts/release-desktop 0.2.0         a release the self-updater offers
+#   scripts/release-desktop 0.2.0-beta.1  a pre-release (SemVer suffix), which
+#                                         the self-updater ignores
+set -eu
+
+if [ -d "${HOME:-}/.cargo/bin" ]; then
+  PATH="${HOME}/.cargo/bin:${PATH}"
+  export PATH
+fi
+
+usage() {
+  printf 'Usage: %s <version>\n' "$0" >&2
+  printf 'Example: %s 0.2.0\n' "$0" >&2
+}
+
+if [ "${1:-}" = "" ]; then
+  usage
+  exit 2
+fi
+
+version="${1#desktop-v}"
+version="${version#v}"
+tag="desktop-v${version}"
+version_core="${version%%[-+]*}"
+
+case "$version" in
+  *[!0-9A-Za-z.+-]*|"")
+    printf 'Invalid SemVer-ish version: %s\n' "$version" >&2
+    exit 2
+    ;;
+esac
+
+case "$version_core" in
+  *.*.*.*)
+    printf 'Invalid SemVer-ish version: %s\n' "$version" >&2
+    exit 2
+    ;;
+  *.*.*) ;;
+  *)
+    printf 'Version must include major.minor.patch, got: %s\n' "$version" >&2
+    exit 2
+    ;;
+esac
+
+for cmd in cargo git perl; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$cmd" >&2
+    exit 1
+  fi
+done
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+manifest=desktop/Cargo.toml
+changelog=desktop/CHANGELOG.md
+
+update_changelog() {
+  release_date=$(date +%Y-%m-%d)
+  VERSION="$version" RELEASE_DATE="$release_date" perl -0pi -e '
+    my $template = <<"EOF";
+## [Unreleased]
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+EOF
+
+    if (/^## \[\Q$ENV{VERSION}\E\] - /m) {
+      print STDERR "desktop/CHANGELOG.md already has version $ENV{VERSION}; continuing.\n";
+      next;
+    }
+
+    my ($intro, $tail) = split /^## \[Unreleased\]\n\n/m, $_, 2;
+    die "desktop/CHANGELOG.md is missing the expected Unreleased section\n" unless defined $tail;
+
+    my ($body, $rest) = $tail =~ /\A(.*?)(?=^## \[|\z)(.*)\z/sm;
+    # Groups still holding only the placeholder are not part of the release.
+    $body =~ s/^### [^\n]+\n\s*- None yet\.\n//mg;
+    $body =~ s/\A\s+//;
+    $body =~ s/\s+\z//;
+    die "desktop/CHANGELOG.md has nothing under Unreleased; add the release notes first\n"
+      unless length $body;
+
+    my $versioned = "## [$ENV{VERSION}] - $ENV{RELEASE_DATE}\n\n$body\n\n";
+    $_ = $intro . $template . "\n" . $versioned . $rest;
+  ' "$changelog"
+}
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  printf 'Working tree must be clean before starting a release.\n' >&2
+  exit 1
+fi
+
+current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+if [ "$current_branch" = "" ]; then
+  printf 'Release must be run from a local branch, not a detached HEAD.\n' >&2
+  exit 1
+fi
+
+upstream_ref=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+if [ "$upstream_ref" = "" ]; then
+  printf 'Current branch has no upstream tracking branch: %s\n' "$current_branch" >&2
+  exit 1
+fi
+
+upstream_remote=${upstream_ref%%/*}
+git fetch "$upstream_remote" --quiet
+
+if ! git merge-base --is-ancestor "$upstream_ref" HEAD; then
+  printf 'Local branch is behind %s; update it before cutting a release.\n' "$upstream_ref" >&2
+  exit 1
+fi
+
+if git rev-parse "$tag" >/dev/null 2>&1; then
+  printf 'Tag already exists locally: %s\n' "$tag" >&2
+  exit 1
+fi
+
+if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+  printf 'Tag already exists on origin: %s\n' "$tag" >&2
+  exit 1
+fi
+
+# Refuse before touching any file when there is nothing to release (the same
+# rule update_changelog applies, read-only), unless the version is already
+# rolled (a re-run after a failed push).
+if ! grep -q "^## \[${version}\] - " "$changelog"; then
+  perl -0ne '
+    my ($body) = /^## \[Unreleased\]\n(.*?)(?=^## \[|\z)/sm or exit 1;
+    $body =~ s/^### [^\n]+\n\s*- None yet\.\n//mg;
+    exit($body =~ /\S/ ? 0 : 1);
+  ' "$changelog" || {
+    printf '%s has nothing under Unreleased; add the release notes first.\n' "$changelog" >&2
+    exit 1
+  }
+fi
+
+# Only the [package] version line: the manifest also pins dependency versions.
+if grep -q "^version = \"${version}\"" "$manifest"; then
+  printf '%s already has version %s; continuing.\n' "$manifest" "$version"
+else
+  VERSION="$version" perl -0pi -e 's/(\[package\][^\[]*?\n)version = "[^"]+"/$1version = "$ENV{VERSION}"/s' "$manifest"
+fi
+grep -q "^version = \"${version}\"" "$manifest" || {
+  printf 'Could not set the version in %s\n' "$manifest" >&2
+  exit 1
+}
+
+update_changelog
+
+# Refresh Cargo.lock for the new version (no dependency changes).
+cargo update -p flightdeck-desktop --offline >/dev/null 2>&1 || cargo update -p flightdeck-desktop >/dev/null
+cargo metadata --format-version 1 --locked --no-deps >/dev/null
+
+git add "$manifest" Cargo.lock "$changelog"
+if git diff --cached --quiet; then
+  printf 'No release changes to commit for %s; tagging HEAD.\n' "$tag"
+else
+  git commit -m "Release ${tag}"
+fi
+
+git tag -a "$tag" -m "FlightDeck Desktop ${version}"
+git push origin HEAD
+git push origin "$tag"
+
+printf 'Pushed %s. desktop.yml builds, signs and publishes it.\n' "$tag"
