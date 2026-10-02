@@ -8003,7 +8003,7 @@ fn build_config_manager(workspace: &Workspace, env: &Env) -> ConfigManager {
 
     let p = workspace.active_project();
     let project_path = p.git.root().join(".flightdeck").join("config.toml");
-    let global = global_path.as_deref().map(&read_table).unwrap_or_default();
+    let global = global_path.as_deref().map(read_table).unwrap_or_default();
     let project = read_table(&project_path);
     let agent_keys: Vec<String> = p.state.config.agents.keys().cloned().collect();
 

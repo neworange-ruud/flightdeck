@@ -231,7 +231,7 @@ impl ClientTuning {
     /// the counter is zero.
     fn take_forced_write_failure(&self) -> bool {
         self.fail_next_envelope_writes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
     }
 }
