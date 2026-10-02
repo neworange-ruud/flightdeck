@@ -57,6 +57,9 @@ fn git_bar() -> GitBar {
         has_upstream: true,
         files_changed: 6,
         collected: true,
+        upstream: Some("origin/flightdeck/fix-login".into()),
+        lines_added: 40,
+        lines_removed: 7,
     }
 }
 

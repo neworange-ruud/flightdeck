@@ -14,7 +14,22 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Control a FlightDeck on another machine.** *Connect to remote…* (the
+  launcher, and File in the menu bar) pairs with a FlightDeck running elsewhere
+  on your network or VPN, using the address and 4-digit code its web access
+  overlay shows in network mode. Each remote opens in its own window with the
+  usual sidebar, git strip and terminals. You browse it independently: looking
+  at another agent never moves the selection on the other screen, and a small
+  `host` marker shows which agent its user is looking at. Commands, keystrokes
+  and dialog answers act on what this window shows. Pick Control (the default)
+  or Observe, and take over the input lock from the status bar when someone
+  else is typing.
+- **Saved remotes.** Paired machines are remembered in
+  `~/.flightdeck/remotes.json` (owner-only), so reconnecting needs no new code.
+  Forget one from the connect window. Nothing connects at launch until you
+  choose a remote.
+- **Plain-WebSocket warning.** The first connect to a remote outside loopback or
+  Tailscale warns, once, that the link is not encrypted.
 
 ### Improvements
 

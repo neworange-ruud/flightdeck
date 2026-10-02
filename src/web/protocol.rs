@@ -893,6 +893,19 @@ pub struct GitBar {
     /// False until git status has been collected for this worktree. Renders
     /// `git: ?`, **not** `clean` — the two mean opposite things.
     pub collected: bool,
+    /// The upstream's name (`origin/flightdeck/fix-login`), when
+    /// [`GitBar::has_upstream`]. Additive and defaulted (forward-compatibility
+    /// rule 4): a native client draws it in its git strip; an older host sends
+    /// none and the client says `upstream` instead of guessing a remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Lines added versus `HEAD` across tracked files. Additive and defaulted,
+    /// like [`GitBar::upstream`].
+    #[serde(default)]
+    pub lines_added: u32,
+    /// Lines removed versus `HEAD` across tracked files.
+    #[serde(default)]
+    pub lines_removed: u32,
 }
 
 /// Where a session is in its lifecycle, for the sidebar's special states.
@@ -2465,10 +2478,11 @@ pub struct Command {
     pub name: String,
     /// Arguments, shaped per command. Absent for commands that take none.
     ///
-    /// Since v6 a session-scoped palette command may carry `session_id` or
-    /// `terminal_id` here to act on that session (or terminal) rather than the
-    /// host's selection; an id the host does not have is rejected, never
-    /// resolved to the selection instead.
+    /// Since v6 a palette command may carry `session_id` or `terminal_id` here
+    /// to act on that session (or terminal) rather than the host's selection,
+    /// or `project_id` alone to act in that project (on its own selected
+    /// session). An id the host does not have is rejected, never resolved to
+    /// the selection instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
 }

@@ -15,6 +15,7 @@ use gpui::{App, Entity};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::host::HostModel;
+use crate::remote::RemoteModel;
 
 /// `[ui] use_f2_to_leave_terminal_focus`, as read once at start-up
 /// ([`set_use_f2`]). GPUI bindings are registered once, so the table the app
@@ -95,6 +96,29 @@ pub fn perform_entry(entry: &KeymapEntry, host: &Entity<HostModel>, cx: &mut App
 pub fn perform_id(id: &str, host: &Entity<HostModel>, cx: &mut App) {
     if let Some(entry) = keymap().entry(id) {
         perform_entry(entry, host, cx);
+    }
+}
+
+/// Perform `entry` against a remote window: the same intent, handed to the
+/// remote model, which keeps browsing local and sends the rest (see
+/// [`crate::remote`]). Mission control has no remote counterpart.
+pub fn perform_remote_entry(entry: &KeymapEntry, remote: &Entity<RemoteModel>, cx: &mut App) {
+    match intent_for(&entry.action) {
+        Intent::Host(event) => remote.update(cx, |model, cx| model.dispatch(event, cx)),
+        Intent::ToggleMainView => {}
+        Intent::PasteClipboard => {
+            let text = cx.read_from_clipboard().and_then(|item| item.text());
+            if let Some(text) = text {
+                remote.update(cx, |model, cx| model.dispatch(HostEvent::Paste(text), cx));
+            }
+        }
+    }
+}
+
+/// [`perform_id`] for a remote window.
+pub fn perform_remote_id(id: &str, remote: &Entity<RemoteModel>, cx: &mut App) {
+    if let Some(entry) = keymap().entry(id) {
+        perform_remote_entry(entry, remote, cx);
     }
 }
 

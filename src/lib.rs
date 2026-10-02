@@ -1367,11 +1367,13 @@ struct PromptState {
 
 /// A remote command's explicit target: the project it lives in (by the same
 /// id the snapshot publishes, the repository root, so it survives other
-/// projects opening and closing) and the tab within it.
+/// projects opening and closing) and, unless the frame named only a project,
+/// the tab within it. A project-only target acts on that project's own
+/// selected tab, as the host's palette would if it were showing that project.
 #[derive(Clone, Debug)]
 struct WebTarget {
     project_root: std::path::PathBuf,
-    target: crate::app::commands::TabTarget,
+    target: Option<crate::app::commands::TabTarget>,
 }
 
 impl WebTarget {
@@ -1387,7 +1389,7 @@ impl WebTarget {
 /// The tab-level target an open prompt — or the running remote command — acts
 /// on, if any.
 fn tab_target(target: Option<&WebTarget>) -> Option<&crate::app::commands::TabTarget> {
-    target.map(|t| &t.target)
+    target.and_then(|t| t.target.as_ref())
 }
 
 impl Ui {
@@ -6534,7 +6536,7 @@ fn handle_prompt_key_project(
         return Ok(());
     };
     // The tab this dialog's answer acts on (web protocol v6); `None` = selected.
-    let target = pstate.target.as_ref().map(|t| t.target.clone());
+    let target = pstate.target.as_ref().and_then(|t| t.target.clone());
     let target = target.as_ref();
 
     match &mut pstate.prompt {
@@ -7093,7 +7095,12 @@ fn run_palette_action(
             return Ok(());
         }
         PaletteAction::CloseProject => {
-            let i = workspace.active;
+            // A remote command names the project it is looking at (v6).
+            let i = ui
+                .web_target
+                .as_ref()
+                .and_then(|t| t.project(workspace))
+                .unwrap_or(workspace.active);
             start_close_project_flow(workspace, ui, i);
             return Ok(());
         }
@@ -8014,8 +8021,9 @@ fn apply_web_selection(
 }
 
 /// The explicit target a palette `Command` frame names, if any (web protocol
-/// v6): `args.terminal_id` (a terminal, and through it its session) or
-/// `args.session_id`. `Ok(None)` when it names neither — every browser frame —
+/// v6): `args.terminal_id` (a terminal, and through it its session),
+/// `args.session_id`, or `args.project_id` alone (that project, acting on its
+/// own selected tab). `Ok(None)` when it names none — every browser frame —
 /// and `Err` with [`stale_id`]'s sentence for an id the host does not have, so
 /// a stale view is refused instead of falling back to the selection.
 fn web_command_target(
@@ -8046,16 +8054,26 @@ fn web_command_target(
         let (project, tab) =
             locate_web_session(workspace, &id).ok_or_else(|| stale_id("session", &id))?;
         (project, tab, None)
+    } else if let Some(id) = arg("project_id") {
+        let project = workspace
+            .projects
+            .iter()
+            .position(|p| p.git.root().display().to_string() == id)
+            .ok_or_else(|| stale_id("project", &id))?;
+        return Ok(Some(WebTarget {
+            project_root: workspace.projects[project].git.root().to_path_buf(),
+            target: None,
+        }));
     } else {
         return Ok(None);
     };
     let p = &workspace.projects[project];
     Ok(Some(WebTarget {
         project_root: p.git.root().to_path_buf(),
-        target: TabTarget {
+        target: Some(TabTarget {
             tab: p.state.tabs[tab].id(),
             terminal,
-        },
+        }),
     }))
 }
 
@@ -12967,7 +12985,7 @@ mod tests {
             ui.web_origin = Some(browser_origin());
             ui.web_target = Some(WebTarget {
                 project_root: PathBuf::from("/repo"),
-                target: crate::app::commands::TabTarget::tab(one_id.clone()),
+                target: Some(crate::app::commands::TabTarget::tab(one_id.clone())),
             });
             apply_effect(
                 Effect::GitStatus {
@@ -12981,6 +12999,31 @@ mod tests {
             let panel = ui.web_git_status.expect("the panel answers the asker");
             assert_eq!(panel.session_id, one_id);
             assert_eq!(panel.session_name, "One");
+        }
+
+        /// A `project_id` target runs a project-level row in that project, not
+        /// the one the host is showing.
+        #[test]
+        fn a_project_target_acts_in_that_project() {
+            let mut ws = two_project_workspace(false);
+            let mut ui = Ui::default();
+            assert_eq!(ws.active, 0);
+            let other = ws.projects[1].git.root().display().to_string();
+
+            let ack = run(
+                &mut ws,
+                &mut ui,
+                &frame(
+                    1,
+                    names::TOGGLE_SPLIT_VIEW,
+                    Some(json!({ "project_id": other })),
+                ),
+            );
+
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{ack:?}");
+            assert!(ws.projects[1].state.split_view, "the named project");
+            assert!(!ws.projects[0].state.split_view, "not the host's");
+            assert_eq!(ws.active, 0, "and the host stayed where it was");
         }
 
         /// A `terminal_id` target closes that child, not the tab's selected one.

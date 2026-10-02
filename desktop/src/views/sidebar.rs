@@ -25,9 +25,10 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 
 use crate::assets::icon;
-use crate::commands::{disabled_in, keycap, keymap, perform_id};
+use crate::commands::{disabled_in, keycap, keymap};
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
+use crate::surface::Surface;
 use crate::theme::{Hex, Palette};
 use crate::views::icons;
 
@@ -43,6 +44,9 @@ pub struct SidebarData {
     /// An `--isolated` run (SPECS §32): one session, so New agent is drawn
     /// disabled.
     pub isolated: bool,
+    /// A remote window: the row the controlled instance itself is looking at
+    /// (R7), marked `host`. Always `None` for the local workspace.
+    pub host_marker: Option<usize>,
 }
 
 impl SidebarData {
@@ -56,6 +60,7 @@ impl SidebarData {
                 .active_state()
                 .selected()
                 .and_then(|tab| tab.session.selected_child()),
+            host_marker: None,
         }
     }
 }
@@ -95,7 +100,7 @@ pub fn focus_terminal(host: &Entity<HostModel>, target: TerminalRef, cx: &mut Ap
 
 /// The sidebar column. `body` is the element that carries the "App" key
 /// context and focus (see [`crate::shell`]).
-pub fn sidebar(data: &SidebarData, host: &Entity<HostModel>, p: &Palette) -> gpui::Div {
+pub fn sidebar(data: &SidebarData, host: &Surface, p: &Palette) -> gpui::Div {
     let working = data
         .rows
         .iter()
@@ -117,7 +122,7 @@ pub fn sidebar(data: &SidebarData, host: &Entity<HostModel>, p: &Palette) -> gpu
     let list = v_flex().gap(px(2.)).px_2().children(
         data.rows
             .iter()
-            .map(|row| agent_row(row, data.focused_child, host, p)),
+            .map(|row| agent_row(row, data.focused_child, data.host_marker, host, p)),
     );
 
     v_flex()
@@ -240,7 +245,8 @@ fn status_words(row: &AgentRowView) -> String {
 fn agent_row(
     row: &AgentRowView,
     focused_child: Option<usize>,
-    host: &Entity<HostModel>,
+    host_marker: Option<usize>,
+    host: &Surface,
     p: &Palette,
 ) -> AnyElement {
     let index = row.index;
@@ -323,6 +329,21 @@ fn agent_row(
                 .text_color(p.ink.hsla())
                 .child(row.name.clone()),
         )
+        .when(host_marker == Some(index), |line| {
+            // R7: the controlled instance is looking at this one.
+            line.child(
+                h_flex()
+                    .id(("host-marker", index))
+                    .debug_selector(move || format!("host-marker-{index}"))
+                    .flex_none()
+                    .gap(px(4.))
+                    .text_size(px(10.5))
+                    .text_color(p.accent.hsla())
+                    .child(div().size(px(6.)).rounded_full().bg(p.accent.hsla()))
+                    .child("host")
+                    .tooltip(icons::tooltip("The host is looking at this agent")),
+            )
+        })
         .child(right);
 
     // Line 2: the branch.
@@ -411,7 +432,7 @@ fn agent_row(
         )
         .on_click({
             let host = host.clone();
-            move |_, _, cx| select_agent(&host, index, cx)
+            move |_, _, cx| host.select_agent(index, cx)
         });
 
     let menu_host = host.clone();
@@ -430,7 +451,7 @@ fn agent_row(
             let host = host.clone();
             move |_, _, cx| {
                 if !selected {
-                    select_agent(&host, index, cx);
+                    host.select_agent(index, cx);
                 }
             }
         })
@@ -448,7 +469,7 @@ fn agent_row(
 fn agent_menu(
     menu: gpui_component::menu::PopupMenu,
     index: usize,
-    host: &Entity<HostModel>,
+    host: &Surface,
 ) -> gpui_component::menu::PopupMenu {
     let item = |label: &'static str, id: Option<&'static str>| {
         let host = host.clone();
@@ -457,17 +478,15 @@ fn agent_menu(
             None => label.to_string(),
         };
         PopupMenuItem::new(text).on_click(move |_, _, cx| {
-            select_agent(&host, index, cx);
+            host.select_agent(index, cx);
             match id {
-                Some(id) => perform_id(id, &host, cx),
-                None => host.update(cx, |model, cx| {
-                    model.dispatch(
-                        HostEvent::Command(Command::RenameAgentTab {
-                            new_name: String::new(),
-                        }),
-                        cx,
-                    )
-                }),
+                Some(id) => host.perform_id(id, cx),
+                None => host.dispatch(
+                    HostEvent::Command(Command::RenameAgentTab {
+                        new_name: String::new(),
+                    }),
+                    cx,
+                ),
             }
         })
     };
@@ -486,7 +505,7 @@ fn agent_menu(
 fn terminal_rows(
     terminals: &[TerminalView],
     focused_child: Option<usize>,
-    host: &Entity<HostModel>,
+    host: &Surface,
     p: &Palette,
 ) -> impl IntoElement {
     v_flex()
@@ -535,7 +554,7 @@ fn terminal_rows(
                         .text_color(p.muted.hsla())
                         .child(command_hint(&term.title)),
                 )
-                .on_click(move |_, _, cx| focus_terminal(&host, target, cx))
+                .on_click(move |_, _, cx| host.focus_terminal(target, cx))
         }))
 }
 
@@ -552,7 +571,7 @@ pub fn command_hint(title: &str) -> String {
 
 /// New agent (⌃N) and New shell (⌃T): the keymap's own entries. New agent is
 /// drawn disabled, with no click handler at all, in an isolated run.
-fn footer(host: &Entity<HostModel>, p: &Palette, isolated: bool) -> impl IntoElement {
+fn footer(host: &Surface, p: &Palette, isolated: bool) -> impl IntoElement {
     let new_agent_disabled = keymap()
         .entry("NewAgentTab")
         .is_some_and(|entry| disabled_in(entry, isolated));
@@ -586,7 +605,7 @@ fn footer(host: &Entity<HostModel>, p: &Palette, isolated: bool) -> impl IntoEle
                     .tooltip(icons::tooltip("Not available in an isolated run"))
             })
             .when(!new_agent_disabled, |d| {
-                d.on_click(move |_, _, cx| perform_id("NewAgentTab", &host, cx))
+                d.on_click(move |_, _, cx| host.perform_id("NewAgentTab", cx))
             })
     };
     let new_shell = {
@@ -610,7 +629,7 @@ fn footer(host: &Entity<HostModel>, p: &Palette, isolated: bool) -> impl IntoEle
                 "New shell  {}",
                 keycap("NewChildTerminal").unwrap_or_default()
             )))
-            .on_click(move |_, _, cx| perform_id("NewChildTerminal", &host, cx))
+            .on_click(move |_, _, cx| host.perform_id("NewChildTerminal", cx))
     };
     h_flex()
         .p_3()

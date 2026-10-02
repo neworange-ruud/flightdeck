@@ -36,6 +36,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   behind the same PTY seam local ones use. FlightDeck Desktop builds its
   remote control on it. The host's access list now names it
   `FlightDeck Desktop`.
+- **Remote commands can also name a project** (`project_id`), so a remote
+  viewing a project the host is not showing can start an agent or close the
+  project there. FlightDeck Web's git bar now also carries the upstream's name
+  and line counts (additive fields; browsers ignore them).
 
 ### Bug fixes
 

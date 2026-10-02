@@ -1813,3 +1813,147 @@ mod front_end_reads {
 }
 
 mod prompts;
+
+/// FlightDeck Desktop as a remote control, end to end
+/// (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md`): a real [`AppHost`] with its
+/// embedded web server started the way the palette starts it, and the core's
+/// native client ([`crate::web::client::RemoteClient`]) attached to it over a
+/// real socket. Nothing between them is faked — the host's own tick serves
+/// the client, and the client's frames run the host's own dispatch path.
+mod native_remote_client {
+    use super::*;
+    use crate::contracts::{PtySession, TabId};
+    use crate::tui::palette::PaletteAction;
+    use crate::web::access::AccessKey;
+    use crate::web::client::views::{dialog_input, DialogDraft};
+    use crate::web::client::{exchange_code, LinkConfig, RemoteClient, Target};
+    use crate::web::protocol::{command as names, SeatRequest};
+    use std::time::{Duration, Instant};
+
+    fn until(
+        host: &mut AppHost,
+        client: &mut RemoteClient,
+        what: &str,
+        mut done: impl FnMut(&mut AppHost, &mut RemoteClient) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            host.tick();
+            client.pump();
+            if done(host, client) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_native_client_browses_and_drives_a_tab_the_host_is_not_showing() {
+        let fakes = Fakes::new();
+        let (mut state, task_pty) = fakes.state_with_a_tab();
+        let second_pty = fakes.pty.queue_session();
+        state
+            .dispatch(
+                Command::NewAgentTab {
+                    name: "Second".to_string(),
+                    agent_key: None,
+                },
+                &fakes.services(),
+            )
+            .unwrap();
+        assert_eq!(state.selected_tab, Some(1), "the host shows Second");
+        state.config.web.bind = "127.0.0.1".into();
+        state.config.web.port = 0;
+        let mut host = fakes.host(state);
+        host.handle(HostEvent::RunPaletteAction(
+            PaletteAction::StartWebInterface,
+        ))
+        .unwrap();
+        host.publish();
+        host.handle(HostEvent::Overlay(OverlayInput::WebAccess(AccessKey::Esc)))
+            .unwrap();
+
+        // Pair with a code, as the connect window does.
+        let address = host
+            .web_surface
+            .handle
+            .as_ref()
+            .expect("listening")
+            .bound_addr()
+            .to_string();
+        let code = host
+            .web_surface
+            .credentials
+            .lock()
+            .unwrap()
+            .mint_bootstrap_code()
+            .reveal()
+            .to_string();
+        let token = crate::remote::runtime::shared()
+            .handle()
+            .block_on(exchange_code(&address, &code, "FlightDeck Desktop/test"))
+            .expect("the code is exchanged");
+        let mut client = RemoteClient::connect(LinkConfig {
+            address,
+            token,
+            seat: SeatRequest::Write,
+            user_agent: "FlightDeck Desktop/test".to_string(),
+        });
+        until(&mut host, &mut client, "the snapshot", |_, c| {
+            c.state().is_live() && c.workspace().ready
+        });
+
+        // Browse to Task, here only (R2).
+        let task = TabId(host.active_state().tabs[0].meta.id.clone());
+        assert!(client.workspace_mut().select_session(&task));
+        let task_terminal = client
+            .workspace()
+            .selected_terminal()
+            .expect("Task's agent terminal is mirrored")
+            .terminal_id
+            .clone();
+
+        // A targeted command opens the shared dialog; answering it acts on Task.
+        client
+            .command_for(names::SET_MANUAL_STATUS, &Target::Session(task.clone()))
+            .expect("live");
+        until(&mut host, &mut client, "the shared dialog", |_, c| {
+            c.workspace().dialog.is_some()
+        });
+        let view = client.workspace().dialog.clone().unwrap();
+        let mut draft = DialogDraft::new(&view);
+        let reply = dialog_input(&view, &mut draft, &OverlayInput::Choose("b".into()))
+            .expect("Blocked answers it");
+        client.command(reply.name, Some(reply.args)).expect("live");
+        until(&mut host, &mut client, "Task blocked", |h, _| {
+            h.active_state().tabs[0].meta.manual_status.as_deref() == Some("blocked")
+        });
+        assert_eq!(host.active_state().tabs[1].meta.manual_status, None);
+        assert_eq!(
+            host.active_state().selected_tab,
+            Some(1),
+            "the host is still showing Second"
+        );
+
+        // Keystrokes reach Task's PTY and no other.
+        let mut pty = client.pty(&task_terminal);
+        pty.write_input(b"echo hi\r").unwrap();
+        until(&mut host, &mut client, "the keystrokes", |_, _| {
+            task_pty.input().ends_with(b"echo hi\r")
+        });
+        assert!(!second_pty.input().ends_with(b"echo hi\r"));
+
+        // And Task's output reaches the client although the host is not
+        // showing it.
+        task_pty.push_output("output from task");
+        let mut seen = Vec::new();
+        until(&mut host, &mut client, "Task's bytes", |_, _| {
+            seen.extend(pty.try_read_output().unwrap());
+            String::from_utf8_lossy(&seen).contains("output from task")
+        });
+
+        client.stop();
+        host.stop_services();
+    }
+}

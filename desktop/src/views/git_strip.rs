@@ -10,14 +10,14 @@
 use flightdeck::view::{GitStripView, UpstreamState};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
+    div, px, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
     StatefulInteractiveElement, Styled,
 };
 use gpui_component::h_flex;
 
-use crate::commands::{keycap, perform_id};
+use crate::commands::keycap;
 use crate::fonts::MONO_FAMILY;
-use crate::host::HostModel;
+use crate::surface::Surface;
 use crate::theme::Palette;
 use crate::views::icons;
 
@@ -25,7 +25,7 @@ use crate::views::icons;
 pub const GIT_STRIP_HEIGHT: Pixels = px(42.);
 
 /// The strip.
-pub fn git_strip(view: &GitStripView, host: &Entity<HostModel>, p: &Palette) -> impl IntoElement {
+pub fn git_strip(view: &GitStripView, host: &Surface, p: &Palette) -> impl IntoElement {
     let bar = h_flex()
         .flex_shrink_0()
         .h(GIT_STRIP_HEIGHT)
@@ -162,7 +162,7 @@ fn button(
     entry_id: &'static str,
     enabled: bool,
     primary: bool,
-    host: &Entity<HostModel>,
+    host: &Surface,
     p: &Palette,
 ) -> impl IntoElement {
     let (bg, ink, hint) = match (primary, enabled) {
@@ -193,6 +193,6 @@ fn button(
         .child(icons::keycap(keycap(entry_id).unwrap_or_default(), hint))
         .when(enabled, |b| {
             b.cursor_pointer()
-                .on_click(move |_, _, cx| perform_id(entry_id, &host, cx))
+                .on_click(move |_, _, cx| host.perform_id(entry_id, cx))
         })
 }

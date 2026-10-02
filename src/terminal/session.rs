@@ -136,6 +136,11 @@ pub struct Terminal {
     /// Always 0 for the primary, which needs no counter — there is at most one
     /// primary per session and it is identified as such.
     stream_id: u64,
+    /// Whether the emulator's replies (a cursor-position report, a colour
+    /// query's answer) are written back to the process. `false` for a
+    /// [`Terminal::mirror`]: the process runs on another machine, whose own
+    /// emulator already answered, and a second answer would arrive as input.
+    answers: bool,
 }
 
 impl Terminal {
@@ -156,6 +161,24 @@ impl Terminal {
             session,
             grid: profile.build(size.rows, size.cols),
             stream_id,
+            answers: true,
+        }
+    }
+
+    /// A terminal whose process runs elsewhere: `session` carries its bytes
+    /// (FlightDeck Desktop's remote control, `crate::web::client::StreamPty`),
+    /// `size` is the host's grid, and the emulator's replies are discarded —
+    /// the host's own emulator answered them already.
+    pub fn mirror(
+        kind: TerminalKind,
+        title: String,
+        session: Box<dyn PtySession>,
+        size: PtySize,
+        profile: TerminalProfile,
+    ) -> Self {
+        Terminal {
+            answers: false,
+            ..Terminal::new(kind, title, session, size, 0, profile)
         }
     }
 
@@ -245,7 +268,7 @@ impl Terminal {
     /// Drain the emulator's pending replies onto the PTY input.
     fn write_replies(&mut self) {
         let reply = self.grid.take_replies();
-        if !reply.is_empty() {
+        if !reply.is_empty() && self.answers {
             let _ = self.session.write_input(&reply);
         }
     }
@@ -655,6 +678,32 @@ mod tests {
 
     fn sz() -> PtySize {
         PtySize::default()
+    }
+
+    /// A mirrored terminal parses what it is sent and never answers: the
+    /// process is on another machine, whose emulator already replied.
+    #[test]
+    fn a_mirror_parses_but_never_answers_a_query() {
+        const DSR_AND_OSC11: &[u8] = b"hi\x1b[6n\x1b]11;?\x07";
+        let pty = FakePty::new();
+        let handle = pty.queue_session();
+        let session = pty.spawn("x", &[], &[], Path::new(CWD), sz()).unwrap();
+        let mut term = Terminal::mirror(
+            TerminalKind::Primary,
+            "agent".to_string(),
+            session,
+            PtySize { rows: 5, cols: 20 },
+            TerminalProfile {
+                emulator: Emulator::Alacritty,
+                default_colors: Some(((0xee, 0xee, 0xee), (0x12, 0x34, 0x56))),
+                env: &[],
+            },
+        );
+        term.process_output(DSR_AND_OSC11);
+        term.answer_cursor_position_query(DSR_AND_OSC11);
+        term.tick();
+        assert!(handle.input().is_empty(), "no reply was written");
+        assert!(term.screen().contents().starts_with("hi"));
     }
 
     /// The TUI's sessions stay on vt100 (which answers no colour query); a

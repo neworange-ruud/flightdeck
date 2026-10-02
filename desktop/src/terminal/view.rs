@@ -93,6 +93,7 @@ use super::layout::{self, CellSpan, TermPalette};
 use super::rowcache::RowCache;
 use super::zoom::{TerminalZoom, ZoomChord};
 use crate::host::HostModel;
+use crate::remote::RemoteModel;
 use crate::theme::{Hex, Palette};
 
 /// History rows one wheel notch scrolls: the TUI's `SCROLL_LINES`.
@@ -111,6 +112,10 @@ pub enum TerminalSource {
     /// The host owns it: whichever terminal is on screen in the active
     /// project (the app).
     Host(Entity<HostModel>),
+    /// A FlightDeck on another machine owns it: the terminal a remote window
+    /// is showing, mirrored over the link (`crate::remote`). It draws and takes
+    /// keys exactly as the host's does; only where the bytes go differs.
+    Remote(Entity<RemoteModel>),
 }
 
 /// A local selection drag in progress.
@@ -255,6 +260,14 @@ impl TerminalView {
         Self::with_source(TerminalSource::Host(host), palette, cx)
     }
 
+    /// A view of whatever terminal a remote window shows. It redraws when the
+    /// remote model does.
+    pub fn for_remote(remote: Entity<RemoteModel>, cx: &mut Context<Self>) -> Self {
+        let palette = TermPalette::from_palette(Palette::global(cx));
+        cx.observe(&remote, |_, _, cx| cx.notify()).detach();
+        Self::with_source(TerminalSource::Remote(remote), palette, cx)
+    }
+
     fn with_source(source: TerminalSource, palette: TermPalette, cx: &mut Context<Self>) -> Self {
         // A zoom chord in any terminal resizes every terminal.
         cx.observe_global::<TerminalZoom>(|_, cx| cx.notify())
@@ -302,7 +315,7 @@ impl TerminalView {
     pub fn owned_terminal(&self) -> Option<&Terminal> {
         match &self.source {
             TerminalSource::Owned(terminal) => Some(terminal),
-            TerminalSource::Host(_) => None,
+            TerminalSource::Host(_) | TerminalSource::Remote(_) => None,
         }
     }
 
@@ -310,7 +323,7 @@ impl TerminalView {
     pub fn owned_terminal_mut(&mut self) -> Option<&mut Terminal> {
         match &mut self.source {
             TerminalSource::Owned(terminal) => Some(terminal),
-            TerminalSource::Host(_) => None,
+            TerminalSource::Host(_) | TerminalSource::Remote(_) => None,
         }
     }
 
@@ -319,6 +332,7 @@ impl TerminalView {
         match &self.source {
             TerminalSource::Owned(terminal) => Some(f(terminal)),
             TerminalSource::Host(host) => host.read(cx).host().active_terminal().map(f),
+            TerminalSource::Remote(remote) => remote.read(cx).active_terminal().map(f),
         }
     }
 
@@ -333,6 +347,9 @@ impl TerminalView {
             TerminalSource::Owned(terminal) => Some(f(terminal)),
             TerminalSource::Host(host) => {
                 host.update(cx, |model, _| model.host_mut().active_terminal_mut().map(f))
+            }
+            TerminalSource::Remote(remote) => {
+                remote.update(cx, |model, _| model.active_terminal_mut().map(f))
             }
         }
     }
@@ -352,6 +369,7 @@ impl TerminalView {
                     .ui
                     .desktop_terminal_font_size
             }
+            TerminalSource::Remote(remote) => remote.read(cx).font_size(),
         }
     }
 
@@ -362,6 +380,9 @@ impl TerminalView {
             TerminalSource::Owned(_) => TerminalZoom::current(cx).size_for(self.base_font_size(cx)),
             // The same rule split view's panes draw with.
             TerminalSource::Host(host) => super::zoom::app_font_size(host.read(cx).host(), cx),
+            TerminalSource::Remote(_) => {
+                TerminalZoom::current(cx).size_for(self.base_font_size(cx))
+            }
         }
     }
 
@@ -375,6 +396,9 @@ impl TerminalView {
                 let host = host.read(cx).host();
                 !host.terminal_focused() && host.active_state().config.ui.dim_terminal_in_app_mode
             }
+            // The host's projects' setting is the host's; a remote window
+            // never dims.
+            TerminalSource::Remote(_) => false,
         }
     }
 
@@ -476,6 +500,9 @@ impl TerminalView {
                 }
             }
             TerminalSource::Host(host) => host.update(cx, |model, _| model.set_viewport(size)),
+            // D4: the host owns PTY geometry; the grid is the host's size and
+            // the element letterboxes it.
+            TerminalSource::Remote(_) => {}
         }
     }
 
@@ -493,6 +520,10 @@ impl TerminalView {
             TerminalSource::Host(host) => {
                 let event = HostEvent::TerminalInput(bytes.to_vec());
                 host.update(cx, |model, cx| model.dispatch(event, cx));
+            }
+            TerminalSource::Remote(remote) => {
+                let event = HostEvent::TerminalInput(bytes.to_vec());
+                remote.update(cx, |model, cx| model.dispatch(event, cx));
             }
         }
     }
@@ -594,7 +625,9 @@ impl TerminalView {
         }
         match &self.source {
             TerminalSource::Owned(_) => self.owned_key_down(event, cx),
-            TerminalSource::Host(_) => self.host_key_down(event, window, cx),
+            TerminalSource::Host(_) | TerminalSource::Remote(_) => {
+                self.host_key_down(event, window, cx)
+            }
         }
     }
 
@@ -702,6 +735,12 @@ impl TerminalView {
             let host = host.clone();
             if !host.read(cx).host().terminal_focused() {
                 host.update(cx, |model, cx| model.dispatch(HostEvent::FocusTerminal, cx));
+            }
+        }
+        if let TerminalSource::Remote(remote) = &self.source {
+            let remote = remote.clone();
+            if !remote.read(cx).terminal_focused() {
+                remote.update(cx, |model, cx| model.dispatch(HostEvent::FocusTerminal, cx));
             }
         }
         let Some((row, col)) = self.cell_at(event.position, cx) else {
@@ -1118,7 +1157,10 @@ impl Render for TerminalView {
             ProcessState::Exited(code) => format!("process exited ({code})"),
             _ => "process ended".to_string(),
         });
-        let is_host = matches!(self.source, TerminalSource::Host(_));
+        let is_host = matches!(
+            self.source,
+            TerminalSource::Host(_) | TerminalSource::Remote(_)
+        );
         // Press on the view (it is under the pointer then); moves and releases
         // are the element's window-level listeners, so a drag keeps working
         // past the view's edges.

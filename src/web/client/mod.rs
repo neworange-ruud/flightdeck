@@ -15,7 +15,9 @@
 //! | [`link`] | the WebSocket task: attach, pump, reconnect, cursors |
 //! | [`mirror`] | [`RemoteWorkspace`]: snapshot + deltas, local selection |
 //! | [`input`] | the held-input queue and its one seq counter |
+//! | [`store`] | `~/.flightdeck/remotes.json`: paired instances and their tokens |
 //! | [`terminals`] | [`StreamPty`]: a remote terminal behind `PtySession` |
+//! | [`views`] | the core's view structs, built from the mirror |
 //!
 //! [`RemoteClient`] ties them together for a synchronous front-end: start it,
 //! call [`RemoteClient::pump`] once per frame, read [`RemoteClient::workspace`].
@@ -24,19 +26,21 @@ pub mod exchange;
 pub mod input;
 pub mod link;
 pub mod mirror;
+pub mod store;
 pub mod terminals;
+pub mod views;
 
 use std::sync::mpsc::{channel, Receiver};
 
 use crate::contracts::TabId;
 use crate::web::protocol::{
-    command as names, Ack, AckOutcome, ConfigView, GitStatusView, SeatRequest, TerminalId,
-    WireError,
+    command as names, Ack, AckOutcome, ConfigView, GitStatusView, ProjectId, SeatRequest,
+    TerminalId, WireError,
 };
 
 pub use exchange::{exchange_code, probe_session, AccessToken, ExchangeError, Probe};
 pub use input::AckFor;
-pub use link::{LinkConfig, LinkEnd, LinkEvent, LinkHandle, LinkState, Outbound};
+pub use link::{LinkConfig, LinkEnd, LinkEvent, LinkHandle, LinkOut, LinkState, Outbound};
 pub use mirror::RemoteWorkspace;
 pub use terminals::{RemoteTerminals, StreamPty};
 
@@ -118,6 +122,8 @@ pub fn link_is_unprotected(address: &str) -> bool {
 /// What a session-scoped command acts on (web protocol v6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
+    /// A project, acting on its own selected session.
+    Project(ProjectId),
     /// A whole session.
     Session(TabId),
     /// One terminal (and through it, its session).
@@ -128,9 +134,42 @@ impl Target {
     /// The command `args` that name this target.
     pub fn args(&self) -> serde_json::Value {
         match self {
+            Target::Project(id) => serde_json::json!({ "project_id": id.as_str() }),
             Target::Session(id) => serde_json::json!({ "session_id": id.0 }),
             Target::Terminal(id) => serde_json::json!({ "terminal_id": id.as_str() }),
         }
+    }
+}
+
+/// The hand-driven side of [`RemoteClient::scripted`].
+pub struct Script {
+    events: std::sync::mpsc::Sender<LinkEvent>,
+    sent: tokio::sync::mpsc::UnboundedReceiver<link::LinkOut>,
+    outbound: Outbound,
+}
+
+impl Script {
+    /// Deliver a frame as the link would.
+    pub fn send(&self, event: LinkEvent) {
+        let _ = self.events.send(event);
+    }
+
+    /// Deliver a snapshot and go live, as the link does after an attach.
+    pub fn snapshot(&self, snapshot: crate::web::protocol::Snapshot) {
+        self.outbound.go_live_for_test();
+        self.send(LinkEvent::State(LinkState::Live {
+            latency_ms: Some(12),
+        }));
+        self.send(LinkEvent::Snapshot(Box::new(snapshot)));
+    }
+
+    /// Everything the client has sent since the last call.
+    pub fn sent(&mut self) -> Vec<link::LinkOut> {
+        let mut out = Vec::new();
+        while let Ok(item) = self.sent.try_recv() {
+            out.push(item);
+        }
+        out
     }
 }
 
@@ -171,6 +210,37 @@ impl RemoteClient {
             configuration: None,
             resync: None,
         }
+    }
+
+    /// A client with no socket behind it, driven by hand: what a link would
+    /// have said goes in through the returned [`Script`], and what the client
+    /// would have sent comes out of it. For front-end tests that draw a remote
+    /// surface from recorded frames.
+    pub fn scripted() -> (RemoteClient, Script) {
+        let (tx, events) = channel();
+        let (outbound, sent) = Outbound::detached();
+        let client = RemoteClient {
+            link: None,
+            events,
+            outbound: outbound.clone(),
+            workspace: RemoteWorkspace::new(),
+            terminals: RemoteTerminals::new(),
+            state: LinkState::Connecting,
+            results: Vec::new(),
+            refused_input: Vec::new(),
+            errors: Vec::new(),
+            git_status: None,
+            configuration: None,
+            resync: None,
+        };
+        (
+            client,
+            Script {
+                events: tx,
+                sent,
+                outbound,
+            },
+        )
     }
 
     /// Apply everything the link has said since the last call. Returns whether
