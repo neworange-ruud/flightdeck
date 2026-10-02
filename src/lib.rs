@@ -95,7 +95,7 @@ use crate::terminal::grid::{encode_mouse_button, encode_mouse_report};
 use crate::terminal::pty::PortablePtyBackend;
 use crate::tui::config_manager::ConfigManager;
 use crate::tui::input::{map_key_with_f2, KeyAction};
-use crate::tui::palette::{CommandPalette, PaletteAction};
+use crate::tui::palette::{CommandPalette, FrontEndAction, PaletteAction};
 use crate::tui::render::{
     child_tab_label, dialog_hit, draw, draw_project_tab_bar, hit_test, overlay_dismissed_by_click,
     palette_hit, project_tab_hit_test, status_bar_hit, ChildTarget, Dialog, DialogAccel,
@@ -1226,6 +1226,13 @@ struct Ui {
     /// the two lifecycle flags above: the lock lives behind
     /// [`crate::web::server::WebServerHandle`], which only the event loop holds.
     pending_input_preempt: bool,
+    /// Whether the front-end performs the palette's front-end rows
+    /// ([`PaletteAction::FrontEnd`]): set once by the desktop app
+    /// ([`crate::host::AppHost::set_desktop_front_end`]), never by the TUI.
+    front_end_actions: bool,
+    /// Front-end rows chosen from the palette, in order, for the front-end to
+    /// take ([`crate::host::AppHost::take_front_end_actions`]) and perform.
+    pending_front_end: Vec<FrontEndAction>,
     /// The input lock, while the web server is running (D14 as revised).
     ///
     /// **This is the desktop's own arbitration seam, and it is deliberately not
@@ -3993,6 +4000,7 @@ fn gated_palette(isolated: bool, ui: &Ui) -> CommandPalette {
     palette.set_paired(ui.remote_paired);
     palette.set_web_running(ui.web_running);
     palette.set_isolated(isolated);
+    palette.set_front_end_actions(ui.front_end_actions);
     palette
 }
 
@@ -7159,6 +7167,13 @@ fn run_palette_action(
             ui.pending_input_preempt = true;
             return Ok(());
         }
+        // A window or process only the front-end can open: queued for it to
+        // take after this turn. Never reached from the TUI or a browser, whose
+        // palettes do not offer these rows.
+        PaletteAction::FrontEnd(action) => {
+            ui.pending_front_end.push(action);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -7232,7 +7247,8 @@ fn run_palette_action(
         | PaletteAction::StartWebInterface
         | PaletteAction::StopWebInterface
         | PaletteAction::ShowWebAccess
-        | PaletteAction::TakeInputLock => Ok(()),
+        | PaletteAction::TakeInputLock
+        | PaletteAction::FrontEnd(_) => Ok(()),
     }
 }
 

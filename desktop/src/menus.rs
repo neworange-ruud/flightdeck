@@ -11,7 +11,8 @@
 //! ## What is not in the table
 //!
 //! A handful of items are the desktop's own, not chords: About, Settings…,
-//! Open project… and the GitHub link ([`AppCommand`]). Each is a small
+//! New window, Open project…, Connect to remote… and the GitHub link
+//! ([`AppCommand`]). Each is a small
 //! action whose handler asks the host for the same thing the palette row
 //! does (`Command::ShowAbout`, `PaletteAction::OpenConfig`, the native folder
 //! picker answering `HostEvent::OpenProject`).
@@ -20,7 +21,7 @@
 //!
 //! ```text
 //! FlightDeck  About · Settings… ⌘, · Services · Quit ⌘Q
-//! File        New agent · New shell · Open project… ⌘O · Connect to remote… · Close session · Close shell · Open worktree
+//! File        New window ⌘N · New agent · New shell · Open project… ⌘O · Connect to remote… · Close session · Close shell · Open worktree
 //! View        Toggle split · Command palette · Projects / Agent sessions / Terminals ▸ · Focus
 //! Git         Push · Pull base · Finish
 //! Agent       Set manual status · Restart
@@ -44,8 +45,9 @@
 //!
 //! ## Shortcuts that are platform conventions, not table chords
 //!
-//! Cmd-, (Settings), Cmd-O (Open project) and Cmd-Q (Quit, the table's
-//! `Quit` action). Cmd-V pastes and Cmd-C copies in the terminal (the table
+//! Cmd-, (Settings), Cmd-N (New window), Cmd-O (Open project) and Cmd-Q
+//! (Quit, the table's `Quit` action). The Dock icon's menu offers New window
+//! too, the usual way to get a second window of a Mac app. Cmd-V pastes and Cmd-C copies in the terminal (the table
 //! and the terminal view). **Cmd-W is left unbound**: it must never close a
 //! session by muscle memory (that is Ctrl-k), and the window has its own
 //! close button.
@@ -53,7 +55,7 @@
 use flightdeck::app::commands::Command;
 use flightdeck::app::keymap::{Keymap, KeymapEntry};
 use flightdeck::host::HostEvent;
-use flightdeck::tui::palette::PaletteAction;
+use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
 use flightdeck::tui::platform;
 use flightdeck_desktop::keys::KeymapAction;
 use gpui::{actions, Action, App, KeyBinding, Menu, MenuItem, SystemMenuType};
@@ -66,6 +68,7 @@ actions!(
         About,
         OpenSettings,
         OpenProjectFolder,
+        NewWindow,
         ConnectToRemote,
         OpenGithub
     ]
@@ -80,6 +83,9 @@ pub enum AppCommand {
     About,
     Settings,
     OpenProject,
+    /// Another instance of the app, on its launcher
+    /// ([`flightdeck_desktop::instance`]).
+    NewWindow,
     /// FlightDeck Desktop as a remote control (`crate::remote::connect`).
     ConnectRemote,
     GitHub,
@@ -91,6 +97,7 @@ impl AppCommand {
             AppCommand::About => "About FlightDeck",
             AppCommand::Settings => "Settings…",
             AppCommand::OpenProject => "Open project…",
+            AppCommand::NewWindow => "New window",
             AppCommand::ConnectRemote => "Connect to remote…",
             AppCommand::GitHub => "FlightDeck on GitHub",
         }
@@ -101,7 +108,10 @@ impl AppCommand {
         match self {
             AppCommand::About => Some(HostEvent::Command(Command::ShowAbout)),
             AppCommand::Settings => Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig)),
-            AppCommand::OpenProject | AppCommand::ConnectRemote | AppCommand::GitHub => None,
+            AppCommand::OpenProject
+            | AppCommand::NewWindow
+            | AppCommand::ConnectRemote
+            | AppCommand::GitHub => None,
         }
     }
 
@@ -110,15 +120,46 @@ impl AppCommand {
             AppCommand::About => Box::new(About),
             AppCommand::Settings => Box::new(OpenSettings),
             AppCommand::OpenProject => Box::new(OpenProjectFolder),
+            AppCommand::NewWindow => Box::new(NewWindow),
             AppCommand::ConnectRemote => Box::new(ConnectToRemote),
             AppCommand::GitHub => Box::new(OpenGithub),
         }
+    }
+
+    /// The item a palette front-end row stands for: the host queues the row
+    /// and the window performs it (`crate::host::HostModel::dispatch`).
+    pub fn for_front_end(action: FrontEndAction) -> AppCommand {
+        match action {
+            FrontEndAction::ConnectToRemote => AppCommand::ConnectRemote,
+            FrontEndAction::NewWindow => AppCommand::NewWindow,
+        }
+    }
+
+    /// It as a menu item, labelled `name`.
+    fn item_named(self, name: impl Into<gpui::SharedString>) -> MenuItem {
+        MenuItem::Action {
+            name: name.into(),
+            action: self.action(),
+            os_action: None,
+            checked: false,
+            disabled: false,
+        }
+    }
+
+    /// It as a menu item under its own label (the Dock menu's).
+    fn menu_item(self) -> MenuItem {
+        self.item_named(self.label())
     }
 
     /// Perform it: the same thing wherever it was asked from.
     pub fn perform(self, cx: &mut App) {
         match self {
             AppCommand::OpenProject => crate::root::pick_folder(cx),
+            AppCommand::NewWindow => {
+                if let Err(e) = flightdeck_desktop::instance::spawn_new_instance() {
+                    crate::root::report(format!("Could not open a new window: {e}"), cx);
+                }
+            }
             AppCommand::ConnectRemote => crate::remote::connect::open_connect_window(None, cx),
             AppCommand::GitHub => cx.open_url(GITHUB_URL),
             other => {
@@ -203,6 +244,8 @@ const LAYOUT: &[(&str, &[Slot])] = &[
     (
         "File",
         &[
+            AppSlot(AppCommand::NewWindow),
+            Sep,
             Entry("NewAgentTab"),
             Entry("NewChildTerminal"),
             AppSlot(AppCommand::OpenProject),
@@ -358,13 +401,7 @@ fn to_gpui_item(item: ItemModel, keymap: &Keymap) -> Option<MenuItem> {
                 Target::Entry(id) => {
                     MenuItem::action(label, KeymapAction::for_entry(keymap.entry(id)?))
                 }
-                Target::App(command) => MenuItem::Action {
-                    name: label.into(),
-                    action: command.action(),
-                    os_action: None,
-                    checked: false,
-                    disabled: false,
-                },
+                Target::App(command) => command.item_named(label),
             };
             base.disabled(disabled)
         }
@@ -394,6 +431,7 @@ pub fn platform_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
     }
     let mut bindings = vec![
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-o", OpenProjectFolder, None),
     ];
     if let Some(quit) = keymap.entry("Quit") {
@@ -414,6 +452,7 @@ pub fn install(cx: &mut App, keymap: &'static Keymap, isolated: bool) {
     cx.bind_keys(platform_bindings(keymap));
     if platform::IS_MACOS {
         cx.set_menus(to_gpui(menu_model(keymap, isolated), keymap));
+        cx.set_dock_menu(vec![AppCommand::NewWindow.menu_item()]);
     }
 }
 
@@ -423,6 +462,7 @@ pub fn register_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| AppCommand::About.perform(cx));
     cx.on_action(|_: &OpenSettings, cx| AppCommand::Settings.perform(cx));
     cx.on_action(|_: &OpenProjectFolder, cx| AppCommand::OpenProject.perform(cx));
+    cx.on_action(|_: &NewWindow, cx| AppCommand::NewWindow.perform(cx));
     cx.on_action(|_: &ConnectToRemote, cx| AppCommand::ConnectRemote.perform(cx));
     cx.on_action(|_: &OpenGithub, cx| AppCommand::GitHub.perform(cx));
 }
@@ -519,6 +559,8 @@ mod tests {
             Target::Entry("NewAgentTab"),
             Target::Entry("NewChildTerminal"),
             Target::App(AppCommand::OpenProject),
+            Target::App(AppCommand::NewWindow),
+            Target::App(AppCommand::ConnectRemote),
             Target::Entry("CloseAgentTab"),
             Target::Entry("ToggleSplitView"),
             Target::Entry("OpenPalette"),
@@ -579,6 +621,39 @@ mod tests {
             Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig))
         );
         assert!(AppCommand::OpenProject.host_event().is_none());
+    }
+
+    #[test]
+    fn the_palettes_front_end_rows_are_the_desktops_own_items() {
+        assert_eq!(
+            AppCommand::for_front_end(FrontEndAction::ConnectToRemote),
+            AppCommand::ConnectRemote
+        );
+        assert_eq!(
+            AppCommand::for_front_end(FrontEndAction::NewWindow),
+            AppCommand::NewWindow
+        );
+        // Performed by the window, never sent to the host.
+        for row in flightdeck::tui::palette::front_end_entries() {
+            let PaletteAction::FrontEnd(action) = row.action else {
+                panic!("{} is not a front-end row", row.label);
+            };
+            assert!(AppCommand::for_front_end(action).host_event().is_none());
+        }
+    }
+
+    #[test]
+    fn new_window_is_cmd_n_on_macos() {
+        let bindings = platform_bindings(keymap_for(false));
+        if platform::IS_MACOS {
+            let cmd_n = [gpui::Keystroke::parse("cmd-n").unwrap()];
+            assert!(bindings.iter().any(|b| {
+                // `Some(false)`: a complete match, not a prefix of a chord.
+                b.match_keystrokes(&cmd_n) == Some(false) && b.action().name() == NewWindow.name()
+            }));
+        } else {
+            assert!(bindings.is_empty());
+        }
     }
 
     #[test]

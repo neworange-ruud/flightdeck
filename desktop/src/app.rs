@@ -1,6 +1,6 @@
 //! Application start-up, the main window, and teardown.
 //!
-//! `flightdeck-desktop [--isolated|-I]` opens exactly what the TUI opens: the
+//! `flightdeck-desktop [--isolated|-I | --launcher]` opens exactly what the TUI opens: the
 //! project for the current working directory (inside a repository) plus every
 //! project remembered from the last session, through the same `AppHost::open`.
 //! Then it seeds the PTY size, resumes the launch project's agents, starts the
@@ -14,6 +14,11 @@
 //! has the session manager's environment rather than the user's shell's, so
 //! the login shell's is adopted first ([`flightdeck_desktop::shell_env`]).
 //!
+//! `--launcher` opens that empty state whatever the working directory is. It
+//! is how File ▸ New window starts another instance
+//! ([`flightdeck_desktop::instance`]): from a repository, the new instance
+//! would otherwise open the same project as this one.
+//!
 //! Quitting — closing the window, Cmd-Q on macOS, Ctrl-q (the table's Quit),
 //! a confirmed quit dialog, SIGTERM/SIGINT/SIGHUP — all end in `cx.quit()`,
 //! and GPUI's quit hook runs the TUI's teardown order before the process
@@ -26,6 +31,7 @@ use flightdeck::config::load::{global_config_path, load_config};
 use flightdeck::contracts::real::RealFs;
 use flightdeck::contracts::FileSystem;
 use flightdeck::host::AppHost;
+use flightdeck_desktop::instance::LAUNCHER_FLAG;
 use gpui::{px, size, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_component::Root;
 
@@ -48,6 +54,8 @@ const TRAFFIC_LIGHT_INSET: gpui::Point<gpui::Pixels> = gpui::point(px(16.), px(1
 /// What the command line asked for.
 struct Launch {
     isolated: bool,
+    /// `--launcher`: open the empty state, not the working directory's project.
+    launcher: bool,
     /// `--spike-snapshot PATH` & co. (a `spike-snapshot` build only): render
     /// the window offscreen after it opens, write it out, quit.
     snapshot: SnapshotOptions,
@@ -55,9 +63,15 @@ struct Launch {
 
 fn parse_args(args: Vec<String>) -> Result<Launch, String> {
     let isolated = flightdeck::parse_isolated(&args).map_err(|e| e.to_string())?;
+    let launcher = args.iter().any(|a| a == LAUNCHER_FLAG);
+    if launcher && isolated {
+        return Err(format!(
+            "{LAUNCHER_FLAG} opens no project, and an isolated run is one project"
+        ));
+    }
     let rest: Vec<String> = args
         .into_iter()
-        .filter(|a| a != "--isolated" && a != "-I")
+        .filter(|a| a != "--isolated" && a != "-I" && a != LAUNCHER_FLAG)
         .collect();
     let (snapshot, rest) = split_snapshot(rest)?;
     if let Some(unknown) = rest.first() {
@@ -69,7 +83,11 @@ fn parse_args(args: Vec<String>) -> Result<Launch, String> {
                     `--features spike-snapshot`"
             .to_string());
     }
-    Ok(Launch { isolated, snapshot })
+    Ok(Launch {
+        isolated,
+        launcher,
+        snapshot,
+    })
 }
 
 /// Open the workspace for a launch from `folder` and bring its services up:
@@ -172,14 +190,16 @@ pub fn run(args: Vec<String>) {
     // Opened before GPUI starts. A launch outside any repository (Finder, the
     // Start menu) opens the window on the empty state instead of exiting; an
     // isolated run is defined by its directory, so there it is the TUI's
-    // error and a non-zero exit.
-    let initial = match open_workspace(services, &cwd, launch.isolated) {
-        Ok(host) => Some(host),
-        Err(e) if launch.isolated => {
+    // error and a non-zero exit. `--launcher` opens nothing at all.
+    let opened = (!launch.launcher).then(|| open_workspace(services, &cwd, launch.isolated));
+    let initial = match opened {
+        None => None,
+        Some(Ok(host)) => Some(host),
+        Some(Err(e)) if launch.isolated => {
             eprintln!("flightdeck error: {e}");
             std::process::exit(1);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             eprintln!("flightdeck-desktop: {e}; opening the project picker");
             None
         }
@@ -391,6 +411,15 @@ mod tests {
         assert!(update_check_in(&fs, path));
         fs.write(path, "not toml [[[").unwrap();
         assert!(update_check_in(&fs, path), "unreadable: the default");
+    }
+
+    #[test]
+    fn launcher_opens_the_empty_state_and_excludes_isolated() {
+        let launch = parse_args(args(&["--launcher"])).unwrap();
+        assert!(launch.launcher && !launch.isolated);
+        assert!(!parse_args(args(&[])).unwrap().launcher);
+        assert!(parse_args(args(&["--launcher", "--isolated"])).is_err());
+        assert!(parse_args(args(&["-I", "--launcher"])).is_err());
     }
 
     #[test]

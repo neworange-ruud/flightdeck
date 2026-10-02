@@ -1399,6 +1399,16 @@ impl<'a> AppHost<'a> {
     /// The TUI and the browser never call this.
     pub fn set_desktop_front_end(&mut self) {
         self.desktop_front_end = true;
+        // The palette's front-end rows (Connect to Remote, New Window) are
+        // the desktop's to perform; see `take_front_end_actions`.
+        self.ui.front_end_actions = true;
+    }
+
+    /// The palette's front-end rows chosen since the last call, in order — a
+    /// window or process the host cannot open itself, so the front-end that
+    /// enabled them ([`AppHost::set_desktop_front_end`]) performs each.
+    pub fn take_front_end_actions(&mut self) -> Vec<crate::tui::palette::FrontEndAction> {
+        std::mem::take(&mut self.ui.pending_front_end)
     }
 
     /// Unix seconds now, from the host's clock: the `now_secs` the view

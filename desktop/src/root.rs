@@ -157,6 +157,21 @@ impl AppRoot {
         }
     }
 
+    /// Show `message`: in the running host's message dialog, or under the
+    /// launcher's buttons.
+    pub fn report(&mut self, message: String, cx: &mut Context<Self>) {
+        match &self.running {
+            Some(running) => running.model.update(cx, |model, cx| {
+                model.host_mut().message(message);
+                cx.notify();
+            }),
+            None => {
+                self.error = Some(message);
+                cx.notify();
+            }
+        }
+    }
+
     /// Bring a started host on screen.
     fn start(&mut self, host: AppHost<'static>, cx: &mut Context<Self>) {
         let model = cx.new(|cx| {
@@ -226,6 +241,15 @@ pub fn pick_folder(cx: &mut App) {
 pub fn open_folder(path: PathBuf, cx: &mut App) {
     if let Some(root) = cx.try_global::<RootHandle>().map(|h| h.0.clone()) {
         root.update(cx, |root, cx| root.open_folder(path, cx));
+    }
+}
+
+/// Tell the user something went wrong with an app-level item (New window):
+/// the running host's one-line message, or the launcher's error line.
+pub fn report(message: String, cx: &mut App) {
+    match cx.try_global::<RootHandle>().map(|h| h.0.clone()) {
+        Some(root) => root.update(cx, |root, cx| root.report(message, cx)),
+        None => eprintln!("flightdeck-desktop: {message}"),
     }
 }
 

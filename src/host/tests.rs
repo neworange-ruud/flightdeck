@@ -1363,6 +1363,48 @@ mod overlays {
         assert_eq!(host.overlay(), None);
     }
 
+    /// A front-end row is queued for the desktop to perform, in order, and
+    /// taken once; the host does nothing else with it.
+    #[test]
+    fn a_desktop_front_end_takes_the_front_end_rows_it_chose() {
+        use crate::tui::palette::FrontEndAction;
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        host.set_desktop_front_end();
+        host.handle(HostEvent::RunPaletteAction(PaletteAction::FrontEnd(
+            FrontEndAction::ConnectToRemote,
+        )))
+        .unwrap();
+        host.handle(HostEvent::OpenPalette).unwrap();
+        host.handle(HostEvent::Overlay(OverlayInput::PaletteRun(
+            PaletteAction::FrontEnd(FrontEndAction::NewWindow),
+        )))
+        .unwrap();
+        assert_eq!(
+            host.take_front_end_actions(),
+            [FrontEndAction::ConnectToRemote, FrontEndAction::NewWindow]
+        );
+        assert!(host.take_front_end_actions().is_empty(), "taken once");
+        assert_eq!(host.overlay(), None, "the palette closed");
+    }
+
+    /// The TUI never enabled the front-end rows, so it cannot be made to queue
+    /// one it has no way to perform.
+    #[test]
+    fn a_tui_front_end_refuses_the_front_end_rows() {
+        use crate::tui::palette::FrontEndAction;
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        assert!(host
+            .handle(HostEvent::RunPaletteAction(PaletteAction::FrontEnd(
+                FrontEndAction::NewWindow,
+            )))
+            .is_err());
+        assert!(host.take_front_end_actions().is_empty());
+    }
+
     /// The desktop front-end flag reaches the help overlay; without it the
     /// screen is the TUI's, byte for byte.
     #[test]

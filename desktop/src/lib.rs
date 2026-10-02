@@ -5,6 +5,8 @@
 //!
 //! The binary (`main.rs`) owns the window and views.
 
+// Another instance of the app, on its launcher (File ▸ New window).
+pub mod instance;
 pub mod keys;
 pub mod overlays;
 // Self-update: install-kind detection, release/asset/checksum rules, the

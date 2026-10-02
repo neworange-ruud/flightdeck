@@ -231,6 +231,71 @@ fn about_and_settings_ask_the_host_for_the_palettes_rows(app: &mut TestAppContex
     );
 }
 
+/// The palette offers Connect to Remote and New Window once the host knows it
+/// is the desktop's, and choosing one is performed by the window as the File
+/// menu's item, not by the host.
+#[gpui::test]
+fn the_palettes_front_end_rows_are_performed_by_the_window(app: &mut TestAppContext) {
+    use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
+    let f = fakes();
+    let host = testing::host(env(f), &f.notifier, two_projects(), 0);
+    let (root, cx) = open_root(app, Some(host), no_opener(), Vec::new());
+    let model = model_of(&root, cx);
+    model.update(cx, |m, _| m.host_mut().set_desktop_front_end());
+    reset(&model, cx);
+
+    model.update(cx, |m, cx| m.dispatch(HostEvent::OpenPalette, cx));
+    let Some(OverlayView::Palette(view)) = model.read_with(cx, |m, _| m.host().overlay()) else {
+        panic!("the palette is open");
+    };
+    let labels: Vec<&str> = view.entries.iter().map(|row| row.label).collect();
+    assert!(labels.contains(&"Connect to Remote"), "{labels:?}");
+    assert!(labels.contains(&"New Window"), "{labels:?}");
+
+    for (action, command) in [
+        (FrontEndAction::ConnectToRemote, AppCommand::ConnectRemote),
+        (FrontEndAction::NewWindow, AppCommand::NewWindow),
+    ] {
+        model.update(cx, |m, cx| m.dispatch(HostEvent::OpenPalette, cx));
+        model.update(cx, |m, cx| {
+            m.dispatch(
+                HostEvent::Overlay(OverlayInput::PaletteRun(PaletteAction::FrontEnd(action))),
+                cx,
+            )
+        });
+        assert_eq!(
+            model.update(cx, |m, _| std::mem::take(&mut m.performed)),
+            [command]
+        );
+        assert!(
+            model.read_with(cx, |m, _| m.host().overlay().is_none()),
+            "the palette closed"
+        );
+    }
+}
+
+/// A New window that could not start says so where the user is looking: the
+/// launcher's error line, or the running host's message.
+#[gpui::test]
+fn an_app_item_failure_is_reported_in_the_window(app: &mut TestAppContext) {
+    let (root, cx) = open_root(app, None, no_opener(), Vec::new());
+    cx.update(|_, cx| crate::root::report("Could not open a new window: nope".into(), cx));
+    assert_eq!(
+        root.read_with(cx, |root, _| root.error().map(str::to_string)),
+        Some("Could not open a new window: nope".to_string())
+    );
+
+    let f = fakes();
+    let host = testing::host(env(f), &f.notifier, two_projects(), 0);
+    let (root, cx) = open_root(app, Some(host), no_opener(), Vec::new());
+    let model = model_of(&root, cx);
+    cx.update(|_, cx| crate::root::report("Could not open a new window: nope".into(), cx));
+    assert!(matches!(
+        model.read_with(cx, |m, _| m.host().overlay()),
+        Some(OverlayView::Message(_))
+    ));
+}
+
 #[gpui::test]
 fn the_open_project_item_answers_a_folder_picker_through_the_host(app: &mut TestAppContext) {
     let f = fakes();
@@ -253,7 +318,7 @@ fn the_open_project_item_answers_a_folder_picker_through_the_host(app: &mut Test
 fn macos_shortcuts_are_platform_conventions_and_cmd_w_stays_free() {
     let bindings = menus::platform_bindings(keymap());
     if flightdeck::tui::platform::IS_MACOS {
-        assert_eq!(bindings.len(), 3, "Cmd-, Cmd-O Cmd-Q");
+        assert_eq!(bindings.len(), 4, "Cmd-, Cmd-N Cmd-O Cmd-Q");
     } else {
         assert!(bindings.is_empty());
     }
