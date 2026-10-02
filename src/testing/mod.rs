@@ -11,7 +11,8 @@ use crate::contracts::domain::{
 };
 use crate::contracts::error::{FlightDeckError, Result};
 use crate::contracts::traits::{
-    Clock, CommandRunner, ContainerRuntime, FileSystem, GitExecutor, PtyBackend, PtySession,
+    Clock, CommandRunner, ContainerRuntime, FileLock, FileSystem, GitExecutor, PtyBackend,
+    PtySession,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,22 @@ pub use fake_grid::FakeGrid;
 #[derive(Debug, Default)]
 pub struct FakeFs {
     inner: Mutex<FakeFsState>,
+    /// Paths a [`FileLock`] from [`FileSystem::try_lock_exclusive`] holds,
+    /// shared with the guards so dropping one releases it.
+    locks: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// What a [`FakeFs`] lock holds: releasing it on drop is the fake's half of
+/// "the OS releases the lock when the process exits".
+struct FakeLockGuard {
+    locks: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for FakeLockGuard {
+    fn drop(&mut self) {
+        self.locks.lock().unwrap().remove(&self.path);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +227,22 @@ impl FileSystem for FakeFs {
         st.dirs.retain(|dir| dir != p && !dir.starts_with(p));
         st.writes.push(p.to_path_buf());
         Ok(())
+    }
+
+    fn try_lock_exclusive(&self, p: &Path) -> Result<Option<FileLock>> {
+        if !self.locks.lock().unwrap().insert(p.to_path_buf()) {
+            return Ok(None);
+        }
+        // The real lock creates the file it locks.
+        {
+            let mut st = self.inner.lock().unwrap();
+            mark_parents(&mut st.dirs, p);
+            st.files.entry(p.to_path_buf()).or_default();
+        }
+        Ok(Some(FileLock::new(FakeLockGuard {
+            locks: self.locks.clone(),
+            path: p.to_path_buf(),
+        })))
     }
 }
 

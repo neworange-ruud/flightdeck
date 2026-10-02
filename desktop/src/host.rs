@@ -162,6 +162,10 @@ pub struct HostModel {
     /// with its chord by.
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
+    /// Every front-end row the host handed back, in order, instead of opening
+    /// a window or a process from a test.
+    #[cfg(test)]
+    pub performed: Vec<crate::menus::AppCommand>,
     _ticker: Option<Task<()>>,
 }
 
@@ -183,6 +187,8 @@ impl HostModel {
             attention: None,
             #[cfg(test)]
             dispatched: Vec::new(),
+            #[cfg(test)]
+            performed: Vec::new(),
             _ticker: None,
         }
     }
@@ -315,6 +321,15 @@ impl HostModel {
             } else {
                 self.host.message(format!("Error: {e}"));
             }
+        }
+        // Palette rows only the window can perform (Connect to Remote, New
+        // Window): the host queued them; open them once this update is done.
+        for action in self.host.take_front_end_actions() {
+            let command = crate::menus::AppCommand::for_front_end(action);
+            #[cfg(test)]
+            self.performed.push(command);
+            #[cfg(not(test))]
+            cx.defer(move |cx| command.perform(cx));
         }
         cx.notify();
         if self.host.should_quit() {

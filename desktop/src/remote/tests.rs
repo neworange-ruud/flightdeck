@@ -284,6 +284,38 @@ fn a_command_names_the_session_this_window_shows(app: &mut TestAppContext) {
     );
 }
 
+/// A remote window's palette offers the desktop's own rows too: another
+/// remote, another window. They are this machine's to perform, so nothing is
+/// sent to the host.
+#[gpui::test]
+fn the_palettes_front_end_rows_stay_on_this_machine(app: &mut TestAppContext) {
+    use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
+    let (model, mut script, cx) = open(app);
+    script.sent();
+    model.update(cx, |m, _| m.apply(HostEvent::OpenPalette));
+    let Some(OverlayView::Palette(view)) = model.read_with(cx, |m, _| m.overlay()) else {
+        panic!("the palette is open");
+    };
+    let labels: Vec<&str> = view.entries.iter().map(|row| row.label).collect();
+    assert!(labels.contains(&"Connect to Remote"), "{labels:?}");
+    assert!(labels.contains(&"New Window"), "{labels:?}");
+
+    model.update(cx, |m, _| {
+        m.apply(HostEvent::Overlay(OverlayInput::PaletteRun(
+            PaletteAction::FrontEnd(FrontEndAction::ConnectToRemote),
+        )))
+    });
+    assert_eq!(
+        model.update(cx, |m, _| m.take_front_end_actions()),
+        [FrontEndAction::ConnectToRemote]
+    );
+    assert!(
+        model.read_with(cx, |m, _| m.overlay()).is_none(),
+        "the palette closed"
+    );
+    assert!(commands(&mut script).is_empty(), "nothing went to the host");
+}
+
 #[gpui::test]
 fn the_hosts_dialog_is_shared_and_answered_by_id(app: &mut TestAppContext) {
     let (model, mut script, cx) = open(app);

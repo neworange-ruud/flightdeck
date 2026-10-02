@@ -43,6 +43,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Only one FlightDeck on a computer talks to the phone relay.** Two of them
+  at once (the TUI next to the desktop app, or two TUIs) kept knocking each
+  other's relay connection off and confused the phone's message order. The
+  first one started owns the relay (`~/.flightdeck/remote.lock`, released when
+  it exits, even after a crash); the others leave it alone, and Pair Phone in
+  them says which FlightDeck to pair from.
 - **Pasted text can no longer end bracketed paste early.** Embedded
   `ESC[200~`/`ESC[201~` markers are stripped, including ones split to reassemble
   after a single pass. Before, the rest of a crafted paste could run as typed

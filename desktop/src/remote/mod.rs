@@ -40,6 +40,7 @@ use flightdeck::host::{
     GitStatusView, HostEvent, MessageView, OverlayInput, OverlayKey, OverlayView,
 };
 use flightdeck::terminal::session::{Terminal, TerminalKind};
+use flightdeck::tui::palette::FrontEndAction;
 use flightdeck::view::TerminalRef;
 use flightdeck::web::client::store::SavedRemote;
 use flightdeck::web::client::views::{self, DialogDraft, LocalAction, RemoteAction};
@@ -98,6 +99,10 @@ pub struct RemoteModel {
     font_size: u16,
     cadence: Cadence,
     close_requested: bool,
+    /// Palette rows only the desktop performs (another window, another
+    /// remote), chosen but not yet performed — [`RemoteModel::dispatch`] hands
+    /// them to the app once its update is done.
+    front_end: Vec<FrontEndAction>,
     /// Every event dispatched, in order, for the tests.
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
@@ -121,10 +126,16 @@ impl RemoteModel {
             font_size: flightdeck::contracts::UiConfig::DEFAULT_DESKTOP_TERMINAL_FONT_SIZE,
             cadence: Cadence::with_rates(HOST_ACTIVE_TURN, HOST_IDLE_TURN),
             close_requested: false,
+            front_end: Vec::new(),
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
         }
+    }
+
+    /// The front-end palette rows chosen since the last call, in order.
+    pub fn take_front_end_actions(&mut self) -> Vec<FrontEndAction> {
+        std::mem::take(&mut self.front_end)
     }
 
     /// Use this text size for the remote terminals.
@@ -368,6 +379,10 @@ impl RemoteModel {
             }
         }
         self.apply(event);
+        for action in self.take_front_end_actions() {
+            let command = crate::menus::AppCommand::for_front_end(action);
+            cx.defer(move |cx| command.perform(cx));
+        }
         cx.notify();
     }
 
@@ -487,6 +502,7 @@ impl RemoteModel {
             RemoteAction::Local(LocalAction::Project(selector)) => self.step_project(selector),
             RemoteAction::Local(LocalAction::Help) => self.local = Local::Help,
             RemoteAction::Local(LocalAction::About) => self.local = Local::About,
+            RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
             RemoteAction::Unavailable(why) => self.local = Local::Message(why.to_string()),
             RemoteAction::Send { name, scope } => {
                 let args = views::target(self.workspace(), scope).map(|t| t.args());

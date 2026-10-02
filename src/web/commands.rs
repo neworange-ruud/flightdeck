@@ -995,6 +995,10 @@ pub fn exposure_of(action: &PaletteAction) -> Exposure {
         PaletteAction::StopWebInterface => Exposure::Wire(names::STOP_WEB_INTERFACE),
         PaletteAction::ShowWebAccess => Exposure::Wire(names::SHOW_WEB_ACCESS),
         PaletteAction::TakeInputLock => Exposure::Wire(names::TAKE_INPUT_LOCK),
+        PaletteAction::FrontEnd(_) => Exposure::NotExposed(
+            "opens a window or a process on the machine of the front-end that offers it; \
+             a browser has no such window, and the host could not open one for it",
+        ),
     }
 }
 

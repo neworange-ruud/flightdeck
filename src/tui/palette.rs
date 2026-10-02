@@ -88,6 +88,24 @@ pub enum PaletteAction {
     /// Offered only while the web interface is running, because with no browser
     /// attached there is one writer and nothing to interrupt.
     TakeInputLock,
+    /// Something only a graphical front-end can do, because it opens a window
+    /// or a process the host has no handle on. These rows are not in the §22
+    /// inventory ([`all_entries`]) and appear only once a front-end has said it
+    /// performs them ([`CommandPalette::set_front_end_actions`]), so the TUI and
+    /// the browser never offer them.
+    FrontEnd(FrontEndAction),
+}
+
+/// The actions behind [`PaletteAction::FrontEnd`]. The host only queues them;
+/// the front-end that asked for them performs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontEndAction {
+    /// Pair with, or reconnect to, a FlightDeck on another machine and drive it
+    /// from a window of its own (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md`).
+    ConnectToRemote,
+    /// Start another instance of the app, opened on its launcher, so one can
+    /// run local projects while another controls a remote.
+    NewWindow,
 }
 
 impl PaletteAction {
@@ -322,6 +340,43 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// 35.
 pub const REQUIRED_ACTION_COUNT: usize = 35;
 
+/// The rows a graphical front-end adds to the palette (see
+/// [`PaletteAction::FrontEnd`]). Each joins the end of its group in
+/// [`ALL_ENTRIES`], so the palette's sections stay contiguous.
+const FRONT_END_ENTRIES: &[PaletteEntry] = &[
+    PaletteEntry {
+        group: "Remote",
+        label: "Connect to Remote",
+        action: PaletteAction::FrontEnd(FrontEndAction::ConnectToRemote),
+    },
+    PaletteEntry {
+        group: "Global",
+        label: "New Window",
+        action: PaletteAction::FrontEnd(FrontEndAction::NewWindow),
+    },
+];
+
+/// The front-end rows, for the tests and for a front-end that lists them.
+pub fn front_end_entries() -> &'static [PaletteEntry] {
+    FRONT_END_ENTRIES
+}
+
+/// Every palette row in display order: the §22 inventory, with the front-end
+/// rows (when `front_end` is set) at the end of their groups. The one ordering
+/// the desktop's palette and a remote window's both draw.
+pub fn rows(front_end: bool) -> impl Iterator<Item = &'static PaletteEntry> {
+    let extras: &'static [PaletteEntry] = if front_end { FRONT_END_ENTRIES } else { &[] };
+    ALL_ENTRIES.iter().enumerate().flat_map(move |(i, entry)| {
+        let ends_group = ALL_ENTRIES
+            .get(i + 1)
+            .is_none_or(|next| next.group != entry.group);
+        let tail = extras
+            .iter()
+            .filter(move |extra| ends_group && extra.group == entry.group);
+        std::iter::once(entry).chain(tail)
+    })
+}
+
 /// Every §22 palette row, in display order, unfiltered and ungated.
 ///
 /// The desktop reaches these through [`CommandPalette::filtered`], which hides
@@ -367,6 +422,9 @@ pub struct CommandPalette {
     /// entries and "New Agent Session Tab". Presentation only — the flows
     /// themselves refuse independently, because keybindings bypass the palette.
     isolated: bool,
+    /// Whether the front-end performs [`PaletteAction::FrontEnd`] rows (the
+    /// desktop app does; the TUI does not). Defaults to `false`.
+    front_end_actions: bool,
 }
 
 impl CommandPalette {
@@ -398,6 +456,19 @@ impl CommandPalette {
     pub fn set_isolated(&mut self, isolated: bool) {
         self.isolated = isolated;
         self.selected = 0;
+    }
+
+    /// Set whether the front-end performs the [`FRONT_END_ENTRIES`] rows, which
+    /// decides whether they are offered at all. Resets the selection like the
+    /// other gates.
+    pub fn set_front_end_actions(&mut self, front_end_actions: bool) {
+        self.front_end_actions = front_end_actions;
+        self.selected = 0;
+    }
+
+    /// Every row this palette could offer, in display order (see [`rows`]).
+    fn rows(&self) -> impl Iterator<Item = &'static PaletteEntry> {
+        rows(self.front_end_actions)
     }
 
     /// Whether an entry is visible given the current pairing and isolation
@@ -463,8 +534,7 @@ impl CommandPalette {
     /// they do not apply to the current pairing state.
     pub fn filtered(&self) -> Vec<&'static PaletteEntry> {
         let needle = self.filter.to_lowercase();
-        ALL_ENTRIES
-            .iter()
+        self.rows()
             .filter(|e| self.entry_visible(e))
             .filter(|e| needle.is_empty() || e.label.to_lowercase().contains(&needle))
             .collect()
@@ -639,6 +709,60 @@ mod tests {
         // writer and nothing to interrupt).
         let palette = CommandPalette::new();
         assert_eq!(palette.filtered().len(), REQUIRED_ACTION_COUNT - 4);
+    }
+
+    /// The front-end rows are the desktop's alone: a palette nobody enabled
+    /// them on (the TUI's) never offers them, so the §22 inventory is unchanged.
+    #[test]
+    fn front_end_rows_are_offered_only_once_enabled() {
+        let is_front_end = |e: &&PaletteEntry| matches!(e.action, PaletteAction::FrontEnd(_));
+        let tui = CommandPalette::new();
+        assert!(!tui.filtered().iter().any(is_front_end));
+
+        let mut desktop = CommandPalette::new();
+        desktop.set_front_end_actions(true);
+        let offered: Vec<&str> = desktop
+            .filtered()
+            .into_iter()
+            .filter(is_front_end)
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(offered, ["Connect to Remote", "New Window"]);
+        assert_eq!(
+            desktop.filtered().len(),
+            tui.filtered().len() + FRONT_END_ENTRIES.len()
+        );
+        // Not part of the browser-mirrored §22 inventory.
+        assert!(!all_entries().iter().any(|e| is_front_end(&e)));
+    }
+
+    /// Each front-end row joins the end of a group the palette already has, so
+    /// a section header is never drawn twice.
+    #[test]
+    fn front_end_rows_keep_their_groups_contiguous() {
+        let mut palette = CommandPalette::new();
+        palette.set_front_end_actions(true);
+        for extra in FRONT_END_ENTRIES {
+            assert!(
+                ALL_ENTRIES.iter().any(|e| e.group == extra.group),
+                "'{}' names a group the palette does not have",
+                extra.label
+            );
+        }
+        let groups: Vec<&str> = palette.rows().map(|e| e.group).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, group) in groups.iter().enumerate() {
+            if i == 0 || groups[i - 1] != *group {
+                assert!(!seen.contains(group), "group '{group}' is split in two");
+                seen.push(group);
+            }
+        }
+        // And they filter like any other row.
+        palette.set_filter("remote");
+        assert!(palette
+            .filtered()
+            .iter()
+            .any(|e| e.label == "Connect to Remote"));
     }
 
     #[test]

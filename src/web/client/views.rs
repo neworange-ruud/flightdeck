@@ -19,7 +19,7 @@ use crate::host::{
     ButtonRole, DialogButton, DialogKind, DialogRow, DialogView as HostDialog, GitStatusView,
     OverlayInput, OverlayKey, PaletteRow, PaletteView,
 };
-use crate::tui::palette::{all_entries, PaletteAction, PaletteEntry};
+use crate::tui::palette::{FrontEndAction, PaletteAction, PaletteEntry};
 use crate::view::{
     agent_badge, agent_status_text, AgentRowView, ChangeSummary, GitActions, GitStripAgent,
     GitStripView, ProjectStatus, ProjectTabView, TerminalRef, TerminalRole as RowRole,
@@ -243,6 +243,9 @@ pub enum LocalAction {
     Project(Selector),
     Help,
     About,
+    /// A palette row the desktop itself performs — another window, or
+    /// another remote ([`PaletteAction::FrontEnd`]).
+    FrontEnd(FrontEndAction),
 }
 
 /// Which target a sent command names.
@@ -292,6 +295,9 @@ pub fn route_palette(action: &PaletteAction) -> RemoteAction {
         }
         PaletteAction::SwitchProjectPrev => {
             RemoteAction::Local(LocalAction::Project(Selector::Prev))
+        }
+        PaletteAction::FrontEnd(front_end) => {
+            RemoteAction::Local(LocalAction::FrontEnd(*front_end))
         }
         _ => match wire_name(action) {
             Some(name) => RemoteAction::Send {
@@ -375,10 +381,10 @@ pub fn target(ws: &RemoteWorkspace, scope: Scope) -> Option<Target> {
 }
 
 /// The palette rows a remote window offers: this build's own rows, kept to the
-/// ones the host's inventory forwards and a remote window can use.
+/// ones the host's inventory forwards and a remote window can use, plus the
+/// desktop's own front-end rows (a remote window only exists in the desktop).
 pub fn palette_entries(ws: &RemoteWorkspace) -> Vec<&'static PaletteEntry> {
-    all_entries()
-        .iter()
+    crate::tui::palette::rows(true)
         .filter(|entry| match route_palette(&entry.action) {
             RemoteAction::Local(_) => true,
             RemoteAction::Unavailable(_) => false,

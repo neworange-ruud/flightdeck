@@ -58,8 +58,8 @@ use crate::{
     resolve_dialog_outcomes, service_remote_commands, session_index, spawn_finish_count,
     spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
     terminate_all_sessions, update_check_enabled, web_dialog_view, web_host_state_now,
-    web_input_holder, web_started_message, Env, RemoteSetup, StatusMsg, Ui, WebSurface, Workspace,
-    WorkspaceTerminals,
+    web_input_holder, web_started_message, Env, RemoteSetup, RemoteStart, StatusMsg, Ui,
+    WebSurface, Workspace, WorkspaceTerminals,
 };
 use flightdeck_remote_protocol::ProjectId;
 
@@ -423,7 +423,14 @@ impl<'a> AppHost<'a> {
         // FlightDeck Remote (optional). When disabled `start_remote` spawns
         // nothing and returns `None`, so every tee/tick below is a cheap no-op.
         if let Some((remote_in_tx, remote_out_rx)) = self.remote_wiring.take() {
-            self.remote_setup = start_remote(env, workspace, remote_in_tx, remote_out_rx);
+            self.remote_setup = match start_remote(env, workspace, remote_in_tx, remote_out_rx) {
+                RemoteStart::Started(setup) => Some(setup),
+                RemoteStart::HeldElsewhere => {
+                    self.ui.remote_held_elsewhere = true;
+                    None
+                }
+                RemoteStart::Off => None,
+            };
         }
         // The outbound feed bridge exists only while the relay thread does. It builds
         // the phone-facing snapshots/deltas/transcript/events each tick and seals
@@ -1399,6 +1406,16 @@ impl<'a> AppHost<'a> {
     /// The TUI and the browser never call this.
     pub fn set_desktop_front_end(&mut self) {
         self.desktop_front_end = true;
+        // The palette's front-end rows (Connect to Remote, New Window) are
+        // the desktop's to perform; see `take_front_end_actions`.
+        self.ui.front_end_actions = true;
+    }
+
+    /// The palette's front-end rows chosen since the last call, in order — a
+    /// window or process the host cannot open itself, so the front-end that
+    /// enabled them ([`AppHost::set_desktop_front_end`]) performs each.
+    pub fn take_front_end_actions(&mut self) -> Vec<crate::tui::palette::FrontEndAction> {
+        std::mem::take(&mut self.ui.pending_front_end)
     }
 
     /// Unix seconds now, from the host's clock: the `now_secs` the view
