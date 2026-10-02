@@ -39,7 +39,7 @@ use std::sync::Arc;
 use crate::app::commands::{Command, Selector};
 use crate::app::modes::InputMode;
 use crate::app::state::AppState;
-use crate::contracts::error::{FlightDeckError, Result};
+use crate::contracts::error::Result;
 use crate::contracts::{Notifier, PtySize};
 use crate::git::status::WorktreeStatus;
 use crate::persistence::workspace::{
@@ -254,12 +254,9 @@ impl<'a> AppHost<'a> {
         };
 
         // The launch project (the cwd's repository) must be a git repo — fail fast
-        // with the friendly message if not. It is always opened and made active.
-        let launch = open_project(&env, cwd, isolated_root.as_deref()).map_err(|e| {
-            FlightDeckError::Git(format!(
-                "not inside a Git repository (run FlightDeck from a git project): {e}"
-            ))
-        })?;
+        // with `open_project`'s message if not ("<folder> is not inside a Git
+        // repository (<git's reason>)"). It is always opened and made active.
+        let launch = open_project(&env, cwd, isolated_root.as_deref())?;
 
         let mut workspace = Workspace {
             projects: vec![launch],

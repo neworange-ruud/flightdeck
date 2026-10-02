@@ -322,6 +322,13 @@ deliberately narrow.
   project…" and the remembered projects (`host::recent_projects`); choosing a
   folder runs `AppHost::open` on it (`HostEvent::OpenProject`, so the git check
   and its refusal are the TUI's) and swaps the shell in.
+- **Launch environment.** Started outside a terminal (Finder, the Dock, a Linux
+  launcher: stdin is not a TTY), the app adopts the login shell's environment
+  before anything else runs (`$SHELL -l -i -c 'env -0'`, 5 s bound, best
+  effort; `shell_env`). Without it, `PATH` is the session manager's
+  (`/usr/bin:/bin:/usr/sbin:/sbin` on macOS), so `git` is Apple's `xcrun` shim
+  and the agents are not found. Windows does nothing: Explorer already passes
+  the user's environment.
 - **`--isolated`/`-I`:** New agent, project switching and Open project are drawn
   disabled (`KeymapEntry::refused_when_isolated`); the host refuses the chords
   with the TUI's message; an `ISOLATED` badge shows; nothing is saved. Launching

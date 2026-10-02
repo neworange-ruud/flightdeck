@@ -46,6 +46,16 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   input. This covers the TUI, the desktop app and phone replies.
 - **UTF-8 mouse reporting (`?1005`) now sends real UTF-8 coordinates** instead
   of legacy bytes, which were wrong past column 95.
+- **The desktop app works when launched from Finder, the Dock or a desktop
+  launcher.** Such a launch only gets the system `PATH`, so `git` and the
+  agents did not resolve as they do in a terminal, and opening a project could
+  fail. The app now adopts your login shell's environment at start-up when it
+  was not started from a terminal. This is bounded to 5 seconds, and if it
+  fails the launch environment is kept.
+- **"Not a git repository" errors now name the folder and give git's own
+  reason.** Before, any git failure became "could not determine repository
+  root", and the desktop launcher told you to "run FlightDeck from a git
+  project".
 
 ## [1.22.0] - 2026-09-21
 

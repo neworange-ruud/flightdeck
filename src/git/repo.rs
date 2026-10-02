@@ -21,8 +21,20 @@ impl GitCli {
     }
 
     /// Discover the repository root from `cwd` and construct a [`GitCli`].
+    ///
+    /// A failing git is reported in its own words (`fatal: not a git
+    /// repository …`, or whatever else stopped it, such as an unusable `git`
+    /// on `PATH`): the caller says which folder, git says why.
     pub fn discover(cwd: &Path) -> Result<Self> {
         let out = run_git_in(cwd, &["rev-parse", "--show-toplevel"])?;
+        if !out.status.success() {
+            let stderr = stderr_trimmed(&out);
+            return Err(FlightDeckError::Git(if stderr.is_empty() {
+                format!("git rev-parse --show-toplevel failed ({})", out.status)
+            } else {
+                stderr
+            }));
+        }
         let root = stdout_trimmed(&out);
         if root.is_empty() {
             return Err(FlightDeckError::Git(
@@ -699,5 +711,36 @@ detached
     #[test]
     fn parse_worktree_list_handles_empty() {
         assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn discover_outside_a_repository_reports_git_own_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = GitCli::discover(dir.path()).expect_err("not a repository");
+        let message = err.to_string();
+        assert!(
+            message.contains("not a git repository"),
+            "git's stderr, not a generic message: {message}"
+        );
+    }
+
+    #[test]
+    fn discover_finds_the_root_from_a_subfolder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init failed");
+        let sub = dir.path().join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let git = GitCli::discover(&sub).unwrap();
+        assert_eq!(
+            git.root().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 }

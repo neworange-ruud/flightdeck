@@ -10,7 +10,9 @@
 //! Started anywhere else (Finder, the Start menu, a launcher: no repository in
 //! the working directory) the window opens on an empty state offering "Open
 //! project…" and the remembered projects ([`crate::root`]); an `--isolated`
-//! run has no such state and exits with the TUI's error.
+//! run has no such state and exits with the TUI's error. Such a launch also
+//! has the session manager's environment rather than the user's shell's, so
+//! the login shell's is adopted first ([`flightdeck_desktop::shell_env`]).
 //!
 //! Quitting — closing the window, Cmd-Q on macOS, Ctrl-q (the table's Quit),
 //! a confirmed quit dialog, SIGTERM/SIGINT/SIGHUP — all end in `cx.quit()`,
@@ -152,6 +154,10 @@ pub fn run(args: Vec<String>) {
             std::process::exit(2);
         }
     };
+    // Before anything else, and before any thread exists: a launch from
+    // Finder, the Dock or a desktop launcher gets the user's shell `PATH`, so
+    // `git` and the agents resolve as they do in a terminal.
+    flightdeck_desktop::shell_env::import_if_launched_outside_a_terminal();
     // Windows only: an update staged by the previous run replaces this
     // installation before anything opens (and relaunches into it).
     flightdeck_desktop::selfupdate::finish_staged_update_at_launch();

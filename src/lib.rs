@@ -1892,13 +1892,26 @@ struct Project {
 /// Open the git project rooted at (or containing) `path`: discover its repo
 /// root, run the SPECS §7 startup (init, recover — never relaunch agents), and
 /// build a [`Project`] with fresh per-project worker channels. Fails if `path`
-/// is not inside a git repository.
+/// is not inside a git repository, naming the folder and keeping git's own
+/// reason: the same words reach a terminal user at launch, the TUI's folder
+/// browser and the desktop launcher, where "not a repository" and "git itself
+/// would not run" need telling apart.
 ///
 /// `isolated`: `None` for a normal project. `Some(status_root)` for an
 /// isolated run (SPECS §32) whose status plumbing lives at that root —
 /// forwarded straight through to [`startup`].
 fn open_project(env: &Env, path: &Path, isolated: Option<&Path>) -> Result<Project> {
-    let git = ProjectGit::cli(GitCli::discover(path)?);
+    let discovered = GitCli::discover(path).map_err(|e| {
+        let reason = match e {
+            FlightDeckError::Git(reason) => reason,
+            other => other.to_string(),
+        };
+        FlightDeckError::Git(format!(
+            "{} is not inside a Git repository ({reason})",
+            path.display()
+        ))
+    })?;
+    let git = ProjectGit::cli(discovered);
     let root = git.root().to_path_buf();
     let name = derive_project_name(&root);
     let mut state = {
