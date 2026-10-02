@@ -30,6 +30,13 @@ uses that version's section as the GitHub Release notes.
   choose a remote.
 - **Plain-WebSocket warning.** The first connect to a remote outside loopback or
   Tailscale warns, once, that the link is not encrypted.
+- **Run more than one FlightDeck.** *New window* (File in the menu bar, Cmd-N,
+  the Dock icon's menu, the Linux launcher's right-click menu, or the command
+  palette) starts another instance on the launcher, so one can work on local
+  projects while another controls a remote. Each has its own window and quits
+  on its own. `flightdeck-desktop --launcher` does the same from a shell.
+- **Connect to Remote and New Window in the command palette,** in the local
+  window and in a remote window's palette alike.
 
 ### Improvements
 
@@ -41,6 +48,11 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **Only one FlightDeck on a computer talks to the phone relay.** Two of them
+  at once (the desktop app next to the TUI, or two desktop windows) kept
+  knocking each other's relay connection off and confused the phone's
+  message order. The first one started owns the relay; the others leave it
+  alone, and Pair Phone in them says which FlightDeck to pair from.
 - **Agents show colour and bold when the app is launched from Finder or the
   Dock.** Their terminals now always start with `TERM=xterm-256color` and
   `COLORTERM=truecolor`, describing the app's own emulator. Before, they
