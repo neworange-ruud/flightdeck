@@ -116,6 +116,11 @@ pub enum HostEvent {
     /// One atomic paste. A text-editing dialog consumes it as literal
     /// characters; otherwise only a focused terminal receives it.
     Paste(String),
+    /// An image a front-end read off its clipboard, for the focused terminal:
+    /// saved in the paste directory and typed as its path, as the TUI's paste
+    /// key does with a clipboard image. Same lock and focus rules as
+    /// [`HostEvent::Paste`].
+    PasteImage(crate::tui::clipboard::PastedImage),
     /// Every project's terminals are now this viewport size. A front-end whose
     /// chrome differs per project uses [`AppHost::resize_projects`] instead.
     Resize(PtySize),
@@ -1005,6 +1010,7 @@ impl<'a> AppHost<'a> {
                 }
                 let mut host = WorkspaceTerminals {
                     projects: &mut workspace.projects,
+                    fs: env.fs,
                 };
                 let out = web_surface.streams.apply_inbound(&event, &mut host);
                 if let Some(handle) = web_surface.handle.as_ref() {

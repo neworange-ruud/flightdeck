@@ -302,6 +302,9 @@ impl FileSystem for FailingRename {
     fn write(&self, p: &Path, c: &str) -> flightdeck::contracts::Result<()> {
         RealFs.write(p, c)
     }
+    fn write_bytes(&self, p: &Path, c: &[u8]) -> flightdeck::contracts::Result<()> {
+        RealFs.write_bytes(p, c)
+    }
     fn symlink(&self, t: &Path, l: &Path) -> flightdeck::contracts::Result<()> {
         RealFs.symlink(t, l)
     }

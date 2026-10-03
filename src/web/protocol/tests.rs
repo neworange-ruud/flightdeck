@@ -407,6 +407,7 @@ fn all_client_msgs() -> Vec<ClientMsg> {
             seq: 18,
             terminal_id: TerminalId::new("tab_1:primary"),
             data: vec![0x0d],
+            image: None,
         }),
         ClientMsg::Resize(Resize {
             viewport: Viewport {
@@ -1492,11 +1493,16 @@ fn input_carries_a_seq_the_ack_answers() {
         seq: 7,
         terminal_id: TerminalId::new("t1"),
         data: b"ls\r".to_vec(),
+        image: None,
     };
     let value = serde_json::to_value(ClientMsg::Input(input.clone())).unwrap();
     assert_eq!(value["type"], "input");
     assert_eq!(value["seq"], 7);
     assert_eq!(value["data"], "bHMN");
+    assert!(
+        value.get("image").is_none(),
+        "keystrokes carry no image key"
+    );
 
     let ack = Ack {
         seq: input.seq,
@@ -1504,6 +1510,31 @@ fn input_carries_a_seq_the_ack_answers() {
         detail: None,
     };
     assert_eq!(round_trip(&ack).seq, 7);
+}
+
+#[test]
+fn a_pasted_image_rides_an_input_and_an_older_frame_has_none() {
+    let input = Input {
+        seq: 3,
+        terminal_id: TerminalId::new("t1"),
+        data: Vec::new(),
+        image: Some(ImagePaste {
+            format: "png".to_string(),
+            data: vec![0x89, b'P', b'N', b'G'],
+        }),
+    };
+    let value = serde_json::to_value(ClientMsg::Input(input.clone())).unwrap();
+    assert_eq!(value["image"]["format"], "png");
+    assert_eq!(value["image"]["data"], "iVBORw==");
+    assert_eq!(
+        round_trip(&ClientMsg::Input(input.clone())),
+        ClientMsg::Input(input)
+    );
+    // Rule 4: a frame from before the field parses, without an image.
+    let older: ClientMsg =
+        serde_json::from_str(r#"{"type":"input","seq":1,"terminal_id":"t1","data":"YQ=="}"#)
+            .unwrap();
+    assert!(matches!(older, ClientMsg::Input(Input { image: None, .. })));
 }
 
 #[test]

@@ -9,6 +9,8 @@
 //! alacritty_terminal while the TUI stays on vt100.
 //!
 //! - [`layout`] decides what a frame shows (pure, tested headlessly),
+//! - [`pan`] moves the view over a grid larger than the element (a remote
+//!   host's grid),
 //! - [`rowcache`] keeps each row's layout between frames and redoes only the
 //!   rows the emulator reports changed (damage tracking),
 //! - [`element`] measures, shapes and paints it,
@@ -25,6 +27,7 @@ pub mod cadence;
 pub mod element;
 pub mod input;
 pub mod layout;
+pub mod pan;
 pub mod rowcache;
 pub mod spike;
 pub mod view;

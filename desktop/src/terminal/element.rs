@@ -22,7 +22,7 @@
 //! their column, so a glyph with a foreign advance cannot shift its neighbours.
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
+    fill, point, px, relative, size, App, Bounds, ContentMask, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, Font, GlobalElementId, Hsla, InspectorElementId, IntoElement,
     LayoutId, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ShapedLine, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
@@ -30,6 +30,7 @@ use gpui::{
 
 use super::boxdraw::{BoxGlyph, Corner, Weight};
 use super::layout::{CellSpan, TextSpan};
+use super::pan::Viewport;
 use super::rowcache::RowCache;
 use super::view::TerminalView;
 use crate::theme::Hex;
@@ -101,41 +102,81 @@ const SCROLLBAR_INSET: f32 = 2.0;
 /// The thumb never shrinks below this, however long the history.
 const SCROLLBAR_MIN_THUMB: f32 = 16.0;
 
-/// The scrollbar thumb for a view `offset` rows up into `history` rows, over
-/// a `rows`-row grid drawn in `track` (the grid's own height; the thumb sits
-/// at its right edge, over the last column like a macOS overlay scrollbar).
-/// Its length is the share of the content on screen; its position is how far
-/// through the content the viewport's top row is.
+/// The scrollbar thumbs over the grid drawn in `track` (its visible part):
+/// `(vertical, horizontal)`.
 ///
-/// `None` on the live screen: the bar shows only while scrolled into history,
-/// so a live terminal never carries it, nor does an alternate screen (which
-/// has no history). Drawn from the grid's own numbers each frame, so it costs
-/// no timer and no frame of its own.
-pub fn scrollbar_thumb(
+/// The vertical thumb's length is the share of the content (history plus the
+/// grid's rows) on screen, its position how far through that content the
+/// viewport's top row is. It shows while the view is scrolled into history —
+/// a live terminal that fits never carries it, nor does an alternate screen
+/// (no history) — and whenever the grid is taller than the element (a remote
+/// host's grid, see [`super::pan`]), because then rows are out of view and
+/// the bar is what says so. The horizontal thumb, along the bottom edge, shows
+/// only while the grid is wider than the element.
+///
+/// Thin bars over the last column and row, like macOS overlay scrollbars.
+/// Drawn from the grid's own numbers each frame, so they cost no timer and no
+/// frame of their own.
+pub fn scrollbars(
     track: Bounds<Pixels>,
-    rows: u16,
+    view: &Viewport,
     offset: usize,
     history: usize,
-) -> Option<Bounds<Pixels>> {
-    if offset == 0 || history == 0 {
+) -> (Option<Bounds<Pixels>>, Option<Bounds<Pixels>>) {
+    let rows = usize::from(view.rows.max(1));
+    let in_history = offset > 0 && history > 0;
+    let vertical = (in_history || view.overflow_rows > 0)
+        .then(|| {
+            let content = history + rows + usize::from(view.overflow_rows);
+            let start = history - offset.min(history) + usize::from(view.top);
+            thumb_span(track.size.height, content, rows, start)
+        })
+        .flatten()
+        .map(|(top, length)| {
+            Bounds::new(
+                point(
+                    track.origin.x + track.size.width - px(SCROLLBAR_WIDTH + SCROLLBAR_INSET),
+                    track.origin.y + top,
+                ),
+                size(px(SCROLLBAR_WIDTH), length),
+            )
+        });
+    let horizontal = (view.overflow_cols > 0)
+        .then(|| {
+            let cols = usize::from(view.cols.max(1));
+            let content = cols + usize::from(view.overflow_cols);
+            thumb_span(track.size.width, content, cols, usize::from(view.left))
+        })
+        .flatten()
+        .map(|(left, length)| {
+            Bounds::new(
+                point(
+                    track.origin.x + left,
+                    track.origin.y + track.size.height - px(SCROLLBAR_WIDTH + SCROLLBAR_INSET),
+                ),
+                size(length, px(SCROLLBAR_WIDTH)),
+            )
+        });
+    (vertical, horizontal)
+}
+
+/// A thumb along a `track`-long bar over `content` units of which `shown`
+/// are on screen from `start`: its offset and length. `None` when it all fits.
+fn thumb_span(
+    track: Pixels,
+    content: usize,
+    shown: usize,
+    start: usize,
+) -> Option<(Pixels, Pixels)> {
+    if content <= shown {
         return None;
     }
-    let rows_f = f32::from(rows.max(1));
-    let total = history as f32 + rows_f;
-    let height = track.size.height;
-    let length = (height * (rows_f / total))
+    let length = (track * (shown as f32 / content as f32))
         .max(px(SCROLLBAR_MIN_THUMB))
-        .min(height);
-    // 0.0 at the oldest history row, 1.0 at the live screen.
-    let through = (history - offset.min(history)) as f32 / history as f32;
-    let top = track.origin.y + (height - length) * through;
-    Some(Bounds::new(
-        point(
-            track.origin.x + track.size.width - px(SCROLLBAR_WIDTH + SCROLLBAR_INSET),
-            top,
-        ),
-        size(px(SCROLLBAR_WIDTH), length),
-    ))
+        .min(track);
+    // 0.0 at the content's start, 1.0 at its end.
+    let through = start.min(content - shown) as f32 / (content - shown) as f32;
+    Some(((track - length) * through, length))
 }
 
 /// Paints the grid of the [`TerminalView`] it is given.
@@ -172,8 +213,9 @@ pub struct Prepared {
     grid: Bounds<Pixels>,
     background: Hex,
     cursor_colour: Hex,
-    /// The scrollbar thumb and its colour, while scrolled into history.
-    scrollbar: Option<(Bounds<Pixels>, Hex)>,
+    /// The scrollbar thumbs (see [`scrollbars`]) and their colour.
+    scrollbars: Vec<Bounds<Pixels>>,
+    scrollbar_colour: Hex,
 }
 
 impl Element for TerminalElement {
@@ -215,11 +257,6 @@ impl Element for TerminalElement {
         }
         let points = self.view.read(cx).font_size(cx);
         let (width, height) = measure_cell(window, points);
-        let metrics = CellMetrics {
-            origin: bounds.origin,
-            width,
-            height,
-        };
         // The grid follows the element: as many whole cells as fit.
         let cols = (bounds.size.width / width).floor().max(1.0) as u16;
         let rows = (bounds.size.height / height).floor().max(1.0) as u16;
@@ -228,37 +265,53 @@ impl Element for TerminalElement {
         let window_active = window.is_window_active();
         let focused = self.view.read(cx).focus_handle().is_focused(window) && window_active;
 
-        let (mut cache, selection, palette, scroll) = self.view.update(cx, |view, cx| {
-            // Shaped text is only valid for the font size and the cell width
-            // it was shaped and forced to.
-            let resized_cells = view
-                .metrics()
-                .is_none_or(|old| (old.width, old.height) != (width, height));
-            let reshape = view.take_font_change(points) || resized_cells;
-            view.set_metrics(metrics);
-            view.resize(PtySize { rows, cols }, cx);
-            view.set_window_active(window_active);
-            let (mut cache, selection) = view.prepare_rows(focused, cx);
-            if reshape {
-                cache.invalidate_derived();
-            }
-            (
-                cache,
-                selection,
-                view.frame_palette(cx),
-                view.scroll_position(cx),
-            )
-        });
+        let (mut cache, selection, palette, scroll, metrics, viewport) =
+            self.view.update(cx, |view, cx| {
+                // Shaped text is only valid for the font size and the cell
+                // width it was shaped and forced to.
+                let resized_cells = view
+                    .metrics()
+                    .is_none_or(|old| (old.width, old.height) != (width, height));
+                let reshape = view.take_font_change(points) || resized_cells;
+                view.resize(PtySize { rows, cols }, cx);
+                // A grid larger than the element (a remote host's) is panned:
+                // the cell origin moves up and left by the cells out of view,
+                // so every cell <-> pixel mapping (paint, mouse, IME) follows.
+                let viewport = view.frame_viewport((rows, cols), cx);
+                let metrics = CellMetrics {
+                    origin: point(
+                        bounds.origin.x - width * f32::from(viewport.left),
+                        bounds.origin.y - height * f32::from(viewport.top),
+                    ),
+                    width,
+                    height,
+                };
+                view.set_metrics(metrics);
+                view.set_window_active(window_active);
+                let (mut cache, selection) = view.prepare_rows(focused, cx);
+                if reshape {
+                    cache.invalidate_derived();
+                }
+                (
+                    cache,
+                    selection,
+                    view.frame_palette(cx),
+                    view.scroll_position(cx),
+                    metrics,
+                    viewport,
+                )
+            });
+        // The part of the grid on screen, in whole cells.
         let grid = Bounds::new(
             bounds.origin,
-            size(width * f32::from(cols), height * f32::from(rows)),
+            size(
+                width * f32::from(viewport.cols),
+                height * f32::from(viewport.rows),
+            ),
         );
-        let scrollbar = scroll
-            .and_then(|(offset, history)| {
-                let track = Bounds::new(bounds.origin, size(bounds.size.width, grid.size.height));
-                scrollbar_thumb(track, rows, offset, history)
-            })
-            .map(|thumb| (thumb, palette.scrollbar));
+        let (offset, history) = scroll.unwrap_or((0, 0));
+        let (vertical, horizontal) = scrollbars(grid, &viewport, offset, history);
+        let scrollbars = vertical.into_iter().chain(horizontal).collect();
 
         // Shape what the update re-laid (and everything after a font or cell
         // change); every other row paints the lines shaped on an earlier frame.
@@ -281,7 +334,8 @@ impl Element for TerminalElement {
             grid,
             background: palette.bg,
             cursor_colour: palette.cursor,
-            scrollbar,
+            scrollbars,
+            scrollbar_colour: palette.scrollbar,
         }
     }
 
@@ -307,72 +361,77 @@ impl Element for TerminalElement {
             );
         }
 
-        let backgrounds = rows.iter().flat_map(|r| &r.layout.backgrounds);
-        for span in backgrounds.chain(&prepared.selection) {
-            window.paint_quad(fill(
-                m.cell_bounds(span.row, span.col, span.cols),
-                span.color.hsla(),
-            ));
-        }
+        // A panned grid reaches past the element; nothing of it is drawn there.
+        let mask = ContentMask { bounds };
+        window.with_content_mask(Some(mask), |window| {
+            let backgrounds = rows.iter().flat_map(|r| &r.layout.backgrounds);
+            for span in backgrounds.chain(&prepared.selection) {
+                window.paint_quad(fill(
+                    m.cell_bounds(span.row, span.col, span.cols),
+                    span.color.hsla(),
+                ));
+            }
 
-        let cursor_colour = prepared.cursor_colour.hsla();
-        let cursor = rows.iter().find_map(|r| r.layout.cursor);
-        if let Some(cursor) = cursor.filter(|c| c.filled) {
-            window.paint_quad(fill(
-                m.cell_bounds(cursor.row, cursor.col, cursor.cols),
-                cursor_colour,
-            ));
-        }
+            let cursor_colour = prepared.cursor_colour.hsla();
+            let cursor = rows.iter().find_map(|r| r.layout.cursor);
+            if let Some(cursor) = cursor.filter(|c| c.filled) {
+                window.paint_quad(fill(
+                    m.cell_bounds(cursor.row, cursor.col, cursor.cols),
+                    cursor_colour,
+                ));
+            }
 
-        for row in rows {
-            let Some(lines) = &row.derived else {
-                continue;
-            };
-            for (span, line) in row.layout.texts.iter().zip(lines) {
-                let _ = line.paint(
-                    m.cell_origin(span.row, span.col),
-                    m.height,
-                    TextAlign::Left,
-                    None,
+            for row in rows {
+                let Some(lines) = &row.derived else {
+                    continue;
+                };
+                for (span, line) in row.layout.texts.iter().zip(lines) {
+                    let _ = line.paint(
+                        m.cell_origin(span.row, span.col),
+                        m.height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+
+            for cell in rows.iter().flat_map(|r| &r.layout.boxes) {
+                paint_box(
+                    &cell.glyph,
+                    m.cell_bounds(cell.row, cell.col, 1),
+                    cell.fg.hsla(),
                     window,
-                    cx,
                 );
             }
-        }
 
-        for cell in rows.iter().flat_map(|r| &r.layout.boxes) {
-            paint_box(
-                &cell.glyph,
-                m.cell_bounds(cell.row, cell.col, 1),
-                cell.fg.hsla(),
-                window,
-            );
-        }
-
-        if let Some(cursor) = cursor.filter(|c| !c.filled) {
-            let cell = m.cell_bounds(cursor.row, cursor.col, cursor.cols);
-            let stroke = px(2.);
-            match cursor.shape {
-                CursorShape::Bar => {
-                    window.paint_quad(fill(
-                        Bounds::new(cell.origin, size(stroke, cell.size.height)),
-                        cursor_colour,
-                    ));
+            if let Some(cursor) = cursor.filter(|c| !c.filled) {
+                let cell = m.cell_bounds(cursor.row, cursor.col, cursor.cols);
+                let stroke = px(2.);
+                match cursor.shape {
+                    CursorShape::Bar => {
+                        window.paint_quad(fill(
+                            Bounds::new(cell.origin, size(stroke, cell.size.height)),
+                            cursor_colour,
+                        ));
+                    }
+                    CursorShape::Underline => {
+                        let y = cell.origin.y + cell.size.height - stroke;
+                        window.paint_quad(fill(
+                            Bounds::new(point(cell.origin.x, y), size(cell.size.width, stroke)),
+                            cursor_colour,
+                        ));
+                    }
+                    // An unfocused block: an outline, so the text stays readable.
+                    CursorShape::Block => paint_outline(cell, px(1.), cursor_colour, window),
                 }
-                CursorShape::Underline => {
-                    let y = cell.origin.y + cell.size.height - stroke;
-                    window.paint_quad(fill(
-                        Bounds::new(point(cell.origin.x, y), size(cell.size.width, stroke)),
-                        cursor_colour,
-                    ));
-                }
-                // An unfocused block: an outline, so the text stays readable.
-                CursorShape::Block => paint_outline(cell, px(1.), cursor_colour, window),
             }
-        }
+        });
 
-        if let Some((thumb, colour)) = prepared.scrollbar {
-            window.paint_quad(fill(thumb, colour.hsla()).corner_radii(thumb.size.width / 2.));
+        for thumb in &prepared.scrollbars {
+            let radius = thumb.size.width.min(thumb.size.height) / 2.;
+            window.paint_quad(fill(*thumb, prepared.scrollbar_colour.hsla()).corner_radii(radius));
         }
 
         // A drag keeps following the pointer outside the element: these hear

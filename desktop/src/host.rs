@@ -308,7 +308,10 @@ impl HostModel {
         #[cfg(test)]
         self.dispatched.push(event.clone());
         // Terminal input: turn fast for the echo, starting now.
-        if matches!(event, HostEvent::TerminalInput(_) | HostEvent::Paste(_)) {
+        if matches!(
+            event,
+            HostEvent::TerminalInput(_) | HostEvent::Paste(_) | HostEvent::PasteImage(_)
+        ) {
             self.cadence.input(Instant::now());
             if self._ticker.is_some() {
                 self.start_ticking(cx);

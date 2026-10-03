@@ -85,6 +85,12 @@ impl RemoteWindow {
         }
     }
 
+    /// The terminal view, for tests that drive it.
+    #[cfg(test)]
+    pub(crate) fn terminal_view(&self) -> Entity<TerminalView> {
+        self.terminal.clone()
+    }
+
     fn on_keymap_action(&mut self, action: &KeymapAction, _: &mut Window, cx: &mut Context<Self>) {
         if self.remote.read(cx).overlay().is_some() {
             cx.propagate();

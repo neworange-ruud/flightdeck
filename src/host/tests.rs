@@ -561,6 +561,71 @@ fn a_bracketed_paste_event_is_stripped_of_embedded_markers() {
     assert_eq!(pty.input(), b"\x1b[200~arm -rf ~\x1b[201~".to_vec());
 }
 
+/// The desktop app's Cmd/Ctrl-V with an image and no text: the image is saved
+/// in the paste directory and its path typed, as the TUI's paste key does.
+#[test]
+fn a_pasted_image_is_saved_and_its_path_typed() {
+    let fakes = Fakes::new();
+    let (state, pty) = fakes.state_with_a_tab();
+    let mut host = fakes.host(state);
+    host.handle(HostEvent::FocusTerminal).unwrap();
+
+    host.handle(HostEvent::PasteImage(crate::tui::clipboard::PastedImage {
+        format: "png".to_string(),
+        bytes: vec![0x89, b'P', b'N', b'G'],
+    }))
+    .unwrap();
+
+    let saved: Vec<_> = fakes
+        .fs
+        .writes_under(&crate::tui::clipboard::image_paste_dir())
+        .into_iter()
+        .filter(|path| fakes.fs.file_bytes(path).is_some())
+        .collect();
+    assert_eq!(saved.len(), 1, "one image in the paste directory");
+    assert_eq!(
+        fakes.fs.file_bytes(&saved[0]),
+        Some(vec![0x89, b'P', b'N', b'G'])
+    );
+    let typed = String::from_utf8(pty.input()).unwrap();
+    assert_eq!(typed, format!("{} ", saved[0].display()));
+}
+
+/// Outside terminal focus an image paste does nothing, like a text paste; a
+/// refused image says why and types nothing.
+#[test]
+fn an_image_paste_needs_terminal_focus_and_an_acceptable_image() {
+    let fakes = Fakes::new();
+    let (state, pty) = fakes.state_with_a_tab();
+    let mut host = fakes.host(state);
+    let image = |format: &str| {
+        HostEvent::PasteImage(crate::tui::clipboard::PastedImage {
+            format: format.to_string(),
+            bytes: vec![1, 2, 3],
+        })
+    };
+
+    host.handle(HostEvent::FocusApp).unwrap();
+    host.handle(image("png")).unwrap();
+    assert!(pty.input().is_empty(), "App mode swallows the paste");
+
+    host.handle(HostEvent::FocusTerminal).unwrap();
+    host.handle(image("exe")).unwrap();
+    assert!(pty.input().is_empty());
+    assert!(
+        matches!(&host.ui.overlay, crate::tui::render::UiOverlay::Dialog(d)
+            if d.title.contains("cannot be attached")),
+        "the refusal is said"
+    );
+    assert!(
+        fakes
+            .fs
+            .writes_under(&crate::tui::clipboard::image_paste_dir())
+            .is_empty(),
+        "nothing saved"
+    );
+}
+
 #[test]
 fn resize_event_resizes_every_session_and_records_the_size() {
     let fakes = Fakes::new();

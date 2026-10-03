@@ -74,7 +74,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::web::protocol::{
-    Ack, AckOutcome, Input, TermBytes, TermCursor, TerminalId, ViewerId, Viewport,
+    Ack, AckOutcome, ImagePaste, Input, TermBytes, TermCursor, TerminalId, ViewerId, Viewport,
 };
 use crate::web::replay::{ByteOffset, ReplayBuffer, Resume};
 use crate::web::server::{WebInbound, WebOutbound};
@@ -117,16 +117,26 @@ pub fn child_terminal_id(tab_id: &str, stream_id: u64) -> TerminalId {
 
 /// Where a keystroke goes.
 ///
-/// One method, on purpose. The TUI implements it over `AppState`; the tests
-/// implement it over a bare [`crate::terminal::session::Session`]. Neither
-/// implementation can be asked to resize anything, because this trait cannot
-/// express the request — see the module doc, "What is structurally absent".
+/// Writes only, on purpose: bytes, or a pasted image that becomes bytes on the
+/// host. The TUI implements it over `AppState`; the tests implement it over a
+/// bare [`crate::terminal::session::Session`]. Neither implementation can be
+/// asked to resize anything, because this trait cannot express the request —
+/// see the module doc, "What is structurally absent".
 pub trait TerminalHost {
     /// Write `bytes` to the PTY behind `terminal_id`.
     ///
     /// Returns [`Written::Ok`] only when the bytes really reached the PTY, since
     /// that is the claim the [`Ack`] will make on this method's behalf.
     fn write_terminal_input(&mut self, terminal_id: &TerminalId, bytes: &[u8]) -> Written;
+
+    /// Paste `image` into the terminal behind `terminal_id`: save it where the
+    /// terminal's agent can read it and write its path ([`Input::image`]).
+    ///
+    /// A host that keeps no paste directory refuses, which is the default.
+    fn paste_terminal_image(&mut self, terminal_id: &TerminalId, image: &ImagePaste) -> Written {
+        let _ = (terminal_id, image);
+        Written::Failed("this host does not take pasted images".to_string())
+    }
 }
 
 /// The outcome of one [`TerminalHost::write_terminal_input`].
@@ -231,6 +241,9 @@ pub fn write_into_session(
     terminal_id: &TerminalId,
     bytes: &[u8],
 ) -> Option<Written> {
+    if !session_has_terminal(session, tab_id, terminal_id) {
+        return None;
+    }
     let terminal = if terminal_id == &primary_terminal_id(tab_id) {
         session.primary_mut()?
     } else {
@@ -254,6 +267,23 @@ pub fn write_into_session(
     Some(match terminal.session_mut().write_input(bytes) {
         Ok(()) => Written::Ok,
         Err(e) => Written::Failed(e.to_string()),
+    })
+}
+
+/// Whether `terminal_id` names a terminal of `session` (tab `tab_id`): its
+/// primary, or one of its children that is still open.
+pub fn session_has_terminal(
+    session: &crate::terminal::session::Session,
+    tab_id: &str,
+    terminal_id: &TerminalId,
+) -> bool {
+    if terminal_id == &primary_terminal_id(tab_id) {
+        return session.primary().is_some();
+    }
+    (0..session.child_count()).any(|c| {
+        session
+            .child(c)
+            .is_some_and(|child| terminal_id == &child_terminal_id(tab_id, child.stream_id()))
     })
 }
 
@@ -551,7 +581,11 @@ impl TerminalStreams {
         if input.seq <= watermark {
             return InputVerdict::AlreadyApplied { watermark };
         }
-        let verdict = match host.write_terminal_input(&input.terminal_id, &input.data) {
+        let written = match &input.image {
+            Some(image) => host.paste_terminal_image(&input.terminal_id, image),
+            None => host.write_terminal_input(&input.terminal_id, &input.data),
+        };
+        let verdict = match written {
             Written::Ok => InputVerdict::Applied,
             Written::NoSuchTerminal => InputVerdict::UnknownTerminal,
             Written::NotRunning => InputVerdict::TerminalClosed,

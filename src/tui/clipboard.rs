@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::contracts::FileSystem;
+
 /// Copy `text` to the system clipboard (best effort; failures are silent).
 pub fn copy(text: &str) {
     if text.is_empty() {
@@ -68,6 +70,99 @@ pub fn container_image_path(path: &Path, host_dir: &Path, container_dir: &Path) 
     path.strip_prefix(host_dir)
         .ok()
         .map(|relative| container_dir.join(relative))
+}
+
+/// An image a front-end read off its own clipboard, to paste into a terminal
+/// as a file path, as [`save_clipboard_image`] does for the TUI. The desktop
+/// app reads its clipboard through GPUI rather than a platform command, and a
+/// remote window sends the bytes to the host that runs the agent, because the
+/// agent cannot read a clipboard on another machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastedImage {
+    /// The image format, as a file extension (`png`, `jpg`, …).
+    pub format: String,
+    /// The encoded image.
+    pub bytes: Vec<u8>,
+}
+
+/// The largest pasted image saved, in bytes. Well above a Retina screenshot,
+/// and small enough that one travels in a single web-protocol frame (axum's
+/// 16 MiB frame limit, after base64).
+pub const MAX_PASTED_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The extension a pasted image is saved under: its `format` when that is a
+/// raster format agents read, else `None`. An allowlist, because a remote
+/// viewer chooses `format` and it becomes part of a file name.
+pub fn pasted_image_extension(format: &str) -> Option<&'static str> {
+    match format.to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "bmp" => Some("bmp"),
+        "tif" | "tiff" => Some("tiff"),
+        _ => None,
+    }
+}
+
+/// Save `image` in [`image_paste_dir`] and return its path. Refused as
+/// [`check_pasted_image`] refuses, or when the save fails.
+pub fn save_pasted_image(fs: &dyn FileSystem, image: &PastedImage) -> Result<PathBuf, String> {
+    let ext = check_pasted_image(image)?;
+    let path = unique_image_path(ext);
+    fs.create_dir_all(&image_paste_dir())
+        .and_then(|()| fs.write_bytes(&path, &image.bytes))
+        .map_err(|e| format!("The pasted image could not be saved: {e}"))?;
+    Ok(path)
+}
+
+/// The extension `image` is saved under, or the reason a user reads why it
+/// cannot be pasted: it is empty, larger than [`MAX_PASTED_IMAGE_BYTES`] or
+/// not an image format agents read. A remote window checks before it sends.
+pub fn check_pasted_image(image: &PastedImage) -> Result<&'static str, String> {
+    let Some(ext) = pasted_image_extension(&image.format) else {
+        return Err(format!(
+            "A pasted {} image cannot be attached; copy it as PNG or JPEG.",
+            image.format
+        ));
+    };
+    if image.bytes.is_empty() {
+        return Err("The pasted image is empty.".to_string());
+    }
+    if image.bytes.len() > MAX_PASTED_IMAGE_BYTES {
+        return Err(format!(
+            "The pasted image is {} MB; images up to {} MB can be pasted.",
+            image.bytes.len().div_ceil(1024 * 1024),
+            MAX_PASTED_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(ext)
+}
+
+/// What to type into an agent for an image saved at `path`: the path as the
+/// agent sees it (inside a container, the paste directory's mount), quoted
+/// when it could be word-split, and a trailing space so typing can go on.
+/// What a terminal inserts when an image is dragged in, which agents such as
+/// Claude Code recognise and attach.
+pub fn pasted_image_text(path: &Path, containerized: bool) -> String {
+    let path = if containerized {
+        container_image_path(
+            path,
+            &image_paste_dir(),
+            Path::new(crate::runtime::container::IMAGE_PASTE_DIR),
+        )
+        .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let raw = path.to_string_lossy();
+    let mut text = if raw.contains(char::is_whitespace) {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    } else {
+        raw.into_owned()
+    };
+    text.push(' ');
+    text
 }
 
 /// A unique path under the system temp dir for a pasted image, namespaced by pid
@@ -312,8 +407,67 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, container_image_path};
+    use super::{
+        base64_encode, container_image_path, image_paste_dir, pasted_image_extension,
+        pasted_image_text, save_pasted_image, PastedImage, MAX_PASTED_IMAGE_BYTES,
+    };
+    use crate::testing::FakeFs;
     use std::path::Path;
+
+    fn png(bytes: Vec<u8>) -> PastedImage {
+        PastedImage {
+            format: "png".to_string(),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn a_pasted_image_is_saved_in_the_paste_directory() {
+        let fs = FakeFs::new();
+        let path = save_pasted_image(&fs, &png(vec![1, 2, 3])).unwrap();
+        assert!(path.starts_with(image_paste_dir()));
+        assert_eq!(path.extension().unwrap(), "png");
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3]));
+        let other = save_pasted_image(&fs, &png(vec![4])).unwrap();
+        assert_ne!(path, other, "every paste gets its own file");
+    }
+
+    #[test]
+    fn only_image_formats_within_the_size_limit_are_saved() {
+        let fs = FakeFs::new();
+        let refused = |image: PastedImage| save_pasted_image(&fs, &image).unwrap_err();
+        assert!(refused(PastedImage {
+            format: "../../etc/passwd".to_string(),
+            bytes: vec![1],
+        })
+        .contains("cannot be attached"));
+        assert!(refused(png(Vec::new())).contains("empty"));
+        assert!(refused(png(vec![0; MAX_PASTED_IMAGE_BYTES + 1])).contains("up to 10 MB"));
+        assert!(fs.writes().is_empty(), "a refused image writes nothing");
+        assert_eq!(pasted_image_extension("JPEG"), Some("jpg"));
+        assert_eq!(pasted_image_extension("svg"), None);
+    }
+
+    #[test]
+    fn a_pasted_image_types_its_path_quoted_when_needed() {
+        let dir = image_paste_dir();
+        let plain = dir.join("flightdeck-paste-1-0.png");
+        assert_eq!(
+            pasted_image_text(&plain, false),
+            format!("{} ", plain.display())
+        );
+        let spaced = Path::new("/tmp/my shot's.png");
+        assert_eq!(
+            pasted_image_text(spaced, false),
+            "'/tmp/my shot'\\''s.png' "
+        );
+        // In a container, the paste directory's mount.
+        let mapped = pasted_image_text(&plain, true);
+        assert!(
+            mapped.starts_with(crate::runtime::container::IMAGE_PASTE_DIR),
+            "{mapped}"
+        );
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

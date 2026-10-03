@@ -711,12 +711,20 @@ fn dimming_follows_the_setting(app: &mut TestAppContext) {
 
 #[test]
 fn the_scrollbar_shows_only_in_history_and_tracks_the_offset() {
-    use crate::terminal::element::scrollbar_thumb;
+    use crate::terminal::element::scrollbars;
+    use crate::terminal::pan::Pan;
     let track = gpui::Bounds::new(point(px(0.), px(0.)), size(px(400.), px(240.)));
-    assert_eq!(scrollbar_thumb(track, 24, 0, 1000), None, "live screen");
-    assert_eq!(scrollbar_thumb(track, 24, 5, 0), None, "no history");
-    let oldest = scrollbar_thumb(track, 24, 1000, 1000).unwrap();
-    let newer = scrollbar_thumb(track, 24, 10, 1000).unwrap();
+    let fits = Pan::default().viewport((24, 80), (24, 80));
+    let thumb = |offset, history| scrollbars(track, &fits, offset, history).0;
+    assert_eq!(thumb(0, 1000), None, "live screen");
+    assert_eq!(thumb(5, 0), None, "no history");
+    assert_eq!(
+        scrollbars(track, &fits, 10, 1000).1,
+        None,
+        "nothing sideways"
+    );
+    let oldest = thumb(1000, 1000).unwrap();
+    let newer = thumb(10, 1000).unwrap();
     assert_eq!(oldest.origin.y, px(0.), "at the top of the history");
     assert!(newer.origin.y > oldest.origin.y);
     assert!(newer.origin.y + newer.size.height <= px(240.) + px(0.01));
@@ -724,8 +732,25 @@ fn the_scrollbar_shows_only_in_history_and_tracks_the_offset() {
     assert!(oldest.origin.x > px(390.) && oldest.size.width <= px(4.));
     assert!(oldest.size.height >= px(16.));
     // A short history: the thumb is the share of the content on screen.
-    let half = scrollbar_thumb(track, 24, 24, 24).unwrap();
+    let half = thumb(24, 24).unwrap();
     assert_eq!(half.size.height, px(120.));
+}
+
+#[test]
+fn a_grid_larger_than_the_element_always_shows_its_scrollbars() {
+    use crate::terminal::element::scrollbars;
+    use crate::terminal::pan::Pan;
+    let track = gpui::Bounds::new(point(px(0.), px(0.)), size(px(400.), px(240.)));
+    // 48 rows in 24, 160 columns in 80, on the live screen.
+    let view = Pan::default().viewport((48, 160), (24, 80));
+    let (vertical, horizontal) = scrollbars(track, &view, 0, 0);
+    let vertical = vertical.expect("rows are out of view");
+    assert_eq!(vertical.size.height, px(120.), "half the rows show");
+    assert_eq!(vertical.origin.y, px(120.), "the bottom half");
+    let horizontal = horizontal.expect("columns are out of view");
+    assert_eq!(horizontal.size.width, px(200.));
+    assert_eq!(horizontal.origin.x, px(0.), "the left half");
+    assert!(horizontal.origin.y > px(230.), "along the bottom edge");
 }
 
 // --- resize and the web ----------------------------------------------------------
