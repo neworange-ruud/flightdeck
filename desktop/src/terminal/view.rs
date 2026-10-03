@@ -47,7 +47,11 @@
 //!   report per notch, as the TUI sends); otherwise it scrolls the history,
 //!   [`SCROLL_LINES`] per notch as in the TUI, and trackpad pixels accumulate
 //!   into whole lines. On an alternate screen without reporting it does
-//!   nothing, as in the TUI (there is no history there).
+//!   nothing, as in the TUI (there is no history there). A grid larger than
+//!   the element — a remote host's, which this window may not resize — is
+//!   panned first: the wheel reaches its hidden rows before the history, a
+//!   sideways swipe its hidden columns, and a typed key brings the cursor
+//!   back into view (see [`super::pan`]).
 //! - Cmd-C on macOS copies the selection too (release already has). Input —
 //!   a key, a paste — drops the selection and returns to the live screen (the
 //!   host does that for the app; the owned path does it here).
@@ -90,6 +94,7 @@ use super::cadence::Cadence;
 use super::element::{CellMetrics, TerminalElement};
 use super::input;
 use super::layout::{self, CellSpan, TermPalette};
+use super::pan::{self, Pan, Viewport};
 use super::rowcache::RowCache;
 use super::zoom::{TerminalZoom, ZoomChord};
 use crate::host::HostModel;
@@ -160,6 +165,17 @@ pub struct TerminalView {
     scroll_remainder: f32,
     /// Whether that remainder is trackpad lines (else wheel notches).
     scroll_precise: bool,
+    /// Fractional sideways wheel notches (or trackpad columns) not yet acted on.
+    scroll_remainder_x: f32,
+    /// How far a grid larger than the element is panned (see [`super::pan`]),
+    /// for the grid it was panned on: a different terminal on screen starts
+    /// from the bottom-left again.
+    pan: Pan,
+    pan_grid: Option<usize>,
+    /// What the last frame showed of the grid.
+    viewport: Viewport,
+    /// Bring the cursor into view on the next frame (a key was typed).
+    reveal_cursor: bool,
     exited: Option<ProcessState>,
     /// The composition in progress (Host source; the spike types keys).
     ime: ImeState,
@@ -285,6 +301,11 @@ impl TerminalView {
             autoscrolling: false,
             scroll_remainder: 0.0,
             scroll_precise: false,
+            scroll_remainder_x: 0.0,
+            pan: Pan::default(),
+            pan_grid: None,
+            viewport: Viewport::default(),
+            reveal_cursor: false,
             exited: None,
             ime: ImeState::default(),
             window_active: true,
@@ -485,6 +506,42 @@ impl TerminalView {
         &self.focus_handle
     }
 
+    /// What a frame shows of the grid in an element `fit` (rows, cols) cells
+    /// big: all of it when it fits, else the panned part (see [`super::pan`]).
+    /// Records it for the wheel, and keeps the pan within the grid.
+    pub fn frame_viewport(&mut self, fit: (u16, u16), cx: &gpui::App) -> Viewport {
+        let grid = self.with_terminal(cx, |t| {
+            let cursor = t.screen().cursor();
+            (
+                grid_identity(t),
+                t.screen().size(),
+                (cursor.row, cursor.col),
+            )
+        });
+        let Some((identity, size, cursor)) = grid else {
+            self.viewport = Viewport::default();
+            return self.viewport;
+        };
+        if self.pan_grid != Some(identity) {
+            self.pan_grid = Some(identity);
+            self.pan = Pan::default();
+        }
+        let mut view = self.pan.viewport(size, fit);
+        if std::mem::take(&mut self.reveal_cursor) && view.overflows() {
+            self.pan = pan::reveal(&view, cursor);
+            view = self.pan.viewport(size, fit);
+        }
+        self.pan = self.pan.clamped(size, fit);
+        self.viewport = view;
+        view
+    }
+
+    /// What the last frame showed of the grid.
+    #[cfg(test)]
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
     pub fn set_metrics(&mut self, metrics: CellMetrics) {
         self.metrics = Some(metrics);
     }
@@ -574,6 +631,12 @@ impl TerminalView {
     /// Typing shows the cursor at once and holds it for a whole phase, as
     /// terminals do.
     fn input_happened(&mut self, cx: &mut Context<Self>) {
+        // A key brings the cursor back into view on a grid that does not fit
+        // (see [`super::pan`]); the next frame works out the pan.
+        if self.viewport.overflows() {
+            self.reveal_cursor = true;
+            cx.notify();
+        }
         if self.blinking {
             let was_off = !self.blink_on;
             self.start_blink(cx);
@@ -907,13 +970,15 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Which edge `position` is past, if any: above the grid's first row or
-    /// below its last.
+    /// Which edge `position` is past, if any: above the first row on screen
+    /// or below the last (a panned grid has rows past both, see
+    /// [`super::pan`]).
     fn edge(&self, position: Point<Pixels>, cx: &gpui::App) -> Option<Edge> {
         let m = self.metrics?;
-        let (rows, _) = self.with_terminal(cx, |t| t.screen().size())?;
-        let bottom = m.origin.y + m.height * f32::from(rows);
-        if position.y < m.origin.y {
+        self.with_terminal(cx, |_| ())?;
+        let top = m.origin.y + m.height * f32::from(self.viewport.top);
+        let bottom = top + m.height * f32::from(self.viewport.rows);
+        if position.y < top {
             Some(Edge::Top)
         } else if position.y >= bottom {
             Some(Edge::Bottom)
@@ -948,26 +1013,32 @@ impl TerminalView {
             return false;
         };
         let col = self.cell_at(drag.position, cx).map_or(0, |(_, col)| col);
+        // As the wheel: a panned grid's hidden rows come before the history.
+        let (panned, view) = (self.pan, self.viewport);
         let moved = self.with_terminal_mut(cx, |t| {
             let before = t.screen().scrollback();
-            let rows = t.screen().size().0;
-            let edge_row = match edge {
+            let pan = match edge {
                 Edge::Top => {
-                    t.scroll_up(1);
-                    0
+                    let (pan, rest) = pan::scroll_up(panned, &view, 1);
+                    scroll_history(t, true, rest);
+                    pan
                 }
-                Edge::Bottom => {
-                    t.scroll_down(1);
-                    rows.saturating_sub(1)
-                }
+                Edge::Bottom => pan::scroll_down(panned, 1, scroll_history(t, false, 1)),
+            };
+            let top = view.overflow_rows - pan.up.min(view.overflow_rows);
+            let edge_row = match edge {
+                Edge::Top => top,
+                Edge::Bottom => (top + view.rows).saturating_sub(1),
             };
             t.update_selection(edge_row, col);
-            (t.screen().scrollback() != before, edge_row)
+            let scrolled = t.screen().scrollback() != before || pan != panned;
+            (scrolled, edge_row, pan)
         });
-        let Some((scrolled, edge_row)) = moved else {
+        let Some((scrolled, edge_row, pan)) = moved else {
             self.autoscrolling = false;
             return false;
         };
+        self.pan = pan;
         if scrolled || drag.cell != (edge_row, col) {
             self.drag = Some(Drag {
                 cell: (edge_row, col),
@@ -982,6 +1053,7 @@ impl TerminalView {
         let Some(metrics) = self.metrics else {
             return;
         };
+        self.scroll_sideways(event, metrics, cx);
         // In notches for a wheel, in lines of this terminal for a trackpad's
         // pixels; either way, whole units are acted on and the rest is kept.
         let (units, per_notch, precise) = match event.delta {
@@ -993,6 +1065,7 @@ impl TerminalView {
         if self.scroll_precise != precise {
             self.scroll_precise = precise;
             self.scroll_remainder = 0.0;
+            self.scroll_remainder_x = 0.0;
         }
         self.scroll_remainder += units;
         let whole = self.scroll_remainder.trunc();
@@ -1015,21 +1088,66 @@ impl TerminalView {
             }
             return;
         }
-        // The history (nothing to scroll on an alternate screen, as in the TUI).
+        // The rows of a grid taller than the element, then the history (there
+        // is none on an alternate screen, as in the TUI). See [`super::pan`].
         let lines = count * per_notch;
-        let moved = self.with_terminal_mut(cx, |t| {
-            let before = t.screen().scrollback();
-            if up {
-                t.scroll_up(lines);
-            } else {
-                t.scroll_down(lines);
-            }
-            t.screen().scrollback() != before
-        });
-        if moved == Some(true) {
+        let before = self.pan;
+        let moved = if up {
+            let (pan, rest) = pan::scroll_up(self.pan, &self.viewport, lines);
+            self.pan = pan;
+            rest > 0 && self.with_terminal_mut(cx, |t| scroll_history(t, true, rest)) > Some(0)
+        } else {
+            let left = self
+                .with_terminal_mut(cx, |t| scroll_history(t, false, lines))
+                .unwrap_or(0);
+            self.pan = pan::scroll_down(self.pan, lines, left);
+            left > 0
+        };
+        if moved || self.pan != before {
             cx.notify();
         }
     }
+
+    /// The wheel's sideways part pans a grid wider than the element (a
+    /// trackpad swipe, or Shift-wheel where the platform turns it sideways).
+    fn scroll_sideways(
+        &mut self,
+        event: &ScrollWheelEvent,
+        metrics: CellMetrics,
+        cx: &mut Context<Self>,
+    ) {
+        if self.viewport.overflow_cols == 0 {
+            self.scroll_remainder_x = 0.0;
+            return;
+        }
+        let columns = match event.delta {
+            ScrollDelta::Lines(lines) => lines.x * SCROLL_LINES as f32,
+            ScrollDelta::Pixels(pixels) => pixels.x / metrics.width,
+        };
+        self.scroll_remainder_x += columns;
+        let whole = self.scroll_remainder_x.trunc();
+        if whole == 0.0 {
+            return;
+        }
+        self.scroll_remainder_x -= whole;
+        // A positive delta moves the content right: the view goes left.
+        let pan = pan::scroll_sideways(self.pan, &self.viewport, -(whole as i32));
+        if pan != self.pan {
+            self.pan = pan;
+            cx.notify();
+        }
+    }
+}
+
+/// Scroll `t`'s history `lines` up or down; how many lines it moved.
+fn scroll_history(t: &mut Terminal, up: bool, lines: usize) -> usize {
+    let before = t.screen().scrollback();
+    if up {
+        t.scroll_up(lines);
+    } else {
+        t.scroll_down(lines);
+    }
+    t.screen().scrollback().abs_diff(before)
 }
 
 /// Which grid a row cache was built from: the address of the terminal's

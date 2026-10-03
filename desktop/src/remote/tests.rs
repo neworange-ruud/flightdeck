@@ -114,6 +114,20 @@ fn snapshot() -> Snapshot {
 }
 
 fn open(app: &mut TestAppContext) -> (Entity<RemoteModel>, Script, &mut VisualTestContext) {
+    let (model, script, _, cx) = open_on(app, snapshot());
+    (model, script, cx)
+}
+
+/// [`open`] from `snapshot`, with the window's view.
+fn open_on(
+    app: &mut TestAppContext,
+    snapshot: Snapshot,
+) -> (
+    Entity<RemoteModel>,
+    Script,
+    Entity<RemoteWindow>,
+    &mut VisualTestContext,
+) {
     app.update(|cx| {
         gpui_component::init(cx);
         crate::theme::init(cx);
@@ -121,7 +135,7 @@ fn open(app: &mut TestAppContext) -> (Entity<RemoteModel>, Script, &mut VisualTe
         flightdeck_desktop::overlays::register(cx, crate::commands::keymap());
     });
     let (client, script) = RemoteClient::scripted();
-    script.snapshot(snapshot());
+    script.snapshot(snapshot);
     let model = app.new(|_| {
         RemoteModel::new(
             client,
@@ -130,12 +144,19 @@ fn open(app: &mut TestAppContext) -> (Entity<RemoteModel>, Script, &mut VisualTe
         )
     });
     let for_window = model.clone();
+    let window_view = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = window_view.clone();
     let (_root, cx) = app.add_window_view(|window, cx| {
         let view = cx.new(|cx| RemoteWindow::new(for_window, cx));
+        *slot.borrow_mut() = Some(view.clone());
         Root::new(view, window, cx)
     });
     turn(&model, cx);
-    (model, script, cx)
+    let window_view = window_view
+        .borrow_mut()
+        .take()
+        .expect("the window was built");
+    (model, script, window_view, cx)
 }
 
 fn turn(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) {
@@ -704,4 +725,91 @@ fn a_revoked_link_offers_to_pair_again(app: &mut TestAppContext) {
     script.send(LinkEvent::State(LinkState::Ended(LinkEnd::Revoked)));
     turn(&model, cx);
     assert!(cx.debug_bounds("remote-pair-again").is_some());
+}
+
+// --- a host grid larger than the window (D4, R17) ----------------------------
+
+#[gpui::test]
+fn a_host_grid_larger_than_the_window_pans_instead_of_clipping(app: &mut TestAppContext) {
+    use gpui::{point, ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    let mut big = snapshot();
+    for session in &mut big.projects[0].sessions {
+        for terminal in &mut session.terminals {
+            terminal.geometry = Geometry {
+                cols: 400,
+                rows: 200,
+            };
+        }
+    }
+    let (model, script, window, cx) = open_on(app, big);
+    let text: String = (1..=260).map(|n| format!("line {n}\r\n")).collect();
+    script.send(LinkEvent::Bytes(TermBytes::live(
+        "s2:primary".into(),
+        0,
+        text.into_bytes(),
+    )));
+    model.update(cx, |m, _| {
+        m.focus_terminal(flightdeck::view::TerminalRef::Primary)
+    });
+    turn(&model, cx);
+    let view = window.read_with(cx, |w, _| w.terminal_view());
+    let state = |cx: &mut VisualTestContext| {
+        let viewport = view.read_with(cx, |v, _| v.viewport());
+        let history = model.read_with(cx, |m, _| {
+            m.active_terminal().map_or(0, |t| t.screen().scrollback())
+        });
+        (viewport, history)
+    };
+
+    // The newest rows first: the grid's bottom, with its top out of view.
+    let (viewport, _) = state(cx);
+    assert!(
+        viewport.overflow_rows > 0,
+        "the test window is shorter than 200 rows"
+    );
+    assert!(viewport.overflow_cols > 0, "and narrower than 400 columns");
+    assert_eq!(viewport.top + viewport.rows, 200, "anchored to the bottom");
+    assert_eq!(viewport.left, 0);
+
+    let m = view.read_with(cx, |v, _| v.metrics().unwrap());
+    let inside = point(
+        m.origin.x + m.width * f32::from(viewport.left + 2),
+        m.origin.y + m.height * f32::from(viewport.top + 2),
+    );
+    let wheel = |cx: &mut VisualTestContext, x: f32, y: f32| {
+        cx.simulate_event(ScrollWheelEvent {
+            position: inside,
+            delta: ScrollDelta::Lines(point(x, y)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+    };
+
+    // A notch up pans three rows towards the grid's top, not into history.
+    wheel(cx, 0., 1.);
+    let (after, history) = state(cx);
+    assert_eq!(after.top, viewport.top - 3);
+    assert_eq!(history, 0);
+    // Far enough up, the grid's top shows and then the history does.
+    wheel(cx, 0., 200.);
+    let (after, history) = state(cx);
+    assert_eq!(after.top, 0);
+    assert!(history > 0, "past the grid's top is the history");
+    // Down again: out of the history first, then back to the bottom.
+    wheel(cx, 0., -500.);
+    let (after, history) = state(cx);
+    assert_eq!((after.top, history), (viewport.top, 0));
+    // Sideways pans the columns.
+    wheel(cx, -2., 0.);
+    let (after, _) = state(cx);
+    assert_eq!(after.left, 6);
+
+    // Typing brings the cursor (column 0 of the last row) back into view.
+    wheel(cx, 0., 5.);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let (after, _) = state(cx);
+    assert_eq!((after.top, after.left), (viewport.top, 0));
 }

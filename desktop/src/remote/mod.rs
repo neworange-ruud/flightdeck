@@ -26,7 +26,9 @@
 //! Every terminal the host streams is mirrored into a core [`Terminal`] over a
 //! [`flightdeck::web::client::StreamPty`], on the app's own alacritty profile,
 //! sized to the host's grid (the host owns geometry, D4). So the existing
-//! terminal element draws a remote terminal unchanged. Its emulator never
+//! terminal element draws a remote terminal unchanged; when that grid is
+//! larger than this window, the element pans over it rather than clipping it
+//! (R17, see `crate::terminal::pan`). Its emulator never
 //! answers queries — the host's already did ([`Terminal::mirror`]).
 
 use std::collections::HashMap;
