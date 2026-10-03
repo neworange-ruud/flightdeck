@@ -14,14 +14,25 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.3.0] - 2026-10-03
+
+### New features
+
 - **Paste images into an agent.** Cmd-V (Ctrl-V) with an image on the
   clipboard and no text, such as a screenshot, saves the image and types its
   path, which Claude Code and other agents attach. In a remote window the image
   goes to the host, where the agent runs. Text on the clipboard still wins.
 
-### Improvements
-
-- None yet.
 
 ### Bug fixes
 
