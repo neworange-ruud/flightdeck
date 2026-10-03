@@ -64,6 +64,10 @@ impl FileSystem for RealFs {
         })
     }
 
+    fn write_bytes(&self, p: &Path, contents: &[u8]) -> Result<()> {
+        fs::write(p, contents).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
+    }
+
     fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
         #[cfg(unix)]
         let r = std::os::unix::fs::symlink(target, link);

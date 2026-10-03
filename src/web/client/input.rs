@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::web::protocol::{AckOutcome, ClientMsg, Command, Input, TerminalId};
+use crate::web::protocol::{AckOutcome, ClientMsg, Command, ImagePaste, Input, TerminalId};
 
 /// One keystroke burst waiting for its ack.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +23,8 @@ struct Held {
     seq: u64,
     terminal_id: TerminalId,
     data: Vec<u8>,
+    /// A pasted image, which the host types as a path instead of `data`.
+    image: Option<ImagePaste>,
 }
 
 /// The queue and its sequence counter.
@@ -59,11 +61,27 @@ impl InputQueue {
     /// Queue keystrokes for `terminal_id`. Returns the frame to send now when
     /// the link is live; otherwise the bytes wait for the next snapshot.
     pub fn push(&mut self, terminal_id: TerminalId, data: Vec<u8>) -> Option<ClientMsg> {
+        self.hold(terminal_id, data, None)
+    }
+
+    /// Queue a pasted image for `terminal_id`, held and replayed exactly like
+    /// keystrokes: a paste is input, in order with the keys around it.
+    pub fn push_image(&mut self, terminal_id: TerminalId, image: ImagePaste) -> Option<ClientMsg> {
+        self.hold(terminal_id, Vec::new(), Some(image))
+    }
+
+    fn hold(
+        &mut self,
+        terminal_id: TerminalId,
+        data: Vec<u8>,
+        image: Option<ImagePaste>,
+    ) -> Option<ClientMsg> {
         self.seq += 1;
         let held = Held {
             seq: self.seq,
             terminal_id,
             data,
+            image,
         };
         let frame = self.live.then(|| input_frame(&held));
         self.held.push_back(held);
@@ -142,6 +160,7 @@ fn input_frame(held: &Held) -> ClientMsg {
         seq: held.seq,
         terminal_id: held.terminal_id.clone(),
         data: held.data.clone(),
+        image: held.image.clone(),
     })
 }
 

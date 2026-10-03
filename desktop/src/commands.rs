@@ -5,13 +5,15 @@
 //! The mapping ([`intent_for`]) is the TUI's own: `Action::Dispatch(cmd)` is
 //! `HostEvent::Command(cmd)` (a command with an empty payload opens its
 //! prompt, as in the TUI), project switching and the overlays are their
-//! `HostEvent`s, and Paste reads the system clipboard first.
+//! `HostEvent`s, and Paste reads the system clipboard first: its text, or
+//! the image on it when there is no text.
 
 use flightdeck::app::keymap::{Action, Chord, Key, Keymap, KeymapEntry, Mods};
 use flightdeck::host::HostEvent;
+use flightdeck::tui::clipboard::PastedImage;
 use flightdeck::tui::platform;
 use flightdeck::view::HintAction;
-use gpui::{App, Entity};
+use gpui::{App, ClipboardEntry, ClipboardItem, Entity};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::host::HostModel;
@@ -54,7 +56,8 @@ pub fn disabled_in(entry: &KeymapEntry, isolated: bool) -> bool {
 pub enum Intent {
     /// Hand this to the host.
     Host(HostEvent),
-    /// Read the system clipboard and hand it over as `HostEvent::Paste`.
+    /// Read the system clipboard and hand it over: its text as
+    /// `HostEvent::Paste`, else an image on it as `HostEvent::PasteImage`.
     PasteClipboard,
     /// Switch Projects ⇄ Mission control: the desktop's own view state
     /// (`crate::views::mission::toggle_view`), no host event.
@@ -83,12 +86,29 @@ pub fn perform_entry(entry: &KeymapEntry, host: &Entity<HostModel>, cx: &mut App
         Intent::Host(event) => host.update(cx, |model, cx| model.dispatch(event, cx)),
         Intent::ToggleMainView => crate::views::mission::toggle_view(host, cx),
         Intent::PasteClipboard => {
-            let text = cx.read_from_clipboard().and_then(|item| item.text());
-            if let Some(text) = text {
-                host.update(cx, |model, cx| model.dispatch(HostEvent::Paste(text), cx));
+            if let Some(event) = clipboard_paste(cx.read_from_clipboard()) {
+                host.update(cx, |model, cx| model.dispatch(event, cx));
             }
         }
     }
+}
+
+/// What pasting `item` hands over: its text, as always; with no text, the
+/// first image on it, which the host saves and types as a path (a
+/// screenshot copied to the clipboard has only an image). Text wins when both
+/// are there: a spreadsheet's copied cells carry a picture of themselves too.
+pub fn clipboard_paste(item: Option<ClipboardItem>) -> Option<HostEvent> {
+    let item = item?;
+    if let Some(text) = item.text() {
+        return Some(HostEvent::Paste(text));
+    }
+    item.into_entries().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(HostEvent::PasteImage(PastedImage {
+            format: image.format.extension().to_string(),
+            bytes: image.bytes,
+        })),
+        _ => None,
+    })
 }
 
 /// Perform the entry with this id. A missing id is a programming error in a
@@ -107,9 +127,8 @@ pub fn perform_remote_entry(entry: &KeymapEntry, remote: &Entity<RemoteModel>, c
         Intent::Host(event) => remote.update(cx, |model, cx| model.dispatch(event, cx)),
         Intent::ToggleMainView => {}
         Intent::PasteClipboard => {
-            let text = cx.read_from_clipboard().and_then(|item| item.text());
-            if let Some(text) = text {
-                remote.update(cx, |model, cx| model.dispatch(HostEvent::Paste(text), cx));
+            if let Some(event) = clipboard_paste(cx.read_from_clipboard()) {
+                remote.update(cx, |model, cx| model.dispatch(event, cx));
             }
         }
     }
@@ -174,6 +193,43 @@ pub fn keycap_text(chord: Chord) -> String {
 mod tests {
     use super::*;
     use flightdeck::app::commands::{Command, Selector};
+    use gpui::{ClipboardString, Image, ImageFormat};
+
+    fn image(format: ImageFormat, bytes: Vec<u8>) -> ClipboardEntry {
+        ClipboardEntry::Image(Image::from_bytes(format, bytes))
+    }
+
+    #[test]
+    fn a_paste_takes_the_text_and_else_the_image() {
+        assert_eq!(clipboard_paste(None), None);
+        let text = ClipboardItem::new_string("ls".to_string());
+        assert_eq!(
+            clipboard_paste(Some(text)),
+            Some(HostEvent::Paste("ls".to_string()))
+        );
+        // A screenshot: an image and nothing else.
+        let shot = ClipboardItem {
+            entries: vec![image(ImageFormat::Png, vec![1, 2])],
+        };
+        assert_eq!(
+            clipboard_paste(Some(shot)),
+            Some(HostEvent::PasteImage(PastedImage {
+                format: "png".to_string(),
+                bytes: vec![1, 2],
+            }))
+        );
+        // Copied cells: their text, not the picture of them.
+        let cells = ClipboardItem {
+            entries: vec![
+                image(ImageFormat::Png, vec![1]),
+                ClipboardEntry::String(ClipboardString::new("a\tb".to_string())),
+            ],
+        };
+        assert_eq!(
+            clipboard_paste(Some(cells)),
+            Some(HostEvent::Paste("a\tb".to_string()))
+        );
+    }
 
     #[test]
     fn every_entry_maps_to_the_tui_meaning() {

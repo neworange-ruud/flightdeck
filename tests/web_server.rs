@@ -881,6 +881,7 @@ fn revoking_one_credential_evicts_its_live_sockets_and_leaves_the_others_alone()
                 seq: 91,
                 terminal_id: "t-agent".into(),
                 data: b"rm -rf /\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -922,6 +923,7 @@ fn revoking_one_credential_evicts_its_live_sockets_and_leaves_the_others_alone()
                 seq: 77,
                 terminal_id: "t-agent".into(),
                 data: b"echo still here\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -1045,6 +1047,7 @@ fn a_numbered_row_revokes_the_browser_it_names_and_leaves_the_other_typing() {
                 seq: 55,
                 terminal_id: "t-agent".into(),
                 data: b"echo still here\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -1289,6 +1292,7 @@ fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
                 seq: 1,
                 terminal_id: "t1".into(),
                 data: b"hel".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -1302,6 +1306,7 @@ fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
                 seq: 1,
                 terminal_id: "t1".into(),
                 data: b"wor".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -1414,6 +1419,7 @@ fn a_second_writer_is_seated_refused_by_name_and_can_take_the_turn() {
                 seq: 2,
                 terminal_id: "t1".into(),
                 data: b"lo".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -1636,6 +1642,7 @@ fn the_controllers_input_reaches_the_host_seam() {
                 seq: 11,
                 terminal_id: "t-agent".into(),
                 data: b"echo hi\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2302,6 +2309,7 @@ fn a_controller_and_an_observer_both_see_bytes_but_only_one_types() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-1"),
                 data: b"rm -rf /\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2323,6 +2331,7 @@ fn a_controller_and_an_observer_both_see_bytes_but_only_one_types() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-1"),
                 data: b"ls\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2483,6 +2492,7 @@ fn input_reaches_the_terminal_it_names_and_no_other() {
                 seq: 1,
                 terminal_id: shell_id.clone(),
                 data: b"pwd\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2531,6 +2541,7 @@ async fn type_token(
                 seq: seq_base + offset as u64,
                 terminal_id: terminal.clone(),
                 data: vec![*byte],
+                image: None,
             }),
         )
         .await;
@@ -2688,6 +2699,7 @@ fn input_held_across_a_reconnect_arrives_in_order_exactly_once() {
                     seq,
                     terminal_id: terminal.clone(),
                     data: data.to_vec(),
+                    image: None,
                 }),
             )
             .await;
@@ -2745,6 +2757,7 @@ fn input_held_across_a_reconnect_arrives_in_order_exactly_once() {
                     seq,
                     terminal_id: terminal.clone(),
                     data,
+                    image: None,
                 }),
             )
             .await;
@@ -2800,6 +2813,7 @@ fn input_for_a_terminal_the_host_does_not_have_is_refused_out_loud() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-that-was-closed"),
                 data: b"still here?\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2823,6 +2837,7 @@ fn input_for_a_terminal_the_host_does_not_have_is_refused_out_loud() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-1"),
                 data: b"retry\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2859,6 +2874,7 @@ fn input_for_an_exited_terminal_is_refused_with_the_accurate_reason() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-1"),
                 data: b"anyone there?\r".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -2934,6 +2950,7 @@ fn a_resize_frame_never_resizes_a_pty() {
                 seq: 1,
                 terminal_id: primary_terminal_id("tab-1"),
                 data: b"x".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -3906,6 +3923,7 @@ fn a_writer_can_take_the_input_lock_by_name() {
                 seq: 1,
                 terminal_id: "t1".into(),
                 data: b"a".to_vec(),
+                image: None,
             }),
         )
         .await;
@@ -3937,6 +3955,7 @@ fn a_writer_can_take_the_input_lock_by_name() {
                 seq: 2,
                 terminal_id: "t1".into(),
                 data: b"b".to_vec(),
+                image: None,
             }),
         )
         .await;

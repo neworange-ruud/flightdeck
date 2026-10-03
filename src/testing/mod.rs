@@ -50,6 +50,8 @@ impl Drop for FakeLockGuard {
 #[derive(Debug, Default)]
 struct FakeFsState {
     files: BTreeMap<PathBuf, String>,
+    /// Files written as raw bytes ([`FileSystem::write_bytes`]).
+    blobs: BTreeMap<PathBuf, Vec<u8>>,
     dirs: HashSet<PathBuf>,
     /// Symlinks as `link -> target`.
     symlinks: BTreeMap<PathBuf, PathBuf>,
@@ -93,6 +95,11 @@ impl FakeFs {
         self.inner.lock().unwrap().files.get(path).cloned()
     }
 
+    /// The bytes of a file written with [`FileSystem::write_bytes`], if any.
+    pub fn file_bytes(&self, path: &Path) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().blobs.get(path).cloned()
+    }
+
     /// All file paths currently present, sorted.
     pub fn files(&self) -> Vec<PathBuf> {
         self.inner.lock().unwrap().files.keys().cloned().collect()
@@ -132,7 +139,10 @@ fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
 impl FileSystem for FakeFs {
     fn exists(&self, p: &Path) -> bool {
         let st = self.inner.lock().unwrap();
-        st.files.contains_key(p) || st.dirs.contains(p) || st.symlinks.contains_key(p)
+        st.files.contains_key(p)
+            || st.blobs.contains_key(p)
+            || st.dirs.contains(p)
+            || st.symlinks.contains_key(p)
     }
 
     fn is_dir(&self, p: &Path) -> bool {
@@ -162,6 +172,14 @@ impl FileSystem for FakeFs {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);
         st.files.insert(p.to_path_buf(), contents.to_string());
+        st.writes.push(p.to_path_buf());
+        Ok(())
+    }
+
+    fn write_bytes(&self, p: &Path, contents: &[u8]) -> Result<()> {
+        let mut st = self.inner.lock().unwrap();
+        mark_parents(&mut st.dirs, p);
+        st.blobs.insert(p.to_path_buf(), contents.to_vec());
         st.writes.push(p.to_path_buf());
         Ok(())
     }

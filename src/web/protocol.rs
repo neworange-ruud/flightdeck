@@ -81,6 +81,7 @@
 //! | [`SeatRequest`], [`Seat`], [`SeatInfo`], [`Delta::Seats`] | D14 as revised — N writers + N observers, the input lock, takeover, read-only watch |
 //! | [`ShutdownReason`], `self_initiated` | Q5 — deliberate quit vs network failure, and "I asked for this" |
 //! | [`Input::seq`], [`Ack`], [`Snapshot::last_input_seq`] | turn 2 §5.1 — input is queued, never dropped, never reordered, never doubled |
+//! | [`Input::image`], [`ImagePaste`] | a viewer's clipboard image, which the agent on the host cannot read: saved there and typed as a path, as the TUI's paste key does (additive, rule 4) |
 //! | [`Delta::Status`], [`Delta::Git`], [`Delta::Activity`] | D11 activity feed, and the live sidebar/git bar |
 //! | [`Delta::DialogOpened`] + [`DialogOrigin`] | D13 — shared dialogs carry who opened them |
 //! | [`Command`] (name + free-form args) | D13/D8 — the M2 door: palette, dialogs, git commands |
@@ -2297,6 +2298,27 @@ pub struct Input {
     /// [`ErrorCode::SeatHeld`], and an observer [`AckOutcome::Ignored`]; in
     /// neither case do these bytes reach a PTY, and in neither case do they
     /// vanish unremarked.
+    #[serde(with = "b64")]
+    pub data: Vec<u8>,
+    /// An image pasted into the terminal from the viewer's clipboard, which
+    /// the agent on the host cannot read. The host saves it in its paste
+    /// directory and writes the file's path to the terminal **instead of**
+    /// `data`, on the same seat, lock and seq terms as any keystroke.
+    ///
+    /// Additive under rule 4, not a version bump: a host without it ignores
+    /// the field and writes `data`, which a sender leaves empty, so the paste
+    /// does nothing there rather than typing something else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImagePaste>,
+}
+
+/// An image pasted into a terminal ([`Input::image`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePaste {
+    /// The image format as a file extension (`png`, `jpg`, …). The host saves
+    /// only the raster formats it allows and refuses the rest.
+    pub format: String,
+    /// The encoded image. Base64 on the wire.
     #[serde(with = "b64")]
     pub data: Vec<u8>,
 }

@@ -813,3 +813,63 @@ fn a_host_grid_larger_than_the_window_pans_instead_of_clipping(app: &mut TestApp
     let (after, _) = state(cx);
     assert_eq!((after.top, after.left), (viewport.top, 0));
 }
+
+// --- pasting an image -----------------------------------------------------------
+
+#[gpui::test]
+fn a_pasted_image_goes_to_the_host_with_the_input(app: &mut TestAppContext) {
+    use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat};
+
+    let (model, mut script, cx) = open(app);
+    model.update(cx, |m, _| {
+        m.focus_terminal(flightdeck::view::TerminalRef::Primary)
+    });
+    script.sent();
+    let shot = |bytes: Vec<u8>| ClipboardItem {
+        entries: vec![ClipboardEntry::Image(Image::from_bytes(
+            ImageFormat::Png,
+            bytes,
+        ))],
+    };
+    let paste = |cx: &mut VisualTestContext| {
+        let model = model.clone();
+        cx.update(|_, cx| crate::commands::perform_remote_id("Paste", &model, cx));
+        cx.run_until_parked();
+    };
+
+    cx.update(|_, cx| cx.write_to_clipboard(shot(vec![0x89, b'P'])));
+    paste(cx);
+    let inputs: Vec<_> = script
+        .sent()
+        .into_iter()
+        .filter_map(LinkOut::into_frame)
+        .filter_map(|frame| match frame {
+            ClientMsg::Input(i) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].terminal_id.as_str(), "s2:primary");
+    assert!(inputs[0].data.is_empty(), "an older host types nothing");
+    let image = inputs[0].image.as_ref().expect("the image rides the input");
+    assert_eq!(
+        (image.format.as_str(), &image.data[..]),
+        ("png", &[0x89, b'P'][..])
+    );
+
+    // One the host would refuse never leaves this machine, and says why.
+    let too_big = flightdeck::tui::clipboard::MAX_PASTED_IMAGE_BYTES + 1;
+    cx.update(|_, cx| cx.write_to_clipboard(shot(vec![0; too_big])));
+    paste(cx);
+    assert!(script
+        .sent()
+        .into_iter()
+        .filter_map(LinkOut::into_frame)
+        .next()
+        .is_none());
+    let message = model.read_with(cx, |m, _| match m.overlay() {
+        Some(OverlayView::Message(view)) => view.text,
+        _ => String::new(),
+    });
+    assert!(message.contains("up to 10 MB"), "{message:?}");
+}

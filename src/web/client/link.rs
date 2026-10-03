@@ -35,9 +35,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::web::protocol::{
-    Ack, Attach, ClientInfo, ClientMsg, ConfigView, Delta, ErrorCode, GitStatusView, SeatRequest,
-    ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId, WireError,
-    PROTOCOL_VERSION,
+    Ack, Attach, ClientInfo, ClientMsg, ConfigView, Delta, ErrorCode, GitStatusView, ImagePaste,
+    SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId,
+    WireError, PROTOCOL_VERSION,
 };
 use crate::web::server::COOKIE_NAME;
 
@@ -191,6 +191,14 @@ impl Outbound {
         // The lock is held across the send so channel order is seq order.
         let mut queue = self.lock();
         if let Some(frame) = queue.push(terminal_id, data) {
+            let _ = self.tx.send(LinkOut::Frame(frame));
+        }
+    }
+
+    /// A pasted image for `terminal_id`, held and replayed like keystrokes.
+    pub fn input_image(&self, terminal_id: TerminalId, image: ImagePaste) {
+        let mut queue = self.lock();
+        if let Some(frame) = queue.push_image(terminal_id, image) {
             let _ = self.tx.send(LinkOut::Frame(frame));
         }
     }

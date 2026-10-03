@@ -7,7 +7,7 @@
 //! itself is exercised in `tests/web_server.rs`.
 
 use super::*;
-use crate::web::protocol::AckOutcome;
+use crate::web::protocol::{AckOutcome, ImagePaste};
 
 // ---------------------------------------------------------------------------
 // A recording host
@@ -16,7 +16,7 @@ use crate::web::protocol::AckOutcome;
 /// A [`TerminalHost`] that records what it was asked to write and answers per a
 /// scripted per-terminal outcome.
 ///
-/// Note what it cannot record: a resize. [`TerminalHost`] has one method. The
+/// Note what it cannot record: a resize. [`TerminalHost`] has no such method. The
 /// integration test proves the same thing against a real PTY seam that *does*
 /// count resizes.
 #[derive(Default)]
@@ -60,6 +60,7 @@ fn input(seq: u64, terminal: &str, data: &[u8]) -> Input {
         seq,
         terminal_id: TerminalId::new(terminal),
         data: data.to_vec(),
+        image: None,
     }
 }
 
@@ -380,6 +381,61 @@ fn a_replayed_keystroke_is_ignored_rather_than_typed_twice() {
         "the duplicate must not reach the PTY"
     );
     assert_eq!(streams.watermark(&v), 2);
+}
+
+/// A pasted image goes to the host's paste path instead of `data`, and moves
+/// the watermark like any keystroke once it lands.
+#[test]
+fn a_pasted_image_is_handed_to_the_host_instead_of_the_data() {
+    struct Pasting(Vec<(TerminalId, ImagePaste)>);
+    impl TerminalHost for Pasting {
+        fn write_terminal_input(&mut self, _: &TerminalId, _: &[u8]) -> Written {
+            panic!("an image input must not write its data");
+        }
+        fn paste_terminal_image(&mut self, id: &TerminalId, image: &ImagePaste) -> Written {
+            self.0.push((id.clone(), image.clone()));
+            Written::Ok
+        }
+    }
+    let image = ImagePaste {
+        format: "png".to_string(),
+        data: vec![1, 2, 3],
+    };
+    let mut frame = input(1, "tab:primary", b"");
+    frame.image = Some(image.clone());
+    let mut streams = TerminalStreams::new(1024);
+    let mut host = Pasting(Vec::new());
+    let v = viewer("v1");
+
+    assert_eq!(
+        streams.apply_input(&v, &frame, &mut host),
+        InputVerdict::Applied
+    );
+    assert_eq!(host.0, vec![(TerminalId::new("tab:primary"), image)]);
+    assert_eq!(streams.watermark(&v), 1);
+}
+
+/// A host that keeps no paste directory refuses an image, and the refusal is
+/// re-sendable: the watermark does not move.
+#[test]
+fn a_host_without_image_paste_refuses_it() {
+    let mut frame = input(1, "tab:primary", b"");
+    frame.image = Some(ImagePaste {
+        format: "png".to_string(),
+        data: vec![1],
+    });
+    let mut streams = TerminalStreams::new(1024);
+    let mut host = RecordingHost::with("tab:primary", Written::Ok);
+    let v = viewer("v1");
+
+    let verdict = streams.apply_input(&v, &frame, &mut host);
+    assert!(
+        matches!(verdict, InputVerdict::WriteFailed(_)),
+        "{verdict:?}"
+    );
+    assert_eq!(verdict.ack(1).outcome, AckOutcome::Rejected);
+    assert!(host.written_to("tab:primary").is_empty());
+    assert_eq!(streams.watermark(&v), 0);
 }
 
 /// A frame that arrives *after* a higher seq already landed cannot be written:

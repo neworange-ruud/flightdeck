@@ -123,6 +123,9 @@ pub trait FileSystem {
     fn read_to_string(&self, p: &Path) -> Result<String>;
     /// Write (truncating) a file.
     fn write(&self, p: &Path, contents: &str) -> Result<()>;
+    /// Write (truncating) a file of raw bytes: a pasted image, which is not
+    /// text.
+    fn write_bytes(&self, p: &Path, contents: &[u8]) -> Result<()>;
     /// Create a symbolic link at `link` pointing to `target`. Used to share the
     /// base folder's `.env`/`.env.local` into a new worktree without copying.
     fn symlink(&self, target: &Path, link: &Path) -> Result<()>;

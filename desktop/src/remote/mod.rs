@@ -42,6 +42,7 @@ use flightdeck::host::{
     GitStatusView, HostEvent, MessageView, OverlayInput, OverlayKey, OverlayView,
 };
 use flightdeck::terminal::session::{Terminal, TerminalKind};
+use flightdeck::tui::clipboard::{check_pasted_image, PastedImage};
 use flightdeck::tui::palette::FrontEndAction;
 use flightdeck::view::TerminalRef;
 use flightdeck::web::client::store::SavedRemote;
@@ -49,7 +50,7 @@ use flightdeck::web::client::views::{self, DialogDraft, LocalAction, RemoteActio
 use flightdeck::web::client::{user_agent, LinkConfig};
 use flightdeck::web::client::{LinkEnd, LinkState, RemoteClient, RemoteWorkspace};
 use flightdeck::web::protocol::{
-    AckOutcome, ErrorCode, Geometry, ProjectId, SeatRequest, TerminalId, TerminalRole,
+    AckOutcome, ErrorCode, Geometry, ImagePaste, ProjectId, SeatRequest, TerminalId, TerminalRole,
 };
 use gpui::{App, AppContext, Context, Task};
 
@@ -374,7 +375,10 @@ impl RemoteModel {
     pub fn dispatch(&mut self, event: HostEvent, cx: &mut Context<Self>) {
         #[cfg(test)]
         self.dispatched.push(event.clone());
-        if matches!(event, HostEvent::TerminalInput(_) | HostEvent::Paste(_)) {
+        if matches!(
+            event,
+            HostEvent::TerminalInput(_) | HostEvent::Paste(_) | HostEvent::PasteImage(_)
+        ) {
             self.cadence.input(Instant::now());
             if self._ticker.is_some() {
                 self.start_ticking(cx);
@@ -396,6 +400,7 @@ impl RemoteModel {
                 let bracketed = self.active_terminal().is_some_and(|t| t.bracketed_paste());
                 self.type_bytes(encode_paste(&text, bracketed));
             }
+            HostEvent::PasteImage(image) => self.paste_image(image),
             HostEvent::Command(command) => {
                 let route = views::route_command(&command).unwrap_or(RemoteAction::Unavailable(
                     "The host does not offer this command to a remote window.",
@@ -447,6 +452,36 @@ impl RemoteModel {
             mirror.terminal.scroll_to_bottom();
         }
         self.client.outbound().input(id, bytes);
+    }
+
+    /// Send a pasted image to the host, which saves it and types its path:
+    /// the agent runs there and cannot read this machine's clipboard. One the
+    /// host would refuse is refused here, before it costs a frame — a frame
+    /// past the server's size limit would drop the link.
+    fn paste_image(&mut self, image: PastedImage) {
+        if self.mode != InputMode::Terminal {
+            return;
+        }
+        let Some(id) = self
+            .workspace()
+            .selected_terminal()
+            .map(|t| t.terminal_id.clone())
+        else {
+            return;
+        };
+        if let Err(reason) = check_pasted_image(&image) {
+            self.local = Local::Message(reason);
+            return;
+        }
+        if let Some(mirror) = self.terminals.get_mut(&id) {
+            mirror.terminal.clear_selection();
+            mirror.terminal.scroll_to_bottom();
+        }
+        let image = ImagePaste {
+            format: image.format,
+            data: image.bytes,
+        };
+        self.client.outbound().input_image(id, image);
     }
 
     /// Select agent row `index` and enter APP mode, as a sidebar click does.

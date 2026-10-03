@@ -1887,6 +1887,8 @@ fn spawn_finish_count(git: &ProjectGit, tx: &Sender<FinishCount>, req: FinishCou
 /// [`TerminalHost`]: crate::web::stream::TerminalHost
 struct WorkspaceTerminals<'a> {
     projects: &'a mut [Project],
+    /// Where a pasted image is saved ([`crate::web::protocol::Input::image`]).
+    fs: &'a dyn FileSystem,
 }
 
 impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
@@ -1909,6 +1911,42 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
             }
         }
         crate::web::stream::Written::NoSuchTerminal
+    }
+
+    /// A viewer's pasted image: saved in this machine's paste directory and
+    /// typed as its path, mapped into the container for a containerized tab,
+    /// exactly as the TUI's paste key types a clipboard image. Never Codex's
+    /// native Ctrl-V: the image is on the viewer's clipboard, not this one.
+    fn paste_terminal_image(
+        &mut self,
+        terminal_id: &crate::web::protocol::TerminalId,
+        image: &crate::web::protocol::ImagePaste,
+    ) -> crate::web::stream::Written {
+        let tab = self.projects.iter_mut().find_map(|project| {
+            project.state.tabs.iter_mut().find(|tab| {
+                crate::web::stream::session_has_terminal(&tab.session, &tab.meta.id, terminal_id)
+            })
+        });
+        let Some(tab) = tab else {
+            return crate::web::stream::Written::NoSuchTerminal;
+        };
+        let pasted = crate::tui::clipboard::PastedImage {
+            format: image.format.clone(),
+            bytes: image.data.clone(),
+        };
+        let path = match crate::tui::clipboard::save_pasted_image(self.fs, &pasted) {
+            Ok(path) => path,
+            Err(reason) => return crate::web::stream::Written::Failed(reason),
+        };
+        let text = crate::tui::clipboard::pasted_image_text(&path, tab.meta.containerized);
+        let tab_id = tab.meta.id.clone();
+        crate::web::stream::write_into_session(
+            &mut tab.session,
+            &tab_id,
+            terminal_id,
+            text.as_bytes(),
+        )
+        .unwrap_or(crate::web::stream::Written::NoSuchTerminal)
     }
 }
 
@@ -5038,6 +5076,20 @@ fn apply_host_event(
             }
         }
         HostEvent::Paste(data) => handle_paste(data, workspace, env, ui)?,
+        // Only a focused terminal takes an image, on the same terms as a text
+        // paste; an open prompt or palette has nowhere to put one.
+        HostEvent::PasteImage(image) => {
+            let blocked = ui.prompt.is_some()
+                || ui.palette.is_some()
+                || !matches!(ui.overlay, UiOverlay::None);
+            if !blocked
+                && workspace.active_project().state.mode() == InputMode::Terminal
+                && desktop_may_type(ui, env.clock.now_millis() as i64)
+            {
+                let state = &mut workspace.active_project_mut().state;
+                paste_image_into_active_pty(state, env.fs, &image, ui);
+            }
+        }
         HostEvent::Resize(size) => resize_workspace(workspace, |_| size),
         HostEvent::FocusApp => workspace.active_project_mut().state.focus_app(),
         HostEvent::FocusTerminal => workspace.active_project_mut().state.focus_terminal(),
@@ -8756,31 +8808,43 @@ fn paste_into_active_pty(state: &mut AppState) {
     }
 
     match crate::tui::clipboard::save_clipboard_image() {
+        // A container cannot see the host's temp path. Fresh containers
+        // bind-mount FlightDeck's dedicated paste directory at the same
+        // container path, so the text names the file there.
         Some(path) => {
-            // A container cannot see the host's temp path. Fresh containers
-            // bind-mount FlightDeck's dedicated paste directory at the same
-            // container path, so translate only paths within that directory.
-            let path = if containerized {
-                crate::tui::clipboard::container_image_path(
-                    &path,
-                    &crate::tui::clipboard::image_paste_dir(),
-                    std::path::Path::new(crate::runtime::container::IMAGE_PASTE_DIR),
-                )
-                .unwrap_or(path)
-            } else {
-                path
-            };
-            let raw = path.to_string_lossy();
-            // Quote the path if it could be word-split by the agent's input.
-            let mut text = if raw.contains(char::is_whitespace) {
-                format!("'{}'", raw.replace('\'', "'\\''"))
-            } else {
-                raw.into_owned()
-            };
-            text.push(' ');
+            let text = crate::tui::clipboard::pasted_image_text(&path, containerized);
             write_active_pty(state, text.as_bytes());
         }
         None => write_active_pty(state, &[0x16]),
+    }
+}
+
+/// Paste an image a front-end read off its own clipboard (the desktop app's
+/// Cmd/Ctrl-V with an image and no text): the TUI's [`paste_into_active_pty`]
+/// with the bytes handed over instead of read by a platform command. A local
+/// Codex reads the same clipboard itself, so it gets its Ctrl-V as in the TUI;
+/// every other agent gets the saved file's path. A refused image (too large,
+/// not an image format, the save failed) says why in a notification.
+fn paste_image_into_active_pty(
+    state: &mut AppState,
+    fs: &dyn FileSystem,
+    image: &crate::tui::clipboard::PastedImage,
+    ui: &mut Ui,
+) {
+    let (agent, containerized) = state
+        .selected()
+        .map(|tab| (tab.meta.agent.as_str(), tab.meta.containerized))
+        .unwrap_or_default();
+    if use_native_codex_image_paste(agent, containerized) {
+        write_active_pty(state, &[0x16]);
+        return;
+    }
+    match crate::tui::clipboard::save_pasted_image(fs, image) {
+        Ok(path) => {
+            let text = crate::tui::clipboard::pasted_image_text(&path, containerized);
+            write_active_pty(state, text.as_bytes());
+        }
+        Err(reason) => ui.message(reason),
     }
 }
 
