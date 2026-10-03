@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.24.0] - 2026-10-03
+
+### New features
+
 - **A FlightDeck Desktop window connected to this machine can paste a
   clipboard image into an agent.** The image travels with the keystrokes, and
   FlightDeck saves it in its paste directory and types the file's path, as the
