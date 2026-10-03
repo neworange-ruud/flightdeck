@@ -8,7 +8,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **A FlightDeck Desktop window connected to this machine can paste a
+  clipboard image into an agent.** The image travels with the keystrokes, and
+  FlightDeck saves it in its paste directory and types the file's path, as the
+  TUI's own paste key does with a clipboard image (mapped into the container
+  for a containerized agent). PNG, JPEG, GIF, WebP, BMP and TIFF up to 10 MB.
 
 ### Improvements
 

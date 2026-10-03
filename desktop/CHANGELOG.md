@@ -14,7 +14,10 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Paste images into an agent.** Cmd-V (Ctrl-V) with an image on the
+  clipboard and no text, such as a screenshot, saves the image and types its
+  path, which Claude Code and other agents attach. In a remote window the image
+  goes to the host, where the agent runs. Text on the clipboard still wins.
 
 ### Improvements
 
@@ -22,7 +25,12 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **A remote window smaller than the host's terminal can reach all of it.**
+  The host's grid used to be cut off at the bottom and right, hiding the
+  agent's newest output and its prompt. The window now shows the bottom of the
+  grid first, the wheel scrolls through the hidden rows before the history, a
+  sideways swipe reaches the hidden columns, typing brings the cursor back into
+  view, and scrollbars show when part of the grid is out of view.
 
 ## [0.2.0] - 2026-10-02
 
