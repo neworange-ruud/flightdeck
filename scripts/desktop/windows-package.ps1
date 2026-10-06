@@ -45,7 +45,7 @@ $arch = switch ($osArch) {
 }
 $zipName = "FlightDeck-$version-windows-$arch-portable.zip"
 $zip = Join-Path target\desktop-dist $zipName
-$stage = Join-Path target\desktop-dist\portable
+$stage = Join-Path target\desktop-dist portable
 Remove-Item -Recurse -Force $stage, $zip -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item target\release\flightdeck-desktop.exe $stage
