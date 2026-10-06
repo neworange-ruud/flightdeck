@@ -50,6 +50,7 @@ fn session(id: &str, name: &str, status: InterpretedStatus, git: GitBar) -> Sess
         lifecycle_reporting: true,
         recovered: false,
         attached_existing_branch: false,
+        worktree_path: String::new(),
     }
 }
 
@@ -115,6 +116,7 @@ fn workspace() -> RemoteWorkspace {
         about: None,
         update: None,
         sidebar_position: AgentTabPosition::default(),
+        host_machine: None,
     });
     ws
 }
@@ -452,4 +454,34 @@ fn a_dialog_changed_in_place_replaces_the_draft_and_the_same_one_keeps_it() {
     assert_eq!(draft.text, None, "no field to send text into");
     assert_eq!(draft.list_index, Some(1));
     assert!(dialog_overlay(&moved, &draft).body[0].contains("base branch"));
+#[test]
+fn vscode_opens_the_shown_session_and_falls_back_to_the_root_on_an_older_host() {
+    let mut ws = workspace();
+    let session = ws.selected_session().unwrap().session_id.clone();
+    for project in &mut ws.projects {
+        for s in &mut project.sessions {
+            s.worktree_path = format!("/repo/.flightdeck/worktrees/{}", s.name);
+        }
+    }
+    ws.host_machine = Some(crate::web::protocol::HostMachine {
+        user: Some("dev".to_string()),
+        os: "linux".to_string(),
+    });
+    let open = vscode_folder(&ws, "10.0.0.5:7420", None).unwrap();
+    let name = ws.session(&session).unwrap().name.clone();
+    assert_eq!(open.path, format!("/repo/.flightdeck/worktrees/{name}"));
+    assert_eq!(open.ssh_target, "dev@10.0.0.5");
+    assert!(!open.root_fallback);
+
+    // A host from before `worktree_path` and `host_machine`.
+    for project in &mut ws.projects {
+        for s in &mut project.sessions {
+            s.worktree_path.clear();
+        }
+    }
+    ws.host_machine = None;
+    let open = vscode_folder(&ws, "10.0.0.5:7420", None).unwrap();
+    assert_eq!(open.path, ws.selected_project().unwrap().root);
+    assert!(open.root_fallback);
+    assert_eq!(open.ssh_target, "10.0.0.5", "SSH picks the user");
 }

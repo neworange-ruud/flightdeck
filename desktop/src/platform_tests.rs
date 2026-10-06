@@ -272,6 +272,24 @@ fn the_palettes_front_end_rows_are_performed_by_the_window(app: &mut TestAppCont
             "the palette closed"
         );
     }
+
+    // Open Worktree in VS Code is the window's own: it opens the folder on
+    // screen as a link, and is no app item.
+    model.update(cx, |m, cx| m.dispatch(HostEvent::OpenPalette, cx));
+    model.update(cx, |m, cx| {
+        m.dispatch(
+            HostEvent::Overlay(OverlayInput::PaletteRun(PaletteAction::FrontEnd(
+                FrontEndAction::OpenInVsCode,
+            ))),
+            cx,
+        )
+    });
+    let folder = model.read_with(cx, |m, _| m.host().selected_folder());
+    assert_eq!(
+        model.update(cx, |m, _| std::mem::take(&mut m.opened_urls)),
+        [flightdeck::host::vscode::local_folder_url(&folder)]
+    );
+    assert!(model.update(cx, |m, _| m.performed.is_empty()));
 }
 
 /// A New window that could not start says so where the user is looking: the

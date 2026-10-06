@@ -64,6 +64,7 @@ use crate::{
 use flightdeck_remote_protocol::ProjectId;
 
 pub mod overlay;
+pub mod vscode;
 pub use overlay::{
     AgentChoice, ButtonRole, ConfigView, DialogButton, DialogKind, DialogRow, DialogView,
     GitStatusView, HostNotices, MessageView, NewAgentForm, NewAgentTarget, OverlayInput,
@@ -1333,6 +1334,24 @@ impl<'a> AppHost<'a> {
     /// The active project's application state.
     pub fn active_state(&self) -> &AppState {
         &self.workspace.active_project().state
+    }
+
+    /// The folder the selected Agent Tab runs in — its worktree, or the
+    /// project root for a session on the base branch — else the active
+    /// project's root, for "Open Worktree in VS Code".
+    pub fn selected_folder(&self) -> std::path::PathBuf {
+        let state = self.active_state();
+        let folder = match state.selected() {
+            Some(tab) => crate::fs::paths::to_absolute(
+                &state.repo_root,
+                std::path::Path::new(&tab.meta.worktree_path_relative),
+            ),
+            None => state.repo_root.clone(),
+        };
+        folder
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect()
     }
 
     /// The active project's application state, mutably — for front-end work

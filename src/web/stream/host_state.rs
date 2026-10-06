@@ -228,6 +228,8 @@ pub struct SessionFacts<'a> {
     pub recovered: bool,
     /// The cyan `[existing]` chip.
     pub attached_existing_branch: bool,
+    /// The absolute folder the session runs in.
+    pub worktree_path: String,
     /// The session's terminals, in tab order.
     pub terminals: Vec<TerminalFacts>,
 }
@@ -258,6 +260,7 @@ pub fn session_view(facts: &SessionFacts<'_>, streams: &TerminalStreams) -> Sess
         lifecycle_reporting: lifecycle_reporting(facts.agent_def),
         recovered: facts.recovered,
         attached_existing_branch: facts.attached_existing_branch,
+        worktree_path: facts.worktree_path.clone(),
     }
 }
 

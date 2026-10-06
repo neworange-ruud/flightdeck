@@ -241,6 +241,7 @@ impl Host {
                 lifecycle_reporting: true,
                 recovered: false,
                 attached_existing_branch: false,
+                worktree_path: String::new(),
             })
             .collect::<Vec<_>>();
         let selected = self

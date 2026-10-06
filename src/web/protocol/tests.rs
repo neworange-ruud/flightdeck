@@ -91,6 +91,7 @@ fn session_view() -> SessionView {
         lifecycle_reporting: true,
         recovered: true,
         attached_existing_branch: false,
+        worktree_path: String::new(),
     }
 }
 
@@ -215,6 +216,10 @@ fn snapshot() -> Snapshot {
         // The non-default setting, so the round trip carries 1h position 4
         // rather than only its default (`remote-control-ecsv`, §6.5 R24).
         sidebar_position: crate::contracts::AgentTabPosition::Right,
+        host_machine: Some(HostMachine {
+            user: Some("ruud".to_string()),
+            os: "linux".to_string(),
+        }),
     }
 }
 
@@ -747,6 +752,33 @@ fn sidebar_position_is_additive_and_absent_parses_as_left() {
         parsed.sidebar_position,
         crate::contracts::AgentTabPosition::Left
     );
+}
+
+/// The host's account and OS, and each session's folder, are additive as
+/// well: an older host sends neither, and a client then simply has no remote
+/// folder to open rather than failing to parse.
+#[test]
+fn host_machine_and_worktree_path_are_additive() {
+    let mut value = serde_json::to_value(snapshot()).unwrap();
+    assert_eq!(
+        value["host_machine"],
+        json!({ "user": "ruud", "os": "linux" })
+    );
+    let obj = value.as_object_mut().unwrap();
+    obj.remove("host_machine");
+    for project in obj["projects"].as_array_mut().unwrap() {
+        for session in project["sessions"].as_array_mut().unwrap() {
+            session.as_object_mut().unwrap().remove("worktree_path");
+        }
+    }
+
+    let parsed: Snapshot = serde_json::from_value(value).expect("still parses");
+    assert_eq!(parsed.host_machine, None);
+    assert!(parsed
+        .projects
+        .iter()
+        .flat_map(|p| &p.sessions)
+        .all(|s| s.worktree_path.is_empty()));
 }
 
 #[test]
