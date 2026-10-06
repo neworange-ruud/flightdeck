@@ -44,6 +44,12 @@ pub struct SavedRemote {
     /// The one-time plain-WebSocket warning was accepted for this remote.
     #[serde(default)]
     pub warned_unencrypted: bool,
+    /// Where "Open Worktree in VS Code" connects over SSH: a `Host` alias
+    /// from `~/.ssh/config` or `user@host`. Unset, it is the host's own
+    /// account at this remote's address ([`crate::host::vscode::ssh_target`]).
+    /// Only ever set by hand, so it is kept across a re-pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
 }
 
 impl SavedRemote {
@@ -69,7 +75,7 @@ impl RemotesFile {
     }
 
     /// Save `remote`, replacing any record for the same address (a re-pair
-    /// keeps the warning already accepted).
+    /// keeps the warning already accepted and a hand-set SSH target).
     pub fn upsert(&mut self, mut remote: SavedRemote) {
         match self
             .remotes
@@ -78,6 +84,9 @@ impl RemotesFile {
         {
             Some(existing) => {
                 remote.warned_unencrypted |= existing.warned_unencrypted;
+                if remote.ssh_target.is_none() {
+                    remote.ssh_target = existing.ssh_target.take();
+                }
                 *existing = remote;
             }
             None => self.remotes.push(remote),
@@ -175,7 +184,28 @@ mod tests {
             viewer_id: None,
             host_version: None,
             warned_unencrypted: false,
+            ssh_target: None,
         }
+    }
+
+    #[test]
+    fn a_re_pair_keeps_the_ssh_target_set_by_hand() {
+        let mut file = RemotesFile::default();
+        file.upsert(SavedRemote {
+            ssh_target: Some("buildbox".to_string()),
+            ..remote("10.0.0.2:7420")
+        });
+        file.upsert(SavedRemote {
+            token: "new".to_string(),
+            ..remote("10.0.0.2:7420")
+        });
+        let saved = file.get("10.0.0.2:7420").unwrap();
+        assert_eq!(saved.token, "new");
+        assert_eq!(saved.ssh_target.as_deref(), Some("buildbox"));
+
+        // Absent from the file when unset, and an old file still loads.
+        let json = serde_json::to_string(&remote("h:1")).unwrap();
+        assert!(!json.contains("ssh_target"), "{json}");
     }
 
     #[test]

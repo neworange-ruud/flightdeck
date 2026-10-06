@@ -975,6 +975,7 @@ mod delta {
                 },
                 recovered: false,
                 attached_existing_branch: false,
+                worktree_path: String::new(),
                 terminals,
             },
             &streams,

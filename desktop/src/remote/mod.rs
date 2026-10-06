@@ -106,6 +106,13 @@ pub struct RemoteModel {
     /// remote), chosen but not yet performed — [`RemoteModel::dispatch`] hands
     /// them to the app once its update is done.
     front_end: Vec<FrontEndAction>,
+    /// Links for the platform to open (a host folder in VS Code), likewise
+    /// opened once the update is done.
+    open_urls: Vec<String>,
+    /// The saved remotes, read when a per-remote setting is needed (the SSH
+    /// target), so a hand edit applies without reconnecting. None in a window
+    /// that was not opened from the real file.
+    remotes: connect::Store,
     /// Every event dispatched, in order, for the tests.
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
@@ -130,6 +137,11 @@ impl RemoteModel {
             cadence: Cadence::with_rates(HOST_ACTIVE_TURN, HOST_IDLE_TURN),
             close_requested: false,
             front_end: Vec::new(),
+            open_urls: Vec::new(),
+            remotes: connect::Store {
+                fs: std::rc::Rc::new(flightdeck::contracts::real::RealFs),
+                path: None,
+            },
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
@@ -139,6 +151,16 @@ impl RemoteModel {
     /// The front-end palette rows chosen since the last call, in order.
     pub fn take_front_end_actions(&mut self) -> Vec<FrontEndAction> {
         std::mem::take(&mut self.front_end)
+    }
+
+    /// The links to open since the last call, in order.
+    pub fn take_open_urls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.open_urls)
+    }
+
+    /// Read per-remote settings from `remotes`.
+    pub fn set_remotes(&mut self, remotes: connect::Store) {
+        self.remotes = remotes;
     }
 
     /// Use this text size for the remote terminals.
@@ -386,8 +408,12 @@ impl RemoteModel {
         }
         self.apply(event);
         for action in self.take_front_end_actions() {
-            let command = crate::menus::AppCommand::for_front_end(action);
-            cx.defer(move |cx| command.perform(cx));
+            if let Some(command) = crate::menus::AppCommand::for_front_end(action) {
+                cx.defer(move |cx| command.perform(cx));
+            }
+        }
+        for url in self.take_open_urls() {
+            cx.open_url(&url);
         }
         cx.notify();
     }
@@ -539,6 +565,9 @@ impl RemoteModel {
             RemoteAction::Local(LocalAction::Project(selector)) => self.step_project(selector),
             RemoteAction::Local(LocalAction::Help) => self.local = Local::Help,
             RemoteAction::Local(LocalAction::About) => self.local = Local::About,
+            RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::OpenInVsCode)) => {
+                self.open_in_vscode()
+            }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
             RemoteAction::Unavailable(why) => self.local = Local::Message(why.to_string()),
             RemoteAction::Send { name, scope } => {
@@ -547,6 +576,37 @@ impl RemoteModel {
                     self.local =
                         Local::Message("Not connected to the host — nothing was sent.".to_string());
                 }
+            }
+        }
+    }
+
+    /// Open the session on screen — else the project — in this machine's VS
+    /// Code, over SSH to the host ([`flightdeck::host::vscode`]). The SSH
+    /// target is the one saved for this remote by hand, else the host's own
+    /// account at the address this window reached it on.
+    fn open_in_vscode(&mut self) {
+        let configured = self
+            .remotes
+            .load()
+            .get(&self.address)
+            .and_then(|saved| saved.ssh_target.clone());
+        match views::vscode_folder(self.workspace(), &self.address, configured.as_deref()) {
+            Some(open) => {
+                let fallback = if open.root_fallback {
+                    " — the host's FlightDeck is too old to name the session's folder, so this \
+                     is the project root"
+                } else {
+                    ""
+                };
+                self.notice = Some(format!(
+                    "Opening {} on {} in VS Code (Remote - SSH){fallback}",
+                    open.path, open.ssh_target
+                ));
+                self.open_urls.push(open.url);
+            }
+            None => {
+                self.local =
+                    Local::Message("Select a project or session to open in VS Code.".to_string())
             }
         }
     }
@@ -701,6 +761,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
     let model = cx.new(|cx| {
         let mut model = RemoteModel::new(client, label.clone(), address.clone());
         model.set_font_size(font_size);
+        model.set_remotes(connect::Store::real());
         model.start_ticking(cx);
         model
     });

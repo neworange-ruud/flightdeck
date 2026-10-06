@@ -128,10 +128,13 @@ impl AppCommand {
 
     /// The item a palette front-end row stands for: the host queues the row
     /// and the window performs it (`crate::host::HostModel::dispatch`).
-    pub fn for_front_end(action: FrontEndAction) -> AppCommand {
+    /// `None` for a row about what the window shows (Open Worktree in VS
+    /// Code), which the window performs itself rather than the app.
+    pub fn for_front_end(action: FrontEndAction) -> Option<AppCommand> {
         match action {
-            FrontEndAction::ConnectToRemote => AppCommand::ConnectRemote,
-            FrontEndAction::NewWindow => AppCommand::NewWindow,
+            FrontEndAction::ConnectToRemote => Some(AppCommand::ConnectRemote),
+            FrontEndAction::NewWindow => Some(AppCommand::NewWindow),
+            FrontEndAction::OpenInVsCode => None,
         }
     }
 
@@ -627,18 +630,23 @@ mod tests {
     fn the_palettes_front_end_rows_are_the_desktops_own_items() {
         assert_eq!(
             AppCommand::for_front_end(FrontEndAction::ConnectToRemote),
-            AppCommand::ConnectRemote
+            Some(AppCommand::ConnectRemote)
         );
         assert_eq!(
             AppCommand::for_front_end(FrontEndAction::NewWindow),
-            AppCommand::NewWindow
+            Some(AppCommand::NewWindow)
+        );
+        assert_eq!(
+            AppCommand::for_front_end(FrontEndAction::OpenInVsCode),
+            None,
+            "the window opens its own folder"
         );
         // Performed by the window, never sent to the host.
         for row in flightdeck::tui::palette::front_end_entries() {
             let PaletteAction::FrontEnd(action) = row.action else {
                 panic!("{} is not a front-end row", row.label);
             };
-            assert!(AppCommand::for_front_end(action).host_event().is_none());
+            assert!(AppCommand::for_front_end(action).is_none_or(|c| c.host_event().is_none()));
         }
     }
 

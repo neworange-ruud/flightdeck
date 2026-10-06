@@ -106,6 +106,9 @@ pub enum FrontEndAction {
     /// Start another instance of the app, opened on its launcher, so one can
     /// run local projects while another controls a remote.
     NewWindow,
+    /// Open the selected session's folder in VS Code on this machine — over
+    /// SSH when the session is on a remote host ([`crate::host::vscode`]).
+    OpenInVsCode,
 }
 
 impl PaletteAction {
@@ -353,6 +356,11 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
         group: "Global",
         label: "New Window",
         action: PaletteAction::FrontEnd(FrontEndAction::NewWindow),
+    },
+    PaletteEntry {
+        group: "Worktree",
+        label: "Open Worktree in VS Code",
+        action: PaletteAction::FrontEnd(FrontEndAction::OpenInVsCode),
     },
 ];
 
@@ -727,7 +735,14 @@ mod tests {
             .filter(is_front_end)
             .map(|e| e.label)
             .collect();
-        assert_eq!(offered, ["Connect to Remote", "New Window"]);
+        assert_eq!(
+            offered,
+            [
+                "Open Worktree in VS Code",
+                "Connect to Remote",
+                "New Window"
+            ]
+        );
         assert_eq!(
             desktop.filtered().len(),
             tui.filtered().len() + FRONT_END_ENTRIES.len()

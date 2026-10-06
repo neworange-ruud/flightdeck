@@ -166,6 +166,10 @@ pub struct HostModel {
     /// a window or a process from a test.
     #[cfg(test)]
     pub performed: Vec<crate::menus::AppCommand>,
+    /// Every link handed to the platform, in order, instead of opening VS
+    /// Code from a test.
+    #[cfg(test)]
+    pub opened_urls: Vec<String>,
     _ticker: Option<Task<()>>,
 }
 
@@ -189,6 +193,8 @@ impl HostModel {
             dispatched: Vec::new(),
             #[cfg(test)]
             performed: Vec::new(),
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             _ticker: None,
         }
     }
@@ -326,9 +332,17 @@ impl HostModel {
             }
         }
         // Palette rows only the window can perform (Connect to Remote, New
-        // Window): the host queued them; open them once this update is done.
+        // Window, Open Worktree in VS Code): the host queued them; open them
+        // once this update is done.
         for action in self.host.take_front_end_actions() {
-            let command = crate::menus::AppCommand::for_front_end(action);
+            let Some(command) = crate::menus::AppCommand::for_front_end(action) else {
+                let url = flightdeck::host::vscode::local_folder_url(&self.host.selected_folder());
+                #[cfg(test)]
+                self.opened_urls.push(url);
+                #[cfg(not(test))]
+                cx.open_url(&url);
+                continue;
+            };
             #[cfg(test)]
             self.performed.push(command);
             #[cfg(not(test))]
