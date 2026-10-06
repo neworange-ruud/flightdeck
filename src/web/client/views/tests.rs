@@ -454,6 +454,8 @@ fn a_dialog_changed_in_place_replaces_the_draft_and_the_same_one_keeps_it() {
     assert_eq!(draft.text, None, "no field to send text into");
     assert_eq!(draft.list_index, Some(1));
     assert!(dialog_overlay(&moved, &draft).body[0].contains("base branch"));
+}
+
 #[test]
 fn vscode_opens_the_shown_session_and_falls_back_to_the_root_on_an_older_host() {
     let mut ws = workspace();
