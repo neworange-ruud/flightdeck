@@ -1829,7 +1829,9 @@ pub enum Delta {
     },
     /// A new activity-feed entry (D11).
     Activity(ActivityEvent),
-    /// A dialog opened on either surface (D13).
+    /// A dialog opened on either surface (D13), or the open one changed in
+    /// place — re-sent under the same `dialog_id`, which a client applies as
+    /// an update to the dialog it already shows.
     DialogOpened(DialogView),
     /// A dialog closed on either surface.
     DialogClosed {

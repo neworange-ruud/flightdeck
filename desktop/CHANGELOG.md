@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- In a remote window, the New Agent dialog now follows the host. Switching target updates the form, and choosing an agent with ↑/↓ moves the `(•)` mark. Before, the form stayed as it first opened and the mark stayed on the host's agent.
 
 ## [0.3.0] - 2026-10-03
 

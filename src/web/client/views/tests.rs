@@ -391,3 +391,65 @@ fn a_dialog_the_host_will_not_let_us_confirm_offers_only_cancel() {
     assert_eq!(shown.buttons[0].role, ButtonRole::Cancel);
     assert!(shown.body.iter().any(|l| l.contains("is gone")));
 }
+
+fn agent_radio(selected: usize) -> wire::DialogView {
+    let mut view = dialog(DialogBody {
+        input: Some(String::new()),
+        list: ["Claude Code", "Codex CLI", "OpenCode"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| DialogChoice {
+                label: format!("{} {name}", if i == selected { "(•)" } else { "( )" }),
+                selected: i == selected,
+            })
+            .collect(),
+        buttons: keys(&[
+            ("Enter", "Create", false),
+            ("Esc", "Cancel", true),
+            ("Tab", "Target: new branch", false),
+        ]),
+        confirmable: true,
+        ..DialogBody::default()
+    });
+    view.kind = "new_agent".to_string();
+    view
+}
+
+#[test]
+fn the_agent_radio_marks_this_windows_choice_not_the_hosts() {
+    let view = agent_radio(2);
+    let mut draft = DialogDraft::new(&view);
+    dialog_input(&view, &mut draft, &OverlayInput::Key(OverlayKey::Up));
+    dialog_input(&view, &mut draft, &OverlayInput::Key(OverlayKey::Up));
+    let labels: Vec<_> = dialog_overlay(&view, &draft)
+        .list
+        .into_iter()
+        .map(|row| row.label)
+        .collect();
+    assert_eq!(labels, ["(•) Claude Code", "( ) Codex CLI", "( ) OpenCode"]);
+}
+
+#[test]
+fn a_dialog_changed_in_place_replaces_the_draft_and_the_same_one_keeps_it() {
+    let view = agent_radio(0);
+    let mut draft = DialogDraft::new(&view);
+    dialog_input(
+        &view,
+        &mut draft,
+        &OverlayInput::SetText("fix login".into()),
+    );
+    dialog_input(&view, &mut draft, &OverlayInput::Key(OverlayKey::Down));
+    assert!(!draft.follow(&view.clone()), "re-sent unchanged");
+    assert_eq!(draft.text.as_deref(), Some("fix login"));
+
+    // The host took the answer's `Tab`: base target, Codex chosen, no field.
+    let mut moved = agent_radio(1);
+    let mut body = dialog_body(&moved);
+    body.input = None;
+    moved.title = "New Agent Session Tab\nRuns on base branch 'main'.".to_string();
+    moved.body = Some(serde_json::to_value(body).unwrap());
+    assert!(draft.follow(&moved));
+    assert_eq!(draft.text, None, "no field to send text into");
+    assert_eq!(draft.list_index, Some(1));
+    assert!(dialog_overlay(&moved, &draft).body[0].contains("base branch"));
+}

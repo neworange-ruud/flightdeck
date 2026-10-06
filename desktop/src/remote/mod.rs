@@ -269,11 +269,11 @@ impl RemoteModel {
     }
 
     /// Keep the draft on the host's open dialog: a new dialog starts a new
-    /// draft, a closed one drops it.
+    /// draft, one that changed in place is followed, a closed one drops it.
     fn track_dialog(&mut self) -> bool {
         let open = self.workspace().dialog.clone();
-        match (open, &self.draft) {
-            (Some(view), Some(draft)) if draft.dialog_id == view.dialog_id => false,
+        match (open, &mut self.draft) {
+            (Some(view), Some(draft)) if draft.dialog_id == view.dialog_id => draft.follow(&view),
             (Some(view), _) => {
                 self.draft = Some(DialogDraft::new(&view));
                 true

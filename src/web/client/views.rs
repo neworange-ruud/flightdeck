@@ -436,6 +436,10 @@ pub struct DialogDraft {
     pub list_index: Option<usize>,
     /// The name typed for artboard 1g's second step, when the dialog has one.
     pub typed_name: String,
+    /// The host's dialog as this draft last took it, so a re-announced dialog
+    /// that changed in place (the new-agent form's `Tab`) can be told apart
+    /// from the same one sent again.
+    pub seen: wire::DialogView,
 }
 
 /// The dialog's structured body, if it carried one.
@@ -455,7 +459,37 @@ impl DialogDraft {
             text: body.input,
             list_index: body.list.iter().position(|c| c.selected),
             typed_name: String::new(),
+            seen: view.clone(),
         }
+    }
+
+    /// Follow the host's dialog after it changed in place: its field and list
+    /// as the host now has them, since the host only ever changes them through
+    /// an answer that already carried this draft (`Tab`) or through another
+    /// surface answering first. Returns whether anything changed.
+    pub fn follow(&mut self, view: &wire::DialogView) -> bool {
+        if self.seen == *view {
+            return false;
+        }
+        let typed_name = std::mem::take(&mut self.typed_name);
+        *self = DialogDraft {
+            typed_name,
+            ..DialogDraft::new(view)
+        };
+        true
+    }
+}
+
+/// The agent radio's rows carry the host's `(•)` / `( )` mark in their label;
+/// redrawn so the mark follows this window's choice rather than the host's.
+fn radio_label(label: &str, on: bool) -> String {
+    match label
+        .strip_prefix("(•) ")
+        .or_else(|| label.strip_prefix("( ) "))
+    {
+        Some(rest) if on => format!("(•) {rest}"),
+        Some(rest) => format!("( ) {rest}"),
+        None => label.to_string(),
     }
 }
 
@@ -514,9 +548,12 @@ pub fn dialog_overlay(view: &wire::DialogView, draft: &DialogDraft) -> HostDialo
             .list
             .iter()
             .enumerate()
-            .map(|(i, choice)| DialogRow {
-                label: choice.label.clone(),
-                selected: draft.list_index.map_or(choice.selected, |s| s == i),
+            .map(|(i, choice)| {
+                let selected = draft.list_index.map_or(choice.selected, |s| s == i);
+                DialogRow {
+                    label: radio_label(&choice.label, selected),
+                    selected,
+                }
             })
             .collect(),
         list_filter: body.list_filter,

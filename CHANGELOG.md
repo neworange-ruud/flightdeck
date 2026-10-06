@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- A shared dialog that changes in place — the New Agent form switching target with `Tab`, or its agent radio and field moving on the host — is now re-sent to remote clients. Before, a browser or remote desktop kept showing the form as it first opened.
 
 ## [1.24.0] - 2026-10-03
 
