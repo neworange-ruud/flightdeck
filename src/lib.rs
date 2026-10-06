@@ -14163,6 +14163,38 @@ mod tests {
             assert_eq!(dialog_id, &first);
         }
 
+        /// A dialog that changes in place keeps its id, so the diff must still
+        /// carry the change. Without it a remote desktop went on showing the
+        /// new-agent form's first target after the host had moved to the next.
+        #[test]
+        fn a_dialog_changed_in_place_is_re_announced_under_the_same_id() {
+            use crate::web::protocol::Delta;
+            let mut ws = one_project_workspace(false);
+            let mut ui = Ui::default();
+            open_new_agent(&ws, &mut ui, browser_origin());
+            let id = ui.dialog_id().expect("open");
+            let published = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+            let unchanged = crate::web::stream::deltas(&published, &published);
+            assert!(unchanged.is_empty(), "{unchanged:?}");
+
+            let tab = answer(1, names::DIALOG_CONFIRM, &ui, json!({ "choice": "Tab" }));
+            assert_eq!(run(&mut ws, &mut ui, &tab).outcome, AckOutcome::Applied);
+            let next = crate::web::server::HostState {
+                dialog: maybe_view(&ui, &ws),
+                ..crate::web::server::HostState::default()
+            };
+
+            let frames = crate::web::stream::deltas(&published, &next);
+            let [Delta::DialogOpened(view)] = frames.as_slice() else {
+                panic!("one re-announcement: {frames:?}");
+            };
+            assert_eq!(view.dialog_id, id);
+            assert!(view.title.contains("existing branch"), "{}", view.title);
+        }
+
         /// The other side of the same coin: where somebody *did* decide, the
         /// diff's `Superseded` is upgraded to the real outcome. Without this the
         /// browser would be told "replaced" about a dialog the desktop answered.

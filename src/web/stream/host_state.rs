@@ -412,6 +412,11 @@ pub fn deltas(previous: &HostState, next: &HostState) -> Vec<Delta> {
             });
             out.push(Delta::DialogOpened(open.clone()));
         }
+        // The same dialog, changed in place: the new-agent form's `Tab` moves
+        // its target, and the host's own keys move its radio and field. Sent
+        // again under the same id, which every client already treats as an
+        // update rather than a new question.
+        (Some(was), Some(open)) if was != open => out.push(Delta::DialogOpened(open.clone())),
         _ => {}
     }
 
