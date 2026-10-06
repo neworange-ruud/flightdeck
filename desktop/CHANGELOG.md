@@ -14,11 +14,22 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- **Open Worktree in VS Code**, from the command palette or an agent's right-click menu. A remote window opens the host's folder through VS Code's Remote - SSH extension, as the host's FlightDeck user at the address you connected to, or through an `ssh_target` you set for that remote in `~/.flightdeck/remotes.json`. A local window opens the folder directly.
+- None yet.
 
 ### Improvements
 
 - None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.4.0] - 2026-10-06
+
+### New features
+
+- **Open Worktree in VS Code**, from the command palette or an agent's right-click menu. A remote window opens the host's folder through VS Code's Remote - SSH extension, as the host's FlightDeck user at the address you connected to, or through an `ssh_target` you set for that remote in `~/.flightdeck/remotes.json`. A local window opens the folder directly.
+
 
 ### Bug fixes
 
